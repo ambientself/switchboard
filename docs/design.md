@@ -75,7 +75,8 @@ must be identified and tested before employee rollout (Q13).
 
 ### In scope
 
-- Tools only: `initialize`, `ping`, `tools/list`, `tools/call`, over MCP's HTTP transport.
+- Tools only, over MCP's HTTP transport: `tools/list` and `tools/call` in both revisions,
+  `server/discover` in the newer one, and `initialize` and `ping` in the older one.
 - Several identity issuers at once, one per caller type.
 - Built-in connectors and proxied MCP servers, presented the same way to callers and held
   to different levels of assurance (section 13).
@@ -134,10 +135,11 @@ flowchart LR
   surfaces and policy. It starts as checked-in configuration files and becomes a Postgres
   service with an API when teams need to onboard without a pull request.
 
-The proxy is built on `axum` with the `rmcp` SDK; see
-[decision 0001](decisions/0001-build-on-axum-not-pingora.md). The SDK sits behind a small
-protocol adapter, and its types do not appear in the policy or connector interfaces, so the
-choice can be revisited once it has been tried against real clients.
+The proxy is built on `axum`, with the MCP endpoint written by hand behind a small protocol
+adapter; see decisions [0001](decisions/0001-build-on-axum-not-pingora.md) and
+[0007](decisions/0007-serve-two-mcp-revisions-from-a-hand-written-endpoint.md). It serves MCP
+revisions `2026-07-28` and `2025-06-18` on one endpoint, without sessions in either. The
+`rmcp` SDK is used only in tests, as a client.
 
 ### Proposed workspace layout
 
