@@ -15,26 +15,35 @@ commit in [baseline.json](baseline.json). The local directory is historically ca
 From the Switchboard repository root:
 
 ```sh
-python3 conformance/run.py --otto-source /path/to/agentrunner
+python3 conformance/run.py --otto-source /path/to/otto
 ```
 
 To run a focused scenario:
 
 ```sh
-python3 conformance/run.py --otto-source /path/to/agentrunner \
+python3 conformance/run.py --otto-source /path/to/otto \
   --test TestAuditBeginFailureBlocksExecutionAndDenial
 ```
 
-The runner exports the exact committed tree into a temporary directory, builds
-`cmd/otto-gateway`, starts a disposable Postgres container, and runs the tests with the race
+`python3` must resolve to 3.12 or newer in the directory you run from; the runner says so and
+stops if it does not.
+
+The runner exports the exact committed tree into a temporary directory and builds three of
+Otto's binaries from it: the gateway, the key custodian the gateway asks for GitHub tokens,
+and the session service, which is the only binary that migrates the schema. It starts a
+disposable Postgres container, creates Otto's component roles with Otto's own bootstrap
+script, applies the schema with the pinned migrator, and runs the tests with the race
 detector. Uncommitted changes in the source clone are not included or modified. The runner
 does not reset or check out that clone, run its migrations against an existing database, or
 use its deployment configuration.
 
-Each test gets an isolated schema loaded from the pinned `0013_gateway_audit.sql`, a fresh
-RSA key and team manifest, a loopback issuer and fake GitHub server, and its own gateway
-process. The fake vendor validates App JWT signatures, issues only a dummy installation
-token, and observes that an unfinished allowed audit row exists before downstream work.
+Each test gets its own copy of the migrated database, a fresh RSA key, turn-grant signing
+key and team manifest, a loopback issuer, fake GitHub and Jira servers, and its own gateway
+and custodian processes. The gateway connects as Otto's narrow `otto_gateway` role; the
+suite inspects rows as the owner. Turn grants are minted by the suite from Otto's wire
+format, without importing Otto's code. The fake vendor validates App JWT signatures, issues
+dummy installation tokens scoped exactly as asked, and observes that an unfinished allowed
+audit row exists before downstream work.
 No vendor or cluster credentials are needed. Inherited gateway configuration and proxy
 settings are not passed to the gateway.
 
@@ -51,14 +60,16 @@ fails with setup instructions instead of silently skipping the suite.
 
 | Area | Executable checks |
 | --- | --- |
-| Boot | Missing, partial and contradictory gates; malformed manifest; partial connector configuration; explicit local opt-outs. |
+| Boot | Missing, partial and contradictory gates for identity, turn grants and audit; malformed manifest; a database login wider than the gateway's role; partial connector configuration; the retired App-key variable; explicit local opt-outs. |
 | Protocol | Fixed negotiated revision, request IDs, initialization, ping, tool listing, notifications, malformed requests and unsupported methods; no client session ID. |
 | Identity | Signed local tokens; expiry, not-before, audience, issuer, subject, lifetime, algorithm, key ID and signature failures; opaque 401 with an audit row. |
-| Attribution | Required acting headers; proved/claimed team mismatch; proved, failed and disabled verification states. |
-| Tools | Exactly five real tools with classifications and required argument schemas; unconfigured connector serves one marked fixture. |
-| GitHub | Real broker code against a fake API; App JWT validation, installation discovery/token reuse, all five tool results, proposal write routes, organization and argument restrictions, result bounds and credential redaction. |
-| Audit | Allowed and denied records, audit before vendor requests, begin failure, finish failure and completion after client disconnect. |
-| Known gaps | Repeated writes are not deduplicated; fencing-epoch headers are recorded without enforcement. |
+| Turn grants | Missing grant; sixteen kinds of unverifiable grant, including forged claims under a genuine signature; grant and pod team mismatch; a tool outside the grant; legacy headers accepted only with grant checking off. |
+| Attribution | Proved, failed and disabled verification states; nothing from an unverified grant recorded; the caller's tool-use identifier recorded. |
+| Tools | Exactly eighteen tools with classifications and required arguments, none destructive; unconfigured connector serves a marked fixture. |
+| GitHub | Real custodian and connector code against a fake API; App JWT validation; tokens scoped by repository and permission; results of the five original tools; draft pull requests; scope refusals and argument errors told apart; result bounds and credential redaction. |
+| Audit | Allowed, denied and refused records; audit before vendor requests; begin failure; finish failure; the answer waiting for finish; completion after client disconnect. |
+| Known gaps in Otto | Repeated comments are not deduplicated. |
+| Not covered | The behavior of thirteen newer tools, the three control-plane endpoints, grant key rotation and the custodian's peer check. See [observed behavior](../docs/otto-baseline.md). |
 
 The negative scenarios are part of the baseline, not desired Switchboard behavior. See
 [observed behavior](../docs/otto-baseline.md) before using these tests as a migration gate.
@@ -80,9 +91,21 @@ its internal constructor's behavior. Otto's own unit tests cover that internal b
 New company-wide requirements belong in a separate future suite. They must not be smuggled
 into this baseline as failures against behavior the pinned Go gateway never implemented.
 
+## Checking that the tests can fail
+
+```sh
+python3 conformance/mutation_check.py --otto-source /path/to/otto
+```
+
+This breaks one guard in the pinned gateway at a time, builds it, and requires the test named
+for that guard to fail. A guard whose text no longer matches the pinned source is reported as
+not caught, so the list has to be kept current when the pin moves. `run.py --gateway-binary`
+is the same mechanism for a one-off check.
+
 ## Updating the pin
 
 Change the commit/toolchain/image in `baseline.json` deliberately, run the entire suite, and
 review each behavior change in `docs/otto-baseline.md`. Never refresh expected responses
-merely to make a failing test pass. The database migration is read from the same source
-commit as the gateway so schema and binary stay aligned.
+merely to make a failing test pass. The schema is applied by the migrator built from the same
+source commit as the gateway, so schema and binary stay aligned. Then run
+`mutation_check.py`; its guard patterns are tied to the pinned source.
