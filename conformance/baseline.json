@@ -1,15 +1,28 @@
 {
   "repository": "https://github.com/ambientself/otto.git",
-  "commit": "4ad4f69ce678f3ebf91d9be5bbcad86ed614bf65",
+  "commit": "752395a2d93962ec734f0cc28bbb101c5805f3e8",
   "go_toolchain": "go1.26.5",
   "postgres_image": "postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
   "protocol_version": "2025-06-18",
   "endpoint": "/mcp",
   "tools": {
-    "github_search": {"switchboard": "github__search", "classification": "read"},
-    "github_get_file": {"switchboard": "github__get_file", "classification": "read"},
-    "github_get_pr": {"switchboard": "github__get_pr", "classification": "read"},
-    "github_create_pr": {"switchboard": "github__create_pr", "classification": "write"},
-    "github_pr_comment": {"switchboard": "github__pr_comment", "classification": "write"}
+    "declare_unverified_claim": {"switchboard": "otto__declare_unverified_claim", "classification": "read", "required": ["claim"]},
+    "github_amend_change": {"switchboard": "github__amend_change", "classification": "write", "required": ["owner", "repo", "pr_number", "files", "unverifiedClaims"]},
+    "github_create_pr": {"switchboard": "github__create_pr", "classification": "write", "required": ["owner", "repo", "title", "head", "base"]},
+    "github_get_checks": {"switchboard": "github__get_checks", "classification": "read", "required": ["owner", "repo", "number"]},
+    "github_get_file": {"switchboard": "github__get_file", "classification": "read", "required": ["owner", "repo", "path"]},
+    "github_get_issue": {"switchboard": "github__get_issue", "classification": "read", "required": ["owner", "repo", "number"]},
+    "github_get_job_log": {"switchboard": "github__get_job_log", "classification": "read", "required": ["owner", "repo", "jobId"]},
+    "github_get_pr": {"switchboard": "github__get_pr", "classification": "read", "required": ["owner", "repo", "number"]},
+    "github_list_releases": {"switchboard": "github__list_releases", "classification": "read", "required": ["owner", "repo"]},
+    "github_pr_comment": {"switchboard": "github__pr_comment", "classification": "write", "required": ["owner", "repo", "body"]},
+    "github_pr_template": {"switchboard": "github__pr_template", "classification": "read", "required": ["repo"]},
+    "github_propose_change": {"switchboard": "github__propose_change", "classification": "write", "required": ["owner", "repo", "title", "idempotency_key", "files", "unverifiedClaims"]},
+    "github_repo_conventions": {"switchboard": "github__repo_conventions", "classification": "read", "required": ["repo"]},
+    "github_search": {"switchboard": "github__search", "classification": "read", "required": ["query"]},
+    "github_skill_body": {"switchboard": "github__skill_body", "classification": "read", "required": ["ref"]},
+    "jira_comment": {"switchboard": "jira__comment", "classification": "write", "required": ["key", "body"]},
+    "jira_get_issue": {"switchboard": "jira__get_issue", "classification": "read", "required": ["key"]},
+    "jira_search": {"switchboard": "jira__search", "classification": "read", "required": ["jql"]}
   }
 }

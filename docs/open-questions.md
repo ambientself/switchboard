@@ -1,12 +1,11 @@
 # Open questions
 
-Q1–Q8 are settled below. Q9–Q13 are proposed refinements from the design review, not yet
-accepted decisions. When resolved, move their requirements into [design.md](design.md) and
-remove the open question. Vendor research remains in [systems.md](systems.md).
+Q1–Q8 and Q14–Q16 are settled below. Q9–Q13 and Q17–Q19 are open. When resolved, move their requirements into
+[design.md](design.md) and remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
 
-- **2026-09-30:** The gateway is the one MCP path for TKWW. Otto is one caller of it.
+- **2026-09-30:** The gateway is the one MCP path for Org. Otto is one caller of it.
 - **2026-09-30:** Target systems are GitHub, Atlassian, New Relic, Sumo Logic, Akamai, AWS and
   self-built MCP servers. See [systems.md](systems.md).
 - **2026-09-30:** Both built-in connectors and proxied servers are needed, because self-built
@@ -30,8 +29,31 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
 - **2026-09-30 (Q7):** GitHub is the built-in parity target; a self-built server establishes
   proxy support. Other vendor choices require research; approving this approach does not
   establish their authentication or transport capabilities.
-- **2026-09-30 (Q8):** Conformance lives here, against a pinned `agentrunner` commit. Tests of
+- **2026-09-30 (Q8):** Conformance lives here, against a pinned `otto` commit. Tests of
   existing Otto behavior are separate from tests of new company-wide behavior.
+- **2026-10-01 (Q1, reaffirmed):** Otto still switches to this gateway, after review against
+  Otto `752395a`. The work is larger than first scoped; see
+  [decision 0002](decisions/0002-replace-ottos-mcp-gateway.md).
+- **2026-10-01 (Q14):** Otto keeps its control-plane endpoints and the state behind them, and
+  asks this gateway to perform their vendor actions on a surface only Otto's control-plane
+  workloads may use. This replaces an answer given earlier the same day that moved the
+  endpoints into the gateway. See
+  [decision 0003](decisions/0003-otto-keeps-its-control-plane-endpoints.md).
+- **2026-10-01 (Q15):** Otto is asked to sign turn grants asymmetrically so this gateway holds
+  only a public key, with no shared-secret exception. See
+  [decision 0004](decisions/0004-verify-turn-grants-with-a-public-key.md).
+- **2026-10-01 (Q16):** The conformance baseline was re-pinned to Otto `752395a`, and is
+  re-pinned on a schedule from here, with a freeze of Otto's gateway behavior agreed before
+  cutover. See [design.md](design.md), section 18.
+- **2026-10-01:** Otto is one piece of the gateway. The core is written for every caller;
+  Otto-specific behavior is confined to a profile, a delegation verifier and an extension
+  adapter crate, and Otto's parity gates Otto's cutover only. See [design.md](design.md),
+  sections 1 and 17.
+- **2026-10-01:** Build without a comparison against extending Otto's gateway or adopting an
+  existing one. See [decision 0005](decisions/0005-build-without-a-comparison-first.md).
+- **2026-10-01:** The milestone order follows the design review: kernel and harness, one
+  non-Otto read-only slice, proxy hardening, Otto, employees' agents. See
+  [design.md](design.md), section 17.
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -74,7 +96,7 @@ receipts, and the design currently omits Otto's planned retry and fencing contra
 ## Q11. How quickly do policy changes and revocations take effect?
 
 The proxy reads an in-memory snapshot, but the design gives no maximum age or propagation
-bound. Tool drift withdrawal appears in milestone 5 while scheduled detection appears in 7.
+bound. Drift detection and withdrawal now arrive together, in milestone 3.
 A definition hash detects interface changes, not a changed implementation behind the same schema.
 
 - **Recommendation:** use validated, versioned snapshots with atomic replacement and a
@@ -89,7 +111,7 @@ A definition hash detects interface changes, not a changed implementation behind
 
 ## Q12. Which operational controls belong before broad rollout?
 
-Rate limits and circuit breakers currently wait until milestone 7, after both proxying and
+Limits and isolation of a failing server now arrive in milestone 3, before Otto and
 employee access. Explicit identity/audit opt-outs also lack a production deployment restriction.
 
 - **Recommendation:** add request/result size limits, execution deadlines, bounded concurrency,
@@ -118,3 +140,55 @@ remain unverified. Publishing discovery metadata alone does not establish intero
 - **References:** [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
   and [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports).
 - **Blocks:** employee client acceptance tests and deployment setup.
+
+## Q17. What stops an agent going around the gateway?
+
+Central authorization is real only where there is no other route. An agent that holds a vendor
+credential, or can reach a vendor or another MCP server directly, is audited when it uses the
+gateway and ungoverned when it does not.
+
+- **Recommendation:** for each environment the gateway serves, state the controls and show
+  they hold: no vendor credential in the caller, egress that reaches vendors only through the
+  gateway, downstream MCP servers that accept only the gateway's identity. Keep a list of
+  exceptions. Otto's sandboxes already have default-deny egress; a laptop does not, so for
+  employees the honest claim is "the governed path", not "the only path".
+- **Blocks:** milestone 2 for its one workload; milestone 5 for employees.
+
+## Q18. What must a turn grant bind?
+
+Otto's grant names a team, a human, an execution, tools, an epoch and an expiry. It does not
+name the gateway it is for, and it can be presented again until it expires. Otto signs the
+fencing epoch and does not yet enforce it. Any accepted arguments are allowed for a granted
+tool.
+
+- **Recommendation:** add the issuer, the gateway and deployment it is for, and a unique
+  identifier; keep expiry short. Enforce the epoch. Decide whether a grant may be presented
+  more than once: a turn makes many calls, so the likely answer is yes within one turn, with
+  the identifier recorded so reuse elsewhere is detectable. Test replay, use against another
+  deployment, clock skew, key rotation and emergency revocation.
+- **Blocks:** milestone 4. This is a change in Otto, alongside decision 0004.
+
+## Q19. Which workload and which server are the first slice?
+
+Milestone 2 needs one internal workload that is not Otto and one self-built, read-only MCP
+server.
+
+- **Recommendation:** pick a server whose data has an obvious resource limit to enforce, such
+  as per team or per project, and a workload that runs in a cluster with a ServiceAccount, so
+  identity is real from the start and egress can be restricted.
+- **Blocks:** milestone 2.
+
+## Review findings not yet reflected in the design
+
+From the independent review of 2026-10-01. Accepted in principle, not yet designed:
+
+- Separate three records that the audit section treats as one: telemetry for malformed and
+  unauthenticated traffic, the authorization audit, and idempotency receipts for writes.
+  Decide whether reads need the same synchronous write as mutations (Q10).
+- Crash recovery: a durable way to complete or reconcile a write whose audit row was begun
+  and never finished (Q10).
+- Overload behavior for the audit store: admission control, bounded pools, and what an
+  authentication flood does to the database (Q12).
+- Freshness and revocation bounds for group claims and team manifests (Q11).
+- Identity and audit opt-outs unavailable outside development builds (Q12).
+- A table tracing each invariant to its decision and its test.
