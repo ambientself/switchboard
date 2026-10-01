@@ -20,13 +20,20 @@ any Otto action.
 
 Ask Otto to sign turn grants with an asymmetric key. This gateway holds only the public key.
 
-If that change would delay Otto's cutover, the first cutover may use the shared secret,
-recorded as a known gap with a date by which it closes.
+There is no shared-secret exception. An earlier draft allowed the first cutover to use the
+shared secret if the change would delay it. That contradicted the reason for the decision: a
+compromised company-wide gateway could forge any Otto action. Otto's cutover waits for the
+asymmetric signature.
+
+Still to be specified, as Q18 in [open-questions.md](../open-questions.md): what else a grant
+must bind (the gateway it is for, the deployment, a unique identifier), whether a grant may be
+presented more than once, and enforcement of the fencing epoch, which Otto signs but does not
+yet enforce.
 
 ## Consequences
 
 - The verifier interface in this gateway does not change with the algorithm, so work on
-  milestone 2 can start before Otto's change lands.
+  the Otto adapter can start before Otto's change lands.
 - Changing the grant format is a breaking wire change in Otto. Otto's own procedure for the
   last one was to stop admitting turns, drain, roll the control plane, the gateway and the
   sandbox image together, and resume. Combining this change with the cutover avoids doing

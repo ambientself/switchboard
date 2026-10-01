@@ -21,7 +21,7 @@ gateway. Otto is one caller of that gateway, and this baseline covers only Otto'
 | Missing grant | A call with no grant gets its own sentence, naming a control plane that predates grants as the likely cause. | Keep it distinct from a bad grant: it is an operator's rollout problem, not a probe. |
 | Bad grant | Sixteen kinds of unverifiable grant all get one fixed sentence: wrong key, forged claims under a genuine signature, expired, no tools, no epoch, wrong version, oversized, a missing field. The audit row records the proved pod and team and nothing from the grant. | Do not record unverified claims as identity, and do not tell the caller which check failed. |
 | Grant and pod disagree | A grant minted for a team other than the pod's proved team is refused, naming both teams. | Proved and delegated team must agree. |
-| Per-turn tools | A served tool that the turn's grant does not list is refused, with the tool and classification on the row. `tools/list` still returns every served tool under a narrow grant. | The design shows callers only what they may call. For Otto's profile, decide whether to keep Otto's behavior or narrow the list (Q9). |
+| Per-turn tools | A served tool that the turn's grant does not list is refused, with the tool and classification on the row. `tools/list` still returns every served tool under a narrow grant. | The design narrows the list, deliberately. Whether Otto's callers rely on the full list is checked when Otto's adapter is built. |
 | Identity failure | HTTP 401, one opaque sentence and a Bearer challenge, for eleven kinds of bad token. If the grant still verifies, the row keeps who the turn was for. | Preserve status, envelope and audit, not only the sentence. |
 | Audit scope | `initialize`, `ping` and `tools/list` are audited, as well as `tools/call`. Accepted notifications return 202 with no row. Authenticated malformed JSON returns 400 with no row. | "One row per tool call" understates coverage; "no answer without a row" overstates it. Q10. |
 | Scope refusals | A call naming another organization, a repository outside the team's, or a comment Atlantis could read as a command is refused by the connector. The row is `allowed` with outcome `refused`, and `refusal_reason` holds the sentence the caller read. No token is requested. | A refusal is a denial or a `refused` outcome. Q9 decides where this check lives for proxied tools. |
@@ -47,16 +47,17 @@ These exist in Otto at this commit and are not exercised beyond being listed:
   `github_get_checks`, `github_get_job_log`, `github_propose_change`, `github_amend_change`,
   `github_pr_template`, `github_repo_conventions`, `github_skill_body`,
   `declare_unverified_claim` and the three Jira tools.
-- The control-plane endpoints `/repo-config`, `/pr-receipt` and `/pr-outcome`, which
-  [decision 0003](decisions/0003-serve-ottos-control-plane-endpoints.md) moves to this
-  gateway.
+- The control-plane endpoints `/repo-config`, `/pr-receipt` and `/pr-outcome`. Under
+  [decision 0003](decisions/0003-otto-keeps-its-control-plane-endpoints.md) they stay in
+  Otto, so the suite will cover the vendor actions they call once those are defined, not the
+  endpoints themselves.
 - Grant key rotation, the custodian's peer-identity check (Linux only), and the gateway
   waiting for database grants at boot.
 - Whether the fencing epoch in the grant is enforced. Otto's code says it is signed and not
   yet enforced; the suite only checks that it is recorded.
 
-Extending coverage to these is required before Otto's cutover and is not needed to start the
-company-wide core.
+Extending coverage is required before Otto's cutover, which is milestone 4 of the design. It
+is not needed for the milestones before it.
 
 ## Evidence that the tests can fail
 

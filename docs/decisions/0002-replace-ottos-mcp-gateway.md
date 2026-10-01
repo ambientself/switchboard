@@ -44,9 +44,13 @@ What the review changed is the size and shape of the work, not the decision:
   from this project.
 - **`/repo-config` does not separate as cleanly as assumed,** and it now has siblings,
   `/pr-receipt` and `/pr-outcome`. All three need the GitHub credential, and Otto's own rule
-  is that a second holder of that credential is a second path. They move to this gateway;
-  see [decision 0003](0003-serve-ottos-control-plane-endpoints.md), which supersedes the
-  sentence above that leaves `/repo-config` with Otto.
+  is that a second holder of that credential is a second path. They stay with Otto, as the
+  decision above says, and Otto's control plane asks this gateway to perform their vendor
+  actions; see [decision 0003](0003-otto-keeps-its-control-plane-endpoints.md).
+- **The cutover is staged, not a single switch.** This gateway first runs alongside Otto's
+  and is compared with it, then takes reads, then writes. The Go gateway's MCP path is
+  retired only after that. "After the conformance suite passes" above is necessary and not
+  sufficient: the suite does not yet cover thirteen tools.
 - **Parity is a moving target.** Fifty-five commits touched Otto's gateway between the two
   commits above. The baseline is re-pinned now and then on a schedule, with a freeze before
   cutover; see [design.md](../design.md), section 18.

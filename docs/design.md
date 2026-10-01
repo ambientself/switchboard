@@ -1,15 +1,24 @@
 # MCP gateway design
 
-Date: 2026-09-30, revised 2026-10-01 against Otto `752395a`. Status: draft. Q1–Q8 are
-settled. Proposed refinements and remaining implementation decisions are in
-[open-questions.md](open-questions.md); they are not yet accepted requirements.
+Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
+review. Status: draft. Settled questions and the ones still open are in
+[open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
 ## 1. Purpose
 
 This is the one MCP path for Org. Every agent in the company, whoever runs it, reaches
-tools through this gateway and nowhere else. The gateway proves who is calling, decides
+tools through this gateway. The gateway proves who is calling, decides
 whether the call is allowed, shows each caller only the tools it may use, attaches the
 credential on the server side, and writes an audit row before it answers.
+
+"The one path" is a property of the environments agents run in, not of this service alone. It
+holds only where an agent has no other route to a vendor: no vendor credential in the caller,
+egress that reaches vendors only through the gateway, and downstream MCP servers that accept
+only the gateway's identity. Which environments meet that, and the exceptions, is Q17.
+
+This is built to find out what such a gateway looks like, without a comparison against
+extending Otto's gateway or adopting an existing one first; see
+[decision 0005](decisions/0005-build-without-a-comparison-first.md).
 
 Otto, Org's platform for running agents in Kubernetes sandboxes, is one caller among several.
 It is also the only caller with a working gateway today (`cmd/otto-gateway` in the
@@ -20,18 +29,18 @@ Otto's stricter rules as policy for Otto's callers.
 **Otto is one piece of this gateway, not its shape.** The core (identity, policy, audit,
 credentials, connectors, proxied servers, tool surfaces and the registry) is written for every
 caller and knows nothing about Otto. What is specific to Otto is confined to three places: a
-policy profile, a delegation verifier for its turn grants, and the `otto-extension` crate
-holding its control-plane endpoints and the tools that depend on its state. Otto's contract
-decides when Otto can switch over. It does not decide what the core looks like, and it does
+policy profile, a delegation verifier for its turn grants, and a client for the interface
+through which Otto supplies facts only it knows. Otto's endpoints, tables and release cadence
+stay in Otto. Otto's contract decides when Otto can switch over. It does not decide what the core looks like, and it does
 not hold up the rest of the company's path.
 
-**Migration decision:** this gateway replaces Otto's Go MCP gateway. Otto will be reconfigured
-to call it directly once the conformance suite passes. Until then, the Go gateway remains
-Otto's MCP path. Model brokering is already a separate Otto service. Otto's control-plane
-endpoints on the Go gateway (`/repo-config`, `/pr-receipt`, `/pr-outcome`) move to this
-gateway too, on a surface only Otto's control-plane workloads may use. See decisions
-[0002](decisions/0002-replace-ottos-mcp-gateway.md) and
-[0003](decisions/0003-serve-ottos-control-plane-endpoints.md).
+**Migration decision:** this gateway replaces Otto's Go MCP gateway, in stages: run alongside
+it and compare, then take reads, then writes, then retire the Go gateway's MCP path. Until
+each stage, the Go gateway remains Otto's path. Otto keeps its model broker and its
+control-plane endpoints (`/repo-config`, `/pr-receipt`, `/pr-outcome`); when those endpoints
+need something done in a vendor system, Otto's control plane asks this gateway to do it. See
+decisions [0002](decisions/0002-replace-ottos-mcp-gateway.md) and
+[0003](decisions/0003-otto-keeps-its-control-plane-endpoints.md).
 
 ### Sources
 
@@ -50,9 +59,10 @@ serve different purposes; writing an audit record does not itself prevent duplic
 
 | Caller | How it proves itself | Who it acts for | Status |
 | --- | --- | --- | --- |
-| Otto sandbox | Kubernetes ServiceAccount token, checked against the cluster's OIDC issuer, plus a signed per-turn grant from Otto's control plane. | A team (proved from the token) and a human (attested by the control plane in the grant). | Exists; served by the Go gateway today. |
-| Employee's own agent, such as a coding assistant on a laptop | An access token for this gateway from the company identity provider, Okta. | That employee (proved). | Next after Otto. |
-| Internal service or scheduled automation | A workload token from a configured, trusted issuer. | A team (proved). | After employees' agents. |
+| Internal service or scheduled automation | A workload token from a configured, trusted issuer. | A team (proved). | First: the first slice serves one such workload (Q19). |
+| Otto sandbox | Kubernetes ServiceAccount token, checked against the cluster's OIDC issuer, plus a signed per-turn grant from Otto's control plane. | A team (proved from the token) and a human (attested by the control plane in the grant). | Exists; served by the Go gateway until its staged cutover. |
+| Otto control plane | A workload token for a subject that is not a sandbox. | Otto itself, performing vendor actions for its own endpoints. | With Otto's cutover. |
+| Employee's own agent, such as a coding assistant on a laptop | An access token for this gateway from the company identity provider, Okta. | That employee (proved). | After Otto. |
 
 Agents hosted by outside vendors that would call in from the internet are deferred.
 
@@ -67,10 +77,11 @@ must be identified and tested before employee rollout (Q13).
 
 - Tools only: `initialize`, `ping`, `tools/list`, `tools/call`, over MCP's HTTP transport.
 - Several identity issuers at once, one per caller type.
-- Built-in connectors and proxied MCP servers behind one interface.
+- Built-in connectors and proxied MCP servers, presented the same way to callers and held
+  to different levels of assurance (section 13).
 - A registry of servers, tools, owners, tool surfaces and policy.
 - The systems listed in [systems.md](systems.md).
-- Otto's control-plane endpoints, on a surface restricted to named workload subjects.
+- Surfaces restricted to named workload subjects.
 - Otto's security and behavioral contract, preserved for Otto's callers through conformance.
   Endpoint and tool-name changes are explicit migration mappings in Otto's configuration.
 
@@ -78,8 +89,10 @@ must be identified and tested before employee rollout (Q13).
 
 - MCP resources, prompts and sampling.
 - Servers that speak only stdio; they must be wrapped in an HTTP server first.
-- Otto's model-call broker, which is a separate Otto service.
-- Approval flows and capability grants.
+- Otto's model-call broker and control-plane endpoints, which stay in Otto.
+- Human approval of individual calls, and grants of a capability to perform one specific
+  action. Approval of a tool for a surface, turn grants and per-user grants are different
+  things and are in scope.
 - A registry UI. Configuration files come first, then an API.
 
 ## 4. Terms
@@ -112,17 +125,24 @@ flowchart LR
     T[Tool owners] --> R
 ```
 
-- **Proxy (data plane).** Stateless. It handles every MCP request from an in-memory snapshot
-  of the registry, so the registry is not on the request path. The audit store is on the
-  request path, deliberately (section 11).
+- **Proxy (data plane).** Any instance can serve any request and an instance can be replaced
+  at any time, but it is not stateless: it holds a registry snapshot, upstream session caches
+  and audit completions still in flight. `tools/list` is answered from the snapshot's approved
+  definitions, so neither the registry nor a proxied server is on that path. The audit store
+  is on the request path, deliberately (section 11).
 - **Registry (control plane).** The source of truth for servers, approved tools, owners, tool
   surfaces and policy. It starts as checked-in configuration files and becomes a Postgres
   service with an API when teams need to onboard without a pull request.
 
 The proxy is built on `axum` with the `rmcp` SDK; see
-[decision 0001](decisions/0001-build-on-axum-not-pingora.md).
+[decision 0001](decisions/0001-build-on-axum-not-pingora.md). The SDK sits behind a small
+protocol adapter, and its types do not appear in the policy or connector interfaces, so the
+choice can be revisited once it has been tried against real clients.
 
 ### Proposed workspace layout
+
+This is where the code is expected to end up. It starts as fewer crates, split along these
+lines only once the interfaces between them have settled.
 
 | Crate | Contents |
 | --- | --- |
@@ -130,7 +150,7 @@ The proxy is built on `axum` with the `rmcp` SDK; see
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `gateway-audit` | The audit store over Postgres, and the explicit no-op store. |
 | `connector-github` | GitHub tools, and the client for the key custodian. |
-| `otto-extension` | Otto's control-plane endpoints and the tools that depend on Otto-owned state. The core crates do not depend on it. |
+| `otto-adapter` | Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway` | The proxy binary: HTTP handler, boot gates, wiring. |
 | `registry` | The control-plane binary, once it exists. |
@@ -140,10 +160,12 @@ The proxy is built on `axum` with the `rmcp` SDK; see
 
 Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps in order:
 
-1. **Verify the caller** against the issuer its token names, and resolve the principal.
+1. **Verify the caller** against the issuers configured for this deployment, and resolve the
+   principal. A token naming any other issuer is refused; a token never chooses where keys
+   are fetched from.
 2. **Verify the delegation,** where the profile requires one. For Otto this is the turn grant;
    a grant whose team contradicts the proved team is refused.
-3. **Select the profile** from the principal.
+3. **Select the profile** from the issuer, the deployment and the principal.
 4. **Parse** the JSON-RPC message and look up the tool in the surface.
 5. **Decide**, from the tool's classification, the profile's policy and, for Otto, whether the
    grant lists the tool.
@@ -156,11 +178,15 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
 
 A denial at steps 1 to 5 still passes through step 6 before the caller reads it.
 `tools/list` runs steps 1 to 5 for every tool in the surface and returns those that pass.
+This is deliberately stricter than Otto's Go gateway, which lists every served tool even
+under a grant that permits only some; whether Otto's callers rely on that is checked when
+Otto's adapter is built.
 
 ## 7. Identity
 
-**Several issuers, one verifier interface.** Each configured issuer has a kind (Kubernetes
-cluster, or company identity provider) and maps a verified token to a principal:
+**Several issuers, one verifier interface.** Each deployment has a fixed list of issuers and
+audiences. Each issuer has a kind (Kubernetes cluster, or company identity provider) and maps
+a verified token to a principal, which is identified by issuer and subject together:
 
 | Principal | Proved facts | From |
 | --- | --- | --- |
@@ -188,7 +214,9 @@ audit record keeps it in the claimed columns.
 Otto signs grants with a shared secret today, so any verifier can also mint. Otto is asked to
 sign them asymmetrically so this gateway holds only a public key; see
 [decision 0004](decisions/0004-verify-turn-grants-with-a-public-key.md). A control plane that
-delegates to this gateway signs with a key the gateway cannot use to sign.
+delegates to this gateway signs with a key the gateway cannot use to sign. A grant as Otto
+defines it today can be presented again until it expires and is not tied to one gateway; what
+it must additionally bind is Q18.
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -200,7 +228,8 @@ that needs a proved team cannot be handed a header value by mistake.
 
 ## 8. Policy
 
-Policy has two layers, evaluated by one function.
+Policy has two layers. One function decides from who is calling and which tool; what the call
+names is decided where the arguments are understood, and both land in one audit record.
 
 **Classification, company-wide.** Every tool has exactly one classification. A tool with none
 never runs; there is no default.
@@ -217,9 +246,9 @@ profiles. Production mutation is denied for every profile initially.
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
 **Which surfaces a principal may use** is an allowlist: teams and groups against surfaces.
-Default deny. A surface can also be restricted to named workload subjects, which is how
-Otto's control-plane endpoints are kept away from sandboxes; each such endpoint has its own
-set of subjects.
+Default deny. A surface can also be restricted to named workload subjects, each surface with
+its own set. That is how the vendor actions Otto's control plane performs are kept away from
+sandboxes.
 
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
 refused unless the turn's grant lists it.
@@ -252,7 +281,11 @@ or more credential modes:
 
 **Long-lived keys sit in a custodian, not in the gateway process.** Otto moved its GitHub App
 key into a separate process that only exchanges it for short-lived tokens, so a compromised
-gateway cannot take the key itself. This design adopts that split for every vendor key.
+gateway cannot take the key itself. The gateway still holds the short-lived tokens, and a
+compromised gateway can still ask for more. So the custodian checks each request against
+what that team and tool may ask for, limits the rate and lifetime, and keeps its own record.
+Where a vendor supports workload federation or its own short-lived credentials, that is
+preferred to holding a key at all.
 
 **Tokens are narrowed per call where the vendor allows it.** Otto requests GitHub tokens
 limited to the proved team's repositories, and its accepted direction is one repository per
@@ -276,7 +309,10 @@ Every refusal is a sentence a model can act on, never a bare status code or a st
 
 ## 11. The audit record
 
-One row per call, denials included.
+One row per request that reaches a decision, denials included. Three cases produce no row and
+are stated here so the rule is not read as wider than it is: an accepted notification, a
+request body that cannot be parsed, and the fixed answer given when the row itself cannot be
+written.
 
 - **Begin before the work.** The row is written before the tool runs and before a denial is
   returned. For a denial, that row is the complete record.
@@ -296,7 +332,10 @@ One row per call, denials included.
   audit trail.
 
 This puts Postgres on the path of every call for the whole company. Its availability becomes
-the gateway's availability, and that is an accepted cost of the rule.
+the gateway's availability, and that is an accepted cost of the rule. The first slice
+measures what it costs in latency, and what a slow or unavailable database does to callers,
+before more callers are added. An audit row is not an idempotency record: it does not stop a
+write being made twice (Q10).
 
 For Otto's callers the row must match the existing `gateway_audit` table.
 
@@ -321,8 +360,14 @@ audit table lacks a column it writes, and if its database role can do more than 
 ## 13. Connectors and proxied servers
 
 A connector lists its tools with their classifications and runs a call given a verified
-context. There are two implementations, and [systems.md](systems.md) says which each target
-system is likely to use.
+context. There are two kinds, and [systems.md](systems.md) says which each target system is
+likely to use. Callers see them the same way. Policy does not: a built-in connector
+understands its arguments and can limit a call to the resources a caller may touch, and a
+proxied server usually cannot be checked that way. Every tool therefore declares where its
+resource check, argument validation, credential narrowing and output limits happen, and a
+proxied tool is exposed only if one of these holds: the gateway has an adapter for that
+tool's arguments, or its credential and route limit the server to exactly the permitted
+resources.
 
 **Built-in connectors** are gateway code calling a vendor API. The GitHub connector is the
 model: it brokers a GitHub App token, limits every call to one organization before any request
@@ -334,13 +379,20 @@ leaves, bounds result sizes, and tags every result as external evidence.
 2. The registry reads the server's tool list.
 3. A person assigns each tool a classification and approves it. A server is never trusted to
    classify its own tools.
-4. Each approval records a hash of the tool's name, description and input schema.
+4. Each approval records a hash of the tool's name, description and input schema, together
+   with the server's identity, its address and its credential configuration.
 5. Approved tools are added to tool surfaces.
 
 **Drift.** The registry re-reads each server's tool list on a schedule. A tool whose
 definition no longer matches its hash is withdrawn from every surface until it is approved
 again. A description is text an agent reads as guidance, so a changed description is a changed
-interface and a possible attack.
+interface and a possible attack. The hash detects a changed interface. It does not detect a
+changed implementation behind the same interface; that remains a risk, covered by the owner's
+accountability, monitoring and emergency withdrawal.
+
+**Where the gateway will connect** is limited to approved destinations, with the server's
+identity verified, redirects refused and internal addresses unreachable through a registered
+URL.
 
 **Descriptions shown to agents** are the approved ones, never the live ones.
 
@@ -356,8 +408,8 @@ recoverable from the name; names stay within 64 characters of letters, digits, `
 Small surfaces matter for two reasons: an agent cannot call what it cannot see, and agents
 choose better from a short list.
 
-If a proxied server is down, `tools/list` returns the rest of the surface and records the
-failure.
+`tools/list` is answered from approved definitions and does not contact a proxied server, so a
+server that is down still appears in the list and fails when called.
 
 ## 15. Sessions
 
@@ -371,44 +423,46 @@ authorize replaying a write whose outcome is unknown; recovery behavior is part 
 
 A change that weakens one of these is wrong even if every test passes.
 
-1. **This gateway is the only place that decides authorization for tool calls,** and the
-   decision is one function.
+1. **This gateway is the only place that decides authorization for tool calls it serves.**
+   Calls from an environment are governed only where that environment has no route around
+   the gateway (Q17).
 2. **No caller holds a downstream credential,** except a minted short-lived one issued
    deliberately.
 3. **A caller's own token is never sent downstream.**
 4. **A tool with no classification or no approval never runs.**
-5. **No answer without an audit row.**
+5. **No tool runs, and no decision is returned, without an audit row.** The three stated
+   exceptions are in section 11.
 6. **Proved and claimed are never the same value, type or column.**
 7. **Identity failures are indistinguishable to the caller,** in content and in cost.
 8. **An unconfigured security gate refuses to start.**
 9. **An approval binds to an exact tool definition.**
-10. **Content from external systems is data,** tagged as such, never instructions.
+10. **Content from external systems is data.** It is kept structurally separate and tagged.
+    A tag does not make hostile content safe to read; it tells the caller what it is.
 11. **The whole request path runs with no real credential,** against fakes.
 
 ## 17. Delivery milestones
 
-There are two tracks. The **core track** is milestones 1, 2, 3, 5, 6 and 7: the gateway every
-caller uses. The **Otto track** is milestone 4 and the conformance suite: what Otto needs
-before it can switch over. The tracks share milestones 1 to 3, where Otto's working gateway
-is a useful reference for behavior the core needs anyway. After that they run independently:
-proxied servers and employees' agents do not wait for Otto's tools, and Otto's cutover does
-not wait for them.
+The order follows the design review: prove the company-wide idea on something small that is
+not Otto, then harden the proxy, then bring Otto over. Each milestone is usable on its own.
 
-The third column says what covers for a behavior before its milestone.
-
-| Milestone | Turns on | Stands in until then |
+| Milestone | Turns on | Decides first |
 | --- | --- | --- |
-| 1. Skeleton | The endpoint; `initialize`, `tools/list`, `tools/call`; tool registry and decision function; a canned fixture tool; named denials; boot gates. The conformance suite, passing against the Go gateway first. | — |
-| 2. Identity | The verifier interface with the Kubernetes issuer; team manifest; delegation verification, with Otto's turn grant and its per-turn tool check as the first; opaque refusals. A local test issuer for user tokens. | Identity explicitly disabled by flag. |
-| 3. Audit | Begin and finish; the three outcomes; the finish budget; fail closed; boot checks. | Audit explicitly disabled by flag. |
-| 4. Otto's tools (Otto track) | The key custodian; GitHub reads, then GitHub writes with the proposal store, then Jira; team and organization limits; evidence tagging; Otto's control-plane endpoints on a workload-restricted surface. Otto switches over when the conformance suite passes at the frozen Otto commit. | The canned fixture. |
-| 5. Proxied servers | The proxy connector against one self-built server; file-based registry; approval, hash pinning and withdrawal; tool surfaces. | Built-in connectors on one surface. |
-| 6. Employees' agents | Okta as an issuer; user principals and group policy; client discovery metadata; private network reachability from laptops; per-user grants for any launch integration that requires them. | The local test issuer. |
-| 7. Operations | Per-team rate limits and circuit breakers; registry as a service with an API; drift polling on a schedule. | No limits; registry in files. |
-| Later | Internal services and scheduled automations; the remaining systems and their required per-user grants; brokered AWS inventory tools; approval flows; a registry UI. | Not built. |
+| 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
+| 2. First slice | One internal workload that is not Otto, calling one self-built read-only MCP server through the gateway: real workload identity, one resource limit, approval from files, durable audit, bounded output, and withdrawal shown to work. | Which workload and server (Q19). Audit semantics for reads (Q10). What stops that workload going around the gateway (Q17). |
+| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection. | Freshness and revocation bounds (Q11). |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. |
+| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. | Clients and access (Q13). Employee write boundaries (Q9). |
+| 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
+| Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
 
-Milestone 6 depends on access to Okta, which Org's IT owns. That request has the longest lead
-time in the plan and should be sent before milestone 1 starts.
+Milestone 2 is the test of whether this is worth continuing. If it shows the core is not, the
+plan stops there ([decision 0005](decisions/0005-build-without-a-comparison-first.md)).
+
+Milestone 5 depends on access to Okta, which Org's IT owns. That request has the longest lead
+time in the plan and should be sent when milestone 1 starts.
+
+Milestone 4 depends on Otto: asymmetric grant signing, the resolver interface, and keeping its
+control-plane endpoints running outside its Go gateway.
 
 ## 18. Testing
 
@@ -421,8 +475,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   fakes. It is not derived from Otto's gateway and is not gated on the conformance suite.
 - **The conformance suite is the Otto contract in executable form,** and the acceptance test
   for Otto's cutover only. It sends HTTP requests and compares responses and audit rows. It
-  must pass against the Go gateway before any Rust exists, which proves it describes real
-  behavior. Endpoint and tool-name mappings for the
+  passes against the Go gateway, which proves it describes real behavior. It is not run
+  against the Rust gateway until milestone 4. Endpoint and tool-name mappings for the
   Rust gateway are explicit in the suite and in Otto's migration configuration; those mappings
   do not relax the security or behavioral assertions.
 - The suite lives in this repository and runs against a pinned `otto` commit.
@@ -433,20 +487,20 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   The failures at each re-pin are the list of what changed in Otto. Before cutover, Otto's
   gateway behavior is frozen for an agreed period; the commit at the start of that freeze is
   the one parity is declared against.
-- Otto's control-plane endpoints are part of the cutover, so the suite must cover them. It
-  does not yet, nor the behavior of thirteen newer tools; see
-  [otto-baseline.md](otto-baseline.md).
+- The suite does not yet cover the behavior of thirteen newer tools; see
+  [otto-baseline.md](otto-baseline.md). Otto's control-plane endpoints stay in Otto, so the
+  suite covers the vendor actions they will call once those are defined, not the endpoints.
+- How quickly a change can be checked is planned in [feedback-loops.md](feedback-loops.md).
 - `conformance/mutation_check.py` breaks guards in the pinned gateway and requires the named
   test to fail. It is run after every re-pin.
 - Each invariant in section 16 gets a test that is shown to fail when its guard is removed.
   Where the guard is a type, the test is a compile-fail test.
-- Audit tests use a real Postgres. Everything in `gateway-core` is tested with no database.
+- Audit store tests use a real Postgres. Everything else, including end-to-end tests of the
+  gateway, runs on the in-memory fakes with no database.
 
-## 19. Proposed refinements
+## 19. Still open
 
-The accepted architecture stays in place. Before implementation, resolve Q9–Q13 in
-[open-questions.md](open-questions.md): resource-level authorization, audit completion and
-safe retries, bounded policy staleness, earlier operational protections, and concrete client
-compatibility. The current request path and milestone table do not yet include those proposed
-changes. Vendor feasibility and AWS issuance-to-action auditing remain research work in
-[systems.md](systems.md).
+Q9 to Q13 and Q17 to Q19 in [open-questions.md](open-questions.md). The milestone table says
+which each milestone must settle before it starts. Vendor feasibility remains research in
+[systems.md](systems.md). The independent review's findings that are not yet reflected here
+are listed at the end of that file.
