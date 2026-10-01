@@ -1,12 +1,12 @@
 # Open questions
 
-Q1–Q8 are settled below. Q9–Q13 are proposed refinements from the design review, not yet
-accepted decisions. When resolved, move their requirements into [design.md](design.md) and
-remove the open question. Vendor research remains in [systems.md](systems.md).
+Q1–Q8 and Q14–Q16 are settled below. Q9–Q13 are proposed refinements from the design review,
+not yet accepted decisions. When resolved, move their requirements into
+[design.md](design.md) and remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
 
-- **2026-09-30:** The gateway is the one MCP path for TKWW. Otto is one caller of it.
+- **2026-09-30:** The gateway is the one MCP path for Org. Otto is one caller of it.
 - **2026-09-30:** Target systems are GitHub, Atlassian, New Relic, Sumo Logic, Akamai, AWS and
   self-built MCP servers. See [systems.md](systems.md).
 - **2026-09-30:** Both built-in connectors and proxied servers are needed, because self-built
@@ -30,8 +30,23 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
 - **2026-09-30 (Q7):** GitHub is the built-in parity target; a self-built server establishes
   proxy support. Other vendor choices require research; approving this approach does not
   establish their authentication or transport capabilities.
-- **2026-09-30 (Q8):** Conformance lives here, against a pinned `agentrunner` commit. Tests of
+- **2026-09-30 (Q8):** Conformance lives here, against a pinned `otto` commit. Tests of
   existing Otto behavior are separate from tests of new company-wide behavior.
+- **2026-10-01 (Q1, reaffirmed):** Otto still switches to this gateway, after review against
+  Otto `752395a`. The work is larger than first scoped; see
+  [decision 0002](decisions/0002-replace-ottos-mcp-gateway.md).
+- **2026-10-01 (Q14):** This gateway serves Otto's control-plane endpoints on a surface only
+  Otto's control-plane workloads may use, and is the only holder of the vendor credentials.
+  See [decision 0003](decisions/0003-serve-ottos-control-plane-endpoints.md).
+- **2026-10-01 (Q15):** Otto is asked to sign turn grants asymmetrically so this gateway holds
+  only a public key. See [decision 0004](decisions/0004-verify-turn-grants-with-a-public-key.md).
+- **2026-10-01 (Q16):** The conformance baseline was re-pinned to Otto `752395a`, and is
+  re-pinned on a schedule from here, with a freeze of Otto's gateway behavior agreed before
+  cutover. See [design.md](design.md), section 18.
+- **2026-10-01:** Otto is one piece of the gateway. The core is written for every caller;
+  Otto-specific behavior is confined to a profile, a delegation verifier and an extension
+  crate, and Otto's parity gates Otto's cutover only. See [design.md](design.md), sections 1
+  and 17.
 
 ## Q9. What does authorization check beyond tool classification?
 
