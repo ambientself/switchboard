@@ -351,6 +351,10 @@ time in the plan and should be sent before milestone 1 starts.
 
 ## 18. Testing
 
+The initial Go baseline is executable in [conformance/](../conformance/README.md).
+Its [observed behavior](otto-baseline.md) records discrepancies with this draft and future
+Otto promises. These findings inform Q9–Q13; they are not silent changes to the desired design.
+
 - **The conformance suite is the Otto contract in executable form.** It sends HTTP requests
   and compares responses and audit rows. It must pass against the Go gateway before any Rust
   exists, which proves it describes real behavior. Endpoint and tool-name mappings for the

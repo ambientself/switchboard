@@ -13,7 +13,11 @@ caller, proxied MCP servers and a registry. The model for those additions is Doo
 Gateway
 ([write-up, 2026-07-30](https://careersatdoordash.com/blog/how-doordash-built-a-centralized-gateway-for-ai-agent-tool-access/)).
 
-**Status: planning.** There is no code yet.
+**Status: conformance baseline.** The pinned Otto Go gateway passes the black-box suite.
+The Rust gateway is not implemented yet.
+
+Run the baseline with `python3 conformance/run.py --otto-source /path/to/agentrunner`.
+See [conformance setup and coverage](conformance/README.md).
 
 ## Documents
 
@@ -21,6 +25,7 @@ Gateway
 | --- | --- |
 | [docs/design.md](docs/design.md) | The design: scope, architecture, data model, invariants and delivery milestones. Authoritative once the open questions are settled. |
 | [docs/systems.md](docs/systems.md) | The systems the gateway must reach, how each is likely to be connected, and what is still unverified. |
+| [docs/otto-baseline.md](docs/otto-baseline.md) | Behavior verified against the pinned Go gateway, including gaps and differences from the draft. |
 | [docs/open-questions.md](docs/open-questions.md) | Settled questions and proposed refinements, each open item with a recommendation and what it blocks. |
 | [docs/decisions/](docs/decisions/) | Decision records, one per file, for choices that are settled. |
 
