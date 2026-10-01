@@ -1,11 +1,11 @@
 # MCP gateway
 
-The one MCP path for TKWW, planned in Rust. Every agent in the company reaches tools through
+The one MCP path for Org, planned in Rust. Every agent in the company reaches tools through
 this gateway: it proves who is calling, decides whether the call is allowed, shows each caller
 only the tools it may use, attaches the credential on the server side and writes an audit row
 before answering.
 
-Otto, TKWW's platform for running agents in Kubernetes sandboxes, is one caller. It has a
+Otto, Org's platform for running agents in Kubernetes sandboxes, is one caller. It has a
 working gateway of its own, written in Go at `cmd/otto-gateway` in the `agentrunner`
 repository, and a written contract for gateway behavior. This design applies that contract's
 mechanisms company-wide and adds what a company-wide gateway needs beyond it: several kinds of
