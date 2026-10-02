@@ -68,9 +68,11 @@ The current decision function considers classification and profile, with surface
 It does not fully specify restrictions on the resources named by tool arguments. One read
 operation might address any repository, Jira project or AWS account available to its credential.
 
-- **Recommendation:** pass a validated call context to the single decision function: principal,
-  surface, approved tool, normalized arguments, target resources/environment, credential scope
-  and policy revision. Make resource restrictions enforceable for built-in and proxied tools.
+- **Settled for the core:** what the decision function sees and returns is
+  [decision 0006](decisions/0006-what-the-decision-function-sees.md). It sees the resources a
+  call names, not its arguments.
+- **Recommendation for the rest:** make resource restrictions enforceable for built-in and
+  proxied tools.
   If a generic proxy cannot establish the permitted scope, require a constrained server or
   connector before exposing that tool. Keep initial employee writes proposal-shaped; grant
   broader writes only by a later explicit policy decision.
@@ -164,7 +166,8 @@ gateway and ungoverned when it does not.
 ## Q18. What must a turn grant bind?
 
 Otto's grant names a team, a human, an execution, tools, an epoch and an expiry. It does not
-name the gateway it is for, and it can be presented again until it expires. Otto signs the
+name the gateway it is for, and it can be presented again until it expires. It is tied to the
+caller only by team: a grant for a team can be presented by any proved workload of that team. Otto signs the
 fencing epoch and does not yet enforce it. Any accepted arguments are allowed for a granted
 tool.
 
