@@ -59,7 +59,7 @@ serve different purposes; writing an audit record does not itself prevent duplic
 
 | Caller | How it proves itself | Who it acts for | Status |
 | --- | --- | --- | --- |
-| Internal service or scheduled automation | A workload token from a configured, trusted issuer. | A team (proved). | First: the first slice serves one such workload (Q19). |
+| Internal service or scheduled automation | A workload token from a configured, trusted issuer. | A team (proved). | First: the first slice serves a mock one, then a real one. |
 | Otto sandbox | Kubernetes ServiceAccount token, checked against the cluster's OIDC issuer, plus a signed per-turn grant from Otto's control plane. | A team (proved from the token) and a human (attested by the control plane in the grant). | Exists; served by the Go gateway until its staged cutover. |
 | Otto control plane | A workload token for a subject that is not a sandbox. | Otto itself, performing vendor actions for its own endpoints. | With Otto's cutover. |
 | Employee's own agent, such as a coding assistant on a laptop | An access token for this gateway from the company identity provider, Okta. | That employee (proved). | After Otto. |
@@ -450,14 +450,15 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | Milestone | Turns on | Decides first |
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
-| 2. First slice | One internal workload that is not Otto, calling one self-built read-only MCP server through the gateway: real workload identity, one resource limit, approval from files, durable audit, bounded output, and withdrawal shown to work. | Which workload and server (Q19). Audit semantics for reads (Q10). What stops that workload going around the gateway (Q17). |
+| 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail ([decision 0008](decisions/0008-mock-the-first-slice.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one. | Audit semantics for reads (Q10). |
 | 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection. | Freshness and revocation bounds (Q11). |
 | 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. | Clients and access (Q13). Employee write boundaries (Q9). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
 
-Milestone 2 is the test of whether this is worth continuing. If it shows the core is not, the
+Milestone 2 is the test of whether this is worth continuing. The mock slice shows whether it
+works; a real workload shows whether it is worth adopting. If either shows the core is not, the
 plan stops there ([decision 0005](decisions/0005-build-without-a-comparison-first.md)).
 
 Milestone 5 depends on access to Okta, which Org's IT owns. That request has the longest lead
@@ -502,7 +503,7 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
 
 ## 19. Still open
 
-Q9 to Q13 and Q17 to Q19 in [open-questions.md](open-questions.md). The milestone table says
+Q9 to Q13, Q17 and Q18 in [open-questions.md](open-questions.md). The milestone table says
 which each milestone must settle before it starts. Vendor feasibility remains research in
 [systems.md](systems.md). The independent review's findings that are not yet reflected here
 are listed at the end of that file.
