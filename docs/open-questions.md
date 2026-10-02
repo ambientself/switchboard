@@ -1,6 +1,6 @@
 # Open questions
 
-Q1–Q8 and Q14–Q16 are settled below. Q9–Q13 and Q17–Q19 are open. When resolved, move their requirements into
+Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. When resolved, move their requirements into
 [design.md](design.md) and remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
@@ -54,6 +54,13 @@ Q1–Q8 and Q14–Q16 are settled below. Q9–Q13 and Q17–Q19 are open. When r
 - **2026-10-01:** The milestone order follows the design review: kernel and harness, one
   non-Otto read-only slice, proxy hardening, Otto, employees' agents. See
   [design.md](design.md), section 17.
+- **2026-10-01 (part of Q9):** What the decision function sees and returns. See
+  [decision 0006](decisions/0006-what-the-decision-function-sees.md).
+- **2026-10-01 (part of Q13):** Serve MCP `2026-07-28` and `2025-06-18` on one hand-written
+  endpoint; Claude Code is the first client. See
+  [decision 0007](decisions/0007-serve-two-mcp-revisions-from-a-hand-written-endpoint.md).
+- **2026-10-01 (Q19):** The first slice uses a mock workload and mock server, in kind and
+  Docker Compose. See [decision 0008](decisions/0008-mock-the-first-slice.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -167,16 +174,6 @@ tool.
   the identifier recorded so reuse elsewhere is detectable. Test replay, use against another
   deployment, clock skew, key rotation and emergency revocation.
 - **Blocks:** milestone 4. This is a change in Otto, alongside decision 0004.
-
-## Q19. Which workload and which server are the first slice?
-
-Milestone 2 needs one internal workload that is not Otto and one self-built, read-only MCP
-server.
-
-- **Recommendation:** pick a server whose data has an obvious resource limit to enforce, such
-  as per team or per project, and a workload that runs in a cluster with a ServiceAccount, so
-  identity is real from the start and egress can be restricted.
-- **Blocks:** milestone 2.
 
 ## Review findings not yet reflected in the design
 

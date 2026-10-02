@@ -32,6 +32,10 @@ built for:
 
 ## Consequences
 
+[Decision 0007](0007-serve-two-mcp-revisions-from-a-hand-written-endpoint.md) later narrowed
+the second half of this decision: the MCP endpoint is written by hand on `axum`, and `rmcp`
+is used only in tests.
+
 - TLS termination, load balancing and connection draining are left to whatever already fronts
   the service (a cloud load balancer, Envoy, or Pingora itself as an edge).
 - The proxy must handle graceful shutdown of long-lived response streams itself.
