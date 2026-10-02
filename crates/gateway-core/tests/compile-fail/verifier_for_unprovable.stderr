@@ -1,0 +1,18 @@
+error[E0277]: the trait bound `TeamId: Provable` is not satisfied
+  --> tests/compile-fail/verifier_for_unprovable.rs:12:17
+   |
+12 |     type Fact = TeamId;
+   |                 ^^^^^^ the trait `Provable` is not implemented for `TeamId`
+   |
+help: the following other types implement trait `Provable`
+  --> src/proof.rs
+   |
+   | impl Provable for Principal {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Principal`
+   | impl Provable for Delegation {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Delegation`
+note: required by a bound in `gateway_core::Verifier::Fact`
+  --> src/proof.rs
+   |
+   |     type Fact: Provable;
+   |                ^^^^^^^^ required by this bound in `Verifier::Fact`

@@ -1,0 +1,49 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/compile-fail/proved_outside_verifier.rs:7:13
+  |
+7 |     let _ = Proved(principal.clone());
+  |             ^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/proof.rs
+  |
+  | pub struct Proved<T>(T);
+  |                      ^ private field
+
+error[E0599]: no associated function or constant named `new` found for struct `Proved<T>` in the current scope
+ --> tests/compile-fail/proved_outside_verifier.rs:8:21
+  |
+8 |     let _ = Proved::new(principal.clone());
+  |                     ^^^ associated function or constant not found in `Proved<_>`
+  |
+note: if you're trying to build a new `Proved<_>`, consider using `Proved::<T>::verify` which returns `Result<Proved<_>, <_ as Verifier>::Error>`
+ --> src/proof.rs
+  |
+  | /     pub fn verify<V>(verifier: &V, evidence: &V::Evidence) -> Result<Self, V::Error>
+  | |     where
+  | |         V: Verifier<Fact = T> + ?Sized,
+  | |_______________________________________^
+help: there is a method `ne` with a similar name
+  |
+8 -     let _ = Proved::new(principal.clone());
+8 +     let _ = Proved::ne(principal.clone());
+  |
+
+error[E0308]: mismatched types
+ --> tests/compile-fail/proved_outside_verifier.rs:9:45
+  |
+9 |     let _: Proved<Principal> = Proved::from(principal);
+  |                                ------------ ^^^^^^^^^ expected `Proved<Principal>`, found `Principal`
+  |                                |
+  |                                arguments to this function are incorrect
+  |
+  = note: expected struct `Proved<Principal>`
+             found struct `Principal`
+note: associated function defined here
+ --> $RUST/core/src/convert/mod.rs
+
+error[E0277]: the trait bound `Proved<Principal>: Default` is not satisfied
+  --> tests/compile-fail/proved_outside_verifier.rs:10:32
+   |
+10 |     let _: Proved<Principal> = Default::default();
+   |                                ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `Proved<Principal>`

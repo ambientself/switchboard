@@ -1,0 +1,547 @@
+{
+  "about": "The decision table. Each case names a snapshot, a principal and a delegation defined below, the profile, surface, tool and resources of one call, and the decision expected, with the exact sentence for a denial. tests/decision_table.rs runs every case and reports every one that fails. To add a policy rule, add cases here first and watch them fail.",
+  "deployment": "test",
+  "principals": {
+    "payments-sandbox": {
+      "id": { "issuer": "https://cluster-a.example.test", "subject": "system:serviceaccount:otto:sandbox-payments" },
+      "kind": "workload",
+      "team": "payments"
+    },
+    "search-sandbox": {
+      "id": { "issuer": "https://cluster-a.example.test", "subject": "system:serviceaccount:otto:sandbox-search" },
+      "kind": "workload",
+      "team": "search"
+    },
+    "platform-sandbox": {
+      "id": { "issuer": "https://cluster-a.example.test", "subject": "system:serviceaccount:otto:sandbox-platform" },
+      "kind": "workload",
+      "team": "platform"
+    },
+    "control-plane": {
+      "id": { "issuer": "https://cluster-a.example.test", "subject": "system:serviceaccount:otto:control-plane" },
+      "kind": "workload",
+      "team": "platform"
+    },
+    "control-plane-other-cluster": {
+      "id": { "issuer": "https://cluster-b.example.test", "subject": "system:serviceaccount:otto:control-plane" },
+      "kind": "workload",
+      "team": "platform"
+    },
+    "inventory-service": {
+      "id": { "issuer": "https://cluster-a.example.test", "subject": "system:serviceaccount:inventory:api" },
+      "kind": "workload",
+      "team": "inventory"
+    },
+    "eng-user": {
+      "id": { "issuer": "https://idp.example.test", "subject": "eng-user@example.test" },
+      "kind": "user",
+      "groups": ["engineering"]
+    },
+    "finance-user": {
+      "id": { "issuer": "https://idp.example.test", "subject": "finance-user@example.test" },
+      "kind": "user",
+      "groups": ["finance"]
+    },
+    "eng-finance-user": {
+      "id": { "issuer": "https://idp.example.test", "subject": "eng-finance-user@example.test" },
+      "kind": "user",
+      "groups": ["engineering", "finance"]
+    },
+    "no-groups-user": {
+      "id": { "issuer": "https://idp.example.test", "subject": "no-groups-user@example.test" },
+      "kind": "user",
+      "groups": []
+    }
+  },
+  "delegations": {
+    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": null },
+    "payments-turn-narrow": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file"] },
+    "payments-turn-empty": { "acting_person": "requester@example.test", "team": "payments", "tools": [] },
+    "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": null },
+    "search-turn-narrow": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file"] },
+    "inventory-turn": { "acting_person": "requester@example.test", "team": "inventory", "tools": null },
+    "inventory-turn-narrow": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["jira__get_issue"] }
+  },
+  "snapshots": {
+    "base": {
+      "revision": "base-1",
+      "tools": [
+        { "name": "github__get_file", "classification": "read", "connector": "github", "declares_resources": true, "checks_own_scope": false },
+        { "name": "github__search_code", "classification": "read", "connector": "github", "declares_resources": false, "checks_own_scope": true },
+        { "name": "github__list_org_repos", "classification": "read", "connector": "github", "declares_resources": false, "checks_own_scope": false },
+        { "name": "github__open_pull_request", "classification": "write", "connector": "github", "declares_resources": true, "checks_own_scope": false },
+        { "name": "github__delete_branch", "classification": "destructive", "connector": "github", "declares_resources": true, "checks_own_scope": false },
+        { "name": "github__delete_repository", "classification": "destructive", "connector": "github", "declares_resources": true, "checks_own_scope": false },
+        { "name": "jira__get_issue", "classification": "read", "connector": "jira", "declares_resources": true, "checks_own_scope": false },
+        { "name": "jira__create_issue", "classification": "write", "connector": "jira", "declares_resources": true, "checks_own_scope": false },
+        { "name": "docs__search", "classification": "read", "connector": "docs", "declares_resources": false, "checks_own_scope": false },
+        { "name": "otto__post_status", "classification": "write", "connector": "otto", "declares_resources": false, "checks_own_scope": false }
+      ],
+      "surfaces": [
+        {
+          "name": "otto-sandbox",
+          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue"],
+          "teams": ["payments", "search"]
+        },
+        {
+          "name": "otto-control",
+          "tools": ["otto__post_status", "github__delete_repository"],
+          "teams": ["platform"],
+          "subjects": [{ "issuer": "https://cluster-a.example.test", "subject": "system:serviceaccount:otto:control-plane" }]
+        },
+        {
+          "name": "employee",
+          "tools": ["docs__search", "github__get_file", "github__delete_branch", "jira__get_issue", "jira__create_issue"],
+          "groups": ["engineering", "finance-readers"]
+        },
+        {
+          "name": "service",
+          "tools": ["docs__search", "jira__get_issue", "jira__create_issue"],
+          "teams": ["inventory"]
+        }
+      ],
+      "profiles": [
+        { "name": "otto", "classifications": ["read", "write"], "requires_delegation": true },
+        { "name": "employee", "classifications": ["read"], "requires_delegation": false },
+        { "name": "service", "classifications": ["read", "write"], "requires_delegation": false },
+        { "name": "lists-destructive", "classifications": ["read", "write", "destructive"], "requires_delegation": false }
+      ],
+      "limits": {
+        "teams": {
+          "payments": [
+            { "system": "github", "kind": "repository", "identifier": "example-org/payments-api" },
+            { "system": "jira", "kind": "project", "identifier": "PAY" }
+          ],
+          "search": [
+            { "system": "github", "kind": "repository", "identifier": "example-org/search-indexer" }
+          ],
+          "inventory": [
+            { "system": "jira", "kind": "project", "identifier": "INV" }
+          ]
+        },
+        "groups": {
+          "engineering": [
+            { "system": "github", "kind": "repository", "identifier": "example-org/handbook" },
+            { "system": "jira", "kind": "project", "identifier": "ENG" }
+          ],
+          "finance": [
+            { "system": "jira", "kind": "project", "identifier": "FIN" }
+          ]
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "name": "otto read inside the team's limit is allowed",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "otto write inside the team's limit is allowed",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "another team's sandbox reaches its own repository",
+      "snapshot": "base", "principal": "search-sandbox", "delegation": "search-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/search-indexer" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "unknown resources are allowed for a tool that checks its own scope",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__search_code",
+      "resources": "unknown",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a delegation that lists the tool allows it",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "an employee reads within a group's limit",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a call that names no resources passes the resource check",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a user in two groups reaches the union of their limits",
+      "snapshot": "base", "principal": "eng-finance-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "jira__get_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "FIN" }, { "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a service writes within its team's limit",
+      "snapshot": "base", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "service", "tool": "jira__create_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "the named control plane reaches its restricted surface",
+      "snapshot": "base", "principal": "control-plane", "delegation": null,
+      "profile": "service", "surface": "otto-control", "tool": "otto__post_status",
+      "resources": { "named": [] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a delegation that agrees is accepted where the profile does not require one",
+      "snapshot": "base", "principal": "inventory-service", "delegation": "inventory-turn",
+      "profile": "service", "surface": "service", "tool": "jira__get_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "allow" }
+    },
+
+    {
+      "name": "a surface that does not exist is not available",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "no-such-surface", "tool": "github__get_file",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `no-such-surface` is not available to workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "a team not on the surface's allowlist is denied",
+      "snapshot": "base", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `otto-sandbox` is not available to workload `system:serviceaccount:inventory:api` of team `inventory` from issuer `https://cluster-a.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "a user whose groups are not on the surface's allowlist is denied",
+      "snapshot": "base", "principal": "finance-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `employee` is not available to user `finance-user@example.test` from issuer `https://idp.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "a user with no groups is denied",
+      "snapshot": "base", "principal": "no-groups-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `employee` is not available to user `no-groups-user@example.test` from issuer `https://idp.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "a workload is not let onto a surface that lists only groups",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `employee` is not available to workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "a surface restricted to named principals refuses another workload of the permitted team",
+      "snapshot": "base", "principal": "platform-sandbox", "delegation": null,
+      "profile": "service", "surface": "otto-control", "tool": "otto__post_status",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `otto-control` is not available to workload `system:serviceaccount:otto:sandbox-platform` of team `platform` from issuer `https://cluster-a.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "the same subject from a different issuer is a different principal",
+      "snapshot": "base", "principal": "control-plane-other-cluster", "delegation": null,
+      "profile": "service", "surface": "otto-control", "tool": "otto__post_status",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `otto-control` is not available to workload `system:serviceaccount:otto:control-plane` of team `platform` from issuer `https://cluster-b.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+
+    {
+      "name": "a tool approved nowhere is unknown",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__force_push",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "unknown_tool",
+        "sentence": "Tool `github__force_push` is not an approved tool. Call `tools/list` on surface `otto-sandbox` to see the tools you may call." }
+    },
+    {
+      "name": "a tool approved on another surface is not on this one",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "otto__post_status",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "tool_not_on_surface",
+        "sentence": "Tool `otto__post_status` is not served on surface `otto-sandbox`. Call `tools/list` on surface `otto-sandbox` to see the tools it serves." }
+    },
+    {
+      "name": "order: a surface check failure is reported before an unknown tool",
+      "snapshot": "base", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "otto-sandbox", "tool": "github__force_push",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "surface_not_permitted",
+        "sentence": "Surface `otto-sandbox` is not available to workload `system:serviceaccount:inventory:api` of team `inventory` from issuer `https://cluster-a.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+
+    {
+      "name": "a profile that requires a delegation refuses a call without one",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": null,
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_disagrees",
+        "sentence": "Profile `otto` requires a delegation saying whom this call acts for, and the call carried none. Present the delegation issued for this work." }
+    },
+    {
+      "name": "a delegation issued for another team names both teams",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "search-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_disagrees",
+        "sentence": "The delegation was issued for team `search`, but the caller is proved to belong to team `payments`. Present a delegation issued for team `payments`." }
+    },
+    {
+      "name": "a delegation presented by a user cannot agree with a team",
+      "snapshot": "base", "principal": "eng-user", "delegation": "payments-turn",
+      "profile": "employee", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "delegation_disagrees",
+        "sentence": "The delegation was issued for team `payments`, but the caller is user `eng-user@example.test` from issuer `https://idp.example.test`, who belongs to no team. Only a workload of the team a delegation was issued for may present it." }
+    },
+    {
+      "name": "a delegation that disagrees is refused even where the profile does not require one",
+      "snapshot": "base", "principal": "inventory-service", "delegation": "payments-turn",
+      "profile": "service", "surface": "service", "tool": "jira__get_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "deny", "reason": "delegation_disagrees",
+        "sentence": "The delegation was issued for team `payments`, but the caller is proved to belong to team `inventory`. Present a delegation issued for team `inventory`." }
+    },
+    {
+      "name": "order: an unknown tool is reported before a missing delegation",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": null,
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__force_push",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "unknown_tool",
+        "sentence": "Tool `github__force_push` is not an approved tool. Call `tools/list` on surface `otto-sandbox` to see the tools you may call." }
+    },
+
+    {
+      "name": "a delegation that lists other tools narrows the surface",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `github__open_pull_request` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "a delegation that lists no tools permits none",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-empty",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `github__get_file` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "a delegation narrows even where the profile does not require one",
+      "snapshot": "base", "principal": "inventory-service", "delegation": "inventory-turn-narrow",
+      "profile": "service", "surface": "service", "tool": "jira__create_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `jira__create_issue` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "order: a team mismatch is reported before the delegation's tool list",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "search-turn-narrow",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "delegation_disagrees",
+        "sentence": "The delegation was issued for team `search`, but the caller is proved to belong to team `payments`. Present a delegation issued for team `payments`." }
+    },
+    {
+      "name": "order: a tool on another surface is reported before the delegation's tool list",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "docs__search",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "tool_not_on_surface",
+        "sentence": "Tool `docs__search` is not served on surface `otto-sandbox`. Call `tools/list` on surface `otto-sandbox` to see the tools it serves." }
+    },
+
+    {
+      "name": "a destructive tool is denied in the otto profile",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "a destructive tool is denied in the employee profile",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "a destructive tool is denied in the service profile",
+      "snapshot": "base", "principal": "control-plane", "delegation": null,
+      "profile": "service", "surface": "otto-control", "tool": "github__delete_repository",
+      "resources": { "named": [] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_repository` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "a destructive tool is denied even by a profile whose data lists destructive",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "lists-destructive", "surface": "employee", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "the lists-destructive profile still permits what it lists besides destructive",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "lists-destructive", "surface": "employee", "tool": "jira__create_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a write is denied by a profile that permits only reads",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "jira__create_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__create_issue` is classified `write`, which profile `employee` does not permit. Choose a tool whose classification this profile permits." }
+    },
+    {
+      "name": "order: the delegation's tool list is reported before a destructive classification",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
+        "sentence": "Tool `github__delete_branch` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+    },
+    {
+      "name": "order: a destructive classification is reported before a resource outside the limit",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__delete_branch",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/search-indexer" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
+    },
+    {
+      "name": "order: a missing delegation is reported before a resource outside the limit",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": null,
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/search-indexer" }] },
+      "expect": { "decision": "deny", "reason": "delegation_disagrees",
+        "sentence": "Profile `otto` requires a delegation saying whom this call acts for, and the call carried none. Present the delegation issued for this work." }
+    },
+
+    {
+      "name": "another team's repository is outside the limit",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/search-indexer" }] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__get_file` names github repository `example-org/search-indexer`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "one resource outside the limit denies the call, and is the one named",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [
+        { "system": "github", "kind": "repository", "identifier": "example-org/payments-api" },
+        { "system": "github", "kind": "repository", "identifier": "example-org/handbook" }
+      ] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__open_pull_request` names github repository `example-org/handbook`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "a limit matches on kind as well as identifier",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "gist", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__get_file` names github gist `example-org/payments-api`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "a limit matches on system as well as identifier",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "jira__get_issue",
+      "resources": { "named": [{ "system": "confluence", "kind": "project", "identifier": "PAY" }] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `jira__get_issue` names confluence project `PAY`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "a user's resource outside every group's limit is denied",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "jira__get_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "FIN" }] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `jira__get_issue` names jira project `FIN`, which is outside what user `eng-user@example.test` from issuer `https://idp.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "unknown resources are denied for a tool that does not check its own scope",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__list_org_repos",
+      "resources": "unknown",
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__list_org_repos` cannot say which resources this call names before it runs, and it does not check its own scope, so the call cannot be allowed. Call a tool that names the resources it touches." }
+    },
+    {
+      "name": "a resource is checked even for a tool that declares none",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "docs__search",
+      "resources": { "named": [{ "system": "docs", "kind": "space", "identifier": "SECRET" }] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `docs__search` names docs space `SECRET`, which is outside what user `eng-user@example.test` from issuer `https://idp.example.test` may reach. Name only resources within that limit." }
+    }
+  ],
+  "lists": [
+    {
+      "name": "otto sees every non-destructive tool on its surface",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox",
+      "expect": ["github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
+    },
+    {
+      "name": "a narrowing delegation narrows the list",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-narrow",
+      "profile": "otto", "surface": "otto-sandbox",
+      "expect": ["github__get_file"]
+    },
+    {
+      "name": "a missing delegation lists nothing",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": null,
+      "profile": "otto", "surface": "otto-sandbox",
+      "expect": []
+    },
+    {
+      "name": "an employee sees only reads",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee",
+      "expect": ["docs__search", "github__get_file", "jira__get_issue"]
+    },
+    {
+      "name": "a surface the caller may not use lists nothing",
+      "snapshot": "base", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "otto-sandbox",
+      "expect": []
+    },
+    {
+      "name": "a surface that does not exist lists nothing",
+      "snapshot": "base", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "no-such-surface",
+      "expect": []
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+ --> tests/compile-fail/run_without_guard.rs:6:15
+  |
+6 |     connector.run(arguments).await
+  |               ^^^ --------- argument #1 of type `&AuditGuard` is missing
+  |
+note: method defined here
+ --> src/connector.rs
+  |
+  |     fn run(
+  |        ^^^
+help: provide the argument
+  |
+6 |     connector.run(/* &AuditGuard */, arguments).await
+  |                   ++++++++++++++++++
