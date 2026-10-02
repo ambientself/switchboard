@@ -106,6 +106,32 @@ fn a_gate_holds_until_it_is_opened_and_then_lets_everything_through() {
     );
 }
 
+/// The gate wakes the task that is waiting at it, on whatever executor: a thread parked in
+/// `block_on` is woken by `open`. Bounded by a timeout so that a gate that never wakes fails
+/// the test rather than hanging it.
+#[test]
+fn opening_a_gate_wakes_a_task_parked_at_it() {
+    let gate = Gate::closed();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let waiter = gate.clone();
+    std::thread::spawn(move || {
+        block_on(waiter.wait());
+        let _ = sender.send(());
+    });
+    // Wait for the task to arrive at the gate, then open it.
+    let mut spins = 0u32;
+    while gate.waiting() == 0 {
+        std::thread::yield_now();
+        spins += 1;
+        assert!(spins < 50_000_000, "the task never reached the gate");
+    }
+    gate.open();
+    assert!(
+        receiver.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "the task was not woken when the gate opened"
+    );
+}
+
 // --- The audit store ------------------------------------------------------------------------
 
 #[test]

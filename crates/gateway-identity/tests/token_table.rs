@@ -221,6 +221,16 @@ fn cases() -> Vec<Case> {
             t.alg(the_other_algorithm(s))
         }),
         refused(
+            "an alg of the same family, signed as the issuer signs",
+            AlgorithmNotAllowed,
+            |t, s| {
+                t.alg(match s.algorithm {
+                    gateway_identity::SigningAlgorithm::Rs256 => "RS384",
+                    gateway_identity::SigningAlgorithm::Es256 => "ES384",
+                })
+            },
+        ),
+        refused(
             "HMAC under a made-up secret",
             AlgorithmNotAllowed,
             |t, _| t.hmac_signed(b"a secret the attacker chose"),
