@@ -51,7 +51,7 @@ server before it can be registered.
 | System | What agents need it for | Recommendation | Service identity | Read-only |
 | --- | --- | --- | --- | --- |
 | GitHub | Search; read files, releases, pull requests, issues, checks, job logs; draft pull requests; comment. | Built-in. Official server is an option later. | Yes, documented, not tested. | Yes. |
-| Atlassian | Jira search, read, comment. Confluence reads if wanted. | Built-in now. Proxy the hosted server after a test. | Yes, service account API key. | Yes, by scope. |
+| Atlassian | Jira search, read, comment. Confluence search and read. | Built-in now. Proxy the hosted server after a test. | Yes, service account API key. | Yes, by scope. |
 | Sumo Logic | Log search while investigating. | Proxy the vendor's hosted server. | Yes, OAuth client credentials. | Yes, by scope. |
 | New Relic | Metrics, traces, alerts while investigating. | Built-in (NerdGraph), unless an API-key test passes. | Not verified. | Yes. No write tools listed. |
 | Slack | Search and read channels and threads. | Not yet. | No for the hosted server. | Yes, by scope. |
@@ -193,12 +193,16 @@ at `/x/repos/readonly`, and check that a call to a repository outside the token 
   can reach only those. Jira permissions would normally decide this; no Atlassian page says it
   for MCP.
 - Rate limits for the hosted server, and its data-residency and plan requirements.
-- Whether Confluence is wanted at all. That is a question for Org, not for the vendor.
 
 **Smallest useful surface.** Jira: `searchJiraIssuesUsingJql`, `getJiraIssue`,
 `listJiraIssueComments`, plus one comment write (`addOrEditJiraIssueComment`) as a proposal.
-That matches the three tools Otto has today. Confluence, if wanted: `searchConfluence` and
-`getConfluenceContent`.
+That matches the three tools Otto has today.
+
+Confluence is in use and wanted (confirmed 2026-10-01): `searchConfluence` and
+`getConfluenceContent`. Otto's gateway has no Confluence tools, so there is nothing built-in to
+carry over. That makes Confluence the stronger reason to test the hosted server: if a service
+account can be limited to chosen spaces, Confluence reads can be proxied without writing a
+connector. The test below should cover a space limit as well as a project limit.
 
 **Recommendation: built-in now, then test the hosted server.** Otto's built-in Jira tools limit
 calls to an allowlist of projects. A proxied server cannot enforce that unless the gateway
