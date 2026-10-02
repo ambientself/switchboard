@@ -4,6 +4,7 @@ error[E0423]: cannot initialize a tuple struct which contains private fields
 7 |     let _ = Proved(principal.clone());
   |             ^^^^^^
   |
+  = note: a struct named `Proved` exists in another namespace
 note: constructor is not visible here due to private fields
  --> src/proof.rs
   |
