@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is the exact version in rust-toolchain.toml, with its components; the
+      # compile-fail tests' expected output is tied to it.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

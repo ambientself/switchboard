@@ -1,0 +1,38 @@
+error[E0308]: mismatched types
+ --> tests/compile-fail/connector_without_tool_call.rs:7:27
+  |
+7 |     let _ = connector.run(guard);
+  |                       --- ^^^^^ expected `ToolCall`, found `AuditGuard`
+  |                       |
+  |                       arguments to this method are incorrect
+  |
+note: method defined here
+ --> src/connector.rs
+  |
+  |     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
+  |        ^^^
+
+error[E0624]: associated function `new` is private
+ --> tests/compile-fail/connector_without_tool_call.rs:9:37
+  |
+9 |     let _ = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));
+  |                                     ^^^ private associated function
+  |
+ ::: src/connector.rs
+  |
+  |     pub(crate) fn new(call: CallContext, tool: ApprovedTool, arguments: serde_json::Value) -> Self {
+  |     ---------------------------------------------------------------------------------------------- private associated function defined here
+
+error[E0308]: mismatched types
+ --> tests/compile-fail/connector_without_tool_call.rs:9:47
+  |
+9 |     let _ = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));
+  |                           -------------       ^^^^ expected `ApprovedTool`, found `SurfaceName`
+  |                           |
+  |                           arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/connector.rs
+  |
+  |     pub(crate) fn new(call: CallContext, tool: ApprovedTool, arguments: serde_json::Value) -> Self {
+  |                   ^^^

@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `guard`
+ --> tests/compile-fail/guard_reused.rs:8:40
+  |
+6 | async fn twice(connector: &dyn Connector, guard: AuditGuard) -> (Ran, Ran) {
+  |                                           ----- move occurs because `guard` has type `AuditGuard`, which does not implement the `Copy` trait
+7 |     let first = audit::run(connector, guard).await;
+  |                                       ----- value moved here
+8 |     let second = audit::run(connector, guard).await;
+  |                                        ^^^^^ value used here after move

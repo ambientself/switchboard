@@ -1,0 +1,22 @@
+[package]
+name = "gateway-core"
+version = "0.1.0"
+description = "The gateway's policy core: principals, classification, the decision function, denial sentences and the audit record. No I/O."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The core performs no I/O. Keep HTTP, MCP, database and async-runtime crates out of this
+# list; they belong in the crates that wrap the core.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+trybuild = "1"
+
+[lints]
+workspace = true

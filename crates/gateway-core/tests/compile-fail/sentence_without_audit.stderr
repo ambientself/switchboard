@@ -1,0 +1,10 @@
+error[E0624]: method `sentence` is private
+ --> tests/compile-fail/sentence_without_audit.rs:7:43
+  |
+7 |     decision.reason().map(|reason| reason.sentence())
+  |                                           ^^^^^^^^ private method
+  |
+ ::: src/decision.rs
+  |
+  |     pub(crate) fn sentence(&self) -> String {
+  |     --------------------------------------- private method defined here

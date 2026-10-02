@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> tests/compile-fail/run_without_guard.rs:7:5
+  |
+7 |     audit::run(connector).await
+  |     ^^^^^^^^^^----------- argument #2 of type `AuditGuard` is missing
+  |
+note: function defined here
+ --> src/audit.rs
+  |
+  | pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
+  |              ^^^
+help: provide the argument
+  |
+7 |     audit::run(connector, /* AuditGuard */).await
+  |                         ++++++++++++++++++
