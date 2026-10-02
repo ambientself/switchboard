@@ -8,6 +8,7 @@ fn skip_audit(call: CallContext, tool: ApprovedTool) -> AuditGuard {
         row: AuditRowId::new("never written"),
         call,
         tool,
+        arguments: serde_json::Value::Null,
     }
 }
 

@@ -1,8 +1,12 @@
 //! The call context, the decision, and the function that turns one into the other.
 //!
 //! [`decide`] reads the snapshot and the call context and nothing else: no clock, no network,
-//! no global state. It runs the six checks of decision 0006 in order, and the first that fails
-//! decides the reason.
+//! no global state. It first finds the caller's profile in the snapshot, then runs the six
+//! checks of decision 0006 in order, and the first that fails decides the reason.
+//!
+//! A decision does not give out the sentence a caller would read. That sentence exists only on
+//! the [`Refusal`](crate::audit::Refusal) that [`audit::begin`](crate::audit::begin) returns
+//! once the denial's row is written, so no call path can answer a denial it has not recorded.
 
 // The checks return a `Reason` in their `Err`, which is large because a reason carries the
 // principal and resource its sentence names. At most one is built per decision, so boxing it
@@ -12,8 +16,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::classification::Classification;
-use crate::names::{DeploymentName, PolicyRevision, ProfileName, SurfaceName, TeamId, ToolName};
-use crate::policy::{ApprovedTool, PolicySnapshot, Profile, Resource, ResourceLimits, Resources};
+use crate::names::{
+    DeploymentName, PolicyRevision, ProfileName, RequestedTool, SurfaceName, TeamId, ToolName,
+};
+use crate::policy::{
+    ApprovedTool, PolicySnapshot, Profile, Resource, ResourceDeclaration, ResourceLimits, Resources,
+};
 use crate::principal::{Delegation, Principal, PrincipalId};
 use crate::proof::Proved;
 use crate::sentences;
@@ -26,10 +34,10 @@ pub struct CallerContext {
     pub principal: Proved<Principal>,
     /// A verified statement of whom the principal is acting for, if one was presented.
     pub delegation: Option<Proved<Delegation>>,
-    /// The policy set selected for this caller from its issuer, the deployment and the
-    /// principal. Selection happens before the decision, so the decision never sees a
-    /// profile that does not exist.
-    pub profile: Profile,
+    /// The name of the policy set selected for this caller from its issuer, the deployment and
+    /// the principal. The decision looks it up in the snapshot it decides from, so a profile
+    /// cannot be supplied from anywhere else.
+    pub profile: ProfileName,
     /// The surface the request arrived on, as the request named it. It may not exist.
     pub surface: SurfaceName,
     /// The deployment that received the call.
@@ -44,22 +52,31 @@ pub struct CallerContext {
 pub struct CallContext {
     /// Who is calling, on which surface, under which profile.
     pub caller: CallerContext,
-    /// The tool the call names, as the request named it. Whether it is approved, and on which
-    /// surfaces, is resolved against the snapshot inside [`decide`], so the classification a
-    /// decision uses is always the one in the snapshot whose revision it records.
-    pub tool: ToolName,
+    /// The tool the call names, exactly as the request named it. Whether it is a valid name,
+    /// whether it is approved and on which surfaces is resolved inside [`decide`], so the
+    /// classification a decision uses is always the one in the snapshot whose revision it
+    /// records.
+    pub tool: RequestedTool,
     /// The resources the call names, from the tool's resource adapter.
     pub resources: Resources,
 }
 
-/// Why a call was denied. One of a fixed set of kinds; [`Reason::sentence`] gives the sentence
-/// returned to the caller and written to the audit record.
+/// Why a call was denied: one of a fixed set of kinds, with the details its sentence names.
+///
+/// Inspectable, for logging and tests. The sentence a caller reads is not available here: only
+/// [`Refusal::sentence`](crate::audit::Refusal::sentence) gives it, once the row is written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reason {
-    /// The tool is not approved on any surface.
+    /// The snapshot has no profile with the name the caller's context carries.
+    ProfileUnknown {
+        /// The profile the context named.
+        profile: ProfileName,
+    },
+    /// The tool is not approved on any surface, or the requested name is not a valid tool
+    /// name.
     UnknownTool {
-        /// The tool the call named.
-        tool: ToolName,
+        /// The tool the call named, as it named it.
+        tool: RequestedTool,
         /// The surface the call arrived on.
         surface: SurfaceName,
     },
@@ -95,8 +112,8 @@ pub enum Reason {
         /// The caller's profile.
         profile: ProfileName,
     },
-    /// A resource the call names is outside what the caller may reach, or the resources are
-    /// unknown and the tool does not check its own scope.
+    /// A resource the call names is outside what the caller may reach, or the resources the
+    /// call reaches are not known well enough to check.
     ResourceOutsideLimit(ResourceProblem),
 }
 
@@ -136,9 +153,14 @@ pub enum ResourceProblem {
         /// The proved caller.
         principal: Principal,
     },
-    /// The tool cannot name its resources before it runs, and is not marked as checking its
-    /// own scope.
+    /// The resources are unknown, and the tool does not check its own scope.
     Unknown {
+        /// The tool the call named.
+        tool: ToolName,
+    },
+    /// The tool declares its resources, and the call named none: the resource adapter found
+    /// nothing to check, which must not read as "nothing to check against".
+    NoneNamed {
         /// The tool the call named.
         tool: ToolName,
     },
@@ -149,6 +171,8 @@ pub enum ResourceProblem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonKind {
+    /// See [`Reason::ProfileUnknown`].
+    ProfileUnknown,
     /// See [`Reason::UnknownTool`].
     UnknownTool,
     /// See [`Reason::ToolNotOnSurface`].
@@ -167,7 +191,8 @@ pub enum ReasonKind {
 
 impl ReasonKind {
     /// Every kind of reason.
-    pub const ALL: [ReasonKind; 7] = [
+    pub const ALL: [ReasonKind; 8] = [
+        ReasonKind::ProfileUnknown,
         ReasonKind::UnknownTool,
         ReasonKind::ToolNotOnSurface,
         ReasonKind::SurfaceNotPermitted,
@@ -182,6 +207,7 @@ impl Reason {
     /// This reason's kind.
     pub fn kind(&self) -> ReasonKind {
         match self {
+            Reason::ProfileUnknown { .. } => ReasonKind::ProfileUnknown,
             Reason::UnknownTool { .. } => ReasonKind::UnknownTool,
             Reason::ToolNotOnSurface { .. } => ReasonKind::ToolNotOnSurface,
             Reason::SurfaceNotPermitted { .. } => ReasonKind::SurfaceNotPermitted,
@@ -192,9 +218,10 @@ impl Reason {
         }
     }
 
-    /// The sentence for this reason: the text returned to the caller and written to the audit
-    /// record. The wording lives in [`sentences`](crate::sentences).
-    pub fn sentence(&self) -> String {
+    /// The sentence for this reason. Crate-private on purpose: outside the crate it is reached
+    /// only through [`Refusal::sentence`](crate::audit::Refusal::sentence), after the row is
+    /// written.
+    pub(crate) fn sentence(&self) -> String {
         sentences::render(self)
     }
 }
@@ -270,12 +297,15 @@ impl Decision {
 
 /// Decides one `tools/call`.
 pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
-    let verdict = match check(snapshot, &call.caller, &call.tool, &call.resources) {
+    let verdict = match check(snapshot, &call.caller, &call.tool, Some(&call.resources)) {
         Ok(tool) => Verdict::Allow(tool.clone()),
         Err(reason) => Verdict::Deny {
             reason,
-            tool: snapshot
-                .tool_on_surface(&call.caller.surface, &call.tool)
+            tool: call
+                .tool
+                .name()
+                .ok()
+                .and_then(|name| snapshot.tool_on_surface(&call.caller.surface, &name))
                 .cloned(),
         },
     };
@@ -295,30 +325,49 @@ pub fn list_tools<'s>(
     let Some(surface) = snapshot.surface(&caller.surface) else {
         return Vec::new();
     };
-    let no_resources = Resources::Named(Vec::new());
     surface
         .tools
         .iter()
-        .filter_map(|tool| check(snapshot, caller, tool, &no_resources).ok())
+        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())
         .collect()
 }
 
-/// The six checks, in the order decision 0006 states. The order is the contract: a call that
-/// fails two checks is reported by the earlier one.
+/// The checks, in order. The order is the contract: a call that fails two checks is reported
+/// by the earlier one. Checks 1 to 6 are decision 0006's; the profile lookup comes first
+/// because none of them means anything without a profile.
+///
+/// `resources` is `None` for `tools/list`, which decides with no resources at all, and the
+/// call's resources otherwise.
 fn check<'s>(
     snapshot: &'s PolicySnapshot,
     caller: &CallerContext,
-    tool: &ToolName,
-    resources: &Resources,
+    tool: &RequestedTool,
+    resources: Option<&Resources>,
 ) -> Result<&'s ApprovedTool, Reason> {
     let principal = caller.principal.get();
+    let profile = profile_is_known(snapshot, &caller.profile)?;
     surface_is_permitted(snapshot, caller, principal)?;
     let tool = tool_is_approved_on_surface(snapshot, &caller.surface, tool)?;
-    delegation_agrees(caller, principal)?;
+    delegation_agrees(caller, profile, principal)?;
     delegation_lists_tool(caller.delegation.as_ref(), tool)?;
-    classification_is_permitted(&caller.profile, tool)?;
-    resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;
+    classification_is_permitted(profile, tool)?;
+    if let Some(resources) = resources {
+        resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;
+    }
     Ok(tool)
+}
+
+/// Check 0. The profile comes from the snapshot the decision is made from, never from the
+/// context, so a profile the snapshot does not hold cannot permit anything.
+fn profile_is_known<'s>(
+    snapshot: &'s PolicySnapshot,
+    profile: &ProfileName,
+) -> Result<&'s Profile, Reason> {
+    snapshot
+        .profile(profile)
+        .ok_or_else(|| Reason::ProfileUnknown {
+            profile: profile.clone(),
+        })
 }
 
 /// Check 1. A surface that does not exist is reported the same way as one the principal may
@@ -337,30 +386,41 @@ fn surface_is_permitted(
     }
 }
 
-/// Check 2.
+/// Check 2. A requested name that is not a valid tool name is an unknown tool.
 fn tool_is_approved_on_surface<'s>(
     snapshot: &'s PolicySnapshot,
     surface: &SurfaceName,
-    tool: &ToolName,
+    requested: &RequestedTool,
 ) -> Result<&'s ApprovedTool, Reason> {
-    if let Some(approved) = snapshot.tool_on_surface(surface, tool) {
+    let unknown = || Reason::UnknownTool {
+        tool: requested.clone(),
+        surface: surface.clone(),
+    };
+    let name = requested.name().map_err(|_| unknown())?;
+    if let Some(approved) = snapshot.tool_on_surface(surface, &name) {
         return Ok(approved);
     }
-    let (tool, surface) = (tool.clone(), surface.clone());
-    Err(match snapshot.tool(&tool) {
-        Some(_) => Reason::ToolNotOnSurface { tool, surface },
-        None => Reason::UnknownTool { tool, surface },
+    Err(match snapshot.tool(&name) {
+        Some(_) => Reason::ToolNotOnSurface {
+            tool: name,
+            surface: surface.clone(),
+        },
+        None => unknown(),
     })
 }
 
 /// Check 3. A delegation that is present must agree with the principal even when the profile
 /// does not require one: a delegation contradicting the proved team is a sign of something
 /// wrong, and ignoring it would let a caller present one only when it narrows nothing.
-fn delegation_agrees(caller: &CallerContext, principal: &Principal) -> Result<(), Reason> {
+fn delegation_agrees(
+    caller: &CallerContext,
+    profile: &Profile,
+    principal: &Principal,
+) -> Result<(), Reason> {
     let Some(delegation) = &caller.delegation else {
-        return if caller.profile.requires_delegation {
+        return if profile.requires_delegation {
             Err(Reason::DelegationDisagrees(DelegationProblem::Missing {
-                profile: caller.profile.name.clone(),
+                profile: profile.name.clone(),
             }))
         } else {
             Ok(())
@@ -413,28 +473,40 @@ fn classification_is_permitted(profile: &Profile, tool: &ApprovedTool) -> Result
     }
 }
 
-/// Check 6.
+/// Check 6. Every named resource is checked, whatever the tool declares, so a wrong
+/// declaration cannot widen what a call reaches; the declaration only decides what an empty or
+/// unknown list means.
 fn resources_are_within_limit(
     limits: &ResourceLimits,
     principal: &Principal,
     tool: &ApprovedTool,
     resources: &Resources,
 ) -> Result<(), Reason> {
-    match resources {
-        Resources::Named(named) => match named
-            .iter()
-            .find(|resource| !limits.permits(principal, resource))
-        {
-            Some(outside) => Err(Reason::ResourceOutsideLimit(ResourceProblem::Outside {
+    let problem = match (resources, tool.resources) {
+        (Resources::Named(named), declaration) => {
+            match named
+                .iter()
+                .find(|resource| !limits.permits(principal, resource))
+            {
+                Some(outside) => ResourceProblem::Outside {
+                    tool: tool.name.clone(),
+                    resource: outside.clone(),
+                    principal: principal.clone(),
+                },
+                None if named.is_empty() && declaration == ResourceDeclaration::Declared => {
+                    ResourceProblem::NoneNamed {
+                        tool: tool.name.clone(),
+                    }
+                }
+                None => return Ok(()),
+            }
+        }
+        (Resources::Unknown, ResourceDeclaration::ChecksOwnScope) => return Ok(()),
+        (Resources::Unknown, ResourceDeclaration::Declared | ResourceDeclaration::NoResources) => {
+            ResourceProblem::Unknown {
                 tool: tool.name.clone(),
-                resource: outside.clone(),
-                principal: principal.clone(),
-            })),
-            None => Ok(()),
-        },
-        Resources::Unknown if tool.checks_own_scope => Ok(()),
-        Resources::Unknown => Err(Reason::ResourceOutsideLimit(ResourceProblem::Unknown {
-            tool: tool.name.clone(),
-        })),
-    }
+            }
+        }
+    };
+    Err(Reason::ResourceOutsideLimit(problem))
 }

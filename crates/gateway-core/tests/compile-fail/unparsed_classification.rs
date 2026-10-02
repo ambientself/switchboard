@@ -1,22 +1,20 @@
 // A tool cannot be approved with a classification that has not been parsed, or whose parse
 // error has not been handled.
 
-use gateway_core::{ApprovedTool, Classification};
+use gateway_core::{ApprovedTool, Classification, ResourceDeclaration};
 
 fn approve(text: &str) -> (ApprovedTool, ApprovedTool) {
     let unhandled = ApprovedTool {
-        name: "github__get_file".into(),
+        name: "github__get_file".parse().unwrap(),
         classification: text.parse::<Classification>(),
         connector: "github".into(),
-        declares_resources: true,
-        checks_own_scope: false,
+        resources: ResourceDeclaration::Declared,
     };
     let unparsed = ApprovedTool {
-        name: "github__get_file".into(),
+        name: "github__get_file".parse().unwrap(),
         classification: text,
         connector: "github".into(),
-        declares_resources: true,
-        checks_own_scope: false,
+        resources: ResourceDeclaration::Declared,
     };
     (unhandled, unparsed)
 }

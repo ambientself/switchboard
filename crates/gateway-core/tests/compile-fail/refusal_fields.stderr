@@ -1,0 +1,5 @@
+error[E0616]: field `sentence` of struct `Refusal` is private
+ --> tests/compile-fail/refusal_fields.rs:6:13
+  |
+6 |     refusal.sentence = String::new();
+  |             ^^^^^^^^ private field

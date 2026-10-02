@@ -1,39 +1,39 @@
 //! Proved and claimed values, and the verifier capability that is the only way to make a
 //! proved one.
 //!
-//! # How `Proved` is sealed
+//! # What sealing `Proved` does, and what it does not
 //!
-//! [`Proved<T>`] has a private field and no public constructor, no `Default`, no `From`, and no
-//! `Deserialize`. The one way to obtain a `Proved` value from outside this module is
-//! [`Proved::verify`], which runs a [`Verifier`] over its evidence and wraps what the
-//! verifier returns. Inside the crate, the only other constructors are the projections at the
-//! bottom of this file, which narrow an already proved value to one of its parts.
+//! [`Proved<T>`] has a private field and no public constructor, no `Default`, no `From` and no
+//! `Deserialize`. Outside this module, the one way to obtain a `Proved` value is
+//! [`Proved::verify`], which runs a [`Verifier`] over its evidence and wraps what the verifier
+//! returns. Inside the crate, the only other constructors are the projections at the bottom of
+//! this file, which narrow an already proved value to one of its parts. There is no generic
+//! `map`, because `proved.map(|_| anything)` would fabricate a proved value from any input.
 //!
-//! Real verifiers live in later crates (an identity crate with one verifier per issuer type, a
-//! delegation verifier for Otto's turn grants) and test fakes live in another, so the
-//! capability cannot be private to this crate. Rust cannot restrict a constructor to a named
-//! list of downstream crates, so the boundary is drawn where it can be seen instead: a crate
-//! that wants to produce proved values must write `impl Verifier for ...`. That line is the
-//! thing to look for in review, and it is enumerable. Code that merely holds a header value, a
-//! [`Claimed`] value or a deserialized principal has no path to a `Proved` without writing one.
+//! What a verifier can prove is closed: [`Verifier::Fact`] must be [`Provable`], which is
+//! sealed and implemented only for [`Principal`] and [`Delegation`]. A proved team therefore
+//! exists only as part of a proved principal or delegation.
 //!
-//! What a verifier can prove is also closed. [`Verifier::Fact`] must be [`Provable`], which is
-//! sealed and implemented only for [`Principal`] and [`Delegation`], the two values decision
-//! 0006 says verifiers fill. A proved team or proved subject therefore exists only as a
-//! projection of a proved principal or delegation; nobody can write a verifier that proves an
-//! arbitrary team.
+//! That is all the type system gives. **A `Verifier` implementation can return a principal
+//! with any issuer, subject, team or groups it likes**, and the types will call it proved.
+//! Nothing here ties a verifier to the issuer it was configured for, or checks that it looked
+//! at a signature at all. Real verifiers live in later crates and test fakes in another, so
+//! the capability cannot be private to this crate, and Rust cannot restrict a trait to a list
+//! of implementing crates. The control is therefore review: every `impl Verifier for` in the
+//! workspace is a place where proof is created, and each one has to be read.
 //!
-//! A generic `map` on `Proved` is deliberately absent: `proved.map(|_| anything)` would
-//! fabricate a proved value from any input.
+//! What sealing does buy is that code which merely holds a header value, a [`Claimed`] value
+//! or a deserialized principal has no path to a `Proved` without writing such an impl.
 
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::names::{Person, TeamId};
 use crate::principal::{Delegation, Principal};
 
-/// A value the gateway verified, from a signed token or a signed delegation.
+/// A value a [`Verifier`] accepted, from a signed token or a signed delegation.
 ///
-/// Only a [`Verifier`] can make one; see the [module documentation](self). Two proved values
+/// Only a verifier can make one; see the [module documentation](self) for what that does and
+/// does not guarantee. Two proved values
 /// compare equal when their contents do. A proved value never compares equal to a claimed one,
 /// because no comparison between the two types exists: code that wants to compare them has to
 /// unwrap both with [`get`](Proved::get) and say so.
@@ -148,5 +148,27 @@ impl Proved<Delegation> {
     /// stays claimed.
     pub fn acting_person(&self) -> Claimed<Person> {
         self.0.acting_person.clone()
+    }
+}
+
+/// A value that was proved when an audit row was written, as read back from the row.
+///
+/// Reading a row is not verification, so a row's proved columns come back as this type: not
+/// [`Proved`], which only a verifier can make, and not [`Claimed`], which would erase the
+/// difference between the columns. It converts from a `Proved` value and never into one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WasProved<T>(T);
+
+impl<T> WasProved<T> {
+    /// The value as it was proved.
+    pub fn get(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> From<Proved<T>> for WasProved<T> {
+    fn from(proved: Proved<T>) -> Self {
+        Self(proved.0)
     }
 }

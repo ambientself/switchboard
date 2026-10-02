@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/compile-fail/decision_clone.rs:6:5
+  |
+5 | fn copy(decision: &Decision) -> Decision {
+  |                                 -------- expected `Decision` because of return type
+6 |     decision.clone()
+  |     ^^^^^^^^^^^^^^^^ expected `Decision`, found `&Decision`
+  |
+note: `Decision` does not implement `Clone`, so `&Decision` was cloned instead
+ --> tests/compile-fail/decision_clone.rs:6:5
+  |
+6 |     decision.clone()
+  |     ^^^^^^^^

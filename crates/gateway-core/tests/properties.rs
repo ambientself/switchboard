@@ -15,10 +15,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, Decision, Delegation, GroupId,
-    Issuer, PolicySnapshot, Principal, PrincipalId, PrincipalKind, Profile, ReasonKind, Resource,
-    ResourceLimits, Resources, SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName,
+    Issuer, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
+    ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
+    ResourceProblem, Resources, SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName,
     Verdict, decide, list_tools,
 };
+
+use common::tool_name;
 use proptest::prelude::*;
 use proptest::sample::{select, subsequence};
 use proptest::strategy::ValueTree;
@@ -41,7 +44,11 @@ struct World {
     data: SnapshotData,
     principal: Principal,
     delegation: Option<Delegation>,
+    /// The profile in the snapshot.
     profile: Profile,
+    /// The profile the caller's context names: usually `profile`'s name, sometimes one the
+    /// snapshot does not hold.
+    profile_name: ProfileName,
     surface: SurfaceName,
     tool: ToolName,
     resources: Resources,
@@ -49,14 +56,16 @@ struct World {
 
 impl World {
     fn snapshot(&self) -> PolicySnapshot {
-        PolicySnapshot::new(self.data.clone()).expect("a generated snapshot is invalid")
+        let mut data = self.data.clone();
+        data.profiles = vec![self.profile.clone()];
+        PolicySnapshot::new(data).expect("a generated snapshot is invalid")
     }
 
     fn caller(&self) -> CallerContext {
         CallerContext {
             principal: common::proved(&self.principal),
             delegation: self.delegation.as_ref().map(common::proved),
-            profile: self.profile.clone(),
+            profile: self.profile_name.clone(),
             surface: self.surface.clone(),
             deployment: "test".into(),
         }
@@ -65,7 +74,7 @@ impl World {
     fn call(&self) -> CallContext {
         CallContext {
             caller: self.caller(),
-            tool: self.tool.clone(),
+            tool: self.tool.clone().into(),
             resources: self.resources.clone(),
         }
     }
@@ -94,7 +103,7 @@ fn open_up(world: &mut World) {
         world.surface = SURFACES[0].into();
     }
     if world.tool.as_str() == UNAPPROVED_TOOL {
-        world.tool = TOOLS[0].into();
+        world.tool = tool_name(TOOLS[0]);
     }
     if let PrincipalKind::User { groups } = &mut world.principal.kind {
         groups.insert(GROUPS[0].into());
@@ -110,7 +119,7 @@ fn open_up(world: &mut World) {
             }
             PrincipalKind::User { groups } => surface.groups.extend(groups.iter().cloned()),
         }
-        surface.subjects = None;
+        surface.principals = PrincipalRestriction::AnyInTeamsAndGroups;
         // Check 2: the surface serves the tool.
         surface.tools.insert(tool.clone());
     }
@@ -138,6 +147,9 @@ fn open_up(world: &mut World) {
         }
     }
 
+    // Check 0: the context names the snapshot's profile.
+    world.profile_name = world.profile.name.clone();
+
     // Check 5: the profile permits every classification, destructive included, so that only
     // the destructive rule itself can deny.
     world.profile.classifications = Classification::ALL.into_iter().collect();
@@ -164,7 +176,7 @@ fn open_up(world: &mut World) {
         }
     }
     if let Some(approved) = world.approved_tool_mut() {
-        approved.checks_own_scope = true;
+        approved.resources = ResourceDeclaration::ChecksOwnScope;
     }
 }
 
@@ -204,6 +216,10 @@ fn names<T: From<&'static str> + Ord>(items: Vec<&'static str>) -> BTreeSet<T> {
     items.into_iter().map(T::from).collect()
 }
 
+fn tool_names(items: Vec<&'static str>) -> BTreeSet<ToolName> {
+    items.into_iter().map(tool_name).collect()
+}
+
 fn any_principal() -> impl Strategy<Value = Principal> {
     let kind = prop_oneof![
         select(TEAMS.to_vec()).prop_map(|team| PrincipalKind::Workload { team: team.into() }),
@@ -215,20 +231,19 @@ fn any_principal() -> impl Strategy<Value = Principal> {
 }
 
 fn any_tool(name: &'static str) -> impl Strategy<Value = ApprovedTool> {
-    (
-        select(Classification::ALL.to_vec()),
-        any::<bool>(),
-        any::<bool>(),
+    let declarations = vec![
+        ResourceDeclaration::NoResources,
+        ResourceDeclaration::Declared,
+        ResourceDeclaration::ChecksOwnScope,
+    ];
+    (select(Classification::ALL.to_vec()), select(declarations)).prop_map(
+        move |(classification, resources)| ApprovedTool {
+            name: tool_name(name),
+            classification,
+            connector: "sys".into(),
+            resources,
+        },
     )
-        .prop_map(
-            move |(classification, declares_resources, checks_own_scope)| ApprovedTool {
-                name: name.into(),
-                classification,
-                connector: "sys".into(),
-                declares_resources,
-                checks_own_scope,
-            },
-        )
 }
 
 fn any_surface(name: &'static str) -> impl Strategy<Value = Surface> {
@@ -240,10 +255,13 @@ fn any_surface(name: &'static str) -> impl Strategy<Value = Surface> {
     )
         .prop_map(move |(tools, teams, groups, subjects)| Surface {
             name: name.into(),
-            tools: names(tools),
+            tools: tool_names(tools),
             teams: names(teams),
             groups: names(groups),
-            subjects: subjects.map(|subjects| subjects.into_iter().collect()),
+            principals: match subjects {
+                None => PrincipalRestriction::AnyInTeamsAndGroups,
+                Some(subjects) => PrincipalRestriction::Only(subjects.into_iter().collect()),
+            },
         })
 }
 
@@ -280,7 +298,7 @@ fn any_delegation() -> impl Strategy<Value = Option<Delegation>> {
             .prop_map(|(team, tools)| Delegation {
                 acting_person: gateway_core::Claimed::new("requester@example.test".into()),
                 team: team.into(),
-                tools: tools.map(names),
+                tools: tools.map(tool_names),
             }),
     )
 }
@@ -313,6 +331,7 @@ fn any_world() -> impl Strategy<Value = World> {
         any_principal(),
         any_delegation(),
         profile,
+        proptest::bool::weighted(0.1),
         select(reachable),
         select(callable),
         resources,
@@ -320,7 +339,7 @@ fn any_world() -> impl Strategy<Value = World> {
     (data, call).prop_map(
         |(
             (one, two, three, a, b, limits),
-            (principal, delegation, profile, surface, tool, resources),
+            (principal, delegation, profile, unknown_profile, surface, tool, resources),
         )| {
             World {
                 data: SnapshotData {
@@ -332,9 +351,14 @@ fn any_world() -> impl Strategy<Value = World> {
                 },
                 principal,
                 delegation,
+                profile_name: if unknown_profile {
+                    "profile-missing".into()
+                } else {
+                    profile.name.clone()
+                },
                 profile,
                 surface: surface.into(),
-                tool: tool.into(),
+                tool: tool_name(tool),
                 resources,
             }
         },
@@ -421,10 +445,7 @@ proptest! {
         let rebuilt = decide(&world.snapshot(), &world.call());
         prop_assert_eq!(&first, &again);
         prop_assert_eq!(&first, &rebuilt);
-        prop_assert_eq!(
-            first.reason().map(|reason| reason.sentence()),
-            rebuilt.reason().map(|reason| reason.sentence())
-        );
+        prop_assert_eq!(first.reason(), rebuilt.reason());
     }
 
     #[test]
@@ -434,9 +455,16 @@ proptest! {
         let listed: BTreeSet<ToolName> = list_tools(&snapshot, &caller).iter().map(|tool| tool.name.clone()).collect();
         let served: BTreeSet<ToolName> = snapshot.surface(&world.surface).map(|surface| surface.tools.clone()).unwrap_or_default();
         prop_assert!(listed.is_subset(&served));
+        // `tools/list` decides with no resources at all; a call with an empty list differs only
+        // for a tool that declares its resources, which check 6 then refuses with `NoneNamed`.
         for tool in served {
-            let call = CallContext { caller: caller.clone(), tool: tool.clone(), resources: Resources::Named(Vec::new()) };
-            prop_assert_eq!(decide(&snapshot, &call).is_allowed(), listed.contains(&tool), "tool {}", tool);
+            let call = CallContext { caller: caller.clone(), tool: tool.clone().into(), resources: Resources::Named(Vec::new()) };
+            let decision = decide(&snapshot, &call);
+            let passes_all_but_resources = decision.is_allowed() || matches!(
+                decision.reason(),
+                Some(Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { .. }))
+            );
+            prop_assert_eq!(passes_all_but_resources, listed.contains(&tool), "tool {}", tool);
         }
     }
 
@@ -448,6 +476,32 @@ proptest! {
         }
         let decision = world.decide();
         prop_assert!(decision.is_allowed(), "open_up left a check closed: {decision:?}");
+    }
+}
+
+proptest! {
+    /// Whatever a caller sends as a tool name, the sentence it gets back and the row written for
+    /// it carry no control character and stay short.
+    #[test]
+    fn a_requested_name_never_reaches_a_sentence_or_row_raw(world in world(), raw in "\\PC{0,40}|[\\x00-\\x7f]{0,40}|\\PC{200,400}") {
+        let mut call = world.call();
+        call.tool = gateway_core::RequestedTool::new(raw.clone());
+        let store = common::MemoryStore::default();
+        let begun = common::ready(gateway_core::audit::begin(
+            &store,
+            decide(&world.snapshot(), &call),
+            serde_json::Value::Null,
+            Default::default(),
+        ))
+        .unwrap();
+        let row = store.last();
+        for text in [Some(row.tool.as_str()), row.sentence.as_deref()].into_iter().flatten() {
+            prop_assert!(!text.chars().any(char::is_control), "{text:?}");
+            prop_assert!(text.chars().count() <= 600, "{} characters", text.chars().count());
+        }
+        if let gateway_core::audit::Begun::Denied(refusal) = begun {
+            prop_assert_eq!(Some(refusal.sentence()), row.sentence.as_deref());
+        }
     }
 }
 

@@ -24,16 +24,30 @@ pub struct ApprovedTool {
     pub classification: Classification,
     /// The connector or proxied server that runs the tool.
     pub connector: ConnectorName,
-    /// Whether the tool's resource adapter can name the resources a call touches before it
-    /// runs.
-    ///
-    /// The resource adapter reads this, not the decision function: the decision function
-    /// checks whatever resources the call context names, so a wrong declaration cannot widen
-    /// what a call may reach.
-    pub declares_resources: bool,
-    /// Whether the tool checks its own scope when it runs, and refuses what is outside it. Only
-    /// such a tool may be called when the resources a call names are unknown.
-    pub checks_own_scope: bool,
+    /// How the resources a call reaches are known: see [`ResourceDeclaration`].
+    pub resources: ResourceDeclaration,
+}
+
+/// How a tool's resources are checked. Decision 0006 describes two facts about a tool, whether
+/// it declares its resources and whether it checks its own scope when it runs. Of their four
+/// combinations, one (neither) could never be allowed when called, and another (a tool that
+/// reaches nothing scoped) has to be said explicitly, or a resource adapter that finds nothing
+/// would be indistinguishable from one that failed. So the declaration is one of three, and
+/// the uncallable combination cannot be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceDeclaration {
+    /// The tool reaches nothing a resource limit applies to, such as a search of public
+    /// documentation. A call names no resources; any it does name are still checked.
+    NoResources,
+    /// The tool's resource adapter names the resources a call reaches before it runs. Every
+    /// named resource must be within the caller's limit, and a call that names none, or whose
+    /// resources are unknown, is denied: the adapter failing to find one must not let the call
+    /// through.
+    Declared,
+    /// The tool checks its own scope when it runs, and refuses what is outside it. Its calls
+    /// may arrive with unknown resources; any resources that are named are still checked.
+    ChecksOwnScope,
 }
 
 /// One resource a call names: a system, a kind of thing in it, and which one.
@@ -77,10 +91,20 @@ pub struct Surface {
     /// Groups whose users may use this surface.
     #[serde(default)]
     pub groups: BTreeSet<GroupId>,
-    /// If present, only these principals may use the surface, in addition to the team and
-    /// group allowlist. Absent means no restriction by principal.
-    #[serde(default)]
-    pub subjects: Option<BTreeSet<PrincipalId>>,
+    /// Whether the surface is further restricted to named principals. Required, with no
+    /// default: a dropped field must not read as "unrestricted".
+    pub principals: PrincipalRestriction,
+}
+
+/// Which principals, among those the team and group allowlist admits, may use a surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalRestriction {
+    /// Any principal the team and group allowlist admits.
+    AnyInTeamsAndGroups,
+    /// Only these principals, and only if the allowlist also admits them. Each is an issuer
+    /// and a subject, so the same subject from another issuer is not admitted.
+    Only(BTreeSet<PrincipalId>),
 }
 
 impl Surface {
@@ -90,11 +114,11 @@ impl Surface {
             PrincipalKind::Workload { team } => self.teams.contains(team),
             PrincipalKind::User { groups } => !self.groups.is_disjoint(groups),
         };
-        let by_subject = self
-            .subjects
-            .as_ref()
-            .is_none_or(|subjects| subjects.contains(&principal.id));
-        by_team_or_group && by_subject
+        let by_principal = match &self.principals {
+            PrincipalRestriction::AnyInTeamsAndGroups => true,
+            PrincipalRestriction::Only(principals) => principals.contains(&principal.id),
+        };
+        by_team_or_group && by_principal
     }
 }
 
@@ -276,23 +300,26 @@ impl TryFrom<SnapshotData> for PolicySnapshot {
 mod tests {
     use super::*;
 
-    fn tool(name: &str) -> ApprovedTool {
+    fn tool_name(name: &str) -> ToolName {
+        ToolName::parse(name).unwrap()
+    }
+
+    fn tool(tool: &str) -> ApprovedTool {
         ApprovedTool {
-            name: name.into(),
+            name: tool_name(tool),
             classification: Classification::Read,
             connector: "fixture".into(),
-            declares_resources: false,
-            checks_own_scope: false,
+            resources: ResourceDeclaration::NoResources,
         }
     }
 
     fn surface(name: &str, tools: &[&str]) -> Surface {
         Surface {
             name: name.into(),
-            tools: tools.iter().map(|&tool| tool.into()).collect(),
+            tools: tools.iter().map(|&tool| tool_name(tool)).collect(),
             teams: BTreeSet::new(),
             groups: BTreeSet::new(),
-            subjects: None,
+            principals: PrincipalRestriction::AnyInTeamsAndGroups,
         }
     }
 
@@ -326,7 +353,7 @@ mod tests {
         data.tools.push(tool("a__read"));
         assert_eq!(
             PolicySnapshot::new(data),
-            Err(SnapshotError::DuplicateTool("a__read".into()))
+            Err(SnapshotError::DuplicateTool(tool_name("a__read")))
         );
     }
 
@@ -359,15 +386,170 @@ mod tests {
             PolicySnapshot::new(data),
             Err(SnapshotError::UnapprovedToolOnSurface {
                 surface: "three".into(),
-                tool: "c__unapproved".into(),
+                tool: tool_name("c__unapproved"),
             })
         );
     }
 
+    const TOOL: &str = r#""name": "a__read", "connector": "fixture""#;
+
     #[test]
     fn a_tool_with_no_classification_cannot_be_loaded() {
-        let json = r#"{"name": "a__read", "connector": "fixture",
-                       "declares_resources": false, "checks_own_scope": false}"#;
-        assert!(serde_json::from_str::<ApprovedTool>(json).is_err());
+        let json = format!(r#"{{{TOOL}, "resources": "declared"}}"#);
+        assert!(serde_json::from_str::<ApprovedTool>(&json).is_err());
+    }
+
+    #[test]
+    fn a_tool_must_say_how_its_resources_are_known() {
+        let parse = |rest: &str| {
+            serde_json::from_str::<ApprovedTool>(&format!(
+                "{{{TOOL}, \"classification\": \"read\"{rest}}}"
+            ))
+        };
+        assert!(parse(r#", "resources": "declared""#).is_ok());
+        assert!(parse(r#", "resources": "checks_own_scope""#).is_ok());
+        assert!(parse(r#", "resources": "no_resources""#).is_ok());
+        assert!(parse("").is_err(), "a missing declaration was accepted");
+        assert!(parse(r#", "resources": null"#).is_err());
+        assert!(parse(r#", "resources": "neither""#).is_err());
+    }
+
+    #[test]
+    fn a_tool_with_an_unknown_field_is_refused() {
+        let json = format!(
+            r#"{{{TOOL}, "classification": "read", "resources": "declared", "classfication": "write"}}"#
+        );
+        assert!(serde_json::from_str::<ApprovedTool>(&json).is_err());
+    }
+
+    const SURFACE: &str = r#""name": "s", "tools": [], "teams": ["t"]"#;
+
+    #[test]
+    fn a_surface_must_say_whether_it_restricts_principals() {
+        let parse = |rest: &str| serde_json::from_str::<Surface>(&format!("{{{SURFACE}{rest}}}"));
+        let any = parse(r#", "principals": "any_in_teams_and_groups""#).unwrap();
+        assert_eq!(any.principals, PrincipalRestriction::AnyInTeamsAndGroups);
+        let only = parse(r#", "principals": {"only": [{"issuer": "i", "subject": "s"}]}"#);
+        assert!(
+            matches!(only.unwrap().principals, PrincipalRestriction::Only(set) if set.len() == 1)
+        );
+        assert!(
+            parse("").is_err(),
+            "a missing restriction read as unrestricted"
+        );
+        assert!(
+            parse(r#", "principals": null"#).is_err(),
+            "null read as unrestricted"
+        );
+        assert!(parse(r#", "principals": {"only": null}"#).is_err());
+    }
+
+    #[test]
+    fn a_surface_with_an_unknown_field_is_refused() {
+        let json =
+            format!(r#"{{{SURFACE}, "principals": "any_in_teams_and_groups", "subjects": []}}"#);
+        assert!(serde_json::from_str::<Surface>(&json).is_err());
+    }
+
+    fn resource(system: &str, kind: &str, identifier: &str) -> Resource {
+        Resource {
+            system: system.into(),
+            kind: kind.into(),
+            identifier: identifier.into(),
+        }
+    }
+
+    fn workload(team: &str) -> Principal {
+        Principal {
+            id: PrincipalId {
+                issuer: "i".into(),
+                subject: "w".into(),
+            },
+            kind: PrincipalKind::Workload { team: team.into() },
+        }
+    }
+
+    fn user(groups: &[&str]) -> Principal {
+        Principal {
+            id: PrincipalId {
+                issuer: "i".into(),
+                subject: "u".into(),
+            },
+            kind: PrincipalKind::User {
+                groups: groups.iter().map(|&group| group.into()).collect(),
+            },
+        }
+    }
+
+    /// Team `alpha` and group `alpha` share a name and nothing else.
+    fn limits() -> ResourceLimits {
+        ResourceLimits {
+            teams: [("alpha".into(), [resource("git", "repo", "org/a")].into())].into(),
+            groups: [("beta".into(), [resource("git", "repo", "org/b")].into())].into(),
+        }
+    }
+
+    #[test]
+    fn a_limit_is_an_exact_match_on_system_kind_and_identifier() {
+        let limits = limits();
+        for principal in [workload("alpha")] {
+            assert!(limits.permits(&principal, &resource("git", "repo", "org/a")));
+            for outside in [
+                resource("other", "repo", "org/a"),
+                resource("git", "other", "org/a"),
+                resource("git", "repo", "org/A"),
+                resource("git", "repo", "org/a-two"),
+                resource("git", "repo", "org/"),
+            ] {
+                assert!(!limits.permits(&principal, &outside), "{outside:?}");
+            }
+        }
+        let principal = user(&["beta"]);
+        assert!(limits.permits(&principal, &resource("git", "repo", "org/b")));
+        for outside in [
+            resource("other", "repo", "org/b"),
+            resource("git", "other", "org/b"),
+            resource("git", "repo", "ORG/B"),
+            resource("git", "repo", "org/b-two"),
+        ] {
+            assert!(!limits.permits(&principal, &outside), "{outside:?}");
+        }
+    }
+
+    #[test]
+    fn a_team_and_a_group_with_the_same_name_do_not_share_limits() {
+        let mut limits = limits();
+        limits.groups.insert("alpha".into(), BTreeSet::new());
+        limits.teams.insert("beta".into(), BTreeSet::new());
+        assert!(!limits.permits(&user(&["alpha"]), &resource("git", "repo", "org/a")));
+        assert!(!limits.permits(&workload("beta"), &resource("git", "repo", "org/b")));
+        limits.groups.remove(&GroupId::from("alpha"));
+        limits.teams.remove(&TeamId::from("beta"));
+        assert!(!limits.permits(&user(&["alpha"]), &resource("git", "repo", "org/a")));
+        assert!(!limits.permits(&workload("beta"), &resource("git", "repo", "org/b")));
+    }
+
+    #[test]
+    fn a_user_reaches_any_of_their_groups_limits() {
+        let limits = limits();
+        assert!(limits.permits(
+            &user(&["unlisted", "beta"]),
+            &resource("git", "repo", "org/b")
+        ));
+    }
+
+    #[test]
+    fn a_team_and_a_group_with_the_same_name_do_not_share_a_surface() {
+        let surface = Surface {
+            name: "s".into(),
+            tools: BTreeSet::new(),
+            teams: ["alpha".into()].into(),
+            groups: ["beta".into()].into(),
+            principals: PrincipalRestriction::AnyInTeamsAndGroups,
+        };
+        assert!(surface.permits(&workload("alpha")));
+        assert!(surface.permits(&user(&["beta"])));
+        assert!(!surface.permits(&user(&["alpha"])));
+        assert!(!surface.permits(&workload("beta")));
     }
 }

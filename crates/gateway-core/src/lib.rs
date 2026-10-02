@@ -5,18 +5,19 @@
 //! it depends on no HTTP, MCP, database or async-runtime crate. That is what lets its tests run
 //! in seconds with nothing else running.
 //!
-//! The interface is [decision 0006](https://github.com/ambientself/switchboard/blob/main/docs/decisions/0006-what-the-decision-function-sees.md):
-//! [`decide`] takes a [`CallContext`] and returns a [`Decision`].
+//! The interface is decision 0006, `docs/decisions/0006-what-the-decision-function-sees.md` in
+//! this repository: [`decide`] takes a [`CallContext`] and returns a [`Decision`].
 //!
-//! Three guarantees are carried by types rather than by checks, and each has a compile-fail
-//! test under `tests/compile-fail`:
+//! Guarantees carried by types rather than by checks, each with compile-fail tests under
+//! `tests/compile-fail`:
 //!
 //! - A [`Proved`] value can only be made by a [`Verifier`], so a [`Claimed`] value or a header
-//!   cannot be passed where a proved one is required. See [`proof`].
+//!   cannot be passed where a proved one is required. See [`proof`] for what that does and
+//!   does not establish.
 //! - A [`Classification`] has no unset state, and an [`ApprovedTool`] cannot be built from
 //!   text that has not been parsed into one.
-//! - Running a tool requires an [`AuditGuard`], which only [`audit::begin`] returns, after the
-//!   audit row is written. See [`audit`].
+//! - A denial's sentence, running a tool, and completing a row each require a value that only
+//!   the step before can make, starting from the audit begin step. See [`audit`].
 
 #![forbid(unsafe_code)]
 
@@ -28,22 +29,23 @@ mod names;
 mod policy;
 mod principal;
 pub mod proof;
-pub mod sentences;
+mod sentences;
 
 pub use audit::{AuditGuard, AuditRecord, AuditStore};
 pub use classification::{Classification, UnrecognizedClassification};
-pub use connector::Connector;
+pub use connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
 pub use decision::{
     CallContext, CallerContext, Decision, DelegationProblem, Reason, ReasonKind, ResourceProblem,
     Verdict, decide, list_tools,
 };
 pub use names::{
-    ConnectorName, DeploymentName, GroupId, Issuer, Person, PolicyRevision, ProfileName, Subject,
-    SurfaceName, TeamId, ToolName, ToolUseId,
+    ConnectorName, DeploymentName, GroupId, InvalidToolName, Issuer, MAX_TOOL_NAME, Person,
+    PolicyRevision, ProfileName, RequestedTool, Subject, SurfaceName, TeamId, ToolName, ToolUseId,
 };
 pub use policy::{
-    ApprovedTool, PolicySnapshot, Profile, Resource, ResourceLimits, Resources, SnapshotData,
-    SnapshotError, Surface,
+    ApprovedTool, PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration,
+    ResourceLimits, Resources, SnapshotData, SnapshotError, Surface,
 };
 pub use principal::{Delegation, Principal, PrincipalId, PrincipalKind};
-pub use proof::{Claimed, Provable, Proved, Verifier};
+pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
+pub use sentences::IDENTITY_FAILURE;

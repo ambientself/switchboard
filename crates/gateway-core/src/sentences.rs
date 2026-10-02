@@ -5,50 +5,67 @@
 //! The text rendered here is both what the caller receives and what the audit record stores,
 //! so the two cannot drift apart.
 //!
-//! Section 10 of the design names three families: named refusals from the decision function,
-//! one opaque sentence for every identity failure, and a distinct one for an audit failure.
+//! The module is private. A denial's sentence leaves the crate only on a
+//! [`Refusal`](crate::audit::Refusal), after its row is written; the audit-failure sentence only
+//! through [`AuditFailure::sentence`](crate::audit::AuditFailure::sentence); and the identity
+//! failure sentence, which no decision produces, is re-exported as
+//! [`IDENTITY_FAILURE`](crate::IDENTITY_FAILURE).
+//!
+//! Every value put into a sentence passes through [`safe`]: control characters, non-ASCII and
+//! backticks are escaped and the length is capped, because some of these values (the tool and
+//! surface a request names, a resource identifier) are chosen by the caller.
 
+use crate::classification::Classification;
 use crate::decision::{DelegationProblem, Reason, ResourceProblem};
+use crate::names::MAX_TOOL_NAME;
 use crate::principal::{Principal, PrincipalKind};
 
-/// The tool is not approved on any surface.
-pub const UNKNOWN_TOOL: &str = "Tool `{tool}` is not an approved tool. Call `tools/list` on surface `{surface}` to see the tools you may call.";
+/// The profile the context names is not in the snapshot.
+const PROFILE_UNKNOWN: &str = "This gateway has no policy profile `{profile}`, so it cannot decide this call and has refused it. This is a fault in the gateway's configuration; report it to the gateway's operators.";
 
-/// The tool is approved, but not on this surface.
-pub const TOOL_NOT_ON_SURFACE: &str = "Tool `{tool}` is not served on surface `{surface}`. Call `tools/list` on surface `{surface}` to see the tools it serves.";
+/// The tool is not approved anywhere, or not on this surface. One sentence for both, so a
+/// caller cannot learn which tool names exist (decision 0007); the audit record keeps the two
+/// kinds apart.
+const TOOL_NOT_AVAILABLE: &str = "Tool `{tool}` is not available on surface `{surface}`. Call `tools/list` to see the tools this surface serves.";
+
+/// The requested name is not a valid tool name. The name is shown escaped and cut short.
+const INVALID_TOOL_NAME: &str = "The requested tool `{tool}` is not a valid tool name: a tool name is 1 to 64 ASCII letters, digits, `_` or `-`. Call `tools/list` to see the tools this surface serves.";
 
 /// The principal may not use the surface.
-pub const SURFACE_NOT_PERMITTED: &str = "Surface `{surface}` is not available to {principal}. Use a surface your team or groups are permitted to use.";
+const SURFACE_NOT_PERMITTED: &str = "Surface `{surface}` is not available to {principal}. Use a surface your team or groups are permitted to use.";
 
 /// The delegation lists its tools, and not this one.
-pub const TOOL_NOT_IN_DELEGATION: &str = "Tool `{tool}` is not among the tools this delegation permits. Call only the tools the delegation lists.";
+const TOOL_NOT_IN_DELEGATION: &str = "Tool `{tool}` is not among the tools this delegation permits. Call only the tools the delegation lists.";
 
 /// The profile requires a delegation, and there was none.
-pub const DELEGATION_MISSING: &str = "Profile `{profile}` requires a delegation saying whom this call acts for, and the call carried none. Present the delegation issued for this work.";
+const DELEGATION_MISSING: &str = "Profile `{profile}` requires a delegation saying whom this call acts for, and the call carried none. Present the delegation issued for this work.";
 
 /// The delegation's team is not the principal's.
-pub const DELEGATION_TEAM_MISMATCH: &str = "The delegation was issued for team `{delegated_team}`, but the caller is proved to belong to team `{proved_team}`. Present a delegation issued for team `{proved_team}`.";
+const DELEGATION_TEAM_MISMATCH: &str = "The delegation was issued for team `{delegated_team}`, but the caller is proved to belong to team `{proved_team}`. Present a delegation issued for team `{proved_team}`.";
 
 /// A delegation was presented by a user, who has no team.
-pub const DELEGATION_WITHOUT_TEAM: &str = "The delegation was issued for team `{delegated_team}`, but the caller is user `{subject}` from issuer `{issuer}`, who belongs to no team. Only a workload of the team a delegation was issued for may present it.";
+const DELEGATION_WITHOUT_TEAM: &str = "The delegation was issued for team `{delegated_team}`, but the caller is user `{subject}` from issuer `{issuer}`, who belongs to no team. Only a workload of the team a delegation was issued for may present it.";
 
 /// The tool is destructive. Its own sentence, because no profile can change the answer.
-pub const DESTRUCTIVE: &str = "Tool `{tool}` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change.";
+const DESTRUCTIVE: &str = "Tool `{tool}` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change.";
 
 /// The profile does not permit the tool's classification.
-pub const CLASSIFICATION_NOT_PERMITTED: &str = "Tool `{tool}` is classified `{classification}`, which profile `{profile}` does not permit. Choose a tool whose classification this profile permits.";
+const CLASSIFICATION_NOT_PERMITTED: &str = "Tool `{tool}` is classified `{classification}`, which profile `{profile}` does not permit. Choose a tool whose classification this profile permits.";
 
 /// A named resource is outside the caller's limit.
-pub const RESOURCE_OUTSIDE_LIMIT: &str = "Tool `{tool}` names {system} {kind} `{identifier}`, which is outside what {principal} may reach. Name only resources within that limit.";
+const RESOURCE_OUTSIDE_LIMIT: &str = "Tool `{tool}` names {system} {kind} `{identifier}`, which is outside what {principal} may reach. Name only resources within that limit.";
 
 /// The resources are unknown and the tool does not check its own scope.
-pub const RESOURCES_UNKNOWN: &str = "Tool `{tool}` cannot say which resources this call names before it runs, and it does not check its own scope, so the call cannot be allowed. Call a tool that names the resources it touches.";
+const RESOURCES_UNKNOWN: &str = "Tool `{tool}` cannot say which resources this call names before it runs, and it does not check its own scope, so the call cannot be allowed. Call a tool that names the resources it touches.";
+
+/// The tool declares its resources and the call named none.
+const RESOURCES_NONE_NAMED: &str = "Tool `{tool}` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for.";
 
 /// How a workload is named inside another sentence.
-pub const WORKLOAD: &str = "workload `{subject}` of team `{team}` from issuer `{issuer}`";
+const WORKLOAD: &str = "workload `{subject}` of team `{team}` from issuer `{issuer}`";
 
 /// How a user is named inside another sentence.
-pub const USER: &str = "user `{subject}` from issuer `{issuer}`";
+const USER: &str = "user `{subject}` from issuer `{issuer}`";
 
 /// The one sentence for every identity failure. Which check failed is logged for operators and
 /// never returned, so a caller cannot learn which subjects exist or why a token was refused.
@@ -56,12 +73,17 @@ pub const IDENTITY_FAILURE: &str =
     "The gateway could not verify who is calling, so the call was refused.";
 
 /// The sentence for a call refused because its audit row could not be written.
-pub const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
+pub(crate) const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
 
-/// Every complete-sentence template, for tests that check them all.
-pub const SENTENCES: [&str; 13] = [
-    UNKNOWN_TOOL,
-    TOOL_NOT_ON_SURFACE,
+/// The longest a value is rendered, in characters after escaping, before it is cut short.
+pub(crate) const MAX_RENDERED: usize = 128;
+
+/// Every complete-sentence template, for the tests that check them all.
+#[cfg(test)]
+const SENTENCES: [&str; 15] = [
+    PROFILE_UNKNOWN,
+    TOOL_NOT_AVAILABLE,
+    INVALID_TOOL_NAME,
     SURFACE_NOT_PERMITTED,
     TOOL_NOT_IN_DELEGATION,
     DELEGATION_MISSING,
@@ -71,33 +93,53 @@ pub const SENTENCES: [&str; 13] = [
     CLASSIFICATION_NOT_PERMITTED,
     RESOURCE_OUTSIDE_LIMIT,
     RESOURCES_UNKNOWN,
+    RESOURCES_NONE_NAMED,
     IDENTITY_FAILURE,
     AUDIT_FAILURE,
 ];
 
 /// The sentence for `reason`.
 pub(crate) fn render(reason: &Reason) -> String {
-    match reason {
-        Reason::UnknownTool { tool, surface } => fill(
-            UNKNOWN_TOOL,
-            &[("tool", tool.as_str()), ("surface", surface.as_str())],
-        ),
+    use Piece::Text;
+    let rendered = match reason {
+        Reason::ProfileUnknown { profile } => {
+            fill(PROFILE_UNKNOWN, &[("profile", Text(profile.as_str()))])
+        }
+        Reason::UnknownTool { tool, surface } => match tool.name() {
+            Ok(name) => fill(
+                TOOL_NOT_AVAILABLE,
+                &[
+                    ("tool", Text(name.as_str())),
+                    ("surface", Text(surface.as_str())),
+                ],
+            ),
+            Err(_) => fill(
+                INVALID_TOOL_NAME,
+                &[("tool", Piece::Capped(tool.as_str(), MAX_TOOL_NAME))],
+            ),
+        },
         Reason::ToolNotOnSurface { tool, surface } => fill(
-            TOOL_NOT_ON_SURFACE,
-            &[("tool", tool.as_str()), ("surface", surface.as_str())],
-        ),
-        Reason::SurfaceNotPermitted { surface, principal } => fill(
-            SURFACE_NOT_PERMITTED,
+            TOOL_NOT_AVAILABLE,
             &[
-                ("surface", surface.as_str()),
-                ("principal", &describe(principal)),
+                ("tool", Text(tool.as_str())),
+                ("surface", Text(surface.as_str())),
             ],
         ),
+        Reason::SurfaceNotPermitted { surface, principal } => {
+            let principal = describe(principal);
+            fill(
+                SURFACE_NOT_PERMITTED,
+                &[
+                    ("surface", Text(surface.as_str())),
+                    ("principal", Piece::Rendered(&principal)),
+                ],
+            )
+        }
         Reason::ToolNotInDelegation { tool } => {
-            fill(TOOL_NOT_IN_DELEGATION, &[("tool", tool.as_str())])
+            fill(TOOL_NOT_IN_DELEGATION, &[("tool", Text(tool.as_str()))])
         }
         Reason::DelegationDisagrees(DelegationProblem::Missing { profile }) => {
-            fill(DELEGATION_MISSING, &[("profile", profile.as_str())])
+            fill(DELEGATION_MISSING, &[("profile", Text(profile.as_str()))])
         }
         Reason::DelegationDisagrees(DelegationProblem::TeamMismatch {
             proved_team,
@@ -105,8 +147,8 @@ pub(crate) fn render(reason: &Reason) -> String {
         }) => fill(
             DELEGATION_TEAM_MISMATCH,
             &[
-                ("proved_team", proved_team.as_str()),
-                ("delegated_team", delegated_team.as_str()),
+                ("proved_team", Text(proved_team.as_str())),
+                ("delegated_team", Text(delegated_team.as_str())),
             ],
         ),
         Reason::DelegationDisagrees(DelegationProblem::PrincipalHasNoTeam {
@@ -115,65 +157,113 @@ pub(crate) fn render(reason: &Reason) -> String {
         }) => fill(
             DELEGATION_WITHOUT_TEAM,
             &[
-                ("delegated_team", delegated_team.as_str()),
-                ("subject", principal.subject.as_str()),
-                ("issuer", principal.issuer.as_str()),
+                ("delegated_team", Text(delegated_team.as_str())),
+                ("subject", Text(principal.subject.as_str())),
+                ("issuer", Text(principal.issuer.as_str())),
             ],
         ),
         Reason::ClassificationNotPermitted {
             tool,
+            classification: Classification::Destructive,
+            ..
+        } => fill(DESTRUCTIVE, &[("tool", Text(tool.as_str()))]),
+        Reason::ClassificationNotPermitted {
+            tool,
             classification,
             profile,
-        } => match classification {
-            crate::Classification::Destructive => fill(DESTRUCTIVE, &[("tool", tool.as_str())]),
-            _ => fill(
-                CLASSIFICATION_NOT_PERMITTED,
-                &[
-                    ("tool", tool.as_str()),
-                    ("classification", classification.as_str()),
-                    ("profile", profile.as_str()),
-                ],
-            ),
-        },
+        } => fill(
+            CLASSIFICATION_NOT_PERMITTED,
+            &[
+                ("tool", Text(tool.as_str())),
+                ("classification", Text(classification.as_str())),
+                ("profile", Text(profile.as_str())),
+            ],
+        ),
         Reason::ResourceOutsideLimit(ResourceProblem::Outside {
             tool,
             resource,
             principal,
-        }) => fill(
-            RESOURCE_OUTSIDE_LIMIT,
-            &[
-                ("tool", tool.as_str()),
-                ("system", &resource.system),
-                ("kind", &resource.kind),
-                ("identifier", &resource.identifier),
-                ("principal", &describe(principal)),
-            ],
-        ),
-        Reason::ResourceOutsideLimit(ResourceProblem::Unknown { tool }) => {
-            fill(RESOURCES_UNKNOWN, &[("tool", tool.as_str())])
+        }) => {
+            let principal = describe(principal);
+            fill(
+                RESOURCE_OUTSIDE_LIMIT,
+                &[
+                    ("tool", Text(tool.as_str())),
+                    ("system", Text(&resource.system)),
+                    ("kind", Text(&resource.kind)),
+                    ("identifier", Text(&resource.identifier)),
+                    ("principal", Piece::Rendered(&principal)),
+                ],
+            )
         }
-    }
+        Reason::ResourceOutsideLimit(ResourceProblem::Unknown { tool }) => {
+            fill(RESOURCES_UNKNOWN, &[("tool", Text(tool.as_str()))])
+        }
+        Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { tool }) => {
+            fill(RESOURCES_NONE_NAMED, &[("tool", Text(tool.as_str()))])
+        }
+    };
+    rendered.0
 }
 
-fn describe(principal: &Principal) -> String {
+fn describe(principal: &Principal) -> Rendered {
+    use Piece::Text;
     let id = &principal.id;
     match &principal.kind {
         PrincipalKind::Workload { team } => fill(
             WORKLOAD,
             &[
-                ("subject", id.subject.as_str()),
-                ("team", team.as_str()),
-                ("issuer", id.issuer.as_str()),
+                ("subject", Text(id.subject.as_str())),
+                ("team", Text(team.as_str())),
+                ("issuer", Text(id.issuer.as_str())),
             ],
         ),
         PrincipalKind::User { .. } => fill(
             USER,
             &[
-                ("subject", id.subject.as_str()),
-                ("issuer", id.issuer.as_str()),
+                ("subject", Text(id.subject.as_str())),
+                ("issuer", Text(id.issuer.as_str())),
             ],
         ),
     }
+}
+
+/// Text already built by [`fill`], whose values were made safe when it was.
+struct Rendered(String);
+
+/// A value for a placeholder.
+enum Piece<'a> {
+    /// Untrusted text: made safe and capped at [`MAX_RENDERED`].
+    Text(&'a str),
+    /// Untrusted text: made safe and capped at the given length.
+    Capped(&'a str, usize),
+    /// A fragment [`fill`] already rendered, inserted as it is.
+    Rendered(&'a Rendered),
+}
+
+/// `text` made safe to put inside a sentence or an audit column: printable ASCII stays as it
+/// is, a backtick becomes `` \` `` so it cannot close a code span, and anything else (newlines,
+/// other control characters, non-ASCII) is written as an escape. The result is cut at `cap`
+/// characters and marked with `…`.
+pub(crate) fn safe(text: &str, cap: usize) -> String {
+    let mut out = String::new();
+    let mut length = 0;
+    for character in text.chars() {
+        let piece: String = match character {
+            '`' => "\\`".to_owned(),
+            ' ' => " ".to_owned(),
+            c if c.is_ascii_graphic() => c.to_string(),
+            c => c.escape_default().collect(),
+        };
+        let added = piece.chars().count();
+        if length + added > cap {
+            out.push('…');
+            return out;
+        }
+        out.push_str(&piece);
+        length += added;
+    }
+    out
 }
 
 /// Replaces each `{name}` in `template` with its value, in one pass over the template.
@@ -181,7 +271,7 @@ fn describe(principal: &Principal) -> String {
 /// Values are copied in, never scanned, so a tool name that itself contains `{surface}`
 /// cannot pull another value into the sentence. A placeholder with no value is left as it is,
 /// where a test will see it.
-fn fill(template: &str, values: &[(&str, &str)]) -> String {
+fn fill(template: &str, values: &[(&str, Piece<'_>)]) -> Rendered {
     let mut sentence = String::with_capacity(template.len() + 64);
     let mut rest = template;
     while let Some(open) = rest.find('{') {
@@ -193,18 +283,28 @@ fn fill(template: &str, values: &[(&str, &str)]) -> String {
         };
         let name = &after[..close];
         match values.iter().find(|(key, _)| *key == name) {
-            Some((_, value)) => sentence.push_str(value),
+            Some((_, Piece::Text(value))) => sentence.push_str(&safe(value, MAX_RENDERED)),
+            Some((_, Piece::Capped(value, cap))) => sentence.push_str(&safe(value, *cap)),
+            Some((_, Piece::Rendered(value))) => sentence.push_str(&value.0),
             None => sentence.push_str(&rest[open..open + close + 2]),
         }
         rest = &after[close + 1..];
     }
     sentence.push_str(rest);
-    sentence
+    Rendered(sentence)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text(template: &str, values: &[(&str, &str)]) -> String {
+        let pieces: Vec<(&str, Piece<'_>)> = values
+            .iter()
+            .map(|(key, value)| (*key, Piece::Text(value)))
+            .collect();
+        fill(template, &pieces).0
+    }
 
     #[test]
     fn every_template_is_a_complete_sentence() {
@@ -222,16 +322,18 @@ mod tests {
         }
     }
 
+    /// Pinned as literal text: the constants are the thing under test, so comparing a constant
+    /// with itself would prove nothing.
     #[test]
-    fn the_three_families_are_distinct() {
-        let named: Vec<&str> = SENTENCES
-            .iter()
-            .copied()
-            .filter(|s| *s != IDENTITY_FAILURE && *s != AUDIT_FAILURE)
-            .collect();
-        assert_ne!(IDENTITY_FAILURE, AUDIT_FAILURE);
-        assert!(!named.contains(&IDENTITY_FAILURE));
-        assert!(!named.contains(&AUDIT_FAILURE));
+    fn the_two_fixed_sentences_say_what_they_should() {
+        assert_eq!(
+            IDENTITY_FAILURE,
+            "The gateway could not verify who is calling, so the call was refused."
+        );
+        assert_eq!(
+            AUDIT_FAILURE,
+            "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later."
+        );
         assert!(
             !IDENTITY_FAILURE.contains('{'),
             "the opaque sentence must not vary"
@@ -241,7 +343,7 @@ mod tests {
     #[test]
     fn fill_replaces_every_occurrence() {
         assert_eq!(
-            fill("{a} and {b}, then {a}.", &[("a", "x"), ("b", "y")]),
+            text("{a} and {b}, then {a}.", &[("a", "x"), ("b", "y")]),
             "x and y, then x."
         );
     }
@@ -249,15 +351,40 @@ mod tests {
     #[test]
     fn fill_does_not_expand_placeholders_inside_values() {
         assert_eq!(
-            fill(TOOL_NOT_IN_DELEGATION, &[("tool", "{tool}")]),
+            text(TOOL_NOT_IN_DELEGATION, &[("tool", "{tool}")]),
             "Tool `{tool}` is not among the tools this delegation permits. Call only the tools the delegation lists."
         );
-        assert_eq!(fill("{a}{b}", &[("a", "{b}"), ("b", "z")]), "{b}z");
+        assert_eq!(text("{a}{b}", &[("a", "{b}"), ("b", "z")]), "{b}z");
     }
 
     #[test]
     fn fill_leaves_an_unknown_or_unclosed_placeholder_visible() {
-        assert_eq!(fill("x {nope} y.", &[]), "x {nope} y.");
-        assert_eq!(fill("x {open", &[]), "x {open");
+        assert_eq!(text("x {nope} y.", &[]), "x {nope} y.");
+        assert_eq!(text("x {open", &[]), "x {open");
+    }
+
+    #[test]
+    fn safe_escapes_what_is_not_printable_ascii() {
+        assert_eq!(safe("org/repo-1_A.b", 64), "org/repo-1_A.b");
+        assert_eq!(safe("a b", 64), "a b");
+        assert_eq!(safe("a\nb", 64), "a\\nb");
+        assert_eq!(safe("a\rb\tc\u{0}", 64), "a\\rb\\tc\\u{0}");
+        assert_eq!(safe("a`b", 64), "a\\`b");
+        assert_eq!(safe("caf\u{e9}", 64), "caf\\u{e9}");
+        assert_eq!(safe("\u{202e}", 64), "\\u{202e}");
+    }
+
+    #[test]
+    fn safe_caps_the_length() {
+        assert_eq!(safe("abcdef", 4), "abcd…");
+        assert_eq!(safe("abcd", 4), "abcd");
+        assert_eq!(safe("ab\ncd", 3), "ab…");
+        let long = safe(&"x".repeat(10_000), MAX_RENDERED);
+        assert_eq!(long.chars().count(), MAX_RENDERED + 1);
+    }
+
+    #[test]
+    fn fill_makes_every_value_safe() {
+        assert_eq!(text("`{a}`.", &[("a", "x\n`y")]), "`x\\n\\`y`.");
     }
 }

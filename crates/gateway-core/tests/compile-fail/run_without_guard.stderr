@@ -1,15 +1,15 @@
-error[E0061]: this method takes 2 arguments but 1 argument was supplied
- --> tests/compile-fail/run_without_guard.rs:6:15
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> tests/compile-fail/run_without_guard.rs:7:5
   |
-6 |     connector.run(arguments).await
-  |               ^^^ --------- argument #1 of type `&AuditGuard` is missing
+7 |     audit::run(connector).await
+  |     ^^^^^^^^^^----------- argument #2 of type `AuditGuard` is missing
   |
-note: method defined here
- --> src/connector.rs
+note: function defined here
+ --> src/audit.rs
   |
-  |     fn run(
-  |        ^^^
+  | pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
+  |              ^^^
 help: provide the argument
   |
-6 |     connector.run(/* &AuditGuard */, arguments).await
-  |                   ++++++++++++++++++
+7 |     audit::run(connector, /* AuditGuard */).await
+  |                         ++++++++++++++++++

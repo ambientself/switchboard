@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `ToolName: From<&str>` is not satisfied
+ --> tests/compile-fail/tool_name_unchecked.rs:6:11
+  |
+6 |     (text.into(), ToolName::new(text))
+  |           ^^^^ the trait `From<&str>` is not implemented for `ToolName`
+  |
+  = note: required for `&str` to implement `Into<ToolName>`
+
+error[E0599]: no associated function or constant named `new` found for struct `ToolName` in the current scope
+ --> tests/compile-fail/tool_name_unchecked.rs:6:29
+  |
+6 |     (text.into(), ToolName::new(text))
+  |                             ^^^ associated function or constant not found in `ToolName`
+  |
+note: if you're trying to build a new `ToolName`, consider using `ToolName::parse` which returns `Result<ToolName, InvalidToolName>`
+ --> src/names.rs
+  |
+  |     pub fn parse(value: &str) -> Result<Self, InvalidToolName> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: there is a method `ne` with a similar name
+  |
+6 -     (text.into(), ToolName::new(text))
+6 +     (text.into(), ToolName::ne(text))
+  |

@@ -1,3 +1,6 @@
+# An exact version, not `stable`: the compile-fail tests compare compiler output, which can
+# change wording between releases. Bumping this pin is a deliberate change that regenerates
+# crates/gateway-core/tests/compile-fail/*.stderr; see CONTRIBUTING.md.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]

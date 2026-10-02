@@ -1,15 +1,24 @@
 //! Runs every case in `decision_table.json` and reports every case that fails, by name.
+//!
+//! Each case goes the whole way a call goes: decided, then begun against an in-memory audit
+//! store. The sentence checked is the one on the [`Refusal`](gateway_core::audit::Refusal),
+//! because that is the only place a denial's sentence can be had, and every column of the row
+//! is checked against what the case says.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use gateway_core::audit::{self, Begun, DecisionKind, RequestMetadata};
 use gateway_core::{
-    CallContext, CallerContext, Delegation, DeploymentName, PolicySnapshot, Principal, ProfileName,
-    ReasonKind, Resources, SnapshotData, SurfaceName, ToolName, Verdict, decide, list_tools,
+    AuditRecord, CallContext, CallerContext, Claimed, Delegation, DeploymentName, PolicySnapshot,
+    Principal, ProfileName, ReasonKind, RequestedTool, Resources, SnapshotData, SurfaceName,
+    TeamId, ToolName, WasProved, decide, list_tools,
 };
 use serde::Deserialize;
+
+use common::MemoryStore;
 
 const TABLE: &str = include_str!("decision_table.json");
 
@@ -49,7 +58,7 @@ struct Case {
     delegation: Option<String>,
     profile: ProfileName,
     surface: SurfaceName,
-    tool: ToolName,
+    tool: RequestedTool,
     resources: Resources,
     expect: Expected,
 }
@@ -110,7 +119,7 @@ struct World {
 
 impl World {
     /// Builds the caller's context the way the gateway will: the principal and delegation
-    /// through a verifier, the profile selected from the snapshot.
+    /// through a verifier. The profile is only named; the decision finds it in the snapshot.
     fn caller(&self, caller: Caller<'_>) -> Result<(&PolicySnapshot, CallerContext), String> {
         let snapshot = self
             .snapshots
@@ -128,15 +137,12 @@ impl World {
                     .ok_or_else(|| format!("no delegation `{name}`"))?,
             ),
         };
-        let profile = snapshot
-            .profile(caller.profile)
-            .ok_or_else(|| format!("no profile `{}`", caller.profile))?;
         Ok((
             snapshot,
             CallerContext {
                 principal: common::proved(principal),
                 delegation: delegation.map(common::proved),
-                profile: profile.clone(),
+                profile: caller.profile.clone(),
                 surface: caller.surface.clone(),
                 deployment: self.deployment.clone(),
             },
@@ -173,21 +179,64 @@ fn load() -> (World, Vec<Case>, Vec<ListCase>) {
     (world, table.cases, table.lists)
 }
 
-fn observed(verdict: &Verdict) -> Expected {
-    match verdict {
-        Verdict::Allow(_) => Expected::Allow,
-        Verdict::Deny { reason, .. } => Expected::Deny {
-            reason: reason.kind(),
-            sentence: reason.sentence(),
-        },
-    }
+/// The row a case should leave, built from the case and the world, not from the decision.
+fn expected_row(
+    world: &World,
+    snapshot: &PolicySnapshot,
+    case: &Case,
+    metadata: &RequestMetadata,
+) -> AuditRecord {
+    let principal = &world.principals[&case.principal];
+    let delegation = case
+        .delegation
+        .as_ref()
+        .map(|name| &world.delegations[name]);
+    let served = case
+        .tool
+        .name()
+        .ok()
+        .and_then(|name| snapshot.surface(&case.surface)?.tools.get(&name).cloned())
+        .and_then(|name| snapshot.tool(&name).cloned());
+    let (decision, reason, sentence) = match &case.expect {
+        Expected::Allow => (DecisionKind::Allow, None, None),
+        Expected::Deny { reason, sentence } => {
+            (DecisionKind::Deny, Some(*reason), Some(sentence.clone()))
+        }
+    };
+    let row = serde_json::json!({
+        "tool_use_id": metadata.tool_use_id,
+        "deployment": world.deployment,
+        // Every requested surface and tool in the table is printable ASCII apart from the
+        // escaping cases, whose rows are checked by `hostile_requests_are_escaped_in_the_row`.
+        "surface": escape(case.surface.as_str()),
+        "profile": case.profile,
+        "tool": escape(case.tool.as_str()),
+        "connector": served.as_ref().map(|tool| tool.connector.clone()),
+        "classification": served.as_ref().map(|tool| tool.classification),
+        "decision": decision,
+        "reason": reason,
+        "sentence": sentence,
+        "policy_revision": snapshot.revision(),
+        "proved_principal": principal,
+        "proved_delegation_team": delegation.map(|delegation| &delegation.team),
+        "claimed_acting_person": delegation.map(|delegation| &delegation.acting_person),
+        "claimed_team": metadata.claimed_team,
+        "completion": null,
+    });
+    serde_json::from_value(row).expect("the expected row does not deserialize")
+}
+
+/// The table's own escaping, written out independently of the crate's: the only characters
+/// the table uses that need it are newlines and backticks.
+fn escape(text: &str) -> String {
+    text.replace('`', "\\`").replace('\n', "\\n")
 }
 
 #[test]
 fn every_decision_case_holds() {
     let (world, cases, _) = load();
     let mut failures = Vec::new();
-    for case in &cases {
+    for (index, case) in cases.iter().enumerate() {
         let (snapshot, caller) = match world.caller(case.caller()) {
             Ok(found) => found,
             Err(error) => {
@@ -201,15 +250,42 @@ fn every_decision_case_holds() {
             resources: case.resources.clone(),
         };
         let decision = decide(snapshot, &call);
-        let got = observed(decision.verdict());
+        if decision.policy_revision() != snapshot.revision() {
+            failures.push(format!("case `{}`: wrong policy revision", case.name));
+        }
+        let metadata = RequestMetadata {
+            tool_use_id: Some(format!("toolu-{index}").as_str().into()),
+            claimed_team: Some(Claimed::new(TeamId::from("claimed-team"))),
+        };
+        let store = MemoryStore::default();
+        let begun = common::ready(audit::begin(
+            &store,
+            decision,
+            serde_json::json!({"case": index}),
+            metadata.clone(),
+        ))
+        .expect("the in-memory store refused a row");
+        let got = match &begun {
+            Begun::Allowed(_) => Expected::Allow,
+            Begun::Denied(refusal) => Expected::Deny {
+                reason: refusal.reason().kind(),
+                sentence: refusal.sentence().to_owned(),
+            },
+        };
         if got != case.expect {
             failures.push(format!(
                 "case `{}`:\n    expected {:?}\n    got      {:?}",
                 case.name, case.expect, got
             ));
+            continue;
         }
-        if decision.policy_revision() != snapshot.revision() {
-            failures.push(format!("case `{}`: wrong policy revision", case.name));
+        let rows = store.rows();
+        let want = expected_row(&world, snapshot, case, &metadata);
+        if rows != [want.clone()] {
+            failures.push(format!(
+                "case `{}`: the audit row is wrong\n    expected {want:?}\n    got      {rows:?}",
+                case.name
+            ));
         }
     }
     assert!(
@@ -296,4 +372,17 @@ fn the_table_covers_every_reason_and_profile() {
             );
         }
     }
+}
+
+/// `WasProved` is what a row reads back as; the expected row is built through JSON, so make
+/// sure that conversion means what the comparison assumes.
+#[test]
+fn an_expected_row_reads_proved_columns_as_was_proved() {
+    let (world, cases, _) = load();
+    let case = &cases[0];
+    let (snapshot, _) = world.caller(case.caller()).unwrap();
+    let row = expected_row(&world, snapshot, case, &RequestMetadata::default());
+    let principal: &Principal = row.proved_principal.get();
+    assert_eq!(principal, &world.principals[&case.principal]);
+    let _: Option<WasProved<TeamId>> = row.proved_delegation_team;
 }

@@ -15,8 +15,9 @@ Gateway
 
 **Status: conformance baseline.** The suite passes against the Otto Go gateway pinned at
 `752395a` (re-pinned 2026-10-01). It covers Otto's contract only, and not all of it; the
-gaps are listed in [docs/otto-baseline.md](docs/otto-baseline.md). The Rust gateway is not
-implemented yet.
+gaps are listed in [docs/otto-baseline.md](docs/otto-baseline.md). The Rust gateway's policy
+core exists (`crates/gateway-core`: the decision function, its table of cases and the audit
+record type), but nothing serves requests yet.
 
 Run the baseline with `python3 conformance/run.py --otto-source /path/to/otto`.
 See [conformance setup and coverage](conformance/README.md).

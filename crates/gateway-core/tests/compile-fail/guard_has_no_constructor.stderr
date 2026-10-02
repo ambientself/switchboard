@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `new` found for struct `AuditGuard` in the current scope
+ --> tests/compile-fail/guard_has_no_constructor.rs:7:17
+  |
+7 |     AuditGuard::new(AuditRowId::new("never written"), call, tool)
+  |                 ^^^ associated function or constant not found in `AuditGuard`
