@@ -1,0 +1,27 @@
+[package]
+name = "gateway-testkit"
+version = "0.1.0"
+description = "Fakes and fixtures for testing the gateway with no network, no database and no real credential: an in-memory audit store, a credential source, a fixture connector, a local token issuer and a clock."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Test support, never part of a running gateway. It is the one crate that creates key pairs, so
+# the key-generation crates live here and nowhere else.
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+gateway-identity = { path = "../gateway-identity" }
+base64 = "0.22"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+p256 = "0.13"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rsa = "0.9"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

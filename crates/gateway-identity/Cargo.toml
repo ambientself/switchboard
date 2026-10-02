@@ -1,0 +1,35 @@
+[package]
+name = "gateway-identity"
+version = "0.1.0"
+description = "The gateway's identity verifier: signed tokens in, proved principals out, from a fixed list of issuers. No network I/O."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Verification is offline (design section 7): keys arrive as a JWK set in configuration and
+# nothing here opens a socket. Keep HTTP clients out of this list; fetching and caching keys is
+# a later issue and belongs in the crate that does it.
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+# Already in the build through `jsonwebtoken`. Used once, to read the header's `alg` when
+# `jsonwebtoken` cannot parse the header, so a `none` or unknown algorithm is reported as that
+# and not as a malformed token.
+base64 = "0.22"
+# Exactly one crypto backend, the pure-Rust one. `jsonwebtoken` panics on first use if both
+# backends are enabled anywhere in the build, so the workspace enables only this one. The
+# default `use_pem` feature is off: keys arrive as JWKs, never as PEM.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+serde_json = "1"
+thiserror = "2"
+
+# The testkit depends on this crate (its local issuer builds this crate's configuration), so
+# this dev-dependency is a cycle. Cargo allows it for integration tests, which link the one
+# library; unit tests inside `src/` must not use the testkit, because they would see a second
+# copy of this crate whose types do not match.
+[dev-dependencies]
+gateway-testkit = { path = "../gateway-testkit" }
+proptest = "1"
+
+[lints]
+workspace = true

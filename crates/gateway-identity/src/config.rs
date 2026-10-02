@@ -1,0 +1,153 @@
+//! What a deployment configures: a fixed list of issuers, or an explicit decision not to check.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use gateway_core::{Issuer, Subject, TeamId};
+use jsonwebtoken::jwk::JwkSet;
+use thiserror::Error;
+
+/// The claim a user issuer's groups are read from unless configuration names another.
+pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
+
+/// The one signing algorithm an issuer's tokens may use. Deliberately only two: a token's
+/// header never chooses its algorithm, the issuer's configuration does, and there is no
+/// `none` and no HMAC to choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SigningAlgorithm {
+    /// RSASSA-PKCS1-v1_5 with SHA-256; keys are RSA.
+    Rs256,
+    /// ECDSA with P-256 and SHA-256; keys are on the P-256 curve.
+    Es256,
+}
+
+impl SigningAlgorithm {
+    /// The algorithm's name as a token's `alg` header writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SigningAlgorithm::Rs256 => "RS256",
+            SigningAlgorithm::Es256 => "ES256",
+        }
+    }
+
+    pub(crate) fn jwt(self) -> jsonwebtoken::Algorithm {
+        match self {
+            SigningAlgorithm::Rs256 => jsonwebtoken::Algorithm::RS256,
+            SigningAlgorithm::Es256 => jsonwebtoken::Algorithm::ES256,
+        }
+    }
+}
+
+/// What an issuer's tokens are about, and the facts that come with that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssuerKind {
+    /// A workload issuer, such as a Kubernetes cluster. A token's subject must be in this
+    /// table, which maps it to the team the manifest says it belongs to.
+    Workload {
+        /// Subject to team. A subject not listed is refused, after its signature is checked.
+        subjects: BTreeMap<Subject, TeamId>,
+    },
+    /// A user issuer, such as the company identity provider. Groups come from a claim.
+    User {
+        /// The claim holding the user's groups: an array of strings.
+        groups_claim: String,
+    },
+}
+
+impl IssuerKind {
+    /// A user issuer that reads groups from the claim named [`DEFAULT_GROUPS_CLAIM`].
+    pub fn user() -> Self {
+        IssuerKind::User {
+            groups_claim: DEFAULT_GROUPS_CLAIM.to_owned(),
+        }
+    }
+}
+
+/// One issuer a deployment trusts.
+///
+/// The fields are what design section 7 lists: the issuer string, exact match; its accepted
+/// audiences; its kind; one signing algorithm; its keys, supplied directly; a ceiling on token
+/// lifetime; and a leeway for clock skew. Nothing here is a URL, because nothing in this crate
+/// fetches anything.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IssuerConfig {
+    /// The issuer, matched exactly against a token's `iss`.
+    pub issuer: Issuer,
+    /// The audiences this deployment accepts for this issuer. A token must name at least one.
+    pub audiences: BTreeSet<String>,
+    /// Workload or user, with what each needs.
+    pub kind: IssuerKind,
+    /// The algorithm this issuer signs with. A token whose header says another is refused.
+    pub algorithm: SigningAlgorithm,
+    /// The verification keys. Every key needs a `kid`, which a token must name.
+    pub keys: JwkSet,
+    /// The longest a token may live: `exp - iat` may not exceed it.
+    pub max_lifetime: Duration,
+    /// Clock skew tolerated on `exp`, `nbf` and `iat`.
+    pub leeway: Duration,
+}
+
+/// Whether to verify callers, and against which issuers.
+///
+/// A deployment states one or the other. There is no default and no way to leave both out:
+/// an unconfigured gate is a configuration the caller has to construct on purpose, which is
+/// what lets "we were not checking" be told from "someone tried and was refused" later.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IdentityConfig {
+    /// Verify every caller against these issuers. An empty list is refused.
+    Enforce(Vec<IssuerConfig>),
+    /// Checking was explicitly turned off. The only way a verification can be `disabled`.
+    Disabled,
+}
+
+/// Why identity configuration was refused. Raised when the verifier is built, so a deployment
+/// with bad identity configuration does not start.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ConfigError {
+    /// Enforcement was asked for with no issuer to enforce against.
+    #[error("identity checking is on but no issuer is configured")]
+    NoIssuers,
+    /// Two entries name the same issuer, so which one a token belongs to is ambiguous.
+    #[error("issuer `{0}` is configured more than once")]
+    DuplicateIssuer(Issuer),
+    /// An issuer string that can never match a token.
+    #[error("an issuer is configured with an empty name")]
+    EmptyIssuer,
+    /// An issuer with no audience would accept nothing, or if loosened, everything.
+    #[error("issuer `{0}` has no accepted audience")]
+    NoAudience(Issuer),
+    /// An issuer with a zero ceiling would refuse every token.
+    #[error("issuer `{0}` has a maximum token lifetime of zero")]
+    NoLifetime(Issuer),
+    /// A workload issuer with no subjects would refuse every token.
+    #[error("workload issuer `{0}` has no subjects")]
+    NoSubjects(Issuer),
+    /// A user issuer that reads groups from a claim with no name.
+    #[error("user issuer `{0}` has an empty groups claim name")]
+    EmptyGroupsClaim(Issuer),
+    /// An issuer with no key could never verify a signature.
+    #[error("issuer `{0}` has no keys")]
+    NoKeys(Issuer),
+    /// A key with no `kid`, which a token could not name.
+    #[error("issuer `{0}` has a key with no `kid`")]
+    KeyWithoutId(Issuer),
+    /// Two keys with one `kid`.
+    #[error("issuer `{issuer}` has two keys with `kid` `{kid}`")]
+    DuplicateKeyId {
+        /// The issuer.
+        issuer: Issuer,
+        /// The repeated `kid`.
+        kid: String,
+    },
+    /// A key that is not of the kind, or on the curve, the issuer's algorithm needs, or that
+    /// declares itself for another algorithm or another use.
+    #[error("issuer `{issuer}` key `{kid}` cannot verify {algorithm} signatures")]
+    KeyDoesNotFit {
+        /// The issuer.
+        issuer: Issuer,
+        /// The key.
+        kid: String,
+        /// The algorithm the issuer is configured with.
+        algorithm: &'static str,
+    },
+}
