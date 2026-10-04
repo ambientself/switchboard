@@ -6,17 +6,27 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A tool's fixed label. Every tool has exactly one.
+/// A tool's fixed label. Every tool has exactly one, assigned by the person who approves it.
 ///
 /// There is no unset value and no `Default`: a tool whose classification is missing or
 /// unrecognized cannot be represented, so it cannot be registered and never runs. That removes
 /// the zero-value case Otto's Go gateway has to guard against.
+///
+/// `Write` and `Destructive` are denied in every profile (decision 0006). What a profile can
+/// permit is `Read` and `Propose`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "&'static str")]
 pub enum Classification {
     /// Reads and changes nothing.
     Read,
-    /// Changes something, in a way that can be undone or reviewed.
+    /// Creates something for a person to review, or changes only what the gateway created for
+    /// that purpose: a draft pull request, a comment, a commit to its own proposal branch. It
+    /// never changes, transitions, merges or deploys anything else, so nothing it does takes
+    /// effect until a person acts on it.
+    Propose,
+    /// Changes something directly: a merge, a push to an existing branch, a status transition,
+    /// a configuration change. Denied in every profile, which is how production mutation is
+    /// denied: anything that changes production without a person acting is a `Write` or worse.
     Write,
     /// Destroys something. Denied in every profile.
     Destructive,
@@ -24,8 +34,9 @@ pub enum Classification {
 
 impl Classification {
     /// Every classification, in order.
-    pub const ALL: [Classification; 3] = [
+    pub const ALL: [Classification; 4] = [
         Classification::Read,
+        Classification::Propose,
         Classification::Write,
         Classification::Destructive,
     ];
@@ -34,6 +45,7 @@ impl Classification {
     pub fn as_str(self) -> &'static str {
         match self {
             Classification::Read => "read",
+            Classification::Propose => "propose",
             Classification::Write => "write",
             Classification::Destructive => "destructive",
         }
@@ -46,10 +58,10 @@ impl fmt::Display for Classification {
     }
 }
 
-/// A classification that is not one of `read`, `write` or `destructive`.
+/// A classification that is not one of `read`, `propose`, `write` or `destructive`.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error(
-    "`{0}` is not a classification; a tool must be classified `read`, `write` or `destructive`"
+    "`{0}` is not a classification; a tool must be classified `read`, `propose`, `write` or `destructive`"
 )]
 pub struct UnrecognizedClassification(pub String);
 
@@ -94,7 +106,8 @@ mod tests {
     #[test]
     fn anything_else_is_refused() {
         for text in [
-            "", "Read", "READ", " read", "read ", "admin", "readonly", "none", "null",
+            "", "Read", "READ", " read", "read ", "admin", "readonly", "none", "null", "proposal",
+            "proposes", "Propose",
         ] {
             assert_eq!(
                 text.parse::<Classification>(),

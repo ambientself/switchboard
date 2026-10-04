@@ -69,12 +69,12 @@
     }
   },
   "delegations": {
-    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": null },
+    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__add_comment", "jira__transition_issue"] },
     "payments-turn-narrow": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file"] },
     "payments-turn-empty": { "acting_person": "requester@example.test", "team": "payments", "tools": [] },
-    "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": null },
+    "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__add_comment", "jira__transition_issue"] },
     "search-turn-narrow": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file"] },
-    "inventory-turn": { "acting_person": "requester@example.test", "team": "inventory", "tools": null },
+    "inventory-turn": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["docs__search", "jira__get_issue", "jira__add_comment", "jira__transition_issue"] },
     "inventory-turn-narrow": { "acting_person": "requester@example.test", "team": "inventory", "tools": ["jira__get_issue"] }
   },
   "snapshots": {
@@ -84,18 +84,19 @@
         { "name": "github__get_file", "classification": "read", "connector": "github", "resources": "declared" },
         { "name": "github__search_code", "classification": "read", "connector": "github", "resources": "checks_own_scope" },
         { "name": "github__list_org_repos", "classification": "read", "connector": "github", "resources": "declared" },
-        { "name": "github__open_pull_request", "classification": "write", "connector": "github", "resources": "declared" },
+        { "name": "github__open_pull_request", "classification": "propose", "connector": "github", "resources": "declared" },
         { "name": "github__delete_branch", "classification": "destructive", "connector": "github", "resources": "declared" },
         { "name": "github__delete_repository", "classification": "destructive", "connector": "github", "resources": "declared" },
         { "name": "jira__get_issue", "classification": "read", "connector": "jira", "resources": "declared" },
-        { "name": "jira__create_issue", "classification": "write", "connector": "jira", "resources": "declared" },
+        { "name": "jira__add_comment", "classification": "propose", "connector": "jira", "resources": "declared" },
+        { "name": "jira__transition_issue", "classification": "write", "connector": "jira", "resources": "declared" },
         { "name": "docs__search", "classification": "read", "connector": "docs", "resources": "no_resources" },
-        { "name": "otto__post_status", "classification": "write", "connector": "otto", "resources": "no_resources" }
+        { "name": "otto__post_status", "classification": "propose", "connector": "otto", "resources": "no_resources" }
       ],
       "surfaces": [
         {
           "name": "otto-sandbox",
-          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue"],
+          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__add_comment", "jira__transition_issue"],
           "teams": ["payments", "search"],
           "principals": "any_in_teams_and_groups"
         },
@@ -107,22 +108,22 @@
         },
         {
           "name": "employee",
-          "tools": ["docs__search", "github__get_file", "github__delete_branch", "jira__get_issue", "jira__create_issue"],
+          "tools": ["docs__search", "github__get_file", "github__delete_branch", "jira__get_issue", "jira__add_comment", "jira__transition_issue"],
           "groups": ["engineering", "finance-readers"],
           "principals": "any_in_teams_and_groups"
         },
         {
           "name": "service",
-          "tools": ["docs__search", "jira__get_issue", "jira__create_issue"],
+          "tools": ["docs__search", "jira__get_issue", "jira__add_comment", "jira__transition_issue"],
           "teams": ["inventory", "engineering"],
           "principals": "any_in_teams_and_groups"
         }
       ],
       "profiles": [
-        { "name": "otto", "classifications": ["read", "write"], "requires_delegation": true },
+        { "name": "otto", "classifications": ["read", "propose"], "requires_delegation": true },
         { "name": "employee", "classifications": ["read"], "requires_delegation": false },
-        { "name": "service", "classifications": ["read", "write"], "requires_delegation": false },
-        { "name": "lists-destructive", "classifications": ["read", "write", "destructive"], "requires_delegation": false }
+        { "name": "service", "classifications": ["read", "propose"], "requires_delegation": false },
+        { "name": "lists-everything", "classifications": ["read", "propose", "write", "destructive"], "requires_delegation": false }
       ],
       "limits": {
         "teams": {
@@ -158,7 +159,7 @@
       "expect": { "decision": "allow" }
     },
     {
-      "name": "otto write inside the team's limit is allowed",
+      "name": "otto proposal inside the team's limit is allowed",
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
       "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
@@ -207,9 +208,9 @@
       "expect": { "decision": "allow" }
     },
     {
-      "name": "a service writes within its team's limit",
+      "name": "a service proposes within its team's limit",
       "snapshot": "base", "principal": "inventory-service", "delegation": null,
-      "profile": "service", "surface": "service", "tool": "jira__create_issue",
+      "profile": "service", "surface": "service", "tool": "jira__add_comment",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
       "expect": { "decision": "allow" }
     },
@@ -370,10 +371,10 @@
     {
       "name": "a delegation narrows even where the profile does not require one",
       "snapshot": "base", "principal": "inventory-service", "delegation": "inventory-turn-narrow",
-      "profile": "service", "surface": "service", "tool": "jira__create_issue",
+      "profile": "service", "surface": "service", "tool": "jira__add_comment",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
       "expect": { "decision": "deny", "reason": "tool_not_in_delegation",
-        "sentence": "Tool `jira__create_issue` is not among the tools this delegation permits. Call only the tools the delegation lists." }
+        "sentence": "Tool `jira__add_comment` is not among the tools this delegation permits. Call only the tools the delegation lists." }
     },
     {
       "name": "order: a team mismatch is reported before the delegation's tool list",
@@ -419,25 +420,57 @@
     {
       "name": "a destructive tool is denied even by a profile whose data lists destructive",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
-      "profile": "lists-destructive", "surface": "employee", "tool": "github__delete_branch",
+      "profile": "lists-everything", "surface": "employee", "tool": "github__delete_branch",
       "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
       "expect": { "decision": "deny", "reason": "classification_not_permitted",
         "sentence": "Tool `github__delete_branch` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change." }
     },
     {
-      "name": "the lists-destructive profile still permits what it lists besides destructive",
+      "name": "a direct write is denied in the otto profile",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "jira__transition_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "PAY" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "a direct write is denied in the service profile",
+      "snapshot": "base", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "service", "tool": "jira__transition_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "a direct write is denied even by a profile whose data lists write",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
-      "profile": "lists-destructive", "surface": "employee", "tool": "jira__create_issue",
+      "profile": "lists-everything", "surface": "employee", "tool": "jira__transition_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "a profile whose data lists every classification still permits a proposal",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "lists-everything", "surface": "employee", "tool": "jira__add_comment",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
       "expect": { "decision": "allow" }
     },
     {
-      "name": "a write is denied by a profile that permits only reads",
+      "name": "a proposal is denied by a profile that permits only reads",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
-      "profile": "employee", "surface": "employee", "tool": "jira__create_issue",
+      "profile": "employee", "surface": "employee", "tool": "jira__add_comment",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
       "expect": { "decision": "deny", "reason": "classification_not_permitted",
-        "sentence": "Tool `jira__create_issue` is classified `write`, which profile `employee` does not permit. Choose a tool whose classification this profile permits." }
+        "sentence": "Tool `jira__add_comment` is classified `propose`, which profile `employee` does not permit. Choose a tool whose classification this profile permits." }
+    },
+    {
+      "name": "order: a direct write is reported before a resource outside the limit",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "jira__transition_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
     },
     {
       "name": "order: the delegation's tool list is reported before a destructive classification",
@@ -687,10 +720,16 @@
   ],
   "lists": [
     {
-      "name": "otto sees every non-destructive tool on its surface",
+      "name": "otto sees the reads and proposals on its surface, and no direct write or destructive tool",
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto", "surface": "otto-sandbox",
-      "expect": ["github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
+      "expect": ["github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__add_comment", "jira__get_issue"]
+    },
+    {
+      "name": "a profile whose data lists every classification still lists no direct write or destructive tool",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "lists-everything", "surface": "employee",
+      "expect": ["docs__search", "github__get_file", "jira__add_comment", "jira__get_issue"]
     },
     {
       "name": "a narrowing delegation narrows the list",

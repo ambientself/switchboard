@@ -131,14 +131,12 @@ fn open_up(world: &mut World) {
                 world.delegation = Some(Delegation {
                     acting_person: gateway_core::Claimed::new("requester@example.test".into()),
                     team: team.clone(),
-                    tools: None,
+                    tools: BTreeSet::new(),
                 });
             }
             if let Some(delegation) = &mut world.delegation {
                 delegation.team = team.clone();
-                if let Some(tools) = &mut delegation.tools {
-                    tools.insert(tool.clone());
-                }
+                delegation.tools.insert(tool.clone());
             }
         }
         PrincipalKind::User { .. } => {
@@ -150,8 +148,8 @@ fn open_up(world: &mut World) {
     // Check 0: the context names the snapshot's profile.
     world.profile_name = world.profile.name.clone();
 
-    // Check 5: the profile permits every classification, destructive included, so that only
-    // the destructive rule itself can deny.
+    // Check 5: the profile permits every classification, write and destructive included, so
+    // that only the rule denying those two in every profile can deny.
     world.profile.classifications = Classification::ALL.into_iter().collect();
 
     // Check 6: every named resource is within the limit, and unknown resources are allowed.
@@ -291,15 +289,11 @@ fn any_delegation() -> impl Strategy<Value = Option<Delegation>> {
     let mut listable = TOOLS.to_vec();
     listable.push(UNAPPROVED_TOOL);
     proptest::option::of(
-        (
-            select(TEAMS.to_vec()),
-            proptest::option::of(subset(listable)),
-        )
-            .prop_map(|(team, tools)| Delegation {
-                acting_person: gateway_core::Claimed::new("requester@example.test".into()),
-                team: team.into(),
-                tools: tools.map(tool_names),
-            }),
+        (select(TEAMS.to_vec()), subset(listable)).prop_map(|(team, tools)| Delegation {
+            acting_person: gateway_core::Claimed::new("requester@example.test".into()),
+            team: team.into(),
+            tools: tool_names(tools),
+        }),
     )
 }
 
@@ -390,25 +384,26 @@ proptest! {
     }
 
     #[test]
-    fn a_destructive_tool_is_never_allowed(mut world in world()) {
+    fn a_write_or_destructive_tool_is_never_allowed(
+        mut world in world(),
+        classification in select(vec![Classification::Write, Classification::Destructive]),
+    ) {
         if let Some(approved) = world.approved_tool_mut() {
-            approved.classification = Classification::Destructive;
+            approved.classification = classification;
         }
         let decision = world.decide();
-        prop_assert!(!decision.is_allowed(), "allowed a destructive tool: {decision:?}");
+        prop_assert!(!decision.is_allowed(), "allowed a {classification} tool: {decision:?}");
         let snapshot = world.snapshot();
         prop_assert!(list_tools(&snapshot, &world.caller())
             .iter()
-            .all(|listed| listed.classification != Classification::Destructive));
+            .all(|listed| !matches!(listed.classification, Classification::Write | Classification::Destructive)));
     }
 
     #[test]
-    fn a_delegation_that_lists_tools_never_allows_one_it_does_not_list(mut world in world()) {
+    fn a_delegation_never_allows_a_tool_it_does_not_list(mut world in world()) {
         let tool = world.tool.clone();
         if let Some(delegation) = &mut world.delegation {
-            let mut listed = delegation.tools.take().unwrap_or_default();
-            listed.remove(&tool);
-            delegation.tools = Some(listed);
+            delegation.tools.remove(&tool);
         }
         let decision = world.decide();
         if world.delegation.is_some() {
@@ -469,7 +464,7 @@ proptest! {
     }
 
     #[test]
-    fn an_opened_world_is_allowed(mut world in any_world(), classification in select(vec![Classification::Read, Classification::Write])) {
+    fn an_opened_world_is_allowed(mut world in any_world(), classification in select(vec![Classification::Read, Classification::Propose])) {
         open_up(&mut world);
         if let Some(approved) = world.approved_tool_mut() {
             approved.classification = classification;

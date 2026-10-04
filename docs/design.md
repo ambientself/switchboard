@@ -1,7 +1,7 @@
 # MCP gateway design
 
 Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
-review. Status: draft. Settled questions and the ones still open are in
+review, and 2026-10-04 for the classifications in section 8. Status: draft. Settled questions and the ones still open are in
 [open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
 ## 1. Purpose
@@ -107,7 +107,7 @@ must be identified and tested before employee rollout (Q13).
 | Profile | The policy set that applies to one caller type, such as Otto's. |
 | Connector | Code that implements a group of tools against one external system. |
 | Proxied server | A separate MCP server the gateway forwards to. |
-| Classification | A tool's fixed label: `read`, `write` or `destructive`. |
+| Classification | A tool's fixed label: `read`, `propose`, `write` or `destructive` (section 8). |
 | Tool surface | The named set of tools one endpoint exposes. |
 | Brokering | The gateway attaches a credential on the server side; the caller never holds it. |
 
@@ -233,17 +233,29 @@ that needs a proved team cannot be handed a header value by mistake.
 Policy has two layers. One function decides from who is calling and which tool; what the call
 names is decided where the arguments are understood, and both land in one audit record.
 
-**Classification, company-wide.** Every tool has exactly one classification. A tool with none
-never runs; there is no default.
+**Classification, company-wide.** Every tool has exactly one classification, assigned by the
+person who approves it. A tool with none never runs; there is no default.
+
+| Classification | Meaning |
+| --- | --- |
+| `read` | Reads and changes nothing. |
+| `propose` | Creates something for a person to review, or changes only what the gateway created for that purpose: a draft pull request, a comment, a commit to its own proposal branch. Nothing it does takes effect until a person acts on it. |
+| `write` | Changes something directly: a merge, a push to an existing branch, a status transition, a configuration change. |
+| `destructive` | Destroys something. |
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
-profiles. Production mutation is denied for every profile initially.
+profiles. `write` and `destructive` are denied in every profile by the decision function, so
+no profile's data can permit them. That is how production mutation is denied for every profile
+initially: anything that changes production without a person acting is one of the two.
+Permitting direct writes needs a decision that replaces part of
+[decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
-| Writes | Proposal-shaped only. | Only explicitly approved tools; per-user grants where authorship or permissions require them. Broader write policy remains Q9. | Proposal-shaped only. |
+| Proposals (`propose`) | Allowed. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed. |
+| Direct writes (`write`) | Never. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
@@ -262,11 +274,14 @@ therefore a denial or a refused outcome. Making that scope check uniform across 
 proxied tools is Q9.
 
 **Reads can need a breadth setting.** A read that shows more than its caller could otherwise
-see, such as AWS inventory across accounts, is opt-in per team or group.
+see, such as AWS inventory across accounts, is opt-in per team or group. That is expressed with
+the existing allowlists: such a tool is served only on surfaces whose allowlist is the opted-in
+teams and groups, and the resources it names are checked against their limits. It gets a
+field of its own only when the first such tool is built.
 
 **What Rust adds.** The registry accepts a classification type that can only be built by a
-conversion that fails for anything unrecognized, and a destructive tool can be held only in a
-type the Otto profile's run path does not accept. An enum also has no unset state, which
+conversion that fails for anything unrecognized, and the decision function refuses a `write`
+or `destructive` tool before it reads the profile. An enum also has no unset state, which
 removes the zero-value case the Go gateway has to guard against.
 
 ## 9. Credentials
@@ -339,7 +354,9 @@ measures what it costs in latency, and what a slow or unavailable database does 
 before more callers are added. An audit row is not an idempotency record: it does not stop a
 write being made twice (Q10).
 
-For Otto's callers the row must match the existing `gateway_audit` table.
+For Otto's callers the row must match the existing `gateway_audit` table. That table's
+classification column allows only `read`, `write` and `destructive`, so Otto's adapter records
+a `propose` tool as `write` there, an explicit mapping like its tool names.
 
 **What Rust adds.** The begin step returns a guard value that the tool-running code requires
 as an argument, so a call path that skips the audit write does not compile.

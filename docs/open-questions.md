@@ -61,6 +61,11 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   [decision 0007](decisions/0007-serve-two-mcp-revisions-from-a-hand-written-endpoint.md).
 - **2026-10-01 (Q19):** The first slice uses a mock workload and mock server, in kind and
   Docker Compose. See [decision 0008](decisions/0008-mock-the-first-slice.md).
+- **2026-10-04 (part of Q9):** Tools are classified `read`, `propose`, `write` or
+  `destructive`. `write` and `destructive` are denied in every profile, which is how
+  production mutation is denied initially. A delegation's tool list is required. Broad reads
+  use the existing surface allowlists and resource limits. See the 2026-10-04 amendment to
+  [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 ## Q9. What does authorization check beyond tool classification?
 

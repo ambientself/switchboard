@@ -258,29 +258,52 @@ mutate(
     "        None => Err(Reason::DelegationDisagrees(\n            DelegationProblem::PrincipalHasNoTeam {",
     "        None if true => Ok(()),\n        None => Err(Reason::DelegationDisagrees(\n            DelegationProblem::PrincipalHasNoTeam {",
 )
+DELEGATION_LISTS = "        Some(delegation) if !delegation.get().tools.contains(&tool.name) => {"
 mutate(
     "delegation-empty-list-narrows-nothing",
     "a delegation that lists no tools narrows nothing",
     SRC + "decision.rs",
-    "Some(permitted) if !permitted.contains(&tool.name)",
-    "Some(permitted) if !permitted.is_empty() && !permitted.contains(&tool.name)",
+    DELEGATION_LISTS,
+    "        Some(delegation) if !delegation.get().tools.is_empty() && !delegation.get().tools.contains(&tool.name) => {",
 )
 mutate(
     "delegation-tools-may-be-omitted",
-    "a delegation's tool list may be left out, and then narrows nothing",
+    "a delegation's tool list may be left out",
     SRC + "principal.rs",
-    '    #[serde(deserialize_with = "present")]\n    pub tools',
-    "    #[serde(default)]\n    pub tools",
+    "    pub tools: BTreeSet<ToolName>,",
+    "    #[serde(default)]\n    pub tools: BTreeSet<ToolName>,",
 )
 
 # --- Check 5: the classification -----------------------------------------------------------
 
+DENIED_EVERYWHERE = "        Classification::Write | Classification::Destructive\n    );"
 mutate(
     "destructive-permitted-by-profile",
     "a destructive tool is allowed by a profile that lists destructive",
     SRC + "decision.rs",
-    "    let permitted = tool.classification != Classification::Destructive\n        && profile",
-    "    let permitted = profile",
+    DENIED_EVERYWHERE,
+    "        Classification::Write\n    );",
+)
+mutate(
+    "write-permitted-by-profile",
+    "a direct write is allowed by a profile that lists write",
+    SRC + "decision.rs",
+    DENIED_EVERYWHERE,
+    "        Classification::Destructive\n    );",
+)
+mutate(
+    "propose-denied-everywhere",
+    "a proposal is denied in every profile, like a direct write",
+    SRC + "decision.rs",
+    DENIED_EVERYWHERE,
+    "        Classification::Propose | Classification::Write | Classification::Destructive\n    );",
+)
+mutate(
+    "classification-propose-parses-as-write",
+    "`propose` in configuration reads as write",
+    SRC + "classification.rs",
+    'Classification::Propose => "propose",',
+    'Classification::Propose => "write",',
 )
 CLASSIFICATION_MATCH = "            .find(|classification| classification.as_str() == value)"
 for id, description, replacement in [
@@ -569,7 +592,7 @@ mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not t
 SENTENCE_NAMES = [
     "PROFILE_UNKNOWN", "TOOL_NOT_AVAILABLE", "INVALID_TOOL_NAME", "SURFACE_NOT_PERMITTED",
     "TOOL_NOT_IN_DELEGATION", "DELEGATION_MISSING", "DELEGATION_TEAM_MISMATCH",
-    "DELEGATION_WITHOUT_TEAM", "DESTRUCTIVE", "CLASSIFICATION_NOT_PERMITTED",
+    "DELEGATION_WITHOUT_TEAM", "DESTRUCTIVE", "DIRECT_WRITE", "CLASSIFICATION_NOT_PERMITTED",
     "RESOURCE_OUTSIDE_LIMIT", "RESOURCES_UNKNOWN", "RESOURCES_NONE_NAMED", "WORKLOAD", "USER",
     "IDENTITY_FAILURE", "AUDIT_FAILURE",
 ]
@@ -595,6 +618,9 @@ def sentence_mutations(source: str) -> None:
 mutate("sentence-surfaces-differ", "tool not on this surface reads differently from an unknown tool", SRC + "sentences.rs",
        "        Reason::ToolNotOnSurface { tool, surface } => fill(\n            TOOL_NOT_AVAILABLE,",
        "        Reason::ToolNotOnSurface { tool, surface } => fill(\n            TOOL_NOT_IN_DELEGATION,")
+mutate("sentence-propose-reads-as-write", "a proposal the profile does not permit reads as a direct write", SRC + "sentences.rs",
+       "            classification: Classification::Write,\n            ..\n        } => fill(DIRECT_WRITE,",
+       "            classification: Classification::Write | Classification::Propose,\n            ..\n        } => fill(DIRECT_WRITE,")
 mutate("sentence-system-kind-swapped", "the resource sentence swaps system and kind", SRC + "sentences.rs",
        '("system", Text(&resource.system)),\n                    ("kind", Text(&resource.kind)),',
        '("system", Text(&resource.kind)),\n                    ("kind", Text(&resource.system)),')
