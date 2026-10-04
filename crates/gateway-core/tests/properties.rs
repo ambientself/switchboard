@@ -505,6 +505,51 @@ proptest! {
     }
 }
 
+proptest! {
+    /// Whatever resources a call names, the row records them with no control character, each
+    /// value short, and no more of them than a row holds, with the rest counted.
+    #[test]
+    fn named_resources_never_reach_a_row_raw(
+        world in world(),
+        named in proptest::collection::vec(
+            (
+                "\\PC{0,40}|[\\x00-\\x7f]{0,40}|\\PC{200,400}",
+                "[\\x00-\\x7f]{0,20}|\\PC{200,300}",
+                "[\\x00-\\x7f]{0,20}|\\PC{200,300}",
+            ),
+            0..100,
+        ),
+    ) {
+        let named: Vec<Resource> = named
+            .into_iter()
+            .map(|(identifier, system, kind)| Resource { system, kind, identifier })
+            .collect();
+        let mut call = world.call();
+        call.resources = Resources::Named(named.clone());
+        let store = common::MemoryStore::default();
+        let _ = common::ready(gateway_core::audit::begin(
+            &store,
+            decide(&world.snapshot(), &call),
+            serde_json::Value::Null,
+            Default::default(),
+        ))
+        .unwrap();
+        let row = store.last();
+        let Resources::Named(recorded) = &row.resources else {
+            return Err(TestCaseError::fail("named resources were recorded as unknown"));
+        };
+        let most = gateway_core::audit::MAX_RECORDED_RESOURCES;
+        prop_assert_eq!(recorded.len(), named.len().min(most));
+        prop_assert_eq!(row.resources_omitted, named.len().saturating_sub(most));
+        for resource in recorded {
+            for text in [&resource.system, &resource.kind, &resource.identifier] {
+                prop_assert!(!text.chars().any(char::is_control), "{text:?}");
+                prop_assert!(text.chars().count() <= 129, "{} characters", text.chars().count());
+            }
+        }
+    }
+}
+
 /// Arbitrary worlds, without opening, reach an allow and every kind of reason. Without this,
 /// a generator that failed every call at check 1 would make every property above vacuous.
 #[test]

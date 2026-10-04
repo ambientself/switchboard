@@ -213,6 +213,16 @@ fn expected_row(
         "tool": escape(case.tool.as_str()),
         "connector": served.as_ref().map(|tool| tool.connector.clone()),
         "classification": served.as_ref().map(|tool| tool.classification),
+        // No case names more resources than a row records, so none are omitted.
+        "resources": match &case.resources {
+            Resources::Unknown => serde_json::json!("unknown"),
+            Resources::Named(named) => serde_json::json!({ "named": named.iter().map(|resource| serde_json::json!({
+                "system": escape(&resource.system),
+                "kind": escape(&resource.kind),
+                "identifier": escape(&resource.identifier),
+            })).collect::<Vec<_>>() }),
+        },
+        "resources_omitted": 0,
         "decision": decision,
         "reason": reason,
         "sentence": sentence,

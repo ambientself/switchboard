@@ -528,6 +528,8 @@ for field, old, new in [
     ("profile", "        profile: call.caller.profile.clone(),", '        profile: "x".into(),'),
     ("connector", "        connector: tool.map(|tool| tool.connector.clone()),", "        connector: None,"),
     ("classification", "        classification: tool.map(|tool| tool.classification),", "        classification: None,"),
+    ("resources", "        resources,\n        resources_omitted,", "        resources: { let _ = resources; Resources::Named(Vec::new()) },\n        resources_omitted,"),
+    ("resources-omitted", "        resources_omitted,\n        decision,", "        resources_omitted: { let _ = resources_omitted; 0 },\n        decision,"),
     ("tool-use-id", "        tool_use_id: metadata.tool_use_id,", "        tool_use_id: None,"),
     ("claimed-team", "        claimed_team: metadata.claimed_team,", "        claimed_team: None,"),
     ("revision", "        policy_revision,\n        proved_principal", '        policy_revision: { let _ = policy_revision; PolicyRevision::new("x") },\n        proved_principal'),
@@ -550,6 +552,20 @@ for variant in ("Allow", "Deny"):
            f"    /// The call was {'allowed' if variant == 'Allow' else 'denied'}.\n    #[serde(rename = \"x\")]\n    {variant},")
 mutate("latency-not-written", "latency is not serialized", SRC + "audit.rs",
        "    pub latency_ms: u64,", "    #[serde(skip)]\n    pub latency_ms: u64,")
+RECORDED_TAKE = "        .take(MAX_RECORDED_RESOURCES)\n"
+mutate("record-resources-uncapped", "the row records every resource a call names", SRC + "audit.rs", RECORDED_TAKE, "")
+mutate("record-resources-cap-short", "the row records one resource fewer than it should", SRC + "audit.rs", RECORDED_TAKE,
+       "        .take(MAX_RECORDED_RESOURCES - 1)\n")
+mutate("record-resources-reordered", "the row records resources in reverse order", SRC + "audit.rs",
+       "        .iter()\n" + RECORDED_TAKE, "        .iter()\n        .rev()\n" + RECORDED_TAKE)
+mutate("record-resources-omitted-miscounted", "the row's omitted count is off by one", SRC + "audit.rs",
+       "    let omitted = named.len().saturating_sub(MAX_RECORDED_RESOURCES);",
+       "    let omitted = named.len().saturating_sub(MAX_RECORDED_RESOURCES - 1);")
+mutate("record-resources-unknown-as-none", "unknown resources are recorded as an empty list", SRC + "audit.rs",
+       "        return (Resources::Unknown, 0);", "        return (Resources::Named(Vec::new()), 0);")
+for field in ("system", "kind", "identifier"):
+    mutate(f"record-resource-{field}-unescaped", f"a recorded resource's {field} is not made safe", SRC + "audit.rs",
+           f"            {field}: safe(&resource.{field}),", f"            {field}: resource.{field}.clone(),")
 mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: { let _ = recorded; Outcome::Ok },\n            latency_ms,")
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",

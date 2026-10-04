@@ -37,10 +37,14 @@ use crate::names::{
     ConnectorName, DeploymentName, Person, PolicyRevision, ProfileName, SurfaceName, TeamId,
     ToolUseId,
 };
-use crate::policy::ApprovedTool;
+use crate::policy::{ApprovedTool, Resource, Resources};
 use crate::principal::Principal;
 use crate::proof::{Claimed, WasProved};
 use crate::sentences;
+
+/// The most named resources one audit row records. A call can name any number, so the rest are
+/// counted in [`AuditRecord::resources_omitted`] rather than written out.
+pub const MAX_RECORDED_RESOURCES: usize = 64;
 
 /// Allow or deny, as the audit record's decision column holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +106,15 @@ pub struct AuditRecord {
     pub connector: Option<ConnectorName>,
     /// The tool's classification, if the surface serves it.
     pub classification: Option<Classification>,
+    /// The resources the call named, as the decision checked them, or `unknown` when the tool
+    /// could not say before it ran. Made safe, in the order named, and at most
+    /// [`MAX_RECORDED_RESOURCES`] of them: the caller chose them, through the arguments. The
+    /// one a resource denial names is always in the row's sentence, even if it was left out
+    /// here.
+    pub resources: Resources,
+    /// How many named resources were left out of `resources` because the call named more than
+    /// [`MAX_RECORDED_RESOURCES`]. Zero when none were.
+    pub resources_omitted: usize,
     /// Allow or deny.
     pub decision: DecisionKind,
     /// The kind of reason, for a denial. Unknown tool and tool not on this surface are told
@@ -313,6 +326,7 @@ pub async fn begin(
             Some(sentence.clone()),
         ),
     };
+    let (resources, resources_omitted) = recorded(&call.resources);
     let record = AuditRecord {
         tool_use_id: metadata.tool_use_id,
         deployment: call.caller.deployment.clone(),
@@ -324,6 +338,8 @@ pub async fn begin(
         tool: sentences::safe(call.tool.as_str(), sentences::MAX_RENDERED),
         connector: tool.map(|tool| tool.connector.clone()),
         classification: tool.map(|tool| tool.classification),
+        resources,
+        resources_omitted,
         decision,
         reason,
         sentence,
@@ -361,6 +377,26 @@ pub async fn begin(
             sentence,
         }),
     })
+}
+
+/// The resources as a row records them, and how many were left out: each value made safe, in
+/// the order named, and no more than [`MAX_RECORDED_RESOURCES`].
+fn recorded(resources: &Resources) -> (Resources, usize) {
+    let Resources::Named(named) = resources else {
+        return (Resources::Unknown, 0);
+    };
+    let safe = |text: &str| sentences::safe(text, sentences::MAX_RENDERED);
+    let kept = named
+        .iter()
+        .take(MAX_RECORDED_RESOURCES)
+        .map(|resource| Resource {
+            system: safe(&resource.system),
+            kind: safe(&resource.kind),
+            identifier: safe(&resource.identifier),
+        })
+        .collect();
+    let omitted = named.len().saturating_sub(MAX_RECORDED_RESOURCES);
+    (Resources::Named(kept), omitted)
 }
 
 enum Decided {

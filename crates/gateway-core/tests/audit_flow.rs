@@ -8,13 +8,13 @@ use std::future::ready;
 use std::sync::{Arc, Mutex};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, Outcome,
-    RequestMetadata,
+    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind,
+    MAX_RECORDED_RESOURCES, Outcome, RequestMetadata,
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
     Classification, Connector, ConnectorName, Decision, Delegation, PolicySnapshot, Principal,
-    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, ReasonKind, RequestedTool,
+    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, ReasonKind, RequestedTool, Resource,
     ResourceDeclaration, Resources, SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, decide,
 };
 use serde_json::json;
@@ -432,8 +432,73 @@ fn a_long_valid_looking_name_is_cut_at_the_tool_name_limit() {
 }
 
 #[test]
+fn a_row_records_the_resources_its_call_named() {
+    let store = MemoryStore::default();
+    let repository = |identifier: String| Resource {
+        system: "github".into(),
+        kind: "repository".into(),
+        identifier,
+    };
+    let named = |count: usize| -> Vec<Resource> {
+        (0..count)
+            .map(|n| repository(format!("org/repo-{n}")))
+            .collect()
+    };
+    let record = |resources: Resources| {
+        let mut call = call("fixture__read");
+        call.resources = resources;
+        let _ = begin(&store, decide(&snapshot(), &call));
+        let row = store.last();
+        (row.resources, row.resources_omitted)
+    };
+
+    assert_eq!(record(Resources::Unknown), (Resources::Unknown, 0));
+    assert_eq!(
+        record(Resources::Named(Vec::new())),
+        (Resources::Named(Vec::new()), 0)
+    );
+
+    let exactly = named(MAX_RECORDED_RESOURCES);
+    assert_eq!(
+        record(Resources::Named(exactly.clone())),
+        (Resources::Named(exactly.clone()), 0),
+        "a call naming exactly the most a row records loses none"
+    );
+
+    let mut many = named(MAX_RECORDED_RESOURCES + 6);
+    many[0].identifier = "org/a\nb`c".into();
+    many[1].identifier = "x".repeat(500);
+    many[2].system = "git\rhub".into();
+    many[2].kind = "repo`sitory".into();
+    let (recorded, omitted) = record(Resources::Named(many));
+    assert_eq!(omitted, 6);
+    let Resources::Named(recorded) = recorded else {
+        panic!("named resources were recorded as unknown");
+    };
+    assert_eq!(recorded.len(), MAX_RECORDED_RESOURCES);
+    assert_eq!(recorded[0].identifier, "org/a\\nb\\`c");
+    assert_eq!(recorded[1].identifier, format!("{}…", "x".repeat(128)));
+    assert_eq!(recorded[2].system, "git\\rhub");
+    assert_eq!(recorded[2].kind, "repo\\`sitory");
+    assert_eq!(
+        recorded[3..],
+        exactly[3..],
+        "the rest are kept in the order named"
+    );
+}
+
+#[test]
 fn the_record_serializes_under_pinned_names_and_reads_back() {
     let pins = [
+        (json!(Resources::Unknown), json!("unknown")),
+        (
+            json!(Resources::Named(vec![Resource {
+                system: "github".into(),
+                kind: "repository".into(),
+                identifier: "org/a".into(),
+            }])),
+            json!({"named": [{"system": "github", "kind": "repository", "identifier": "org/a"}]}),
+        ),
         (json!(DecisionKind::Allow), json!("allow")),
         (json!(DecisionKind::Deny), json!("deny")),
         (
