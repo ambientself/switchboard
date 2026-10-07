@@ -7,6 +7,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod budgets;
 mod schema;
 mod store;
 

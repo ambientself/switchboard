@@ -6,6 +6,8 @@
 //!   owner. The table `call_rows` follows the core's [`AuditRecord`](gateway_core::AuditRecord),
 //!   with proved and claimed values in separate columns.
 //! - [`PgAuditStore`] is the core's [`AuditStore`](gateway_core::AuditStore) on that table.
+//!   Begin and finish each keep a time budget ([`Budgets`]). Finish keeps trying, on a task of
+//!   its own, after its answer budget has passed, until a deadline.
 //!
 //! What the database itself enforces, for the gateway's role:
 //!
@@ -42,4 +44,4 @@ mod tests;
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
-pub use store::{PgAuditError, PgAuditStore, PoolSizes};
+pub use store::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};

@@ -1,11 +1,19 @@
 //! [`PgAuditStore`]: the core's [`AuditStore`] on Postgres.
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use deadpool_postgres::{
+    ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod,
+};
 use gateway_core::audit::{AuditRowId, Completion, RowCompletion, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use thiserror::Error;
-use tokio_postgres::Socket;
+use tokio::sync::oneshot;
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
+use tokio_postgres::{CancelToken, Socket};
 
 use crate::columns::{BeginRow, FinishRow};
 
@@ -21,7 +29,7 @@ pub enum PgAuditError {
     Column(&'static str),
     /// No connection could be had.
     #[error("no connection to the audit database: {0}")]
-    Pool(#[from] deadpool_postgres::PoolError),
+    Pool(#[from] PoolError),
     /// A pool could not be built.
     #[error("the audit database pool could not be built: {0}")]
     Build(#[from] deadpool_postgres::BuildError),
@@ -41,6 +49,67 @@ pub enum PgAuditError {
         /// The row finish named.
         row: String,
     },
+    /// Begin did not have a connection and a committed row within its budget. The call is
+    /// refused. The insert, if it was sent, was cancelled.
+    #[error("the audit row was not written within the begin budget of {budget:?}")]
+    BeginBudget {
+        /// The budget that ran out.
+        budget: Duration,
+    },
+    /// Finish did not complete the row within the answer budget. The store keeps trying, on a
+    /// task of its own, until its deadline.
+    #[error(
+        "audit row {row} was not completed within the answer budget of {budget:?}; the store is still trying"
+    )]
+    AnswerBudget {
+        /// The row finish named.
+        row: String,
+        /// The budget that ran out.
+        budget: Duration,
+    },
+    /// One attempt to complete a row took as long as the answer budget, and was cancelled.
+    #[error("an attempt to complete an audit row took too long and was cancelled")]
+    AttemptTimedOut,
+    /// Finish kept trying until its deadline, and the row is still not complete.
+    #[error("audit row {row} was not completed by the finish deadline: {last}")]
+    Deadline {
+        /// The row finish named.
+        row: String,
+        /// Why the last attempt failed.
+        last: Box<PgAuditError>,
+    },
+    /// The task completing the row stopped without saying how it ended.
+    #[error("the task completing audit row {row} stopped without a result")]
+    FinishTaskLost {
+        /// The row finish named.
+        row: String,
+    },
+}
+
+impl PgAuditError {
+    /// Whether trying again could succeed: the database could not be reached, the connection
+    /// broke, the server is short of something or shutting down, or an attempt took too long.
+    /// A refusal by the database itself, a missing row or a different completion is final.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {
+                true
+            }
+            Self::Database(error) => match error.code() {
+                // Connection exception, transaction rollback (serialization, deadlock),
+                // insufficient resources, operator intervention, system error.
+                Some(code) => {
+                    matches!(code.code().get(..2), Some("08" | "40" | "53" | "57" | "58"))
+                }
+                None => {
+                    error.is_closed()
+                        || std::error::Error::source(error)
+                            .is_some_and(|source| source.is::<std::io::Error>())
+                }
+            },
+            _ => false,
+        }
+    }
 }
 
 /// A database error with the server's own message and SQLSTATE, which `tokio_postgres` leaves
@@ -73,28 +142,103 @@ impl Default for PoolSizes {
     }
 }
 
+/// How long the store waits. The defaults are the provisional 2 s, 2 s and 30 s of decision
+/// 0009 point 9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budgets {
+    /// Begin, from asking for a connection to the committed row. Past it, begin fails and the
+    /// core refuses the call.
+    pub begin: Duration,
+    /// How long finish holds the caller's answer while it completes the row. Past it, finish
+    /// fails, so the core answers a refusal with the audit-failure sentence, and the store
+    /// keeps trying. Also the most one attempt may take.
+    pub answer: Duration,
+    /// How long, from the call to finish, the store keeps trying to complete the row.
+    pub finish_deadline: Duration,
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self {
+            begin: Duration::from_secs(2),
+            answer: Duration::from_secs(2),
+            finish_deadline: Duration::from_secs(30),
+        }
+    }
+}
+
+/// What has become of the finishes a store was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FinishCounts {
+    /// Still trying to complete their row.
+    pub in_flight: usize,
+    /// Stopped without completing their row: the deadline passed, or the database refused.
+    /// Each such row keeps an empty outcome.
+    pub given_up: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    in_flight: AtomicUsize,
+    given_up: AtomicU64,
+}
+
+/// Counts one finish in flight until dropped.
+struct InFlight(Arc<Counters>);
+
+impl InFlight {
+    fn start(counters: &Arc<Counters>) -> Self {
+        counters.in_flight.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counters))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Asks the server to stop whatever a connection is running, over a connection of its own.
+type Canceller = Arc<dyn Fn(CancelToken) -> BoxFuture<'static, ()> + Send + Sync>;
+
 /// Every session the store opens commits synchronously, whatever the server, database or role
 /// sets as its default: begin must not return before its row is durable.
 const SESSION_OPTIONS: &str = "-c synchronous_commit=on";
 
+/// The first pause between attempts to complete a row; each pause after doubles, up to
+/// [`LONGEST_PAUSE`].
+const FIRST_PAUSE: Duration = Duration::from_millis(50);
+const LONGEST_PAUSE: Duration = Duration::from_secs(1);
+
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
 /// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE). The database assigns each row its
-/// identifier and both its times. Begin inserts the first half of a row and returns once the
-/// insert is committed. Finish writes the completion columns of a row that has none; an
-/// identical completion written again is accepted, and a different one is an error, so the
-/// first completion stands. The table's trigger holds the same rule for every role.
+/// identifier and both its times.
 ///
-/// Neither operation has a time limit of its own yet: a connection is waited for, and a
-/// statement runs, until the database answers.
+/// - Begin inserts the first half of a row and returns once the insert is committed. It has
+///   [`Budgets::begin`], counted from asking for a connection. Past it, the insert is
+///   cancelled, the connection is discarded, and begin fails, so the core refuses the call.
+/// - Finish writes the completion columns of a row that has none, on a task of its own. It
+///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
+///   then. The task keeps trying, while the failure is one that trying again could fix, until
+///   [`Budgets::finish_deadline`]. An identical completion written again is accepted, and a
+///   different one is an error, so the first completion stands and retrying is safe. The
+///   table's trigger holds the same rule for every role.
+///
+/// Must be used inside a Tokio runtime: finish spawns its task there.
 pub struct PgAuditStore {
     pub(crate) begin: Pool,
     pub(crate) finish: Pool,
+    budgets: Budgets,
+    cancel: Canceller,
+    counters: Arc<Counters>,
 }
 
 impl PgAuditStore {
     /// A store that connects with `config` and `tls`, opening connections as they are first
-    /// needed. Nothing connects here, so a database that is down is found by the first call.
+    /// needed, with the default [`Budgets`]. Nothing connects here, so a database that is down
+    /// is found by the first call.
     ///
     /// Each session sets `synchronous_commit` to `on`, after any options `config` carries.
     pub fn connect<T>(
@@ -124,60 +268,214 @@ impl PgAuditStore {
             );
             Pool::builder(manager).max_size(size).build()
         };
+        let begin = pool(sizes.begin)?;
+        let finish = pool(sizes.finish)?;
+        let cancel: Canceller = Arc::new(move |token: CancelToken| {
+            let tls = tls.clone();
+            Box::pin(async move {
+                // Best effort: if the cancel request fails, the statement runs to its end.
+                let _ = token.cancel_query(tls).await;
+            })
+        });
         Ok(Self {
-            begin: pool(sizes.begin)?,
-            finish: pool(sizes.finish)?,
+            begin,
+            finish,
+            budgets: Budgets::default(),
+            cancel,
+            counters: Arc::default(),
         })
+    }
+
+    /// The same store with `budgets` in place of the defaults.
+    #[must_use]
+    pub fn with_budgets(self, budgets: Budgets) -> Self {
+        Self { budgets, ..self }
+    }
+
+    /// The budgets this store keeps.
+    pub fn budgets(&self) -> Budgets {
+        self.budgets
+    }
+
+    /// How many finishes are still trying, and how many gave up. A gateway shutting down can
+    /// wait for `in_flight` to reach zero; `given_up` is for its telemetry.
+    pub fn finishes(&self) -> FinishCounts {
+        FinishCounts {
+            in_flight: self.counters.in_flight.load(Ordering::SeqCst),
+            given_up: self.counters.given_up.load(Ordering::SeqCst),
+        }
     }
 
     async fn insert(&self, record: &AuditRecord) -> Result<AuditRowId, PgAuditError> {
         let row = BeginRow::from_record(record)?;
-        let client = self.begin.get().await?;
-        let statement = client.prepare_cached(BeginRow::INSERT).await?;
-        let inserted = client.query_one(&statement, &row.parameters()).await?;
-        Ok(AuditRowId::new(inserted.try_get::<_, String>(0)?))
+        let budget = self.budgets.begin;
+        let deadline = Instant::now() + budget;
+        let client = timeout_at(deadline, self.begin.get())
+            .await
+            .map_err(|_| PgAuditError::BeginBudget { budget })??;
+        match timeout_at(deadline, insert_on(&client, &row)).await {
+            Ok(inserted) => inserted,
+            Err(_) => {
+                abandon(client, &self.cancel);
+                Err(PgAuditError::BeginBudget { budget })
+            }
+        }
     }
 
-    /// Completes `row`. Reached from outside the crate only through [`AuditStore::finish`],
-    /// which takes a completion only the core can make.
+    /// Completes `row` in one attempt, on a connection from the finish pool, with no budget.
+    /// For tests, which cannot make the core's completion for a row of their own choosing.
+    #[cfg(test)]
     pub(crate) async fn complete(
         &self,
         row: &AuditRowId,
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
-        let finish = FinishRow::from_completion(completion);
         let client = self.finish.get().await?;
-        let statement = client.prepare_cached(FinishRow::UPDATE).await?;
-        let updated = client
-            .execute(
-                &statement,
-                &[
-                    &row.as_str(),
-                    &finish.outcome,
-                    &finish.outcome_sentence,
-                    &finish.latency_ms,
-                ],
-            )
-            .await?;
-        if updated == 1 {
-            return Ok(());
-        }
-        // Nothing matched: the row is missing, or already complete. A retried finish whose
-        // first attempt was written finds its own completion, which is success.
-        let statement = client.prepare_cached(FinishRow::SELECT).await?;
-        let Some(existing) = client.query_opt(&statement, &[&row.as_str()]).await? else {
-            return Err(PgAuditError::NoSuchRow {
-                row: row.as_str().to_owned(),
-            });
+        complete_on(
+            &client,
+            row.as_str(),
+            &FinishRow::from_completion(completion),
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_within_budget(
+        &self,
+        row: &AuditRowId,
+        completion: &Completion,
+    ) -> Result<(), PgAuditError> {
+        let started = Instant::now();
+        let task = Retry {
+            pool: self.finish.clone(),
+            cancel: Arc::clone(&self.cancel),
+            row: row.as_str().to_owned(),
+            finish: FinishRow::from_completion(completion),
+            attempt: self.budgets.answer,
+            deadline: started + self.budgets.finish_deadline,
         };
-        let outcome: Option<String> = existing.try_get(0)?;
-        let outcome_sentence: Option<String> = existing.try_get(1)?;
-        let latency_ms: Option<i64> = existing.try_get(2)?;
-        match outcome {
-            Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),
-            _ => Err(PgAuditError::CompletedDifferently {
+        let (sender, receiver) = oneshot::channel();
+        let in_flight = InFlight::start(&self.counters);
+        tokio::spawn(async move {
+            let result = task.run().await;
+            if result.is_err() {
+                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
+            }
+            drop(in_flight);
+            // The caller may have stopped waiting, after the answer budget.
+            let _ = sender.send(result);
+        });
+        let answer_by = started + self.budgets.answer;
+        match timeout_at(answer_by, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(PgAuditError::FinishTaskLost {
                 row: row.as_str().to_owned(),
             }),
+            Err(_) => Err(PgAuditError::AnswerBudget {
+                row: row.as_str().to_owned(),
+                budget: self.budgets.answer,
+            }),
+        }
+    }
+}
+
+/// Inserts the first half of a row and returns the identifier the database assigned.
+async fn insert_on(client: &ClientWrapper, row: &BeginRow) -> Result<AuditRowId, PgAuditError> {
+    let statement = client.prepare_cached(BeginRow::INSERT).await?;
+    let inserted = client.query_one(&statement, &row.parameters()).await?;
+    Ok(AuditRowId::new(inserted.try_get::<_, String>(0)?))
+}
+
+/// Writes the completion of `row` if it has none, and otherwise checks the one it has.
+async fn complete_on(
+    client: &ClientWrapper,
+    row: &str,
+    finish: &FinishRow,
+) -> Result<(), PgAuditError> {
+    let statement = client.prepare_cached(FinishRow::UPDATE).await?;
+    let updated = client
+        .execute(
+            &statement,
+            &[
+                &row,
+                &finish.outcome,
+                &finish.outcome_sentence,
+                &finish.latency_ms,
+            ],
+        )
+        .await?;
+    if updated == 1 {
+        return Ok(());
+    }
+    // Nothing matched: the row is missing, or already complete. A retried finish whose
+    // first attempt was written finds its own completion, which is success.
+    let statement = client.prepare_cached(FinishRow::SELECT).await?;
+    let Some(existing) = client.query_opt(&statement, &[&row]).await? else {
+        return Err(PgAuditError::NoSuchRow {
+            row: row.to_owned(),
+        });
+    };
+    let outcome: Option<String> = existing.try_get(0)?;
+    let outcome_sentence: Option<String> = existing.try_get(1)?;
+    let latency_ms: Option<i64> = existing.try_get(2)?;
+    match outcome {
+        Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),
+        _ => Err(PgAuditError::CompletedDifferently {
+            row: row.to_owned(),
+        }),
+    }
+}
+
+/// Gives up on a connection whose statement ran out of time: asks the server to cancel the
+/// statement, so it does not go on to write after the caller was told it failed, and takes the
+/// connection out of its pool, so no later call waits behind it.
+fn abandon(client: Object, cancel: &Canceller) {
+    tokio::spawn(cancel(client.cancel_token()));
+    drop(Object::take(client));
+}
+
+/// The task that completes one row, trying again until its deadline.
+struct Retry {
+    pool: Pool,
+    cancel: Canceller,
+    row: String,
+    finish: FinishRow,
+    attempt: Duration,
+    deadline: Instant,
+}
+
+impl Retry {
+    async fn run(self) -> Result<(), PgAuditError> {
+        let mut pause = FIRST_PAUSE;
+        loop {
+            let last = match self.once().await {
+                Ok(()) => return Ok(()),
+                Err(error) if !error.is_transient() => return Err(error),
+                Err(error) => error,
+            };
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(PgAuditError::Deadline {
+                    row: self.row,
+                    last: Box::new(last),
+                });
+            }
+            sleep_until((now + pause).min(self.deadline)).await;
+            pause = (pause * 2).min(LONGEST_PAUSE);
+        }
+    }
+
+    /// One attempt, bounded by the answer budget and by the deadline.
+    async fn once(&self) -> Result<(), PgAuditError> {
+        let by = (Instant::now() + self.attempt).min(self.deadline);
+        let client = timeout_at(by, self.pool.get())
+            .await
+            .map_err(|_| PgAuditError::AttemptTimedOut)??;
+        match timeout_at(by, complete_on(&client, &self.row, &self.finish)).await {
+            Ok(completed) => completed,
+            Err(_) => {
+                abandon(client, &self.cancel);
+                Err(PgAuditError::AttemptTimedOut)
+            }
         }
     }
 }
@@ -195,9 +493,39 @@ impl AuditStore for PgAuditStore {
         completion: &'a RowCompletion,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            self.complete(completion.row(), completion.completion())
+            self.finish_within_budget(completion.row(), completion.completion())
                 .await
                 .map_err(StoreError::from)
         })
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn the_default_budgets_are_two_two_and_thirty_seconds() {
+        assert_eq!(
+            Budgets::default(),
+            Budgets {
+                begin: Duration::from_secs(2),
+                answer: Duration::from_secs(2),
+                finish_deadline: Duration::from_secs(30),
+            }
+        );
+    }
+
+    #[test]
+    fn only_failures_that_trying_again_could_fix_are_retried() {
+        assert!(PgAuditError::AttemptTimedOut.is_transient());
+        for final_error in [
+            PgAuditError::NoSuchRow { row: "r".into() },
+            PgAuditError::CompletedDifferently { row: "r".into() },
+            PgAuditError::Pool(PoolError::Closed),
+            PgAuditError::Column("x"),
+        ] {
+            assert!(!final_error.is_transient(), "{final_error}");
+        }
     }
 }

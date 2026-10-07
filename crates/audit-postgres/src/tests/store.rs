@@ -18,18 +18,23 @@ use super::{GATEWAY_ROLE, TestDatabase};
 use crate::{PgAuditError, PgAuditStore, PoolSizes};
 
 /// One call, as a test describes it.
-struct Call {
-    caller: Caller,
-    surface: &'static str,
-    tool: &'static str,
-    arguments: Value,
-    metadata: RequestMetadata,
-    connector_fails: bool,
-    latency_ms: u64,
+pub(super) struct Call {
+    pub(super) caller: Caller,
+    pub(super) surface: &'static str,
+    pub(super) tool: &'static str,
+    pub(super) arguments: Value,
+    pub(super) metadata: RequestMetadata,
+    pub(super) connector_fails: bool,
+    pub(super) latency_ms: u64,
 }
 
 impl Call {
-    fn new(caller: Caller, surface: &'static str, tool: &'static str, document: &str) -> Self {
+    pub(super) fn new(
+        caller: Caller,
+        surface: &'static str,
+        tool: &'static str,
+        document: &str,
+    ) -> Self {
         Self {
             caller,
             surface,
@@ -43,7 +48,11 @@ impl Call {
 }
 
 /// Runs `call` through the core's begin, run and finish on `store`, and returns its row.
-async fn through_core(store: &dyn AuditStore, fixture: &Fixture, call: &Call) -> AuditRowId {
+pub(super) async fn through_core(
+    store: &dyn AuditStore,
+    fixture: &Fixture,
+    call: &Call,
+) -> AuditRowId {
     let connector = FixtureConnector::new(std::sync::Arc::new(FakeCredentialSource::new()));
     if call.connector_fails {
         connector.fail_next();
@@ -76,7 +85,7 @@ async fn through_core(store: &dyn AuditStore, fixture: &Fixture, call: &Call) ->
 
 /// Reads a row back as the core's record, through a superuser session: the gateway's role
 /// cannot read who called.
-async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
+pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
     let row = admin
         .query_one(
             "SELECT tool_use_id, deployment, surface, profile, tool, connector, classification,
@@ -215,7 +224,7 @@ async fn the_database_assigns_each_row_its_own_identifier() {
 }
 
 /// An allowed call's row, begun through the core and not yet finished.
-async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditRowId {
+pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditRowId {
     let call = Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT);
     let context = CallContext {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
@@ -232,7 +241,7 @@ async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditRowId {
     }
 }
 
-fn completion(outcome: Outcome, latency_ms: u64) -> Completion {
+pub(super) fn completion(outcome: Outcome, latency_ms: u64) -> Completion {
     Completion {
         outcome,
         latency_ms,
@@ -387,7 +396,7 @@ async fn finish_has_a_pool_of_its_own() {
     let _held = store.begin.get().await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(10),
-        store.complete(&row, &completion(Outcome::Ok, 1)),
+        store.finish_within_budget(&row, &completion(Outcome::Ok, 1)),
     )
     .await
     .expect("finish waited for a begin connection")
