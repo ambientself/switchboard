@@ -48,6 +48,10 @@ cargo test -p audit-postgres
 Add `-- --nocapture` to see the latency test's p50 and p95 for begin and finish. They measure
 your machine, not production.
 
+CI runs these tests in the job "Audit store against Postgres", against a `postgres:17` service
+container, and fails the job if any of them says it was skipped.
+
 Set it for the mutation check too. Without it, the `pg-` mutations other than `pg-columns-*`
-and the few caught by unit tests survive. CI does not set it yet; `docs/ci-postgres-job.md` is
-a draft of the job that would.
+and the few caught by unit tests survive. When running mutation checks side by side, give each
+run a server of its own: the tests change the two cluster-wide roles, one test at a time
+within a run but not across runs.
