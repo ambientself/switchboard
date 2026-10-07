@@ -923,6 +923,96 @@ mutate_all(
 )
 
 
+# --- gateway -------------------------------------------------------------------------------
+
+GW = "crates/gateway/src/"
+BOOT = GW + "boot.rs"
+SELECTOR = GW + "selector.rs"
+CATALOG = GW + "catalog.rs"
+
+# The identity and audit gates: configured, explicitly disabled, neither, both.
+mutate("gw-boot-identity-neither-starts", "identity neither enforced nor disabled starts, unchecked", BOOT,
+       "        (None, false) => return Err(BootError::IdentityUnconfigured),\n",
+       "        (None, false) => (IdentityConfig::Disabled, GateState::Disabled),\n")
+mutate("gw-boot-identity-both-starts", "identity both enforced and disabled starts, unchecked", BOOT,
+       "        (Some(_), true) => return Err(BootError::IdentityContradiction),\n",
+       "        (Some(_), true) => (IdentityConfig::Disabled, GateState::Disabled),\n")
+mutate("gw-boot-audit-neither-starts", "audit with no store and no opt-out starts, recording nothing", BOOT,
+       "        (None, false) => Err(BootError::AuditUnconfigured),\n",
+       "        (None, false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled)),\n")
+mutate("gw-boot-audit-both-starts", "audit with a store and an opt-out starts", BOOT,
+       "        (Some(_), true) => Err(BootError::AuditContradiction),\n",
+       "        (Some(store), true) => Ok((store, GateState::On)),\n")
+mutate("gw-noop-store-when-enforced", "the no-op store is used although a store was supplied", BOOT,
+       "        (Some(store), false) => Ok((store, GateState::On)),\n",
+       "        (Some(_), false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::On)),\n")
+mutate("gw-disabled-store-constructible", "anyone can make the no-op audit store", GW + "audit.rs",
+       "    pub(crate) fn new() -> Self {", "    pub fn new() -> Self {")
+mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Host starts", BOOT,
+       "    if config.http.allowed_hosts.is_empty() {\n        return Err(BootError::NoAllowedHosts);\n    }\n", "")
+
+# Tool definitions.
+mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
+       "            if !self.definitions.contains_key(name) {\n                return Err(CatalogError::Missing(name.clone()));\n            }\n",
+       "")
+mutate("gw-boot-catalog-not-checked", "boot does not check the catalog against the snapshot", BOOT,
+       "    catalog.check(&approved)?;\n", "    let _ = &approved;\n")
+mutate("gw-catalog-unapproved-accepted", "a definition for a tool nobody approved is kept", CATALOG,
+       "            Some(name) => Err(CatalogError::NotApproved(name.clone())),", "            Some(_) => Ok(()),")
+mutate("gw-catalog-duplicate-accepted", "a second definition for a tool replaces the first", CATALOG,
+       "            if let Some(previous) = catalog.insert(definition.name.clone(), definition) {\n"
+       "                return Err(CatalogError::Duplicate(previous.name));\n            }\n",
+       "            catalog.insert(definition.name.clone(), definition);\n")
+mutate("gw-catalog-schema-not-checked", "an input schema that is not an object schema is accepted", CATALOG,
+       '    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")',
+       "    let _ = schema;\n    true")
+
+# Connectors.
+mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
+       "        if !connectors.contains_key(&tool.connector) {", "        if false && !connectors.contains_key(&tool.connector) {")
+mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice keeps the last one", BOOT,
+       "        if connectors.insert(name.clone(), registered).is_some() {\n"
+       "            return Err(BootError::DuplicateConnector(name));\n        }\n",
+       "        connectors.insert(name, registered);\n")
+
+# Profile selection: the rules, and the checks on them at boot.
+mutate("gw-selector-first-group-only", "only the user's first group selects a profile", SELECTOR,
+       "                    .iter()\n                    .filter_map(|group| rules.and_then(|rules| rules.get(group)))",
+       "                    .iter()\n                    .take(1)\n                    .filter_map(|group| rules.and_then(|rules| rules.get(group)))")
+mutate("gw-selector-ignores-issuer", "a user's groups select through another issuer's rules", SELECTOR,
+       "                let rules = self.users.get(issuer);", "                let rules = self.users.values().next();")
+mutate("gw-selector-workload-ignores-issuer", "a workload's team selects through another issuer's rules", SELECTOR,
+       "                .get(issuer)\n                .and_then(|teams| teams.get(team))",
+       "                .values()\n                .find_map(|teams| teams.get(team))")
+mutate("gw-selector-ambiguous-picks-first", "a user whose groups select two profiles gets the first", SELECTOR,
+       "        (Some(profile), None) => Some(profile),", "        (Some(profile), _) => Some(profile),")
+mutate("gw-selector-duplicate-workload-rule", "a second rule for one workload key replaces the first", SELECTOR,
+       "            if teams.insert(rule.team.clone(), rule.profile).is_some() {",
+       "            if teams.insert(rule.team.clone(), rule.profile).is_some() && false {")
+mutate("gw-selector-duplicate-user-rule", "a second rule for one user key replaces the first", SELECTOR,
+       "            if groups.insert(rule.group.clone(), rule.profile).is_some() {",
+       "            if groups.insert(rule.group.clone(), rule.profile).is_some() && false {")
+mutate("gw-boot-reserved-profile-accepted", "a policy may define the profile given to unselected callers", BOOT,
+       "    if snapshot.profile(&ProfileName::new(NO_PROFILE)).is_some() {",
+       "    if false && snapshot.profile(&ProfileName::new(NO_PROFILE)).is_some() {")
+mutate("gw-boot-unknown-profile-accepted", "a rule may select a profile the policy lacks", BOOT,
+       "        .find(|profile| snapshot.profile(profile).is_none())", "        .find(|_| false)")
+mutate("gw-boot-rule-issuer-not-checked", "a rule may name an issuer that is not configured", BOOT,
+       "        rules_name_configured_issuers(&config.profiles, issuers)?;\n", "        let _ = issuers;\n")
+mutate("gw-boot-rule-issuer-any-kind", "a workload rule may name a user issuer", BOOT,
+       "        .find(|rule| !issuers.workloads.contains(&rule.issuer))",
+       "        .find(|rule| !issuers.workloads.contains(&rule.issuer) && !issuers.users.contains(&rule.issuer))")
+
+# The testkit is a test tool. Moving it from the gateway's dev-dependencies into its own leaves
+# Cargo.lock as it is, so `--locked` still builds and the allowlist test is what notices.
+mutate_all(
+    "gw-dependency-testkit",
+    "the gateway depends on the testkit",
+    ("crates/gateway/Cargo.toml", 'tracing = "0.1"\n', 'tracing = "0.1"\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+)
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
