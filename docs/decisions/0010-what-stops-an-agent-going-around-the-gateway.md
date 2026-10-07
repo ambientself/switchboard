@@ -195,10 +195,11 @@ gateway's. While its MCP path serves any tool, writes included, no Otto turn has
 
 A sealed turn and a turn with egress open share an issuer, a deployment and often a subject, so
 Otto is asked to carry the turn's egress setting in the turn grant, which this gateway verifies
-and records. It is an additive claim under the two-step rule of decision 0012, on what a turn
-grant binds: Otto starts minting it, then this gateway starts requiring it. Otto mints it from
-the same setting as the `PublicEgress` claim on its model-broker token, so the two cannot
-disagree. A grant without it is read as egress open.
+and records. It is the `egress` claim in decision 0012's list of what Otto changes, on what a
+turn grant binds. It is asked for in Otto's first change, and if it misses that, it is added
+under 0012's two-step rule for new claims: Otto starts minting it, then this gateway starts
+requiring it. Otto mints it from the same setting as the `PublicEgress` claim on its
+model-broker token, so the two cannot disagree. A grant without it is read as egress open.
 
 Otto is also asked to remove the sandbox's unused Pod Identity association and the rule that
 opens its endpoint. If Otto keeps them, the register holds an entry for the sandbox's AWS
@@ -433,8 +434,8 @@ These need a party other than the owner. The record holds as written while they 
   credential, by address as well as by name, which ADR-0010 already says the list should
   cover; `make egress-check` gains a row for each; the Pod Identity association and its rule
   go, or stay with outside evidence; and the turn grant carries the egress setting. The last
-  is an additive claim under decision 0012's two-step rule, and belongs in 0012's list of what
-  Otto changes, so that Otto gets one list.
+  is the `egress` claim in decision 0012's list of what Otto changes, so that Otto gets one
+  list for the grant.
 - `github.com` and AWS are the hard cases for Otto. Both serve toolchains and accept
   credentials, and AWS shares its addresses with much else. Refusing them breaks fetches;
   allowing them leaves a route. Which to do is Otto's call, recorded in the register.
