@@ -14,7 +14,8 @@
 //!
 //! In each mode, too: the SDK reads the tool definitions as the catalog states them, takes a
 //! failing tool as an error result, cannot start without a valid token, gets an error for a
-//! method the gateway does not serve and carries on, has concurrent calls answered and
+//! method the gateway does not serve and carries on, has `ping` answered in the legacy era and
+//! refused as unknown in the modern one, has concurrent calls answered and
 //! recorded one by one, and a call it abandons still finishes its row.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -30,7 +31,8 @@ use gateway_dev::{FixtureGateway, catalog_data, start_fixture_gateway};
 use gateway_mcp::{CHALLENGE, DENIAL_CODE, LEGACY, MODERN, TOOL_USE_ID_META};
 use gateway_testkit::{Caller, DOCUMENT_ARGUMENT, READ_TOOL, SURFACE_ALL, SURFACE_READ};
 use rmcp::model::{
-    CallToolRequestParams, ClientJsonRpcMessage, ErrorCode, ProtocolVersion, RequestMetaObject,
+    CallToolRequestParams, ClientJsonRpcMessage, ClientRequest, ErrorCode, PingRequest,
+    ProtocolVersion, RequestMetaObject, ServerResult,
 };
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -476,6 +478,39 @@ async fn a_method_the_gateway_does_not_serve_is_an_error_and_the_client_carries_
         assert!(!tools.is_empty(), "{mode:?}");
         client.cancel().await.unwrap();
     }
+}
+
+/// `ping` is served in the 2025-06-18 era, where the SDK takes the empty result as an answer.
+/// The 2026-07-28 revision removed it, so there it is an unknown method.
+#[tokio::test]
+async fn ping_is_answered_in_the_legacy_era_and_unknown_in_the_modern_one() {
+    let gateway = start_fixture_gateway().await.unwrap();
+    for mode in MODES {
+        let (client, recording) = connect(&gateway, SURFACE_READ, Caller::TeamA, mode).await;
+        let answer = client
+            .send_request(ClientRequest::PingRequest(PingRequest::default()))
+            .await;
+        if mode.modern() {
+            let Err(ServiceError::McpError(error)) = answer else {
+                panic!("{mode:?}: ping was served: {answer:?}");
+            };
+            assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND, "{mode:?}");
+        } else {
+            let Ok(ServerResult::EmptyResult(_)) = answer else {
+                panic!("{mode:?}: ping was not answered with an empty result: {answer:?}");
+            };
+        }
+        // The client carries on either way.
+        assert!(
+            !client.list_all_tools().await.unwrap().is_empty(),
+            "{mode:?}"
+        );
+        client.cancel().await.unwrap();
+        let mut expected: Vec<&str> = mode.opening().to_vec();
+        expected.extend(["ping", "tools/list"]);
+        assert_eq!(recording.methods(), expected, "{mode:?}");
+    }
+    assert!(gateway.store().rows().is_empty());
 }
 
 /// Waits up to five seconds for `condition`.

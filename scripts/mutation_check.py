@@ -1133,6 +1133,8 @@ mutate("mcp-name-sentinel-not-decoded", "the base64 sentinel in Mcp-Name is comp
 mutate("mcp-modern-ping-served", "ping is served under 2026-07-28", MCP_PARSE,
        '        "server/discover" => Ok(Call::Discover),\n',
        '        "server/discover" => Ok(Call::Discover),\n        "ping" => Ok(Call::Ping),\n')
+mutate("mcp-legacy-ping-unknown", "ping is not served under 2025-06-18", MCP_PARSE,
+       '        "ping" => Ok(Call::Ping),\n', "")
 mutate("mcp-modern-unknown-method-200", "an unknown modern method is answered 200, not 404", MCP_REJECTION,
        "            Era::Modern => StatusCode::NOT_FOUND,", "            Era::Modern => StatusCode::OK,")
 mutate("mcp-legacy-any-header-version", "a legacy request accepts any MCP-Protocol-Version", MCP_PARSE,
