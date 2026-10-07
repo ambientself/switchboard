@@ -78,9 +78,9 @@ fn surface(name: &str, tools: &[&str]) -> Surface {
 fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
     let mut tools = vec![
         tool("fixture__read", Classification::Read),
-        tool("fixture__write", Classification::Write),
+        tool("fixture__propose", Classification::Propose),
     ];
-    let mut surfaces = vec![surface("fixture", &["fixture__read", "fixture__write"])];
+    let mut surfaces = vec![surface("fixture", &["fixture__read", "fixture__propose"])];
     if elsewhere {
         tools.push(tool("fixture__elsewhere", Classification::Read));
         surfaces.push(surface("other", &["fixture__elsewhere"]));
@@ -145,7 +145,9 @@ fn call(tool: &str) -> CallContext {
     let delegation = Delegation {
         acting_person: Claimed::new("requester@example.test".into()),
         team: "payments".into(),
-        tools: None,
+        tools: ["fixture__read", "fixture__propose", "fixture__elsewhere"]
+            .map(tool_name)
+            .into(),
     };
     CallContext {
         caller: CallerContext {
@@ -258,17 +260,17 @@ fn finish_completes_the_row_its_call_began_and_no_other() {
 #[test]
 fn a_denial_returns_exactly_the_sentence_its_row_holds_and_is_never_completed() {
     let store = MemoryStore::default();
-    let refusal = denied(&store, decide(&snapshot(), &call("fixture__write")));
+    let refusal = denied(&store, decide(&snapshot(), &call("fixture__propose")));
     let rows = store.rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].decision, DecisionKind::Deny);
     assert_eq!(rows[0].reason, Some(ReasonKind::ClassificationNotPermitted));
-    assert_eq!(rows[0].classification, Some(Classification::Write));
+    assert_eq!(rows[0].classification, Some(Classification::Propose));
     assert_eq!(rows[0].connector, Some(ConnectorName::from("fixture")));
     assert_eq!(rows[0].sentence.as_deref(), Some(refusal.sentence()));
     assert_eq!(
         refusal.sentence(),
-        "Tool `fixture__write` is classified `write`, which profile `readers` does not permit. Choose a tool whose classification this profile permits."
+        "Tool `fixture__propose` is classified `propose`, which profile `readers` does not permit. Choose a tool whose classification this profile permits."
     );
     assert_eq!(rows[0].completion, None);
     assert_eq!(refusal.row(), &AuditRowId::new("0"));
@@ -324,7 +326,7 @@ fn a_store_that_cannot_begin_withholds_a_denial_too() {
         fail_begin: true,
         ..MemoryStore::default()
     };
-    let decision = decide(&snapshot(), &call("fixture__write"));
+    let decision = decide(&snapshot(), &call("fixture__propose"));
     assert!(!decision.is_allowed());
     let failure = common::ready(audit::begin(&store, decision, json!({}), metadata()))
         .expect_err("a denial with no row must not be answered with its sentence");
@@ -729,7 +731,7 @@ fn the_record_serializes_under_pinned_names_and_reads_back() {
     let connector = RecordingConnector::answering(ToolOutcome::Refused("No.".into()));
     let ran = common::ready(audit::run(&connector, allowed(&store, "fixture__read")));
     let _ = common::ready(audit::finish(&store, ran, 7));
-    let _ = denied(&store, decide(&snapshot(), &call("fixture__write")));
+    let _ = denied(&store, decide(&snapshot(), &call("fixture__propose")));
     let mut named = permitted(MAX_RECORDED_RESOURCES + 3);
     named.insert(1, repository("a\\b\n`c\u{e9}"));
     let mut resourceful = call("fixture__read");

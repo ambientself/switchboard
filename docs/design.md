@@ -1,7 +1,8 @@
 # MCP gateway design
 
 Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
-review. Status: draft. Settled questions and the ones still open are in
+review, and 2026-10-04 and 2026-10-06 for the classifications in section 8. Status: draft.
+Settled questions and the ones still open are in
 [open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
 ## 1. Purpose
@@ -107,7 +108,8 @@ must be identified and tested before employee rollout (Q13).
 | Profile | The policy set that applies to one caller type, such as Otto's. |
 | Connector | Code that implements a group of tools against one external system. |
 | Proxied server | A separate MCP server the gateway forwards to. |
-| Classification | A tool's fixed label: `read`, `write` or `destructive`. |
+| Classification | A tool's fixed label: `read`, `propose`, `write` or `destructive` (section 8). |
+| A write | Any call that changes something: a `propose` tool or a `write` tool. Written as code, `write` is only the classification for direct writes. Receipts and recovery (Q10) apply to every write. |
 | Tool surface | The named set of tools one endpoint exposes. |
 | Brokering | The gateway attaches a credential on the server side; the caller never holds it. |
 
@@ -233,17 +235,73 @@ that needs a proved team cannot be handed a header value by mistake.
 Policy has two layers. One function decides from who is calling and which tool; what the call
 names is decided where the arguments are understood, and both land in one audit record.
 
-**Classification, company-wide.** Every tool has exactly one classification. A tool with none
-never runs; there is no default.
+**Classification, company-wide.** Every tool has exactly one classification, assigned by the
+person who approves it. A tool with none never runs; there is no default.
+
+| Classification | Meaning |
+| --- | --- |
+| `read` | Reads and changes nothing. |
+| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on something it created for review. Nothing it does takes effect until a person acts on it. |
+| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create for review. |
+| `destructive` | Destroys something. |
+
+A comment is `propose` only when it is on something the gateway itself created for review,
+such as its own draft pull request or an issue it opened. A comment anywhere else is `write`,
+because a comment can take effect on its own: a bot reads `/deploy` or `atlantis apply` as a
+command, and a comment can trigger CI. The rule is about what the comment is on, not that
+thing's state: a comment on the gateway's own pull request is still `propose` after a person
+marks it ready for review, if its tool makes the guards below.
+
+The decision function sees only the classification, not what the gateway created. A tool is
+`propose` only if it refuses, when it runs, to act on anything the gateway did not create, by
+a check such as the author being the gateway's own identity, a reserved branch prefix, or a
+fact from Otto's resolver. A tool that cannot make that check is `write`.
+
+Acting only on what the gateway created is not enough. A comment on the gateway's own pull
+request can still be a command. So a `propose` tool must also guard, when it runs, against
+anything that would take effect without a person acting. A guard is either a refusal or a
+value the tool forces. Otto's tools show the cases. `github_pr_comment` refuses a comment whose
+first word Atlantis would read as a command, on any pull request. `github_create_pr` forces a
+draft, because the org's Atlantis plans every pull request that is not a draft, on a server
+holding an AWS role. `github_amend_change` refuses to commit to a pull request a person has
+marked ready for review, because Atlantis would plan the new commit.
+
+A refusal is recorded as the outcome `refused`. A forced value is not a refusal: the call
+completes with the outcome `ok`, and what it created is a draft. A `propose` tool has no
+setting that turns a guard off. Otto has one, `CreateReadyPRs`, an operator flag that makes
+`github_create_pr` open pull requests that are ready for review. It is not carried over; a
+create-PR tool with such a setting is `write`.
+
+The bots whose commands a comment tool refuses are named when the tool is approved: those
+configured for the repositories or projects it can reach. Today that is Atlantis. CI cannot
+be refused by what starts it: a draft pull request, a push to the gateway's proposal branch and
+a comment each start the workflows configured for them. That is acceptable where those workflows
+only build and test. Whether a proposal stays `propose` in a repository where a workflow that a
+pull request, a push or a comment starts can deploy or holds a production credential is open (Q9).
+
+The guards are made by the connector, so the decision function cannot watch them. Each one,
+the forced draft included, is tested like any other guard: the tool's connector has a test
+against the fake vendor that fails without it, and a mutation that removes it (section 18).
+
+Under this rule Otto's `github_pr_comment` and `jira_comment` are `write`: they comment on
+pull requests and issues the gateway did not create. So is `addOrEditJiraIssueComment` on
+Atlassian's hosted server, which [systems.md](systems.md) plans for the Jira surface. Otto's
+callers are denied them, which loses parity with Otto's gateway (#12). Whether to allow them by
+a narrow, recorded exception is open (Q9).
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
-profiles. Production mutation is denied for every profile initially.
+profiles. `write` and `destructive` are denied in every profile by the decision function, so
+no profile's data can permit them. That is how production mutation is denied for every profile
+initially: anything that changes production without a person acting is one of the two.
+Permitting direct writes needs a decision that replaces part of
+[decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
-| Writes | Proposal-shaped only. | Only explicitly approved tools; per-user grants where authorship or permissions require them. Broader write policy remains Q9. | Proposal-shaped only. |
+| Proposals (`propose`) | Allowed. A comment is a proposal only on something the gateway created for review, such as its own draft pull request or an issue it opened, and only if its tool refuses the commands of the bots named when it was approved. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
+| Direct writes (`write`) | Never. That includes a comment on anything the gateway did not create for review, so Otto's two comment tools are denied unless Q9 settles an exception. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
@@ -255,19 +313,35 @@ sandboxes.
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
 refused unless the turn's grant lists it.
 
-**Scope is decided by the connector.** Which repository, project or account a call names can
-only be checked once its arguments are understood, so the connector makes that refusal and it
-is recorded as the outcome `refused` on an allowed row. "What did the gateway refuse" is
-therefore a denial or a refused outcome. Making that scope check uniform across built-in and
-proxied tools is Q9.
+**Scope is checked in two places.** A tool that declares its resources has them checked by the
+decision function against the caller's limits, before anything runs. A resource outside the
+limit, or none where the tool declares some, is a denial. A tool whose scope can only be seen
+once its arguments are understood is marked as checking its own scope, and its connector
+refuses at run time. That refusal is recorded as the outcome `refused` on an allowed row, as
+is a `propose` tool's refusal of something the gateway did not create or of something that
+would act on its own. "What did the gateway refuse" is therefore a denial or a refused
+outcome. Making the scope check uniform across built-in and proxied tools is Q9.
 
 **Reads can need a breadth setting.** A read that shows more than its caller could otherwise
-see, such as AWS inventory across accounts, is opt-in per team or group.
+see, such as AWS inventory across accounts, is opt-in per team or group. That is expressed with
+the existing allowlists: such a tool is served only on surfaces whose allowlist is the opted-in
+teams and groups, and the resources it names are checked against their limits. It gets a
+field of its own only when the first such tool is built.
 
 **What Rust adds.** The registry accepts a classification type that can only be built by a
-conversion that fails for anything unrecognized, and a destructive tool can be held only in a
-type the Otto profile's run path does not accept. An enum also has no unset state, which
-removes the zero-value case the Go gateway has to guard against.
+conversion that fails for anything unrecognized. An enum also has no unset state, which
+removes the zero-value case the Go gateway has to guard against. A tool runs only with a
+guard that only an allow from the decision function produces, and code that skips either
+does not compile.
+
+An earlier version of this section said a destructive tool could be held only in a type the
+Otto profile's run path does not accept. That was not built, and it has been dropped. Every
+profile shares one run path, so a type per profile would need a run path per profile, and the
+rule is about every profile, not Otto's. Instead the decision function refuses a `write` or
+`destructive` tool before it reads the profile. That is a runtime check, and tests watch it:
+a property that such a tool is never allowed or listed, decision-table cases for each
+profile, and mutations that remove each half of the check
+([decision 0006](decisions/0006-what-the-decision-function-sees.md), amended 2026-10-04).
 
 ## 9. Credentials
 
@@ -323,7 +397,8 @@ written.
   cannot leave an outcome empty on a call that completed. The answer waits for this for a
   short fixed budget (two seconds in Otto) and then goes out regardless, because withholding
   the result of a write that already happened invites a retry.
-- **Three outcomes:** `ok`, `error` and `refused`, the last for a connector's scope refusal.
+- **Three outcomes:** `ok`, `error` and `refused`, the last for a connector's scope refusal
+  or a `propose` tool's refusal (section 8).
 - **The caller's tool-use identifier is recorded,** so a caller's control plane can look up
   the decision for a call it already knows about. Otto's does.
 - **The resources a call names are recorded,** so "who reached this repository" can be
@@ -363,10 +438,14 @@ before more callers are added. An audit row is not an idempotency record: it doe
 write being made twice (Q10).
 
 For Otto's callers the row must match the existing `gateway_audit` table. That table has no
-general column for the resources a call names. It records them for one tool only:
-`github_skill_body` writes the skill ref it was asked for (`skill_ref_requested`) and the
-repository and commit it read (`skill_repo`, `skill_commit`). Other Otto calls' resources are
-not recorded. Whether the table gains a general column, and who adds it, is open (Q12).
+column for the resources an allowed call names. A denial's or refusal's sentence names the one
+resource that caused it, as prose capped at 1,024 characters (`deny_reason`, `refusal_reason`).
+`github_skill_body` also records the skill ref it was asked for (`skill_ref_requested`) and the
+repository and commit it read (`skill_repo`, `skill_commit`), but only on an allowed call, and
+those columns travel on the finish write, which Otto makes best-effort. Whether the table gains
+a general column, and who adds it, is open (Q12). The table's classification column allows only
+`read`, `write` and `destructive`, so Otto's adapter records a `propose` tool as `write` there,
+an explicit mapping like its tool names.
 
 **What Rust adds.** The begin step returns a guard value that the tool-running code requires
 as an argument, so a call path that skips the audit write does not compile.
@@ -479,7 +558,7 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail ([decision 0008](decisions/0008-mock-the-first-slice.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one. | Audit semantics for reads (Q10). |
 | 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection. | Freshness and revocation bounds (Q11). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. Whether Otto's comment tools get an exception to the comment rule (Q9). |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. | Clients and access (Q13). Employee write boundaries (Q9). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
@@ -520,11 +599,41 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
 - The suite does not yet cover the behavior of thirteen newer tools; see
   [otto-baseline.md](otto-baseline.md). Otto's control-plane endpoints stay in Otto, so the
   suite covers the vendor actions they will call once those are defined, not the endpoints.
+- **Classifications are mapped.** The suite compares the classification each tool is served
+  and recorded with: in the tool inventory, and in the provenance and audit row of each call
+  in the brokered-credentials test. It pins `write` for `github_create_pr`,
+  `github_propose_change` and `github_amend_change`, which are `propose` here. The Otto
+  adapter reports and records `propose` as `write` (decision 0006), so these checks pass
+  through that mapping, like the tool-name mapping. They are not expected differences.
+- **The comment tools are an expected difference.** Under section 8 the Rust gateway denies
+  `github_pr_comment` and `jira_comment` to Otto's callers, so the suite's cases that use them
+  cannot pass against it until Q9 settles an exception. They are:
+  - the tool inventory, which requires both to be served;
+  - `TestOriginalToolsAndBrokeredCredentials`, which calls `github_pr_comment` as an allowed
+    call, checks its confirmation, and requires exactly two writes, the comment's among them;
+  - the three cases in `TestScopeRefusalsAndArgumentErrors` that use `github_pr_comment`:
+    another organization, an Atlantis command, and an empty body;
+  - `TestAuditFinishFailureDoesNotUndoSuccess` and `TestRepeatedCommentIsWrittenTwice`, where
+    it is the only write.
+
+  When the suite is extended in milestone 4, these go in a group of expected differences, and
+  their coverage is kept. In the brokered-credentials test only the comment case and the
+  write count move; its `github_create_pr` case still runs against the Rust gateway, with the
+  token-scope checks and the check that the pull request is opened as a draft. The two audit
+  tests are also run with a `propose` tool. The Atlantis command refusal is the guard a
+  `propose` comment tool needs, and is tested as section 8 says. The brokered-credentials test
+  calls a comment a proposal write ("non-proposal write"); that is Otto's definition, not this
+  gateway's. This is a difference in policy, not a mapping.
 - How quickly a change can be checked is planned in [feedback-loops.md](feedback-loops.md).
 - `conformance/mutation_check.py` breaks guards in the pinned gateway and requires the named
   test to fail. It is run after every re-pin.
 - Each invariant in section 16 gets a test that is shown to fail when its guard is removed.
   Where the guard is a type, the test is a compile-fail test.
+- A `propose` tool's run-time guards (section 8), refusals and forced values such as a draft,
+  are guards like any other. Its connector has a test against the fake vendor that fails
+  without each one, and a mutation that removes it. Where such a guard would sit inside a
+  proxied server, the gateway cannot test it this way; whether it can still make the tool
+  `propose` is part of Q9.
 - Audit store tests use a real Postgres. Everything else, including end-to-end tests of the
   gateway, runs on the in-memory fakes with no database.
 

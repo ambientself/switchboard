@@ -50,6 +50,10 @@ const DELEGATION_WITHOUT_TEAM: &str = "The delegation was issued for team `{dele
 /// The tool is destructive. Its own sentence, because no profile can change the answer.
 const DESTRUCTIVE: &str = "Tool `{tool}` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change.";
 
+/// The tool is a direct write. Its own sentence, because no profile can change the answer, and
+/// because the caller can usually do what it wanted by proposing instead.
+const DIRECT_WRITE: &str = "Tool `{tool}` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it.";
+
 /// The profile does not permit the tool's classification.
 const CLASSIFICATION_NOT_PERMITTED: &str = "Tool `{tool}` is classified `{classification}`, which profile `{profile}` does not permit. Choose a tool whose classification this profile permits.";
 
@@ -81,7 +85,7 @@ pub(crate) const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 15] = [
+const SENTENCES: [&str; 16] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -91,6 +95,7 @@ const SENTENCES: [&str; 15] = [
     DELEGATION_TEAM_MISMATCH,
     DELEGATION_WITHOUT_TEAM,
     DESTRUCTIVE,
+    DIRECT_WRITE,
     CLASSIFICATION_NOT_PERMITTED,
     RESOURCE_OUTSIDE_LIMIT,
     RESOURCES_UNKNOWN,
@@ -168,6 +173,11 @@ pub(crate) fn render(reason: &Reason) -> String {
             classification: Classification::Destructive,
             ..
         } => fill(DESTRUCTIVE, &[("tool", Text(tool.as_str()))]),
+        Reason::ClassificationNotPermitted {
+            tool,
+            classification: Classification::Write,
+            ..
+        } => fill(DIRECT_WRITE, &[("tool", Text(tool.as_str()))]),
         Reason::ClassificationNotPermitted {
             tool,
             classification,
