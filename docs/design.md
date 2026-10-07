@@ -281,11 +281,13 @@ sandboxes.
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
 refused unless the turn's grant lists it.
 
-**Scope is decided by the connector.** Which repository, project or account a call names can
-only be checked once its arguments are understood, so the connector makes that refusal and it
-is recorded as the outcome `refused` on an allowed row. "What did the gateway refuse" is
-therefore a denial or a refused outcome. Making that scope check uniform across built-in and
-proxied tools is Q9.
+**Scope is checked in two places.** A tool that declares its resources has them checked by the
+decision function against the caller's limits, before anything runs. A resource outside the
+limit, or none where the tool declares some, is a denial. A tool whose scope can only be seen
+once its arguments are understood is marked as checking its own scope, and its connector
+refuses at run time. That refusal is recorded as the outcome `refused` on an allowed row.
+"What did the gateway refuse" is therefore a denial or a refused outcome. Making the scope
+check uniform across built-in and proxied tools is Q9.
 
 **Reads can need a breadth setting.** A read that shows more than its caller could otherwise
 see, such as AWS inventory across accounts, is opt-in per team or group. That is expressed with
