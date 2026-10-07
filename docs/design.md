@@ -154,7 +154,9 @@ lines only once the interfaces between them have settled.
 | `connector-github` | GitHub tools, and the client for the key custodian. |
 | `otto-adapter` | Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
-| `gateway` | The proxy binary: HTTP handler, boot gates, wiring. |
+| `gateway-mcp` | The MCP protocol adapter: JSON-RPC envelopes, the two revisions, header checks, rendering. No policy types. |
+| `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, wiring. |
+| `gateway-dev` | The gateway on the test fakes (`switchboard-dev`), a scripted client, and the end-to-end tests. |
 | `registry` | The control-plane binary, once it exists. |
 | `conformance` | The black-box suite, a fake vendor API and a fake MCP server. |
 
