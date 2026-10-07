@@ -845,8 +845,11 @@ mutate_all(
     (IDENTITY + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
 )
-mutate("identity-second-crypto-backend", "a second crypto backend is enabled", IDENTITY + "Cargo.toml",
-       'features = ["rust_crypto"] }\nserde_json', 'features = ["rust_crypto", "aws_lc_rs"] }\nserde_json')
+# Enabling `aws_lc_rs` itself would add crates to Cargo.lock, which `--locked` refuses before any
+# test runs, so that mutation could never give a verdict. Any second entry in the feature list
+# fails the same assertion a second backend would, and leaves the lock as it is.
+mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
+       'features = ["rust_crypto"] }\nserde_json', 'features = ["rust_crypto", "rust_crypto"] }\nserde_json')
 
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
