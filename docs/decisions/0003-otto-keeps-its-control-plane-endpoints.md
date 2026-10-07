@@ -2,6 +2,10 @@
 
 Date: 2026-10-01. Status: accepted. Replaces the first version of this decision, made the same
 day, which moved the endpoints into the gateway.
+Noted on 2026-10-07: "never holds a vendor credential" covers the vendor actions this decision
+moves to the gateway. Otto's control plane keeps the credentials for its own conversation
+surfaces, such as its Slack app. That is an entry in the register of
+[decision 0010](0010-what-stops-an-agent-going-around-the-gateway.md).
 
 ## Context
 

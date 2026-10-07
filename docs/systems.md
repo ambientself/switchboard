@@ -48,6 +48,25 @@ server before it can be registered.
 - "Not verified" means no primary source was found, or the sources disagree.
 - Counts of tools are taken from the vendor's own lists on that date. They change often.
 
+## What every vendor's test also confirms
+
+Added on 2026-10-07 by
+[decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md). Each "To
+confirm" step below also records, with its source:
+
+- which hosts accept the vendor's credentials, and where that list comes from. The route
+  check's list of hosts to refuse is built from it.
+- whether the gateway's credential can be limited to its egress addresses, for that one
+  credential or only for the whole organization. Whether to use such a limit is for IT and the
+  vendor's administrators.
+- whether sign-in to the vendor's hosted MCP server can be restricted.
+- whether the vendor's audit log attributes actions to the gateway's credential.
+
+A self-built server identifies the gateway by a token for one of the gateway's own workload
+identities, with the server as audience. It accepts only those identities, one for each
+deployment and one for each team service identity registered for it, never a source address
+or any other subject.
+
 ## Summary
 
 | System | What agents need it for | Recommendation | Service identity | Read-only |
@@ -61,7 +80,7 @@ server before it can be registered.
 | Akamai | Configuration and delivery data. | Built-in, reads only. | Yes, EdgeGrid API client. | Yes, per API. |
 | Salesforce | Read records. | Not yet. | No for the hosted server. Yes for the REST API. | Yes. |
 | MongoDB Atlas | Read cluster and collection data. | Proxy the vendor's hosted server. | Yes, service account. | Yes. |
-| Self-built | Whatever an Org team exposes. | Proxied, by definition. | How a team's server proves the gateway is its caller is open. | Each tool's classification is assigned by a person. |
+| Self-built | Whatever an Org team exposes. | Proxied, by definition. | The server accepts only the gateway's own workload identities, by a token with the server as audience (decision 0010). Milestone 2 builds the first, for the mock server. | Each tool's classification is assigned by a person. |
 
 "Service identity: yes" is what the vendor documents. It stays unproven until the test named in
 each section has been run.
@@ -709,7 +728,7 @@ the access list fails.
 
 | System | What agents need it for | Leaning | To verify |
 | --- | --- | --- | --- |
-| Self-built | Whatever an Org team exposes. | Proxied, by definition. | How a team's server proves the gateway is its caller. Who assigns each tool's classification. |
+| Self-built | Whatever an Org team exposes. | Proxied, by definition. | Who assigns each tool's classification. That the server refuses every caller but the gateway: the registry's probe checks it at registration and on each drift poll. |
 
 ## Okta
 

@@ -1,13 +1,16 @@
 # Open questions
 
-Q1–Q8, Q14–Q16 and Q19 are settled below, and so is Q10 apart from read auditing. Q9–Q13,
-Q17 and Q18 are open; Q10 is narrowed to what compliance requires of read auditing. When
-resolved, move their requirements into [design.md](design.md) and remove the open question.
-Vendor research remains in [systems.md](systems.md).
+Q1–Q8, Q14–Q17 and Q19 are settled below, and so is Q10 apart from read auditing. Q9–Q13
+and Q18 are open; Q10 is narrowed to what compliance requires of read auditing. When resolved,
+move their requirements into [design.md](design.md) and remove the open question. Vendor
+research remains in [systems.md](systems.md).
 
 ## Settled
 
-- **2026-09-30:** The gateway is the one MCP path for Org. Otto is one caller of it.
+- **2026-09-30:** The gateway is the one MCP path for Org. Otto is one caller of it. Noted on
+  2026-10-07: scoped by
+  [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md) to a claim
+  per environment, "the only path" or "the governed path".
 - **2026-09-30:** Target systems are GitHub, Atlassian, New Relic, Sumo Logic, Akamai, AWS and
   self-built MCP servers. See [systems.md](systems.md).
 - **2026-09-30:** Both built-in connectors and proxied servers are needed, because self-built
@@ -80,6 +83,15 @@ Vendor research remains in [systems.md](systems.md).
   a call. Reads stay synchronous on Q4's acceptance until compliance says what it requires. The
   owner accepted the recommendations on 2026-10-07. See
   [decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md). Fencing is in Q18.
+- **2026-10-07 (Q17):** Each environment that serves agents carries "the only path" or "the
+  governed path". The only path needs three controls, shown by dated evidence from inside the
+  environment with a positive control in the same run. The first slice in kind is the only path
+  to the mock server once the kind run's evidence is current. Real services and Otto's
+  sandboxes start on the governed path, and a real workload passes the route check before it
+  sees real data. Laptops stay on the governed path.
+  Known routes around the gateway, with owners, are in [route-exceptions.md](route-exceptions.md).
+  What Otto, IT, the security team and platform owners decide is listed in the record. See
+  [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -207,19 +219,6 @@ remain unverified. Publishing discovery metadata alone does not establish intero
 - **References:** [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
   and [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports).
 - **Blocks:** employee client acceptance tests and deployment setup.
-
-## Q17. What stops an agent going around the gateway?
-
-Central authorization is real only where there is no other route. An agent that holds a vendor
-credential, or can reach a vendor or another MCP server directly, is audited when it uses the
-gateway and ungoverned when it does not.
-
-- **Recommendation:** for each environment the gateway serves, state the controls and show
-  they hold: no vendor credential in the caller, egress that reaches vendors only through the
-  gateway, downstream MCP servers that accept only the gateway's identity. Keep a list of
-  exceptions. Otto's sandboxes already have default-deny egress; a laptop does not, so for
-  employees the honest claim is "the governed path", not "the only path".
-- **Blocks:** milestone 2 for its one workload; milestone 5 for employees.
 
 ## Q18. What must a turn grant bind?
 
