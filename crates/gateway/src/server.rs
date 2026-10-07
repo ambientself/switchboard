@@ -19,12 +19,17 @@
 //!    for. A client that disconnects drops the handler, but not that task, so a tool call that
 //!    started still completes its audit row.
 //!
+//! Shutting down waits for those tasks too, not only for the connections still open: a call
+//! whose client has gone is still running, and a process that exited under it would leave its
+//! row open.
+//!
 //! Every request is logged once it is answered, with its status and how long it took. A
 //! disabled gate is logged at boot, and again every [`DISABLED_GATE_REMINDER`] while the
 //! gateway serves.
 
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -38,6 +43,7 @@ use http::request::Parts;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::Instrument;
 
 use crate::boot::{GateState, Gates};
@@ -55,7 +61,8 @@ pub async fn serve(listener: TcpListener, gates: Gates) -> io::Result<()> {
 }
 
 /// Serves `gates` on `listener` until `shutdown` completes, then stops taking connections and
-/// returns once the requests in flight are answered.
+/// returns once the requests in flight are answered and every tool call started has completed
+/// its audit row, including calls whose clients have gone.
 pub async fn serve_with_shutdown<F>(
     listener: TcpListener,
     gates: Gates,
@@ -75,18 +82,80 @@ where
     );
     let path = RequestPath::new(gates);
     let reminder = tokio::spawn(remind(path.clone()));
-    let served = axum::serve(listener, router(path))
-        .with_graceful_shutdown(shutdown)
-        .await;
+    let answers = Answers::default();
+    let served = axum::serve(
+        listener,
+        router(Endpoint {
+            path,
+            answers: answers.clone(),
+        }),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await;
     reminder.abort();
     tracing::info!(%address, "stopped listening");
+    let running = answers.running();
+    if running > 0 {
+        tracing::info!(
+            %address,
+            running,
+            "waiting for the answers still running to complete their rows"
+        );
+    }
+    answers.finished().await;
     served
 }
 
-fn router(path: RequestPath) -> Router {
+/// What the endpoint's handler holds: the request path, and the answers it has started.
+#[derive(Clone)]
+struct Endpoint {
+    path: RequestPath,
+    answers: Answers,
+}
+
+/// Counts the answer tasks that are running, whether or not anyone is still waiting for them.
+#[derive(Clone)]
+struct Answers(Arc<watch::Sender<usize>>);
+
+impl Default for Answers {
+    fn default() -> Self {
+        Self(Arc::new(watch::Sender::new(0)))
+    }
+}
+
+impl Answers {
+    /// Counts one more answer running, until the returned guard is dropped.
+    fn start(&self) -> Running {
+        self.0.send_modify(|running| *running += 1);
+        Running(self.0.clone())
+    }
+
+    fn running(&self) -> usize {
+        *self.0.borrow()
+    }
+
+    /// Returns once no answer is running.
+    async fn finished(&self) {
+        let mut running = self.0.subscribe();
+        // The sender is held here, so the channel cannot close while this waits.
+        let _ = running.wait_for(|running| *running == 0).await;
+    }
+}
+
+/// One answer running. Dropped when its task ends, however it ends.
+struct Running(Arc<watch::Sender<usize>>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0
+            .send_modify(|running| *running = running.saturating_sub(1));
+    }
+}
+
+fn router(endpoint: Endpoint) -> Router {
     Router::new()
-        .route("/mcp/{surface}", any(endpoint))
-        .with_state(path)
+        .route("/mcp/{surface}", any(handle))
+        .with_state(endpoint)
 }
 
 /// Logs each disabled gate every [`DISABLED_GATE_REMINDER`]. Returns at once if none is.
@@ -118,13 +187,13 @@ async fn remind(path: RequestPath) {
     }
 }
 
-async fn endpoint(State(path): State<RequestPath>, request: Request) -> Response {
+async fn handle(State(endpoint): State<Endpoint>, request: Request) -> Response {
     let started = Instant::now();
     let (mut parts, body) = request.into_parts();
     let method = parts.method.clone();
     let uri_path = parts.uri.path().to_owned();
     let span = tracing::info_span!("request", %method, path = %uri_path);
-    let response = answer(&path, &mut parts, body)
+    let response = answer(&endpoint, &mut parts, body)
         .instrument(span.clone())
         .await;
     span.in_scope(|| {
@@ -138,7 +207,8 @@ async fn endpoint(State(path): State<RequestPath>, request: Request) -> Response
 }
 
 /// The steps in the [module documentation](self), in order.
-async fn answer(path: &RequestPath, parts: &mut Parts, body: Body) -> HttpResponse {
+async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpResponse {
+    let path = &endpoint.path;
     let gates = path.gates();
     if let Err(rejection) = check_host(gates, parts) {
         return refused(&rejection);
@@ -174,7 +244,12 @@ async fn answer(path: &RequestPath, parts: &mut Parts, body: Body) -> HttpRespon
     let answering = path.respond(admitted, &surface, &parts.headers, &body);
     let span = tracing::info_span!("answer", %surface);
     // Its own task, so a client that goes away cannot stop a call between running the tool
-    // and completing its row.
+    // and completing its row; counted, so that shutting down waits for it.
+    let running = endpoint.answers.start();
+    let answering = async move {
+        let _running = running;
+        answering.await
+    };
     match tokio::spawn(answering.instrument(span)).await {
         Ok(response) => response,
         Err(error) => {

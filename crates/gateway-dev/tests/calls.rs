@@ -472,6 +472,41 @@ async fn shutting_down_waits_for_a_call_in_flight_and_answers_it() {
 }
 
 #[tokio::test]
+async fn shutting_down_waits_for_a_call_whose_client_has_gone_to_complete_its_row() {
+    let gateway = start_fixture_gateway().await.unwrap();
+    let store = gateway.store().clone();
+    let gate = gateway.connector().hang_next();
+    let request = Request::in_era(
+        Era::Legacy,
+        &gateway.url(SURFACE_READ),
+        "tools/call",
+        call_params(READ_TOOL, document(TEAM_A_DOCUMENT)),
+    )
+    .bearer(&gateway.token(Caller::TeamA));
+    let sending = tokio::spawn(async move { request.send_on(&client()).await });
+    eventually("the call reaching the connector", || gate.waiting() == 1).await;
+    sending.abort();
+    assert!(sending.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // No connection is open, but a call is still running. A process that exits once the
+    // server returns would leave its row open for good.
+    let stopping = tokio::spawn(gateway.shutdown());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !stopping.is_finished(),
+        "stopped while a call was still running"
+    );
+    gate.open();
+    stopping.await.unwrap().unwrap();
+    assert_eq!(
+        store.row(0).unwrap().completion.map(|c| c.outcome),
+        Some(Outcome::Ok),
+        "the row was not complete when the server returned"
+    );
+}
+
+#[tokio::test]
 async fn no_answer_is_sent_until_the_row_is_finished() {
     let gateway = start_fixture_gateway().await.unwrap();
     let held = gateway.store().hold_finishes();
