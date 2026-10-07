@@ -104,8 +104,10 @@ check that the deployment files load.
   head, PR #35), #26, #10, #14 and #9 work that has not been merged, on top of main with #29
   and #30.
 
-## Not done here
+## Findings
 
-- Measuring how long a ConfigMap edit takes to reach the gateway in kind (planDemo.md, Tier C).
-  Compose shows the withdrawal live.
-- The latency findings over 200 calls (#14k).
+[docs/first-slice-findings.md](../docs/first-slice-findings.md) holds what the runs measured
+(#14k). It covers audit begin and finish latency over 200 calls, a paused or stopped
+database, and how long a registry change takes to show: up to 2 s in Compose, and 33 to 88 s
+in kind, where kubelet updates the mounted ConfigMap. It also says what the kind run proved,
+what it did not, and the gaps.
