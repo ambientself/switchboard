@@ -45,7 +45,7 @@
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
 use gateway_core::{
@@ -290,28 +290,42 @@ impl RequestPath {
             tool: requested,
             resources,
         };
+        let decided = Instant::now();
         let decision = decide(&snapshot, &context);
+        let decide_us = micros(decided.elapsed());
         let metadata = RequestMetadata {
             tool_use_id: bounded_tool_use_id(tool_use_id),
             claimed_team: None,
         };
 
         let store = gates.audit_store().as_ref();
-        let guard = match audit::begin(store, decision, arguments, metadata).await {
+        let begun = Instant::now();
+        let begin = audit::begin(store, decision, arguments, metadata).await;
+        let begin_us = micros(begun.elapsed());
+        let guard = match begin {
             Err(failure) => {
-                tracing::error!(%failure, "refused a tool call: its audit row could not be written");
+                tracing::error!(
+                    %failure,
+                    decide_us,
+                    begin_us,
+                    "refused a tool call: its audit row could not be written"
+                );
                 return Reply::Denied(failure.sentence().to_owned());
             }
             Ok(Begun::Denied(refusal)) => {
                 tracing::info!(
                     row = refusal.row().as_str(),
                     reason = ?refusal.reason().kind(),
+                    decide_us,
+                    begin_us,
                     "denied a tool call"
                 );
                 return Reply::Denied(refusal.sentence().to_owned());
             }
             Ok(Begun::Allowed(guard)) => guard,
         };
+        let row = guard.row().clone();
+        let tool = guard.tool().name.clone();
         let Some(connector) = gates.connector(&guard.tool().connector) else {
             // The boot gates refuse a tool on a surface whose connector is not registered.
             tracing::error!(
@@ -325,13 +339,28 @@ impl RequestPath {
         };
 
         let started = gates.clock().now();
+        let running = Instant::now();
         let ran = audit::run(connector.as_ref(), guard).await;
+        let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
         // No answer budget (G2): the core gives out the answer when the store's finish returns.
+        let finishing = Instant::now();
         let finished = audit::finish(store, ran, latency_ms).await;
+        let finish_us = micros(finishing.elapsed());
         if let Some(failure) = finished.failure() {
             tracing::error!(%failure, "a tool call ran but its audit row could not be completed");
         }
+        tracing::info!(
+            row = row.as_str(),
+            %tool,
+            outcome = outcome_name(finished.answer()),
+            latency_ms,
+            decide_us,
+            begin_us,
+            run_us,
+            finish_us,
+            "ran a tool call"
+        );
         match finished.answer().clone() {
             Answer::Ok(value) => Reply::ToolOk(value),
             Answer::Error(message) => Reply::ToolError(message),
@@ -414,6 +443,21 @@ fn entry(tool: &ApprovedTool, definition: &ToolDefinition) -> ToolEntry {
         input_schema: definition.input_schema.clone(),
         read_only: tool.classification == Classification::Read,
     }
+}
+
+/// How an answer is named in the log.
+fn outcome_name(answer: &Answer) -> &'static str {
+    match answer {
+        Answer::Ok(_) => "ok",
+        Answer::Error(_) => "error",
+        Answer::Refused(_) => "refused",
+        Answer::AuditFailed { .. } => "audit_failed",
+    }
+}
+
+/// A duration in whole microseconds, for the log.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn elapsed_millis(clock: &dyn Clock, since: SystemTime) -> u64 {
