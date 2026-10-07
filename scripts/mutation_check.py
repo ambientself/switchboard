@@ -950,7 +950,11 @@ mutate("fake-connector-hang-ignored", "a connector told to hang does not", K,
 mutate("fake-connector-hang-next-is-hang-all", "a hang meant for the next call is never cleared", K,
        "                    let gate = gate.clone();\n                    state.hang = Hang::Never;\n                    Some(gate)", "                    Some(gate.clone())")
 mutate("fake-connector-calls-not-recorded", "calls are not recorded", K, "            state.received.push(ReceivedCall {", "            let _ = (ReceivedCall {")
-mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "                    self.state().writes.push(WriteRecord {", "                    drop(WriteRecord {")
+mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "        self.state().writes.push(write);", "        drop(write);")
+mutate("fake-connector-draft-guard-ignored", "the draft tool revises a draft the gateway did not open", K,
+       "                .filter(|draft| state.drafts.get(*draft) == Some(&document))", "                .filter(|_| true)")
+mutate("fake-connector-draft-any-document", "the draft tool revises a draft through a call naming another document", K,
+       "state.drafts.get(*draft) == Some(&document)", "state.drafts.contains_key(*draft)")
 mutate("fake-connector-scope-ignored", "the scoped tool refuses nothing", K,
        "                    match named.filter(|name| !scope.contains(*name)) {", "                    match named.filter(|name| false && !scope.contains(*name)) {")
 mutate("fake-connector-scope-any-team", "a workload may reach any team's documents through the scoped tool", K,
