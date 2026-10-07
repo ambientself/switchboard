@@ -360,8 +360,10 @@ before more callers are added. An audit row is not an idempotency record: it doe
 write being made twice (Q10).
 
 For Otto's callers the row must match the existing `gateway_audit` table. That table has no
-column for the resources a call names, so an Otto call's resources are not recorded. Whether
-it gains one, and who adds it, is open (Q12).
+general column for the resources a call names. It records them for one tool only:
+`github_skill_body` writes the skill ref it was asked for (`skill_ref_requested`) and the
+repository and commit it read (`skill_repo`, `skill_commit`). Other Otto calls' resources are
+not recorded. Whether the table gains a general column, and who adds it, is open (Q12).
 
 **What Rust adds.** The begin step returns a guard value that the tool-running code requires
 as an argument, so a call path that skips the audit write does not compile.

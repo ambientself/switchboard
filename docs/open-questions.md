@@ -132,10 +132,14 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
   payloads. Define availability and latency targets and measure audit overhead against them.
   A row's recorded resources alone can reach 147,648 characters
   ([design.md](design.md), section 11).
-- **Otto's audit table:** Otto's `gateway_audit` table has no column for the resources a call
-  names, so the rows written for Otto's callers do not record them. Decide whether the table
-  gains one, and who adds it. [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md)
-  makes the table's contract a compatibility requirement, so adding a column changes it.
+- **Otto's audit table:** Otto's `gateway_audit` table has no general column for the
+  resources a call names. Only `github_skill_body` records them, in `skill_ref_requested`,
+  `skill_repo` and `skill_commit`, so the rows for Otto's other calls do not. Decide whether
+  the table gains a general column, and who adds it.
+  [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md) makes the table's contract a
+  compatibility requirement, so adding a column changes it. Otto's rule for this table, stated
+  in its migration 0036, is typed columns and not one JSONB bag, so a new column must be
+  typed. Otto's writer bounds each text column in bytes.
 - **Blocks:** rollout sequencing and production readiness.
 
 ## Q13. Which employee clients and access infrastructure are the acceptance targets?
