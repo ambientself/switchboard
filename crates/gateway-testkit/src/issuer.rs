@@ -117,6 +117,15 @@ impl LocalIssuer {
         }
     }
 
+    /// The JWK set as the JSON document an issuer serves at its `jwks_uri`: the body a test
+    /// server returns for the issuer's keys. This crate has no HTTP server, so a test that
+    /// fetches keys over HTTP serves this document from a route of its own.
+    pub fn jwks_document(&self) -> String {
+        // A JWK set of public keys always serializes. If it somehow did not, an empty set is a
+        // document a verifier refuses, which is a safe way for a test to be wrong.
+        serde_json::to_string(&self.jwk_set()).unwrap_or_else(|_| r#"{"keys":[]}"#.to_owned())
+    }
+
     /// An issuer entry for `gateway-identity` that trusts this issuer's key, accepts
     /// `audiences`, and allows tokens of up to [`DEFAULT_MAX_LIFETIME`] seconds with
     /// [`DEFAULT_LEEWAY`] seconds of leeway. Every field is public, so a test changes the one

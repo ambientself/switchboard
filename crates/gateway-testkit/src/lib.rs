@@ -9,8 +9,9 @@
 //!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a write tool and a scope-checking tool, records
 //!   every call, and can fail or hang.
-//! - [`LocalIssuer`] generates a key pair when built and signs tokens a test can break in any
-//!   one way; [`FixedClock`] and [`SteppableClock`] say what time it is.
+//! - [`LocalIssuer`] generates a key pair when built, gives its public keys as the JWKS
+//!   document an issuer serves, and signs tokens a test can break in any one way;
+//!   [`FixedClock`] and [`SteppableClock`] say what time it is.
 //! - [`Fixture`] puts them together with a policy snapshot, two teams, a user group, two
 //!   surfaces and one resource limit per team, and builds a [`CallerContext`] for each of the
 //!   callers it knows by proving a token through the real verifier.
