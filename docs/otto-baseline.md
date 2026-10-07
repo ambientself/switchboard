@@ -56,6 +56,10 @@ These exist in Otto at this commit and are not exercised beyond being listed:
 - Whether the fencing epoch in the grant is enforced. Otto's code says it is signed and not
   yet enforced; the suite only checks that it is recorded.
 
+Grant key rotation and epoch enforcement in this gateway are tested by the new-behavior group
+for [decision 0012](decisions/0012-what-a-turn-grant-binds.md) ([design.md](design.md),
+section 18), not by this suite.
+
 Extending coverage is required before Otto's cutover, which is milestone 4 of the design. It
 is not needed for the milestones before it.
 

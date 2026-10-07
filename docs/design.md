@@ -54,7 +54,7 @@ decisions [0002](decisions/0002-replace-ottos-mcp-gateway.md) and
 | --- | --- |
 | `otto/docs/05-mcp-gateway.md` | Classification, the denial contract, proved against claimed identity, audit before answer, boot gates. |
 | `otto/docs/adr/0009-otto-builds-the-mcp-gateway.md` | Exactly one place decides authorization. |
-| `otto/docs/02-control-plane.md` | Policy tiers, approval design, action receipts and failover fencing. Receipts: [decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md). Fencing: Q18. |
+| `otto/docs/02-control-plane.md` | Policy tiers, approval design, action receipts and failover fencing. Receipts: [decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md). Fencing: [decision 0012](decisions/0012-what-a-turn-grant-binds.md). |
 | [DoorDash's Agent Gateway write-up](https://careersatdoordash.com/blog/how-doordash-built-a-centralized-gateway-for-ai-agent-tool-access/) | The registry and proxy split, curated tool surfaces, self-serve onboarding, several credential modes. |
 
 The control-plane document's asynchronous read-receipt proposal was not taken. Every tool
@@ -174,16 +174,19 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
 1. **Verify the caller** against the issuers configured for this deployment, and resolve the
    principal. A token naming any other issuer is refused; a token never chooses where keys
    are fetched from.
-2. **Verify the delegation,** where the profile requires one. For Otto this is the turn grant;
-   a grant whose team contradicts the proved team is refused. A delegation that cannot be
-   verified is passed on as unverified, with only the kind of failure; the verifier does not
-   deny it, and step 5 denies it at check 3 with a single reason of its own.
+2. **Verify the delegation,** where the profile requires one. For Otto this is the turn grant:
+   its version, key, canonical encoding, signature, audience, lifetime and, once required, pod
+   are checked. A grant whose team contradicts the proved team is refused. A delegation that
+   cannot be verified is passed on as unverified, with only the kind of failure; the verifier
+   does not deny it, and step 5 denies it at check 3 with a single reason of its own.
 3. **Select the profile** from the issuer, the deployment and the principal.
 4. **Parse** the JSON-RPC message and look up the tool in the surface.
 5. **Decide**, from the tool's classification, the profile's policy and, for Otto, whether the
-   grant lists the tool. A side effect, a call to any tool not classified `read`, that carries
-   no key is denied. That is the last check, after the resource check and any currency check,
-   so a caller is asked for a key only when the call would otherwise be allowed.
+   grant lists the tool. For a call of a tool not classified `read` under the profile for
+   Otto's sandboxes, the decision also needs Otto's answer that the turn is current. A side
+   effect, a call to any tool not classified `read`, that carries no key is denied. That is
+   the last check, after the resource check and any currency check, so a caller is asked for a
+   key only when the call would otherwise be allowed.
 6. **Write the audit row.** The gateway assigns the row a UUIDv7 first. Begin has a budget,
    within which it is retried by that identifier. For a side effect, the receipt is reserved
    in the same transaction, and a reused key is answered there without running anything. If
@@ -230,7 +233,7 @@ a verified token to a principal, which is identified by issuer and subject toget
 
 | Principal | Proved facts | From |
 | --- | --- | --- |
-| Workload | Subject, and the team the manifest maps it to. | A ServiceAccount token. |
+| Workload | Subject, and the team the manifest maps it to, and, for a pod's token, the pod UID. | A ServiceAccount token. |
 | User | Subject and group memberships. | An identity-provider token. |
 
 **Verification is strict and offline.** One signing algorithm, a key ID required, signing
@@ -256,9 +259,18 @@ audit record keeps it in the claimed columns.
 Otto signs grants with a shared secret today, so any verifier can also mint. Otto is asked to
 sign them asymmetrically so this gateway holds only a public key; see
 [decision 0004](decisions/0004-verify-turn-grants-with-a-public-key.md). A control plane that
-delegates to this gateway signs with a key the gateway cannot use to sign. A grant as Otto
-defines it today can be presented again until it expires and is not tied to one gateway; what
-it must additionally bind is Q18.
+delegates to this gateway signs with a key the gateway cannot use to sign.
+
+What a grant binds is [decision 0012](decisions/0012-what-a-turn-grant-binds.md). Its issuer is
+fixed by the Ed25519 key that verifies it, one key per Otto environment. `aud` lists the
+gateway deployments it is for, two during the cutover. `iat` and `exp` bound its lifetime to
+at most 15 minutes, with 30 seconds of leeway. `pod` binds it to the sandbox pod's UID, by
+stage 3 at the latest. `egress` carries the turn's egress setting, which is recorded (decision
+0010, pull request #31). Within those bounds a grant may be presented any number of times, and
+every row records its digest, so reuse from another pod, or another deployment sharing this
+gateway's audit store, is one query. A call of any tool not classified `read` is also checked for currency: Otto's resolver
+says whether the turn is still current, which enforces the fencing epoch and lets Otto revoke
+one turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves.
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -378,7 +390,11 @@ its own set. That is how the vendor actions Otto's control plane performs are ke
 sandboxes.
 
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
-refused unless the turn's grant lists it.
+refused unless the turn's grant lists it. A grant only narrows: check 4 runs before check 5,
+so a grant that lists a `write` tool is still denied, unless the exception decision 0011 (pull
+request #32) records for Otto's two comment tools names it. Under the profile for Otto's
+sandboxes a call of any tool not classified `read` also needs a current control plane
+([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
 **How a tool's resources are found** is stated in its approval, in one of four ways
 ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 1):
@@ -575,6 +591,11 @@ written complete, has no finish, and is never open.
   grant.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
+- **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
+  presented), issuer, key ID, the pod UID, the turn's egress setting and, for a call of a tool
+  not classified `read`, Otto's currency answer. A grant that fails verification is denied at
+  check 3 as an unverified delegation. If its signature verified, its row records its digest
+  and the binding that failed, and no claims.
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
   Otto adds them. Whether it does is part of the question about that table in Q12.
 
@@ -633,6 +654,18 @@ and `duplicate` as `ok`, since the effect exists.
 
 **What Rust adds.** The begin step returns a guard value that the tool-running code requires
 as an argument, so a call path that skips the audit write does not compile.
+
+**Turn grants in Otto's table and in operations.** Otto's `gateway_audit` has `session_id`,
+`turn_id` and `fencing_epoch`, and no column for a grant's digest, issuer, key ID, pod UID,
+egress setting or currency answer. Those are kept in this gateway's record unless Otto adds
+columns ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Grant verification
+failures are counted by kind: version, unknown key, retired key, encoding, signature, malformed, expired,
+not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Also counted: accepted
+grants by key ID, which shows a rotation's progress, currency answers by result, and the
+resolver's latency and timeouts. Each audience or pod failure is investigated, because an
+honest sandbox under a correct configuration never produces one. Lifetime failures alert on a
+rate, because honest sandboxes produce them. Until it is decided how these reach a person, the
+gateway's maintainers review the counts as part of each cutover stage's go/no-go.
 
 ### Receipts
 
@@ -719,6 +752,16 @@ profile can change it. Only the harness's test builds are exempt, through a test
 cargo feature that the release build never enables. `#[cfg(test)]` cannot do this, because
 the harness runs the gateway from integration tests. CI starts the release artifact with a
 `propose` snapshot and no receipt store, and requires it to refuse.
+
+Turn-grant keys have their own checks
+([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
+the profile for Otto's sandboxes has no grant key, a key file holds private key material, a key
+is of small order, the same key is configured twice or under two issuers, a previous key has no
+end instant, or a surface under that profile serves a tool not classified `read` while `pod`
+is not required for its issuer. Surfaces change with the snapshot, so the last is also checked
+when a snapshot is loaded: a snapshot that breaks it is refused, and the running snapshot is
+kept. The gateway also refuses to start with grant checking turned off outside a development
+build. The Rust target of the conformance suite is a development build.
 
 ## 13. Connectors and proxied servers
 
@@ -853,6 +896,8 @@ A change that weakens one of these is wrong even if every test passes.
 14. **Nothing after the decision function can allow a call it denied.**
 15. **A proxied call's credential reaches nothing outside its caller's limit,** as its recorded
     reach states.
+16. **A delegation is accepted only within its lifetime, at a deployment it names, and once
+    bound, from the pod it names.**
 
 ## 17. Delivery milestones
 
@@ -864,7 +909,7 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. |
 | 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds (Q11). Tool assurance and proxied exposure (decision 0011). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents (Q18). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. The mechanism for the exception for Otto's comment tools (decision 0011). Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. The mechanism for the exception for Otto's comment tools (decision 0011). Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13). Per-user grants and receipts before any employee proposal for that system (decision 0011). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
@@ -877,7 +922,12 @@ Milestone 5 depends on access to Okta, which Org's IT owns. That request has the
 time in the plan and should be sent when milestone 1 starts.
 
 Milestone 4 depends on Otto: asymmetric grant signing, the resolver interface, and keeping its
-control-plane endpoints running outside its Go gateway.
+control-plane endpoints running outside its Go gateway. Before stage 1, Otto signs grants with
+Ed25519 under canonical encoding, with `aud`, `iat` and a key per environment, and its Go
+gateway verifies them too. Before stage 3, Otto mints `pod` (if it did not before stage 1) and
+answers the currency question on the resolver interface. Otto is also asked to mint the
+turn's egress setting, in the first change if it can and otherwise later. None of this has
+been agreed with Otto yet ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
 Alert thresholds, routing and paging for audit and receipts come before the first production
 deployment, whichever milestone that is (decision 0009).
@@ -949,6 +999,45 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   are guards like any other. Its connector has a test against the fake vendor that fails
   without each one, and a mutation that removes it. Such a guard cannot sit inside a proxied
   server, because a proxied tool is only ever `read` (decision 0011).
+- **Turn grants are tested as new company-wide behavior,** in their own group apart from the
+  baseline ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Each guard gets a
+  mutation in `scripts/mutation_check.py` and a test named to fail.
+  - Replay. One grant used for many calls from its pod is accepted, and every row carries its
+    digest. The same grant is refused from another pod of the same team once `pod` is
+    required, at a deployment not in `aud`, and after expiry plus leeway. A proposal after
+    Otto says the turn ended is denied, while a read still succeeds until expiry.
+  - Format and forgery. The sixteen baseline kinds, re-minted in the new format. A `v1` HMAC
+    grant, and one whose MAC is keyed with the public key's bytes. A model-broker token.
+    Claims swapped under a genuine signature. A grant signed with another environment's key. A
+    grant re-encoded with non-zero trailing bits, and a signature with a non-canonical S.
+  - Clock skew. Issued 29 and 31 seconds in the future. Expired 29 and 31 seconds ago. A
+    lifetime of exactly 15 minutes, and one second over. An expiry within 15 minutes of now
+    with an issue time a year earlier.
+  - Key rotation. A previous key accepted before its end instant and refused after it, across
+    a restart. An unknown key ID. Each boot refusal in section 12, including a small-order key
+    and a tool not classified `read` served while `pod` is not required. A snapshot that adds
+    such a tool to Otto's sandbox surface while `pod` is not required, refused at load with the
+    running snapshot kept.
+  - Currency. Each answer against a read, a proposal and, once decision 0011's exception
+    exists, an excepted `write` tool. No answer, a slow answer, an error, an unknown version,
+    and an answer to another question, each denying a proposal. A proposal under the profile
+    with currency not asked, denied. The property: a call of a tool not classified `read`
+    under such a profile is never allowed unless its currency is current. A mutation that
+    applies the check to `propose` alone fails the excepted `write` case. In Otto: a
+    superseded control plane that is still running answers superseded for its own turns.
+  - Revocation. A revoked turn's next proposal denied. A removed key, and a team removed from
+    the allowlist, each taking effect within one rollout until Q11 sets a bound.
+  - Failures. A grant that fails verification denied at check 3 as an unverified delegation.
+    An audience or pod failure recorded with the grant's digest and the failed binding, and no
+    claims; a bad signature recorded with neither. A lifetime failure counted by kind.
+  - Composition. A grant that lists a `write` tool no exception names, denied at check 5. Once
+    decision 0011's exception exists, a grant that lists an excepted comment tool, allowed only
+    while current. A name with no mapping, which permits nothing. The mapping is one-to-one. An
+    empty tool list, refused as unverifiable.
+
+  The conformance suite changes only when it is re-pinned to Otto's new format (#23). Until
+  then it cannot run against the Rust target, because its grants are `v1` HMAC grants. The
+  Rust target is a development build, so the cases that start it with grant checking off run.
 - Audit store tests use a real Postgres. Everything else, including end-to-end tests of the
   gateway, runs on the in-memory fakes with no database.
 
@@ -1000,7 +1089,7 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9, and Q10 to Q13 and Q18, in [open-questions.md](open-questions.md). Q10 is
+What remains of Q9, and Q10 to Q13, in [open-questions.md](open-questions.md). Q10 is
 narrowed to what compliance requires of read auditing; the rest of it is decision 0009. What
 decision 0010 leaves to Otto, IT, the security team and platform owners is listed in that
 record. The milestone table says which each milestone must settle before it starts. Vendor

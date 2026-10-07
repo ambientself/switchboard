@@ -2,13 +2,14 @@
 
 Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
 on 2026-10-04 (classifications, direct writes and delegation tool lists), with the rule for
-comments added on 2026-10-06, and on 2026-10-07 for decision 0009 and by
-[decision 0011](0011-resource-authorization-and-tool-assurance.md); the amendments are at the
-end. Status: accepted. Settles the part of Q9 that milestone 1 needs, and with the amendment,
-what the core needs for employee proposals and broad reads. The rest of Q9 is settled by
-decision 0011, including a narrow, recorded exception for Otto's two comment tools, except what
-that record lists as still open. Among those is whether a proposal stays `propose` where the CI
-it starts can deploy or holds a production credential.
+comments added on 2026-10-06, and on 2026-10-07 for decision 0009, by
+[decision 0011](0011-resource-authorization-and-tool-assurance.md), and for currency of Otto's
+side-effecting calls, from [decision 0012](0012-what-a-turn-grant-binds.md); the amendments are
+at the end. Status: accepted. Settles the part of Q9 that milestone 1 needs, and with the
+amendment, what the core needs for employee proposals and broad reads. The rest of Q9 is
+settled by decision 0011, including a narrow, recorded exception for Otto's two comment tools,
+except what that record lists as still open. Among those is whether a proposal stays `propose`
+where the CI it starts can deploy or holds a production credential.
 
 ## Context
 
@@ -324,3 +325,72 @@ changes four things here.
 
 "Receipts before writes (Q10)" in the consequences above is now decision 0009. Receipts come
 before the first `propose` tool reaches a real system.
+
+## Amended 2026-10-07: currency for Otto's side-effecting calls
+
+[Decision 0012](0012-what-a-turn-grant-binds.md) allows a call of any tool not classified
+`read` under the profile for Otto's sandboxes only while Otto says the turn is current. That
+is, its control plane still holds the lease at the grant's epoch, and the turn has not ended or
+been revoked. This amendment puts that rule in the decision function. It covers Otto's
+`propose` tools, and its two `write` comment tools once the exception that decision 0011 (pull
+request #32) records for them is built.
+
+### What changes
+
+- **The call context** gains the call's currency: current, not current (superseded, ended or
+  revoked), unconfirmed, or not asked. The Otto adapter fills it, for `tools/call` only. It
+  asks Otto's resolver only when the snapshot's tool is not classified `read` and the profile
+  requires currency. An adapter that fails to ask leaves "not asked".
+- **The principal** gains, for a Kubernetes workload, the pod UID its token proves. **The
+  delegation** gains its issuer, digest, key ID and egress setting. The function reads none of
+  these. The audit record keeps them.
+- **A profile** gains a setting: a call of a tool not classified `read` requires a current
+  control plane. The profile for Otto's sandboxes sets it. The profile for Otto's
+  control-plane surface does not, because Otto's receipts are posted after the turn has ended.
+- **A new check after check 5,** and after the exception step that decision 0011 adds to
+  check 5, before check 6. Under such a profile a call of a tool not classified `read` is
+  allowed only if its currency is current. Not current, unconfirmed and not asked are each
+  denied. A `write` tool that no exception names is denied at check 5 first. The check is
+  skipped for `tools/list`, like check 6, and does not apply to `read`.
+- **Two new reason kinds,** each with its sentence: the control plane is not current, and
+  currency is unconfirmed. "Not asked" is denied as unconfirmed. The row records which answer
+  Otto gave.
+
+### Why currency is in the function
+
+The 2026-10-04 amendment kept profiles to a set of classifications, and rejected fields that
+mean something only for some tools and profiles. Currency is such a field. It goes in the
+function anyway, so that the decision table and its properties cover it. The alternative is
+for the adapter to deny before the function runs. That is a second place that decides, which
+this record allows only for refusals that can never allow: a connector's, and those decisions
+0009 and 0011 add.
+
+### What runs before the function
+
+The turn-grant verifier's own checks run before the function: version, key, encoding,
+signature, audience, lifetime and, once required, pod. A grant that fails any of them reaches
+the function as a delegation that is present and unverified, and check 3 denies it under the
+reason kind decision 0009 (pull request #33) gives an unverified delegation. The caller reads
+the fixed sentence for a bad grant. Which of the verifier's checks failed is logged and
+counted, and is not a reason kind. The row holds the proved columns and nothing from the
+grant's claims. When the signature verified and a binding failed (audience, lifetime or pod),
+the row also records the grant's digest and which binding failed. That is the one exception
+to 0009's rule that such a row holds nothing from the grant: a digest is not a claim. Check 3
+still names a team mismatch. Such a grant verified, and the mismatch is usually a rollout
+fault.
+
+### Consequences
+
+- The Otto adapter asks Otto's resolver before deciding each call of a tool not classified
+  `read` under the profile for Otto's sandboxes, from stage 3. No answer within one second
+  denies the call.
+- The decision table gains a case for each currency value against a `read` tool, a `propose`
+  tool and, once decision 0011's exception exists, an excepted `write` tool, under a profile
+  that requires currency and one that does not.
+- A new property: under a profile that requires currency, a call of a tool not classified
+  `read` is never allowed unless its currency is current.
+- New mutations: the currency check skipped, "not asked" treated as current, "unconfirmed"
+  treated as current, the check applied to `read`, and the check applied to `propose` alone.
+- The core changes these need (the currency type in the call context, the profile setting,
+  the check, the reason kinds and the recorded fields) are follow-on code for milestone 4.
+  They are not built yet.
