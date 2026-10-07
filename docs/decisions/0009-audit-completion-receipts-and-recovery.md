@@ -1,14 +1,17 @@
 # 0009: What an audit row guarantees, recovery, and receipts for side effects
 
-Date: 2026-10-06. Status: proposed. Settles Q10, except what compliance requires of read
-auditing, which is deferred (Needs the owner 1). Fencing is not decided here; it moved to Q18.
-Written against [decision 0006](0006-what-the-decision-function-sees.md) as amended on
-2026-10-04 (`propose`, and `write` and `destructive` denied in every profile) and the resources
-column on the audit record.
+Date: 2026-10-06, accepted 2026-10-07. Status: accepted. The owner accepted both parts on
+2026-10-07, taking the recommendation on every question that was the owner's to answer (see
+The owner's answers). Settles Q10, except what compliance requires of read auditing, which
+stays open (Still open 1); Q10 is narrowed to it. Other details need someone other than the
+owner. They are listed under Still open, with who decides and what holds until then. Fencing
+is not decided here; it moved to Q18. Written against
+[decision 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04 (`propose`,
+and `write` and `destructive` denied in every profile) and the resources column on the audit
+record.
 
 Part 1 covers every audit row and is needed before milestone 2. Part 2 covers receipts and is
-needed before the first tool not classified `read` reaches a real system. The owner can accept
-part 1 alone (Needs the owner 16).
+needed before the first tool not classified `read` reaches a real system. Both are accepted.
 
 ## Context
 
@@ -61,7 +64,8 @@ operators only, as section 10 already requires. It records the issuer and subjec
 claimed, as claims, escaped and capped, and never the token. "We were not checking" is still a
 row with identity `disabled`; "someone tried and was refused" is a telemetry event. The cost is
 that failed authentication is kept less durably than the audit, can be dropped under load, and
-an incident review joins two sources.
+an incident review joins two sources. Whether that loss is acceptable is the security team's
+call (Still open 4), and where telemetry goes is for whoever runs logging (Still open 3).
 
 **A delegation that cannot be verified is an audit row.** A forged or expired turn grant
 presented under a proved workload identity is one of the most security-relevant events the
@@ -89,10 +93,11 @@ quote it.
 ### What begin guarantees
 
 - When begin returns success, the row is committed. It survives a crash of the gateway and a
-  restart of the database server. It survives a failover only if the owner requires a
-  synchronous standby (Needs the owner 6). The Postgres store uses synchronous commit for its
-  own sessions and refuses to start against a server with `fsync` or `full_page_writes` off.
-  These are configuration gates, not tests of durability.
+  restart of the database server. It survives a failover only with a synchronous standby,
+  which is still open (Still open 5); until then, committed means committed on the primary.
+  The Postgres store uses synchronous commit for its own sessions and refuses to start against
+  a server with `fsync` or `full_page_writes` off. These are configuration gates, not tests of
+  durability.
 - Besides what it holds today, the row records the instance that began it, the database's time
   at begin, and the row's deadline: that time plus the begin budget, the call deadline and the
   finish deadline. The gateway supplies the allowance. The database sets both times, and the
@@ -139,8 +144,11 @@ gateway without sessions it can reach an instance that is not running the call.
 - Finish, receipt settlement and reconciliation's short writes use a small connection pool of
   their own, so a surge of begins cannot starve the writes that close rows.
 
-The core has no timer. Its `finish` returns the answer together with the pending write, and
-the gateway binary races the write against the answer budget.
+The core has no timer, so the store keeps the answer budget. Its `finish` waits for the write
+for at most the budget and then returns, with an error if the row is not yet complete, while
+the write goes on retrying on a task of its own until the finish deadline. The Postgres store
+built for #10 does this. The in-memory store must do the same, so the contract suite can test
+it on both.
 
 ### Outcomes
 
@@ -171,18 +179,19 @@ after the deadline is still written, and the row then shows what the gateway lea
 Rows are never edited by hand. A person's finding about a row or a receipt is a resolution
 record: what it concerns, what the person concluded and from what evidence, who they are as
 proved by the path they used, and the database's time. Resolution records are appended and
-never changed.
+never changed. Which path that is, and who may use it, is still open (Still open 10). Until it
+is settled no resolution is recorded, and an open row stays in the open-row query.
 
 ### The database role
 
-On the audit table, the gateway's role may insert every column except the two times. It may
-select the identifier, kind, decision, deadline and completion columns, which finish, a
-retried begin and the open-row query need. It may update the completion columns. It cannot
-delete, and it cannot read who called what. A trigger refuses any update to a completion that
-is already set, so "at most once" holds in the database and not only in code. The receipt
-table has grants and a trigger of its own (part 2). The boot check on the role in section 12
-also checks both tables' grants, and that both triggers exist and are enabled. Deletion for
-retention uses a separate role (Q12).
+On the audit table, the gateway's role may insert every column except the times, which the
+database sets. It may select the identifier, kind, decision, deadline and completion columns,
+which finish, a retried begin and the open-row query need. It may update the completion
+columns. It cannot delete, and it cannot read who called what. A trigger refuses any update to
+a completion that is already set, so "at most once" holds in the database and not only in code.
+The receipt table has grants and a trigger of its own (part 2). The boot check on the role in
+section 12 also checks both tables' grants, and that both triggers exist and are enabled.
+Deletion for retention uses a separate role (Q12).
 
 ### Shutdown
 
@@ -196,7 +205,8 @@ than that, so it is set explicitly.
 
 Two seconds for the begin budget. Two seconds for the answer budget, as in Otto. Thirty
 seconds for the finish deadline, counted from when the tool returns. Call deadlines are set per
-tool. Q12 owns all of them.
+tool. The owner accepted these as defaults on 2026-10-07. Q12 owns all of them, and sets the
+final values from the first slice's measurements.
 
 ### Signals
 
@@ -204,7 +214,7 @@ Counted and exported from milestone 2: begin failures and the audit-failure answ
 cause; answers released before finish; finishes not written by their deadline; open rows;
 receipts in `unknown` and the age of the oldest; begin and finish latency; connections in use
 per pool; telemetry dropped. Alert thresholds, paging and who is paged are set before the first
-production deployment, not for the mock slice.
+production deployment, not for the mock slice (Still open 9).
 
 ## Decision, part 2: receipts for side effects
 
@@ -248,21 +258,23 @@ logged and alerted on.
 
 The key is chosen per request, never per connection. MCP clients set headers once per server,
 so a client configured with a fixed `Idempotency-Key` would have every later side effect
-answered as reuse. The recommendation is the caller's tool-use identifier, which MCP clients
+answered as reuse. The carriers are the caller's tool-use identifier, which MCP clients
 already send in the request's `_meta`, and a named `_meta` field for callers that are not
 models, such as Otto's control plane. A header is accepted only from a profile that declares
-its callers set it per request. Which carriers, in which order, is Needs the owner 12.
+its callers set it per request. The owner accepted these carriers, in this order, on
+2026-10-07. What Otto's control plane sends is agreed with Otto's owners (Still open 8).
 
 A call that carries both a key and a tool-use identifier records both. The same key arriving
 with a different tool-use identifier is refused with a sentence of its own, because that is
 what a key fixed in configuration looks like.
 
 A key is scoped to the proved principal and, when a delegation is present, to the delegation's
-identifying fields: for Otto, the session and the turn, to be confirmed with Q18. Many
-sandboxes share one workload subject, and one person uses several clients, so a principal
-alone is too wide. Within its scope a key is unique across all tools. Without a delegation, two
-clients of one principal can still choose the same key. With tool-use identifiers that is
-unlikely, and a collision is answered by the reuse table below, never across principals.
+identifying fields: for Otto, the session and the turn, to be confirmed with Otto's owners and
+Q18 (Still open 8). Many sandboxes share one workload subject, and one person uses several
+clients, so a principal alone is too wide. Within its scope a key is unique across all tools.
+Without a delegation, two clients of one principal can still choose the same key. With
+tool-use identifiers that is unlikely, and a collision is answered by the reuse table below,
+never across principals.
 
 A side-effecting call that carries no key is denied by the decision function, with a reason
 kind and a sentence of its own asking for one, since that is knowable before anything runs.
@@ -275,6 +287,8 @@ SHA-256 over the arguments as canonical JSON (RFC 8785), except that integers ar
 exactly rather than as doubles, so two different large integers never share a digest. The core
 hashes the value the guard carries; it still does not parse a tool's arguments. The cost is
 that anyone who can read receipts can test a guess at arguments that have few possible values.
+The owner decided on 2026-10-07 that this digest is not storing the arguments under Q12's rule,
+and accepted that cost.
 
 ### Reuse
 
@@ -321,7 +335,9 @@ instance claims a receipt by setting a short lease in a transaction that commits
 vendor call, so no lock or connection is held across it. Each receipt is looked up a bounded
 number of times and then handed to a person, who records a resolution. With no declared lookup
 it goes straight to a person. A `propose` tool may be approved with no lookup: a duplicate
-proposal is a second draft or comment, which a person sees before acting on it.
+proposal is a second draft or comment, which a person sees before acting on it. No `write` tool
+can be allowed today (decision 0006). Whether one could ever be approved without a lookup, and
+who could grant that, is for the decision that permits direct writes.
 
 ### What may be retried
 
@@ -388,9 +404,9 @@ with a trigger missing or disabled, or on a role wider than its own.
 | No side effect reaches a real system without receipts. | A snapshot with a `propose` tool refused at boot and at swap without a receipt store. | — | The check removed, or keyed on where the snapshot came from. |
 
 Milestone 2 needs part 1 without the two new outcomes: identifiers, budgets, the detached
-task, the grants and trigger, the open-row query and the signals. Part 2 is needed before the first side effect reaches a real
-system, which is milestone 4 at the latest. If this record is accepted, the suite and this
-table move to section 18 of the design.
+task, the grants and trigger, the open-row query and the signals. Part 2 is needed before the
+first side effect reaches a real system, which is milestone 4 at the latest. The suite and
+this table are also in section 18 of the design.
 
 ## Alternatives rejected
 
@@ -408,7 +424,7 @@ table move to section 18 of the design.
   because the row begun before the read already records who read which resources; because it
   turns a database fault after the vendor call into a failed call and a second vendor read; and
   because the audit-failure sentence says nothing ran, which would be false, so it would need a
-  sentence of its own. The owner may weigh this differently.
+  sentence of its own. The owner kept this rejection on 2026-10-07.
 - **Other placements of the three records:** a synchronous row for every failed
   authentication, as Otto writes; telemetry for a delegation that cannot be verified; no row
   for `tools/list`. The reasons are given above. Leaving out `tools/list` would also narrow
@@ -458,7 +474,8 @@ table move to section 18 of the design.
   answer. Two invariants are added: "The gateway never repeats a tool call on its own" and "A
   side effect that may have happened is never presented as safe to repeat."
 - The core's interface changes. `begin` takes the identifier the gateway chose. `finish`
-  returns the answer with the pending write. `ToolOutcome` gains `unknown` and a vendor
+  gives out the answer once the store's finish returns, which is within the answer budget.
+  `ToolOutcome` gains `unknown` and a vendor
   reference, and the record's outcome gains `unknown` and `duplicate`. `Begun` gains a call
   answered at receipt reservation. A guard can be given up without running, which completes
   the row as `error`. The record gains its kind, the instance, the database's time, the
@@ -496,44 +513,76 @@ table move to section 18 of the design.
 - The grants and triggers do not protect rows against a database superuser who rewrites them.
 - Fencing stays with Q18. Nothing here depends on it.
 
-## Needs the owner
+## The owner's answers
+
+The owner accepted the record on 2026-10-07, taking the recommendation on every question that
+was the owner's to answer. Each answer carries the proposal's number.
+
+- **2. A read's result goes out when its finish fails,** as in Otto. Withholding it stays
+  rejected (see Alternatives rejected).
+- **3. Identity failures, `initialize` and `ping` are telemetry,** as the table of three records
+  says. Unverifiable grants stay audit rows. Whether Otto's adapter still writes them into
+  `gateway_audit` is for Otto's owners (Still open 2).
+- **9. The provisional values are the defaults:** two seconds for begin, two seconds for the
+  answer to wait, and thirty seconds for finish. Q12 sets the final values from the
+  measurements.
+- **12. The key's carriers** are the tool-use identifier, a named `_meta` field, and a header only
+  from a profile that declares its callers set it per request, in that order. A side effect
+  that carries no key is denied. What Otto's control plane sends, and which grant fields
+  scope a key, need Otto's owners (Still open 8).
+- **13. A `propose` tool may be approved with no lookup.** A duplicate proposal reaches a person
+  before it acts. Whether a `write` tool ever could is left to the decision that permits
+  direct writes, since none can be allowed until then.
+- **14. The argument digest does not count as storing the arguments** under Q12's rule.
+- **15. Receipts come before the first `propose` tool** reaches a real system, not only before the
+  first `write` tool. The risk of a duplicate draft pull request or comment is not accepted.
+- **16. Both parts are accepted now.** Q10 is narrowed to what compliance requires of read
+  auditing.
+
+## Still open
+
+Each of these needs someone other than the owner. The record holds while they are open; what
+applies until each is answered is stated with it.
 
 1. **What compliance requires of read auditing,** if anything: coverage, immutability and
-   retention. Q4 accepted the synchronous write; nobody has said it is required. Reads are
-   written synchronously on Q4's acceptance until compliance answers. That is the one deferral
-   in this record, and a stricter or looser requirement would change part 1.
-2. **Withholding a read's result when its finish fails,** rejected above. It trades
-   availability for "an empty read outcome means nothing was delivered".
-3. **Moving identity failures, `initialize` and `ping` out of the audit table,** and whether
-   Otto's adapter must still write them into `gateway_audit`, to be agreed with Otto.
-   Unverifiable grants stay audit rows.
-4. **Where telemetry goes, how long it is kept, and who can read it,** and whether the audit
-   table is the compliance system of record or is exported to one. This needs whoever runs
-   logging.
-5. **Whether failed-authentication evidence may be dropped** by the bounded telemetry queue
-   under load, or needs a durable sink. This is a security call.
-6. **What "committed" means:** the primary only, or also a synchronous standby and
+   retention. Compliance decides. Until it answers, reads are written synchronously, on Q4's
+   acceptance. A stricter or looser requirement would change part 1. Issue #3 stays open until
+   it answers. (Proposal 1.)
+2. **Whether Otto's adapter still writes identity failures, `initialize` and `ping` into
+   `gateway_audit`.** Otto's owners decide, when the adapter is built (#22, #23). Until then
+   this gateway writes no row for them, and that is a recorded parity difference.
+   (Proposal 3.)
+3. **Where telemetry goes, how long it is kept, and who can read it,** and whether the audit
+   table is the compliance system of record or is exported to one, such as Sumo Logic.
+   Whoever runs logging decides, with compliance for the system of record. Until then
+   telemetry is the gateway's structured events and counters, and the audit table is the only
+   audit record. (Proposal 4.)
+4. **Whether evidence of failed authentication may be dropped** by the bounded telemetry queue
+   under load, or needs a durable sink. The security team decides. Until then it goes through
+   the bounded queue, and drops are counted. (Proposal 5.)
+5. **What "committed" means:** the primary only, or also a synchronous standby and
    point-in-time recovery. A standby costs latency and joins the gateway's availability, and
-   it is the only way a begin survives a failover. This needs whoever runs Postgres, probably
-   IT.
-7. **Who owns the audit and receipt schema,** its grants, its triggers and its migrations.
-8. **Tamper evidence beyond grants and triggers,** such as an append-only copy or a hash chain,
-   and who holds the database superuser login. This needs security and the storage owners.
-9. **The provisional values:** two seconds for begin, two seconds for the answer to wait, and
-   thirty seconds for finish. Accept them, or leave them to Q12 and the measurements.
-10. **Who is paged, and on whose rotation,** for begin failures, open rows and unknown receipts,
-    before the first production deployment. Who settles a receipt by hand once reconciliation
-    gives up, and whether the owning team in the registry is accountable for it.
-11. **How a person records a resolution:** through which authenticated path, and who may.
-12. **The key's carriers and their order,** and denying side effects that carry no key. The
-    recommendation is the tool-use identifier, a named `_meta` field, and a header only from
-    profiles that declare it is set per request. The carrier, Otto's tool-use identifier as its
-    key, and the delegation fields that scope a key need agreement from Otto's owners.
-13. **Approval without a lookup,** allowed above for `propose` tools. Whether a future `write`
-    tool could ever be approved without one, and who could grant that.
-14. **Whether a digest of the arguments counts as storing them** under the rule in Q12.
-15. **Receipts before the first `propose` tool,** as recommended, or only before any `write`
-    tool. Otto's gateway ships its proposal tools without general deduplication. The risk is a
-    duplicate draft pull request or comment.
-16. **Accepting all of this now,** or only part 1, with Q10 kept open for receipts until they
-    are built.
+   it is the only way a begin survives a failover. Whoever runs Postgres decides, probably IT.
+   Until then a begin is committed on the primary, with synchronous commit, and does not
+   survive a failover. (Proposal 6.)
+6. **Who owns the audit and receipt schema,** its grants, its triggers and its migrations. The
+   owner of the audit database decides, under Q12. Until then the schema and its migrations
+   live in this repository. (Proposal 7.)
+7. **Tamper evidence beyond grants and triggers,** such as an append-only copy or a hash chain,
+   and who holds the database superuser login. The security team and the storage owners
+   decide. Until then the grants and triggers are the only protection, and they do not stop a
+   superuser. (Proposal 8.)
+8. **Otto's key:** the carrier Otto's control plane uses, Otto's tool-use identifier as its
+   key, and which grant fields scope a key. The session and the turn are recommended. Otto's
+   owners decide (#21, #22). Until then Otto's callers make every side effect through Otto's
+   Go gateway: the cutover of writes waits for this answer. (Proposal 12.)
+9. **Who is paged, and on whose rotation,** for begin failures, open rows and unknown receipts,
+   and who settles a receipt by hand once reconciliation gives up, including whether the
+   owning team in the registry is accountable for it. Whoever runs the on-call rotation
+   decides, with the owning teams, before the first production deployment. Until then the
+   signals are counted and exported and nobody is paged. The mock slice needs no paging.
+   (Proposal 10.)
+10. **How a person records a resolution:** through which authenticated path, and who may. The
+    security team decides, before part 2 reaches a real system. Until then no resolution is
+    recorded. Open rows stay in the open-row query, and no receipt can be `unknown` before
+    part 2 is built. (Proposal 11.)

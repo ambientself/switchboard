@@ -43,6 +43,9 @@ can script, including to fail.
   test process with fakes behind it, and drive it over HTTP. No Docker, no database, no
   second binary. This is where "audit begin fails, so the call is refused" is tested in
   milliseconds, by telling the fake store to fail.
+- **The audit store contract suite on the fake** (design section 18), with scripted lost
+  confirmations, hangs and a process lost between run and finish. The Postgres store passes
+  the same suite in the slow loop.
 - **A fake MCP server and a fake vendor API** as a crate, scriptable to list tools, change its
   tool list, stream slowly, hang and return errors. Proxied-server work is tested against it.
 - **A local issuer** that signs user and workload tokens, so nothing waits on Okta.
@@ -58,8 +61,11 @@ can script, including to fail.
   synchronous write adds. A local Postgres left running with a fresh database per run can
   bring the audit store's own tests into the per-change loop.
 - **Fuzzing** of JSON-RPC bodies, grants and tool arguments.
+- **The audit store contract suite on Postgres,** the same test functions the fake passes.
 - **Failure runs:** a slow or unavailable database, a hanging upstream, a crash after a vendor
-  write and before the audit row is finished.
+  write and before the audit row is finished. One more, once receipts exist: the gateway is
+  killed after a vendor write and restarted; the row reads as open after its deadline; the
+  receipt is reconciled; and a retry with the same key makes no second write.
 - **Otto's conformance suite against both gateways, from milestone 4.** Today the suite is
   tied to the Go binary's flags. Give it a target adapter (start this gateway in this mode,
   map these tool names) so the same scenarios run against Otto's Go gateway and the Rust one.
