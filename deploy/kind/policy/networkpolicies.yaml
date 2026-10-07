@@ -1,0 +1,70 @@
+# The routes draft 0010 asks the kind run to prove. demo.sh applies these only after showing that
+# a direct call to mock-docs connects without them, and then starts new pods: kindnet keeps
+# connections opened before a policy, and a new pod is briefly outside its policy.
+#
+# mock-docs: only the gateway may connect.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: only-gateway
+  namespace: mock-docs
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: switchboard
+          podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+# Postgres: only the gateway and the migration Job may connect.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-only-gateway
+  namespace: switchboard
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+        - podSelector:
+            matchLabels:
+              app: migrate
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+# The gateway: only the two teams' namespaces may connect.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-from-teams
+  namespace: switchboard
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: team-a
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: team-b
+      ports:
+        - port: 8080
+          protocol: TCP

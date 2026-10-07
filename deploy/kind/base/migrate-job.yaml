@@ -1,0 +1,50 @@
+# Creates the roles and database and applies the audit migrations (deploy/demo/migrate.sh).
+# A Job's pod template cannot change, so demo.sh deletes this Job before applying the base.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: switchboard
+  labels:
+    app: migrate
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: migrate
+    spec:
+      serviceAccountName: migrate
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: switchboard-demo:dev
+          imagePullPolicy: Never
+          command: ["migrate.sh"]
+          env:
+            - name: PGHOST
+              value: postgres.switchboard.svc.cluster.local
+            - name: WAIT_SECONDS
+              value: "120"
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: database, key: superuser-password}}
+            - name: OWNER_PASSWORD
+              valueFrom: {secretKeyRef: {name: database, key: owner-password}}
+            - name: GATEWAY_PASSWORD
+              valueFrom: {secretKeyRef: {name: database, key: gateway-password}}
+            - name: READER_PASSWORD
+              valueFrom: {secretKeyRef: {name: database, key: reader-password}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
