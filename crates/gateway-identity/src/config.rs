@@ -10,6 +10,14 @@ use thiserror::Error;
 /// The claim a user issuer's groups are read from unless configuration names another.
 pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
 
+/// The most leeway an issuer may be configured with.
+///
+/// Leeway is for skew between clocks that are kept in time. Five minutes is the usual allowance
+/// (Kerberos uses it), and a clock further out than that is broken, not skewed. Every second of
+/// leeway is a second added to every token's life, and a leeway as long as the lifetime ceiling
+/// would turn the time checks off without anyone having said so.
+pub const MAX_LEEWAY: Duration = Duration::from_secs(300);
+
 /// The one signing algorithm an issuer's tokens may use. Deliberately only two: a token's
 /// header never chooses its algorithm, the issuer's configuration does, and there is no
 /// `none` and no HMAC to choose.
@@ -83,7 +91,7 @@ pub struct IssuerConfig {
     pub keys: JwkSet,
     /// The longest a token may live: `exp - iat` may not exceed it.
     pub max_lifetime: Duration,
-    /// Clock skew tolerated on `exp`, `nbf` and `iat`.
+    /// Clock skew tolerated on `exp`, `nbf` and `iat`. At most [`MAX_LEEWAY`].
     pub leeway: Duration,
 }
 
@@ -119,6 +127,9 @@ pub enum ConfigError {
     /// An issuer with a zero ceiling would refuse every token.
     #[error("issuer `{0}` has a maximum token lifetime of zero")]
     NoLifetime(Issuer),
+    /// A leeway over [`MAX_LEEWAY`], which would stretch every token's life.
+    #[error("issuer `{0}` has a leeway of more than {max} seconds", max = MAX_LEEWAY.as_secs())]
+    LeewayTooLarge(Issuer),
     /// A workload issuer with no subjects would refuse every token.
     #[error("workload issuer `{0}` has no subjects")]
     NoSubjects(Issuer),

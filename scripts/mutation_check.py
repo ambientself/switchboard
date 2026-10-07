@@ -784,6 +784,11 @@ mutate("identity-config-key-algorithm-ignored", "a key that declares another alg
        "    shape && declared_algorithm && declared_use", "    shape && declared_use")
 mutate("identity-config-key-use-ignored", "a key that declares itself for encryption is accepted", V,
        "    shape && declared_algorithm && declared_use", "    shape && declared_algorithm")
+LEEWAY = "        if config.leeway > MAX_LEEWAY {"
+mutate("identity-config-leeway-unbounded", "an issuer can be configured with any leeway", V, LEEWAY, "        if false {")
+mutate("identity-config-leeway-boundary", "a leeway of exactly the maximum is refused", V, LEEWAY, "        if config.leeway >= MAX_LEEWAY {")
+mutate("identity-config-leeway-whole-seconds", "a leeway is compared in whole seconds", V, LEEWAY,
+       "        if config.leeway.as_secs() > MAX_LEEWAY.as_secs() {")
 
 # --- The identity gate and the opaque failure ----------------------------------------------
 

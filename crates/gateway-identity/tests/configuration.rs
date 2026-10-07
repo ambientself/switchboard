@@ -7,9 +7,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway_core::{IDENTITY_FAILURE, Verifier};
+use gateway_core::{IDENTITY_FAILURE, Principal, Verifier};
 use gateway_identity::{
-    ConfigError, Identity, IdentityConfig, IssuerConfig, IssuerKind, SigningAlgorithm,
+    ConfigError, Identity, IdentityConfig, IssuerConfig, IssuerKind, MAX_LEEWAY, SigningAlgorithm,
     TokenVerifier, Verification, VerificationState, VerifyError,
 };
 use gateway_testkit::{FixedClock, SteppableClock};
@@ -26,6 +26,12 @@ fn setup(algorithm: SigningAlgorithm, kind: Kind) -> Setup {
 
 fn build(configs: Vec<IssuerConfig>) -> Result<TokenVerifier, ConfigError> {
     TokenVerifier::new(configs, Arc::new(FixedClock::at(NOW)))
+}
+
+fn verify(verifier: &TokenVerifier, token: &str) -> Result<Principal, VerifyError> {
+    verifier
+        .verify(token)
+        .map_err(|failure| failure.detail().clone())
 }
 
 #[test]
@@ -71,6 +77,24 @@ fn configuration_that_could_never_verify_or_is_ambiguous_is_refused() {
                     config
                 },
                 ConfigError::NoLifetime(name.clone()),
+            ),
+            (
+                "a leeway a second over the maximum",
+                {
+                    let mut config = es_user.config();
+                    config.leeway = MAX_LEEWAY + Duration::from_secs(1);
+                    config
+                },
+                ConfigError::LeewayTooLarge(name.clone()),
+            ),
+            (
+                "a leeway as long as the lifetime ceiling",
+                {
+                    let mut config = es_user.config();
+                    config.leeway = config.max_lifetime;
+                    config
+                },
+                ConfigError::LeewayTooLarge(name.clone()),
             ),
             (
                 "a workload issuer with no subjects",
@@ -399,4 +423,26 @@ fn an_unknown_subject_is_refused_only_after_its_signature_is_checked() {
             "{setup:?}: a known subject"
         );
     }
+}
+
+/// The leeway may be up to [`MAX_LEEWAY`], which is five minutes, and no more.
+#[test]
+fn leeway_is_at_most_five_minutes() {
+    assert_eq!(MAX_LEEWAY, Duration::from_secs(300));
+    let setup = setup(SigningAlgorithm::Es256, Kind::Workload);
+    let mut config = setup.config();
+    config.leeway = MAX_LEEWAY;
+    let verifier = build(vec![config.clone()]).unwrap();
+    // The whole of it applies: a token that expired just inside it is accepted.
+    let expired = setup
+        .token()
+        .issued_at(NOW - 600)
+        .expires_at(NOW - MAX_LEEWAY.as_secs() + 1)
+        .build();
+    assert_eq!(verify(&verifier, &expired), Ok(setup.principal()));
+    config.leeway = MAX_LEEWAY + Duration::from_millis(1);
+    assert_eq!(
+        build(vec![config]).unwrap_err(),
+        ConfigError::LeewayTooLarge(setup.issuer.issuer().into())
+    );
 }

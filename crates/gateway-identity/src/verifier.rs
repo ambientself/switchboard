@@ -12,7 +12,7 @@ use jsonwebtoken::{DecodingKey, Validation};
 use serde_json::{Map, Value};
 
 use crate::clock::{Clock, unix_seconds};
-use crate::config::{ConfigError, IssuerConfig, IssuerKind, SigningAlgorithm};
+use crate::config::{ConfigError, IssuerConfig, IssuerKind, MAX_LEEWAY, SigningAlgorithm};
 use crate::error::{Claim, IdentityFailure, VerifyError};
 
 /// The largest token accepted, in bytes. Larger than any token an identity provider issues for
@@ -173,6 +173,9 @@ impl Entry {
         let max_lifetime = config.max_lifetime.as_secs();
         if max_lifetime == 0 {
             return Err(ConfigError::NoLifetime(issuer));
+        }
+        if config.leeway > MAX_LEEWAY {
+            return Err(ConfigError::LeewayTooLarge(issuer));
         }
         match &config.kind {
             IssuerKind::Workload { subjects } if subjects.is_empty() => {
