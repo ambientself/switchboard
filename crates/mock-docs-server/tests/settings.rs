@@ -90,6 +90,24 @@ fn the_digest_must_be_64_hex_digits_in_either_case() {
     }
 }
 
+/// A digest that differs from the token's in one byte, at either end or in the middle, does not
+/// accept the token: every byte is compared.
+#[test]
+fn every_byte_of_the_digest_counts() {
+    let digest = sha256_hex(TOKEN);
+    for position in [0, 31, 63] {
+        let mut changed = digest.clone().into_bytes();
+        changed[position] = if changed[position] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+        let changed = String::from_utf8(changed).unwrap();
+        let accepted = AcceptedCredential::sha256_hex(&changed).unwrap();
+        assert!(!accepted.accepts(TOKEN), "digest changed at {position}");
+    }
+}
+
 #[test]
 fn a_token_file_loses_its_trailing_newline_and_must_not_be_empty() {
     let file = token_file("newline", &format!("{TOKEN}\n"));
