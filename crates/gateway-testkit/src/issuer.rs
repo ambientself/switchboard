@@ -189,7 +189,7 @@ enum Signing<'a> {
     Other(&'a LocalIssuer),
     /// An HMAC over the signing input with this secret: the algorithm-confusion attack.
     Hmac(Vec<u8>),
-    /// The right key, with one character of the signature changed.
+    /// The right key, with one bit of the signature flipped.
     Corrupted,
     /// No signature at all.
     Unsigned,
@@ -298,7 +298,7 @@ impl<'a> TokenBuilder<'a> {
         self.alg("HS256")
     }
 
-    /// Signs correctly, then changes one character of the signature.
+    /// Signs correctly, then flips one bit of the signature, which changes its first character.
     pub fn corrupt_signature(mut self) -> Self {
         self.signing = Signing::Corrupted;
         self
@@ -343,13 +343,14 @@ fn sign(key: &EncodingKey, algorithm: SigningAlgorithm, signing_input: &str) -> 
         .unwrap_or_default()
 }
 
-/// The signature with its first character swapped for a different base64url character.
+/// The signature with the top bit of its first byte flipped. That changes the first base64url
+/// character and nothing else, whatever the signature is. An empty signature becomes one zero
+/// byte.
 fn corrupt(signature: &str) -> String {
-    let mut characters = signature.chars();
-    let swapped = match characters.next() {
-        Some('A') => 'B',
-        Some(_) => 'A',
-        None => 'A',
-    };
-    std::iter::once(swapped).chain(characters).collect()
+    let mut bytes = URL_SAFE_NO_PAD.decode(signature).unwrap_or_default();
+    match bytes.first_mut() {
+        Some(first) => *first ^= 0x80,
+        None => bytes.push(0),
+    }
+    URL_SAFE_NO_PAD.encode(bytes)
 }
