@@ -6,8 +6,11 @@
 //! exchanged, belongs to the crates that implement [`CredentialSource`].
 //!
 //! The question takes a [`Proved<Principal>`](crate::Proved), so a connector cannot ask on
-//! behalf of a team a caller merely claimed: the argument that reaches it came from a
-//! verifier, through the decision, the audit guard and the [`ToolCall`](crate::ToolCall).
+//! behalf of a team a caller merely claimed, or a principal it built itself: the argument came
+//! from a [`Verifier`](crate::Verifier). That is all the type guarantees. It does not show that
+//! the call was decided or audited. `Proved` is `Clone`, and any code holding one can ask. A
+//! connector's principal comes from its [`ToolCall`](crate::ToolCall), which only the audited
+//! path makes; the decision and the audit guard are enforced there, not here.
 
 use std::fmt;
 

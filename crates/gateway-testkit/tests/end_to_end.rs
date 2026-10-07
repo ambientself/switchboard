@@ -1,6 +1,9 @@
 //! The gateway's whole path with no HTTP: verifier, decision, audit begin, run, audit finish,
-//! using only the fakes and the fixture. This is the path issue 26 puts behind an endpoint, so
-//! each behaviour the design promises is shown here, in milliseconds, by telling a fake to fail.
+//! using only the fakes and the fixture. Each behaviour the design promises is shown here, in
+//! milliseconds, by telling a fake to fail.
+//!
+//! The `Gateway` below is test code that strings the steps together to exercise the harness.
+//! It is not the gateway's request path: issue 26 builds that, behind its HTTP endpoint.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::pin::pin;
@@ -17,8 +20,8 @@ use gateway_core::{
 use gateway_identity::{Identity, Verification, VerifyError};
 use gateway_testkit::{
     Caller, FakeCredentialSource, Fixture, FixtureConnector, InMemoryAuditStore, READ_TOOL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    WRITE_TOOL, block_on, poll_once,
+    SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT,
+    TEAM_B_DOCUMENT, WRITE_TOOL, block_on, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -393,11 +396,13 @@ fn a_failure_to_finish_the_row_does_not_undo_a_success() {
 #[test]
 fn a_scope_refusal_is_the_outcome_refused_with_one_sentence_in_the_row_and_the_answer() {
     let gateway = Gateway::new();
+    // Team A asks the tool that checks its own scope for team B's document. The decision
+    // function cannot see that, so it allows the call, and the connector refuses it.
     let response = gateway.call(
         Caller::TeamA,
         SURFACE_ALL,
         SCOPED_READ_TOOL,
-        json!({"document": "restricted-notes"}),
+        json!({"document": TEAM_B_DOCUMENT}),
     );
     let Response::Answered {
         answer: Answer::Refused(sentence),
@@ -406,10 +411,7 @@ fn a_scope_refusal_is_the_outcome_refused_with_one_sentence_in_the_row_and_the_a
     else {
         panic!("{response:?}")
     };
-    assert_eq!(
-        sentence,
-        "The fixture connector refused this call: the document `restricted-notes` is outside the scope of the caller's team."
-    );
+    assert_eq!(sentence, SCOPE_REFUSAL);
     let row = gateway.store.row(0).unwrap();
     assert_eq!(
         row.decision,
@@ -547,7 +549,10 @@ fn a_caller_who_cannot_be_verified_gets_the_one_sentence_and_nothing_runs() {
         }
     ));
     gateway.assert_nothing_ran();
-    // No principal was proved, so there is nothing to write a row about (see the PR).
+    // The core's audit record needs a proved principal, so this test path writes no row for a
+    // caller who was not verified. Whether issue 26 records identity failures, and how, is
+    // still to be settled: design section 6 says a denial at step 1 also passes through the
+    // audit step, and section 11 asks for a row only once a decision is reached.
     assert!(gateway.store.rows().is_empty());
 }
 

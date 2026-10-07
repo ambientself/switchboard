@@ -3,16 +3,18 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use gateway_identity::{IssuerKind, SigningAlgorithm};
+use gateway_core::Verifier;
+use gateway_identity::{IssuerKind, SigningAlgorithm, TokenVerifier, VerifyError};
 use gateway_testkit::{
-    DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DEFAULT_TOKEN_LIFETIME, FIXTURE_NOW, LocalIssuer,
+    DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DEFAULT_TOKEN_LIFETIME, FIXTURE_NOW, FixedClock,
+    LocalIssuer,
 };
-use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, JwkSet, KeyAlgorithm, PublicKeyUse};
 use serde_json::{Value, json};
 
 static RSA: LazyLock<LocalIssuer> =
@@ -192,6 +194,64 @@ fn the_jwk_set_publishes_the_public_half_only_and_says_what_it_is_for() {
     let text = serde_json::to_string(&[rsa, ec]).unwrap();
     for private in ["\"d\"", "\"p\"", "\"q\"", "\"dp\"", "\"dq\"", "\"qi\""] {
         assert!(!text.contains(private), "the JWK set holds {private}");
+    }
+}
+
+/// The JWKS document is what an issuer serves at its `jwks_uri`. A verifier configured from the
+/// document as fetched, and nothing else, verifies the issuer's tokens.
+#[test]
+fn the_jwks_document_is_the_issuers_key_set_and_verifies_its_tokens() {
+    for issuer in issuers() {
+        let document = issuer.jwks_document();
+        let served: JwkSet = serde_json::from_str(&document).unwrap();
+        assert_eq!(served, issuer.jwk_set());
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["keys"][0]["kid"], issuer.key_id());
+
+        let mut config = issuer.config(
+            IssuerKind::Workload {
+                subjects: [("sub-1".into(), "team-1".into())].into(),
+            },
+            &["aud-1"],
+        );
+        config.keys = served;
+        let verifier =
+            TokenVerifier::new(vec![config], Arc::new(FixedClock::at(FIXTURE_NOW))).unwrap();
+        let token = issuer.workload_token("sub-1", "aud-1", now()).build();
+        assert!(verifier.verify(&token).is_ok(), "{}", issuer.issuer());
+    }
+}
+
+/// A corrupted signature differs from the good one in its first character only, for every
+/// token, and never verifies.
+#[test]
+fn a_corrupted_signature_always_differs_and_never_verifies() {
+    for issuer in issuers() {
+        let config = issuer.config(
+            IssuerKind::Workload {
+                subjects: [("sub-1".into(), "team-1".into())].into(),
+            },
+            &["aud-1"],
+        );
+        let verifier =
+            TokenVerifier::new(vec![config], Arc::new(FixedClock::at(FIXTURE_NOW))).unwrap();
+        for n in 0..64 {
+            let base = || {
+                issuer
+                    .workload_token("sub-1", "aud-1", now())
+                    .claim("n", json!(n))
+            };
+            let good = parts(&base().build()).2;
+            let token = base().corrupt_signature().build();
+            let corrupted = parts(&token).2;
+            assert_ne!(corrupted[..1], good[..1], "{n}");
+            assert_eq!(corrupted[1..], good[1..], "{n}");
+            assert_eq!(
+                verifier.verify(&token).unwrap_err().detail(),
+                &VerifyError::BadSignature,
+                "{n}"
+            );
+        }
     }
 }
 

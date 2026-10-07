@@ -6,12 +6,13 @@
 //!
 //! - [`InMemoryAuditStore`] keeps rows in order, can fail or hold `begin` and `finish`.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
-//!   can refuse.
+//!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a write tool and a scope-checking tool, records
 //!   every call, and can fail or hang.
-//! - [`LocalIssuer`] generates a key pair when built and signs tokens a test can break in any
-//!   one way; [`FixedClock`] and [`SteppableClock`] say what time it is.
-//! - [`Fixture`] puts them together with a policy snapshot, two teams, a user group, two
+//! - [`LocalIssuer`] generates a key pair when built, gives its public keys as the JWKS
+//!   document an issuer serves, and signs tokens a test can break in any one way;
+//!   [`FixedClock`] and [`SteppableClock`] say what time it is.
+//! - [`Fixture`] puts them together with a policy snapshot, two teams, two user groups, two
 //!   surfaces and one resource limit per team, and builds a [`CallerContext`] for each of the
 //!   callers it knows by proving a token through the real verifier.
 //!
@@ -36,7 +37,8 @@ pub use audit::InMemoryAuditStore;
 pub use clock::{FIXTURE_NOW, FixedClock, SteppableClock};
 pub use connector::{
     CONNECTOR, DOCUMENT_ARGUMENT, FORBIDDEN_DOCUMENT, FixtureConnector, READ_TOOL, RESOURCE_KIND,
-    RESOURCE_SYSTEM, ReceivedCall, SCOPED_READ_TOOL, WRITE_TOOL, WriteRecord, document,
+    RESOURCE_SYSTEM, ReceivedCall, SCOPE_REFUSAL, SCOPED_READ_TOOL, WRITE_TOOL, WriteRecord,
+    document,
 };
 pub use credentials::{CredentialRequest, FakeCredentialSource};
 pub use exec::{block_on, poll_once};

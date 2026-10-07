@@ -623,10 +623,10 @@ mutate_all(
     (TESTKIT_SRC + "credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
     (TESTKIT_SRC + "credentials.rs", "        let principal = caller.get();\n", "        let principal = caller;\n"),
     (TESTKIT_SRC + "connector.rs", "self.credentials.credential_for(&connector, &caller).await", "self.credentials.credential_for(&connector, caller.get()).await"),
-    # The tests that call the source directly are changed to match, so that what is left to
-    # fail is the compile-fail case for a claimed principal, which is the guard under test.
-    (TESTKIT + "tests/fakes.rs", "        block_on(source.credential_for(&connector, caller))", "        block_on(source.credential_for(&connector, caller.get()))"),
-    (TESTKIT + "tests/fakes.rs", "    let ask = || block_on(source.credential_for(&connector, &caller));", "    let ask = || block_on(source.credential_for(&connector, caller.get()));"),
+    # The one test helper that calls the source directly is changed to match, so that what is
+    # left to fail is the compile-fail case for a plain principal, which compiles under this
+    # mutation: that is the guard under test.
+    (TESTKIT + "tests/fakes.rs", '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))', '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller.get()))'),
 )
 
 # --- The identity verifier: the order and each check ---------------------------------------
@@ -857,19 +857,20 @@ mutate("fake-audit-fail-next-is-fail-all", "a failure meant for the next call is
        "            Failing::Next => {\n                *self = Failing::Never;\n                true\n            }", "            Failing::Next => true,")
 mutate("fake-audit-fail-all-is-fail-next", "a failure meant for every call is cleared after one", A,
        "            Failing::Always => true,", "            Failing::Always => {\n                *self = Failing::Never;\n                true\n            }")
-mutate("fake-audit-begin-hold-ignored", "a held begin is not held", A, "            state.begin_gate.clone()", "            None")
-mutate("fake-audit-finish-hold-ignored", "a held finish is not held", A, "            state.finish_gate.clone()", "            None")
+mutate("fake-audit-begin-hold-ignored", "a held begin is not held", A, "            state.begin_gate.clone()", "            None::<Gate>")
+mutate("fake-audit-finish-hold-ignored", "a held finish is not held", A, "            state.finish_gate.clone()", "            None::<Gate>")
 mutate("fake-audit-begin-attempts-not-counted", "begin attempts are not counted", A, "            state.begin_attempts += 1;\n", "")
 mutate("fake-audit-finish-attempts-not-counted", "finish attempts are not counted", A, "            state.finish_attempts += 1;\n", "")
 mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "            if row.completion.is_some() {", "            if false {")
 mutate("fake-audit-row-ids-not-positions", "every row has the same identifier", A, "            Ok(AuditRowId::new(position.to_string()))", '            Ok(AuditRowId::new("0"))')
 
 C = TESTKIT_SRC + "credentials.rs"
-mutate("fake-credentials-refuse-next-ignored", "a request told to be refused is issued", C,
-       "            Refusing::Next => {\n                state.refusing = Refusing::Never;\n                true\n            }", "            Refusing::Next => false,")
-mutate("fake-credentials-refuse-next-is-refuse-all", "a refusal meant for the next request is never cleared", C,
-       "            Refusing::Next => {\n                state.refusing = Refusing::Never;\n                true\n            }", "            Refusing::Next => true,")
-mutate("fake-credentials-refuse-all-ignored", "requests told to be refused are issued", C, "            Refusing::Always => true,", "            Refusing::Always => false,")
+NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
+mutate("fake-credentials-refuse-next-ignored", "a request told to fail is issued", C, NEXT_FAILURE, "            Refusing::Next(_) => None,")
+mutate("fake-credentials-refuse-next-is-refuse-all", "a failure meant for the next request is never cleared", C, NEXT_FAILURE, "            Refusing::Next(failure) => Some(failure),")
+mutate("fake-credentials-refuse-all-ignored", "requests told to fail are issued", C, "            Refusing::Always(failure) => Some(failure),", "            Refusing::Always(_) => None,")
+mutate("fake-credentials-unavailable-is-refused", "a source told to be unavailable refuses instead", C,
+       "            Some(Failure::Unavailable) => Err(CredentialError::Unavailable(", "            Some(Failure::Unavailable) => Err(CredentialError::Refused(")
 mutate("fake-credentials-count-not-kept", "every credential has the same number", C, "            state.issued += 1;\n", "")
 mutate("fake-credentials-label-ignores-team", "every team's credential is labelled alike", C,
        "                Some(team) => team.to_string(),", '                Some(_) => "team".to_owned(),')
@@ -887,7 +888,11 @@ mutate("fake-connector-hang-next-is-hang-all", "a hang meant for the next call i
 mutate("fake-connector-calls-not-recorded", "calls are not recorded", K, "            state.received.push(ReceivedCall {", "            let _ = (ReceivedCall {")
 mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "                    self.state().writes.push(WriteRecord {", "                    drop(WriteRecord {")
 mutate("fake-connector-scope-ignored", "the scoped tool refuses nothing", K,
-       "                    match named.filter(|name| forbidden.contains(*name)) {", "                    match named.filter(|name| false && forbidden.contains(*name)) {")
+       "                    match named.filter(|name| !scope.contains(*name)) {", "                    match named.filter(|name| false && !scope.contains(*name)) {")
+mutate("fake-connector-scope-any-team", "a workload may reach any team's documents through the scoped tool", K,
+       "                    state.team_scopes.get(team).cloned().unwrap_or_default()", "                    state.team_scopes.values().flatten().cloned().collect()")
+mutate("fake-connector-scope-any-group", "a user may reach any group's documents through the scoped tool", K,
+       "                    .filter_map(|group| state.group_scopes.get(group))", "                    .flat_map(|_| state.group_scopes.values())")
 mutate("fake-connector-credential-refusal-ignored", "a refused credential does not stop the call", K,
        "                Err(_) => {\n                    return ToolOutcome::Error(\n                        \"the fixture connector could not get a credential\".into(),\n                    );\n                }",
        "                Err(_) => String::new(),")
@@ -900,15 +905,22 @@ mutate("fake-connector-time-not-taken", "a connector told to take time does not"
 I = TESTKIT_SRC + "issuer.rs"
 mutate("fake-issuer-without-kid-is-a-no-op", "a token cannot be made without a kid", I, '        self.header.remove("kid");\n', "")
 mutate("fake-issuer-signed-by-is-a-no-op", "a token cannot be signed by another issuer", I, "        self.signing = Signing::Other(other);\n", "        let _ = other;\n")
-mutate("fake-issuer-corrupt-is-a-no-op", "a corrupted signature is not corrupted", I, "        Some('A') => 'B',\n", "        Some('A') => 'A',\n")
+mutate("fake-issuer-corrupt-is-a-no-op", "a corrupted signature is not corrupted", I, "        Some(first) => *first ^= 0x80,", "        Some(first) => *first ^= 0x00,")
+mutate("fake-issuer-jwks-document-empty", "the served JWKS document holds no keys", I,
+       "        serde_json::to_string(&self.jwk_set())", "        serde_json::to_string(&JwkSet { keys: Vec::new() })")
 mutate("fake-issuer-lifetime-ignores-iat", "a lifetime is counted from the epoch", I, "        self.expires_at(issued + lifetime)", "        self.expires_at(lifetime + 0 * issued)")
 mutate("fake-issuer-unsigned-is-signed", "an unsigned token is signed", I,
        "            Signing::Unsigned => String::new(),", "            Signing::Unsigned => sign(&self.issuer.key, self.issuer.algorithm, &signing_input),")
 mutate("fake-issuer-jwk-has-no-kid", "the published key has no kid", I, "        jwk.common.key_id = Some(key_id.clone());\n", "")
 mutate("fake-clock-advance-is-a-no-op", "a steppable clock does not move", TESTKIT_SRC + "clock.rs", "                Some(millis.saturating_add(by))", "                Some(millis)")
 mutate("fake-gate-open-wakes-nobody", "opening a gate wakes nothing", TESTKIT_SRC + "gate.rs", "        for waker in wakers {\n            waker.wake();\n        }\n", "        drop(wakers);\n")
-mutate("fake-fixture-profile-for-everyone", "every caller gets team A's profile", TESTKIT_SRC + "fixture.rs",
-       "            |caller| caller.profile().into(),\n", "            |_| PROFILE_TEAM_A.into(),\n")
+F = TESTKIT_SRC + "fixture.rs"
+mutate("fake-fixture-profile-for-everyone", "every caller gets team A's profile", F,
+       "        ProfileName::new(selected.unwrap_or(UNKNOWN_PROFILE))", "        ProfileName::new(selected.map_or(PROFILE_TEAM_A, |_| PROFILE_TEAM_A))")
+mutate("fake-fixture-profile-from-first-group", "a user's profile is chosen from its first group only", F,
+       "                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))", "                    .take(1)\n                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))")
+mutate("fake-fixture-several-profiles-pick-one", "a user whose groups select two profiles gets one of them", F,
+       "                if profiles.len() == 1 {", "                if !profiles.is_empty() {")
 
 
 # --- The core's dependencies ---------------------------------------------------------------

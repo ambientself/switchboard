@@ -7,16 +7,20 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
-use gateway_core::audit::{self, Answer, Begun, Completion, Outcome, RequestMetadata};
+use gateway_core::audit::{
+    self, Answer, AuditRowId, Begun, Completion, Outcome, RequestMetadata, RowCompletion,
+    StoreError,
+};
 use gateway_core::{
-    AuditGuard, CallContext, ConnectorName, CredentialError, CredentialSource, Principal,
-    RequestedTool, Resources, decide,
+    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, ConnectorName, CredentialError,
+    CredentialHandle, CredentialSource, Principal, Proved, RequestedTool, Resources, decide,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
-    Caller, FIXTURE_NOW, FakeCredentialSource, FixedClock, Fixture, FixtureConnector, Gate,
-    InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SteppableClock, WRITE_TOOL,
-    block_on, poll_once,
+    Caller, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FakeCredentialSource, FixedClock, Fixture,
+    FixtureConnector, GROUP_G_DOCUMENT, Gate, InMemoryAuditStore, READ_TOOL, SCOPE_REFUSAL,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+    WRITE_TOOL, block_on, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -53,8 +57,16 @@ fn guard_for(
     }
 }
 
-fn principal(fixture: &Fixture, caller: Caller) -> gateway_core::Proved<Principal> {
+fn principal(fixture: &Fixture, caller: Caller) -> Proved<Principal> {
     fixture.principal(caller).unwrap()
+}
+
+/// Asks `source` for the fixture connector's credential for `caller`, as a connector would.
+fn ask(
+    source: &FakeCredentialSource,
+    caller: &Proved<Principal>,
+) -> Result<CredentialHandle, CredentialError> {
+    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))
 }
 
 // --- Clocks ---------------------------------------------------------------------------------
@@ -404,22 +416,96 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
     assert!(store.rows().is_empty());
 }
 
+/// A store in front of the in-memory one that names every row it begins `"0"`. Finishing the
+/// second call therefore hands the in-memory store a completion for a row that is already
+/// finished, which the core's own path never does.
+struct EveryRowIsRowZero<'a>(&'a InMemoryAuditStore);
+
+impl AuditStore for EveryRowIsRowZero<'_> {
+    fn begin<'a>(
+        &'a self,
+        record: &'a AuditRecord,
+    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
+        Box::pin(async move {
+            self.0.begin(record).await?;
+            Ok(AuditRowId::new("0"))
+        })
+    }
+
+    fn finish<'a>(
+        &'a self,
+        completion: &'a RowCompletion,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.0.finish(completion)
+    }
+}
+
+#[test]
+fn a_row_that_is_already_finished_cannot_be_finished_again() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let forwarding = EveryRowIsRowZero(&store);
+    let guard = |n: u32| {
+        let arguments = json!({"document": "team-a-notes", "n": n});
+        let call = CallContext {
+            caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
+            tool: RequestedTool::new(READ_TOOL),
+            resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
+        };
+        let decision = decide(&fixture.policy, &call);
+        match block_on(audit::begin(
+            &forwarding,
+            decision,
+            arguments,
+            RequestMetadata::default(),
+        ))
+        .unwrap()
+        {
+            Begun::Allowed(guard) => guard,
+            Begun::Denied(refusal) => panic!("{refusal:?}"),
+        }
+    };
+    let (first, second) = (guard(1), guard(2));
+    assert_eq!(store.rows().len(), 2);
+
+    let finished = block_on(audit::finish(
+        &forwarding,
+        block_on(audit::run(&connector, first)),
+        5,
+    ));
+    assert!(finished.failure().is_none());
+    // The second call's completion is for row 0 too, with another latency.
+    let finished = block_on(audit::finish(
+        &forwarding,
+        block_on(audit::run(&connector, second)),
+        9,
+    ));
+    assert!(
+        finished.failure().is_some(),
+        "a second completion for one row was accepted"
+    );
+    assert_eq!(
+        store.rows()[0].completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 5
+        }),
+        "the row kept its first completion"
+    );
+    assert_eq!(store.rows()[1].completion, None);
+    assert_eq!(store.finish_attempts(), 2);
+}
+
 // --- The credential source ------------------------------------------------------------------
 
 #[test]
 fn credentials_are_labelled_by_connector_team_and_count_and_every_request_is_recorded() {
     let (fixture, source) = (fixture(), FakeCredentialSource::new());
-    let connector = ConnectorName::from("fixture");
     let team_a = principal(&fixture, Caller::TeamA);
     let team_b = principal(&fixture, Caller::TeamB);
     let user = principal(&fixture, Caller::UserInGroupG);
 
-    let label = |caller| {
-        block_on(source.credential_for(&connector, caller))
-            .unwrap()
-            .label()
-            .to_owned()
-    };
+    let label = |caller| ask(&source, caller).unwrap().label().to_owned();
     assert_eq!(label(&team_a), "fake-credential-for-fixture-team-a-1");
     assert_eq!(label(&team_b), "fake-credential-for-fixture-team-b-2");
     assert_eq!(label(&team_a), "fake-credential-for-fixture-team-a-3");
@@ -442,9 +528,8 @@ fn credentials_are_labelled_by_connector_team_and_count_and_every_request_is_rec
 #[test]
 fn a_credential_source_told_to_refuse_refuses_and_still_records_the_request() {
     let (fixture, source) = (fixture(), FakeCredentialSource::new());
-    let connector = ConnectorName::from("fixture");
     let caller = principal(&fixture, Caller::TeamA);
-    let ask = || block_on(source.credential_for(&connector, &caller));
+    let ask = || ask(&source, &caller);
 
     source.refuse_next();
     assert!(matches!(ask(), Err(CredentialError::Refused(_))));
@@ -468,6 +553,40 @@ fn a_credential_source_told_to_refuse_refuses_and_still_records_the_request() {
             .map(|request| request.issued.is_some())
             .collect::<Vec<_>>(),
         [false, true, true, false, false, true]
+    );
+}
+
+#[test]
+fn a_credential_source_told_to_be_unavailable_says_so_and_still_records_the_request() {
+    let (fixture, source) = (fixture(), FakeCredentialSource::new());
+    let caller = principal(&fixture, Caller::TeamA);
+    let ask = || ask(&source, &caller);
+
+    source.unavailable_next();
+    assert_eq!(
+        ask(),
+        Err(CredentialError::Unavailable(
+            "the fake credential source was told to be unavailable".into()
+        ))
+    );
+    assert_eq!(
+        ask().unwrap().label(),
+        "fake-credential-for-fixture-team-a-1",
+        "only the next request failed, and it issued nothing"
+    );
+
+    source.unavailable_all();
+    assert!(matches!(ask(), Err(CredentialError::Unavailable(_))));
+    assert!(matches!(ask(), Err(CredentialError::Unavailable(_))));
+    // Refusing replaces being unavailable, and stopping ends either.
+    source.refuse_all();
+    assert!(matches!(ask(), Err(CredentialError::Refused(_))));
+    source.stop_refusing();
+    assert!(ask().is_ok());
+    assert_eq!(
+        source.requests().len(),
+        6,
+        "failed requests are recorded too"
     );
 }
 
@@ -550,40 +669,92 @@ fn the_write_tool_records_that_a_write_happened_under_the_callers_team_credentia
     );
 }
 
-#[test]
-fn the_scoped_tool_refuses_a_forbidden_document_and_serves_any_other() {
-    let rig = rig();
-    let refused = rig.answer(
-        Caller::TeamA,
-        SCOPED_READ_TOOL,
-        documents("restricted-notes"),
-    );
-    let Answer::Refused(sentence) = refused else {
-        panic!("{refused:?}")
+/// Runs the scoped tool for `caller` on a surface open to it, to its answer. The scoped tool
+/// checks its own scope, so the decision allows any document and only the connector refuses.
+fn scoped(rig: &Rig, caller: Caller, document: &str) -> Answer {
+    let surface = if caller == Caller::UserInGroupG {
+        SURFACE_READ
+    } else {
+        SURFACE_ALL
     };
-    assert_eq!(
-        sentence,
-        "The fixture connector refused this call: the document `restricted-notes` is outside the scope of the caller's team."
-    );
-    assert!(matches!(
-        rig.answer(Caller::TeamA, SCOPED_READ_TOOL, documents("team-a-notes")),
-        Answer::Ok(_)
-    ));
-    // Other forbidden documents can be added, and are then refused.
-    assert!(matches!(
-        rig.answer(Caller::TeamA, SCOPED_READ_TOOL, documents("payroll")),
-        Answer::Ok(_)
-    ));
-    rig.connector.forbid("payroll");
-    assert!(matches!(
-        rig.answer(Caller::TeamA, SCOPED_READ_TOOL, documents("payroll")),
-        Answer::Refused(_)
-    ));
-    // A call that names no document is not a forbidden one.
+    let arguments = documents(document);
+    let call = CallContext {
+        caller: rig.fixture.caller_context(caller, surface).unwrap(),
+        tool: RequestedTool::new(SCOPED_READ_TOOL),
+        resources: FixtureConnector::resources_of(SCOPED_READ_TOOL, &arguments),
+    };
+    let decision = decide(&rig.fixture.policy, &call);
+    let Begun::Allowed(guard) = block_on(audit::begin(
+        &rig.store,
+        decision,
+        arguments,
+        RequestMetadata::default(),
+    ))
+    .unwrap() else {
+        panic!("the scoped tool was denied to {caller:?}")
+    };
+    let ran = block_on(audit::run(&rig.connector, guard));
+    block_on(audit::finish(&rig.store, ran, 0)).answer().clone()
+}
+
+#[test]
+fn the_scoped_tool_serves_each_caller_its_own_documents_and_refuses_the_rest() {
+    let rig = rig();
+    let refused = Answer::Refused(SCOPE_REFUSAL.to_owned());
+    for (caller, own, others) in [
+        (
+            Caller::TeamA,
+            TEAM_A_DOCUMENT,
+            [TEAM_B_DOCUMENT, GROUP_G_DOCUMENT],
+        ),
+        (
+            Caller::TeamB,
+            TEAM_B_DOCUMENT,
+            [TEAM_A_DOCUMENT, GROUP_G_DOCUMENT],
+        ),
+        (
+            Caller::UserInGroupG,
+            GROUP_G_DOCUMENT,
+            [TEAM_A_DOCUMENT, TEAM_B_DOCUMENT],
+        ),
+    ] {
+        assert!(
+            matches!(scoped(&rig, caller, own), Answer::Ok(_)),
+            "{caller:?} {own}"
+        );
+        for other in others.into_iter().chain([FORBIDDEN_DOCUMENT]) {
+            assert_eq!(scoped(&rig, caller, other), refused, "{caller:?} {other}");
+        }
+    }
+    // A call that names no document reaches nothing outside the caller's scope.
     assert!(matches!(
         rig.answer(Caller::TeamA, SCOPED_READ_TOOL, json!({})),
         Answer::Ok(_)
     ));
+}
+
+#[test]
+fn the_scoped_tool_serves_a_granted_document_to_the_team_or_group_it_was_granted_to_only() {
+    let rig = rig();
+    let refused = Answer::Refused(SCOPE_REFUSAL.to_owned());
+    assert_eq!(scoped(&rig, Caller::TeamA, "payroll"), refused);
+    rig.connector.grant_to_team("team-a", "payroll");
+    assert!(matches!(
+        scoped(&rig, Caller::TeamA, "payroll"),
+        Answer::Ok(_)
+    ));
+    assert_eq!(scoped(&rig, Caller::TeamB, "payroll"), refused);
+    assert_eq!(scoped(&rig, Caller::UserInGroupG, "payroll"), refused);
+
+    // A grant to a group the user is not in does not reach the user.
+    rig.connector.grant_to_group("group-review", "review-notes");
+    assert_eq!(scoped(&rig, Caller::UserInGroupG, "review-notes"), refused);
+    rig.connector.grant_to_group("group-g", "review-notes");
+    assert!(matches!(
+        scoped(&rig, Caller::UserInGroupG, "review-notes"),
+        Answer::Ok(_)
+    ));
+    assert_eq!(scoped(&rig, Caller::TeamA, "review-notes"), refused);
 }
 
 #[test]
@@ -699,11 +870,26 @@ fn a_connector_told_to_hang_has_received_the_call_and_done_nothing_until_release
     ));
     assert_eq!(rig.connector.writes().len(), 1);
 
-    // Only the next call hung; hang_all holds every call at one gate.
-    assert!(matches!(
-        rig.answer(Caller::TeamA, READ_TOOL, documents("team-a-notes")),
-        Answer::Ok(_)
-    ));
+    // Only the next call hangs: a second call starts and finishes while the first is held.
+    let gate = rig.connector.hang_next();
+    let held = rig.guard(Caller::TeamA, READ_TOOL, documents("team-a-notes"));
+    let mut held = pin!(audit::run(&rig.connector, held));
+    assert!(poll_once(held.as_mut()).is_pending());
+    let next = rig.guard(Caller::TeamB, READ_TOOL, documents("team-b-notes"));
+    let mut next = pin!(audit::run(&rig.connector, next));
+    assert!(
+        poll_once(next.as_mut()).is_ready(),
+        "a call after the one told to hang was held too"
+    );
+    assert!(
+        poll_once(held.as_mut()).is_pending(),
+        "the held call is still held"
+    );
+    assert_eq!(gate.waiting(), 1);
+    gate.open();
+    assert!(poll_once(held.as_mut()).is_ready());
+
+    // hang_all holds every call at one gate.
     let gate = rig.connector.hang_all();
     let first = rig.guard(Caller::TeamA, READ_TOOL, documents("team-a-notes"));
     let second = rig.guard(Caller::TeamB, READ_TOOL, documents("team-b-notes"));

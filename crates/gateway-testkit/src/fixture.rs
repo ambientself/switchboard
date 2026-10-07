@@ -1,9 +1,10 @@
-//! A ready-made world: two teams, a user group, two surfaces, the fixture connector's tools,
-//! and the issuers and verifier that prove callers into it.
+//! A ready-made world: two teams, two user groups, two surfaces, the fixture connector's
+//! tools, and the issuers and verifier that prove callers into it.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use gateway_core::{CallerContext, PolicySnapshot, Principal, ProfileName, Proved};
+use gateway_core::{CallerContext, PolicySnapshot, Principal, PrincipalKind, ProfileName, Proved};
 use gateway_identity::{
     ConfigError, Identity, IdentityConfig, IssuerConfig, IssuerKind, SigningAlgorithm,
     TokenVerifier, VerifyError,
@@ -36,8 +37,11 @@ pub const USER_SUBJECT: &str = "user-1@fixture.test";
 pub const TEAM_A: &str = "team-a";
 /// Team B.
 pub const TEAM_B: &str = "team-b";
-/// The user group.
+/// The user group the fixture's one user is in.
 pub const GROUP_G: &str = "group-g";
+/// A second user group, with a profile of its own and no surface. It is there so that a user in
+/// two groups that select different profiles can be tested.
+pub const GROUP_REVIEW: &str = "group-review";
 /// The surface serving the read tools, open to both teams and to group G.
 pub const SURFACE_READ: &str = "fixture-read";
 /// The surface serving all three tools, open to both teams and not to users.
@@ -46,8 +50,10 @@ pub const SURFACE_ALL: &str = "fixture-all";
 pub const PROFILE_TEAM_A: &str = "workload-rw";
 /// The profile of team B's workloads: reads only.
 pub const PROFILE_TEAM_B: &str = "workload-ro";
-/// The profile of users: reads only.
+/// The profile of users in group G: reads only.
 pub const PROFILE_USER: &str = "user-ro";
+/// The profile of users in [`GROUP_REVIEW`]: reads only.
+pub const PROFILE_REVIEWER: &str = "user-review";
 /// A profile name the fixture policy does not hold, selected for a principal it does not know.
 pub const UNKNOWN_PROFILE: &str = "no-such-profile";
 /// The one document team A may reach.
@@ -106,11 +112,26 @@ pub enum FixtureError {
     Verification(VerifyError),
 }
 
+/// The profile each team's workloads get.
+const TEAM_PROFILES: [(&str, &str); 2] = [(TEAM_A, PROFILE_TEAM_A), (TEAM_B, PROFILE_TEAM_B)];
+
+/// The profile each user group selects.
+const GROUP_PROFILES: [(&str, &str); 2] =
+    [(GROUP_G, PROFILE_USER), (GROUP_REVIEW, PROFILE_REVIEWER)];
+
+fn profile_for(table: &[(&'static str, &'static str)], name: &str) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, profile)| *profile)
+}
+
 /// The fixture policy as data, exactly as configuration would state it.
 ///
 /// Two surfaces: [`SURFACE_READ`] serves the read and scoped read tools to both teams and to
-/// group G, and [`SURFACE_ALL`] serves all three to both teams and to no user. Three profiles:
-/// team A may read and write, team B and users may only read. One resource limit for each
+/// group G, and [`SURFACE_ALL`] serves all three to both teams and to no user. Four profiles:
+/// team A may read and write, team B and the two user groups may only read. One resource
+/// limit for each
 /// team and for the group, each a single document. The read and write tools declare their
 /// resources; the scoped read tool checks its own scope. So every kind of denial the decision
 /// function makes is reachable from here with one change to a call: another surface, tool or
@@ -152,6 +173,7 @@ pub fn policy_data() -> Value {
             {"name": PROFILE_TEAM_A, "classifications": ["read", "write"], "requires_delegation": false},
             {"name": PROFILE_TEAM_B, "classifications": ["read"], "requires_delegation": false},
             {"name": PROFILE_USER, "classifications": ["read"], "requires_delegation": false},
+            {"name": PROFILE_REVIEWER, "classifications": ["read"], "requires_delegation": false},
         ],
         "limits": {
             "teams": {
@@ -269,25 +291,32 @@ impl Fixture {
     }
 
     /// The profile policy selects for a proved principal: the stand-in for choosing it from
-    /// the issuer, the deployment and the principal. A principal the fixture does not know
+    /// the issuer, the deployment and the principal.
+    ///
+    /// A workload from the workload issuer gets its team's profile. A user from the user issuer
+    /// gets the profile its groups select, looking at every group it is in; groups that select
+    /// no profile are passed over. If its groups select more than one profile, it gets none:
+    /// the design does not say which would win, so the fixture does not choose. Anything else
     /// gets a profile the snapshot does not hold, which the decision function denies.
     pub fn select_profile(principal: &Principal) -> ProfileName {
-        let known = match (
-            principal.id.issuer.as_str(),
-            principal.team(),
-            principal.groups().next(),
-        ) {
-            (WORKLOAD_ISSUER, Some(team), _) if team.as_str() == TEAM_A => Some(Caller::TeamA),
-            (WORKLOAD_ISSUER, Some(team), _) if team.as_str() == TEAM_B => Some(Caller::TeamB),
-            (USER_ISSUER, None, Some(group)) if group.as_str() == GROUP_G => {
-                Some(Caller::UserInGroupG)
+        let selected = match (principal.id.issuer.as_str(), &principal.kind) {
+            (WORKLOAD_ISSUER, PrincipalKind::Workload { team }) => {
+                profile_for(&TEAM_PROFILES, team.as_str())
+            }
+            (USER_ISSUER, PrincipalKind::User { groups }) => {
+                let profiles: BTreeSet<&str> = groups
+                    .iter()
+                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))
+                    .collect();
+                if profiles.len() == 1 {
+                    profiles.first().copied()
+                } else {
+                    None
+                }
             }
             _ => None,
         };
-        known.map_or_else(
-            || ProfileName::new(UNKNOWN_PROFILE),
-            |caller| caller.profile().into(),
-        )
+        ProfileName::new(selected.unwrap_or(UNKNOWN_PROFILE))
     }
 
     /// A caller context for a proved principal on `surface`, with no delegation, the profile
