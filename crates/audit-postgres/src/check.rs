@@ -189,8 +189,8 @@ pub enum Problem {
         /// The attribute, as `CREATE ROLE` spells it.
         attribute: &'static str,
     },
-    /// The session's role owns, or is a member of the role that owns, an audit object, so it
-    /// could change or drop it.
+    /// The session's role owns, or is a member of the role that owns, the database or an
+    /// audit object, so it could change or drop it.
     Owns {
         /// The object.
         object: String,
@@ -218,6 +218,13 @@ pub enum Problem {
         privilege: String,
         /// What it is needed on.
         object: String,
+    },
+    /// The session logged in as another role than the one it runs as, for example through a
+    /// `role` setting in its options or a role default. `SET ROLE NONE` returns it to the role
+    /// it logged in as, which the other checks do not look at.
+    LoggedInAs {
+        /// The role the session logged in as.
+        role: String,
     },
 }
 
@@ -276,6 +283,11 @@ impl fmt::Display for Problem {
                 f,
                 "this session's role lacks {privilege} on {object}, which the store needs"
             ),
+            Self::LoggedInAs { role } => write!(
+                f,
+                "this session logged in as {role}, and SET ROLE NONE would return it to {role}; \
+                 the store must log in as the role it runs as"
+            ),
         }
     }
 }
@@ -316,12 +328,15 @@ impl PgAuditStore {
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
     ///   two triggers, enabled: the one that sets both times at insert, and the one that
     ///   completes a row at most once.
+    /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
+    ///   to another role.
     /// - The role is not a superuser, and cannot create roles or databases, replicate, or
     ///   bypass row security; nor can any role it is a member of.
     /// - The role is not a member of `pg_execute_server_program`, `pg_read_server_files` or
     ///   `pg_write_server_files`, which reach the server's programs and files.
-    /// - The role does not own the schema, the table, the trigger function or anything else in
-    ///   the schema, and is not a member of a role that does.
+    /// - The role does not own the database, the schema, the table, the trigger function or
+    ///   anything else in the schema, and is not a member of a role that does. The database's
+    ///   owner can drop it, and every row with it, without CREATE on it.
     /// - The role holds its own privileges: inserting the first half of a row, updating the
     ///   completion, selecting the identifier, decision and completion, and using the schema.
     /// - Neither the role nor any role it is a member of holds more. A membership counts
@@ -342,12 +357,20 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     let mut problems = Vec::new();
     let session = client
         .query_one(
-            "SELECT current_user::text, current_setting('server_version_num')::int",
+            "SELECT current_user::text, session_user::text,
+                    current_setting('server_version_num')::int",
             &[],
         )
         .await?;
     let role: String = session.get(0);
-    let version: i32 = session.get(1);
+    let logged_in: String = session.get(1);
+    let version: i32 = session.get(2);
+
+    // Every check below asks about the current role. A session can return to the role it
+    // logged in as, so the two must be the same.
+    if logged_in != role {
+        problems.push(Problem::LoggedInAs { role: logged_in });
+    }
 
     for (name, expected) in DURABILITY {
         let found: String = client
@@ -471,7 +494,12 @@ async fn ownership(
 ) -> Result<(), tokio_postgres::Error> {
     let owned = client
         .query(
-            "SELECT 'the schema ' || n.nspname
+            "SELECT 'the database ' || d.datname
+             FROM pg_catalog.pg_database d
+             WHERE d.datname = current_database()
+                 AND pg_has_role(current_user, d.datdba, 'MEMBER')
+             UNION ALL
+             SELECT 'the schema ' || n.nspname
              FROM pg_catalog.pg_namespace n
              WHERE n.nspname = 'switchboard_audit'
                  AND pg_has_role(current_user, n.nspowner, 'MEMBER')

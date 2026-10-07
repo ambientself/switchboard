@@ -1285,6 +1285,13 @@ mutate("pg-check-schema-owner-membership-ignored", "a member of the schema's own
 mutate("pg-check-function-owner-membership-ignored", "a member of the trigger functions' owner passes the check", PG_CHECK,
        "                 AND pg_has_role(current_user, p.proowner, 'MEMBER')",
        "                 AND p.proowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-database-owner-ignored", "the database's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, d.datdba, 'MEMBER')", "                 AND false")
+mutate("pg-check-database-owner-membership-ignored", "a role that can become the database's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, d.datdba, 'MEMBER')",
+       "                 AND d.datdba = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-logged-in-as-ignored", "a session that logged in as another role passes the check", PG_CHECK,
+       "    if logged_in != role {", "    if false {")
 mutate("pg-check-privileges-own-role-only", "a role the session can become is not checked for privileges", PG_CHECK,
        "                 WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND {test})",
        "                 WHERE r.rolname = current_user AND {test})")

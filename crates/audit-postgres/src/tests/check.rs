@@ -4,7 +4,7 @@ use tokio_postgres::NoTls;
 
 use std::collections::BTreeSet;
 
-use super::{GATEWAY_ROLE, OWNER_ROLE, TestDatabase};
+use super::{DUMMY_PASSWORD, GATEWAY_ROLE, OWNER_ROLE, TestDatabase, connect};
 use crate::check::{INSERTED, SELECTED, UPDATED};
 use crate::{BootCheckError, PgAuditStore, PoolSizes, Problem};
 
@@ -112,6 +112,124 @@ async fn a_role_that_can_become_the_owner_is_refused() {
             "{object}: {found:?}"
         );
     }
+}
+
+/// The database's owner can drop the database, and every row with it, even once CREATE on it
+/// has been taken away.
+#[tokio::test]
+async fn a_role_that_owns_the_database_or_can_become_its_owner_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let give_the_database_to = |role: String| {
+        format!(
+            "ALTER DATABASE {name} OWNER TO {role}; REVOKE CREATE ON DATABASE {name} FROM {role};",
+            name = db.name()
+        )
+    };
+    let owns = vec![Problem::Owns {
+        object: format!("the database {}", db.name()),
+    }];
+
+    // NOINHERIT membership still lets the role SET ROLE to the owner.
+    let owner = db.new_role("NOLOGIN", &[]).await;
+    let member = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    admin
+        .batch_execute(&format!(
+            "{} GRANT {owner} TO {member} WITH INHERIT FALSE;",
+            give_the_database_to(owner.clone())
+        ))
+        .await
+        .unwrap();
+    assert_eq!(problems(&db.store_as(&member)).await, owns);
+
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    admin
+        .batch_execute(&give_the_database_to(role.clone()))
+        .await
+        .unwrap();
+    assert_eq!(problems(&db.store_as(&role)).await, owns);
+
+    // What the check refuses is real: from another database, the role drops this one. It can
+    // end its own sessions in it, but not the superuser's or another role's, so those go first.
+    drop(admin);
+    let server = connect(&db.server).await;
+    for _ in 0..250 {
+        let others: i64 = server
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND usename <> $2",
+                &[&db.name(), &role],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let mut elsewhere = db.server.clone();
+    elsewhere.user(&role).password(DUMMY_PASSWORD);
+    connect(&elsewhere)
+        .await
+        .batch_execute(&format!("DROP DATABASE {} WITH (FORCE)", db.name()))
+        .await
+        .unwrap();
+}
+
+/// A session that logged in as one role and took the gateway's at startup can go back to the
+/// first with SET ROLE NONE, so it is refused, however little the gateway's role can do.
+#[tokio::test]
+async fn a_session_that_logged_in_as_another_role_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let as_gateway = |role: &str| {
+        let mut config = db.config_as(role);
+        config.options(format!("-c role={GATEWAY_ROLE}"));
+        PgAuditStore::connect(config, NoTls, PoolSizes::default()).unwrap()
+    };
+    let refused = |logged_in: &str| BootCheckError::Unfit {
+        role: GATEWAY_ROLE.into(),
+        problems: vec![Problem::LoggedInAs {
+            role: logged_in.into(),
+        }],
+    };
+
+    // A role that can become the schema's owner.
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE, OWNER_ROLE]).await;
+    let store = as_gateway(&role);
+    let error = store.check_at_boot().await.unwrap_err();
+    assert_eq!(error.to_string(), refused(&role).to_string());
+    // What the check refuses is real: the session goes back to the role it logged in as and
+    // removes the trigger that completes a row once. (RESET ROLE would not: it returns to the
+    // role the startup options set.)
+    let session = store.begin.get().await.unwrap();
+    let current: String = session
+        .query_one("SELECT current_user::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(current, GATEWAY_ROLE);
+    session
+        .batch_execute("SET ROLE NONE; DROP TRIGGER complete_once ON switchboard_audit.call_rows")
+        .await
+        .unwrap();
+
+    // The server's superuser.
+    let mut config = db.admin_config();
+    config.options(format!("-c role={GATEWAY_ROLE}"));
+    let superuser = config.get_user().unwrap().to_owned();
+    let store = PgAuditStore::connect(config, NoTls, PoolSizes::default()).unwrap();
+    let BootCheckError::Unfit { role, problems } = store.check_at_boot().await.unwrap_err() else {
+        panic!("the check failed to run");
+    };
+    assert_eq!(role, GATEWAY_ROLE);
+    assert!(
+        problems.contains(&Problem::LoggedInAs { role: superuser }),
+        "{problems:?}"
+    );
 }
 
 #[tokio::test]

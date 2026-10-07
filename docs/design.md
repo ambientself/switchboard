@@ -810,8 +810,9 @@ unconfigured one is absent from every surface.
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
 Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the trigger
-that sets the times or a write-once trigger missing or disabled, or with grants beyond
-decision 0009's on the audit or receipt table.
+that sets the times or a write-once trigger missing or disabled, with grants beyond decision
+0009's on the audit or receipt table, with a role that owns the database, or with a session that
+logged in as another role than the one it runs as.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
