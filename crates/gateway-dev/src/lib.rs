@@ -9,6 +9,12 @@
 //!   returns hands back every fake, so a test can switch a failure on and read what happened.
 //! - [`AuditPrinter`] is an audit store that prints each row as a JSON line as it is written.
 //! - [`fixture_config`] and [`catalog_data`] are the fixture world as gateway configuration.
+//! - [`tokens::write_tokens`] writes a token for each fixture caller to a file, for a client
+//!   outside the process.
+//! - [`client`] is the scripted client: `initialize` or `server/discover`, `tools/list`, an
+//!   allowed call and a denied one, in either MCP era, printed as it goes.
+//!
+//! The `switchboard-dev` binary puts these together in one command.
 //!
 //! Nothing here belongs in a running gateway: it depends on the testkit, whose keys are
 //! generated in process and whose credentials are labelled dummies.
@@ -20,8 +26,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 mod printer;
 mod start;
+pub mod tokens;
 mod world;
 
 pub use printer::AuditPrinter;
