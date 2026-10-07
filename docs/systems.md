@@ -195,8 +195,12 @@ at `/x/repos/readonly`, and check that a call to a repository outside the token 
 - Rate limits for the hosted server, and its data-residency and plan requirements.
 
 **Smallest useful surface.** Jira: `searchJiraIssuesUsingJql`, `getJiraIssue`,
-`listJiraIssueComments`, plus one comment write (`addOrEditJiraIssueComment`) as a proposal.
-That matches the three tools Otto has today.
+`listJiraIssueComments`, plus one comment write (`addOrEditJiraIssueComment`). That matches the
+three tools Otto has today. The comment write is classified `write`, not `propose`: it
+comments on issues the gateway did not create, and a comment can act as a command. It is
+denied in every profile, as Otto's `jira_comment` is, unless the owner records an exception
+(Q9; the 2026-10-04 amendment to
+[decision 0006](decisions/0006-what-the-decision-function-sees.md)).
 
 Confluence is in use and wanted (confirmed 2026-10-01): `searchConfluence` and
 `getConfluenceContent`. Otto's gateway has no Confluence tools, so there is nothing built-in to

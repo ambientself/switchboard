@@ -1,9 +1,10 @@
 # 0006: What the decision function sees and returns
 
 Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
-on 2026-10-04 (classifications, direct writes and delegation tool lists; see the end). Status:
-accepted. Settles the part of Q9 that milestone 1 needs. The rest of
-Q9 (tool assurance for proxied servers, employee writes, breadth of reads) stays open.
+on 2026-10-04 (classifications, direct writes and delegation tool lists; see the end), with
+the rule for comments added on 2026-10-06. Status: accepted. Settles the part of Q9 that
+milestone 1 needs. The rest of Q9 (tool assurance for proxied servers, employee writes,
+breadth of reads) stays open.
 
 ## Context
 
@@ -106,14 +107,40 @@ There are now four classifications:
 | Classification | Meaning |
 | --- | --- |
 | `read` | Reads and changes nothing. |
-| `propose` | Creates something for a person to review, or changes only what the gateway created for that purpose: a draft pull request, a comment, a commit to its own proposal branch. It never changes, transitions, merges or deploys anything else, so nothing it does takes effect until a person acts on it. |
-| `write` | Changes something directly: a merge, a push to an existing branch, a status transition, a configuration change. |
+| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on its own draft pull request or issue. It never changes, transitions, merges or deploys anything else, so nothing it does takes effect until a person acts on it. |
+| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create. |
 | `destructive` | Destroys something. |
 
-`propose` is Otto's definition, "open a PR, don't push; comment, don't transition", and every
-write tool Otto serves at `752395a` meets it. The person approving a tool assigns its
-classification. A tool is `propose` only if nothing it does takes effect until a person acts;
-a tool that cannot promise that is `write`, whatever its name.
+`propose` follows Otto's definition, "open a PR, don't push; comment, don't transition", with
+one difference: Otto allows a comment on any pull request or issue a team may reach, and this
+definition does not (see Comments, below).
+
+The person approving a tool assigns its classification. The decision function sees only the
+classification; it cannot tell what the gateway created. So a tool is `propose` only if it
+refuses, when it runs, to act on anything the gateway did not create, by a check such as the
+author being the gateway's own identity, a reserved branch prefix, or a fact from Otto's
+resolver ([decision 0003](0003-otto-keeps-its-control-plane-endpoints.md)). Otto's
+`github_amend_change` makes this check: it commits only to an open pull request its own App
+opened, on a branch under its reserved prefix. A tool that cannot make the check is `write`,
+whatever its name.
+
+### Comments
+
+Decided by the owner on 2026-10-06. A comment is `propose` only when it is on something the
+gateway itself created for review, such as its own draft pull request or an issue it opened.
+A comment anywhere else is `write`. A comment can take effect on its own: a bot reads
+`/deploy` or `atlantis apply` as a command, and a comment can start CI.
+
+Of the five write tools Otto serves at `752395a`, three are `propose` under this rule:
+`github_create_pr`, `github_propose_change` and `github_amend_change`. Two are `write`:
+`github_pr_comment` posts on any pull request in the team's repositories, and `jira_comment`
+on any issue in the configured projects. So is `addOrEditJiraIssueComment` on Atlassian's
+hosted server, the comment write in the Jira surface [systems.md](../systems.md) lists to
+match Otto's.
+
+Otto's callers are therefore denied both comment tools, and the gateway does not reach parity
+with Otto's gateway for them (#12). No exception is made here. Whether to allow them by a narrow,
+recorded exception is open in Q9 for the owner.
 
 ### Direct writes are denied in every profile
 
@@ -167,5 +194,14 @@ checked against their limits. A dedicated field waits for the first such tool.
 - Approving a tool now includes judging whether it proposes or writes directly. That judgment
   is what keeps production mutation out, so it is part of what the reviewer of an approval
   checks.
-- The decision table's write tools are reclassified: proposals are `propose`, and the direct
-  write that remains is there to show the denial.
+- The rule binds the vendor actions Otto's control plane asks for under
+  [decision 0003](0003-otto-keeps-its-control-plane-endpoints.md), since they are ordinary
+  tools under a profile. Each must be `read` or `propose`. The receipt comment is posted or
+  edited on a pull request the gateway opened for Otto's proposal, so it is `propose` if its
+  tool refuses any other pull request. If Otto's proposed Jira answer endpoint answers by
+  commenting on an issue the gateway did not create, that is `write`. An action that needs a
+  direct write takes the decision that replaces the section above.
+- Otto's two comment tools are denied to Otto's callers until Q9 settles an exception (see
+  Comments, above).
+- The decision table's write tools are reclassified: proposals are `propose`, and the comment
+  and the transition that remain are `write`, to show the denial.

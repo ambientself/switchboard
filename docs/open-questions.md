@@ -64,7 +64,9 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
 - **2026-10-04 (part of Q9):** Tools are classified `read`, `propose`, `write` or
   `destructive`. `write` and `destructive` are denied in every profile, which is how
   production mutation is denied initially. A delegation's tool list is required. Broad reads
-  use the existing surface allowlists and resource limits. See the 2026-10-04 amendment to
+  use the existing surface allowlists and resource limits. On 2026-10-06 the owner decided
+  that a comment is `propose` only on something the gateway created for review, and `write`
+  anywhere else. See the 2026-10-04 amendment to
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 ## Q9. What does authorization check beyond tool classification?
@@ -83,7 +85,14 @@ operation might address any repository, Jira project or AWS account available to
   broader writes only by a later explicit policy decision.
 - **Boundary:** the gateway owns agent-access policy; downstream systems still enforce their
   own credential and resource permissions. One gateway decision point does not remove them.
-- **Blocks:** policy/connector interfaces and employee data-access enforcement.
+- **Open for the owner: Otto's comment tools.** Otto's `github_pr_comment` and `jira_comment`
+  comment on pull requests and issues the gateway did not create, so they are `write` and are
+  denied to Otto's callers. So is the hosted Atlassian server's
+  `addOrEditJiraIssueComment`, which [systems.md](systems.md) lists to match `jira_comment`.
+  That loses parity with Otto's gateway (#12). A narrow, recorded exception is the likely
+  answer. Until one is recorded, they stay denied.
+- **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
+  write cutover for its comment tools.
 
 ## Q10. What happens after execution when recording or delivery fails?
 

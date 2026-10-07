@@ -19,14 +19,20 @@ use thiserror::Error;
 pub enum Classification {
     /// Reads and changes nothing.
     Read,
-    /// Creates something for a person to review, or changes only what the gateway created for
-    /// that purpose: a draft pull request, a comment, a commit to its own proposal branch. It
-    /// never changes, transitions, merges or deploys anything else, so nothing it does takes
-    /// effect until a person acts on it.
+    /// Creates something for a person to review, or changes only what the gateway itself
+    /// created for review: a draft pull request, an issue it opens, a commit to its own
+    /// proposal branch, a comment on its own draft pull request or issue. It never changes,
+    /// transitions, merges or deploys anything else, so nothing it does takes effect until a
+    /// person acts on it.
+    ///
+    /// The decision function cannot see what the gateway created. A tool is `Propose` only if
+    /// it refuses, when it runs, to act on anything else.
     Propose,
-    /// Changes something directly: a merge, a push to an existing branch, a status transition,
-    /// a configuration change. Denied in every profile, which is how production mutation is
-    /// denied: anything that changes production without a person acting is a `Write` or worse.
+    /// Changes something directly: a merge, a push to a branch the gateway did not create for a
+    /// proposal, a status transition, a configuration change, a comment on anything the gateway
+    /// did not create. A comment counts because it can take effect on its own, as a bot command
+    /// or a CI trigger. Denied in every profile, which is how production mutation is denied:
+    /// anything that changes production without a person acting is a `Write` or worse.
     Write,
     /// Destroys something. Denied in every profile.
     Destructive,

@@ -1,7 +1,8 @@
 # MCP gateway design
 
 Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
-review, and 2026-10-04 for the classifications in section 8. Status: draft. Settled questions and the ones still open are in
+review, and 2026-10-04 and 2026-10-06 for the classifications in section 8. Status: draft.
+Settled questions and the ones still open are in
 [open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
 ## 1. Purpose
@@ -239,9 +240,21 @@ person who approves it. A tool with none never runs; there is no default.
 | Classification | Meaning |
 | --- | --- |
 | `read` | Reads and changes nothing. |
-| `propose` | Creates something for a person to review, or changes only what the gateway created for that purpose: a draft pull request, a comment, a commit to its own proposal branch. Nothing it does takes effect until a person acts on it. |
-| `write` | Changes something directly: a merge, a push to an existing branch, a status transition, a configuration change. |
+| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on its own draft pull request or issue. Nothing it does takes effect until a person acts on it. |
+| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create. |
 | `destructive` | Destroys something. |
+
+A comment on something the gateway did not create is `write`, because a comment can take
+effect on its own: a bot reads `/deploy` or `atlantis apply` as a command, and a comment can
+trigger CI. The decision function sees only the classification, not what the gateway created.
+A tool is `propose` only if it refuses, when it runs, to act on anything the gateway did not
+create, by a check such as the author being the gateway's own identity, a reserved branch
+prefix, or a fact from Otto's resolver. A tool that cannot make that check is `write`.
+
+Under this rule Otto's `github_pr_comment` and `jira_comment` are `write`: they comment on
+pull requests and issues the gateway did not create. Otto's callers are denied them, which
+loses parity with Otto's gateway. Whether to allow them by a narrow, recorded exception is
+open (Q9).
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
@@ -254,8 +267,8 @@ Permitting direct writes needs a decision that replaces part of
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
-| Proposals (`propose`) | Allowed. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed. |
-| Direct writes (`write`) | Never. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
+| Proposals (`propose`) | Allowed. A comment is a proposal only on a pull request or issue the gateway created. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
+| Direct writes (`write`) | Never. That includes a comment on anything the gateway did not create, so Otto's two comment tools are denied unless Q9 settles an exception. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
@@ -469,7 +482,7 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail ([decision 0008](decisions/0008-mock-the-first-slice.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one. | Audit semantics for reads (Q10). |
 | 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection. | Freshness and revocation bounds (Q11). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. Whether Otto's comment tools get an exception to the comment rule (Q9). |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. | Clients and access (Q13). Employee write boundaries (Q9). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
