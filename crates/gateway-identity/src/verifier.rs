@@ -365,6 +365,13 @@ fn carries_crit(token: &str) -> bool {
 /// clock, which this crate must not, so those checks are made below against the injected
 /// clock. What is left of `decode` is the signature, and the parse of what the signature
 /// covers.
+///
+/// An ES256 signature is malleable: given a valid `(r, s)`, anyone can write `(r, n - s)`,
+/// which also verifies, so one set of claims has two token strings. Nothing in the gateway
+/// keys on a token's string: no cache, replay check or audit record holds it, and the
+/// principal comes from the claims, which are the same under both. So both forms are accepted.
+/// Anything that later keys on the token itself (a replay cache, a record of tokens seen) must
+/// first require the low-s form, or key on the claims instead.
 fn verify_signature(
     token: &str,
     algorithm: SigningAlgorithm,
