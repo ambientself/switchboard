@@ -11,6 +11,11 @@
 //! In each mode every fixture caller lists its tools, reads its own document and is denied
 //! another team's. The SDK's HTTP client is wrapped so the test sees every POST the SDK sent,
 //! with its headers, and any session the gateway tried to start, which must be none.
+//!
+//! In each mode, too: the SDK reads the tool definitions as the catalog states them, takes a
+//! failing tool as an error result, cannot start without a valid token, gets an error for a
+//! method the gateway does not serve and carries on, has concurrent calls answered and
+//! recorded one by one, and a call it abandons still finishes its row.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;

@@ -23,6 +23,12 @@ pub async fn post(url: &str, token: Option<&str>, body: &Value) -> (u16, Value) 
         request = request.bearer_auth(token);
     }
     let answer = request.send().await.unwrap();
+    // The gateway never starts a session (plan #26 section 6, test 7), whatever it answers.
+    assert!(
+        answer.headers().get("mcp-session-id").is_none(),
+        "a session was started: {:?}",
+        answer.headers()
+    );
     let status = answer.status().as_u16();
     let text = answer.text().await.unwrap();
     let body = if text.is_empty() {
