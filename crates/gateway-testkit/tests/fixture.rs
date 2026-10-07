@@ -10,10 +10,10 @@ use gateway_core::{
 };
 use gateway_identity::{SigningAlgorithm, VerifyError};
 use gateway_testkit::{
-    AUDIENCE, Caller, DEPLOYMENT, Fixture, FixtureConnector, GROUP_G, PROFILE_TEAM_A,
-    PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A,
-    TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT, UNKNOWN_PROFILE, USER_ISSUER,
-    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, policy, policy_data,
+    AUDIENCE, Caller, DEPLOYMENT, Fixture, FixtureConnector, GROUP_G, GROUP_REVIEW,
+    PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL,
+    SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT,
+    UNKNOWN_PROFILE, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, policy, policy_data,
 };
 use serde_json::{Value, json};
 
@@ -206,6 +206,76 @@ fn a_principal_the_fixture_does_not_know_gets_a_profile_the_snapshot_does_not_ho
                 .is_none()
         );
     }
+}
+
+/// A user's profile is chosen from all of its groups, not the first. Groups the fixture does
+/// not map are passed over, and groups that select two different profiles select none.
+#[test]
+fn a_user_gets_the_profile_its_groups_select_and_none_if_they_disagree() {
+    let user = |groups: &[&str]| Principal {
+        id: PrincipalId {
+            issuer: USER_ISSUER.into(),
+            subject: USER_SUBJECT.into(),
+        },
+        kind: PrincipalKind::User {
+            groups: groups.iter().map(|group| (*group).into()).collect(),
+        },
+    };
+    for (groups, expected) in [
+        (&[GROUP_G][..], PROFILE_USER),
+        (&[GROUP_REVIEW], PROFILE_REVIEWER),
+        // Groups are held in order, and these sort before and after group G.
+        (&["aaa-unmapped", GROUP_G], PROFILE_USER),
+        (&[GROUP_G, "zzz-unmapped"], PROFILE_USER),
+        (
+            &["aaa-unmapped", GROUP_REVIEW, "zzz-unmapped"],
+            PROFILE_REVIEWER,
+        ),
+        // Two groups that select different profiles: the design does not say which wins.
+        (&[GROUP_G, GROUP_REVIEW], UNKNOWN_PROFILE),
+        (&["aaa-unmapped", GROUP_G, GROUP_REVIEW], UNKNOWN_PROFILE),
+    ] {
+        assert_eq!(
+            Fixture::select_profile(&user(groups)).as_str(),
+            expected,
+            "{groups:?}"
+        );
+    }
+    // Every profile the fixture selects is one its policy holds.
+    let snapshot = policy().unwrap();
+    for profile in [
+        PROFILE_TEAM_A,
+        PROFILE_TEAM_B,
+        PROFILE_USER,
+        PROFILE_REVIEWER,
+    ] {
+        assert!(snapshot.profile(&profile.into()).is_some(), "{profile}");
+    }
+}
+
+#[test]
+fn a_user_in_two_groups_with_different_profiles_is_denied_whatever_it_calls() {
+    let fixture = fixture();
+    let now = gateway_identity::Clock::now(&fixture.clock);
+    let token = fixture
+        .user_issuer
+        .user_token(USER_SUBJECT, AUDIENCE, &[GROUP_G, GROUP_REVIEW], now)
+        .build();
+    let principal = gateway_core::Proved::verify(fixture.verifier(), token.as_str()).unwrap();
+    let call = CallContext {
+        caller: Fixture::context_for(principal, SURFACE_READ),
+        tool: RequestedTool::new(READ_TOOL),
+        resources: FixtureConnector::resources_of(
+            READ_TOOL,
+            &json!({"document": gateway_testkit::GROUP_G_DOCUMENT}),
+        ),
+    };
+    assert_eq!(
+        decide(&fixture.policy, &call)
+            .reason()
+            .map(|reason| reason.kind()),
+        Some(ReasonKind::ProfileUnknown)
+    );
 }
 
 /// One call, changed one way at a time from an allowed one, reaches each denial.

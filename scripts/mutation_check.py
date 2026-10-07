@@ -914,8 +914,13 @@ mutate("fake-issuer-unsigned-is-signed", "an unsigned token is signed", I,
 mutate("fake-issuer-jwk-has-no-kid", "the published key has no kid", I, "        jwk.common.key_id = Some(key_id.clone());\n", "")
 mutate("fake-clock-advance-is-a-no-op", "a steppable clock does not move", TESTKIT_SRC + "clock.rs", "                Some(millis.saturating_add(by))", "                Some(millis)")
 mutate("fake-gate-open-wakes-nobody", "opening a gate wakes nothing", TESTKIT_SRC + "gate.rs", "        for waker in wakers {\n            waker.wake();\n        }\n", "        drop(wakers);\n")
-mutate("fake-fixture-profile-for-everyone", "every caller gets team A's profile", TESTKIT_SRC + "fixture.rs",
-       "            |caller| caller.profile().into(),\n", "            |_| PROFILE_TEAM_A.into(),\n")
+F = TESTKIT_SRC + "fixture.rs"
+mutate("fake-fixture-profile-for-everyone", "every caller gets team A's profile", F,
+       "        ProfileName::new(selected.unwrap_or(UNKNOWN_PROFILE))", "        ProfileName::new(selected.map_or(PROFILE_TEAM_A, |_| PROFILE_TEAM_A))")
+mutate("fake-fixture-profile-from-first-group", "a user's profile is chosen from its first group only", F,
+       "                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))", "                    .take(1)\n                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))")
+mutate("fake-fixture-several-profiles-pick-one", "a user whose groups select two profiles gets one of them", F,
+       "                if profiles.len() == 1 {", "                if !profiles.is_empty() {")
 
 
 # --- The core's dependencies ---------------------------------------------------------------
