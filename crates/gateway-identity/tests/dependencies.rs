@@ -7,10 +7,11 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-const ALLOWED: [&str; 5] = [
+const ALLOWED: [&str; 6] = [
     "gateway-core",
     "base64",
     "jsonwebtoken",
+    "rsa",
     "serde_json",
     "thiserror",
 ];

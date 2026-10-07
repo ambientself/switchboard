@@ -865,6 +865,11 @@ mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measure
 mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
        "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
        "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
+mutate("identity-config-rsa-backend-check-skipped", "an RSA key the crypto backend cannot use is accepted", V,
+       "        rsa_key_usable(&params.n, &params.e)?;\n", "")
+mutate("identity-config-unusable-rsa-key-reported-as-unfit", "an RSA key the backend cannot use is reported as a key of the wrong kind", V,
+       "            Unfit::UnusableRsa(reason) => ConfigError::UnusableRsaKey {\n                issuer,\n                kid,\n                reason,\n            },\n",
+       "            Unfit::UnusableRsa(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },\n")
 mutate_all("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer",
            (V, "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
             "                Err(unfit) => {\n                    return Err(unfit.error(issuer.clone(), kid, config.algorithm));\n                }"),
@@ -910,7 +915,7 @@ mutate_all(
 # test runs, so that mutation could never give a verdict. Any second entry in the feature list
 # fails the same assertion a second backend would, and leaves the lock as it is.
 mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
-       'features = ["rust_crypto"] }\nserde_json', 'features = ["rust_crypto", "rust_crypto"] }\nserde_json')
+       'features = ["rust_crypto"] }\n', 'features = ["rust_crypto", "rust_crypto"] }\n')
 
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
