@@ -516,7 +516,11 @@ fn a_row_records_the_resources_its_call_named() {
     assert!(refusal.is_none());
     assert_eq!((recorded, omitted), (as_recorded(&[]), 0));
 
-    let exactly = permitted(MAX_RECORDED_RESOURCES);
+    // The most a row records, written as a number: the constant is what is under test, so
+    // comparing it with itself would prove nothing.
+    let most = 64;
+    assert_eq!(MAX_RECORDED_RESOURCES, most);
+    let exactly = permitted(most);
     let (refusal, recorded, omitted) = record_call(Resources::Named(exactly.clone()));
     assert!(refusal.is_none());
     assert_eq!(
@@ -525,13 +529,13 @@ fn a_row_records_the_resources_its_call_named() {
         "a call naming exactly the most a row records loses none"
     );
 
-    let mut many = permitted(MAX_RECORDED_RESOURCES + 6);
+    let mut many = permitted(most + 6);
     many.reverse();
     let (refusal, recorded, omitted) = record_call(Resources::Named(many.clone()));
     assert!(refusal.is_none());
     assert_eq!(
         (recorded, omitted),
-        (as_recorded(&many[..MAX_RECORDED_RESOURCES]), 6),
+        (as_recorded(&many[..most]), 6),
         "the first named are kept, in the order named, and the rest counted"
     );
 }
@@ -638,7 +642,7 @@ fn recorded_values_are_escaped_reversibly() {
     assert_eq!(recorded.kind, "repo\\`sit\\\\ory");
 }
 
-/// Every identifier the target systems document fits whole; only a longer one is cut.
+/// Each identifier length checked in `docs/systems.md` fits whole; only a longer one is cut.
 #[test]
 fn recorded_values_are_capped() {
     let named = |identifier: String| Resource {
@@ -747,6 +751,12 @@ fn the_record_serializes_under_pinned_names_and_reads_back() {
     let mut unknown = serde_json::to_value(store.last()).unwrap();
     unknown["extra"] = json!(1);
     assert!(serde_json::from_value::<AuditRecord>(unknown).is_err());
+    let mut unknown = serde_json::to_value(store.last()).unwrap();
+    unknown["resources"]["named"][0]["extra"] = json!(1);
+    assert!(
+        serde_json::from_value::<AuditRecord>(unknown).is_err(),
+        "a recorded resource with a field it does not have was read"
+    );
 }
 
 /// Connectors of different kinds in one registry, and one store behind an `Arc`: what the

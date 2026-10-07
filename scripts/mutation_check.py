@@ -404,8 +404,9 @@ mutate("snapshot-unapproved-tool", "a surface may serve an unapproved tool", SRC
 for struct in ("Surface", "ApprovedTool"):
     mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "policy.rs",
            f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
-mutate("unknown-fields-AuditRecord", "AuditRecord accepts unknown fields", SRC + "audit.rs",
-       "#[serde(deny_unknown_fields)]\npub struct AuditRecord {", "pub struct AuditRecord {")
+for struct in ("AuditRecord", "RecordedResource"):
+    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "audit.rs",
+           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
 mutate_all(
     "surface-restriction-default",
     "a surface with no principal restriction written reads as unrestricted",
@@ -556,6 +557,8 @@ RECORDED_TAKE = "        .take(MAX_RECORDED_RESOURCES)\n"
 mutate("record-resources-uncapped", "the row records every resource a call names", SRC + "audit.rs", RECORDED_TAKE, "")
 mutate("record-resources-cap-short", "the row records one resource fewer than it should", SRC + "audit.rs", RECORDED_TAKE,
        "        .take(MAX_RECORDED_RESOURCES - 1)\n")
+mutate("record-resources-cap-constant", "a row records at most 63 resources, not 64", SRC + "audit.rs",
+       "pub const MAX_RECORDED_RESOURCES: usize = 64;", "pub const MAX_RECORDED_RESOURCES: usize = 63;")
 mutate("record-resources-reordered", "the row records resources in reverse order", SRC + "audit.rs",
        "        .copied()\n" + RECORDED_TAKE, "        .copied()\n        .rev()\n" + RECORDED_TAKE)
 mutate("record-resources-repeats-kept", "a resource named twice is recorded twice", SRC + "audit.rs",
