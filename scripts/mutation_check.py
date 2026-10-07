@@ -273,6 +273,17 @@ mutate(
     "    pub tools: BTreeSet<ToolName>,",
     "    #[serde(default)]\n    pub tools: BTreeSet<ToolName>,",
 )
+mutate_all(
+    "delegation-null-tools-read-as-empty",
+    "a delegation whose tool list is null reads as one that lists no tools",
+    (
+        SRC + "principal.rs",
+        "    pub tools: BTreeSet<ToolName>,\n}",
+        "    #[serde(deserialize_with = \"null_is_empty\")]\n    pub tools: BTreeSet<ToolName>,\n}\n\n"
+        "fn null_is_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeSet<ToolName>, D::Error> {\n"
+        "    Ok(Option::<BTreeSet<ToolName>>::deserialize(deserializer)?.unwrap_or_default())\n}",
+    ),
+)
 
 # --- Check 5: the classification -----------------------------------------------------------
 
@@ -323,8 +334,8 @@ for id, description, replacement in [
 ]:
     mutate(id, description, SRC + "decision.rs", PROFILE_LISTS, f"    let permitted = {replacement};")
 mutate(
-    "classification-propose-parses-as-write",
-    "`propose` in configuration reads as write",
+    "classification-write-parses-as-propose",
+    "`write` in configuration reads as propose, and `propose` is refused",
     SRC + "classification.rs",
     'Classification::Propose => "propose",',
     'Classification::Propose => "write",',
