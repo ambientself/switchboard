@@ -45,6 +45,48 @@ where
     }
 }
 
+/// The store's log, as JSON lines, for one test. Each `#[tokio::test]` runs its tasks on its
+/// own thread, the store's spawned ones included, so a subscriber set there sees all of them
+/// and nothing from other tests.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// Starts capturing on this thread, until the guard is dropped.
+    fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        let captured = Self::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// The fields of every event the store logged on giving up a row.
+    fn given_up(&self) -> Vec<serde_json::Value> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == crate::GIVEN_UP_EVENT)
+            .inspect(|event| assert_eq!(event["level"], "ERROR", "{event}"))
+            .map(|event| event["fields"].clone())
+            .collect()
+    }
+}
+
 /// The store's own error behind the core's audit failure.
 fn cause(failure: &AuditFailure) -> &PgAuditError {
     failure
@@ -265,6 +307,7 @@ async fn an_insert_with_no_answer_by_the_finish_deadline_is_given_up_and_its_con
         .with_budgets(budgets)
         .without_cancelling();
     let lock = lock_table(&db).await;
+    let (log, _logging) = Captured::start();
 
     let failure = within(budgets.begin + SLACK, begin_read(&store, &fixture))
         .await
@@ -280,6 +323,12 @@ async fn an_insert_with_no_answer_by_the_finish_deadline_is_given_up_and_its_con
         || async { store.finishes().given_up == 1 },
     )
     .await;
+    // Logged when it happens, not only counted. There is no row identifier to name.
+    let given_up = log.given_up();
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    assert_eq!(given_up[0]["stage"], "begin");
+    assert_eq!(given_up[0]["decision"], "allow");
+    assert!(given_up[0].get("row").is_none(), "{given_up:?}");
     // Its connection, still waiting on the lock, is not handed to a later begin.
     assert_eq!(store.begin.status().size, 0);
     release(&lock).await;
@@ -481,6 +530,58 @@ async fn finish_tries_again_until_the_database_takes_connections() {
     assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
 }
 
+/// Needs no server: nothing listens where the store connects, so every attempt fails, as when
+/// the database is down, until the deadline. Runs in every CI job.
+#[tokio::test]
+async fn a_finish_given_up_at_its_deadline_is_logged_naming_its_row() {
+    let config: tokio_postgres::Config = "host=127.0.0.1 port=1 user=nobody dbname=nothing"
+        .parse()
+        .unwrap();
+    let budgets = Budgets {
+        answer: Duration::from_millis(100),
+        finish_deadline: Duration::from_millis(600),
+        ..Budgets::default()
+    };
+    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())
+        .unwrap()
+        .with_budgets(budgets);
+    let (log, _logging) = Captured::start();
+    let row = gateway_core::audit::AuditRowId::new("00000000-0000-4000-8000-000000000001");
+
+    let error = within(
+        budgets.answer + SLACK,
+        store.finish_within_budget(&row, &completion(Outcome::Error, 9)),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, PgAuditError::AnswerBudget { .. }),
+        "{error}"
+    );
+    // Still trying: nothing is given up before the deadline.
+    assert!(log.given_up().is_empty());
+    until(
+        budgets.finish_deadline + SLACK,
+        "giving up at the deadline",
+        || async { store.finishes().in_flight == 0 },
+    )
+    .await;
+    assert_eq!(store.finishes().given_up, 1);
+    // Decision 0009: a finish not written by its deadline is a telemetry event naming the row
+    // and the outcome's kind, when it happens.
+    let given_up = log.given_up();
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    assert_eq!(given_up[0]["stage"], "finish");
+    assert_eq!(given_up[0]["row"], row.as_str());
+    assert_eq!(given_up[0]["outcome"], "error");
+    assert!(
+        given_up[0]["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("finish deadline")),
+        "{given_up:?}"
+    );
+}
+
 #[tokio::test]
 async fn finish_gives_up_at_its_deadline() {
     let Some(db) = TestDatabase::create().await else {
@@ -501,6 +602,7 @@ async fn finish_gives_up_at_its_deadline() {
     )
     .await;
     allow_connections(&db, false).await;
+    let (log, _logging) = Captured::start();
 
     let started = Instant::now();
     let finished = within(budgets.answer + SLACK, audit::finish(&store, ok, 7)).await;
@@ -508,6 +610,8 @@ async fn finish_gives_up_at_its_deadline() {
         cause(finished.failure().unwrap()),
         PgAuditError::AnswerBudget { .. }
     ));
+    // Still trying: nothing is given up before the deadline.
+    assert!(log.given_up().is_empty());
     until(
         budgets.finish_deadline + SLACK,
         "giving up at the deadline",
@@ -516,6 +620,19 @@ async fn finish_gives_up_at_its_deadline() {
     .await;
     assert!(started.elapsed() >= budgets.finish_deadline - Duration::from_millis(100));
     assert_eq!(store.finishes().given_up, 1);
+    // Decision 0009: a finish not written by its deadline is a telemetry event naming the row
+    // and the outcome's kind, when it happens.
+    let given_up = log.given_up();
+    assert_eq!(given_up.len(), 1, "{given_up:?}");
+    assert_eq!(given_up[0]["stage"], "finish");
+    assert_eq!(given_up[0]["row"], row.as_str());
+    assert_eq!(given_up[0]["outcome"], "ok");
+    assert!(
+        given_up[0]["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("finish deadline")),
+        "{given_up:?}"
+    );
 
     allow_connections(&db, true).await;
     sleep(Duration::from_millis(300)).await;

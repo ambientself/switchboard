@@ -57,9 +57,25 @@ ingress policy admitting one label, a new pod without it timed out (by Service I
 and a new pod with it still connected. Kubelet's readiness probes still pass under a deny-all
 ingress policy. No Calico was needed.
 
-The demo still checks this every run: before the policy, the direct call must connect and get
-401 from the server; after it, a new pod's direct call must time out (curl exit 28), and the
-same pod must still reach the gateway and get an allowed read through it.
+The demo still checks this every run, for each team: before the policy, a new pod's direct call
+must connect and get 401 from the server; after it, a new pod's direct call must time out
+(curl exit 28), and the same pod must still reach the gateway and get an allowed read through
+it.
+
+Network policy does not see what reaches a pod through the API server: exec, port-forward,
+and the pod and Service proxy routes. The operator checks ask `kubectl auth can-i` for each of
+these, with `create` and `get`, in `mock-docs` and `switchboard`, for each team's workload, and
+require `no`. They also check that neither workload can read the two namespaces' secrets or the
+gateway's configuration, start pods, or mint the gateway's tokens.
+
+## Stopping the gateway
+
+Decision 0009 says the gateway's termination grace period must be longer than the
+readiness-removal delay plus the begin budget, the call deadline and the finish deadline, or a
+stop can leave open rows. Here that is 2 s + 5 s + 30 s, plus 6 s for the readiness probe in
+kind. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
+`kind/base/gateway.yaml` and `stop_grace_period` in `compose/compose.yaml`, in place of 30 s and
+10 s. `crates/demo-checks` holds both to the code's budgets.
 
 ## Loading images into kind
 
@@ -86,7 +102,7 @@ check that the deployment files load.
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
 | mock-docs | `mock-docs-server`, configured by environment: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`. |
-| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"`; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, and that no allowed row names the other team's project. |
+| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
 ## What a run shows that is not settled

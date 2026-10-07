@@ -7,7 +7,8 @@
 //!   with proved and claimed values in separate columns.
 //! - [`PgAuditStore`] is the core's [`AuditStore`](gateway_core::AuditStore) on that table.
 //!   Begin and finish each keep a time budget ([`Budgets`]). Finish keeps trying, on a task of
-//!   its own, after its answer budget has passed, until a deadline.
+//!   its own, after its answer budget has passed, until a deadline. Each row it stops trying
+//!   to write is counted and logged as [`GIVEN_UP_EVENT`].
 //! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
 //!   is as the store expects and the role it connects as can do no more than the store needs.
 //!
@@ -49,4 +50,4 @@ pub use check::{BootCheckError, Problem};
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
-pub use store::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
+pub use store::{Budgets, FinishCounts, GIVEN_UP_EVENT, PgAuditError, PgAuditStore, PoolSizes};

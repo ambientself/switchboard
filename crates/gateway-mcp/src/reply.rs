@@ -87,6 +87,16 @@ pub enum Reply {
     /// content; under 2025-06-18 structured content must be an object, so other values are
     /// sent as text only.
     ToolOk(Value),
+    /// A proxied MCP server's tool ran and answered. Its content blocks and its structured
+    /// content are sent as the server gave them, not wrapped again. Under 2025-06-18
+    /// structured content must be an object, so any other value is left out; the content
+    /// blocks still carry the answer.
+    ToolResult {
+        /// The server's `content` blocks.
+        content: Vec<Value>,
+        /// The server's `structuredContent`, if it gave one.
+        structured_content: Option<Value>,
+    },
     /// A tool ran and failed: a result with `isError: true` and the message as text (owner
     /// answer Q5).
     ToolError(String),
@@ -155,6 +165,18 @@ pub fn render(server: &ServerInfo, era: Era, id: &RequestId, reply: Reply) -> Ht
             });
             if era == Era::Modern || value.is_object() {
                 insert(&mut result, "structuredContent", value);
+            }
+            result
+        }
+        Reply::ToolResult {
+            content,
+            structured_content,
+        } => {
+            let mut result = json!({"content": content, "isError": false});
+            let structured =
+                structured_content.filter(|value| era == Era::Modern || value.is_object());
+            if let Some(structured) = structured {
+                insert(&mut result, "structuredContent", structured);
             }
             result
         }

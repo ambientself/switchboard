@@ -146,6 +146,50 @@ mark_start() {
 # project_json NAME: the `resources` column of a call that named only the docs project NAME.
 project_json() { printf '[{"system":"docs","kind":"project","identifier":"%s"}]' "$1"; }
 
+# row_resources_json: every row from this run, as one JSON array of what check_row_resources
+# reads.
+row_resources_json() {
+  psql_reader -Atc "select coalesce(json_agg(json_build_object('team', proved_team, 'tool', tool,
+      'decision', decision, 'reason', reason, 'sentence', sentence, 'resources', resources)
+      order by begun_at), '[]') from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE)"
+}
+
+# check_row_resources ROWS: every row records what its call named. ROWS is a JSON array of
+# {team, tool, decision, reason, sentence, resources}. Each row is matched to the demo's call
+# that made it, and its resources must be what that call named:
+#   - an allowed call: its team's own project (team-a atlas, team-b borealis);
+#   - a call denied for naming no project: none, [];
+#   - a call denied for its project: the other team's project;
+#   - a call to a tool the gateway does not know: "unknown", since no adapter read the call.
+# A row that matches none of the demo's calls fails the check too.
+check_row_resources() {
+  local rows=$1 total wrong
+  # shellcheck disable=SC2016 # jq's own variables
+  if ! wrong=$(printf '%s' "$rows" | jq -c '
+      def project($name): [{system: "docs", kind: "project", identifier: $name}];
+      def own: {"team-a": "atlas", "team-b": "borealis"}[.team // ""];
+      def other: {"team-a": "borealis", "team-b": "atlas"}[.team // ""];
+      def named:
+        if .decision == "allow" then project(own)
+        elif .reason == "unknown_tool" then "unknown"
+        elif .reason == "resource_outside_limit" and (.sentence // "" | contains("named none of them")) then []
+        elif .reason == "resource_outside_limit" then project(other)
+        else "no call of the demo makes this row" end;
+      .[] | select(.resources != named) | {team, tool, decision, reason, resources, named: named}') \
+    || ! total=$(printf '%s' "$rows" | jq -e 'length'); then
+    fail "audit: every row records the resources its call named (the rows are not a JSON array)"
+    return
+  fi
+  if [ -n "$wrong" ]; then
+    printf '%s\n' "$wrong" | sed 's/^/    wrong: /'
+  fi
+  if [ "$total" -eq 0 ]; then
+    fail "audit: every row records the resources its call named (there are no rows)"
+  else
+    check "$(count_lines . "$wrong")" 0 "audit: every row records the resources its call named ($total rows)"
+  fi
+}
+
 # The columns are crates/audit-postgres's (sql/migrations/0001_call_rows.sql). `resources` is a
 # JSON array of the {system, kind, identifier} each call named, or "unknown"; the listing shows
 # each as system/kind/identifier.
@@ -170,8 +214,11 @@ audit_rows() {
     check "$(audit_count "proved_team = '$team' and decision = 'allow'
         and resources @> '$(project_json "$other")'::jsonb")" 0 \
       "audit: no allowed row of $team names $other"
+    check_at_least "$(audit_count "proved_team = '$team' and resources = '[]'::jsonb
+        and sentence like '%named none of them%'")" 1 \
+      "audit: $team's call that named no project records none"
   done
-  check "$(audit_count "resources is null")" 0 "audit: every row records the resources its call named"
+  check_row_resources "$(row_resources_json)"
   # A begin that ran past its budget may still commit; the store then completes the row as
   # error, because the call was refused and nothing ran (decision 0009).
   check "$(audit_count "decision = 'allow' and outcome is null")" 0 "audit: no allowed row is left without an outcome"
@@ -277,8 +324,11 @@ compose_run() {
   sleep 4
   compose_workload "after the withdrawal" withdrawn team-a
   swap_registry "$ROOT/deploy/compose/config/registry/registry.toml"
-  check_at_least "$(audit_count "tool = '$READ_TOOL' and decision = 'deny' and policy_revision = 'demo-2'")" 1 \
-    "audit: the call to the withdrawn tool is a deny row under revision demo-2"
+  # The gateway no longer knows the tool, so no adapter read the call: its resources are
+  # unknown, not none.
+  check_at_least "$(audit_count "tool = '$READ_TOOL' and decision = 'deny' and policy_revision = 'demo-2'
+      and reason = 'unknown_tool' and resources = '\"unknown\"'::jsonb")" 1 \
+    "audit: the call to the withdrawn tool is a deny row under revision demo-2, its resources unknown"
   # Let the gateway load the restored registry before anything else runs against it.
   sleep 4
 
@@ -327,12 +377,47 @@ kind_workload() { # LABEL NAMESPACE CRONJOB MODE
   tally_workload "$label" "$JOB_STATUS" "$(k -n "$ns" logs "job/$JOB")"
 }
 
-# can_i ARGS...: the answer to `kubectl auth can-i ARGS` for team-a's workload, checked to be no.
+# can_i_no TEAM ARGS...: the answer to `kubectl auth can-i ARGS` for TEAM's workload, checked
+# to be no.
 can_i_no() {
-  local answer
+  local team=$1 answer
+  shift
   # can-i exits 1 when the answer is no; the answer itself is what is checked.
-  if answer=$(k auth can-i "$@" --as=system:serviceaccount:team-a:mock-workload 2>/dev/null); then :; fi
-  check "$answer" no "team-a's workload may not: $*"
+  if answer=$(k auth can-i "$@" --as="system:serviceaccount:$team:mock-workload" 2>/dev/null); then :; fi
+  check "$answer" no "$team's workload may not: $*"
+}
+
+# operator_checks: what each team's workload may not do through the cluster API. Reading the
+# gateway's or the server's secrets and configuration, starting pods, and minting the
+# gateway's tokens would each reach the server without the gateway. So would the API server's
+# own routes to a pod or Service: exec, port-forward and the proxy. Their traffic comes from the
+# API server, not the workload's pod, so the network policy does not stop it. Each route is
+# checked for mock-docs and for the gateway, with both verbs a request through it can use.
+operator_checks() {
+  local team ns verb subresource
+  for team in team-a team-b; do
+    can_i_no "$team" get secrets -n switchboard
+    can_i_no "$team" get secrets -n mock-docs
+    can_i_no "$team" get configmaps -n switchboard
+    can_i_no "$team" create pods -n "$team"
+    can_i_no "$team" create serviceaccounts --subresource=token -n switchboard
+    for ns in mock-docs switchboard; do
+      for verb in create get; do
+        for subresource in exec portforward proxy; do
+          can_i_no "$team" "$verb" pods --subresource="$subresource" -n "$ns"
+        done
+        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"
+      done
+    done
+  done
+}
+
+# before_policy_probes: before the network policy, a new pod of each team calls mock-docs
+# directly. The call must connect and the server must refuse the workload's own token. Each
+# team's later check that its direct call is dropped then has its own control in the same run.
+before_policy_probes() {
+  kind_workload "team-a before policy" team-a mock-workload before-policy
+  kind_workload "team-b before policy" team-b mock-workload before-policy
 }
 
 # run_image: tags the image just built with its own ID and sets IMG_RUN to that tag. The
@@ -418,8 +503,8 @@ kind_run() {
   step "the gateway's boot lines"
   check_boot "$(k -n switchboard logs deploy/gateway)"
 
-  step "before the policy: a direct call to mock-docs connects, and the server refuses the workload's own token"
-  kind_workload "before policy" team-a mock-workload before-policy
+  step "before the policy: each team's direct call to mock-docs connects, and the server refuses the workload's own token"
+  before_policy_probes
 
   step "apply the network policy; new pods from here on; settle 10 s"
   k apply -k "$ROOT/deploy/kind/policy"
@@ -432,17 +517,12 @@ kind_run() {
   step "identity: a ServiceAccount not in the team manifest"
   kind_workload "stranger" team-a stranger-workload refused
 
-  step "operator checks: the workload holds nothing that reaches the server"
-  can_i_no get secrets -n switchboard
-  can_i_no get secrets -n mock-docs
-  can_i_no get configmaps -n switchboard
-  can_i_no create pods -n team-a
-  can_i_no create pods --subresource=exec -n mock-docs
-  can_i_no create serviceaccounts --subresource=token -n switchboard
+  step "operator checks: neither team's workload may read the gateway's or mock-docs' secrets, start pods, mint the gateway's tokens, or exec, port-forward or proxy to either"
+  operator_checks
 
   step "the server never saw a workload token through the gateway"
-  # The one direct call before the policy carried the workload's token and was refused (401);
-  # every request the server accepted carried the gateway's credential.
+  # The two direct calls before the policy, one per team, carried the workloads' own tokens and
+  # were refused (401); every request the server accepted carried the gateway's credential.
   check_server_bearers "$(k -n mock-docs logs deploy/mock-docs)" \
     "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 4 accepted
 

@@ -5,6 +5,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::read;
 use sha2::{Digest, Sha256};
 
@@ -164,6 +166,61 @@ fn workload_tokens_are_for_the_gateways_audience_and_short_lived() {
     let gateway = read("deploy/kind/base/config/gateway.toml");
     assert!(gateway.contains("audiences = [\"switchboard\"]"));
     assert!(gateway.contains("max_lifetime_seconds = 3600"));
+}
+
+/// The number on the one line of `text` that starts with `prefix`, after it.
+fn number_after(text: &str, prefix: &str, suffix: &str) -> u64 {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .collect();
+    assert_eq!(lines.len(), 1, "want one line starting `{prefix}`:\n{text}");
+    lines[0]
+        .strip_suffix(suffix)
+        .and_then(|number| number.parse().ok())
+        .unwrap_or_else(|| panic!("`{prefix}{}` is not a number", lines[0]))
+}
+
+/// Decision 0009, Shutdown: how long a call that began just before the gateway was told to stop
+/// may take, with its row: the begin budget, the call deadline and the finish deadline. The
+/// demo's deployment files set none of them, so each is the code's default.
+fn begin_call_and_finish() -> Duration {
+    let budgets = audit_postgres::Budgets::default();
+    budgets.begin + connector_proxy::DEFAULT_DEADLINE + budgets.finish_deadline
+}
+
+#[test]
+fn the_gateway_is_given_time_to_complete_its_rows_when_it_stops() {
+    let gateway = read("deploy/kind/base/gateway.yaml");
+    let deployment = documents_with(&gateway, "kind: Deployment");
+    assert_eq!(deployment.len(), 1, "{gateway}");
+    let grace = number_after(deployment[0], "      terminationGracePeriodSeconds: ", "");
+    // Readiness removal: the probe's period times the failures it takes.
+    let probe = deployment[0]
+        .split_once("          readinessProbe:\n")
+        .expect("the gateway has a readiness probe")
+        .1;
+    let probe: String = probe
+        .lines()
+        .take_while(|line| line.starts_with("            "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let removal = number_after(&probe, "            periodSeconds: ", "")
+        * number_after(&probe, "            failureThreshold: ", "");
+    let needed = Duration::from_secs(removal) + begin_call_and_finish();
+    assert!(
+        Duration::from_secs(grace) > needed,
+        "kind: a grace period of {grace} s is not longer than {needed:?}"
+    );
+
+    let compose = read("deploy/compose/compose.yaml");
+    let service = compose_service(&compose, "gateway");
+    let grace = number_after(&service, "    stop_grace_period: ", "s");
+    assert!(
+        Duration::from_secs(grace) > begin_call_and_finish(),
+        "Compose: a grace period of {grace} s is not longer than {:?}",
+        begin_call_and_finish()
+    );
 }
 
 #[test]

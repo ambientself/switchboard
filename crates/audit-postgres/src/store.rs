@@ -215,6 +215,16 @@ const LONGEST_PAUSE: Duration = Duration::from_secs(1);
 /// How long a request to cancel a statement may take before the store stops asking.
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
+/// The `event` field of the error the store logs each time it stops trying to write a row
+/// and counts it in [`FinishCounts::given_up`] (decision 0009: a finish not written by its
+/// deadline is a telemetry event naming the row).
+///
+/// - `stage = "finish"`: completing a row failed. It names the `row` and the `outcome` that was
+///   not written, and `cause` says why. Past the finish deadline the row stays open.
+/// - `stage = "begin"`: an insert that ran past the begin budget had no answer by the finish
+///   deadline, so there is no row identifier to name. If it commits, the row stays open.
+pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";
+
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
 /// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE), and call
@@ -363,6 +373,14 @@ impl PgAuditStore {
                 // this, nothing completes it.
                 abandon(client, &late.cancel);
                 counters.given_up.fetch_add(1, Ordering::SeqCst);
+                // There is no row identifier to name: the insert never answered.
+                tracing::error!(
+                    event = GIVEN_UP_EVENT,
+                    stage = "begin",
+                    decision = if allowed { "allow" } else { "deny" },
+                    "an audit row's insert had no answer by the finish deadline; if it commits, \
+                     nothing completes it"
+                );
                 return;
             };
             let Err(inserted) = sender.send(inserted) else {
@@ -525,11 +543,23 @@ struct Retry {
 }
 
 impl Retry {
-    /// [`run`](Self::run), counted in flight until it ends, and as given up if it fails.
+    /// [`run`](Self::run), counted in flight until it ends. If it fails, it is counted as given
+    /// up and logged as [`GIVEN_UP_EVENT`], naming the row and the completion that was not
+    /// written (decision 0009, What finish guarantees).
     async fn run_counted(self, in_flight: InFlight) -> Result<(), PgAuditError> {
+        let row = self.row.clone();
+        let outcome = self.finish.outcome;
         let result = self.run().await;
-        if result.is_err() {
+        if let Err(cause) = &result {
             in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
+            tracing::error!(
+                event = GIVEN_UP_EVENT,
+                stage = "finish",
+                row = row.as_str(),
+                outcome,
+                %cause,
+                "an audit row's completion was not written, and the store has stopped trying"
+            );
         }
         drop(in_flight);
         result

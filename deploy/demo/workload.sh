@@ -108,11 +108,15 @@ call() { rpc "$1" tools/call "{\"name\":\"$2\",\"arguments\":$3}"; }
 # body FILTER: applies a jq filter to the last body; prints `invalid JSON` if it is not JSON.
 body() { jq -r "$1" "$BODY" 2>/dev/null || echo "invalid JSON"; }
 
-# An allowed call: HTTP 200, a result with isError exactly false, and some content.
+# An allowed call: HTTP 200, a result with isError exactly false, and some content. The content
+# is the server's own: no text block holds a whole tool result, with its own `content`, as JSON.
 expect_allowed() {
   check "$1" 200 "$2: HTTP status"
   check "$(body '.result.isError')" false "$2: isError"
   check "$(body '(.result.content // []) | length > 0')" true "$2: has content"
+  check "$(body '[(.result.content // [])[] | .text? // empty | strings
+      | (try fromjson catch null) | objects | select(has("content"))] | length')" 0 \
+    "$2: the server's own content, not wrapped again"
 }
 # A refused call: HTTP 200 and JSON-RPC error -32001.
 expect_denied() {

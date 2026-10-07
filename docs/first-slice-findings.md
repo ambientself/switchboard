@@ -262,18 +262,22 @@ From the run of 2026-10-07 (93/93):
 1. **A row given up at the finish deadline is silent.** The store counts it, and the binary
    reports the count only at shutdown. Decision 0009 asks for a telemetry event naming the
    row when it happens. Without one, the open row is found only by querying for it. That query
-   is not built either (decision 0009's open-row work).
+   is not built either (decision 0009's open-row work). *Fixed after these runs:* the store
+   now logs `audit_row_given_up` at `ERROR` when it gives up, naming the row and the outcome it
+   could not write. The open-row query is still not built.
 2. **The gateway's termination grace period is the default.** In kind it is 30 s, and Compose
    uses its default of 10 s. Decision 0009 says it must be longer than the readiness-removal
    delay plus the begin budget, the call deadline and the finish deadline: 2 s + 5 s + 30 s
-   here, plus the delay. Until it is set, every deploy can leave open rows.
+   here, plus the delay. Until it is set, every deploy can leave open rows. *Fixed after these
+   runs:* both manifests now give the gateway 50 s (see `deploy/README.md`).
 3. **Proxied results reach the caller wrapped twice.** The proxy hands the upstream's whole
    `result` object to the core. The reply then puts that object, serialized, into a single
    text block, and also into `structuredContent`. A read of `atlas/plan` answers with a text
    block whose text is `{"content":[{"text":"The atlas plan. …","type":"text"}],"isError":false}`,
    not the server's own text block. The demo checks only that some content is present, so it
-   passes. A real client would show the JSON. This was found while measuring and is not fixed
-   here. It belongs to `connector-proxy` and `gateway-mcp`.
+   passes. A real client would show the JSON. This was found while measuring. *Fixed after
+   these runs:* the gateway passes on the server's `content` and `structuredContent` as the
+   server sent them, and the workload fails a result whose text holds a whole tool result.
 4. **Withdrawal in kind takes up to 88 s** (section 3). Any "refused within the stated time"
    claim for kind must use that number, not Compose's 2 s.
 5. **Some refusals leave no row.** Identity failures go to the log only, by design (decision
@@ -286,3 +290,14 @@ From the run of 2026-10-07 (93/93):
 8. **Unmerged.** Everything here runs from `agent/first-slice`, which stacks unmerged work
    (#25's harness, #26, #10, #14 and #9) on main. Milestone 2 is not done until those merge
    and the owner rules on what remains of decisions 0009 and 0010.
+9. **The runs claimed more than some checks tested.** A review of the demo after these runs
+   found four. A call to a tool the gateway does not know, such as the withdrawn one, recorded
+   `resources` as `[]`, which reads as a call that named nothing, though it named a project.
+   The check "every row records the resources its call named" only checked that the column
+   was not null. The operator checks were six, for team-a's workload only, and did not ask
+   about exec, port-forward or the proxy routes, which reach a pod through the API server and
+   not through network policy. Only team-a's direct call had a pre-policy control. *Fixed
+   after these runs:* such a row records `"unknown"`; the driver matches every row to the call
+   that made it and checks its resources; the operator checks cover both teams and those
+   routes, in `mock-docs` and `switchboard`; and each team makes its own pre-policy call.
+   Sections 1 to 6 describe the runs as they were, before these fixes.

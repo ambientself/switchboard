@@ -33,6 +33,8 @@ enum Fake {
     WrongDenialSentence,
     /// Refuses team A's read of its own project.
     DeniesOwnProject,
+    /// Wraps each tool result again: the whole result as JSON in one text block.
+    WrapsTwice,
     /// Takes any bearer as team A.
     AcceptsAnyToken,
     /// Refuses a bad token with 401 but another sentence.
@@ -142,6 +144,17 @@ fn read_ok(project: &str) -> Value {
     )
 }
 
+/// What the gateway once answered a proxied call with: the server's whole result as the text
+/// of one block, and again as structured content.
+fn wrapped(answer: Value) -> Value {
+    let inner = answer["result"].clone();
+    result(json!({
+        "content": [{"type": "text", "text": inner.to_string()}],
+        "structuredContent": inner,
+        "isError": false,
+    }))
+}
+
 fn outside_limit(project: &str) -> Value {
     error(
         -32001,
@@ -215,6 +228,7 @@ fn answer(fake: Fake, bearer: Option<&str>, body: &Value) -> (u16, Option<Value>
                     ),
                 ),
                 Some(OWN) if fake == Fake::DeniesOwnProject => outside_limit(OWN),
+                Some(OWN) if fake == Fake::WrapsTwice => wrapped(read_ok(OWN)),
                 Some(OWN) => read_ok(OWN),
                 Some(other) if fake == Fake::AllowsOtherProject => read_ok(other),
                 Some(_) if fake == Fake::WrongDenialSentence => error(-32001, "Denied."),
@@ -376,6 +390,17 @@ fn a_denial_without_the_resource_limit_sentence_fails_the_run() {
 fn an_error_answer_to_the_teams_own_read_fails_the_run() {
     let run = Workload::new("own-denied", serve(Fake::DeniesOwnProject)).run("full");
     assert_failed(&run, "read own project atlas: isError");
+}
+
+#[test]
+fn a_result_wrapped_twice_fails_the_run() {
+    let run = Workload::new("wrapped", serve(Fake::WrapsTwice)).run("full");
+    for call in ["list own project atlas", "read own project atlas"] {
+        assert_failed(
+            &run,
+            &format!("{call}: the server's own content, not wrapped again"),
+        );
+    }
 }
 
 #[test]

@@ -67,7 +67,7 @@ use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
 
-use crate::boot::{GateState, Gates};
+use crate::boot::{GateState, Gates, Results};
 use crate::catalog::ToolDefinition;
 use crate::policy::ServedPolicy;
 
@@ -361,6 +361,7 @@ impl RequestPath {
                 "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
             );
         };
+        let results = gates.results(&guard.tool().connector);
 
         let started = gates.clock().now();
         let running = Instant::now();
@@ -386,6 +387,7 @@ impl RequestPath {
             "ran a tool call"
         );
         match finished.answer().clone() {
+            Answer::Ok(value) if results == Some(Results::ToolResults) => passed_on(value),
             Answer::Ok(value) => Reply::ToolOk(value),
             Answer::Error(message) => Reply::ToolError(message),
             Answer::Refused(sentence) => Reply::Denied(sentence),
@@ -394,8 +396,11 @@ impl RequestPath {
     }
 
     /// The resources the call names, from the adapter registered with the connector of the
-    /// approved tool the call names. Never chosen by anything else in the request. A name that
-    /// is not an approved tool names no resources; the decision denies it before it looks.
+    /// approved tool the call names. Never chosen by anything else in the request.
+    ///
+    /// For a name that is not an approved tool there is no adapter, so nobody can say what the
+    /// call names: [`Resources::Unknown`], which its row records as `unknown`. Recording none
+    /// would read as a call that named nothing. The decision denies the call before it looks.
     fn resources(
         &self,
         snapshot: &PolicySnapshot,
@@ -403,11 +408,13 @@ impl RequestPath {
         arguments: &Value,
     ) -> Resources {
         let gates = &self.inner.gates;
-        let approved = requested.name().ok().and_then(|name| snapshot.tool(&name));
-        let adapter =
-            approved.and_then(|tool| Some((tool, gates.resource_adapter(&tool.connector)?)));
-        match adapter {
-            Some((tool, adapter)) => adapter.resources(tool, arguments),
+        let Some(approved) = requested.name().ok().and_then(|name| snapshot.tool(&name)) else {
+            return Resources::Unknown;
+        };
+        match gates.resource_adapter(&approved.connector) {
+            Some(adapter) => adapter.resources(approved, arguments),
+            // Every connector is registered with an adapter, and the boot gates refuse an
+            // approved tool whose connector is not registered.
             None => Resources::Named(Vec::new()),
         }
     }
@@ -472,6 +479,22 @@ fn entry(tool: &ApprovedTool, definition: &ToolDefinition) -> ToolEntry {
         input_schema: definition.input_schema.clone(),
         read_only: tool.classification == Classification::Read,
     }
+}
+
+/// A proxied server's tool result as the caller gets it: the server's content blocks and
+/// structured content, as it sent them, not wrapped in another text block. The connector hands
+/// on only a result with a content list; anything else is logged and sent as a value, wrapped.
+fn passed_on(value: Value) -> Reply {
+    if let Value::Object(result) = &value
+        && let Some(Value::Array(content)) = result.get("content")
+    {
+        return Reply::ToolResult {
+            content: content.clone(),
+            structured_content: result.get("structuredContent").cloned(),
+        };
+    }
+    tracing::error!("a proxied server's tool result has no content list; it is sent as a value");
+    Reply::ToolOk(value)
 }
 
 /// How an answer is named in the log.

@@ -1283,12 +1283,12 @@ mutate("gw-tool-use-id-dropped", "the tool-use identifier never reaches the row"
        "tool_use_id: bounded_tool_use_id(tool_use_id),",
        "tool_use_id: bounded_tool_use_id(tool_use_id).filter(|_| false),")
 mutate("gw-resources-always-empty", "the resource adapter is ignored", GW_PATH,
-       "            Some((tool, adapter)) => adapter.resources(tool, arguments),",
+       "            Some(adapter) => adapter.resources(approved, arguments),",
        "            Some(_) => Resources::Named(Vec::new()),")
 mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the requested name", GW_PATH,
-       "gates.resource_adapter(&tool.connector)?",
-       "gates.resource_adapter(&gateway_core::ConnectorName::new(requested.as_str()))"
-       ".or(gates.resource_adapter(&tool.connector))?")
+       "match gates.resource_adapter(&approved.connector) {",
+       "match gates.resource_adapter(&gateway_core::ConnectorName::new(requested.as_str()))"
+       ".or(gates.resource_adapter(&approved.connector)) {")
 mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
        "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
        "        let Caller::Proved(principal) = caller else {\n"
@@ -2097,6 +2097,51 @@ mutate("demo-driver-kind-tag-not-from-id", "the run's tag is not taken from the 
        "  IMG_RUN=${IMG%:*}:${image_id:0:12}\n", "  IMG_RUN=$IMG\n")
 mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's ID", DRIVER,
        "    '' | *[!0-9a-f]*)\n", "    __never__)\n")
+
+
+# --- first slice: the demo's honesty review ----------------------------------------------------
+# Unknown resources for a tool the gateway does not know, the row check that tests what it
+# claims, the operator checks for both teams and the API server's routes, team-b's own
+# pre-policy probe, proxied results passed on as the server sent them, the given-up event and
+# the grace periods. pg-given-up-insert-not-logged is caught only against Postgres
+# (SWITCHBOARD_TEST_DATABASE_URL); the other pg-given-up-* ones need no server.
+
+mutate("gw-unknown-tool-resources-none", "a call to a tool the gateway does not know records no resources", GW + "path.rs",
+       "            return Resources::Unknown;\n", "            return Resources::Named(Vec::new());\n")
+mutate("gw-proxied-result-wrapped", "a proxied server's result is wrapped again as one JSON text block", GW + "path.rs",
+       "            Answer::Ok(value) if results == Some(Results::ToolResults) => passed_on(value),\n", "")
+mutate("gw-proxied-structured-content-dropped", "a proxied server's structured content is not passed on", GW + "path.rs",
+       '            structured_content: result.get("structuredContent").cloned(),', "            structured_content: None,")
+mutate("mcp-tool-result-legacy-structured-non-object", "a legacy pass-through result carries structuredContent that is not an object", MCP_REPLY,
+       "structured_content.filter(|value| era == Era::Modern || value.is_object());", "structured_content.filter(|_| true);")
+mutate("pg-given-up-finish-not-logged", "a finish given up at its deadline is only counted", PG_STORE,
+       '                event = GIVEN_UP_EVENT,\n                stage = "finish",', '                event = "not_the_event",\n                stage = "finish",')
+mutate("pg-given-up-finish-row-unnamed", "the given-up event does not name its row", PG_STORE,
+       '                stage = "finish",\n                row = row.as_str(),\n', '                stage = "finish",\n')
+mutate("pg-given-up-insert-not-logged", "an insert given up at the deadline is only counted", PG_STORE,
+       '                    event = GIVEN_UP_EVENT,\n                    stage = "begin",', '                    event = "not_the_event",\n                    stage = "begin",')
+mutate("demo-driver-unknown-row-as-none", "the row check takes none for the resources of a tool the gateway does not know", DRIVER,
+       '        elif .reason == "unknown_tool" then "unknown"\n', '        elif .reason == "unknown_tool" then []\n')
+mutate("demo-driver-row-check-counts-nothing", "the row check passes whatever rows were wrong", DRIVER,
+       '    check "$(count_lines . "$wrong")" 0 "audit: every row', '    check 0 0 "audit: every row')
+mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
+       '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
+mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
+       "  for team in team-a team-b; do\n    can_i_no", "  for team in team-a; do\n    can_i_no")
+mutate("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked", DRIVER,
+       "        for subresource in exec portforward proxy; do\n", "        for subresource in exec; do\n")
+mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", DRIVER,
+       '        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"\n', "")
+mutate("demo-driver-no-team-b-probe", "team-b has no pre-policy probe", DRIVER,
+       '  kind_workload "team-b before policy" team-b mock-workload before-policy\n', "")
+mutate("demo-workload-wrapped-result-passes", "a result wrapped again passes as the server's own", WORKLOAD,
+       '| objects | select(has("content"))]', '| objects | select(false)]')
+mutate("demo-kind-default-grace-period", "the kind gateway gets Kubernetes' default 30 s to stop", "deploy/kind/base/gateway.yaml",
+       "      terminationGracePeriodSeconds: 50\n", "      terminationGracePeriodSeconds: 30\n")
+mutate("demo-kind-slow-readiness-removal", "readiness removal takes longer than the grace period allows", "deploy/kind/base/gateway.yaml",
+       "            failureThreshold: 3\n", "            failureThreshold: 10\n")
+mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
+       "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
 
 
 # --- Running -------------------------------------------------------------------------------

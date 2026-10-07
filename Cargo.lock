@@ -49,6 +49,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -387,6 +389,8 @@ dependencies = [
 name = "demo-checks"
 version = "0.1.0"
 dependencies = [
+ "audit-postgres",
+ "connector-proxy",
  "gateway-core",
  "serde_json",
  "sha2 0.10.9",

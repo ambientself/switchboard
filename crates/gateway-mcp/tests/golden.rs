@@ -81,6 +81,10 @@ fn cases() -> Vec<(&'static str, HttpResponse)> {
         ("tool-ok-object-modern", reply(Modern, named(), Reply::ToolOk(json!({"document": "team-a-notes", "text": "Dummy notes."})))),
         ("tool-ok-string-legacy", reply(Legacy, one(), Reply::ToolOk(json!("plain")))),
         ("tool-ok-string-modern", reply(Modern, one(), Reply::ToolOk(json!("plain")))),
+        ("tool-result-legacy", reply(Legacy, one(), Reply::ToolResult { content: vec![json!({"type": "text", "text": "The atlas plan."})], structured_content: None })),
+        ("tool-result-structured-legacy", reply(Legacy, one(), Reply::ToolResult { content: vec![json!({"type": "text", "text": "{\"project\":\"atlas\"}"})], structured_content: Some(json!({"project": "atlas"})) })),
+        ("tool-result-structured-modern", reply(Modern, named(), Reply::ToolResult { content: vec![json!({"type": "text", "text": "{\"project\":\"atlas\"}"})], structured_content: Some(json!({"project": "atlas"})) })),
+        ("tool-result-non-object-legacy", reply(Legacy, one(), Reply::ToolResult { content: vec![json!({"type": "text", "text": "3"})], structured_content: Some(json!(3)) })),
         ("tool-error-legacy", reply(Legacy, one(), Reply::ToolError("The tool failed: dummy cause.".to_owned()))),
         ("tool-error-modern", reply(Modern, one(), Reply::ToolError("The tool failed: dummy cause.".to_owned()))),
         // Errors the gateway decides.

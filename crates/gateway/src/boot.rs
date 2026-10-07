@@ -208,6 +208,7 @@ impl Wiring {
             Registered {
                 connector,
                 resources,
+                results: Results::Values,
             },
         ));
         self
@@ -230,6 +231,17 @@ impl fmt::Debug for Wiring {
 struct Registered {
     connector: Arc<dyn Connector>,
     resources: Arc<dyn ResourceAdapter>,
+    results: Results,
+}
+
+/// What a connector's successful result is, which decides how it reaches the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Results {
+    /// Any JSON value. The caller gets it as text holding the JSON, and as structured content.
+    Values,
+    /// A proxied MCP server's tool result. The caller gets its content and structured content
+    /// as the server sent them.
+    ToolResults,
 }
 
 /// A configuration that passed every boot gate, with what serving it needs.
@@ -333,6 +345,13 @@ impl Gates {
         self.connectors
             .get(name)
             .map(|registered| &registered.resources)
+    }
+
+    /// What the connector `name`'s successful results are.
+    pub(crate) fn results(&self, name: &ConnectorName) -> Option<Results> {
+        self.connectors
+            .get(name)
+            .map(|registered| registered.results)
     }
 }
 
@@ -448,6 +467,7 @@ pub fn check_registry(
         let registered = Registered {
             connector: Arc::new(CheckedArguments::new(connector, live.clone())),
             resources: Arc::new(RegistryResources::new(live.clone())),
+            results: Results::ToolResults,
         };
         if connectors.insert(name.clone(), registered).is_some() {
             return Err(BootError::DuplicateConnector(name));

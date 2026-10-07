@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{Run, repo, require, scratch, write};
+use serde_json::{Value, json};
 
 /// A directory of fake tools. Each appends one line per call to `calls.log`:
 /// `<tool> KUBECONFIG=<value> <args...>`. `kind get clusters` lists switchboard-demo, `docker
@@ -418,4 +419,232 @@ fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
         "{}",
         run.transcript()
     );
+}
+
+/// A row as `row_resources_json` reads it.
+fn row(
+    team: &str,
+    decision: &str,
+    reason: Option<&str>,
+    sentence: &str,
+    resources: Value,
+) -> Value {
+    json!({
+        "team": team, "tool": "docs__read_document", "decision": decision, "reason": reason,
+        "sentence": if sentence.is_empty() { Value::Null } else { json!(sentence) },
+        "resources": resources,
+    })
+}
+
+fn project(name: &str) -> Value {
+    json!([{"system": "docs", "kind": "project", "identifier": name}])
+}
+
+/// The rows a run of the demo writes, each recording what its call named.
+fn demo_rows() -> Vec<Value> {
+    let none_named = "Tool `docs__read_document` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for.";
+    let outside = |name: &str| {
+        format!(
+            "Tool `docs__read_document` names docs project `{name}`, which is outside what workload `w` may reach. Name only resources within that limit."
+        )
+    };
+    vec![
+        row("team-a", "allow", None, "", project("atlas")),
+        row(
+            "team-a",
+            "deny",
+            Some("resource_outside_limit"),
+            &outside("borealis"),
+            project("borealis"),
+        ),
+        row(
+            "team-a",
+            "deny",
+            Some("resource_outside_limit"),
+            none_named,
+            json!([]),
+        ),
+        row("team-b", "allow", None, "", project("borealis")),
+        row(
+            "team-b",
+            "deny",
+            Some("resource_outside_limit"),
+            &outside("atlas"),
+            project("atlas"),
+        ),
+        row(
+            "team-b",
+            "deny",
+            Some("resource_outside_limit"),
+            none_named,
+            json!([]),
+        ),
+        // The call to the withdrawn tool, which the gateway no longer knows.
+        row(
+            "team-a",
+            "deny",
+            Some("unknown_tool"),
+            "Tool `docs__read_document` is not available on surface `docs`.",
+            json!("unknown"),
+        ),
+    ]
+}
+
+/// Runs check_row_resources on `rows`, given as the text psql would print.
+fn check_rows(name: &str, rows: &str) -> Run {
+    require(&["jq"]);
+    let file = write(&scratch(name), "rows.json", rows);
+    sourced(&format!(
+        "check_row_resources \"$(cat '{}')\"\nFINISHED=1\nresult 0",
+        file.display()
+    ))
+}
+
+const ROWS_CHECK: &str = "audit: every row records the resources its call named";
+
+#[test]
+fn each_row_must_record_what_its_call_named() {
+    let run = check_rows("rows-good", &Value::from(demo_rows()).to_string());
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout.contains(&format!("PASS {ROWS_CHECK} (7 rows)")),
+        "{}",
+        run.transcript()
+    );
+
+    let wrong = |position: usize, resources: Value| {
+        let mut rows = demo_rows();
+        rows[position]["resources"] = resources;
+        Value::from(rows).to_string()
+    };
+    for (case, rows) in [
+        // The unknown tool's call named a project; recording none says it named nothing.
+        ("unknown-as-none", wrong(6, json!([]))),
+        ("allow-names-other", wrong(0, project("borealis"))),
+        ("deny-names-own", wrong(1, project("atlas"))),
+        ("none-named-names-one", wrong(2, project("atlas"))),
+        ("named-as-unknown", wrong(3, json!("unknown"))),
+    ] {
+        let run = check_rows(case, &rows);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(ROWS_CHECK), "{case}: {}", run.transcript());
+        assert!(
+            run.stdout.contains("    wrong: "),
+            "{case}: {}",
+            run.transcript()
+        );
+    }
+
+    // A row no call of the demo makes cannot be judged, and fails.
+    let mut rows = demo_rows();
+    rows.push(row(
+        "team-a",
+        "deny",
+        Some("classification_not_permitted"),
+        "x",
+        json!([]),
+    ));
+    let run = check_rows("rows-unexpected", &Value::from(rows).to_string());
+    assert!(run.failed(ROWS_CHECK), "{}", run.transcript());
+
+    // No rows, or no JSON, checks nothing and fails.
+    for (case, rows) in [
+        ("rows-empty", "[]"),
+        ("rows-none", ""),
+        ("rows-not-json", "(0 rows)"),
+    ] {
+        let run = check_rows(case, rows);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(ROWS_CHECK), "{case}: {}", run.transcript());
+    }
+}
+
+/// Runs `body` with `k` answering every call with `answer`. Returns the run and each call made.
+fn with_can_i(name: &str, answer: &str, body: &str) -> (Run, Vec<String>) {
+    let calls = scratch(name).join("calls.log");
+    let run = sourced(&format!(
+        "k() {{ echo \"k $*\" >> '{}'; echo {answer}; }}\n{body}\nFINISHED=1\nresult 0",
+        calls.display()
+    ));
+    let calls = std::fs::read_to_string(&calls)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (run, calls)
+}
+
+#[test]
+fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy() {
+    let (run, calls) = with_can_i("can-i-no", "no", "operator_checks");
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let called = |call: &str| calls.iter().any(|line| line == call);
+    let passed = |check: &str| run.stdout.lines().any(|line| line == check);
+    for team in ["team-a", "team-b"] {
+        let account = format!("--as=system:serviceaccount:{team}:mock-workload");
+        for ns in ["mock-docs", "switchboard"] {
+            for verb in ["create", "get"] {
+                for route in [
+                    "pods --subresource=exec",
+                    "pods --subresource=portforward",
+                    "pods --subresource=proxy",
+                    "services --subresource=proxy",
+                ] {
+                    let call = format!("k auth can-i {verb} {route} -n {ns} {account}");
+                    assert!(called(&call), "{call}\n{}", run.transcript());
+                    let check = format!("PASS {team}'s workload may not: {verb} {route} -n {ns}");
+                    assert!(passed(&check), "{check}\n{}", run.transcript());
+                }
+            }
+        }
+        for rest in [
+            "get secrets -n switchboard".to_owned(),
+            "get secrets -n mock-docs".to_owned(),
+            "get configmaps -n switchboard".to_owned(),
+            format!("create pods -n {team}"),
+            "create serviceaccounts --subresource=token -n switchboard".to_owned(),
+        ] {
+            let call = format!("k auth can-i {rest} {account}");
+            assert!(called(&call), "{call}\n{}", run.transcript());
+        }
+    }
+
+    // A yes, or no answer at all, fails the check.
+    for answer in ["yes", "''"] {
+        let (run, _) = with_can_i("can-i-answer", answer, "operator_checks");
+        assert_eq!(run.status, Some(1), "{answer}: {}", run.transcript());
+        assert!(
+            run.failed(
+                "team-b's workload may not: create services --subresource=proxy -n mock-docs"
+            ),
+            "{answer}: {}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn each_team_has_its_own_direct_call_before_the_policy() {
+    let run = sourced(
+        "kind_workload() { echo \"workload label=[$1] namespace=$2 cronjob=$3 mode=$4\"; }\nbefore_policy_probes",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.lines("workload "),
+        [
+            "workload label=[team-a before policy] namespace=team-a cronjob=mock-workload mode=before-policy",
+            "workload label=[team-b before policy] namespace=team-b cronjob=mock-workload mode=before-policy",
+        ],
+        "{}",
+        run.transcript()
+    );
+    // The kind run makes them before it applies the network policy.
+    let driver = common::read("deploy/demo/demo.sh");
+    let probes = driver
+        .find("\n  before_policy_probes\n")
+        .expect("kind_run makes the probes");
+    let policy = driver
+        .find("\n  k apply -k \"$ROOT/deploy/kind/policy\"\n")
+        .expect("kind_run applies the policy");
+    assert!(probes < policy);
 }

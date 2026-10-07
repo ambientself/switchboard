@@ -11,9 +11,10 @@
 //!   tool result marked `isError`.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
-//! Text from the server reaches the caller only from a JSON-RPC error's message and from a
-//! failed tool result's text, each cut to [`MAX_MESSAGE_CHARS`] with control characters
-//! replaced by spaces.
+//! A successful result is bounded only by the answer cap; the gateway passes its content and
+//! structured content on to the caller as the server sent them. From a failure, text from the
+//! server reaches the caller only from a JSON-RPC error's message and from a failed tool
+//! result's text, each cut to [`MAX_MESSAGE_CHARS`] with control characters replaced by spaces.
 
 use gateway_core::ToolOutcome;
 use serde_json::{Map, Value};

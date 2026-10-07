@@ -20,6 +20,13 @@ spec:
         app: gateway
     spec:
       serviceAccountName: gateway
+      # Decision 0009, Shutdown: the grace period must outlast the readiness-removal delay plus
+      # the 2 s begin budget, the 5 s call deadline and the 30 s finish deadline. Otherwise a
+      # stop can kill the gateway while it is still completing rows, and they stay open. The
+      # readiness probe below takes up to 6 s to notice (3 failures, 2 s apart), so that is
+      # 43 s. Kubernetes' default of 30 s is too short; 50 s leaves a margin.
+      # crates/demo-checks holds this to the code's values.
+      terminationGracePeriodSeconds: 50
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -66,6 +73,7 @@ spec:
             tcpSocket:
               port: http
             periodSeconds: 2
+            failureThreshold: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

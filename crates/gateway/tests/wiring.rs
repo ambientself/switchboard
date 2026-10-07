@@ -127,9 +127,20 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
         "{}",
         read.body
     );
-    assert!(
-        text(&read.body).contains("The atlas plan."),
+    // The server's own content, as it sent it: one text block, not its whole result wrapped in
+    // another as JSON text.
+    assert_eq!(
+        read.body["result"]["content"],
+        json!([{
+            "type": "text",
+            "text": "The atlas plan. This text belongs to project atlas and to no other."
+        }]),
         "{}",
+        read.body
+    );
+    assert!(
+        read.body["result"].get("structuredContent").is_none(),
+        "the server gave no structured content: {}",
         read.body
     );
     let listing = call(&path, &team_a, LIST_TOOL, json!({"project": "atlas"})).await;
@@ -138,6 +149,34 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
         json!(false),
         "{}",
         listing.body
+    );
+    let structured = &listing.body["result"]["structuredContent"];
+    assert_eq!(structured["project"], json!("atlas"), "{}", listing.body);
+    assert_eq!(
+        listing.body["result"]["content"],
+        json!([{"type": "text", "text": structured.to_string()}]),
+        "{}",
+        listing.body
+    );
+    // A tool error is passed on as one: isError, with the server's text.
+    let missing = call(
+        &path,
+        &team_a,
+        READ_TOOL,
+        json!({"project": "atlas", "document": "no-such-document"}),
+    )
+    .await;
+    assert_eq!(
+        missing.body["result"],
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "There is no document `no-such-document` in project `atlas`."
+            }],
+            "isError": true
+        }),
+        "{}",
+        missing.body
     );
 
     let team_b = token(TEAM_B_SA);
@@ -156,7 +195,7 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
 
     // Every request the server saw carried the gateway's credential, and no caller's token.
     let bearers = world.bearers();
-    assert_eq!(bearers.len(), 3, "{bearers:?}");
+    assert_eq!(bearers.len(), 4, "{bearers:?}");
     assert!(
         bearers
             .iter()
