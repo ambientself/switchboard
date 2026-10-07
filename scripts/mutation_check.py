@@ -1185,7 +1185,7 @@ mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget"
 mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
        "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
 mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
-       "    drop(Object::take(client));", "    drop(client);")
+       "    drop(Object::take(client));\n}\n", "    drop(client);\n}\n")
 # The same two, at finish's call alone: begin's tests do not reach it.
 mutate("pg-finish-timeout-not-cancelled", "a finish attempt that ran out of time is left running", PG_STORE,
        "                abandon(client, &self.cancel);\n                Err(PgAuditError::AttemptTimedOut)",
@@ -1193,7 +1193,7 @@ mutate("pg-finish-timeout-not-cancelled", "a finish attempt that ran out of time
 mutate("pg-finish-timeout-connection-kept", "a finish connection that ran out of time goes back to its pool", PG_STORE,
        "                abandon(client, &self.cancel);\n                Err(PgAuditError::AttemptTimedOut)",
        "                drop(client);\n                Err(PgAuditError::AttemptTimedOut)")
-mutate("pg-finish-waits-past-answer-budget","finish holds the answer until its deadline", PG_STORE,
+mutate("pg-finish-waits-past-answer-budget", "finish holds the answer until its deadline", PG_STORE,
        "let answer_by = started + self.budgets.answer;", "let answer_by = started + self.budgets.finish_deadline;")
 mutate("pg-finish-stops-at-answer-budget", "finish stops trying when the answer goes out", PG_STORE,
        "            deadline: started + self.budgets.finish_deadline,", "            deadline: started + self.budgets.answer,")
@@ -1223,7 +1223,7 @@ mutate("pg-retry-lock-timeout-final", "a lock not had within lock_timeout is not
 mutate("pg-retry-failed-connection-kept", "a connection whose attempt failed is used again", PG_STORE,
        "                drop(Object::take(client));\n                Err(error)",
        "                drop(client);\n                Err(error)")
-mutate("pg-retry-closed-connection-final","a connection found closed is not retried", PG_STORE,
+mutate("pg-retry-closed-connection-final", "a connection found closed is not retried", PG_STORE,
        "                    error.is_closed()\n", "                    false\n")
 mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not retried", PG_STORE,
        "                        || std::error::Error::source(error)\n"
