@@ -1298,6 +1298,185 @@ mutate("dev-client-bin-unexpected-exits-0", "switchboard-client exits 0 when an 
        "    } else {\n        ExitCode::from(1)\n    }", "    } else {\n        ExitCode::SUCCESS\n    }")
 
 
+# --- mock-docs-server ------------------------------------------------------------------------
+
+MOCK = "crates/mock-docs-server/"
+MS = MOCK + "src/server.rs"
+MC = MOCK + "src/config.rs"
+MD = MOCK + "src/documents.rs"
+mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
+       "                accepted: self.inner.accepted.accepts(token),", "                accepted: true,")
+mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
+       "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
+       "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
+mutate("mock-credential-compares-one-byte", "only the first byte of the digest is compared", MC,
+       "            .zip(self.digest.iter())\n", "            .zip(self.digest.iter())\n            .take(1)\n")
+mutate("mock-scheme-ignored", "any scheme carries the token", MS,
+       '    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())', "    (!scheme.is_empty() && !token.is_empty())")
+mutate("mock-post-refusal-skipped", "POST /mcp answers a caller it did not accept", MS,
+       '    let mut line = request_line("request", &method, &uri, &caller);\n    if !caller.accepted {',
+       '    let mut line = request_line("request", &method, &uri, &caller);\n    if false {')
+mutate("mock-other-refusal-skipped", "other methods and paths answer a caller they did not accept", MS,
+       '        .write(request_line("request", &method, &uri, &caller));\n    if !caller.accepted {',
+       '        .write(request_line("request", &method, &uri, &caller));\n    if false {')
+mutate("mock-admin-get-refusal-skipped", "the admin tool list answers a caller it did not accept", MS,
+       '        .write(request_line("admin", &method, &uri, &caller));\n    if !caller.accepted {',
+       '        .write(request_line("admin", &method, &uri, &caller));\n    if false {')
+mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools for a caller it did not accept", MS,
+       '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
+       '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
+mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
+       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(self.inner.accepted.logged_prefix()),")
+mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
+mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
+       "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
+mutate("mock-documents-keyed-by-name", "a document is found by its name alone, in any project", MD,
+       "        self.0.get(&(project.to_owned(), document.to_owned()))",
+       "        let _ = project;\n        self.0.iter().find(|((_, name), _)| name == document).map(|(_, content)| content)")
+mutate("mock-list-ignores-project", "listing a project lists every project's documents", MD,
+       "            .filter(|(owner, _)| owner == project)", "            .filter(|(owner, _)| !owner.is_empty() || project.is_empty())")
+mutate("mock-withdrawn-tool-callable", "a tool not offered can still be called", MS,
+       "            .filter(|tool| self.offers(*tool))\n", "")
+mutate("mock-extra-argument-accepted", "an argument the tool does not declare is accepted", MS,
+       "        .find(|key| !tool.arguments().contains(&key.as_str()))", "        .find(|key| key.is_empty())")
+mutate("mock-slow-doc-not-slow", "slow-doc answers at once", MS, "                tokio::time::sleep(self.inner.slow).await;\n", "")
+mutate("mock-hang-doc-answers", "hang-doc answers", MS,
+       "            Some(Content::Hang) => std::future::pending().await,", "            Some(Content::Hang) => Ok(text_result(String::new())),")
+mutate("mock-hang-doc-is-slow", "hang-doc answers after slow-doc's delay", MS,
+       "            Some(Content::Hang) => std::future::pending().await,",
+       "            Some(Content::Hang) => {\n                tokio::time::sleep(self.inner.slow).await;\n                Ok(text_result(String::new()))\n            }")
+mutate("mock-fail-doc-succeeds", "fail-doc answers with a result", MS,
+       "            Some(Content::Fail) => Err(RpcError::new(", "            Some(Content::Fail) => Ok(text_result(String::new())).map_err(|_: RpcError| RpcError::new(")
+mutate("mock-huge-doc-half-size", "huge-doc answers with half a mebibyte", MS, '"x".repeat(HUGE_BYTES)', '"x".repeat(HUGE_BYTES / 2)')
+mutate("mock-two-credentials-take-the-file", "with both credential variables set, the file wins", MC,
+       "            (Some(path), None) => read_token_file", "            (Some(path), _) => read_token_file")
+mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part of the token", MC,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
+       "        if tools.contains(&tool) {", "        if false {")
+mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
+       "                if tools.contains(&tool) {", "                if false {")
+# Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
+mutate_all(
+    "mock-dependency-added",
+    "the mock server gains a dependency outside the allowlist",
+    (MOCK + "Cargo.toml", 'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\n',
+     'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n'),
+    (MOCK + "Cargo.toml", '[dev-dependencies]\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n', "[dev-dependencies]\n"),
+)
+
+
+# --- connector-proxy -------------------------------------------------------------------------
+
+PROXY = "crates/connector-proxy/"
+PC = PROXY + "src/connector.rs"
+PO = PROXY + "src/outcome.rs"
+PK = PROXY + "src/credentials.rs"
+# The bounds.
+mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
+       "        match tokio::time::timeout(self.deadline, self.exchange(request)).await {",
+       "        match Ok::<_, ()>(self.exchange(request).await) {")
+mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
+       "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
+mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
+mutate("proxy-streamed-size-unchecked", "a body without a declared length is read whatever its size", PC,
+       "                if received.len() + data.len() > self.max_response_bytes {", "                if false {")
+mutate("proxy-streamed-size-off-by-one", "a streamed body of exactly the cap is discarded", PC,
+       "                if received.len() + data.len() > self.max_response_bytes {",
+       "                if received.len() + data.len() >= self.max_response_bytes {")
+mutate("proxy-declared-length-ignored", "a declared length over the cap is not refused before reading", PC,
+       "            .is_some_and(|length| length > self.max_response_bytes as u64)", "            .is_some_and(|_| false)")
+mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap is refused", PC,
+       "            .is_some_and(|length| length > self.max_response_bytes as u64)",
+       "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
+mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
+       "            let frame = frame.map_err(|_| ToolOutcome::Error(outcome::BROKEN_OFF.to_owned()))?;",
+       "            let Ok(frame) = frame else { break };")
+# What is sent, and to whom.
+mutate("proxy-credential-not-sent", "the request carries no credential", PC,
+       "            .header(AUTHORIZATION, authorization)\n", "")
+mutate("proxy-connector-unchecked", "a tool routed to another connector is forwarded", PC,
+       "        if tool.connector != self.connector {", "        if false {")
+mutate("proxy-unmapped-tool-sent-as-is", "a tool with no upstream name is sent under its exposed name", PC,
+       "        let Some(upstream_name) = self.tools.get(&tool.name) else {\n"
+       "            return ToolOutcome::Refused(outcome::NOT_SERVED.to_owned());\n        };",
+       "        let upstream_name = self.tools.get(&tool.name).map_or(tool.name.as_str(), String::as_str);")
+mutate("proxy-exposed-name-sent", "the exposed name is sent instead of the upstream name", PC,
+       "self.request(id, upstream_name, arguments, secret)", "self.request(id, tool.name.as_str(), arguments, secret)")
+mutate("proxy-arguments-unchecked", "arguments that are not an object are sent as an empty object", PC,
+       "        let Value::Object(arguments) = call.arguments() else {\n"
+       "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
+       "        let empty = Map::new();\n        let arguments = match call.arguments() {\n"
+       "            Value::Object(arguments) => arguments,\n            _ => &empty,\n        };")
+# Statuses.
+mutate("proxy-401-not-named", "a rejected credential is reported as a bare status", PC,
+       "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
+mutate("proxy-403-is-an-error", "the server's refusal is recorded as an error", PC,
+       "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));",
+       "            return Err(ToolOutcome::Error(outcome::UPSTREAM_REFUSED.to_owned()));")
+mutate("proxy-any-status-read", "a body is read whatever the status", PC,
+       "        if status != StatusCode::OK {", "        if false {")
+# Reading the answer.
+mutate("proxy-media-type-unchecked", "an answer of any media type is read as JSON", PO,
+       "    if !content_type.is_some_and(is_json) {", "    if false {")
+mutate("proxy-version-unchecked", "an answer without jsonrpc 2.0 is accepted", PO,
+       '    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")\n',
+       '    if message.get("jsonrpc").and_then(Value::as_str) == Some("never")\n')
+mutate("proxy-id-unchecked", "an answer to another request is accepted", PO,
+       '        || message.get("id").and_then(Value::as_u64) != Some(id)\n', "")
+mutate("proxy-result-and-error-accepted", "an answer with a result and an error is read as a result", PO,
+       "        (Some(Value::Object(result)), None) => tool_result(result),",
+       "        (Some(Value::Object(result)), _) => tool_result(result),")
+mutate("proxy-content-unchecked", "a result without content is accepted", PO,
+       '    let Some(Value::Array(content)) = result.get("content") else {\n'
+       "        return ToolOutcome::Error(NOT_MCP.to_owned());\n    };",
+       "    let empty = Vec::new();\n"
+       '    let content = match result.get("content") {\n        Some(Value::Array(content)) => content,\n        _ => &empty,\n    };')
+mutate("proxy-tool-error-is-ok", "a tool result marked isError is passed on as success", PO,
+       '    if result.get("isError") != Some(&Value::Bool(true)) {', "    if true {")
+mutate("proxy-server-text-uncut", "the server's text reaches the caller at any length", PO,
+       "        .take(MAX_MESSAGE_CHARS)\n", "")
+mutate("proxy-server-control-characters-kept", "the server's control characters reach the caller", PO,
+       "        .map(|c| if c.is_control() { ' ' } else { c })\n", "")
+# Configuration.
+mutate("proxy-https-accepted", "a URL of any scheme is accepted", PC,
+       '    let acceptable = endpoint.scheme_str() == Some("http")\n', "    let acceptable = endpoint.scheme_str().is_some()\n")
+mutate("proxy-user-information-accepted", "a URL carrying a user name or password is accepted", PC,
+       "        && !authority.as_str().contains('@');", ";")
+mutate("proxy-no-tools-accepted", "a server exposing no tools is accepted", PC, "        if tools.is_empty() {", "        if false {")
+mutate("proxy-empty-upstream-name-accepted", "an empty upstream name is accepted", PC,
+       ".find(|(_, upstream)| upstream.is_empty())", ".find(|_| false)")
+mutate("proxy-zero-deadline-accepted", "a zero deadline is accepted", PC, "        if deadline.is_zero() {", "        if false {")
+mutate("proxy-zero-cap-accepted", "a zero cap is accepted", PC, "        if max_response_bytes == 0 {", "        if false {")
+mutate("proxy-missing-credential-accepted", "a connector with no credential is built", PC,
+       "        if !credentials.connectors().any(|held| *held == connector) {", "        if false {")
+# The credential source.
+mutate("proxy-credential-not-trimmed", "the credential file's trailing newline is part of the token", PK,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("proxy-empty-credential-accepted", "an empty credential file is accepted", PK, "    if token.is_empty() {", "    if false {")
+mutate("proxy-credential-any-bytes", "a credential with spaces or control characters is accepted", PK,
+       "    if !token.bytes().all(is_token_byte) {", "    if false {")
+mutate("proxy-credential-size-unbounded", "a credential file of any size is read", PK,
+       "    if length > MAX_CREDENTIAL_BYTES {", "    if false {")
+mutate("proxy-credential-size-off-by-one", "a credential file of exactly the limit is refused", PK,
+       "    if length > MAX_CREDENTIAL_BYTES {", "    if length >= MAX_CREDENTIAL_BYTES {")
+mutate("proxy-duplicate-credential-accepted", "two files for one connector are accepted", PK,
+       "            if entries.contains_key(&connector) {", "            if false {")
+mutate("proxy-credential-for-any-connector", "a credential is issued for a connector that has none", PK,
+       "        match self.entries.get(connector) {", "        match self.entries.values().next() {")
+mutate("proxy-debug-shows-secret", "the source's debug output shows the secret", PK,
+       "                    .map(|(connector, stored)| (connector, &stored.label)),",
+       "                    .map(|(connector, stored)| (connector, &stored.secret.0)),")
+# Moving a dev-dependency into the connector's own dependencies leaves Cargo.lock as it is.
+mutate_all(
+    "proxy-dependency-added",
+    "the connector links the test fakes",
+    (PROXY + "Cargo.toml", 'tokio = { version = "1", features = ["time"] }\n',
+     'tokio = { version = "1", features = ["time"] }\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    (PROXY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+)
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
