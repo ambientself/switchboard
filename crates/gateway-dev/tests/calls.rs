@@ -11,15 +11,15 @@ mod support;
 
 use std::time::Duration;
 
-use gateway_core::audit::{DecisionKind, Outcome};
+use gateway_core::audit::{DecisionKind, Outcome, RecordedResource, RecordedResources};
 use gateway_core::{ReasonKind, ToolUseId};
 use gateway_dev::{FixtureGateway, start_fixture_gateway};
 use gateway_mcp::{Era, TOOL_USE_ID_META};
 use gateway_testkit::{
     AUDIENCE, Caller, DRAFT_ARGUMENT, DRAFT_REFUSAL, DRAFT_TOOL, FORBIDDEN_DOCUMENT, FOREIGN_DRAFT,
-    GROUP_G, GROUP_G_DOCUMENT, GROUP_REVIEW, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL,
-    SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B, TEAM_B_DOCUMENT, USER_SUBJECT,
-    WRITE_TOOL,
+    GROUP_G, GROUP_G_DOCUMENT, GROUP_REVIEW, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM,
+    SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B,
+    TEAM_B_DOCUMENT, USER_SUBJECT, WRITE_TOOL,
 };
 use serde_json::{Value, json};
 use support::{
@@ -746,6 +746,34 @@ async fn each_team_reads_its_own_document_with_its_own_credential_and_is_denied_
             TEAM_B_DOCUMENT
         };
         assert_eq!(call.arguments, document(expected));
+    }
+    // Each row records the document its call named, the allowed and the denied alike.
+    let rows = gateway.store().rows();
+    assert_eq!(rows.len(), 8);
+    for (n, row) in rows.iter().enumerate() {
+        let (own, other) = if n < 4 {
+            (TEAM_A_DOCUMENT, TEAM_B_DOCUMENT)
+        } else {
+            (TEAM_B_DOCUMENT, TEAM_A_DOCUMENT)
+        };
+        let (decision, named) = if n % 2 == 0 {
+            (DecisionKind::Allow, own)
+        } else {
+            (DecisionKind::Deny, other)
+        };
+        assert_eq!(row.decision, decision, "row {n}");
+        assert_eq!(
+            (&row.resources, row.resources_omitted),
+            (
+                &RecordedResources::Named(vec![RecordedResource {
+                    system: RESOURCE_SYSTEM.to_owned(),
+                    kind: RESOURCE_KIND.to_owned(),
+                    identifier: named.to_owned(),
+                }]),
+                0
+            ),
+            "row {n}"
+        );
     }
 }
 
