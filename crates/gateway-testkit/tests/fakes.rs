@@ -7,10 +7,13 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
-use gateway_core::audit::{self, Answer, Begun, Completion, Outcome, RequestMetadata};
+use gateway_core::audit::{
+    self, Answer, AuditRowId, Begun, Completion, Outcome, RequestMetadata, RowCompletion,
+    StoreError,
+};
 use gateway_core::{
-    AuditGuard, CallContext, ConnectorName, CredentialError, CredentialHandle, CredentialSource,
-    Principal, Proved, RequestedTool, Resources, decide,
+    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, ConnectorName, CredentialError,
+    CredentialHandle, CredentialSource, Principal, Proved, RequestedTool, Resources, decide,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
@@ -410,6 +413,86 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
     gate.open();
     assert!(matches!(poll_once(begin.as_mut()), Poll::Ready(Err(_))));
     assert!(store.rows().is_empty());
+}
+
+/// A store in front of the in-memory one that names every row it begins `"0"`. Finishing the
+/// second call therefore hands the in-memory store a completion for a row that is already
+/// finished, which the core's own path never does.
+struct EveryRowIsRowZero<'a>(&'a InMemoryAuditStore);
+
+impl AuditStore for EveryRowIsRowZero<'_> {
+    fn begin<'a>(
+        &'a self,
+        record: &'a AuditRecord,
+    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
+        Box::pin(async move {
+            self.0.begin(record).await?;
+            Ok(AuditRowId::new("0"))
+        })
+    }
+
+    fn finish<'a>(
+        &'a self,
+        completion: &'a RowCompletion,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.0.finish(completion)
+    }
+}
+
+#[test]
+fn a_row_that_is_already_finished_cannot_be_finished_again() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let forwarding = EveryRowIsRowZero(&store);
+    let guard = |n: u32| {
+        let arguments = json!({"document": "team-a-notes", "n": n});
+        let call = CallContext {
+            caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
+            tool: RequestedTool::new(READ_TOOL),
+            resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
+        };
+        let decision = decide(&fixture.policy, &call);
+        match block_on(audit::begin(
+            &forwarding,
+            decision,
+            arguments,
+            RequestMetadata::default(),
+        ))
+        .unwrap()
+        {
+            Begun::Allowed(guard) => guard,
+            Begun::Denied(refusal) => panic!("{refusal:?}"),
+        }
+    };
+    let (first, second) = (guard(1), guard(2));
+    assert_eq!(store.rows().len(), 2);
+
+    let finished = block_on(audit::finish(
+        &forwarding,
+        block_on(audit::run(&connector, first)),
+        5,
+    ));
+    assert!(finished.failure().is_none());
+    // The second call's completion is for row 0 too, with another latency.
+    let finished = block_on(audit::finish(
+        &forwarding,
+        block_on(audit::run(&connector, second)),
+        9,
+    ));
+    assert!(
+        finished.failure().is_some(),
+        "a second completion for one row was accepted"
+    );
+    assert_eq!(
+        store.rows()[0].completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 5
+        }),
+        "the row kept its first completion"
+    );
+    assert_eq!(store.rows()[1].completion, None);
+    assert_eq!(store.finish_attempts(), 2);
 }
 
 // --- The credential source ------------------------------------------------------------------
