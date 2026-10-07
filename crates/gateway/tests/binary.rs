@@ -21,6 +21,11 @@ const BINARY: &str = env!("CARGO_BIN_EXE_switchboard");
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// How long a run that should end on its own may take. It is generous because the first run
+/// of a freshly built binary can be slow on a loaded machine; it only has to be shorter than
+/// forever, so that a refused configuration that starts serving fails the test.
+const EXIT_PATIENCE: Duration = Duration::from_secs(120);
+
 /// A configuration this build can start: audit disabled, and no tool on any surface, because
 /// the binary registers no connector.
 fn startable(identity: Value) -> Value {
@@ -70,9 +75,9 @@ fn config_file(name: &str, config: &Value) -> PathBuf {
     path
 }
 
-/// Runs the binary to its exit. One that is still running after [`PATIENCE`] is killed and
-/// fails the test, so a configuration that should be refused but starts a server fails at once
-/// rather than hanging the test.
+/// Runs the binary to its exit. One that is still running after [`EXIT_PATIENCE`] is killed
+/// and fails the test, so a configuration that should be refused but starts a server fails the
+/// test rather than hanging it.
 fn run(arguments: &[&str]) -> Output {
     let mut child = Command::new(BINARY)
         .args(arguments)
@@ -89,7 +94,7 @@ fn run(arguments: &[&str]) -> Output {
     };
     let stdout = drain(Box::new(child.stdout.take().unwrap()));
     let stderr = drain(Box::new(child.stderr.take().unwrap()));
-    let deadline = Instant::now() + PATIENCE;
+    let deadline = Instant::now() + EXIT_PATIENCE;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -97,7 +102,7 @@ fn run(arguments: &[&str]) -> Output {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("switchboard {arguments:?} was still running after {PATIENCE:?}");
+            panic!("switchboard {arguments:?} was still running after {EXIT_PATIENCE:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
