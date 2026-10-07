@@ -26,7 +26,7 @@ use gateway_core::audit::{self, Begun, RecordedResources};
 
 use common::tool_name;
 use proptest::prelude::*;
-use proptest::sample::{select, subsequence};
+use proptest::sample::{Index, select, subsequence};
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
@@ -600,6 +600,62 @@ fn any_named_resource() -> impl Strategy<Value = Resource> {
     prop_oneof![select(resource_pool()), arbitrary]
 }
 
+/// Resources the generated limits never hold. [`widened`] adds all of them to every team's and
+/// group's limit, so that a call can name more distinct permitted resources than a row
+/// records.
+fn wide_pool() -> Vec<Resource> {
+    (0..100)
+        .map(|n| Resource {
+            system: "github".into(),
+            kind: "repository".into(),
+            identifier: format!("wide/{n}"),
+        })
+        .collect()
+}
+
+/// `world`, with every resource in [`wide_pool`] in every team's and group's limit.
+fn widened(mut world: World) -> World {
+    let limits = &mut world.data.limits;
+    for team in TEAMS {
+        let limit = limits.teams.entry(team.into()).or_default();
+        limit.extend(wide_pool());
+    }
+    for group in GROUPS {
+        let limit = limits.groups.entry(group.into()).or_default();
+        limit.extend(wide_pool());
+    }
+    world
+}
+
+/// The resources a call names: up to 249 drawn from [`wide_pool`], so that repeats are common
+/// and a call often names more distinct ones than a row records, with up to three from
+/// [`any_named_resource`] put in anywhere among them. Those are usually outside the limit, so
+/// a resource denial falls at any position, past the most a row records included.
+fn any_named_resources() -> impl Strategy<Value = Vec<Resource>> {
+    (
+        proptest::collection::vec(select(wide_pool()), 0..250),
+        proptest::collection::vec((any::<Index>(), any_named_resource()), 0..4),
+    )
+        .prop_map(|(mut named, others)| {
+            for (at, resource) in others {
+                let at = at.index(named.len() + 1);
+                named.insert(at, resource);
+            }
+            named
+        })
+}
+
+/// Each resource in `named` once, in the order first named.
+fn distinct(named: &[Resource]) -> Vec<&Resource> {
+    let mut distinct: Vec<&Resource> = Vec::new();
+    for resource in named {
+        if !distinct.contains(&resource) {
+            distinct.push(resource);
+        }
+    }
+    distinct
+}
+
 /// Writes the row for `call` in `world`, and returns it with the resource a resource denial
 /// named, if there was one.
 fn row_and_denied(world: &World, call: &CallContext) -> (AuditRecord, Option<Resource>) {
@@ -628,22 +684,19 @@ proptest! {
     /// first named, up to the most a row holds, with the one a resource denial names always
     /// among them and the rest counted. Each recorded value reads back as the value named, or
     /// as the longest beginning of it that fits, and carries no control character.
+    /// [`resource_calls_reach_the_cap_and_a_denial_past_it`] shows that the generated calls
+    /// reach the cap, the omitted count and a denial past the cap.
     #[test]
     fn named_resources_reach_a_row_as_named_and_never_raw(
-        world in world(),
-        named in proptest::collection::vec(any_named_resource(), 0..100),
+        world in world().prop_map(widened),
+        named in any_named_resources(),
     ) {
         let mut call = world.call();
         call.resources = Resources::Named(named.clone());
         let (row, denied) = row_and_denied(&world, &call);
 
         let most = audit::MAX_RECORDED_RESOURCES;
-        let mut distinct: Vec<&Resource> = Vec::new();
-        for resource in &named {
-            if !distinct.contains(&resource) {
-                distinct.push(resource);
-            }
-        }
+        let distinct = distinct(&named);
         let mut expected: Vec<&Resource> = distinct.iter().copied().take(most).collect();
         if let Some(denied) = &denied {
             prop_assert!(distinct.contains(&denied), "the denial names a resource the call did not");
@@ -699,6 +752,48 @@ proptest! {
         prop_assert_eq!(unescape(&second), Some(other.clone()));
         prop_assert_eq!(first == second, one == other, "{:?} and {:?}", one, other);
     }
+}
+
+/// The calls [`named_resources_reach_a_row_as_named_and_never_raw`] is given reach what it
+/// checks: an allowed call with resources left off its row, and resource denials for one
+/// first named inside and past the most a row records. Without this, the property's model of
+/// the cap could be wrong and still pass.
+#[test]
+fn resource_calls_reach_the_cap_and_a_denial_past_it() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = (world().prop_map(widened), any_named_resources());
+    let (mut allowed_with_omitted, mut denied_inside, mut denied_past) = (0, 0, 0);
+    for _ in 0..500 {
+        let (world, named) = strategy
+            .new_tree(&mut runner)
+            .expect("generate a call")
+            .current();
+        let mut call = world.call();
+        call.resources = Resources::Named(named.clone());
+        let (row, denied) = row_and_denied(&world, &call);
+        match denied {
+            None if row.decision == audit::DecisionKind::Allow && row.resources_omitted > 0 => {
+                allowed_with_omitted += 1;
+            }
+            None => {}
+            Some(denied) => {
+                let at = distinct(&named)
+                    .iter()
+                    .position(|resource| **resource == denied)
+                    .expect("the denial names a resource the call did not");
+                if at < audit::MAX_RECORDED_RESOURCES {
+                    denied_inside += 1;
+                } else {
+                    denied_past += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        allowed_with_omitted > 0 && denied_inside > 0 && denied_past > 0,
+        "allowed with resources omitted: {allowed_with_omitted}, denied inside the cap: \
+         {denied_inside}, denied past it: {denied_past}"
+    );
 }
 
 /// Arbitrary worlds, without opening, reach an allow and every kind of reason. Without this,
