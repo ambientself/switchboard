@@ -19,6 +19,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }
+trybuild = "1"
 
 [lints]
 workspace = true
