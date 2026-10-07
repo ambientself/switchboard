@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::names::{GroupId, Issuer, Person, Subject, TeamId, ToolName};
 use crate::proof::Claimed;
@@ -81,23 +81,10 @@ pub struct Delegation {
     pub acting_person: Claimed<Person>,
     /// The team the delegation was issued for. It must agree with the principal's team.
     pub team: TeamId,
-    /// The tools the delegation permits, if it narrows them. `None` narrows nothing; an empty
-    /// set permits no tool at all.
-    ///
-    /// Required when deserialized, even though it is optional: a missing list would otherwise
-    /// read as `None`, which narrows nothing, so a dropped field would widen access.
-    #[serde(deserialize_with = "present")]
-    pub tools: Option<BTreeSet<ToolName>>,
-}
-
-/// Deserializes an `Option` that must be written out, as `null` or a value. Naming a
-/// `deserialize_with` function is what stops serde treating a missing `Option` as `None`.
-fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
+    /// The tools the delegation permits. Always present, so a delegation always narrows: there
+    /// is no value that means "every tool on the surface", and an empty set permits no tool at
+    /// all (decision 0006, check 4).
+    pub tools: BTreeSet<ToolName>,
 }
 
 #[cfg(test)]
@@ -105,19 +92,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_delegation_must_say_whether_it_narrows_tools() {
+    fn a_delegation_must_list_its_tools() {
         let parse = |json: &str| serde_json::from_str::<Delegation>(json);
         let base = r#""acting_person": "requester@example.test", "team": "payments""#;
         assert!(
             parse(&format!("{{{base}}}")).is_err(),
             "a missing tool list was accepted"
         );
-        let unlimited = parse(&format!(r#"{{{base}, "tools": null}}"#)).ok();
-        assert_eq!(unlimited.map(|delegation| delegation.tools), Some(None));
-        let narrowed = parse(&format!(r#"{{{base}, "tools": []}}"#)).ok();
+        assert!(
+            parse(&format!(r#"{{{base}, "tools": null}}"#)).is_err(),
+            "a null tool list was accepted"
+        );
+        let empty = parse(&format!(r#"{{{base}, "tools": []}}"#)).ok();
         assert_eq!(
-            narrowed.map(|delegation| delegation.tools),
-            Some(Some(BTreeSet::new()))
+            empty.map(|delegation| delegation.tools),
+            Some(BTreeSet::new())
         );
     }
 

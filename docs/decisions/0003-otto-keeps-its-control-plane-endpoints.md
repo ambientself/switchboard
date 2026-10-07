@@ -2,6 +2,10 @@
 
 Date: 2026-10-01. Status: accepted. Replaces the first version of this decision, made the same
 day, which moved the endpoints into the gateway.
+Noted on 2026-10-07: "never holds a vendor credential" covers the vendor actions this decision
+moves to the gateway. Otto's control plane keeps the credentials for its own conversation
+surfaces, such as its Slack app. That is an entry in the register of
+[decision 0010](0010-what-stops-an-agent-going-around-the-gateway.md).
 
 ## Context
 
@@ -58,6 +62,13 @@ of two ways, chosen per fact when the tool is built:
 - The actions Otto's control plane needs are ordinary tools with classifications: read a file
   at a commit, read a pull request's state, post or edit a comment on a pull request. They are
   designed when Otto's adapter is built, not copied from the three endpoints' current shapes.
+  Since the 2026-10-04 amendment to
+  [decision 0006](0006-what-the-decision-function-sees.md), each must be classified `read` or
+  `propose`: a direct write is denied in every profile, these included. A comment is
+  `propose` only on something the gateway created for review, such as the pull request
+  carrying Otto's receipt, and only if its tool refuses the commands of the bots named when it
+  is approved. Editing the receipt after a person marks that pull request ready for review is
+  still `propose`.
 - A sandbox's subject is never admitted to the control-plane surface, so a model cannot ask
   for instruction-position text or edit its own receipt.
 - There is no Otto extension crate holding endpoints or Otto's tables. What is specific to

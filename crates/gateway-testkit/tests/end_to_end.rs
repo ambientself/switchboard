@@ -12,16 +12,18 @@ use std::task::Poll;
 use std::time::Duration;
 
 use gateway_core::audit::{
-    self, Answer, Begun, Completion, DecisionKind, Outcome, RequestMetadata,
+    self, Answer, Begun, Completion, DecisionKind, Outcome, RecordedResource, RecordedResources,
+    RequestMetadata,
 };
 use gateway_core::{
     CallContext, Classification, IDENTITY_FAILURE, ReasonKind, RequestedTool, decide,
 };
 use gateway_identity::{Identity, Verification, VerifyError};
 use gateway_testkit::{
-    Caller, FakeCredentialSource, Fixture, FixtureConnector, InMemoryAuditStore, READ_TOOL,
-    SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT,
-    TEAM_B_DOCUMENT, WRITE_TOOL, block_on, poll_once,
+    Caller, DRAFT_REFUSAL, DRAFT_TOOL, FOREIGN_DRAFT, FakeCredentialSource, Fixture,
+    FixtureConnector, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND,
+    RESOURCE_SYSTEM, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock,
+    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, block_on, policy_data, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -148,6 +150,21 @@ fn own(caller: Caller) -> Value {
     json!({"document": caller.own_document()})
 }
 
+/// The resources column of a row for a call that named these documents, none of which needs
+/// escaping.
+fn recorded(documents: &[&str]) -> RecordedResources {
+    RecordedResources::Named(
+        documents
+            .iter()
+            .map(|document| RecordedResource {
+                system: RESOURCE_SYSTEM.to_owned(),
+                kind: RESOURCE_KIND.to_owned(),
+                identifier: (*document).to_owned(),
+            })
+            .collect(),
+    )
+}
+
 #[test]
 fn an_allowed_read_returns_the_echo_and_completes_its_row() {
     let gateway = Gateway::new();
@@ -181,6 +198,10 @@ fn an_allowed_read_returns_the_echo_and_completes_its_row() {
     assert_eq!(row.tool, READ_TOOL);
     assert_eq!(row.connector.as_ref().map(|c| c.as_str()), Some("fixture"));
     assert_eq!(row.classification, Some(Classification::Read));
+    assert_eq!(
+        (&row.resources, row.resources_omitted),
+        (&recorded(&[TEAM_A_DOCUMENT]), 0)
+    );
     assert_eq!(row.surface.as_str(), SURFACE_ALL);
     assert_eq!(row.policy_revision.as_str(), "fixture-1");
     assert_eq!(
@@ -242,18 +263,25 @@ fn each_caller_runs_under_its_own_credential() {
 fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
     use ReasonKind::*;
     let gateway = Gateway::new();
-    let table: [(Caller, &str, &str, Value, ReasonKind); 6] = [
+    let table: [(Caller, &str, &str, Value, ReasonKind); 7] = [
         (
             Caller::TeamB,
             SURFACE_ALL,
-            WRITE_TOOL,
+            DRAFT_TOOL,
             own(Caller::TeamB),
             ClassificationNotPermitted,
         ),
         (
             Caller::TeamA,
-            SURFACE_READ,
+            SURFACE_ALL,
             WRITE_TOOL,
+            own(Caller::TeamA),
+            ClassificationNotPermitted,
+        ),
+        (
+            Caller::TeamA,
+            SURFACE_READ,
+            DRAFT_TOOL,
             own(Caller::TeamA),
             ToolNotOnSurface,
         ),
@@ -281,12 +309,13 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
         (
             Caller::TeamA,
             SURFACE_ALL,
-            WRITE_TOOL,
+            DRAFT_TOOL,
             json!({}),
             ResourceOutsideLimit,
         ),
     ];
     for (position, (caller, surface, tool, arguments, expected)) in table.into_iter().enumerate() {
+        let named = arguments["document"].as_str().map(str::to_owned);
         let Response::Denied { sentence, reason } = gateway.call(caller, surface, tool, arguments)
         else {
             panic!("{caller:?} {tool} was not denied")
@@ -301,33 +330,127 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
             "the row and the answer say the same"
         );
         assert_eq!(row.completion, None, "a denial's row is complete as begun");
+        // The row records what the call named, whether or not the decision got as far as
+        // checking it. A call that named no document records an empty list, not `unknown`.
+        assert_eq!(
+            (&row.resources, row.resources_omitted),
+            (&recorded(named.as_deref().as_slice()), 0),
+            "{caller:?} {surface} {tool}"
+        );
         gateway.assert_nothing_ran();
     }
-    assert_eq!(gateway.store.rows().len(), 6, "one row per denied call");
+    assert_eq!(gateway.store.rows().len(), 7, "one row per denied call");
     assert_eq!(gateway.store.finish_attempts(), 0);
 }
 
+/// The fixture policy with `write` added to every profile's classifications. No profile can
+/// permit a direct write, so this changes no decision; it is here so that a write denied under
+/// it is denied by that rule and not because the profile leaves `write` out.
+fn with_every_profile_listing_write(gateway: &mut Gateway) {
+    let mut data = policy_data();
+    for profile in data["profiles"].as_array_mut().unwrap() {
+        profile["classifications"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("write"));
+    }
+    gateway.fixture.policy = serde_json::from_value(data).unwrap();
+}
+
+/// A direct write is denied in every profile, even one that lists `write`, with its own
+/// sentence, which points the caller at proposing instead. The same change proposed is allowed
+/// where the profile permits proposals.
 #[test]
-fn a_denied_write_does_not_write_and_the_same_write_allowed_does() {
-    let gateway = Gateway::new();
-    let write = |caller| gateway.call(caller, SURFACE_ALL, WRITE_TOOL, own(caller));
-    assert!(matches!(write(Caller::TeamB), Response::Denied { .. }));
-    assert!(gateway.connector.writes().is_empty());
-    assert!(matches!(
-        write(Caller::TeamA),
-        Response::Answered {
-            answer: Answer::Ok(_),
-            ..
-        }
-    ));
+fn a_direct_write_is_denied_to_every_caller_and_the_same_change_proposed_is_allowed() {
+    let mut gateway = Gateway::new();
+    with_every_profile_listing_write(&mut gateway);
+    for caller in [Caller::TeamA, Caller::TeamB] {
+        let Response::Denied { sentence, reason } =
+            gateway.call(caller, SURFACE_ALL, WRITE_TOOL, own(caller))
+        else {
+            panic!("{caller:?}'s write was not denied")
+        };
+        assert_eq!(reason, ReasonKind::ClassificationNotPermitted);
+        assert_eq!(
+            sentence,
+            format!(
+                "Tool `{WRITE_TOOL}` is classified `write`: it changes something directly \
+                 instead of proposing a change for a person to review, and direct writes are \
+                 denied in every profile. Use a tool that proposes the change, or ask a person \
+                 to make it."
+            ),
+            "{caller:?}"
+        );
+    }
+    gateway.assert_nothing_ran();
+
+    // Team A's profile permits proposals: the draft is opened, and is the one write.
+    let Response::Answered {
+        answer: Answer::Ok(answer),
+        row_completed: true,
+    } = gateway.call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA))
+    else {
+        panic!("team A's draft was not opened")
+    };
+    assert_eq!(answer["draft"], "draft-1");
+    let writes = gateway.connector.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].tool, DRAFT_TOOL);
+    let row = gateway.store.row(2).unwrap();
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(row.classification, Some(Classification::Propose));
+
+    // Team B's does not, and is told so in the sentence for a profile, not the one for writes.
+    let Response::Denied { sentence, reason } =
+        gateway.call(Caller::TeamB, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamB))
+    else {
+        panic!("team B's draft was not denied")
+    };
+    assert_eq!(reason, ReasonKind::ClassificationNotPermitted);
+    assert_eq!(
+        sentence,
+        format!(
+            "Tool `{DRAFT_TOOL}` is classified `propose`, which profile `{PROFILE_TEAM_B}` does \
+             not permit. Choose a tool whose classification this profile permits."
+        )
+    );
     assert_eq!(gateway.connector.writes().len(), 1);
+}
+
+/// A `propose` tool's refusal of something the gateway did not create is recorded like a scope
+/// refusal: the outcome `refused`, on a row the decision function allowed.
+#[test]
+fn a_proposal_on_something_the_gateway_did_not_create_is_the_outcome_refused() {
+    let gateway = Gateway::new();
+    let response = gateway.call(
+        Caller::TeamA,
+        SURFACE_ALL,
+        DRAFT_TOOL,
+        json!({"document": TEAM_A_DOCUMENT, "draft": FOREIGN_DRAFT}),
+    );
+    let Response::Answered {
+        answer: Answer::Refused(sentence),
+        row_completed: true,
+    } = response
+    else {
+        panic!("{response:?}")
+    };
+    assert_eq!(sentence, DRAFT_REFUSAL);
+    let row = gateway.store.row(0).unwrap();
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(
+        row.completion.map(|completion| completion.outcome),
+        Some(Outcome::Refused { sentence })
+    );
+    assert_eq!(gateway.connector.received().len(), 1, "it ran, and refused");
+    assert!(gateway.connector.writes().is_empty(), "and wrote nothing");
 }
 
 #[test]
 fn when_the_audit_row_cannot_be_begun_the_call_is_refused_and_nothing_runs() {
     let gateway = Gateway::new();
     gateway.store.fail_next_begin();
-    let response = gateway.call(Caller::TeamA, SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA));
+    let response = gateway.call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA));
     assert!(
         matches!(response, Response::AuditFailed(AUDIT_FAILURE)),
         "{response:?}"
@@ -337,7 +460,7 @@ fn when_the_audit_row_cannot_be_begun_the_call_is_refused_and_nothing_runs() {
 
     // A denial is refused the same way: with no row, nothing is returned but the audit failure.
     gateway.store.fail_next_begin();
-    let response = gateway.call(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, own(Caller::TeamB));
+    let response = gateway.call(Caller::TeamB, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamB));
     assert!(
         matches!(response, Response::AuditFailed(AUDIT_FAILURE)),
         "{response:?}"
@@ -346,7 +469,7 @@ fn when_the_audit_row_cannot_be_begun_the_call_is_refused_and_nothing_runs() {
 
     // And when the store is back, the same call goes through.
     assert!(matches!(
-        gateway.call(Caller::TeamA, SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA)),
+        gateway.call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA)),
         Response::Answered {
             answer: Answer::Ok(_),
             row_completed: true
@@ -375,7 +498,7 @@ fn a_failure_to_finish_the_row_does_not_undo_a_success() {
     let Response::Answered {
         answer,
         row_completed,
-    } = gateway.call(Caller::TeamA, SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA))
+    } = gateway.call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA))
     else {
         panic!("not answered")
     };
@@ -417,6 +540,11 @@ fn a_scope_refusal_is_the_outcome_refused_with_one_sentence_in_the_row_and_the_a
         row.decision,
         DecisionKind::Allow,
         "the decision function allowed it"
+    );
+    assert_eq!(
+        (row.resources, row.resources_omitted),
+        (RecordedResources::Unknown, 0),
+        "the tool could not say what the call names before it ran"
     );
     assert_eq!(
         row.completion,
@@ -477,7 +605,7 @@ fn a_connector_error_and_a_refused_credential_are_recorded_as_errors() {
     );
 
     gateway.credentials.refuse_next();
-    let response = gateway.call(Caller::TeamA, SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA));
+    let response = gateway.call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA));
     assert!(
         matches!(
             response,
@@ -563,7 +691,7 @@ fn the_audit_row_is_written_before_the_tool_runs_and_finished_before_the_answer(
 
     // A connector that hangs: the row already exists, with an empty outcome.
     let gate = gateway.connector.hang_next();
-    let mut call = pin!(gateway.handle(Some(&token), SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA)));
+    let mut call = pin!(gateway.handle(Some(&token), SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA)));
     assert!(poll_once(call.as_mut()).is_pending());
     assert_eq!(gateway.connector.received().len(), 1);
     assert!(gateway.connector.writes().is_empty());
@@ -583,7 +711,7 @@ fn the_audit_row_is_written_before_the_tool_runs_and_finished_before_the_answer(
 
     // A store that is slow to finish: the tool has run, and the answer waits for the row.
     let gate = gateway.store.hold_finishes();
-    let mut call = pin!(gateway.handle(Some(&token), SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA)));
+    let mut call = pin!(gateway.handle(Some(&token), SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA)));
     assert!(poll_once(call.as_mut()).is_pending());
     assert_eq!(
         gateway.connector.writes().len(),
@@ -604,7 +732,7 @@ fn the_audit_row_is_written_before_the_tool_runs_and_finished_before_the_answer(
     // A store that is slow to begin: nothing runs, and nothing is answered, until the row is
     // written.
     let gate = gateway.store.hold_begins();
-    let mut call = pin!(gateway.handle(Some(&token), SURFACE_ALL, WRITE_TOOL, own(Caller::TeamA)));
+    let mut call = pin!(gateway.handle(Some(&token), SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA)));
     assert!(poll_once(call.as_mut()).is_pending());
     assert_eq!(gateway.store.rows().len(), 2);
     assert_eq!(

@@ -1,6 +1,7 @@
 # 0008: Mock the first slice, in kind and Docker Compose
 
-Date: 2026-10-01. Status: accepted. Settles Q19.
+Date: 2026-10-01. Status: accepted. Settles Q19. Noted on 2026-10-07: its kind test is
+specified by [decision 0010](0010-what-stops-an-agent-going-around-the-gateway.md).
 
 ## Context
 

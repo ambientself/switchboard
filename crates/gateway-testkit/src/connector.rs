@@ -1,4 +1,4 @@
-//! A connector with three tools, that records what reaches it and can be told to fail or hang.
+//! A connector with four tools, that records what reaches it and can be told to fail or hang.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -18,13 +18,22 @@ use crate::gate::Gate;
 pub const CONNECTOR: &str = "fixture";
 /// A read tool: echoes its arguments and the credential it was given.
 pub const READ_TOOL: &str = "fixture__read";
-/// A write tool: records that a write happened.
+/// A `propose` tool: opens a draft against a document for a person to review, or revises a
+/// draft it opened, and refuses any other draft when it runs.
+pub const DRAFT_TOOL: &str = "fixture__draft";
+/// A direct write: records that a document was changed. Classified `write`, so the decision
+/// function denies it in every profile and it never reaches the connector.
 pub const WRITE_TOOL: &str = "fixture__write";
 /// A read tool that checks its own scope, and refuses a document outside the caller's scope
 /// when it runs.
 pub const SCOPED_READ_TOOL: &str = "fixture__scoped_read";
 /// The argument that names the document a call reaches.
 pub const DOCUMENT_ARGUMENT: &str = "document";
+/// The argument that names the draft a call to [`DRAFT_TOOL`] revises. A call without it opens a
+/// new draft.
+pub const DRAFT_ARGUMENT: &str = "draft";
+/// A draft the gateway did not open, such as one a person opened. The draft tool refuses it.
+pub const FOREIGN_DRAFT: &str = "draft-by-a-person";
 /// The system a fixture resource belongs to.
 pub const RESOURCE_SYSTEM: &str = "fixture";
 /// The kind of resource a document is.
@@ -35,6 +44,9 @@ pub const FORBIDDEN_DOCUMENT: &str = "restricted-notes";
 /// the caller chose.
 pub const SCOPE_REFUSAL: &str =
     "The fixture connector refused this call: the document it names is outside the caller's scope.";
+/// The sentence the draft tool refuses with. It does not repeat the draft, which is text the
+/// caller chose.
+pub const DRAFT_REFUSAL: &str = "The fixture connector refused this call: the draft it names was not opened by the gateway for the document the call names.";
 
 /// One call that reached the connector.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,9 +61,12 @@ pub struct ReceivedCall {
     pub team: Option<TeamId>,
 }
 
-/// One write the write tool performed.
+/// One write a tool performed: a draft the draft tool opened or revised, or a direct write. The
+/// design calls both a write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteRecord {
+    /// The tool that made it.
+    pub tool: String,
     /// The arguments the write was made with.
     pub arguments: Value,
     /// The label of the credential it was made under.
@@ -79,6 +94,8 @@ enum Failing {
 struct State {
     received: Vec<ReceivedCall>,
     writes: Vec<WriteRecord>,
+    /// The drafts the draft tool opened, each with the document it was opened against.
+    drafts: BTreeMap<String, Option<String>>,
     failing: Failing,
     hang: Hang,
     team_scopes: BTreeMap<TeamId, BTreeSet<String>>,
@@ -86,13 +103,24 @@ struct State {
     work: Option<(SteppableClock, Duration)>,
 }
 
-/// A [`Connector`] serving [`READ_TOOL`], [`WRITE_TOOL`] and [`SCOPED_READ_TOOL`].
+/// A [`Connector`] serving [`READ_TOOL`], [`DRAFT_TOOL`], [`WRITE_TOOL`] and
+/// [`SCOPED_READ_TOOL`].
 ///
 /// - Every call it receives is recorded first, before anything else it does, so a test can
 ///   show that a denied call never arrived: `received()` and `writes()` stay empty.
 /// - It asks its [`CredentialSource`] for the caller's credential, as a real connector would,
 ///   and answers with an error if none is issued. The read tools echo the credential's label
 ///   back.
+/// - The draft tool acts only on what the gateway created, as a `propose` tool must (design
+///   section 8). A call that names no draft opens one, `draft-1`, `draft-2` and so on, against
+///   the document the call names. A call that names a draft revises it only if this connector
+///   opened it against the same document, and is refused with [`DRAFT_REFUSAL`] otherwise:
+///   [`FOREIGN_DRAFT`], a draft not yet opened, or another document's draft. The document is
+///   checked against the caller's limit by the decision function, so a team cannot revise
+///   another team's draft. Opening and revising each record a write.
+/// - The write tool is never reached through the fixture policy, because the decision function
+///   denies a `write` tool in every profile. It records a write the same way the draft tool
+///   does, so a write that did reach it would show in `writes()`.
 /// - The scoped tool serves a document only to a caller whose scope holds it, and refuses any
 ///   other with [`SCOPE_REFUSAL`]. That is the connector-side refusal the audit record calls
 ///   `refused`. A workload's scope is its team's documents; a user's is the documents of all
@@ -114,6 +142,7 @@ impl FixtureConnector {
             state: Mutex::new(State {
                 received: Vec::new(),
                 writes: Vec::new(),
+                drafts: BTreeMap::new(),
                 failing: Failing::Never,
                 hang: Hang::Never,
                 team_scopes: BTreeMap::from([
@@ -138,7 +167,7 @@ impl FixtureConnector {
         self.state().received.clone()
     }
 
-    /// Every write the write tool performed.
+    /// Every write performed, by the draft tool or the write tool, in order.
     pub fn writes(&self) -> Vec<WriteRecord> {
         self.state().writes.clone()
     }
@@ -197,7 +226,7 @@ impl FixtureConnector {
     }
 
     /// What a resource adapter for these tools finds in a call's arguments, which the caller
-    /// of the gateway puts in the call context. The read and write tools declare their
+    /// of the gateway puts in the call context. The read, draft and write tools declare their
     /// resources, so a call that names no document names none, and is denied by the decision
     /// function. The scoped tool checks its own scope, so its resources are not known
     /// beforehand.
@@ -292,14 +321,25 @@ impl Connector for FixtureConnector {
             if let Some((clock, duration)) = work {
                 clock.advance(duration);
             }
+            let write = WriteRecord {
+                tool: tool.clone(),
+                arguments: arguments.clone(),
+                credential: credential.clone(),
+                principal: caller.get().id.clone(),
+            };
             match tool.as_str() {
                 READ_TOOL => ToolOutcome::Ok(echo(&tool, &arguments, &credential)),
+                DRAFT_TOOL => match self.draft(&arguments) {
+                    Some(draft) => {
+                        self.record(write);
+                        ToolOutcome::Ok(
+                            json!({"tool": tool, "draft": draft, "credential": credential}),
+                        )
+                    }
+                    None => ToolOutcome::Refused(DRAFT_REFUSAL.to_owned()),
+                },
                 WRITE_TOOL => {
-                    self.state().writes.push(WriteRecord {
-                        arguments: arguments.clone(),
-                        credential: credential.clone(),
-                        principal: caller.get().id.clone(),
-                    });
+                    self.record(write);
                     ToolOutcome::Ok(
                         json!({"tool": tool, "written": true, "credential": credential}),
                     )
@@ -314,6 +354,33 @@ impl Connector for FixtureConnector {
                 _ => ToolOutcome::Error(format!("the fixture connector has no tool `{tool}`")),
             }
         })
+    }
+}
+
+impl FixtureConnector {
+    /// The draft a call to the draft tool opens or revises, or `None` if it names a draft this
+    /// connector did not open against the document the call names.
+    fn draft(&self, arguments: &Value) -> Option<String> {
+        let document = arguments
+            .get(DOCUMENT_ARGUMENT)
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut state = self.state();
+        match arguments.get(DRAFT_ARGUMENT) {
+            None => {
+                let draft = format!("draft-{}", state.drafts.len() + 1);
+                state.drafts.insert(draft.clone(), document);
+                Some(draft)
+            }
+            Some(named) => named
+                .as_str()
+                .filter(|draft| state.drafts.get(*draft) == Some(&document))
+                .map(str::to_owned),
+        }
+    }
+
+    fn record(&self, write: WriteRecord) {
+        self.state().writes.push(write);
     }
 }
 
