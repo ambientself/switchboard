@@ -1,12 +1,15 @@
 # 0006: What the decision function sees and returns
 
-Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
+Date: 2026-10-01, amended the same day after the first implementation was reviewed. Amended
 on 2026-10-04 (classifications, direct writes and delegation tool lists), with the rule for
-comments added on 2026-10-06, and on 2026-10-07 for decision 0009, by
-[decision 0011](0011-resource-authorization-and-tool-assurance.md), and for currency of Otto's
-side-effecting calls, from [decision 0012](0012-what-a-turn-grant-binds.md); the amendments are
-at the end. Status: accepted. Settles the part of Q9 that milestone 1 needs, and with the
-amendment, what the core needs for employee proposals and broad reads. The rest of Q9 is
+comments added on 2026-10-06. Amended three times on 2026-10-07, when the owner accepted
+[decision 0011](0011-resource-authorization-and-tool-assurance.md) (what may refuse outside
+this function, and the exception for Otto's comment tools),
+[decision 0009](0009-audit-completion-receipts-and-recovery.md) (unverified delegations, keys
+and receipts) and [decision 0012](0012-what-a-turn-grant-binds.md) (currency for Otto's
+side-effecting calls). The amendments are at the end, in that order, followed by the order of
+checks they leave. Status: accepted. Settles the part of Q9 that milestone 1 needs, and with
+the amendment, what the core needs for employee proposals and broad reads. The rest of Q9 is
 settled by decision 0011, including a narrow, recorded exception for Otto's two comment tools,
 except what that record lists as still open. Among those is whether a proposal stays `propose`
 where the CI it starts can deploy or holds a production credential.
@@ -67,7 +70,8 @@ caller and the one written to the audit record are the same text.
    own scope when it runs.
 
 The first failing check decides the reason. `tools/list` runs the same function once per tool
-with no resources and returns the tools that pass.
+with no resources and returns the tools that pass. The 2026-10-07 amendments add to this list;
+the order they leave is at the end of this record.
 
 ### What a connector may still do
 
@@ -295,6 +299,26 @@ enforces it on any surface, so a surface of its own is not required.
   only on what the gateway created for review is `propose` and allowed, to show the other side
   of the comment rule.
 
+## Amended 2026-10-07: what may refuse outside this function, and Otto's comment tools
+
+[Decision 0011](0011-resource-authorization-and-tool-assurance.md), accepted on 2026-10-07,
+changed the sections above in place. In summary:
+
+- **More may refuse outside this function, and still none may allow.** The gateway's argument
+  check, the connector, the credential layer and the custodian may each refuse after the
+  decision (What a connector may still do). The credential layer's refusal, such as an
+  employee with no grant, is recorded as `refused`, like a connector's.
+- **Check 5 gains an exception step,** once #12 builds it. Check 5 denies `write` and
+  `destructive` unless the tool is named in the calling profile's list of excepted tools. The
+  first entries are Otto's `github_pr_comment` and `jira_comment`, in Otto's profile only. An
+  allow under the exception gives the exception as its reason (Comments, and Direct writes are
+  denied in every profile). Until #12 builds it, both tools stay denied.
+- **Resources.** `checks_own_scope` is available only to built-in connectors, and a `declared`
+  tool's adapter may name its connector entry's whole recorded reach (Consequences). Broad
+  reads use a breadth resource in a limit, with no field of their own (Broad reads).
+- **A proxied tool is only ever `read`,** so a refusal inside a proxied server cannot make its
+  tool `propose` (the consequences of the 2026-10-04 amendment).
+
 ## Amended 2026-10-07: unverified delegations, keys and receipts
 
 [Decision 0009](0009-audit-completion-receipts-and-recovery.md), accepted on 2026-10-07,
@@ -333,8 +357,8 @@ before the first `propose` tool reaches a real system.
 `read` under the profile for Otto's sandboxes only while Otto says the turn is current. That
 is, its control plane still holds the lease at the grant's epoch, and the turn has not ended or
 been revoked. This amendment puts that rule in the decision function. It covers Otto's
-`propose` tools, and its two `write` comment tools once the exception that decision 0011 (pull
-request #32) records for them is built.
+`propose` tools, and its two `write` comment tools once the exception that decision 0011
+records for them, above, is built.
 
 ### What changes
 
@@ -395,3 +419,31 @@ verified, and the mismatch is usually a rollout fault.
 - The core changes these need (the currency type in the call context, the profile setting,
   the check, the reason kinds and the recorded fields) are follow-on code for milestone 4.
   They are not built yet.
+
+## The order of checks after the 2026-10-07 amendments
+
+In this order, the first check that fails giving the reason:
+
+- **Check 0.** The profile exists.
+- **Check 1.** The surface is permitted to the principal.
+- **Check 2.** The tool is approved on the surface.
+- **Check 3.** A delegation is present if the profile requires one, and one that is present is
+  verified and agrees with the principal. An unverified delegation is denied here under its
+  own reason kind (decision 0009).
+- **Check 4.** The delegation, if present, lists the tool.
+- **Check 5.** The profile permits the classification. `write` and `destructive` are denied
+  before the profile is read, unless the tool is named in the profile's list of excepted
+  tools, once #12 builds that list (decision 0011).
+- **The currency check.** Under a profile that requires it, a tool not classified `read` needs
+  a current control plane (decision 0012).
+- **Check 6.** Each named resource is within the caller's limit.
+- **The key check,** last. A tool not classified `read` whose call carries no key is denied
+  (decision 0009).
+
+`tools/list` decides with no resources and no key, and skips the currency check, check 6 and
+the key check. The checks added on 2026-10-07 are named, not numbered, so that "check 6" still
+means the resource check wherever it is cited. The reason kinds added on 2026-10-07 are an
+unverified delegation, a control plane that is not current, unconfirmed currency, and a
+missing key, each with its sentence. Outside this function, the receipt check at begin, the
+argument check, the connector, the credential layer and the custodian may each refuse, and
+none may allow.
