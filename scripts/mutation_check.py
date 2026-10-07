@@ -923,6 +923,83 @@ mutate_all(
 )
 
 
+# --- audit-postgres ------------------------------------------------------------------------
+
+# Most of these are caught only by the tests against Postgres, which run when
+# SWITCHBOARD_TEST_DATABASE_URL names a superuser on a throwaway server (see the crate's
+# documentation). Without it they survive. The `pg-columns-*` ones need no server.
+PG = "crates/audit-postgres/"
+PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
+PG_STORE = PG + "src/store.rs"
+PG_COLUMNS = PG + "src/columns.rs"
+mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_SQL,
+       "    IF OLD.outcome IS NOT NULL THEN", "    IF false THEN")
+mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_SQL,
+       "    IF OLD.decision <> 'allow' THEN", "    IF false THEN")
+mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_SQL,
+       "        RAISE EXCEPTION 'a completion of audit row % has no outcome', OLD.id;", "        NULL;")
+mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_SQL,
+       "        RAISE EXCEPTION 'only the completion of audit row % may be written', OLD.id;", "        NULL;")
+mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_SQL,
+       "    NEW.finished_at := clock_timestamp();\n", "")
+mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_SQL,
+       "CREATE TRIGGER complete_once\n    BEFORE UPDATE ON switchboard_audit.call_rows\n"
+       "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
+mutate("pg-grant-insert-begun-at", "the gateway may write the begin time", PG_SQL,
+       "    tool_use_id, deployment, surface, profile, tool, connector, classification,\n",
+       "    begun_at, tool_use_id, deployment, surface, profile, tool, connector, classification,\n")
+mutate("pg-grant-update-widened", "the gateway may update a begin column", PG_SQL,
+       "GRANT UPDATE (outcome, outcome_sentence, latency_ms)", "GRANT UPDATE (outcome, outcome_sentence, latency_ms, tool)")
+mutate("pg-grant-select-widened", "the gateway may read who called", PG_SQL,
+       "GRANT SELECT (id, decision, outcome, outcome_sentence, latency_ms)",
+       "GRANT SELECT (id, decision, outcome, outcome_sentence, latency_ms, proved_subject)")
+mutate("pg-grant-delete", "the gateway may delete rows", PG_SQL,
+       "REVOKE ALL ON switchboard_audit.call_rows FROM PUBLIC;\n",
+       "REVOKE ALL ON switchboard_audit.call_rows FROM PUBLIC;\n"
+       "GRANT DELETE ON switchboard_audit.call_rows TO switchboard_gateway;\n")
+mutate("pg-grant-gateway-creates", "the gateway may create objects in the database", PG + "sql/roles.sql",
+       "'GRANT CONNECT ON DATABASE %I TO switchboard_gateway'", "'GRANT CONNECT, CREATE ON DATABASE %I TO switchboard_gateway'")
+mutate("pg-check-denial-sentence", "a denial may lack its sentence", PG_SQL,
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
+       "WHEN 'deny' THEN reason IS NOT NULL AND outcome IS NULL")
+mutate("pg-check-allowed-connector", "an allowed call may lack its connector and classification", PG_SQL,
+       "\n                AND connector IS NOT NULL AND classification IS NOT NULL", "")
+mutate("pg-check-workload-team", "a workload may lack its team", PG_SQL,
+       "        (proved_kind = 'workload') = (proved_team IS NOT NULL)\n", "        true\n")
+mutate("pg-check-refusal-sentence", "only a refusal carrying a sentence is not checked", PG_SQL,
+       "        AND coalesce(outcome = 'refused', false) = (outcome_sentence IS NOT NULL)\n", "")
+mutate("pg-check-resources-shape", "resources may be any JSON", PG_SQL,
+       "        CHECK (jsonb_typeof(resources) = 'array' OR resources = '\"unknown\"'::jsonb),", "        CHECK (true),")
+mutate("pg-migrate-any-role", "any role may run the migrations", PG + "src/migrate.rs",
+       "    if current_user != OWNER_ROLE {", "    if false {")
+mutate("pg-session-not-synchronous", "sessions keep the role's synchronous_commit", PG_STORE,
+       "        config.options(options);\n", "        let _ = options;\n")
+mutate("pg-session-options-replaced", "the caller's session options are dropped", PG_STORE,
+       'format!("{existing} {SESSION_OPTIONS}")', "SESSION_OPTIONS.to_owned()")
+mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
+       "        let client = self.finish.get().await?;", "        let client = self.begin.get().await?;")
+mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
+       "WHERE id = ($1::text)::uuid AND outcome IS NULL", "WHERE id = ($1::text)::uuid")
+mutate("pg-finish-same-again-refused", "the same completion written again is an error", PG_STORE,
+       "            Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),",
+       "            Some(outcome) if false && finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),")
+mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
+       "            _ => Err(PgAuditError::CompletedDifferently {\n                row: row.as_str().to_owned(),\n            }),",
+       "            _ => Ok(()),")
+mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succeeds", PG_STORE,
+       "            return Err(PgAuditError::NoSuchRow {\n                row: row.as_str().to_owned(),\n            });",
+       "            return Ok(());")
+mutate("pg-columns-complete-record-begun", "begin drops a completion it was handed", PG_COLUMNS,
+       "        if record.completion.is_some() {", "        if false {")
+mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
+       "            claimed_team: record\n                .claimed_team", "            claimed_team: record\n                .proved_delegation_team")
+mutate("pg-columns-workload-team-as-group", "a workload's team is written as a group", PG_COLUMNS,
+       '            PrincipalKind::Workload { team } => ("workload", Some(team.to_string()), None),',
+       '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![team.to_string()])),')
+mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
+       "            && Some(self.latency_ms) == latency_ms\n", "")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
