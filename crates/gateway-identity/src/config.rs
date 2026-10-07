@@ -92,7 +92,10 @@ pub struct IssuerConfig {
     pub kind: IssuerKind,
     /// The algorithm this issuer signs with. A token whose header says another is refused.
     pub algorithm: SigningAlgorithm,
-    /// The verification keys. Every key needs a `kid`, which a token must name.
+    /// The verification keys. Every key needs a `kid`, which a token must name. A key that
+    /// cannot verify this issuer's signatures, such as an encryption key published in the same
+    /// set, is left out, and a token naming it is refused; the issuer is refused only if no key
+    /// can verify.
     pub keys: JwkSet,
     /// The longest a token may live: `exp - iat` may not exceed it.
     pub max_lifetime: Duration,
@@ -168,8 +171,9 @@ pub enum ConfigError {
         /// The repeated `kid`.
         kid: String,
     },
-    /// A key that is not of the kind, or on the curve, the issuer's algorithm needs, or that
-    /// declares itself for another algorithm, use or operation, or is not a key at all.
+    /// No key in the issuer's set can verify its signatures: this is the first one. It is not
+    /// of the kind, or on the curve, the issuer's algorithm needs, or it declares itself for
+    /// another algorithm, use or operation, or it is not a key at all.
     #[error("issuer `{issuer}` key `{kid}` cannot verify {algorithm} signatures")]
     KeyDoesNotFit {
         /// The issuer.
@@ -179,7 +183,8 @@ pub enum ConfigError {
         /// The algorithm the issuer is configured with.
         algorithm: &'static str,
     },
-    /// An RSA key shorter than [`MIN_RSA_BITS`].
+    /// No key in the issuer's set can verify its signatures, and the first is an RSA key
+    /// shorter than [`MIN_RSA_BITS`].
     #[error(
         "issuer `{issuer}` key `{kid}` is a {bits}-bit RSA key, shorter than {} bits",
         MIN_RSA_BITS

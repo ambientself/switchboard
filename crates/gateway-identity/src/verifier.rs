@@ -200,23 +200,37 @@ impl Entry {
             }
             _ => {}
         }
-        if config.keys.keys.is_empty() {
-            return Err(ConfigError::NoKeys(issuer));
-        }
+        // A set may hold keys that cannot verify this issuer's signatures, such as the
+        // encryption key an identity provider publishes beside its signing keys. Those are left
+        // out, so a token naming one is refused as naming an unknown key, and the issuer is
+        // refused only if no key is left, or there were none. Every key still needs a `kid`
+        // that no other key in the set has, so which key a token names is never in doubt.
+        let mut kids = BTreeSet::new();
         let mut keys = BTreeMap::new();
+        let mut first_unfit = None;
         for jwk in &config.keys.keys {
             let kid = jwk
                 .common
                 .key_id
                 .clone()
                 .ok_or_else(|| ConfigError::KeyWithoutId(issuer.clone()))?;
-            let decoded = match decoding_key(jwk, config.algorithm) {
-                Ok(decoded) => decoded,
-                Err(unfit) => return Err(unfit.error(issuer, kid, config.algorithm)),
-            };
-            if keys.insert(kid.clone(), decoded).is_some() {
+            if !kids.insert(kid.clone()) {
                 return Err(ConfigError::DuplicateKeyId { issuer, kid });
             }
+            match decoding_key(jwk, config.algorithm) {
+                Ok(decoded) => {
+                    keys.insert(kid, decoded);
+                }
+                Err(unfit) => {
+                    first_unfit.get_or_insert((kid, unfit));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Err(match first_unfit {
+                Some((kid, unfit)) => unfit.error(issuer, kid, config.algorithm),
+                None => ConfigError::NoKeys(issuer),
+            });
         }
         Ok(Self {
             issuer,
@@ -230,7 +244,7 @@ impl Entry {
     }
 }
 
-/// Why a key cannot verify an issuer's signatures.
+/// Why a key in an issuer's set was left out.
 enum Unfit {
     /// Not of the kind the algorithm needs, declared for something else, or not a key.
     DoesNotFit,

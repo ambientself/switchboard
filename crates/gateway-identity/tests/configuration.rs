@@ -632,3 +632,142 @@ fn a_key_listing_verify_among_its_operations_is_used() {
         }
     }
 }
+
+/// An identity provider's key set can hold keys that are not for this issuer's signatures,
+/// such as an encryption key, or an old short key it still publishes. Those are left out and
+/// the rest verify. A token naming a key that was left out is refused as naming an unknown key,
+/// even when it was signed by that key.
+#[test]
+fn keys_that_cannot_verify_are_left_out_and_the_rest_are_used() {
+    let es = setup(SigningAlgorithm::Es256, Kind::Workload);
+    let rs = setup(SigningAlgorithm::Rs256, Kind::Workload);
+
+    let mut encryption = es.other.jwk_set().keys[0].clone();
+    encryption.common.key_id = Some("encryption".into());
+    encryption.common.public_key_use = Some(PublicKeyUse::Encryption);
+    let mut config = es.config();
+    config.keys.keys = vec![
+        encryption,
+        rs.issuer.jwk_set().keys[0].clone(),
+        es.issuer.jwk_set().keys[0].clone(),
+    ];
+    let verifier = build(vec![config]).unwrap();
+    assert_eq!(verify(&verifier, &es.token().build()), Ok(es.principal()));
+    let under_encryption_key = es.token().signed_by(es.other).kid("encryption").build();
+    assert_eq!(
+        verify(&verifier, &under_encryption_key),
+        Err(VerifyError::UnknownKeyId)
+    );
+    assert_eq!(
+        verify(&verifier, &es.token().kid(rs.issuer.key_id()).build()),
+        Err(VerifyError::UnknownKeyId)
+    );
+
+    let mut config = rs.config();
+    config
+        .keys
+        .keys
+        .insert(0, rsa_jwk("short", &modulus(0xff, 128)));
+    let verifier = build(vec![config]).unwrap();
+    assert_eq!(verify(&verifier, &rs.token().build()), Ok(rs.principal()));
+    assert_eq!(
+        verify(&verifier, &rs.token().kid("short").build()),
+        Err(VerifyError::UnknownKeyId)
+    );
+}
+
+/// An issuer none of whose keys can verify is refused, naming the first key and why.
+#[test]
+fn an_issuer_with_no_key_that_can_verify_is_refused_with_the_first() {
+    let es = setup(SigningAlgorithm::Es256, Kind::Workload);
+    let rs = setup(SigningAlgorithm::Rs256, Kind::Workload);
+    let short = rsa_jwk("short", &modulus(0xff, 128));
+    let ec = es.issuer.jwk_set().keys[0].clone();
+    let mut config = rs.config();
+    config.keys.keys = vec![short.clone(), ec.clone()];
+    assert_eq!(
+        build(vec![config.clone()]).unwrap_err(),
+        ConfigError::WeakKey {
+            issuer: rs.issuer.issuer().into(),
+            kid: "short".into(),
+            bits: 1024,
+        }
+    );
+    config.keys.keys = vec![ec, short];
+    assert_eq!(
+        build(vec![config]).unwrap_err(),
+        ConfigError::KeyDoesNotFit {
+            issuer: rs.issuer.issuer().into(),
+            kid: es.issuer.key_id().to_owned(),
+            algorithm: "RS256",
+        }
+    );
+}
+
+/// A `kid` names one key in the set, counting the keys that are left out, so a token's `kid`
+/// can never mean two keys.
+#[test]
+fn a_kid_is_unique_among_all_of_an_issuers_keys() {
+    let es = setup(SigningAlgorithm::Es256, Kind::Workload);
+    let mut twin = es.other.jwk_set().keys[0].clone();
+    twin.common.key_id = Some(es.issuer.key_id().to_owned());
+    twin.common.public_key_use = Some(PublicKeyUse::Encryption);
+    let mut config = es.config();
+    config.keys.keys.push(twin);
+    assert_eq!(
+        build(vec![config]).unwrap_err(),
+        ConfigError::DuplicateKeyId {
+            issuer: es.issuer.issuer().into(),
+            kid: es.issuer.key_id().to_owned(),
+        }
+    );
+}
+
+/// Rotation: while an issuer's set holds the old key and the new one, a token under either
+/// verifies, chosen by its `kid`; once the old key is removed, its tokens are refused.
+#[test]
+fn keys_rotate_by_kid() {
+    for setup in setups()
+        .into_iter()
+        .filter(|setup| setup.kind == Kind::Workload)
+    {
+        let (old, new) = (setup.issuer, setup.other);
+        let under_old = setup.token().build();
+        let under_new = setup.token().signed_by(new).kid(new.key_id()).build();
+
+        let mut both = setup.config();
+        both.keys.keys.extend(new.jwk_set().keys);
+        let verifier = build(vec![both]).unwrap();
+        assert_eq!(
+            verify(&verifier, &under_old),
+            Ok(setup.principal()),
+            "{setup:?}"
+        );
+        assert_eq!(
+            verify(&verifier, &under_new),
+            Ok(setup.principal()),
+            "{setup:?}"
+        );
+        // The kid chooses the key: the new key's signature under the old key's kid fails.
+        let mislabelled = setup.token().signed_by(new).kid(old.key_id()).build();
+        assert_eq!(
+            verify(&verifier, &mislabelled),
+            Err(VerifyError::BadSignature),
+            "{setup:?}"
+        );
+
+        let mut new_only = setup.config();
+        new_only.keys = new.jwk_set();
+        let verifier = build(vec![new_only]).unwrap();
+        assert_eq!(
+            verify(&verifier, &under_new),
+            Ok(setup.principal()),
+            "{setup:?}"
+        );
+        assert_eq!(
+            verify(&verifier, &under_old),
+            Err(VerifyError::UnknownKeyId),
+            "{setup:?}"
+        );
+    }
+}

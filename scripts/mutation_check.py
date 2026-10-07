@@ -771,11 +771,11 @@ mutate("identity-config-no-subjects-allowed", "a workload issuer with no subject
 mutate("identity-config-empty-groups-claim-allowed", "a user issuer with an unnamed groups claim is configured", V,
        "            IssuerKind::User { groups_claim } if groups_claim.is_empty() => {", "            IssuerKind::User { groups_claim } if false && groups_claim.is_empty() => {")
 mutate("identity-config-no-keys-allowed", "an issuer with no keys is configured", V,
-       "        if config.keys.keys.is_empty() {", "        if false {")
+       "        if keys.is_empty() {", "        if keys.is_empty() && first_unfit.is_some() {")
 mutate("identity-config-key-without-kid-allowed", "a key with no kid is given a blank one", V,
        "                .ok_or_else(|| ConfigError::KeyWithoutId(issuer.clone()))?;", "                .unwrap_or_default();")
 mutate("identity-config-duplicate-kid-allowed", "two keys can share a kid", V,
-       "            if keys.insert(kid.clone(), decoded).is_some() {", "            if keys.insert(kid.clone(), decoded).is_some() && false {")
+       "            if !kids.insert(kid.clone()) {", "            if !kids.insert(kid.clone()) && false {")
 FITS = "    shape && declared_algorithm && declared_use && declared_operations"
 mutate("identity-config-key-shape-ignored", "a key of the wrong type is accepted for the issuer's algorithm", V,
        FITS, "    declared_algorithm && declared_use && declared_operations")
@@ -804,6 +804,15 @@ mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measure
 mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
        "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
        "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
+mutate("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer", V,
+       "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
+       "                Err(unfit) => {\n                    return Err(unfit.error(issuer, kid, config.algorithm));\n                }")
+mutate("identity-config-no-usable-key-allowed", "an issuer none of whose keys can verify is configured", V,
+       "        if keys.is_empty() {", "        if keys.is_empty() && first_unfit.is_none() {")
+mutate("identity-config-last-unfit-key-reported", "the last key that cannot verify is reported, not the first", V,
+       "                    first_unfit.get_or_insert((kid, unfit));", "                    first_unfit = Some((kid, unfit));")
+mutate("identity-config-duplicate-kid-among-usable-only", "a kid may repeat if one of its keys is left out", V,
+       "            if !kids.insert(kid.clone()) {", "            if !kids.insert(kid.clone()) && decoding_key(jwk, config.algorithm).is_ok() {")
 LEEWAY = "        if config.leeway > MAX_LEEWAY {"
 mutate("identity-config-leeway-unbounded", "an issuer can be configured with any leeway", V, LEEWAY, "        if false {")
 mutate("identity-config-leeway-boundary", "a leeway of exactly the maximum is refused", V, LEEWAY, "        if config.leeway >= MAX_LEEWAY {")
