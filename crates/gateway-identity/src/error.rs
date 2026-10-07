@@ -65,6 +65,10 @@ pub enum VerifyError {
     /// The header's `alg` is not the issuer's configured algorithm, including `none`.
     #[error("the token's algorithm is not the one its issuer is configured with")]
     AlgorithmNotAllowed,
+    /// The header has a `crit` member, which names extensions this verifier would have to
+    /// understand. It understands none.
+    #[error("the token's header names critical extensions")]
+    CriticalHeader,
     /// The header has no `kid`.
     #[error("the token names no key id")]
     MissingKeyId,

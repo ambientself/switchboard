@@ -87,6 +87,12 @@ impl TokenVerifier {
         if header.alg != entry.algorithm.jwt() {
             return Err(VerifyError::AlgorithmNotAllowed);
         }
+        // `crit` names header parameters a verifier must understand to accept the token (RFC
+        // 7515 section 4.1.11). This verifier understands none, so a token carrying `crit` is
+        // refused whatever it lists, even nothing.
+        if carries_crit(token) {
+            return Err(VerifyError::CriticalHeader);
+        }
         let kid = header.kid.as_deref().ok_or(VerifyError::MissingKeyId)?;
         let key = entry.keys.get(kid).ok_or(VerifyError::UnknownKeyId)?;
 
@@ -255,6 +261,18 @@ fn header_error(token: &str) -> VerifyError {
     } else {
         VerifyError::MalformedToken
     }
+}
+
+/// Whether a token's header has a `crit` member, of any value. Read from the header's JSON
+/// rather than from `jsonwebtoken`'s parse of it, which reads a `crit` of `null` as no `crit`.
+/// A header that cannot be read is counted as having one, so this can only refuse.
+fn carries_crit(token: &str) -> bool {
+    token
+        .split('.')
+        .next()
+        .and_then(|header| URL_SAFE_NO_PAD.decode(header).ok())
+        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
+        .is_none_or(|header| header.contains_key("crit"))
 }
 
 /// Checks the signature under `key` and returns the claims it covers.

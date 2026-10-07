@@ -257,6 +257,25 @@ fn cases() -> Vec<Case> {
         refused("a header with no alg", MalformedToken, |t, _| {
             t.header("alg", serde_json::Value::Null)
         }),
+        refused(
+            "a crit header naming an extension",
+            CriticalHeader,
+            |t, _| {
+                t.header("crit", json!(["https://example.test/ext"]))
+                    .header("https://example.test/ext", json!(true))
+            },
+        ),
+        refused(
+            "a crit header naming a registered parameter",
+            CriticalHeader,
+            |t, _| t.header("crit", json!(["exp"])),
+        ),
+        refused("an empty crit header", CriticalHeader, |t, _| {
+            t.header("crit", json!([]))
+        }),
+        refused("a crit header of null", CriticalHeader, |t, _| {
+            t.header("crit", serde_json::Value::Null)
+        }),
         refused("no kid", MissingKeyId, |t, _| t.without_kid()),
         refused("a kid the issuer does not have", UnknownKeyId, |t, _| {
             t.kid("no-such-key")
@@ -605,6 +624,7 @@ fn the_table_has_a_case_for_every_way_a_token_can_be_refused() {
             VerifyError::MissingIssuer => "MissingIssuer".into(),
             VerifyError::UnknownIssuer => "UnknownIssuer".into(),
             VerifyError::AlgorithmNotAllowed => "AlgorithmNotAllowed".into(),
+            VerifyError::CriticalHeader => "CriticalHeader".into(),
             VerifyError::MissingKeyId => "MissingKeyId".into(),
             VerifyError::UnknownKeyId => "UnknownKeyId".into(),
             VerifyError::UnusableKey => "UnusableKey".into(),
@@ -629,6 +649,7 @@ fn the_table_has_a_case_for_every_way_a_token_can_be_refused() {
         "MissingIssuer",
         "UnknownIssuer",
         "AlgorithmNotAllowed",
+        "CriticalHeader",
         "MissingKeyId",
         "UnknownKeyId",
         "BadSignature",

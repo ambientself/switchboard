@@ -735,6 +735,13 @@ mutate("identity-groups-ignored", "a user's groups are not read", V,
        "                groups: groups_of(&claims, groups_claim)?,", "                groups: BTreeSet::new(),")
 mutate("identity-groups-claim-name-ignored", "groups are always read from `groups`", V,
        "                groups: groups_of(&claims, groups_claim)?,", '                groups: groups_of(&claims, "groups")?,')
+mutate("identity-crit-ignored", "a token carrying crit is checked as if it did not", V,
+       "        if carries_crit(token) {", "        if false {")
+CRIT = '        .is_none_or(|header| header.contains_key("crit"))'
+mutate("identity-crit-null-ignored", "a crit of null is read as no crit", V, CRIT,
+       '        .is_none_or(|header| header.get("crit").is_some_and(|crit| !crit.is_null()))')
+mutate("identity-crit-empty-allowed", "a crit that lists nothing is accepted", V, CRIT,
+       '        .is_none_or(|header| header.get("crit").is_some_and(|crit| crit.as_array().is_none_or(|names| !names.is_empty())))')
 mutate("identity-token-size-unbounded", "a token of any size is parsed", V,
        "    if token.len() > MAX_TOKEN_BYTES {", "    if false && token.len() > MAX_TOKEN_BYTES {")
 mutate("identity-clock-is-the-system-clock", "verification reads the system time, not the injected clock", V,
