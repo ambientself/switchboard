@@ -1,7 +1,9 @@
 //! `mock-docs-server`: the mock document server, configured by environment variables.
 //!
 //! - `MOCK_DOCS_TOKEN_FILE`: a file holding the one accepted bearer token; or
-//! - `MOCK_DOCS_TOKEN_SHA256`: the token's SHA-256 in hex. Exactly one of the two.
+//! - `MOCK_DOCS_TOKEN_SHA256`: the token's SHA-256 in hex; or
+//! - `MOCK_DOCS_TOKEN_SHA256_FILE`: a file holding the token's SHA-256 in hex. Exactly one of
+//!   the three.
 //! - `MOCK_DOCS_LISTEN`: the MCP endpoint's address, default `0.0.0.0:8080`.
 //! - `MOCK_DOCS_ADMIN_LISTEN`: the admin endpoint's address. Unset, there is none.
 //! - `MOCK_DOCS_TOOLS`: the tools offered at start, comma-separated, default

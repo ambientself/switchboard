@@ -1,36 +1,41 @@
-# The gateway's configuration for the kind demo.
-#
-# TODO(integration): the shape follows plan26.md section 5 (#26 boot gates) and planDemo.md
-# (#9a identity loader, #10 audit, #14b registry, #14e reload). Keep it in step with
-# deploy/compose/config/gateway.toml; only the issuer, its keys, the subjects and the hosts differ.
+# The gateway's deployment file for the kind demo: `switchboard --config=<this file>`. The format
+# is in crates/gateway/src/deployment.rs. Relative paths are read from this file's directory.
+# Keep it in step with deploy/compose/config/gateway.toml; only the issuer, its keys, the team
+# manifest, the hosts and the credential's path differ.
 
-listen = "0.0.0.0:8080"
 deployment = "kind-demo"
+listen = "0.0.0.0:8080"
+
+[http]
 allowed_hosts = ["gateway.switchboard.svc.cluster.local", "gateway.switchboard.svc"]
 allowed_origins = []
 
 [registry]
-directory = "/etc/switchboard/registry"
+# ConfigMap `registry`, mounted without subPath, so an edit reaches the running gateway.
+file = "/etc/switchboard/registry/registry.toml"
 poll_seconds = 2
 
 [identity]
+mode = "enforce"
+
 # The cluster's own ServiceAccount issuer. demo.sh checks that the cluster reports exactly this
 # issuer and copies its keys into ConfigMap cluster-issuer-keys at deploy time. The keys are
-# copied once and not rotated or fetched.
-[[identity.enforce]]
+# copied once: they are not fetched, and not rotated.
+[[identity.issuers]]
 issuer = "https://kubernetes.default.svc.cluster.local"
 kind = "workload"
 audiences = ["switchboard"]
 algorithm = "RS256"
 keys_file = "/etc/switchboard/issuer/jwks.json"
+subjects_file = "teams.toml"
 max_lifetime_seconds = 3600
 leeway_seconds = 30
 
-# The team manifest. team-a's `stranger` ServiceAccount is deliberately absent.
-[identity.enforce.subjects]
-"system:serviceaccount:team-a:mock-workload" = "team-a"
-"system:serviceaccount:team-b:mock-workload" = "team-b"
-
 [audit]
-store = "postgres"
+mode = "postgres"
 url_env = "SWITCHBOARD_DATABASE_URL"
+
+[credentials]
+# Secret switchboard/docs-credential, a dummy value. The proxy sends it upstream; the workload
+# never sees it.
+docs-credential = "/var/run/secrets/switchboard/docs-credential"

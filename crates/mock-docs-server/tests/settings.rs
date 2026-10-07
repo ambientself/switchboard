@@ -44,18 +44,33 @@ fn exactly_one_credential_must_be_configured() {
     let digest = sha256_hex(TOKEN);
     let file = token_file("both", TOKEN);
     let file = file.to_str().unwrap();
+    let digest_file = token_file("digest", &format!("{digest}\n"));
+    let digest_file = digest_file.to_str().unwrap();
     assert_eq!(settings(&[]).unwrap_err(), ConfigError::NoCredential);
-    assert_eq!(
-        settings(&[
+    for two in [
+        [
             ("MOCK_DOCS_TOKEN_FILE", file),
-            ("MOCK_DOCS_TOKEN_SHA256", &digest)
-        ])
-        .unwrap_err(),
-        ConfigError::TwoCredentials
-    );
+            ("MOCK_DOCS_TOKEN_SHA256", &digest),
+        ],
+        [
+            ("MOCK_DOCS_TOKEN_FILE", file),
+            ("MOCK_DOCS_TOKEN_SHA256_FILE", digest_file),
+        ],
+        [
+            ("MOCK_DOCS_TOKEN_SHA256", &digest),
+            ("MOCK_DOCS_TOKEN_SHA256_FILE", digest_file),
+        ],
+    ] {
+        assert_eq!(
+            settings(&two).unwrap_err(),
+            ConfigError::TwoCredentials,
+            "{two:?}"
+        );
+    }
     for vars in [
         [("MOCK_DOCS_TOKEN_FILE", file)],
         [("MOCK_DOCS_TOKEN_SHA256", &digest)],
+        [("MOCK_DOCS_TOKEN_SHA256_FILE", digest_file)],
     ] {
         let accepted = settings(&vars).unwrap().config.accepted;
         assert!(accepted.accepts(TOKEN));
@@ -88,6 +103,28 @@ fn the_digest_must_be_64_hex_digits_in_either_case() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn a_digest_file_must_hold_64_hex_digits() {
+    let digest = sha256_hex(TOKEN);
+    // Holding the token itself, not its hash, is refused rather than hashed.
+    for (name, contents) in [
+        ("token-not-digest", TOKEN),
+        ("short", &digest[..62]),
+        ("empty", ""),
+    ] {
+        let path = token_file(name, contents);
+        assert_eq!(
+            settings(&[("MOCK_DOCS_TOKEN_SHA256_FILE", path.to_str().unwrap())]).unwrap_err(),
+            ConfigError::BadDigest,
+            "{name}"
+        );
+    }
+    assert!(matches!(
+        settings(&[("MOCK_DOCS_TOKEN_SHA256_FILE", "/nonexistent/digest")]).unwrap_err(),
+        ConfigError::TokenFile(_)
+    ));
 }
 
 /// A digest that differs from the token's in one byte, at either end or in the middle, does not

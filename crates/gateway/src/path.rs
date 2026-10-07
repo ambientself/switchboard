@@ -20,6 +20,9 @@
 //!   They still need a verified caller, because `admit` ran first.
 //! - `tools/list` selects the caller's profile and returns the tools on the surface that pass
 //!   the core's checks, with their catalog definitions. No row.
+//!
+//! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
+//! everything from it, so a registry reload never splits one request across two versions.
 //! - `tools/call` reads the call's resources through the adapter registered for the approved
 //!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
 //!   answers. A denial is answered with the sentence the row holds.
@@ -62,6 +65,7 @@ use serde_json::Value;
 
 use crate::boot::{GateState, Gates};
 use crate::catalog::ToolDefinition;
+use crate::policy::ServedPolicy;
 
 /// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
 pub const MAX_TOOL_USE_ID: usize = 128;
@@ -171,6 +175,7 @@ impl RequestPath {
             }),
             Verification::Failed(failure) => {
                 tracing::warn!(
+                    event = "identity_failed",
                     deployment = %gates.deployment(),
                     cause = %failure.detail(),
                     "refused a caller whose identity was not proved"
@@ -247,23 +252,9 @@ impl RequestPath {
         let Caller::Proved(principal) = caller else {
             return Vec::new();
         };
-        let caller = self.caller_context(principal, surface);
-        self.entries(list_tools(self.inner.gates.snapshot(), &caller))
-    }
-
-    fn entries(&self, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
-        let catalog = self.inner.gates.catalog();
-        tools
-            .into_iter()
-            .filter_map(|tool| match catalog.definition(&tool.name) {
-                Some(definition) => Some(entry(tool, definition)),
-                None => {
-                    // The boot gates refuse an approved tool without a definition.
-                    tracing::error!(tool = %tool.name, "an approved tool has no definition");
-                    None
-                }
-            })
-            .collect()
+        let policy = self.inner.gates.policy();
+        let caller = self.caller_context(&policy, principal, surface);
+        entries(&policy, list_tools(policy.snapshot(), &caller))
     }
 
     /// `tools/call`: design section 6's steps 1 to 9.
@@ -276,7 +267,36 @@ impl RequestPath {
             );
             return Reply::Denied(IDENTITY_DISABLED.to_owned());
         };
-        let snapshot = gates.snapshot().clone();
+        let policy = gates.policy();
+        self.decide_and_run(&policy, principal, surface, call).await
+    }
+}
+
+fn entries(policy: &ServedPolicy, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
+    let catalog = policy.catalog();
+    tools
+        .into_iter()
+        .filter_map(|tool| match catalog.definition(&tool.name) {
+            Some(definition) => Some(entry(tool, definition)),
+            None => {
+                // The boot gates refuse an approved tool without a definition.
+                tracing::error!(tool = %tool.name, "an approved tool has no definition");
+                None
+            }
+        })
+        .collect()
+}
+
+impl RequestPath {
+    async fn decide_and_run(
+        &self,
+        policy: &ServedPolicy,
+        principal: Proved<Principal>,
+        surface: SurfaceName,
+        call: ToolCall,
+    ) -> Reply {
+        let gates = &self.inner.gates;
+        let snapshot = policy.snapshot();
         let ToolCall {
             name,
             arguments,
@@ -284,14 +304,14 @@ impl RequestPath {
         } = call;
         let arguments = Value::Object(arguments);
         let requested = RequestedTool::new(name);
-        let resources = self.resources(&snapshot, &requested, &arguments);
+        let resources = self.resources(snapshot, &requested, &arguments);
         let context = CallContext {
-            caller: self.caller_context(principal, surface),
+            caller: self.caller_context(policy, principal, surface),
             tool: requested,
             resources,
         };
         let decided = Instant::now();
-        let decision = decide(&snapshot, &context);
+        let decision = decide(snapshot, &context);
         let decide_us = micros(decided.elapsed());
         let metadata = RequestMetadata {
             tool_use_id: bounded_tool_use_id(tool_use_id),
@@ -390,10 +410,15 @@ impl RequestPath {
 
     /// Design section 6's step 3: the profile, from the configured rules. There is no
     /// delegation verifier yet.
-    fn caller_context(&self, principal: Proved<Principal>, surface: SurfaceName) -> CallerContext {
+    fn caller_context(
+        &self,
+        policy: &ServedPolicy,
+        principal: Proved<Principal>,
+        surface: SurfaceName,
+    ) -> CallerContext {
         let gates = &self.inner.gates;
         CallerContext {
-            profile: gates.selector().select(principal.get()),
+            profile: policy.select(principal.get()),
             principal,
             delegation: None,
             surface,

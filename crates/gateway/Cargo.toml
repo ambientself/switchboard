@@ -10,12 +10,18 @@ publish.workspace = true
 # What a running gateway is built from. The testkit's fakes and the MCP SDK are test tools: they
 # stay in [dev-dependencies], and tests/dependencies.rs holds this list to an allowlist.
 [dependencies]
+# The audit store on Postgres, with its boot checks and migrations.
+audit-postgres = { path = "../audit-postgres" }
 # The HTTP server: HTTP/1.1 only, with nothing axum would add by default (form and query
 # extractors, JSON, its own tracing).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# The connector for a proxied MCP server, and the file-backed credential it sends upstream.
+connector-proxy = { path = "../connector-proxy" }
 gateway-core = { path = "../gateway-core" }
 gateway-identity = { path = "../gateway-identity" }
 gateway-mcp = { path = "../gateway-mcp" }
+# The registry file: the policy, the approved definitions and the argument adapters.
+gateway-registry = { path = "../gateway-registry" }
 # The request vocabulary the MCP adapter speaks: methods, header maps and status codes.
 http = "1"
 # Tells a body over the size limit apart from one that could not be read.
@@ -24,12 +30,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Parses the audit database URL and connects without TLS; the store itself is audit-postgres.
+tokio-postgres = "0.7"
+# The deployment file and the team manifests.
+toml = "1"
 tracing = "0.1"
 # Structured logs: one JSON object per line.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }
+# The proxied server the wiring tests forward to.
+mock-docs-server = { path = "../mock-docs-server" }
+# Reads the mock server's log of which bearers reached it.
+sha2 = "0.10"
 # The loopback tests write HTTP by hand over a socket.
 tokio = { version = "1", features = ["io-util", "sync"] }
 trybuild = "1"

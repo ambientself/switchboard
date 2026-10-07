@@ -654,17 +654,24 @@ dependencies = [
 name = "gateway"
 version = "0.1.0"
 dependencies = [
+ "audit-postgres",
  "axum",
+ "connector-proxy",
  "gateway-core",
  "gateway-identity",
  "gateway-mcp",
+ "gateway-registry",
  "gateway-testkit",
  "http",
  "http-body-util",
+ "mock-docs-server",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "tokio-postgres",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "trybuild",
@@ -685,6 +692,7 @@ dependencies = [
 name = "gateway-dev"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "gateway",
  "gateway-core",

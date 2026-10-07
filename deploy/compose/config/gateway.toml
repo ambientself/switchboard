@@ -1,41 +1,43 @@
-# The gateway's configuration for the Compose demo.
-#
-# TODO(integration): the shape follows plan26.md section 5 (#26 boot gates) and planDemo.md
-# (#9a identity loader, #10 audit, #14b registry, #14e reload). The gateway's own config types
-# decide the real field names; change this file to match them, and the kind copy in
-# deploy/kind/base/config/gateway.toml with it.
+# The gateway's deployment file for the Compose demo: `switchboard --config=<this file>`.
+# The format is in crates/gateway/src/deployment.rs. Relative paths are read from this file's
+# directory. Keep it in step with deploy/kind/base/config/gateway.toml; only the issuer, its
+# keys, the team manifest, the hosts and the credential's path differ.
 
-listen = "0.0.0.0:8080"
 deployment = "compose-demo"
+listen = "0.0.0.0:8080"
+
+[http]
 # Host is matched without the port. `gateway` is the Compose service name; the other two are
 # how the host reaches the published port.
 allowed_hosts = ["gateway", "127.0.0.1", "localhost"]
 allowed_origins = []
 
 [registry]
-# A directory, not a file: an edit that replaces the file keeps working (#14e).
-directory = "/etc/switchboard/registry"
+# Inside a mounted directory, not a mounted file, so replacing the file is seen (planDemo 14e).
+file = "/etc/switchboard/registry/registry.toml"
 poll_seconds = 2
 
 [identity]
-# The Compose dev issuer. Development only: it signs whatever subject it is asked for, and it
-# is reachable only on the Compose network.
-[[identity.enforce]]
+mode = "enforce"
+
+# The Compose dev issuer. Development only: it signs tokens for the subjects it is started with,
+# and it is reachable only on the Compose network.
+[[identity.issuers]]
 issuer = "https://dev-issuer.switchboard.test"
 kind = "workload"
 audiences = ["switchboard"]
 algorithm = "RS256"
-# Written by the dev issuer at start-up to the shared volume.
+# Written by the dev issuer at start-up to the shared volume. Read once, at boot.
 keys_file = "/shared/issuer/jwks.json"
+subjects_file = "teams.toml"
 max_lifetime_seconds = 3600
 leeway_seconds = 30
 
-# The team manifest: subject to team. `workload:team-a:stranger` is deliberately absent.
-[identity.enforce.subjects]
-"workload:team-a:mock-workload" = "team-a"
-"workload:team-b:mock-workload" = "team-b"
-
 [audit]
-store = "postgres"
-# The URL is read from this environment variable, so it is not written in this file.
+mode = "postgres"
+# The URL, which holds the dummy password, is read from this environment variable.
 url_env = "SWITCHBOARD_DATABASE_URL"
+
+[credentials]
+# A Compose secret holding a dummy value. The proxy sends it upstream; the workload never sees it.
+docs-credential = "/run/secrets/docs-credential"

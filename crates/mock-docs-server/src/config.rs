@@ -20,6 +20,9 @@ pub const LOGGED_PREFIX_HEX: usize = 12;
 pub const TOKEN_FILE_VAR: &str = "MOCK_DOCS_TOKEN_FILE";
 /// The variable holding the hex SHA-256 of the one accepted bearer credential.
 pub const TOKEN_SHA256_VAR: &str = "MOCK_DOCS_TOKEN_SHA256";
+/// The variable naming a file that holds the hex SHA-256 of the one accepted bearer
+/// credential, so a deployment can hand the server a secret file holding only the hash.
+pub const TOKEN_SHA256_FILE_VAR: &str = "MOCK_DOCS_TOKEN_SHA256_FILE";
 /// The variable holding the MCP endpoint's listen address.
 pub const LISTEN_VAR: &str = "MOCK_DOCS_LISTEN";
 /// The variable holding the admin endpoint's listen address. Unset, there is no admin endpoint.
@@ -108,14 +111,20 @@ pub struct Settings {
 
 impl Settings {
     /// Reads the settings through `var`, which returns a variable's value or `None` if it is
-    /// unset. Exactly one of [`TOKEN_FILE_VAR`] and [`TOKEN_SHA256_VAR`] must be set; anything
-    /// missing, contradictory or unreadable is an error, and the server does not start.
+    /// unset. Exactly one of [`TOKEN_FILE_VAR`], [`TOKEN_SHA256_VAR`] and
+    /// [`TOKEN_SHA256_FILE_VAR`] must be set; anything missing, contradictory or unreadable is
+    /// an error, and the server does not start.
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let accepted = match (var(TOKEN_FILE_VAR), var(TOKEN_SHA256_VAR)) {
-            (Some(path), None) => read_token_file(Path::new(&path))?,
-            (None, Some(hex)) => AcceptedCredential::sha256_hex(&hex)?,
-            (None, None) => return Err(ConfigError::NoCredential),
-            (Some(_), Some(_)) => return Err(ConfigError::TwoCredentials),
+        let accepted = match (
+            var(TOKEN_FILE_VAR),
+            var(TOKEN_SHA256_VAR),
+            var(TOKEN_SHA256_FILE_VAR),
+        ) {
+            (Some(path), None, None) => read_token_file(Path::new(&path))?,
+            (None, Some(hex), None) => AcceptedCredential::sha256_hex(&hex)?,
+            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,
+            (None, None, None) => return Err(ConfigError::NoCredential),
+            _ => return Err(ConfigError::TwoCredentials),
         };
         let listen = address(
             LISTEN_VAR,
@@ -175,11 +184,12 @@ impl fmt::Display for ConfigError {
         match self {
             Self::NoCredential => write!(
                 formatter,
-                "set one of {TOKEN_FILE_VAR} and {TOKEN_SHA256_VAR}: the server accepts one credential"
+                "set one of {TOKEN_FILE_VAR}, {TOKEN_SHA256_VAR} and {TOKEN_SHA256_FILE_VAR}: \
+                 the server accepts one credential"
             ),
             Self::TwoCredentials => write!(
                 formatter,
-                "set only one of {TOKEN_FILE_VAR} and {TOKEN_SHA256_VAR}"
+                "set only one of {TOKEN_FILE_VAR}, {TOKEN_SHA256_VAR} and {TOKEN_SHA256_FILE_VAR}"
             ),
             Self::TokenFile(reason) => {
                 write!(formatter, "cannot read {TOKEN_FILE_VAR}: {reason}")
@@ -207,6 +217,12 @@ fn read_token_file(path: &Path) -> Result<AcceptedCredential, ConfigError> {
         return Err(ConfigError::EmptyToken);
     }
     Ok(AcceptedCredential::token(token))
+}
+
+fn read_digest_file(path: &Path) -> Result<AcceptedCredential, ConfigError> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| ConfigError::TokenFile(error.to_string()))?;
+    AcceptedCredential::sha256_hex(&text)
 }
 
 fn address(var: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {

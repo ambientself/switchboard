@@ -10,6 +10,8 @@ publish.workspace = true
 # Development only. This crate depends on the testkit, which nothing in a running gateway may,
 # so the switchboard-dev binary lives here and not in the gateway crate.
 [dependencies]
+# The development issuer's HTTP server, as the gateway builds its own.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 gateway = { path = "../gateway" }
 gateway-core = { path = "../gateway-core" }
 gateway-identity = { path = "../gateway-identity" }

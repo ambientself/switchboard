@@ -2,7 +2,13 @@
 //!
 //! ```text
 //! switchboard-dev [--port PORT] [--tokens PATH] [--once]
+//! switchboard-dev issuer --listen=ADDRESS --issuer=NAME --keys-out=FILE --subject=S [--subject=S ...]
 //! ```
+//!
+//! `switchboard-dev issuer` runs the development issuer for the Compose demo (see
+//! [`gateway_dev::issuer`]): it writes its JWK set to `FILE`, then serves `GET /token` for the
+//! named subjects on `ADDRESS` until interrupted. It logs one JSON line at start and one per
+//! token asked for. The rest of this describes the command without `issuer`.
 //!
 //! 1. Starts the gateway on `127.0.0.1:PORT` (default [`DEFAULT_PORT`]; 0 picks a free one)
 //!    over the fixture world: two in-process issuers on the system clock, the fixture policy and
@@ -36,7 +42,103 @@ use tracing_subscriber::EnvFilter;
 /// The port the gateway listens on unless `--port` says otherwise.
 const DEFAULT_PORT: u16 = 8471;
 
-const USAGE: &str = "usage: switchboard-dev [--port PORT] [--tokens PATH] [--once]";
+const USAGE: &str = "usage: switchboard-dev [--port PORT] [--tokens PATH] [--once]\n       \
+     switchboard-dev issuer --listen=ADDRESS --issuer=NAME --keys-out=FILE --subject=S [--subject=S ...]";
+
+struct IssuerArguments {
+    listen: std::net::SocketAddr,
+    issuer: String,
+    keys_out: PathBuf,
+    subjects: std::collections::BTreeSet<String>,
+}
+
+/// `--name=value` or `--name value`.
+fn flag_value(
+    argument: &str,
+    rest: &mut impl Iterator<Item = String>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    if let Some(value) = argument.strip_prefix(&format!("{name}=")) {
+        return Ok(Some(value.to_owned()));
+    }
+    if argument == name {
+        return rest.next().map(Some).ok_or(format!("{name} needs a value"));
+    }
+    Ok(None)
+}
+
+fn issuer_arguments(arguments: impl Iterator<Item = String>) -> Result<IssuerArguments, String> {
+    let mut arguments = arguments;
+    let (mut listen, mut issuer, mut keys_out) = (None, None, None);
+    let mut subjects = std::collections::BTreeSet::new();
+    while let Some(argument) = arguments.next() {
+        if let Some(value) = flag_value(&argument, &mut arguments, "--listen")? {
+            listen = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("`{value}` is not an address"))?,
+            );
+        } else if let Some(value) = flag_value(&argument, &mut arguments, "--issuer")? {
+            issuer = Some(value);
+        } else if let Some(value) = flag_value(&argument, &mut arguments, "--keys-out")? {
+            keys_out = Some(PathBuf::from(value));
+        } else if let Some(value) = flag_value(&argument, &mut arguments, "--subject")? {
+            if value.is_empty() || !subjects.insert(value.clone()) {
+                return Err(format!("subject `{value}` is empty or given twice"));
+            }
+        } else {
+            return Err(format!("unknown argument `{argument}`"));
+        }
+    }
+    Ok(IssuerArguments {
+        listen: listen.ok_or("--listen is required")?,
+        issuer: issuer
+            .filter(|issuer| !issuer.is_empty())
+            .ok_or("--issuer is required")?,
+        keys_out: keys_out.ok_or("--keys-out is required")?,
+        subjects: (!subjects.is_empty())
+            .then_some(subjects)
+            .ok_or("at least one --subject is required")?,
+    })
+}
+
+async fn run_issuer(arguments: IssuerArguments) -> ExitCode {
+    let issuer =
+        match gateway_dev::issuer::DevIssuer::new(&arguments.issuer, arguments.subjects.clone()) {
+            Ok(issuer) => issuer,
+            Err(error) => return fail(&format!("cannot make a key: {error}")),
+        };
+    if let Err(error) = issuer.write_keys(&arguments.keys_out) {
+        return fail(&format!(
+            "cannot write `{}`: {error}",
+            arguments.keys_out.display()
+        ));
+    }
+    let listener = match tokio::net::TcpListener::bind(arguments.listen).await {
+        Ok(listener) => listener,
+        Err(error) => return fail(&format!("cannot listen on {}: {error}", arguments.listen)),
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "dev_issuer_ready",
+            "issuer": issuer.name(),
+            "kid": issuer.key_id(),
+            "keys_out": arguments.keys_out.display().to_string(),
+            "listen": listener.local_addr().map_or_else(|_| arguments.listen.to_string(), |bound| bound.to_string()),
+            "subjects": arguments.subjects,
+            "note": "Development only: this issuer signs for anyone who can reach it.",
+        })
+    );
+    let _ = io::stdout().flush();
+    tokio::select! {
+        served = gateway_dev::issuer::serve(listener, issuer) => match served {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(&format!("the listener failed: {error}")),
+        },
+        () = interrupted() => ExitCode::SUCCESS,
+    }
+}
 
 struct Arguments {
     port: u16,
@@ -86,6 +188,15 @@ fn fail(what: &str) -> ExitCode {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("issuer") {
+        return match issuer_arguments(std::env::args().skip(2)) {
+            Ok(arguments) => run_issuer(arguments).await,
+            Err(problem) => {
+                eprintln!("switchboard-dev issuer: {problem}\n{USAGE}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let arguments = match arguments() {
         Ok(arguments) => arguments,
         Err(problem) if problem.is_empty() => {

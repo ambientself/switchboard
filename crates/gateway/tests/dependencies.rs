@@ -9,23 +9,30 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-const ALLOWED: [&str; 12] = [
+const ALLOWED: [&str; 17] = [
+    "audit-postgres",
     "axum",
+    "connector-proxy",
     "gateway-core",
     "gateway-identity",
     "gateway-mcp",
+    "gateway-registry",
     "http",
     "http-body-util",
     "serde",
     "serde_json",
     "thiserror",
     "tokio",
+    "tokio-postgres",
+    "toml",
     "tracing",
     "tracing-subscriber",
 ];
 
-/// Never in a running gateway, whatever else the allowlist comes to hold.
-const TEST_ONLY: [&str; 2] = ["gateway-testkit", "rmcp"];
+/// Never in a running gateway, whatever else the allowlist comes to hold. The mock server plays
+/// a third party in tests and the demo; the gateway dev crate holds the fixture wiring and the
+/// development issuer, built on the testkit.
+const TEST_ONLY: [&str; 4] = ["gateway-testkit", "rmcp", "mock-docs-server", "gateway-dev"];
 
 /// The crate names in one `[section]` of the manifest.
 fn section(name: &str) -> Vec<String> {

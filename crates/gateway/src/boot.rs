@@ -18,6 +18,12 @@
 //!    of the rule's kind; no two rules share a key; the snapshot does not hold [`NO_PROFILE`];
 //!    and every profile a rule names exists.
 //!
+//! [`check_registry`] runs the same gates for a deployment whose policy comes from the registry
+//! file (`gateway-registry`), which has already checked its own tools, definitions, adapters
+//! and rules. Its connectors are registered with [`Wiring::proxied`]: each one is wrapped in
+//! the registry's argument check, and its resource adapter is the one the registry approved
+//! for each tool. Every approved tool's server must have a connector.
+//!
 //! A disabled gate starts with a warning logged here; the HTTP layer repeats it while the
 //! gateway runs.
 
@@ -30,11 +36,15 @@ use gateway_core::{
     SnapshotError, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
+use gateway_registry::{Registry, RulePrincipal};
 use thiserror::Error;
 
 use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection};
+use crate::policy::{LivePolicy, ServedPolicy};
+use crate::proxied::{CheckedArguments, RegistryResources};
+use crate::reload::Reloader;
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
 
@@ -119,6 +129,33 @@ pub enum BootError {
         /// The issuer the rule names.
         issuer: Issuer,
     },
+    /// A connector registered with [`Wiring::proxied`] in a deployment whose policy is not the
+    /// registry's, so nothing would read its tools' arguments.
+    #[error(
+        "connector `{0}` is registered as a proxied server, which needs the policy to come from \
+         the registry"
+    )]
+    ProxiedWithoutRegistry(ConnectorName),
+    /// A connector registered with its own resource adapter in a deployment whose policy is the
+    /// registry's, where every tool's adapter comes from the registry.
+    #[error(
+        "connector `{0}` is registered with its own resource adapter, but this deployment's \
+         tools read their resources as the registry says"
+    )]
+    AdapterBesideRegistry(ConnectorName),
+}
+
+/// The parts of a deployment's configuration that are not its policy, for [`check_registry`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settings {
+    /// The deployment's name, recorded on every audit row.
+    pub deployment: DeploymentName,
+    /// Whether and how callers are verified.
+    pub identity: IdentitySection,
+    /// Whether audit is explicitly disabled.
+    pub audit: AuditSection,
+    /// What the HTTP endpoint accepts.
+    pub http: HttpSection,
 }
 
 /// What code supplies to the gateway, beside its configuration: the clock, the audit store, and
@@ -127,6 +164,7 @@ pub struct Wiring {
     clock: Arc<dyn Clock>,
     audit_store: Option<Arc<dyn AuditStore>>,
     connectors: Vec<(ConnectorName, Registered)>,
+    proxied: Vec<(ConnectorName, Arc<dyn Connector>)>,
 }
 
 impl Wiring {
@@ -136,7 +174,20 @@ impl Wiring {
             clock,
             audit_store: None,
             connectors: Vec::new(),
+            proxied: Vec::new(),
         }
+    }
+
+    /// Registers the connector for the registry's server `name`. [`check_registry`] wraps it
+    /// in the registry's argument check, and reads its tools' resources with the adapters the
+    /// registry approved; [`check`] refuses it.
+    pub fn proxied(
+        mut self,
+        name: impl Into<ConnectorName>,
+        connector: Arc<dyn Connector>,
+    ) -> Self {
+        self.proxied.push((name.into(), connector));
+        self
     }
 
     /// Records every call in `store`. Configuration must not also disable audit.
@@ -167,9 +218,11 @@ impl fmt::Debug for Wiring {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let connectors: Vec<&ConnectorName> =
             self.connectors.iter().map(|(name, _)| name).collect();
+        let proxied: Vec<&ConnectorName> = self.proxied.iter().map(|(name, _)| name).collect();
         f.debug_struct("Wiring")
             .field("audit_store", &self.audit_store.is_some())
             .field("connectors", &connectors)
+            .field("proxied", &proxied)
             .finish_non_exhaustive()
     }
 }
@@ -192,10 +245,17 @@ pub struct Gates {
     audit_store: Arc<dyn AuditStore>,
     audit_state: GateState,
     http: HttpSection,
-    snapshot: Arc<PolicySnapshot>,
-    catalog: ToolCatalog,
-    selector: ProfileSelector,
+    policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
+}
+
+/// What the gateway was started with that a policy reload cannot change: the issuers, which
+/// profile rules must name, and the registry's servers and routes, which the connectors were
+/// built for.
+pub(crate) struct Basis {
+    pub(crate) issuers: Option<Issuers>,
+    pub(crate) registry: Registry,
+    pub(crate) connectors: BTreeSet<ConnectorName>,
 }
 
 impl fmt::Debug for Gates {
@@ -204,7 +264,7 @@ impl fmt::Debug for Gates {
             .field("deployment", &self.deployment)
             .field("identity_state", &self.identity_state)
             .field("audit_state", &self.audit_state)
-            .field("revision", self.snapshot.revision())
+            .field("revision", self.policy.current().revision())
             .field("connectors", &self.connectors.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -251,19 +311,14 @@ impl Gates {
         &self.http.allowed_origins
     }
 
-    /// The policy snapshot.
-    pub fn snapshot(&self) -> &Arc<PolicySnapshot> {
-        &self.snapshot
+    /// The policy served now: its snapshot, definitions and profile rules, taken together.
+    pub fn policy(&self) -> Arc<ServedPolicy> {
+        self.policy.current()
     }
 
-    /// Every approved tool's definition.
-    pub fn catalog(&self) -> &ToolCatalog {
-        &self.catalog
-    }
-
-    /// The profile selector.
-    pub fn selector(&self) -> &ProfileSelector {
-        &self.selector
+    /// The policy snapshot served now.
+    pub fn snapshot(&self) -> Arc<PolicySnapshot> {
+        self.policy.current().snapshot().clone()
     }
 
     /// The connector registered as `name`.
@@ -287,7 +342,11 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
         clock,
         audit_store,
         connectors: registrations,
+        proxied,
     } = wiring;
+    if let Some((name, _)) = proxied.into_iter().next() {
+        return Err(BootError::ProxiedWithoutRegistry(name));
+    }
     let issuers = configured_issuers(&config.identity);
     let (identity, identity_state) = identity_gate(config.identity, clock.clone())?;
     let (audit_store, audit_state) = audit_gate(&config.audit, audit_store)?;
@@ -342,19 +401,7 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
         return Err(BootError::UnknownProfile(unknown.clone()));
     }
 
-    if identity_state == GateState::Disabled {
-        tracing::warn!(
-            deployment = %config.deployment,
-            "identity is disabled: callers are not verified, no tools are listed and every call \
-             is refused"
-        );
-    }
-    if audit_state == GateState::Disabled {
-        tracing::warn!(
-            deployment = %config.deployment,
-            "audit is disabled: calls are allowed and run with no record of them"
-        );
-    }
+    warn_disabled(&config.deployment, identity_state, audit_state);
     Ok(Gates {
         deployment: config.deployment,
         clock,
@@ -363,11 +410,134 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
         audit_store,
         audit_state,
         http: config.http,
-        snapshot: Arc::new(snapshot),
-        catalog,
-        selector,
+        policy: Arc::new(LivePolicy::new(ServedPolicy::from_config(
+            snapshot, catalog, selector,
+        ))),
         connectors,
     })
+}
+
+/// Runs the boot gates for a deployment whose policy is the registry file's, in the order the
+/// [module documentation](self) gives. Returns the gates, and the [`Reloader`] that replaces
+/// their policy with a new version of the registry file.
+pub fn check_registry(
+    settings: Settings,
+    registry: Registry,
+    wiring: Wiring,
+) -> Result<(Gates, Reloader), BootError> {
+    let Wiring {
+        clock,
+        audit_store,
+        connectors: registrations,
+        proxied,
+    } = wiring;
+    if let Some((name, _)) = registrations.into_iter().next() {
+        return Err(BootError::AdapterBesideRegistry(name));
+    }
+    let issuers = configured_issuers(&settings.identity);
+    let (identity, identity_state) = identity_gate(settings.identity, clock.clone())?;
+    let (audit_store, audit_state) = audit_gate(&settings.audit, audit_store)?;
+    if settings.http.allowed_hosts.is_empty() {
+        return Err(BootError::NoAllowedHosts);
+    }
+
+    let served = ServedPolicy::from_registry(&registry)?;
+    let live = Arc::new(LivePolicy::new(served));
+    let mut connectors = BTreeMap::new();
+    for (name, connector) in proxied {
+        let registered = Registered {
+            connector: Arc::new(CheckedArguments::new(connector, live.clone())),
+            resources: Arc::new(RegistryResources::new(live.clone())),
+        };
+        if connectors.insert(name.clone(), registered).is_some() {
+            return Err(BootError::DuplicateConnector(name));
+        }
+    }
+    let basis = Basis {
+        issuers,
+        registry,
+        connectors: connectors.keys().cloned().collect(),
+    };
+    check_registry_policy(&basis.registry, &live.current(), &basis)?;
+
+    warn_disabled(&settings.deployment, identity_state, audit_state);
+    let reloader = Reloader::new(live.clone(), basis);
+    let gates = Gates {
+        deployment: settings.deployment,
+        clock,
+        identity,
+        identity_state,
+        audit_store,
+        audit_state,
+        http: settings.http,
+        policy: live,
+        connectors,
+    };
+    Ok((gates, reloader))
+}
+
+/// The gates a registry's policy must pass, at boot and on every reload: every approved tool's
+/// server has a connector; with identity enforced, every rule names a configured issuer of its
+/// kind; the snapshot does not define [`NO_PROFILE`]; and every profile a rule names exists.
+pub(crate) fn check_registry_policy(
+    registry: &Registry,
+    policy: &ServedPolicy,
+    basis: &Basis,
+) -> Result<(), BootError> {
+    for (tool, route) in registry.routes() {
+        if !basis.connectors.contains(&route.server) {
+            return Err(BootError::UnregisteredConnector {
+                tool: tool.clone(),
+                connector: route.server.clone(),
+            });
+        }
+    }
+    if let Some(issuers) = &basis.issuers {
+        for rule in registry.profile_rules().rules() {
+            let (kind, configured) = match rule.principal {
+                RulePrincipal::Workload => ("workload", &issuers.workloads),
+                RulePrincipal::UserInGroup(_) => ("user", &issuers.users),
+            };
+            if !configured.contains(&rule.issuer) {
+                return Err(BootError::RuleIssuerNotConfigured {
+                    kind,
+                    issuer: rule.issuer.clone(),
+                });
+            }
+        }
+    }
+    if policy
+        .snapshot()
+        .profile(&ProfileName::new(NO_PROFILE))
+        .is_some()
+    {
+        return Err(BootError::ReservedProfile);
+    }
+    if let Some(unknown) = policy
+        .selected_profiles()
+        .into_iter()
+        .find(|profile| policy.snapshot().profile(profile).is_none())
+    {
+        return Err(BootError::UnknownProfile(unknown));
+    }
+    Ok(())
+}
+
+/// Logs a warning for each gate that is turned off.
+fn warn_disabled(deployment: &DeploymentName, identity: GateState, audit: GateState) {
+    if identity == GateState::Disabled {
+        tracing::warn!(
+            %deployment,
+            "identity is disabled: callers are not verified, no tools are listed and every call \
+             is refused"
+        );
+    }
+    if audit == GateState::Disabled {
+        tracing::warn!(
+            %deployment,
+            "audit is disabled: calls are allowed and run with no record of them"
+        );
+    }
 }
 
 fn identity_gate(
@@ -406,7 +576,8 @@ fn audit_gate(
 }
 
 /// The configured workload and user issuers, or `None` when identity is not enforced.
-struct Issuers {
+#[derive(Clone)]
+pub(crate) struct Issuers {
     workloads: BTreeSet<Issuer>,
     users: BTreeSet<Issuer>,
 }
