@@ -262,29 +262,87 @@ mutate(
     "        None => Err(Reason::DelegationDisagrees(\n            DelegationProblem::PrincipalHasNoTeam {",
     "        None if true => Ok(()),\n        None => Err(Reason::DelegationDisagrees(\n            DelegationProblem::PrincipalHasNoTeam {",
 )
+DELEGATION_LISTS = "        Some(delegation) if !delegation.get().tools.contains(&tool.name) => {"
 mutate(
     "delegation-empty-list-narrows-nothing",
     "a delegation that lists no tools narrows nothing",
     SRC + "decision.rs",
-    "Some(permitted) if !permitted.contains(&tool.name)",
-    "Some(permitted) if !permitted.is_empty() && !permitted.contains(&tool.name)",
+    DELEGATION_LISTS,
+    "        Some(delegation) if !delegation.get().tools.is_empty() && !delegation.get().tools.contains(&tool.name) => {",
 )
 mutate(
     "delegation-tools-may-be-omitted",
-    "a delegation's tool list may be left out, and then narrows nothing",
+    "a delegation's tool list may be left out",
     SRC + "principal.rs",
-    '    #[serde(deserialize_with = "present")]\n    pub tools',
-    "    #[serde(default)]\n    pub tools",
+    "    pub tools: BTreeSet<ToolName>,",
+    "    #[serde(default)]\n    pub tools: BTreeSet<ToolName>,",
+)
+mutate_all(
+    "delegation-null-tools-read-as-empty",
+    "a delegation whose tool list is null reads as one that lists no tools",
+    (
+        SRC + "principal.rs",
+        "    pub tools: BTreeSet<ToolName>,\n}",
+        "    #[serde(deserialize_with = \"null_is_empty\")]\n    pub tools: BTreeSet<ToolName>,\n}\n\n"
+        "fn null_is_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeSet<ToolName>, D::Error> {\n"
+        "    Ok(Option::<BTreeSet<ToolName>>::deserialize(deserializer)?.unwrap_or_default())\n}",
+    ),
 )
 
 # --- Check 5: the classification -----------------------------------------------------------
 
+DENIED_EVERYWHERE = "        Classification::Write | Classification::Destructive\n    );"
 mutate(
     "destructive-permitted-by-profile",
     "a destructive tool is allowed by a profile that lists destructive",
     SRC + "decision.rs",
-    "    let permitted = tool.classification != Classification::Destructive\n        && profile",
-    "    let permitted = profile",
+    DENIED_EVERYWHERE,
+    "        Classification::Write\n    );",
+)
+mutate(
+    "write-permitted-by-profile",
+    "a direct write is allowed by a profile that lists write",
+    SRC + "decision.rs",
+    DENIED_EVERYWHERE,
+    "        Classification::Destructive\n    );",
+)
+mutate(
+    "propose-denied-everywhere",
+    "a proposal is denied in every profile, like a direct write",
+    SRC + "decision.rs",
+    DENIED_EVERYWHERE,
+    "        Classification::Propose | Classification::Write | Classification::Destructive\n    );",
+)
+PROFILE_LISTS = "    let permitted = !denied_everywhere && profile.classifications.contains(&tool.classification);"
+for id, description, replacement in [
+    (
+        "profile-ignored",
+        "a profile permits every classification not denied everywhere, whatever it lists",
+        "!denied_everywhere",
+    ),
+    (
+        "read-permitted-by-every-profile",
+        "every profile permits a read, whether or not it lists `read`",
+        "!denied_everywhere\n        && (tool.classification == Classification::Read\n            || profile.classifications.contains(&tool.classification))",
+    ),
+    (
+        "profile-permits-lesser-classifications",
+        "a profile permits every classification ordered at or below one it lists",
+        "!denied_everywhere\n        && profile\n            .classifications\n            .iter()\n            .any(|listed| tool.classification <= *listed)",
+    ),
+    (
+        "empty-profile-permits-everything",
+        "a profile that lists no classification permits every one not denied everywhere",
+        "!denied_everywhere\n        && (profile.classifications.is_empty()\n            || profile.classifications.contains(&tool.classification))",
+    ),
+]:
+    mutate(id, description, SRC + "decision.rs", PROFILE_LISTS, f"    let permitted = {replacement};")
+mutate(
+    "classification-write-parses-as-propose",
+    "`write` in configuration reads as propose, and `propose` is refused",
+    SRC + "classification.rs",
+    'Classification::Propose => "propose",',
+    'Classification::Propose => "write",',
 )
 CLASSIFICATION_MATCH = "            .find(|classification| classification.as_str() == value)"
 for id, description, replacement in [
@@ -408,8 +466,9 @@ mutate("snapshot-unapproved-tool", "a surface may serve an unapproved tool", SRC
 for struct in ("Surface", "ApprovedTool"):
     mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "policy.rs",
            f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
-mutate("unknown-fields-AuditRecord", "AuditRecord accepts unknown fields", SRC + "audit.rs",
-       "#[serde(deny_unknown_fields)]\npub struct AuditRecord {", "pub struct AuditRecord {")
+for struct in ("AuditRecord", "RecordedResource"):
+    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "audit.rs",
+           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
 mutate_all(
     "surface-restriction-default",
     "a surface with no principal restriction written reads as unrestricted",
@@ -532,6 +591,8 @@ for field, old, new in [
     ("profile", "        profile: call.caller.profile.clone(),", '        profile: "x".into(),'),
     ("connector", "        connector: tool.map(|tool| tool.connector.clone()),", "        connector: None,"),
     ("classification", "        classification: tool.map(|tool| tool.classification),", "        classification: None,"),
+    ("resources", "        resources,\n        resources_omitted,", "        resources: { let _ = resources; RecordedResources::Named(Vec::new()) },\n        resources_omitted,"),
+    ("resources-omitted", "        resources_omitted,\n        decision,", "        resources_omitted: { let _ = resources_omitted; 0 },\n        decision,"),
     ("tool-use-id", "        tool_use_id: metadata.tool_use_id,", "        tool_use_id: None,"),
     ("claimed-team", "        claimed_team: metadata.claimed_team,", "        claimed_team: None,"),
     ("revision", "        policy_revision,\n        proved_principal", '        policy_revision: { let _ = policy_revision; PolicyRevision::new("x") },\n        proved_principal'),
@@ -554,6 +615,53 @@ for variant in ("Allow", "Deny"):
            f"    /// The call was {'allowed' if variant == 'Allow' else 'denied'}.\n    #[serde(rename = \"x\")]\n    {variant},")
 mutate("latency-not-written", "latency is not serialized", SRC + "audit.rs",
        "    pub latency_ms: u64,", "    #[serde(skip)]\n    pub latency_ms: u64,")
+RECORDED_TAKE = "        .take(MAX_RECORDED_RESOURCES)\n"
+mutate("record-resources-uncapped", "the row records every resource a call names", SRC + "audit.rs", RECORDED_TAKE, "")
+mutate("record-resources-cap-short", "the row records one resource fewer than it should", SRC + "audit.rs", RECORDED_TAKE,
+       "        .take(MAX_RECORDED_RESOURCES - 1)\n")
+mutate("record-resources-cap-constant", "a row records at most 63 resources, not 64", SRC + "audit.rs",
+       "pub const MAX_RECORDED_RESOURCES: usize = 64;", "pub const MAX_RECORDED_RESOURCES: usize = 63;")
+mutate("record-resources-reordered", "the row records resources in reverse order", SRC + "audit.rs",
+       "        .copied()\n" + RECORDED_TAKE, "        .copied()\n        .rev()\n" + RECORDED_TAKE)
+mutate("record-resources-repeats-kept", "a resource named twice is recorded twice", SRC + "audit.rs",
+       "        .filter(|resource| seen.insert(*resource))\n", "        .filter(|resource| seen.insert(*resource) || true)\n")
+OMITTED = "    let omitted = distinct.len().saturating_sub(kept.len());"
+mutate("record-resources-omitted-miscounted", "the row's omitted count is off by one", SRC + "audit.rs",
+       OMITTED, "    let omitted = (distinct.len() + 1).saturating_sub(kept.len());")
+mutate("record-resources-omitted-counts-repeats", "the row's omitted count includes repeats", SRC + "audit.rs",
+       OMITTED, "    let omitted = named.len().saturating_sub(kept.len());")
+mutate("record-resources-unknown-as-none", "unknown resources are recorded as an empty list", SRC + "audit.rs",
+       "        return (RecordedResources::Unknown, 0);", "        return (RecordedResources::Named(Vec::new()), 0);")
+DENIED_KEPT = (
+    "    if let Some(denied) = denied\n"
+    "        && !kept.contains(&denied)\n"
+    "    {\n"
+    "        kept.truncate(MAX_RECORDED_RESOURCES - 1);\n"
+    "        kept.push(denied);\n"
+    "    }\n"
+)
+mutate("record-resources-denied-dropped", "a resource denial past the cap leaves its resource off the row", SRC + "audit.rs",
+       DENIED_KEPT, "    let _ = denied;\n")
+mutate("record-resources-denied-not-passed", "begin does not tell the row which resource a denial names", SRC + "audit.rs",
+       "        } => Some(resource),\n        _ => None,\n", "        } => { let _ = resource; None }\n        _ => None,\n")
+mutate("record-resources-denied-appended", "a resource denial past the cap makes the row hold one more than the cap", SRC + "audit.rs",
+       "        kept.truncate(MAX_RECORDED_RESOURCES - 1);\n", "")
+mutate("record-resources-denied-first", "a resource denial past the cap is recorded first, not in the order named", SRC + "audit.rs",
+       "        kept.push(denied);\n", "        kept.insert(0, denied);\n")
+for field, cap in (("system", "sentences::MAX_RENDERED"), ("kind", "sentences::MAX_RENDERED"), ("identifier", "MAX_RECORDED_IDENTIFIER")):
+    line = f"            {field}: sentences::safe(&resource.{field}, {cap}),"
+    mutate(f"record-resource-{field}-unescaped", f"a recorded resource's {field} is not made safe", SRC + "audit.rs",
+           line, f"            {field}: resource.{field}.clone(),")
+    mutate(f"record-resource-{field}-uncapped", f"a recorded resource's {field} is not cut short", SRC + "audit.rs",
+           line, f"            {field}: sentences::safe(&resource.{field}, usize::MAX),")
+mutate("record-resource-identifier-cap-128", "a recorded identifier is cut at 128 characters, like the tool name", SRC + "audit.rs",
+       "            identifier: sentences::safe(&resource.identifier, MAX_RECORDED_IDENTIFIER),",
+       "            identifier: sentences::safe(&resource.identifier, sentences::MAX_RENDERED),")
+mutate("record-resource-identifier-cap-short", "a recorded identifier is cut one character early", SRC + "audit.rs",
+       "pub const MAX_RECORDED_IDENTIFIER: usize = 2048;", "pub const MAX_RECORDED_IDENTIFIER: usize = 2047;")
+mutate("record-resource-system-kind-swapped", "a recorded resource's system and kind are swapped", SRC + "audit.rs",
+       "            system: sentences::safe(&resource.system, sentences::MAX_RENDERED),\n            kind: sentences::safe(&resource.kind, sentences::MAX_RENDERED),",
+       "            system: sentences::safe(&resource.kind, sentences::MAX_RENDERED),\n            kind: sentences::safe(&resource.system, sentences::MAX_RENDERED),")
 mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: { let _ = recorded; Outcome::Ok },\n            latency_ms,")
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",
@@ -573,7 +681,7 @@ mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not t
 SENTENCE_NAMES = [
     "PROFILE_UNKNOWN", "TOOL_NOT_AVAILABLE", "INVALID_TOOL_NAME", "SURFACE_NOT_PERMITTED",
     "TOOL_NOT_IN_DELEGATION", "DELEGATION_MISSING", "DELEGATION_TEAM_MISMATCH",
-    "DELEGATION_WITHOUT_TEAM", "DESTRUCTIVE", "CLASSIFICATION_NOT_PERMITTED",
+    "DELEGATION_WITHOUT_TEAM", "DESTRUCTIVE", "DIRECT_WRITE", "CLASSIFICATION_NOT_PERMITTED",
     "RESOURCE_OUTSIDE_LIMIT", "RESOURCES_UNKNOWN", "RESOURCES_NONE_NAMED", "WORKLOAD", "USER",
     "IDENTITY_FAILURE", "AUDIT_FAILURE",
 ]
@@ -599,6 +707,9 @@ def sentence_mutations(source: str) -> None:
 mutate("sentence-surfaces-differ", "tool not on this surface reads differently from an unknown tool", SRC + "sentences.rs",
        "        Reason::ToolNotOnSurface { tool, surface } => fill(\n            TOOL_NOT_AVAILABLE,",
        "        Reason::ToolNotOnSurface { tool, surface } => fill(\n            TOOL_NOT_IN_DELEGATION,")
+mutate("sentence-propose-reads-as-write", "a proposal the profile does not permit reads as a direct write", SRC + "sentences.rs",
+       "            classification: Classification::Write,\n            ..\n        } => fill(DIRECT_WRITE,",
+       "            classification: Classification::Write | Classification::Propose,\n            ..\n        } => fill(DIRECT_WRITE,")
 mutate("sentence-system-kind-swapped", "the resource sentence swaps system and kind", SRC + "sentences.rs",
        '("system", Text(&resource.system)),\n                    ("kind", Text(&resource.kind)),',
        '("system", Text(&resource.kind)),\n                    ("kind", Text(&resource.system)),')
@@ -611,6 +722,8 @@ mutate("safe-no-escape", "control characters are not escaped", SRC + "sentences.
        "            c => c.escape_default().collect(),", "            c => c.to_string(),")
 mutate("safe-backtick", "a backtick is not escaped", SRC + "sentences.rs",
        "            '`' => \"\\\\`\".to_owned(),", "            '`' => \"`\".to_owned(),")
+mutate("safe-backslash", "a backslash is not escaped, so escaping cannot be reversed", SRC + "sentences.rs",
+       "            '\\\\' => \"\\\\\\\\\".to_owned(),\n", "")
 mutate("safe-no-cap", "values are not cut short", SRC + "sentences.rs",
        "        if length + added > cap {", "        if false && length + added > cap {")
 
