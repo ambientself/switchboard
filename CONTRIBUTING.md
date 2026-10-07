@@ -23,7 +23,7 @@ each error is still the intended one.
 python3 scripts/mutation_check.py
 ```
 
-It breaks each guard in the core, one at a time, in a temporary copy of the workspace, and
+It breaks each guard in the gateway crates (the core, the identity verifier and the test fakes), one at a time, in a temporary copy of the workspace, and
 requires the test suite to fail. It needs Python 3.12 or later and nothing else (if your
 `python3` is older, `uv run --python 3.13 scripts/mutation_check.py`), never touches
 the working tree, and prints one line per mutation. It takes a long while (a full test run per

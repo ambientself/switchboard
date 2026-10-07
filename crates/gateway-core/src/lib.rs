@@ -24,6 +24,7 @@
 pub mod audit;
 mod classification;
 mod connector;
+mod credential;
 mod decision;
 mod names;
 mod policy;
@@ -34,6 +35,7 @@ mod sentences;
 pub use audit::{AuditGuard, AuditRecord, AuditStore};
 pub use classification::{Classification, UnrecognizedClassification};
 pub use connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
+pub use credential::{CredentialError, CredentialHandle, CredentialSource};
 pub use decision::{
     CallContext, CallerContext, Decision, DelegationProblem, Reason, ReasonKind, ResourceProblem,
     Verdict, decide, list_tools,

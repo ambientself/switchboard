@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Break each guard in the policy core, one at a time, and require the tests to notice.
+"""Break each guard in the gateway crates, one at a time, and require the tests to notice.
 
     python3 scripts/mutation_check.py              # every mutation
     python3 scripts/mutation_check.py --list       # what would run
@@ -47,6 +47,10 @@ if sys.version_info < (3, 12):
 ROOT = Path(__file__).resolve().parent.parent
 CRATE = "crates/gateway-core/"
 SRC = CRATE + "src/"
+IDENTITY = "crates/gateway-identity/"
+IDENTITY_SRC = IDENTITY + "src/"
+TESTKIT = "crates/gateway-testkit/"
+TESTKIT_SRC = TESTKIT + "src/"
 REGRESSIONS = CRATE + "tests/properties.proptest-regressions"
 TIMEOUT_SECONDS = 1200
 
@@ -723,6 +727,336 @@ mutate("safe-backslash", "a backslash is not escaped, so escaping cannot be reve
 mutate("safe-no-cap", "values are not cut short", SRC + "sentences.rs",
        "        if length + added > cap {", "        if false && length + added > cap {")
 
+# --- The credential source -----------------------------------------------------------------
+
+mutate_all(
+    "credential-source-takes-unproved-principal",
+    "a credential can be asked for on behalf of a principal nobody proved",
+    (SRC + "credential.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
+    (TESTKIT_SRC + "credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
+    (TESTKIT_SRC + "credentials.rs", "        let principal = caller.get();\n", "        let principal = caller;\n"),
+    (TESTKIT_SRC + "connector.rs", "self.credentials.credential_for(&connector, &caller).await", "self.credentials.credential_for(&connector, caller.get()).await"),
+    # The one test helper that calls the source directly is changed to match, so that what is
+    # left to fail is the compile-fail case for a plain principal, which compiles under this
+    # mutation: that is the guard under test.
+    (TESTKIT + "tests/fakes.rs", '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))', '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller.get()))'),
+)
+
+# --- The identity verifier: the order and each check ---------------------------------------
+
+V = IDENTITY_SRC + "verifier.rs"
+SIGNATURE = "        let claims = verify_signature(token, entry.algorithm, key)?;\n"
+mutate("identity-signature-not-checked", "claims are read without checking the signature", V, SIGNATURE,
+       "        let claims: Claims = jsonwebtoken::dangerous::insecure_decode_claims(token).map_err(|_| VerifyError::MalformedToken)?;\n"
+       "        let _ = (entry.algorithm, key);\n")
+mutate("identity-subject-looked-up-before-signature", "an unknown subject is refused before its signature is checked", V, SIGNATURE,
+       "        let early: Claims = jsonwebtoken::dangerous::insecure_decode_claims(token).map_err(|_| VerifyError::MalformedToken)?;\n"
+       "        if let IssuerKind::Workload { subjects } = &entry.kind {\n"
+       "            let known = early.get(\"sub\").and_then(Value::as_str).is_some_and(|s| subjects.contains_key(&gateway_core::Subject::from(s)));\n"
+       "            if !known {\n                return Err(VerifyError::UnknownSubject);\n            }\n        }\n" + SIGNATURE)
+mutate("identity-exp-not-checked", "exp is read but not checked", V,
+       "        let expires_at = check_not_expired(&claims, now, entry.leeway)?;\n",
+       '        let expires_at = date(&claims, "exp", Claim::ExpiresAt)?;\n')
+mutate("identity-exp-optional", "a token with no exp never expires", V,
+       '    let expires_at = date(claims, "exp", Claim::ExpiresAt)?;\n',
+       '    let expires_at = if claims.contains_key("exp") { date(claims, "exp", Claim::ExpiresAt)? } else { u64::MAX };\n')
+mutate("identity-exp-boundary", "a token is valid at exactly exp plus leeway", V,
+       "    if now >= expires_at.saturating_add(leeway) {", "    if now > expires_at.saturating_add(leeway) {")
+mutate("identity-exp-ignores-leeway", "exp is checked with no leeway", V,
+       "    if now >= expires_at.saturating_add(leeway) {", "    if now >= expires_at.saturating_add(0 * leeway) {")
+mutate("identity-exp-leeway-doubled", "exp is checked with twice the leeway", V,
+       "    if now >= expires_at.saturating_add(leeway) {", "    if now >= expires_at.saturating_add(2 * leeway) {")
+mutate("identity-nbf-not-checked", "nbf is not checked", V,
+       "        check_not_early(&claims, now, entry.leeway)?;\n", "")
+mutate("identity-nbf-boundary", "a token is refused at exactly now plus leeway", V,
+       "    if not_before > now.saturating_add(leeway) {", "    if not_before >= now.saturating_add(leeway) {")
+mutate("identity-nbf-ignores-leeway", "nbf is checked with no leeway", V,
+       "    if not_before > now.saturating_add(leeway) {", "    if not_before > now.saturating_add(0 * leeway) {")
+mutate("identity-aud-not-checked", "aud is not checked", V,
+       "        check_audience(&claims, &entry.audiences)?;\n", "")
+mutate("identity-aud-any", "any audience that is named is accepted", V,
+       "    if named.iter().any(|audience| accepted.contains(*audience)) {", "    if !named.is_empty() || accepted.is_empty() {")
+mutate("identity-aud-first-only", "only the first audience in an array is considered", V,
+       "    if named.iter().any(|audience| accepted.contains(*audience)) {", "    if named.first().is_some_and(|audience| accepted.contains(*audience)) {")
+mutate("identity-lifetime-not-checked", "the lifetime ceiling and iat are not checked", V,
+       "        check_lifetime(&claims, expires_at, now, entry)?;\n", "        let _ = (expires_at, now);\n")
+mutate("identity-lifetime-boundary", "a lifetime exactly at the ceiling is refused", V,
+       "    if lifetime > entry.max_lifetime {", "    if lifetime >= entry.max_lifetime {")
+mutate("identity-iat-future-not-checked", "a token issued in the future is accepted", V,
+       "    if issued_at > now.saturating_add(entry.leeway) {", "    if false {")
+mutate("identity-exp-before-iat-wraps", "exp before iat is read as a lifetime of zero", V,
+       "        .checked_sub(issued_at)\n        .ok_or(VerifyError::ExpiresBeforeIssue)?;", "        .checked_sub(issued_at)\n        .unwrap_or(0);")
+mutate("identity-sub-optional", "a token with no sub is accepted with an empty subject", V,
+       "        None => Err(VerifyError::MissingClaim(Claim::Subject)),", '        None => Ok("".into()),')
+
+# --- The identity verifier: the shape of each claim ----------------------------------------
+
+DATE = "        Some(value) => value.as_u64().ok_or(VerifyError::MalformedClaim(claim)),"
+mutate("identity-date-fraction-truncated", "a fractional date is rounded down", V, DATE,
+       "        Some(value) => value.as_u64().or_else(|| value.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)).ok_or(VerifyError::MalformedClaim(claim)),")
+mutate("identity-date-digits-parsed", "a date written as a string of digits is read as a number", V, DATE,
+       "        Some(value) => value.as_u64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).ok_or(VerifyError::MalformedClaim(claim)),")
+mutate("identity-date-negative-is-epoch", "a negative date reads as the epoch", V, DATE,
+       "        Some(value) => value.as_u64().or_else(|| value.as_i64().map(|_| 0)).ok_or(VerifyError::MalformedClaim(claim)),")
+mutate("identity-nbf-null-is-absent", "an nbf of null is treated as no nbf", V,
+       '    if !claims.contains_key("nbf") {', '    if claims.get("nbf").is_none_or(Value::is_null) {')
+mutate("identity-iss-array-read", "an iss that is an array is read from its first element", V,
+       '            .get("iss")\n            .and_then(Value::as_str)',
+       '            .get("iss")\n            .and_then(|v| v.as_str().or_else(|| v.get(0).and_then(Value::as_str)))')
+mutate("identity-aud-array-skips-non-strings", "an aud array's non-string members are skipped", V,
+       "            .map(Value::as_str)\n            .collect::<Option<_>>()\n            .ok_or(VerifyError::MalformedClaim(Claim::Audience))?,",
+       "            .filter_map(Value::as_str)\n            .collect(),")
+mutate("identity-aud-other-type-names-none", "an aud of another type names no audience rather than being malformed", V,
+       "        Some(_) => return Err(VerifyError::MalformedClaim(Claim::Audience)),", "        Some(_) => Vec::new(),")
+mutate("identity-sub-may-be-empty", "an empty sub is accepted", V,
+       "        Some(Value::String(subject)) if !subject.is_empty() => Ok(subject.as_str().into()),",
+       "        Some(Value::String(subject)) => Ok(subject.as_str().into()),")
+mutate("identity-sub-any-type-read-as-text", "a sub that is not a string is read as its JSON text", V,
+       "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Subject)),", "        Some(other) => Ok(other.to_string().as_str().into()),")
+mutate("identity-groups-skip-non-strings", "a groups array's non-string members are skipped", V,
+       "            .map(|group| group.as_str().map(GroupId::from))\n            .collect::<Option<_>>()\n            .ok_or(VerifyError::MalformedClaim(Claim::Groups)),",
+       "            .filter_map(|group| group.as_str().map(GroupId::from))\n            .map(Ok::<_, VerifyError>)\n            .collect(),")
+mutate("identity-groups-null-is-none", "a groups claim of null is a user in no group", V,
+       "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}",
+       "        Some(Value::Null) => Ok(BTreeSet::new()),\n        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}")
+mutate("identity-groups-string-is-one-group", "a groups claim that is a string is one group", V,
+       "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}",
+       "        Some(Value::String(one)) => Ok([GroupId::from(one.as_str())].into()),\n        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}")
+
+mutate("identity-kid-not-required","the header's kid is ignored and the first key is used", V,
+       "        let kid = header.kid.as_deref().ok_or(VerifyError::MissingKeyId)?;\n"
+       "        let key = entry.keys.get(kid).ok_or(VerifyError::UnknownKeyId)?;\n",
+       "        let _ = &header.kid;\n        let key = entry.keys.values().next().ok_or(VerifyError::UnknownKeyId)?;\n")
+mutate("identity-kid-must-exist-not-checked", "an unknown kid falls back to the first key", V,
+       "        let key = entry.keys.get(kid).ok_or(VerifyError::UnknownKeyId)?;\n",
+       "        let key = entry.keys.get(kid).or_else(|| entry.keys.values().next()).ok_or(VerifyError::UnknownKeyId)?;\n")
+# The library also refuses a header algorithm that is not the validation's, so the explicit
+# check is a second line of defence. Loosening both is what shows the table notices a header
+# that names another algorithm of the same family.
+mutate_all("identity-alg-not-checked", "a header may name any algorithm of the issuer's family",
+           (V, "        if header.alg != entry.algorithm.jwt() {", "        if false {"),
+           (V, "    let mut validation = Validation::new(algorithm.jwt());", "    let mut validation = Validation::new_for_family(algorithm.jwt().family());"))
+mutate("identity-unlisted-issuer-accepted", "a token naming an unlisted issuer is checked under the first issuer", V,
+       "        self.issuers.get(issuer).ok_or(VerifyError::UnknownIssuer)",
+       "        self.issuers.get(issuer).or_else(|| self.issuers.values().next()).ok_or(VerifyError::UnknownIssuer)")
+mutate("identity-issuer-match-ignores-case", "the issuer is matched without regard to case", V,
+       "        self.issuers.get(issuer).ok_or(VerifyError::UnknownIssuer)",
+       "        self.issuers.iter().find(|(name, _)| name.eq_ignore_ascii_case(issuer)).map(|(_, entry)| entry).ok_or(VerifyError::UnknownIssuer)")
+mutate("identity-principal-ignores-issuer", "the principal's issuer is not the issuer that vouched", V,
+       "                issuer: entry.issuer.clone(),\n                subject,", '                issuer: "".into(),\n                subject,')
+mutate("identity-unknown-subject-accepted", "an unknown workload subject is given the first team in the table", V,
+       "                    .ok_or(VerifyError::UnknownSubject)?\n                    .clone();",
+       "                    .or_else(|| subjects.values().next())\n                    .ok_or(VerifyError::UnknownSubject)?\n                    .clone();")
+mutate("identity-groups-ignored", "a user's groups are not read", V,
+       "                groups: groups_of(&claims, groups_claim)?,", "                groups: BTreeSet::new(),")
+mutate("identity-groups-claim-name-ignored", "groups are always read from `groups`", V,
+       "                groups: groups_of(&claims, groups_claim)?,", '                groups: groups_of(&claims, "groups")?,')
+mutate("identity-crit-ignored", "a token carrying crit is checked as if it did not", V,
+       "        if carries_crit(token) {", "        if false {")
+CRIT = '        .is_none_or(|header| header.contains_key("crit"))'
+mutate("identity-crit-null-ignored", "a crit of null is read as no crit", V, CRIT,
+       '        .is_none_or(|header| header.get("crit").is_some_and(|crit| !crit.is_null()))')
+mutate("identity-crit-empty-allowed", "a crit that lists nothing is accepted", V, CRIT,
+       '        .is_none_or(|header| header.get("crit").is_some_and(|crit| crit.as_array().is_none_or(|names| !names.is_empty())))')
+mutate("identity-token-size-unbounded", "a token of any size is parsed", V,
+       "    if token.len() > MAX_TOKEN_BYTES {", "    if false && token.len() > MAX_TOKEN_BYTES {")
+mutate("identity-clock-is-the-system-clock", "verification reads the system time, not the injected clock", V,
+       "        let now = unix_seconds(self.clock.as_ref());", "        let now = jsonwebtoken::get_current_timestamp();")
+mutate("identity-unknown-alg-reads-as-malformed", "a header with an algorithm nobody supports is reported as malformed", V,
+       "            .is_some_and(|alg| alg.parse::<jsonwebtoken::Algorithm>().is_err());", "            .is_some_and(|alg| alg.is_empty());")
+mutate("identity-unusable-key-reads-as-bad-signature", "a key that cannot verify is reported as a bad signature", V,
+       "            jsonwebtoken::errors::ErrorKind::InvalidEcdsaKey\n            | jsonwebtoken::errors::ErrorKind::InvalidRsaKey(_)\n            | jsonwebtoken::errors::ErrorKind::InvalidKeyFormat => VerifyError::UnusableKey,\n",
+       "            jsonwebtoken::errors::ErrorKind::InvalidEcdsaKey\n            | jsonwebtoken::errors::ErrorKind::InvalidRsaKey(_)\n            | jsonwebtoken::errors::ErrorKind::InvalidKeyFormat => VerifyError::BadSignature,\n")
+
+# --- The identity verifier: configuration --------------------------------------------------
+
+mutate("identity-config-no-issuers-allowed", "checking can be on with no issuer", V,
+       "        if issuers.is_empty() {\n            return Err(ConfigError::NoIssuers);", "        if false {\n            return Err(ConfigError::NoIssuers);")
+mutate("identity-config-duplicate-issuer-allowed", "an issuer can be configured twice", V,
+       "            if entries.insert(name.clone(), entry).is_some() {", "            if entries.insert(name.clone(), entry).is_some() && false {")
+mutate("identity-config-empty-issuer-allowed", "an issuer with no name is configured", V,
+       "        if issuer.as_str().is_empty() {", "        if false {")
+mutate("identity-config-no-audience-allowed", "an issuer with no audience is configured", V,
+       "        if config.audiences.is_empty() || config.audiences.iter().any(String::is_empty) {", "        if false {")
+mutate("identity-config-empty-audience-allowed", "an issuer with an empty audience is configured", V,
+       "        if config.audiences.is_empty() || config.audiences.iter().any(String::is_empty) {", "        if config.audiences.is_empty() {")
+mutate("identity-config-zero-lifetime-allowed", "an issuer with a zero lifetime ceiling is configured", V,
+       "        if max_lifetime == 0 {", "        if false {")
+mutate("identity-config-no-subjects-allowed", "a workload issuer with no subjects is configured", V,
+       "            IssuerKind::Workload { subjects } if subjects.is_empty() => {", "            IssuerKind::Workload { subjects } if false && subjects.is_empty() => {")
+mutate("identity-config-empty-groups-claim-allowed", "a user issuer with an unnamed groups claim is configured", V,
+       "            IssuerKind::User { groups_claim } if groups_claim.is_empty() => {", "            IssuerKind::User { groups_claim } if false && groups_claim.is_empty() => {")
+mutate("identity-config-no-keys-allowed", "an issuer with no keys is configured", V,
+       "        if keys.is_empty() {", "        if keys.is_empty() && first_unfit.is_some() {")
+mutate("identity-config-key-without-kid-allowed", "a key with no kid is given a blank one", V,
+       "                .ok_or_else(|| ConfigError::KeyWithoutId(issuer.clone()))?;", "                .unwrap_or_default();")
+mutate("identity-config-duplicate-kid-allowed", "two keys can share a kid", V,
+       "            if !kids.insert(kid.clone()) {", "            if !kids.insert(kid.clone()) && false {")
+FITS = "    shape && declared_algorithm && declared_use && declared_operations"
+mutate("identity-config-key-shape-ignored", "a key of the wrong type is accepted for the issuer's algorithm", V,
+       FITS, "    declared_algorithm && declared_use && declared_operations")
+mutate("identity-config-key-curve-ignored", "an EC key on another curve is accepted for ES256", V,
+       "            params.curve == EllipticCurve::P256", "            true")
+mutate("identity-config-key-algorithm-ignored", "a key that declares another algorithm is accepted", V,
+       FITS, "    shape && declared_use && declared_operations")
+mutate("identity-config-key-use-ignored", "a key that declares itself for encryption is accepted", V,
+       FITS, "    shape && declared_algorithm && declared_operations")
+mutate("identity-config-key-ops-ignored", "a key whose key_ops leave out verify is accepted", V,
+       FITS, "    shape && declared_algorithm && declared_use")
+mutate("identity-config-key-ops-any-listed", "a key that lists any operation is accepted", V,
+       "        .is_none_or(|operations| operations.contains(&KeyOperations::Verify));",
+       "        .is_none_or(|operations| !operations.is_empty());")
+RSA_LENGTH = "        if bits < MIN_RSA_BITS {"
+mutate("identity-config-rsa-length-unchecked", "an RSA key of any length is accepted", V, RSA_LENGTH, "        if false {")
+mutate("identity-config-rsa-length-boundary", "an RSA key of exactly the minimum length is refused", V, RSA_LENGTH,
+       "        if bits <= MIN_RSA_BITS {")
+MODULUS_BITS = "    Some((significant.count() + 1) * 8 - unused)"
+mutate("identity-config-rsa-length-in-bytes", "an RSA modulus is measured in whole bytes, leading zeros and all", V, MODULUS_BITS,
+       "    Some(bytes.len() * 8 + 0 * unused + 0 * significant.count())")
+mutate("identity-config-rsa-length-ignores-top-byte", "the unused bits of a modulus's top byte are counted", V, MODULUS_BITS,
+       "    Some((significant.count() + 1) * 8 + 0 * unused)")
+mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measured as one byte", V,
+       "    let top = significant.next()?;", "    let top = significant.next().unwrap_or(&0xff);")
+mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
+       "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
+       "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
+mutate("identity-config-rsa-backend-check-skipped", "an RSA key the crypto backend cannot use is accepted", V,
+       "        rsa_key_usable(&params.n, &params.e)?;\n", "")
+mutate("identity-config-unusable-rsa-key-reported-as-unfit", "an RSA key the backend cannot use is reported as a key of the wrong kind", V,
+       "            Unfit::UnusableRsa(reason) => ConfigError::UnusableRsaKey {\n                issuer,\n                kid,\n                reason,\n            },\n",
+       "            Unfit::UnusableRsa(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },\n")
+mutate_all("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer",
+           (V, "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
+            "                Err(unfit) => {\n                    return Err(unfit.error(issuer.clone(), kid, config.algorithm));\n                }"),
+           (V, "        let mut first_unfit = None;\n", "        let mut first_unfit: Option<(String, Unfit)> = None;\n"))
+mutate("identity-config-no-usable-key-allowed", "an issuer none of whose keys can verify is configured", V,
+       "        if keys.is_empty() {", "        if keys.is_empty() && first_unfit.is_none() {")
+mutate("identity-config-last-unfit-key-reported", "the last key that cannot verify is reported, not the first", V,
+       "                    first_unfit.get_or_insert((kid, unfit));", "                    first_unfit = Some((kid, unfit));")
+mutate("identity-config-duplicate-kid-among-usable-only", "a kid may repeat if one of its keys is left out", V,
+       "            if !kids.insert(kid.clone()) {", "            if !kids.insert(kid.clone()) && decoding_key(jwk, config.algorithm).is_ok() {")
+LEEWAY = "        if config.leeway > MAX_LEEWAY {"
+mutate("identity-config-leeway-unbounded", "an issuer can be configured with any leeway", V, LEEWAY, "        if false {")
+mutate("identity-config-leeway-boundary", "a leeway of exactly the maximum is refused", V, LEEWAY, "        if config.leeway >= MAX_LEEWAY {")
+mutate("identity-config-leeway-whole-seconds", "a leeway is compared in whole seconds", V, LEEWAY,
+       "        if config.leeway.as_secs() > MAX_LEEWAY.as_secs() {")
+mutate("identity-config-second-user-issuer-allowed", "two user issuers can be configured", V,
+       "                return Err(ConfigError::SecondUserIssuer { first, second });", "                let _ = (first, second);")
+
+# --- The identity gate and the opaque failure ----------------------------------------------
+
+mutate("identity-missing-token-is-disabled", "no token reads as checking being off", IDENTITY_SRC + "identity.rs",
+       "            return Verification::Failed(IdentityFailure::new(VerifyError::MissingToken));", "            return Verification::Disabled;")
+mutate("identity-failure-is-disabled", "a refused token reads as checking being off", IDENTITY_SRC + "identity.rs",
+       "            Err(failure) => Verification::Failed(failure),", "            Err(_) => Verification::Disabled,")
+mutate("identity-enforcing-is-disabled", "configured checking is not applied", IDENTITY_SRC + "identity.rs",
+       "            IdentityConfig::Enforce(issuers) => Some(TokenVerifier::new(issuers, clock)?),", "            IdentityConfig::Enforce(issuers) => TokenVerifier::new(issuers, clock).ok().filter(|_| false),")
+mutate("identity-failure-display-names-the-cause", "the failure displays as its cause", IDENTITY_SRC + "error.rs",
+       "        f.write_str(IDENTITY_FAILURE)\n    }\n}\n\nimpl std::error::Error",
+       "        write!(f, \"{}\", self.detail)\n    }\n}\n\nimpl std::error::Error")
+mutate("identity-failure-outward-names-the-cause", "the outward sentence differs by cause", IDENTITY_SRC + "error.rs",
+       "    pub fn outward(&self) -> &'static str {\n        IDENTITY_FAILURE", "    pub fn outward(&self) -> &'static str {\n        if self.detail == VerifyError::UnknownSubject { \"unknown subject\" } else { IDENTITY_FAILURE }")
+mutate("identity-groups-claim-sentence", "the log names the groups claim as `the groups claim claim`", IDENTITY_SRC + "error.rs",
+       '            Claim::Groups => "groups claim",', '            Claim::Groups => "the groups claim claim",')
+mutate("identity-state-names","the proved state is recorded under another name", IDENTITY_SRC + "identity.rs",
+       '            VerificationState::Proved => "proved",', '            VerificationState::Proved => "ok",')
+mutate_all(
+    "identity-dependency-added",
+    "the identity crate gains a dependency outside the allowlist",
+    (IDENTITY + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
+    (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+)
+# Enabling `aws_lc_rs` itself would add crates to Cargo.lock, which `--locked` refuses before any
+# test runs, so that mutation could never give a verdict. Any second entry in the feature list
+# fails the same assertion a second backend would, and leaves the lock as it is.
+mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
+       'features = ["rust_crypto"] }\n', 'features = ["rust_crypto", "rust_crypto"] }\n')
+
+# --- The testkit's fakes: each failure switch ----------------------------------------------
+
+A = TESTKIT_SRC + "audit.rs"
+mutate("fake-audit-fail-next-begin-ignored", "a begin told to fail does not", A, "            if state.begin_failing.take() {", "            if false {")
+mutate("fake-audit-fail-next-finish-ignored", "a finish told to fail does not", A, "            if state.finish_failing.take() {", "            if false {")
+mutate("fake-audit-fail-next-is-fail-all", "a failure meant for the next call is never cleared", A,
+       "            Failing::Next => {\n                *self = Failing::Never;\n                true\n            }", "            Failing::Next => true,")
+mutate("fake-audit-fail-all-is-fail-next", "a failure meant for every call is cleared after one", A,
+       "            Failing::Always => true,", "            Failing::Always => {\n                *self = Failing::Never;\n                true\n            }")
+mutate("fake-audit-begin-hold-ignored", "a held begin is not held", A, "            state.begin_gate.clone()", "            None::<Gate>")
+mutate("fake-audit-finish-hold-ignored", "a held finish is not held", A, "            state.finish_gate.clone()", "            None::<Gate>")
+mutate("fake-audit-begin-attempts-not-counted", "begin attempts are not counted", A, "            state.begin_attempts += 1;\n", "")
+mutate("fake-audit-finish-attempts-not-counted", "finish attempts are not counted", A, "            state.finish_attempts += 1;\n", "")
+mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "            if row.completion.is_some() {", "            if false {")
+mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A,
+       "            state.rows.push(record.clone());",
+       "            state.rows.push(AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() });")
+mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A,
+       "            row.completion = Some(completion.completion().clone());",
+       "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted += 1;")
+mutate("fake-audit-row-ids-not-positions", "every row has the same identifier", A, "            Ok(AuditRowId::new(position.to_string()))", '            Ok(AuditRowId::new("0"))')
+
+C = TESTKIT_SRC + "credentials.rs"
+NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
+mutate("fake-credentials-refuse-next-ignored", "a request told to fail is issued", C, NEXT_FAILURE, "            Refusing::Next(_) => None,")
+mutate("fake-credentials-refuse-next-is-refuse-all", "a failure meant for the next request is never cleared", C, NEXT_FAILURE, "            Refusing::Next(failure) => Some(failure),")
+mutate("fake-credentials-refuse-all-ignored", "requests told to fail are issued", C, "            Refusing::Always(failure) => Some(failure),", "            Refusing::Always(_) => None,")
+mutate("fake-credentials-unavailable-is-refused", "a source told to be unavailable refuses instead", C,
+       "            Some(Failure::Unavailable) => Err(CredentialError::Unavailable(", "            Some(Failure::Unavailable) => Err(CredentialError::Refused(")
+mutate("fake-credentials-count-not-kept", "every credential has the same number", C, "            state.issued += 1;\n", "")
+mutate("fake-credentials-label-ignores-team", "every team's credential is labelled alike", C,
+       "                Some(team) => team.to_string(),", '                Some(_) => "team".to_owned(),')
+mutate("fake-credentials-requests-not-recorded", "requests are not recorded", C, "        state.requests.push(CredentialRequest {", "        let _ = (CredentialRequest {")
+
+K = TESTKIT_SRC + "connector.rs"
+mutate("fake-connector-fail-ignored", "a connector told to fail does not", K,
+       "            let fail = match state.failing {", "            let fail = match state.failing {\n                _ if true => false,")
+mutate("fake-connector-fail-next-is-fail-all", "a failure meant for the next call is never cleared", K,
+       "                Failing::Next => {\n                    state.failing = Failing::Never;\n                    true\n                }", "                Failing::Next => true,")
+mutate("fake-connector-hang-ignored", "a connector told to hang does not", K,
+       "            if let Some(gate) = hang {\n                gate.wait().await;\n            }", "            let _ = hang;")
+mutate("fake-connector-hang-next-is-hang-all", "a hang meant for the next call is never cleared", K,
+       "                    let gate = gate.clone();\n                    state.hang = Hang::Never;\n                    Some(gate)", "                    Some(gate.clone())")
+mutate("fake-connector-calls-not-recorded", "calls are not recorded", K, "            state.received.push(ReceivedCall {", "            let _ = (ReceivedCall {")
+mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "        self.state().writes.push(write);", "        drop(write);")
+mutate("fake-connector-draft-guard-ignored", "the draft tool revises a draft the gateway did not open", K,
+       "                .filter(|draft| state.drafts.get(*draft) == Some(&document))", "                .filter(|_| true)")
+mutate("fake-connector-draft-any-document", "the draft tool revises a draft through a call naming another document", K,
+       "state.drafts.get(*draft) == Some(&document)", "state.drafts.contains_key(*draft)")
+mutate("fake-connector-scope-ignored", "the scoped tool refuses nothing", K,
+       "                    match named.filter(|name| !scope.contains(*name)) {", "                    match named.filter(|name| false && !scope.contains(*name)) {")
+mutate("fake-connector-scope-any-team", "a workload may reach any team's documents through the scoped tool", K,
+       "                    state.team_scopes.get(team).cloned().unwrap_or_default()", "                    state.team_scopes.values().flatten().cloned().collect()")
+mutate("fake-connector-scope-any-group", "a user may reach any group's documents through the scoped tool", K,
+       "                    .filter_map(|group| state.group_scopes.get(group))", "                    .flat_map(|_| state.group_scopes.values())")
+mutate("fake-connector-credential-refusal-ignored", "a refused credential does not stop the call", K,
+       "                Err(_) => {\n                    return ToolOutcome::Error(\n                        \"the fixture connector could not get a credential\".into(),\n                    );\n                }",
+       "                Err(_) => String::new(),")
+mutate("fake-connector-echo-drops-credential", "the echo does not carry the credential label", K,
+       '    json!({"tool": tool, "echo": arguments, "credential": credential})', '    json!({"tool": tool, "echo": arguments, "credential": ""})')
+mutate("fake-connector-time-not-taken", "a connector told to take time does not", K, "                clock.advance(duration);", "                let _ = (clock, duration);")
+
+# --- The testkit's issuer, clocks and gate -------------------------------------------------
+
+I = TESTKIT_SRC + "issuer.rs"
+mutate("fake-issuer-without-kid-is-a-no-op", "a token cannot be made without a kid", I, '        self.header.remove("kid");\n', "")
+mutate("fake-issuer-signed-by-is-a-no-op", "a token cannot be signed by another issuer", I, "        self.signing = Signing::Other(other);\n", "        let _ = other;\n")
+mutate("fake-issuer-corrupt-is-a-no-op", "a corrupted signature is not corrupted", I, "        Some(first) => *first ^= 0x80,", "        Some(first) => *first ^= 0x00,")
+mutate("fake-issuer-jwks-document-empty", "the served JWKS document holds no keys", I,
+       "        serde_json::to_string(&self.jwk_set())", "        serde_json::to_string(&JwkSet { keys: Vec::new() })")
+mutate("fake-issuer-lifetime-ignores-iat", "a lifetime is counted from the epoch", I, "        self.expires_at(issued + lifetime)", "        self.expires_at(lifetime + 0 * issued)")
+mutate("fake-issuer-unsigned-is-signed", "an unsigned token is signed", I,
+       "            Signing::Unsigned => String::new(),", "            Signing::Unsigned => sign(&self.issuer.key, self.issuer.algorithm, &signing_input),")
+mutate("fake-issuer-jwk-has-no-kid", "the published key has no kid", I, "        jwk.common.key_id = Some(key_id.clone());\n", "")
+mutate("fake-clock-advance-is-a-no-op", "a steppable clock does not move", TESTKIT_SRC + "clock.rs", "                Some(millis.saturating_add(by))", "                Some(millis)")
+mutate("fake-gate-open-wakes-nobody", "opening a gate wakes nothing", TESTKIT_SRC + "gate.rs", "        for waker in wakers {\n            waker.wake();\n        }\n", "        drop(wakers);\n")
+F = TESTKIT_SRC + "fixture.rs"
+mutate("fake-fixture-profile-for-everyone", "every caller gets team A's profile", F,
+       "        ProfileName::new(selected.unwrap_or(UNKNOWN_PROFILE))", "        ProfileName::new(selected.map_or(PROFILE_TEAM_A, |_| PROFILE_TEAM_A))")
+mutate("fake-fixture-profile-from-first-group", "a user's profile is chosen from its first group only", F,
+       "                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))", "                    .take(1)\n                    .filter_map(|group| profile_for(&GROUP_PROFILES, group.as_str()))")
+mutate("fake-fixture-several-profiles-pick-one", "a user whose groups select two profiles gets one of them", F,
+       "                if profiles.len() == 1 {", "                if !profiles.is_empty() {")
+
+
 # --- The core's dependencies ---------------------------------------------------------------
 
 # A new crate would change Cargo.lock, which `--locked` refuses before any test runs. Moving a
@@ -784,7 +1118,7 @@ def verdict(mutation: Mutation, code: int | None, output: str) -> tuple[str, str
     trybuild = sorted(set(re.findall(r"^test (tests/compile-fail/\S+) \.\.\. (?:error|mismatch)$", output, re.M)))
     if failed:
         return "CAUGHT", ", ".join(failed + trybuild)
-    broken = re.findall(r"could not compile `gateway-core` \(([^)]*)\)", output)
+    broken = re.findall(r"could not compile `gateway-[a-z]+` \(([^)]*)\)", output)
     if mutation.breaks_build and "lib" in broken:
         return "CAUGHT", "the library does not compile, as intended"
     if broken:
