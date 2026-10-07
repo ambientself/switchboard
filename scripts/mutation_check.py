@@ -2066,7 +2066,8 @@ mutate("demo-compose-dev-issuer-published", "the development issuer is published
 # --- first slice: resources on rows, late begins, naming what goes down ---------------------
 
 # The pg-late-* and pg-begin-not-cancelled ones are caught only against Postgres
-# (SWITCHBOARD_TEST_DATABASE_URL); the pg-columns-resources-* ones need no server.
+# (SWITCHBOARD_TEST_DATABASE_URL); the pg-columns-resources-* ones need no server. The audit
+# store's own section has the mutation that writes unknown resources as none named.
 mutate("pg-late-row-left-open", "an allowed row that commits after its begin failed is left open", PG_STORE,
        "                Ok(committed) if allowed => {", "                Ok(committed) if false => {")
 mutate("pg-late-denial-completed", "a denied row that commits late is given an outcome", PG_STORE,
@@ -2076,12 +2077,9 @@ mutate("pg-late-connection-kept", "a connection whose insert answered late goes 
 mutate("pg-begin-not-cancelled", "an insert past the begin budget is left running", PG_STORE,
        "                tokio::spawn(self.cancel.as_ref()(token));", "                let _ = token;")
 mutate("pg-columns-resources-dropped", "a row records no resources", PG_COLUMNS,
-       "    (Some(column), omitted)", "    (None, 0)")
+       "    Ok((resources, omitted))", "    Ok((json!([]), omitted))")
 mutate("pg-columns-resources-omitted-dropped", "a row counts no resources as left out", PG_COLUMNS,
-       "    (Some(column), omitted)", "    (Some(column), 0)")
-mutate("pg-columns-resources-unknown-as-none", "unknown resources are recorded as none named", PG_COLUMNS,
-       '        RecordedResources::Unknown => Value::String("unknown".to_owned()),',
-       "        RecordedResources::Unknown => Value::Array(vec![]),")
+       "    Ok((resources, omitted))", "    Ok((resources, 0))")
 mutate("demo-driver-down-unnamed-takes-all", "down with nothing named takes down Compose and the cluster", DRIVER,
        "      all) down_compose && down_kind ;;", '      all | "") down_compose && down_kind ;;')
 mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes the cluster too", DRIVER,
