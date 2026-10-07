@@ -1342,6 +1342,10 @@ mutate_all(
 )
 mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
        "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
+mutate("gw-host-bracket-suffix-ignored", "whatever follows a bracketed host is dropped unchecked", GW_SERVER,
+       "            Some(close) => host.split_at(close + 1),", "            Some(close) => return &host[..=close],")
+mutate("gw-host-empty-port-accepted", "a Host ending in a colon with no port is allowed", GW_SERVER,
+       "let is_port = |port: &str| !port.is_empty() && port.bytes()", "let is_port = |port: &str| port.bytes()")
 mutate("gw-host-first-of-two", "the first of two Host headers is checked", GW_SERVER,
        "        (Some(_), Some(_)) => None,", "        (Some(value), Some(_)) => value.to_str().ok(),")
 mutate("gw-host-prefix-match", "a Host that starts with an allowed one is allowed", GW_SERVER,

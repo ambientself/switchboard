@@ -155,6 +155,9 @@ async fn a_host_that_is_not_allowed_is_refused_before_identity() {
         format!("evil.example:{port}"),
         format!("localhost.evil.example:{port}"),
         format!("127.0.0.2:{port}"),
+        "localhost:".to_owned(),
+        format!("localhost:{port}x"),
+        format!("127.0.0.1:{port}:{port}"),
     ] {
         let answer = ping().header("host", &host).send(&server).await;
         answer.assert_forbidden(FORBIDDEN_HOST);

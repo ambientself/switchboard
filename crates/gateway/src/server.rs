@@ -288,13 +288,26 @@ fn check_host(gates: &Gates, parts: &Parts) -> Result<(), Rejection> {
 }
 
 /// A `Host` value without its port: `localhost:8080` is `localhost`, `[::1]:8080` is `[::1]`.
+/// A port is one or more digits after the last `:`, or after the `]` that closes a bracketed
+/// host. A value with anything else there, such as `localhost:` or `[::1].evil.example`, is
+/// kept whole, so it matches no allowed host unless that exact value is allowed.
 fn without_port(host: &str) -> &str {
-    if host.starts_with('[') {
-        return host.find(']').map_or(host, |close| &host[..=close]);
-    }
-    match host.rsplit_once(':') {
-        Some((name, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => name,
-        _ => host,
+    let (name, port) = if host.starts_with('[') {
+        match host.find(']') {
+            Some(close) => host.split_at(close + 1),
+            None => return host,
+        }
+    } else {
+        match host.rfind(':') {
+            Some(colon) => host.split_at(colon),
+            None => return host,
+        }
+    };
+    let is_port = |port: &str| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+    if port.is_empty() || port.strip_prefix(':').is_some_and(is_port) {
+        name
+    } else {
+        host
     }
 }
 
@@ -387,6 +400,22 @@ mod tests {
         assert_eq!(without_port("[::1]:8080"), "[::1]");
         assert_eq!(without_port("[::1]"), "[::1]");
         assert_eq!(without_port("localhost:http"), "localhost:http");
+    }
+
+    #[test]
+    fn what_follows_a_host_must_be_a_port_or_nothing() {
+        for kept in [
+            "[::1].evil.example",
+            "[::1]:garbage",
+            "[::1]:",
+            "[::1]evil",
+            "[::1]:80:80",
+            "[::1",
+            "localhost:",
+            "localhost:8o80",
+        ] {
+            assert_eq!(without_port(kept), kept);
+        }
     }
 
     #[test]
