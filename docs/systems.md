@@ -33,7 +33,11 @@ profiles initially.
 3. **Brokering for API-shaped systems, minting for CLI-shaped ones.**
 4. **A proxied server is exposed only if the gateway can limit it.** Either the gateway
    understands the tool's arguments, or the server's credential and route limit it to exactly
-   the permitted resources (design.md, section 13).
+   the permitted resources (design.md, section 13). Under
+   [decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), a proxied
+   tool's credential must reach nothing outside its callers' limits and must not be able to
+   write. Its section's dated "To confirm" test is recorded before approval, and its reach is
+   re-checked on a schedule.
 5. **Short-lived beats long-lived.** Where a vendor supports workload federation or
    short-lived credentials, prefer that to holding a key (design.md, section 9).
 
@@ -48,6 +52,25 @@ server before it can be registered.
 - "Not verified" means no primary source was found, or the sources disagree.
 - Counts of tools are taken from the vendor's own lists on that date. They change often.
 
+## What every vendor's test also confirms
+
+Added on 2026-10-07 by
+[decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md). Each "To
+confirm" step below also records, with its source:
+
+- which hosts accept the vendor's credentials, and where that list comes from. The route
+  check's list of hosts to refuse is built from it.
+- whether the gateway's credential can be limited to its egress addresses, for that one
+  credential or only for the whole organization. Whether to use such a limit is for IT and the
+  vendor's administrators.
+- whether sign-in to the vendor's hosted MCP server can be restricted.
+- whether the vendor's audit log attributes actions to the gateway's credential.
+
+A self-built server identifies the gateway by a token for one of the gateway's own workload
+identities, with the server as audience. It accepts only those identities, one for each
+deployment and one for each team service identity registered for it, never a source address
+or any other subject.
+
 ## Summary
 
 | System | What agents need it for | Recommendation | Service identity | Read-only |
@@ -61,7 +84,7 @@ server before it can be registered.
 | Akamai | Configuration and delivery data. | Built-in, reads only. | Yes, EdgeGrid API client. | Yes, per API. |
 | Salesforce | Read records. | Not yet. | No for the hosted server. Yes for the REST API. | Yes. |
 | MongoDB Atlas | Read cluster and collection data. | Proxy the vendor's hosted server. | Yes, service account. | Yes. |
-| Self-built | Whatever an Org team exposes. | Proxied, by definition. | How a team's server proves the gateway is its caller is open. | Each tool's classification is assigned by a person. |
+| Self-built | Whatever an Org team exposes. | Proxied, by definition. | The server accepts only the gateway's own workload identities, by a token with the server as audience (decision 0010). Milestone 2 builds the first, for the mock server. | Each tool's classification is assigned by a person. |
 
 "Service identity: yes" is what the vendor documents. It stays unproven until the test named in
 each section has been run.
@@ -199,10 +222,14 @@ at `/x/repos/readonly`, and check that a call to a repository outside the token 
 **Smallest useful surface.** Jira: `searchJiraIssuesUsingJql`, `getJiraIssue`,
 `listJiraIssueComments`, plus one comment write (`addOrEditJiraIssueComment`). That matches the
 three tools Otto has today. The comment write is classified `write`, not `propose`: it
-comments on issues the gateway did not create, and a comment can act as a command. It is
-denied in every profile, as Otto's `jira_comment` is, unless the owner records an exception
-(Q9; the 2026-10-04 amendment to
-[decision 0006](decisions/0006-what-the-decision-function-sees.md)).
+comments on issues the gateway did not create, it can edit comments the gateway did not
+create, and a comment can act as a command. It is denied in every profile, and as a proxied
+tool that is not `read` it is refused at load. It gets no exception: Otto's built-in
+`jira_comment` has a narrow one, in the profile for Otto's sandboxes
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9), and
+this tool does not. A Jira comment proposal therefore stays built-in. If employees will use this
+server's entry, its test adds a restricted issue or page as a canary that must not be
+visible.
 
 Confluence is in use and wanted (confirmed 2026-10-01): `searchConfluence` and
 `getConfluenceContent`. Otto's gateway has no Confluence tools, so there is nothing built-in to
@@ -285,6 +312,8 @@ To confirm: create a service account with a role limited to chosen source catego
 client with only the search, alert and discovery scopes, fetch a token by client credentials,
 and check that the tool list has no write tools, that a search outside the allowed categories
 returns nothing, and that 2-minute timeouts and 429 responses reach the caller as clear denials.
+Decision 0011 requires this test to show that the role's search filter applies to the MCP log
+search.
 
 ## New Relic
 
@@ -490,11 +519,16 @@ advanced-query expression or, better, a few fixed parameters (resource type, acc
 tag) and builds the query itself. Results are bounded to a page. A second tool, "describe
 resource", reads one resource's configuration. Neither takes a free-form AWS call.
 
-**How a team opts in.** Design section 8 already says a read that shows more than its caller
-could see is opt-in per team or group. For AWS that means each team lists the accounts it may
-query. The gateway adds that list as an account filter to every query, and refuses a query that
-names an account outside it. Which accounts are in scope, and who approves a team's list, is
-for Org to decide; it is not settled here.
+**How a team opts in.** Design section 8 says a read that shows more than its caller could
+see is opt-in per team or group
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 7). For
+AWS a team's limit lists the accounts it may query, and the `aws / organization / o-…`
+breadth resource if it may query across all of them. The tool takes fixed parameters only
+(resource type, account, Region, tag), never a Config query. Its connector builds the query and adds the account
+filter: the named accounts, or none when the organization was named. The filter is tested
+with hostile parameter values. A team's list is approved by the data's owner, the cloud
+platform team, and a security reviewer. Which accounts are in scope is for the cloud platform
+team and is still open.
 
 **Recommendation: built-in, brokered, read-only.** The AWS MCP Server's `call_aws` runs any API
 operation, so the gateway could limit it only through the role's IAM policy, not by understanding
@@ -709,7 +743,7 @@ the access list fails.
 
 | System | What agents need it for | Leaning | To verify |
 | --- | --- | --- | --- |
-| Self-built | Whatever an Org team exposes. | Proxied, by definition. | How a team's server proves the gateway is its caller. Who assigns each tool's classification. |
+| Self-built | Whatever an Org team exposes. | Proxied, by definition. | Who assigns each tool's classification. That the server refuses every caller but the gateway: the registry's probe checks it at registration and on each drift poll. |
 
 ## Okta
 
@@ -738,7 +772,8 @@ not. A self-built server chooses its own identifiers, so they have no documented
   configuration set to read-only, project-level roles). **Atlassian** is documented too, with a
   service account API key and read scopes, but needs a test of project limits before it can
   replace Otto's built-in Jira. All three need the test named in their sections before anyone
-  claims they work; none has been run.
+  claims they work; none has been run. Under decision 0011 all three are read-only, and the
+  tested reach is recorded in each approval, often as one connector entry per team.
 - **Need built-in connectors.** **GitHub** and **Jira** (Otto parity, milestone 4). **AWS**,
   brokered and read-only, because the hosted AWS server runs any API call and the breadth needs
   a per-team opt-in. **Akamai**, because every request must be signed with EdgeGrid and the
