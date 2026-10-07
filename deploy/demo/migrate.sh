@@ -21,6 +21,8 @@ MIGRATIONS_DIR=${MIGRATIONS_DIR:-/usr/share/switchboard/migrations}
 ROLES_SQL=${ROLES_SQL:-/usr/share/switchboard/roles.sql}
 WAIT_SECONDS=${WAIT_SECONDS:-60}
 export PGPORT="${PGPORT:-5432}"
+# Notices such as "already exists, skipping" are not news on a second run.
+export PGOPTIONS='-c client_min_messages=warning'
 # TODO(integration): the audit schema name follows planDemo.md (#10a).
 AUDIT_SCHEMA=${AUDIT_SCHEMA:-switchboard_audit}
 
