@@ -1,11 +1,14 @@
 //! The roles, grants, trigger and constraints, exercised with plain SQL.
 
+use std::time::Duration;
+
+use tokio::time::{Instant, sleep};
 use tokio_postgres::Client;
 
 use super::{
-    CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, TestDatabase, code, message,
+    CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, SETUP, TestDatabase, code, message,
 };
-use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, migrate};
+use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, ROLES, migrate};
 
 /// The begin columns of an allowed call by a workload, as `(column, value)` in SQL.
 const ALLOWED: &[(&str, &str)] = &[
@@ -125,6 +128,50 @@ async fn two_migrators_at_once_take_turns() {
         let mut applied = vec![first.unwrap(), second.unwrap()];
         applied.sort_unstable();
         assert_eq!(applied, vec![vec![], vec![1]]);
+    }
+}
+
+/// Several administrators running the roles script on one database at once take turns.
+/// Without the lock, their grants update the database's catalog row at once and all but one
+/// fail.
+#[tokio::test]
+async fn the_roles_script_runs_in_several_sessions_at_once() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    // The runs are held at their first CREATE ROLE until all four are waiting, so they then go
+    // on together rather than one after another as they arrive.
+    let _one_at_a_time = SETUP.lock().await;
+    let gate = db.admin().await;
+    let waiting = format!(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = '{}' AND wait_event_type = 'Lock'",
+        db.name()
+    );
+    for _ in 0..5 {
+        gate.batch_execute("BEGIN; LOCK TABLE pg_catalog.pg_authid IN SHARE MODE")
+            .await
+            .unwrap();
+        let mut runs = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let admin = db.admin().await;
+            runs.spawn(async move { admin.batch_execute(ROLES).await });
+        }
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while gate
+            .query_one(&waiting, &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            < 4
+        {
+            assert!(Instant::now() < give_up, "the runs did not all wait");
+            sleep(Duration::from_millis(10)).await;
+        }
+        gate.batch_execute("COMMIT").await.unwrap();
+        while let Some(run) = runs.join_next().await {
+            run.unwrap().unwrap();
+        }
     }
 }
 

@@ -1108,6 +1108,8 @@ mutate("pg-grant-delete", "the gateway may delete rows", PG_SQL,
        "GRANT DELETE ON switchboard_audit.call_rows TO switchboard_gateway;\n")
 mutate("pg-grant-gateway-creates", "the gateway may create objects in the database", PG + "sql/roles.sql",
        "'GRANT CONNECT ON DATABASE %I TO switchboard_gateway'", "'GRANT CONNECT, CREATE ON DATABASE %I TO switchboard_gateway'")
+mutate("pg-roles-unlocked", "two runs of the roles script grant at once", PG + "sql/roles.sql",
+       "    PERFORM pg_advisory_xact_lock(6005341489043162114);\n", "")
 mutate("pg-check-denial-sentence", "a denial may lack its sentence", PG_SQL,
        "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
        "WHEN 'deny' THEN reason IS NOT NULL AND outcome IS NULL")
