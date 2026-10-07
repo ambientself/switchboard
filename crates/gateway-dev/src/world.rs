@@ -4,10 +4,10 @@
 use gateway::{ResourceAdapter, ToolDefinition};
 use gateway_core::{ApprovedTool, Resources};
 use gateway_testkit::{
-    AUDIENCE, DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DOCUMENT_ARGUMENT, FixtureConnector, GROUP_G,
-    GROUP_REVIEW, LocalIssuer, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER,
-    READ_TOOL, SCOPED_READ_TOOL, TEAM_A, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, USER_ISSUER,
-    WORKLOAD_ISSUER, WRITE_TOOL,
+    AUDIENCE, DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DOCUMENT_ARGUMENT, DRAFT_ARGUMENT, DRAFT_TOOL,
+    FixtureConnector, GROUP_G, GROUP_REVIEW, LocalIssuer, PROFILE_REVIEWER, PROFILE_TEAM_A,
+    PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, TEAM_A, TEAM_A_SUBJECT, TEAM_B,
+    TEAM_B_SUBJECT, USER_ISSUER, WORKLOAD_ISSUER, WRITE_TOOL,
 };
 use serde_json::{Value, json};
 
@@ -31,6 +31,20 @@ pub fn catalog_data() -> Value {
             "input_schema": {
                 "type": "object",
                 "properties": {DOCUMENT_ARGUMENT: document},
+                "required": [DOCUMENT_ARGUMENT],
+            },
+        },
+        {
+            "name": DRAFT_TOOL,
+            "title": "Propose a change to a document",
+            "description": "Opens a draft against one fixture document for a person to review, or revises a draft it opened. It refuses a draft it did not open.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    DOCUMENT_ARGUMENT: document,
+                    DRAFT_ARGUMENT: {"type": "string", "description": "A draft this tool opened, to revise it."},
+                    "text": {"type": "string"},
+                },
                 "required": [DOCUMENT_ARGUMENT],
             },
         },

@@ -27,8 +27,8 @@ use gateway_mcp::{
     TOOL_USE_ID_META,
 };
 use gateway_testkit::{
-    AUDIENCE, CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector, GROUP_G,
-    GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B,
+    AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, FakeCredentialSource, Fixture, FixtureConnector,
+    GROUP_G, GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B,
     PROFILE_USER, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A,
     TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT, TEAM_B_SUBJECT, USER_ISSUER,
     USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, document, poll_once,
@@ -145,7 +145,12 @@ impl World {
             "audit": {},
             "http": {"allowed_hosts": ["localhost"]},
             "policy": gateway_testkit::policy_data(),
-            "catalog": [read, definition(WRITE_TOOL), definition(SCOPED_READ_TOOL)],
+            "catalog": [
+                read,
+                definition(DRAFT_TOOL),
+                definition(WRITE_TOOL),
+                definition(SCOPED_READ_TOOL),
+            ],
             "profiles": {
                 "workloads": [
                     {"issuer": WORKLOAD_ISSUER, "team": TEAM_A, "profile": PROFILE_TEAM_A},

@@ -16,11 +16,11 @@ use gateway_core::{
 use gateway_identity::SigningAlgorithm;
 use gateway_identity::{ConfigError, Verification};
 use gateway_testkit::{
-    AUDIENCE, CONNECTOR, DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, FIXTURE_NOW, FakeCredentialSource,
-    Fixture, FixtureConnector, GROUP_G, InMemoryAuditStore, LocalIssuer, PROFILE_TEAM_A,
-    PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, SURFACE_READ, SteppableClock,
-    TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, USER_ISSUER, USER_SUBJECT,
-    WORKLOAD_ISSUER, WRITE_TOOL, block_on, policy_data,
+    AUDIENCE, CONNECTOR, DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DRAFT_TOOL, FIXTURE_NOW,
+    FakeCredentialSource, Fixture, FixtureConnector, GROUP_G, InMemoryAuditStore, LocalIssuer,
+    PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, SURFACE_READ,
+    SteppableClock, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, USER_ISSUER,
+    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, policy_data,
 };
 use serde_json::{Value, json};
 
@@ -86,7 +86,12 @@ impl World {
             "audit": {},
             "http": {"allowed_hosts": ["localhost"], "allowed_origins": ["http://localhost"]},
             "policy": policy_data(),
-            "catalog": [definition(READ_TOOL), definition(WRITE_TOOL), definition(SCOPED_READ_TOOL)],
+            "catalog": [
+                definition(READ_TOOL),
+                definition(DRAFT_TOOL),
+                definition(WRITE_TOOL),
+                definition(SCOPED_READ_TOOL),
+            ],
             "profiles": {
                 "workloads": [
                     {"issuer": WORKLOAD_ISSUER, "team": TEAM_A, "profile": PROFILE_TEAM_A},
@@ -457,7 +462,7 @@ fn policy_the_core_refuses_is_refused_at_boot() {
 fn an_approved_tool_without_a_definition_is_refused() {
     let world = World::new();
     let mut config = world.config();
-    config["catalog"].as_array_mut().unwrap().remove(1);
+    config["catalog"].as_array_mut().unwrap().remove(2);
     let booted = world.boot(config, world.wiring());
     assert!(
         matches!(&booted, Err(BootError::Catalog(CatalogError::Missing(tool))) if tool.as_str() == WRITE_TOOL),

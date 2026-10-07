@@ -757,6 +757,9 @@ mutate("identity-subject-looked-up-before-signature", "an unknown subject is ref
 mutate("identity-exp-not-checked", "exp is read but not checked", V,
        "        let expires_at = check_not_expired(&claims, now, entry.leeway)?;\n",
        '        let expires_at = date(&claims, "exp", Claim::ExpiresAt)?;\n')
+mutate("identity-exp-optional", "a token with no exp never expires", V,
+       '    let expires_at = date(claims, "exp", Claim::ExpiresAt)?;\n',
+       '    let expires_at = if claims.contains_key("exp") { date(claims, "exp", Claim::ExpiresAt)? } else { u64::MAX };\n')
 mutate("identity-exp-boundary", "a token is valid at exactly exp plus leeway", V,
        "    if now >= expires_at.saturating_add(leeway) {", "    if now > expires_at.saturating_add(leeway) {")
 mutate("identity-exp-ignores-leeway", "exp is checked with no leeway", V,
@@ -917,6 +920,11 @@ mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measure
 mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
        "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
        "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
+mutate("identity-config-rsa-backend-check-skipped", "an RSA key the crypto backend cannot use is accepted", V,
+       "        rsa_key_usable(&params.n, &params.e)?;\n", "")
+mutate("identity-config-unusable-rsa-key-reported-as-unfit", "an RSA key the backend cannot use is reported as a key of the wrong kind", V,
+       "            Unfit::UnusableRsa(reason) => ConfigError::UnusableRsaKey {\n                issuer,\n                kid,\n                reason,\n            },\n",
+       "            Unfit::UnusableRsa(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },\n")
 mutate_all("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer",
            (V, "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
             "                Err(unfit) => {\n                    return Err(unfit.error(issuer.clone(), kid, config.algorithm));\n                }"),
@@ -958,8 +966,11 @@ mutate_all(
     (IDENTITY + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
 )
-mutate("identity-second-crypto-backend", "a second crypto backend is enabled", IDENTITY + "Cargo.toml",
-       'features = ["rust_crypto"] }\nserde_json', 'features = ["rust_crypto", "aws_lc_rs"] }\nserde_json')
+# Enabling `aws_lc_rs` itself would add crates to Cargo.lock, which `--locked` refuses before any
+# test runs, so that mutation could never give a verdict. Any second entry in the feature list
+# fails the same assertion a second backend would, and leaves the lock as it is.
+mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
+       'features = ["rust_crypto"] }\n', 'features = ["rust_crypto", "rust_crypto"] }\n')
 
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
@@ -999,7 +1010,11 @@ mutate("fake-connector-hang-ignored", "a connector told to hang does not", K,
 mutate("fake-connector-hang-next-is-hang-all", "a hang meant for the next call is never cleared", K,
        "                    let gate = gate.clone();\n                    state.hang = Hang::Never;\n                    Some(gate)", "                    Some(gate.clone())")
 mutate("fake-connector-calls-not-recorded", "calls are not recorded", K, "            state.received.push(ReceivedCall {", "            let _ = (ReceivedCall {")
-mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "                    self.state().writes.push(WriteRecord {", "                    drop(WriteRecord {")
+mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "        self.state().writes.push(write);", "        drop(write);")
+mutate("fake-connector-draft-guard-ignored", "the draft tool revises a draft the gateway did not open", K,
+       "                .filter(|draft| state.drafts.get(*draft) == Some(&document))", "                .filter(|_| true)")
+mutate("fake-connector-draft-any-document", "the draft tool revises a draft through a call naming another document", K,
+       "state.drafts.get(*draft) == Some(&document)", "state.drafts.contains_key(*draft)")
 mutate("fake-connector-scope-ignored", "the scoped tool refuses nothing", K,
        "                    match named.filter(|name| !scope.contains(*name)) {", "                    match named.filter(|name| false && !scope.contains(*name)) {")
 mutate("fake-connector-scope-any-team", "a workload may reach any team's documents through the scoped tool", K,
@@ -1868,7 +1883,7 @@ mutate("demo-driver-keeps-kubeconfig-env", "the caller's KUBECONFIG reaches kube
 mutate("demo-driver-default-kubeconfig", "kubectl uses whatever kubeconfig is the default", DRIVER,
        """k() { kubectl --kubeconfig "$KCFG" --context""", """k() { kubectl --context""")
 mutate("demo-driver-down-default-kubeconfig", "down deletes the cluster through the default kubeconfig", DRIVER,
-       """  kind delete cluster --name "$CLUSTER" --kubeconfig "$KCFG"\n""", """  kind delete cluster --name "$CLUSTER"\n""")
+       """down_kind() { kind delete cluster --name "$CLUSTER" --kubeconfig "$KCFG"; }""", """down_kind() { kind delete cluster --name "$CLUSTER"; }""")
 mutate("demo-driver-workload-exit-ignored", "a workload's non-zero exit without a FAIL line is not counted", DRIVER,
        """  elif [ "$status" -ne 0 ] && [ "$failed" -eq 0 ]; then""", """  elif false; then""")
 mutate("demo-driver-result-ignores-failures", "the RESULT passes with FAILs counted", DRIVER,
@@ -2003,6 +2018,31 @@ mutate("demo-driver-health-checks-counted", "the outage step counts health check
 mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,
        "      - issuer-keys:/shared/issuer\n    healthcheck:",
        "      - issuer-keys:/shared/issuer\n    ports:\n      - \"127.0.0.1:18090:8090\"\n    healthcheck:")
+
+
+# --- first slice: resources on rows, late begins, naming what goes down ---------------------
+
+# The pg-late-* and pg-begin-not-cancelled ones are caught only against Postgres
+# (SWITCHBOARD_TEST_DATABASE_URL); the pg-columns-resources-* ones need no server.
+mutate("pg-late-row-left-open", "an allowed row that commits after its begin failed is left open", PG_STORE,
+       "                Ok(committed) if allowed => {", "                Ok(committed) if false => {")
+mutate("pg-late-denial-completed", "a denied row that commits late is given an outcome", PG_STORE,
+       "                Ok(committed) if allowed => {", "                Ok(committed) if true => {")
+mutate("pg-late-connection-kept", "a connection whose insert answered late goes back to its pool", PG_STORE,
+       "            std::mem::drop(Object::take(client));", "            std::mem::drop(client);")
+mutate("pg-begin-not-cancelled", "an insert past the begin budget is left running", PG_STORE,
+       "                tokio::spawn(self.cancel.as_ref()(token));", "                let _ = token;")
+mutate("pg-columns-resources-dropped", "a row records no resources", PG_COLUMNS,
+       "    (Some(column), omitted)", "    (None, 0)")
+mutate("pg-columns-resources-omitted-dropped", "a row counts no resources as left out", PG_COLUMNS,
+       "    (Some(column), omitted)", "    (Some(column), 0)")
+mutate("pg-columns-resources-unknown-as-none", "unknown resources are recorded as none named", PG_COLUMNS,
+       '        RecordedResources::Unknown => Value::String("unknown".to_owned()),',
+       "        RecordedResources::Unknown => Value::Array(vec![]),")
+mutate("demo-driver-down-unnamed-takes-all", "down with nothing named takes down Compose and the cluster", DRIVER,
+       "      all) down_compose && down_kind ;;", '      all | "") down_compose && down_kind ;;')
+mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes the cluster too", DRIVER,
+       "      compose) down_compose ;;", "      compose) down_compose && down_kind ;;")
 
 
 # --- Running -------------------------------------------------------------------------------

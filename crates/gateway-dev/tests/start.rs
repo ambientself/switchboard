@@ -12,7 +12,8 @@ use gateway_core::audit::{DecisionKind, Outcome};
 use gateway_dev::{DEPLOYMENT, Options, start_fixture_gateway, start_fixture_gateway_with};
 use gateway_mcp::DENIAL_CODE;
 use gateway_testkit::{
-    Caller, READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, WRITE_TOOL,
+    Caller, DRAFT_TOOL, READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT,
+    WRITE_TOOL,
 };
 use serde_json::json;
 use support::{legacy, post};
@@ -67,8 +68,8 @@ async fn the_fixture_gateway_serves_a_call_on_loopback_and_records_it() {
 #[tokio::test]
 async fn each_fixture_caller_is_proved_and_gets_its_own_profile() {
     let gateway = start_fixture_gateway().await.unwrap();
-    // Team A's profile may write; team B's and the user's may not, and the user has no access
-    // to the surface that serves the write tool.
+    // Team A's profile may propose; team B's and the user's may not, and the user has no
+    // access to the surface that serves the draft tool. No profile may write.
     let tools = |caller| {
         let token = gateway.token(caller);
         let url = gateway.url(SURFACE_ALL);
@@ -83,9 +84,12 @@ async fn each_fixture_caller_is_proved_and_gets_its_own_profile() {
                 .collect::<Vec<_>>()
         }
     };
-    assert!(tools(Caller::TeamA).await.contains(&WRITE_TOOL.to_owned()));
+    let team_a = tools(Caller::TeamA).await;
+    assert!(team_a.contains(&DRAFT_TOOL.to_owned()), "{team_a:?}");
+    assert!(!team_a.contains(&WRITE_TOOL.to_owned()), "{team_a:?}");
     let team_b = tools(Caller::TeamB).await;
     assert!(team_b.contains(&READ_TOOL.to_owned()), "{team_b:?}");
+    assert!(!team_b.contains(&DRAFT_TOOL.to_owned()), "{team_b:?}");
     assert!(!team_b.contains(&WRITE_TOOL.to_owned()), "{team_b:?}");
     assert_eq!(tools(Caller::UserInGroupG).await, Vec::<String>::new());
 }

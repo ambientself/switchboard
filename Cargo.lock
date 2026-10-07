@@ -718,6 +718,7 @@ dependencies = [
  "gateway-testkit",
  "jsonwebtoken",
  "proptest",
+ "rsa",
  "serde_json",
  "thiserror",
 ]
