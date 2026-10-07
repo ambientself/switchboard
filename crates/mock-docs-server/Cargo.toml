@@ -1,0 +1,22 @@
+[package]
+name = "mock-docs-server"
+version = "0.1.0"
+description = "A mock third-party MCP server for tests and the demo: read-only document tools over session-less HTTP, one accepted bearer credential, and documents that misbehave on purpose."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# This server plays a third party the gateway calls, so it shares no code with the gateway.
+# Keep every `gateway-*` crate out of both lists; tests/dependencies.rs checks the first one.
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true
