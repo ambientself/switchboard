@@ -298,6 +298,30 @@ mutate(
     DENIED_EVERYWHERE,
     "        Classification::Propose | Classification::Write | Classification::Destructive\n    );",
 )
+PROFILE_LISTS = "    let permitted = !denied_everywhere && profile.classifications.contains(&tool.classification);"
+for id, description, replacement in [
+    (
+        "profile-ignored",
+        "a profile permits every classification not denied everywhere, whatever it lists",
+        "!denied_everywhere",
+    ),
+    (
+        "read-permitted-by-every-profile",
+        "every profile permits a read, whether or not it lists `read`",
+        "!denied_everywhere\n        && (tool.classification == Classification::Read\n            || profile.classifications.contains(&tool.classification))",
+    ),
+    (
+        "profile-permits-lesser-classifications",
+        "a profile permits every classification ordered at or below one it lists",
+        "!denied_everywhere\n        && profile\n            .classifications\n            .iter()\n            .any(|listed| tool.classification <= *listed)",
+    ),
+    (
+        "empty-profile-permits-everything",
+        "a profile that lists no classification permits every one not denied everywhere",
+        "!denied_everywhere\n        && (profile.classifications.is_empty()\n            || profile.classifications.contains(&tool.classification))",
+    ),
+]:
+    mutate(id, description, SRC + "decision.rs", PROFILE_LISTS, f"    let permitted = {replacement};")
 mutate(
     "classification-propose-parses-as-write",
     "`propose` in configuration reads as write",

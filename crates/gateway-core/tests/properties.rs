@@ -400,6 +400,24 @@ proptest! {
     }
 
     #[test]
+    fn a_classification_the_profile_does_not_list_is_never_allowed(
+        mut world in world(),
+        classification in select(Classification::ALL.to_vec()),
+        others in subset(Classification::ALL.to_vec()),
+    ) {
+        if let Some(approved) = world.approved_tool_mut() {
+            approved.classification = classification;
+        }
+        world.profile.classifications = others.into_iter().filter(|other| *other != classification).collect();
+        let decision = world.decide();
+        prop_assert!(!decision.is_allowed(), "allowed a {classification} tool the profile does not list: {decision:?}");
+        let snapshot = world.snapshot();
+        prop_assert!(list_tools(&snapshot, &world.caller())
+            .iter()
+            .all(|listed| world.profile.classifications.contains(&listed.classification)));
+    }
+
+    #[test]
     fn a_delegation_never_allows_a_tool_it_does_not_list(mut world in world()) {
         let tool = world.tool.clone();
         if let Some(delegation) = &mut world.delegation {
