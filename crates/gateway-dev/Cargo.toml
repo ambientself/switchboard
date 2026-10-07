@@ -19,7 +19,10 @@ gateway-testkit = { path = "../gateway-testkit" }
 reqwest = { version = "0.12", default-features = false }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["net", "rt", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+# switchboard-dev's logs, as text on standard error.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # Reads a token's claims back.
