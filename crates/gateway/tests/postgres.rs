@@ -165,34 +165,31 @@ async fn run(
         refused.body
     );
 
-    // `resources` stays empty: the core's audit record carries no resources until PR #30, so
-    // the denial is told apart by its sentence, which names the project.
+    // Each row names the project its call named, as `system/kind/identifier`, so an allowed
+    // read shows which project it read and a denial which one it refused.
     let rows = setup
         .query(
             "SELECT tool, decision, coalesce(reason, ''), coalesce(outcome, ''), proved_subject,
                     proved_team, coalesce(sentence, ''), coalesce(outcome_sentence, ''),
-                    policy_revision
+                    policy_revision,
+                    CASE WHEN jsonb_typeof(resources) = 'array' THEN
+                        (SELECT coalesce(string_agg(concat_ws('/', r->>'system', r->>'kind',
+                                                              r->>'identifier'), ','), '')
+                           FROM jsonb_array_elements(resources) AS r)
+                    ELSE coalesce(resources #>> '{}', 'NULL') END,
+                    resources_omitted::text
                FROM switchboard_audit.call_rows ORDER BY begun_at",
             &[],
         )
         .await
         .unwrap();
-    let rows: Vec<[String; 9]> = rows
+    let rows: Vec<[String; 11]> = rows
         .iter()
         .map(|row| std::array::from_fn(|column| row.get(column)))
         .collect();
-    let no_resources = setup
-        .query_one(
-            "SELECT bool_and(resources IS NULL) FROM switchboard_audit.call_rows",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get::<_, bool>(0);
-    assert!(no_resources, "rows now carry resources; check them here");
     assert_eq!(rows.len(), 3, "{rows:#?}");
     let expected = [
-        [READ_TOOL, "allow", "", "ok", "", ""],
+        [READ_TOOL, "allow", "", "ok", "", "", "docs/project/atlas"],
         [
             READ_TOOL,
             "deny",
@@ -200,11 +197,30 @@ async fn run(
             "",
             "`borealis`",
             "",
+            "docs/project/borealis",
         ],
-        [LIST_TOOL, "allow", "", "refused", "", "does not declare"],
+        [
+            LIST_TOOL,
+            "allow",
+            "",
+            "refused",
+            "",
+            "does not declare",
+            "docs/project/atlas",
+        ],
     ];
-    for (row, [tool, decision, reason, outcome, sentence, outcome_sentence]) in
-        rows.iter().zip(expected)
+    for (
+        row,
+        [
+            tool,
+            decision,
+            reason,
+            outcome,
+            sentence,
+            outcome_sentence,
+            resources,
+        ],
+    ) in rows.iter().zip(expected)
     {
         assert_eq!(
             [&row[0], &row[1], &row[2], &row[3]].map(String::as_str),
@@ -216,6 +232,7 @@ async fn run(
         assert!(row[6].contains(sentence), "{row:?}");
         assert!(row[7].contains(outcome_sentence), "{row:?}");
         assert_eq!(row[8], "demo-1");
+        assert_eq!([&row[9], &row[10]], [resources, "0"], "{row:?}");
     }
     Ok(())
 }

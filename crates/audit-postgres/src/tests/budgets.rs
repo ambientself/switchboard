@@ -10,7 +10,7 @@ use gateway_core::audit::{self, Answer, AuditFailure, Begun, Outcome, Ran};
 use gateway_core::{CallContext, RequestedTool, decide};
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector, READ_TOOL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
 };
 use tokio::time::{Instant, sleep};
 use tokio_postgres::Client;
@@ -151,11 +151,15 @@ async fn begin_gives_up_at_its_budget_and_its_insert_never_lands() {
         failure.sentence(),
         "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later."
     );
-    // The connection that ran out of time is gone from the pool, so no later begin queues
-    // behind its statement.
-    assert_eq!(store.begin.status().size, 0);
-
     // The insert was cancelled: once the lock goes, nothing is written for a refused call.
+    // And the connection that ran out of time leaves the pool, so no later begin queues
+    // behind it.
+    until(
+        Duration::from_secs(5),
+        "the connection's removal from the pool",
+        || async { store.begin.status().size == 0 },
+    )
+    .await;
     until(
         Duration::from_secs(5),
         "the insert's cancellation",
@@ -187,6 +191,112 @@ async fn begin_gives_up_at_its_budget_and_its_insert_never_lands() {
         begin_read(&store, &fixture).await.unwrap(),
         Begun::Allowed(_)
     ));
+}
+
+#[tokio::test]
+async fn an_allowed_row_that_commits_after_its_budget_is_completed_as_error() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_millis(300),
+        finish_deadline: Duration::from_secs(10),
+    };
+    // As against a paused server: the cancellation never reaches the insert.
+    let store = db
+        .store(PoolSizes::default())
+        .with_budgets(budgets)
+        .without_cancelling();
+    let admin = db.admin().await;
+    let lock = lock_table(&db).await;
+
+    let failure = within(budgets.begin + SLACK, begin_read(&store, &fixture))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    // The caller was refused, and the insert is still waiting on the lock.
+    release(&lock).await;
+
+    // The insert commits after all. Nothing ran, so the row is completed as `error`, not left
+    // open as an allowed call that may have run.
+    until(
+        Duration::from_secs(5),
+        "the late row's completion",
+        || async {
+            count(
+                &admin,
+                "SELECT count(*) FROM switchboard_audit.call_rows
+              WHERE decision = 'allow' AND outcome = 'error' AND latency_ms = 0",
+            )
+            .await
+                == 1
+        },
+    )
+    .await;
+    assert_eq!(
+        count(&admin, "SELECT count(*) FROM switchboard_audit.call_rows").await,
+        1
+    );
+    until(Duration::from_secs(5), "the late finish's end", || async {
+        store.finishes() == FinishCounts::default()
+    })
+    .await;
+    assert_eq!(store.begin.status().size, 0);
+}
+
+#[tokio::test]
+async fn a_denied_row_that_commits_after_its_budget_is_left_as_it_is() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        ..Budgets::default()
+    };
+    let store = db
+        .store(PoolSizes::default())
+        .with_budgets(budgets)
+        .without_cancelling();
+    let admin = db.admin().await;
+    let lock = lock_table(&db).await;
+
+    // Outside team-a's limit.
+    let call = Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_B_DOCUMENT);
+    let decision = decide_read(&fixture, &call);
+    assert!(!decision.is_allowed(), "{decision:?}");
+    let failure = within(
+        budgets.begin + SLACK,
+        audit::begin(&store, decision, call.arguments, call.metadata),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    release(&lock).await;
+    until(Duration::from_secs(5), "the late denial's row", || async {
+        count(&admin, "SELECT count(*) FROM switchboard_audit.call_rows").await == 1
+    })
+    .await;
+    // A denial is complete as it stands; nothing writes an outcome on it.
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        count(
+            &admin,
+            "SELECT count(*) FROM switchboard_audit.call_rows
+              WHERE decision = 'deny' AND outcome IS NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(store.finishes(), FinishCounts::default());
 }
 
 #[tokio::test]

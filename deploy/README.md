@@ -5,7 +5,9 @@ The first-slice demo (#14) runs in two places, each with one command from the re
 ```sh
 deploy/demo/demo.sh compose   # Tier A: Postgres, the gateway, mock-docs and the dev issuer
 deploy/demo/demo.sh kind      # Tier B: the cluster switchboard-demo, with network policy
-deploy/demo/demo.sh down      # stop Compose and delete the cluster
+deploy/demo/demo.sh down compose   # stop Compose and delete its volumes; the cluster stays
+deploy/demo/demo.sh down kind      # delete the cluster; Compose stays
+deploy/demo/demo.sh down all       # both
 ```
 
 Every check prints PASS or FAIL. The last line counts them, and the script exits non-zero if

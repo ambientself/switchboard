@@ -3,7 +3,7 @@
 //! No I/O here, so the mapping is tested without a database.
 
 use gateway_core::PrincipalKind;
-use gateway_core::audit::{AuditRecord, Completion, DecisionKind, Outcome};
+use gateway_core::audit::{AuditRecord, Completion, DecisionKind, Outcome, RecordedResources};
 use tokio_postgres::types::ToSql;
 
 use crate::store::PgAuditError;
@@ -124,12 +124,30 @@ impl BeginRow {
     }
 }
 
-/// The resources columns. The record does not carry resources yet, so a row records none: the
-/// column stays empty and nothing is counted as left out. When the record gains them, the
-/// named resources become a JSON array of `{system, kind, identifier}` and `unknown` the JSON
-/// string `"unknown"`.
-fn resources(_record: &AuditRecord) -> (Option<serde_json::Value>, i64) {
-    (None, 0)
+/// The resources columns: the named resources as a JSON array of `{system, kind, identifier}`,
+/// or the JSON string `"unknown"` when the tool could not say before it ran, and how many were
+/// left out. The column's check constraint accepts exactly these two shapes.
+fn resources(record: &AuditRecord) -> (Option<serde_json::Value>, i64) {
+    use serde_json::Value;
+    let column = match &record.resources {
+        RecordedResources::Named(named) => Value::Array(
+            named
+                .iter()
+                .map(|resource| {
+                    serde_json::json!({
+                        "system": resource.system,
+                        "kind": resource.kind,
+                        "identifier": resource.identifier,
+                    })
+                })
+                .collect(),
+        ),
+        RecordedResources::Unknown => Value::String("unknown".to_owned()),
+    };
+    // No call names 2^63 resources; a count past the column's range is recorded as the most
+    // it can hold rather than refused.
+    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);
+    (Some(column), omitted)
 }
 
 fn decision(kind: DecisionKind) -> &'static str {
@@ -214,6 +232,10 @@ mod tests {
             "tool": "fixture__write",
             "connector": "fixture",
             "classification": "write",
+            "resources": {"named": [
+                {"system": "fixture", "kind": "project", "identifier": "atlas"}
+            ]},
+            "resources_omitted": 2,
             "decision": "deny",
             "reason": "classification_not_permitted",
             "sentence": "Denied: a sentence.",
@@ -239,6 +261,8 @@ mod tests {
             "tool": "fixture__read",
             "connector": "fixture",
             "classification": "read",
+            "resources": "unknown",
+            "resources_omitted": 0,
             "decision": "allow",
             "reason": null,
             "sentence": null,
@@ -268,8 +292,10 @@ mod tests {
                 tool: "fixture__write".into(),
                 connector: Some("fixture".into()),
                 classification: Some("write"),
-                resources: None,
-                resources_omitted: 0,
+                resources: Some(json!([
+                    {"system": "fixture", "kind": "project", "identifier": "atlas"}
+                ])),
+                resources_omitted: 2,
                 decision: "deny",
                 reason: Some("classification_not_permitted".into()),
                 sentence: Some("Denied: a sentence.".into()),
@@ -294,6 +320,16 @@ mod tests {
         assert_eq!(row.proved_team.as_deref(), Some("team-a"));
         assert_eq!(row.proved_groups, None);
         assert_eq!((row.reason, row.sentence), (None, None));
+        assert_eq!(row.resources, Some(json!("unknown")));
+        assert_eq!(row.resources_omitted, 0);
+    }
+
+    #[test]
+    fn a_call_naming_nothing_records_an_empty_list_not_none() {
+        let mut record = allowed_workload();
+        record.resources = RecordedResources::Named(vec![]);
+        let row = BeginRow::from_record(&record).unwrap();
+        assert_eq!(row.resources, Some(json!([])));
     }
 
     #[test]

@@ -117,10 +117,16 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         }
         completion
     });
-    // The record does not carry resources yet, so a row records none.
-    assert_eq!(row.get::<_, Option<Value>>("resources"), None);
-    assert_eq!(row.get::<_, i64>("resources_omitted"), 0);
+    // The column holds a JSON array of the named resources, or the string "unknown". This
+    // gateway always writes one or the other, so an empty column fails the read-back.
+    let resources = match row.get::<_, Option<Value>>("resources") {
+        Some(Value::Array(named)) => json!({ "named": named }),
+        Some(unknown) if unknown == json!("unknown") => unknown,
+        other => panic!("resources column holds {other:?}"),
+    };
     serde_json::from_value(json!({
+        "resources": resources,
+        "resources_omitted": row.get::<_, i64>("resources_omitted"),
         "tool_use_id": text("tool_use_id"),
         "deployment": text("deployment"),
         "surface": text("surface"),

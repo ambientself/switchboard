@@ -157,25 +157,42 @@ fn every_cluster_call_names_the_demos_own_kubeconfig() {
 }
 
 #[test]
-fn down_deletes_only_the_demo_cluster_through_its_own_kubeconfig() {
-    let (run, calls) = demo(
-        "down",
-        &["down"],
-        &[("KUBECONFIG", "/should/never/be/used")],
-    );
-    assert_eq!(run.status, Some(0), "{}", run.transcript());
+fn down_takes_down_only_what_it_names() {
     let own = own_kubeconfig();
     let root = repo().canonicalize().unwrap();
-    assert_eq!(
-        calls,
-        vec![
-            format!(
-                "docker KUBECONFIG= compose -f {}/deploy/compose/compose.yaml --profile demo down -v --remove-orphans",
-                root.display()
-            ),
-            format!("kind KUBECONFIG= delete cluster --name switchboard-demo --kubeconfig {own}"),
-        ]
+    let compose = format!(
+        "docker KUBECONFIG= compose -f {}/deploy/compose/compose.yaml --profile demo down -v --remove-orphans",
+        root.display()
     );
+    let cluster =
+        format!("kind KUBECONFIG= delete cluster --name switchboard-demo --kubeconfig {own}");
+    for (what, expected) in [
+        ("compose", vec![compose.clone()]),
+        ("kind", vec![cluster.clone()]),
+        ("all", vec![compose.clone(), cluster.clone()]),
+    ] {
+        let (run, calls) = demo(
+            &format!("down-{what}"),
+            &["down", what],
+            &[("KUBECONFIG", "/should/never/be/used")],
+        );
+        assert_eq!(run.status, Some(0), "{what}: {}", run.transcript());
+        assert_eq!(calls, expected, "down {what}");
+    }
+}
+
+#[test]
+fn down_without_naming_what_is_refused() {
+    for args in [&["down"][..], &["down", "everything"][..]] {
+        let (run, calls) = demo("down-unnamed", args, &[]);
+        assert_eq!(run.status, Some(2), "{args:?}: {}", run.transcript());
+        assert!(
+            run.stderr.contains("down compose|kind|all"),
+            "{}",
+            run.transcript()
+        );
+        assert!(calls.is_empty(), "{args:?}: {calls:?}");
+    }
 }
 
 #[test]

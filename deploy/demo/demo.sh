@@ -6,7 +6,11 @@
 #                     outage and a withdrawn tool; check the audit rows
 #   demo.sh kind      the same in the kind cluster switchboard-demo, with projected
 #                     ServiceAccount tokens, network policy and the operator's permission checks
-#   demo.sh down      stop Compose and delete the kind cluster
+#   demo.sh down compose   stop Compose and delete its volumes; the cluster is left alone
+#   demo.sh down kind      delete the kind cluster switchboard-demo; Compose is left alone
+#   demo.sh down all       both
+#
+# A run leaves what it started running, so it can be looked at afterwards.
 #
 # Every check prints PASS or FAIL. The last line is the RESULT with the count, and the exit
 # status is non-zero if any check failed or any step could not run. Nothing is retried and no
@@ -138,25 +142,38 @@ mark_start() {
   echo "audit rows from this run start at epoch $SINCE"
 }
 
-# The columns are crates/audit-postgres's (sql/migrations/0001_call_rows.sql). The rows carry
-# no resources yet: the core's audit record gains them with PR #30, and until then the
-# `resources` column is empty. A denial's sentence names the project it refused, so that is
-# what is checked; an allowed read's row does not say which project it read.
+# project_json NAME: the `resources` column of a call that named only the docs project NAME.
+project_json() { printf '[{"system":"docs","kind":"project","identifier":"%s"}]' "$1"; }
+
+# The columns are crates/audit-postgres's (sql/migrations/0001_call_rows.sql). `resources` is a
+# JSON array of the {system, kind, identifier} each call named, or "unknown"; the listing shows
+# each as system/kind/identifier.
 audit_rows() {
   step "audit rows from this run"
   psql_reader -c "select to_char(begun_at, 'HH24:MI:SS') as at, proved_subject, proved_team as team,
-      tool, decision, reason, outcome, latency_ms as ms, policy_revision as rev
+      tool, coalesce((select string_agg(concat_ws('/', r->>'system', r->>'kind', r->>'identifier'), ',')
+          from jsonb_array_elements(case when jsonb_typeof(resources) = 'array' then resources
+                                         else '[]'::jsonb end) as r), resources #>> '{}') as resources,
+      decision, reason, outcome, latency_ms as ms, policy_revision as rev
     from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE) order by begun_at"
-  local team other
+  local team own other
   for team in team-a team-b; do
-    if [ "$team" = team-a ]; then other=borealis; else other=atlas; fi
+    if [ "$team" = team-a ]; then own=atlas other=borealis; else own=borealis other=atlas; fi
     check_at_least "$(audit_count "proved_team = '$team' and tool = '$READ_TOOL' and decision = 'allow'
-        and outcome = 'ok'")" 1 \
-      "audit: $team's read of its own project is an allow row with outcome ok"
+        and outcome = 'ok' and resources = '$(project_json "$own")'::jsonb")" 1 \
+      "audit: $team's read of $own is an allow row naming $own, with outcome ok"
     check_at_least "$(audit_count "proved_team = '$team' and tool = '$READ_TOOL' and decision = 'deny'
-        and reason = 'resource_outside_limit' and sentence like '%\`$other\`%'")" 1 \
-      "audit: $team's read of $other is a deny row naming the resource limit"
+        and reason = 'resource_outside_limit' and resources = '$(project_json "$other")'::jsonb
+        and sentence like '%\`$other\`%'")" 1 \
+      "audit: $team's read of $other is a deny row naming $other and the resource limit"
+    check "$(audit_count "proved_team = '$team' and decision = 'allow'
+        and resources @> '$(project_json "$other")'::jsonb")" 0 \
+      "audit: no allowed row of $team names $other"
   done
+  check "$(audit_count "resources is null")" 0 "audit: every row records the resources its call named"
+  # A begin that ran past its budget may still commit; the store then completes the row as
+  # error, because the call was refused and nothing ran (decision 0009).
+  check "$(audit_count "decision = 'allow' and outcome is null")" 0 "audit: no allowed row is left without an outcome"
   check "$(audit_count "proved_subject like '%stranger%'")" 0 "audit: no row for the ServiceAccount outside the manifest"
 }
 
@@ -411,10 +428,8 @@ kind_run() {
   FINISHED=1
 }
 
-down() {
-  dc --profile demo down -v --remove-orphans
-  kind delete cluster --name "$CLUSTER" --kubeconfig "$KCFG"
-}
+down_compose() { dc --profile demo down -v --remove-orphans; }
+down_kind() { kind delete cluster --name "$CLUSTER" --kubeconfig "$KCFG"; }
 
 # Sourcing defines the functions and runs nothing; the tests use that.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
@@ -430,9 +445,20 @@ case "${1:-}" in
     trap on_exit EXIT
     kind_run
     ;;
-  down) down ;;
+  down)
+    # What to take down is always named, so stopping Compose never deletes the cluster.
+    case "${2:-}" in
+      compose) down_compose ;;
+      kind) down_kind ;;
+      all) down_compose && down_kind ;;
+      *)
+        echo "usage: $0 down compose|kind|all" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   *)
-    echo "usage: $0 compose|kind|down" >&2
+    echo "usage: $0 compose|kind|down compose|kind|all" >&2
     exit 2
     ;;
 esac

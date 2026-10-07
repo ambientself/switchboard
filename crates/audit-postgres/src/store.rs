@@ -7,7 +7,7 @@ use std::time::Duration;
 use deadpool_postgres::{
     ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod,
 };
-use gateway_core::audit::{AuditRowId, Completion, RowCompletion, StoreError};
+use gateway_core::audit::{AuditRowId, Completion, Outcome, RowCompletion, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -50,7 +50,8 @@ pub enum PgAuditError {
         row: String,
     },
     /// Begin did not have a connection and a committed row within its budget. The call is
-    /// refused. The insert, if it was sent, was cancelled.
+    /// refused. The store asked the server to cancel the insert, if it was sent; if it commits
+    /// anyway, the store completes an allowed row as `error`.
     #[error("the audit row was not written within the begin budget of {budget:?}")]
     BeginBudget {
         /// The budget that ran out.
@@ -221,8 +222,10 @@ const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// identifier and both its times.
 ///
 /// - Begin inserts the first half of a row and returns once the insert is committed. It has
-///   [`Budgets::begin`], counted from asking for a connection. Past it, the insert is
-///   cancelled, the connection is discarded, and begin fails, so the core refuses the call.
+///   [`Budgets::begin`], counted from asking for a connection. Past it, begin fails, so the
+///   core refuses the call, and the store asks the server to cancel the insert and discards
+///   the connection. An allowed row that commits anyway is completed as `error`, since
+///   nothing ran.
 /// - Finish writes the completion columns of a row that has none, on a task of its own. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
@@ -299,6 +302,16 @@ impl PgAuditStore {
         Self { budgets, ..self }
     }
 
+    /// The same store, except that it never asks the server to cancel a statement. A server
+    /// that is paused cannot act on a cancellation before it commits; this stands in for one.
+    #[cfg(test)]
+    pub(crate) fn without_cancelling(self) -> Self {
+        Self {
+            cancel: Arc::new(|_| Box::pin(async {})),
+            ..self
+        }
+    }
+
     /// The budgets this store keeps.
     pub fn budgets(&self) -> Budgets {
         self.budgets
@@ -313,19 +326,87 @@ impl PgAuditStore {
         }
     }
 
+    /// Begin: inserts the first half of a row within the begin budget.
+    ///
+    /// The insert runs on a task of its own. When the budget runs out, begin fails and asks the
+    /// server to cancel the insert. A server that is stalled rather than down, such as one
+    /// paused or behind a lock, may not act on the cancellation before the insert commits, so
+    /// the task keeps waiting for the insert's answer until the finish deadline. If the insert
+    /// committed an allowed row after all, the task completes it as `error`: the call was
+    /// refused, so nothing ran (decision 0009, What begin guarantees). A denied row is complete
+    /// as it is. An insert with no answer by the deadline is counted as given up, and its row,
+    /// if it ever commits, stays open.
     async fn insert(&self, record: &AuditRecord) -> Result<AuditRowId, PgAuditError> {
         let row = BeginRow::from_record(record)?;
         let budget = self.budgets.begin;
-        let deadline = Instant::now() + budget;
+        let started = Instant::now();
+        let deadline = started + budget;
         let client = timeout_at(deadline, self.begin.get())
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
-        match timeout_at(deadline, insert_on(&client, &row)).await {
-            Ok(inserted) => inserted,
+        let token = client.cancel_token();
+        let nothing_ran = Completion {
+            outcome: Outcome::Error,
+            latency_ms: 0,
+        };
+        let mut late = self.retry(
+            String::new(),
+            FinishRow::from_completion(&nothing_ran),
+            started,
+        );
+        let allowed = row.decision == "allow";
+        let counters = Arc::clone(&self.counters);
+        let (sender, mut receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let Ok(inserted) = timeout_at(late.deadline, insert_on(&client, &row)).await else {
+                // No answer by the deadline. Begin failed long ago; if the row commits after
+                // this, nothing completes it.
+                abandon(client, &late.cancel);
+                counters.given_up.fetch_add(1, Ordering::SeqCst);
+                return;
+            };
+            let Err(inserted) = sender.send(inserted) else {
+                // Begin had the answer in time.
+                return;
+            };
+            // Begin had already failed. The connection's last statement was cancelled or
+            // answered late, so it does not go back to its pool.
+            std::mem::drop(Object::take(client));
+            match inserted {
+                Ok(committed) if allowed => {
+                    late.row = committed.as_str().to_owned();
+                    let _ = late.run_counted(InFlight::start(&counters)).await;
+                }
+                // A denial, or no row at all: the insert failed or was cancelled.
+                _ => {}
+            }
+        });
+        match timeout_at(deadline, &mut receiver).await {
+            Ok(Ok(inserted)) => inserted,
+            Ok(Err(_)) => Err(PgAuditError::BeginBudget { budget }),
             Err(_) => {
-                abandon(client, &self.cancel);
+                // Closing first means an answer is either taken here or handed back to the
+                // task, never lost between the two.
+                receiver.close();
+                if let Ok(inserted) = receiver.try_recv() {
+                    return inserted;
+                }
+                tokio::spawn(self.cancel.as_ref()(token));
                 Err(PgAuditError::BeginBudget { budget })
             }
+        }
+    }
+
+    /// The task that completes `row` with `finish` on the finish pool, trying again until the
+    /// finish deadline counted from `started`.
+    fn retry(&self, row: String, finish: FinishRow, started: Instant) -> Retry {
+        Retry {
+            pool: self.finish.clone(),
+            cancel: Arc::clone(&self.cancel),
+            row,
+            finish,
+            attempt: self.budgets.answer,
+            deadline: started + self.budgets.finish_deadline,
         }
     }
 
@@ -352,22 +433,15 @@ impl PgAuditStore {
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
         let started = Instant::now();
-        let task = Retry {
-            pool: self.finish.clone(),
-            cancel: Arc::clone(&self.cancel),
-            row: row.as_str().to_owned(),
-            finish: FinishRow::from_completion(completion),
-            attempt: self.budgets.answer,
-            deadline: started + self.budgets.finish_deadline,
-        };
+        let task = self.retry(
+            row.as_str().to_owned(),
+            FinishRow::from_completion(completion),
+            started,
+        );
         let (sender, receiver) = oneshot::channel();
         let in_flight = InFlight::start(&self.counters);
         tokio::spawn(async move {
-            let result = task.run().await;
-            if result.is_err() {
-                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
-            }
-            drop(in_flight);
+            let result = task.run_counted(in_flight).await;
             // The caller may have stopped waiting, after the answer budget.
             let _ = sender.send(result);
         });
@@ -451,6 +525,16 @@ struct Retry {
 }
 
 impl Retry {
+    /// [`run`](Self::run), counted in flight until it ends, and as given up if it fails.
+    async fn run_counted(self, in_flight: InFlight) -> Result<(), PgAuditError> {
+        let result = self.run().await;
+        if result.is_err() {
+            in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(in_flight);
+        result
+    }
+
     async fn run(self) -> Result<(), PgAuditError> {
         let mut pause = FIRST_PAUSE;
         loop {

@@ -1789,7 +1789,7 @@ PG_CHECK = PG + "src/check.rs"
 mutate("pg-begin-pool-wait-unbounded", "begin waits for a connection past its budget", PG_STORE,
        "timeout_at(deadline, self.begin.get())", "timeout_at(deadline + Duration::from_secs(3600), self.begin.get())")
 mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget", PG_STORE,
-       "timeout_at(deadline, insert_on(&client, &row))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, &row))")
+       "timeout_at(deadline, &mut receiver)", "timeout_at(deadline + Duration::from_secs(3600), &mut receiver)")
 mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
        "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
 mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
@@ -1811,7 +1811,7 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) => {")
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
-       "                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+       "            in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
 mutate("pg-check-durability-ignored", "a server without fsync passes the check", PG_CHECK,
        "    (found != expected).then_some(", "    false.then_some(")
 mutate("pg-check-superuser-ignored", "a superuser passes the check", PG_CHECK,
