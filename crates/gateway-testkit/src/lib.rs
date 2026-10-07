@@ -7,9 +7,8 @@
 //! - [`InMemoryAuditStore`] keeps rows in order, can fail or hold `begin` and `finish`.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
 //!   can refuse or be unavailable.
-//! - [`FixtureConnector`] serves a read tool, a `propose` tool that acts only on drafts it
-//!   opened, a direct-write tool that every profile denies, and a scope-checking tool. It
-//!   records every call, and can fail or hang.
+//! - [`FixtureConnector`] serves a read tool, a write tool and a scope-checking tool, records
+//!   every call, and can fail or hang.
 //! - [`LocalIssuer`] generates a key pair when built, gives its public keys as the JWKS
 //!   document an issuer serves, and signs tokens a test can break in any one way;
 //!   [`FixedClock`] and [`SteppableClock`] say what time it is.
@@ -37,9 +36,9 @@ mod issuer;
 pub use audit::InMemoryAuditStore;
 pub use clock::{FIXTURE_NOW, FixedClock, SteppableClock};
 pub use connector::{
-    CONNECTOR, DOCUMENT_ARGUMENT, DRAFT_ARGUMENT, DRAFT_REFUSAL, DRAFT_TOOL, FORBIDDEN_DOCUMENT,
-    FOREIGN_DRAFT, FixtureConnector, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM, ReceivedCall,
-    SCOPE_REFUSAL, SCOPED_READ_TOOL, WRITE_TOOL, WriteRecord, document,
+    CONNECTOR, DOCUMENT_ARGUMENT, FORBIDDEN_DOCUMENT, FixtureConnector, READ_TOOL, RESOURCE_KIND,
+    RESOURCE_SYSTEM, ReceivedCall, SCOPE_REFUSAL, SCOPED_READ_TOOL, WRITE_TOOL, WriteRecord,
+    document,
 };
 pub use credentials::{CredentialRequest, FakeCredentialSource};
 pub use exec::{block_on, poll_once};

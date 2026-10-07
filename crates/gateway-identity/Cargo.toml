@@ -20,11 +20,6 @@ base64 = "0.22"
 # backends are enabled anywhere in the build, so the workspace enables only this one. The
 # default `use_pem` feature is off: keys arrive as JWKs, never as PEM.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
-# Already in the build through `jsonwebtoken`'s pure-Rust backend, which builds an
-# `RsaPublicKey` from a key's `n` and `e` on every verify. Used once, to build it at
-# configuration as well, so an RSA key the backend would refuse is refused there and not
-# reported as a bad signature on every token.
-rsa = "0.9"
 serde_json = "1"
 thiserror = "2"
 

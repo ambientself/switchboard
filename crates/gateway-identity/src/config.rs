@@ -197,17 +197,4 @@ pub enum ConfigError {
         /// The length of its modulus.
         bits: usize,
     },
-    /// No key in the issuer's set can verify its signatures, and the first is an RSA key the
-    /// crypto backend refuses to use: its modulus is over 4096 bits or even, or its public
-    /// exponent is even, under 3 or over 2^33 - 1. The backend makes this check on every
-    /// verify and reports a failure as a bad signature, so it is made here instead.
-    #[error("issuer `{issuer}` key `{kid}` is an RSA key the verifier cannot use: {reason}")]
-    UnusableRsaKey {
-        /// The issuer.
-        issuer: Issuer,
-        /// The key.
-        kid: String,
-        /// What the backend found wrong with it, in its words.
-        reason: String,
-    },
 }

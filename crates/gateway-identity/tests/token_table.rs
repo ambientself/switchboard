@@ -705,10 +705,8 @@ fn the_table_has_a_case_for_every_way_a_token_can_be_refused() {
     );
 }
 
-/// A token whose kid names a key that is in the set but cannot verify: an EC key whose point is
-/// not on the curve is accepted as configuration, because only its shape is checked there, and
-/// then refuses at use as an unusable key, not as a bad signature. An RSA key the backend cannot
-/// use is refused at configuration instead (`tests/configuration.rs`).
+/// A token whose kid names a key that is in the set but cannot verify: the key is accepted as
+/// configuration, because only its shape can be checked there, and then refuses at use.
 #[test]
 fn a_key_that_cannot_verify_refuses_every_token_under_it() {
     let setup = setups()

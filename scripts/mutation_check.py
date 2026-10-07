@@ -757,9 +757,6 @@ mutate("identity-subject-looked-up-before-signature", "an unknown subject is ref
 mutate("identity-exp-not-checked", "exp is read but not checked", V,
        "        let expires_at = check_not_expired(&claims, now, entry.leeway)?;\n",
        '        let expires_at = date(&claims, "exp", Claim::ExpiresAt)?;\n')
-mutate("identity-exp-optional", "a token with no exp never expires", V,
-       '    let expires_at = date(claims, "exp", Claim::ExpiresAt)?;\n',
-       '    let expires_at = if claims.contains_key("exp") { date(claims, "exp", Claim::ExpiresAt)? } else { u64::MAX };\n')
 mutate("identity-exp-boundary", "a token is valid at exactly exp plus leeway", V,
        "    if now >= expires_at.saturating_add(leeway) {", "    if now > expires_at.saturating_add(leeway) {")
 mutate("identity-exp-ignores-leeway", "exp is checked with no leeway", V,
@@ -920,11 +917,6 @@ mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measure
 mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
        "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
        "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
-mutate("identity-config-rsa-backend-check-skipped", "an RSA key the crypto backend cannot use is accepted", V,
-       "        rsa_key_usable(&params.n, &params.e)?;\n", "")
-mutate("identity-config-unusable-rsa-key-reported-as-unfit", "an RSA key the backend cannot use is reported as a key of the wrong kind", V,
-       "            Unfit::UnusableRsa(reason) => ConfigError::UnusableRsaKey {\n                issuer,\n                kid,\n                reason,\n            },\n",
-       "            Unfit::UnusableRsa(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },\n")
 mutate_all("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer",
            (V, "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
             "                Err(unfit) => {\n                    return Err(unfit.error(issuer.clone(), kid, config.algorithm));\n                }"),
@@ -966,11 +958,8 @@ mutate_all(
     (IDENTITY + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
 )
-# Enabling `aws_lc_rs` itself would add crates to Cargo.lock, which `--locked` refuses before any
-# test runs, so that mutation could never give a verdict. Any second entry in the feature list
-# fails the same assertion a second backend would, and leaves the lock as it is.
-mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
-       'features = ["rust_crypto"] }\n', 'features = ["rust_crypto", "rust_crypto"] }\n')
+mutate("identity-second-crypto-backend", "a second crypto backend is enabled", IDENTITY + "Cargo.toml",
+       'features = ["rust_crypto"] }\nserde_json', 'features = ["rust_crypto", "aws_lc_rs"] }\nserde_json')
 
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
@@ -1010,11 +999,7 @@ mutate("fake-connector-hang-ignored", "a connector told to hang does not", K,
 mutate("fake-connector-hang-next-is-hang-all", "a hang meant for the next call is never cleared", K,
        "                    let gate = gate.clone();\n                    state.hang = Hang::Never;\n                    Some(gate)", "                    Some(gate.clone())")
 mutate("fake-connector-calls-not-recorded", "calls are not recorded", K, "            state.received.push(ReceivedCall {", "            let _ = (ReceivedCall {")
-mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "        self.state().writes.push(write);", "        drop(write);")
-mutate("fake-connector-draft-guard-ignored", "the draft tool revises a draft the gateway did not open", K,
-       "                .filter(|draft| state.drafts.get(*draft) == Some(&document))", "                .filter(|_| true)")
-mutate("fake-connector-draft-any-document", "the draft tool revises a draft through a call naming another document", K,
-       "state.drafts.get(*draft) == Some(&document)", "state.drafts.contains_key(*draft)")
+mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "                    self.state().writes.push(WriteRecord {", "                    drop(WriteRecord {")
 mutate("fake-connector-scope-ignored", "the scoped tool refuses nothing", K,
        "                    match named.filter(|name| !scope.contains(*name)) {", "                    match named.filter(|name| false && !scope.contains(*name)) {")
 mutate("fake-connector-scope-any-team", "a workload may reach any team's documents through the scoped tool", K,

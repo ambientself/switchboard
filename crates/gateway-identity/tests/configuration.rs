@@ -44,26 +44,13 @@ fn modulus(top: u8, bytes: usize) -> Vec<u8> {
     modulus
 }
 
-/// An RSA public key with this modulus and an exponent of 65537, as a JWK. Not half of any key
-/// pair: configuration can only check a key's shape and length, and that is what these are for.
+/// An RSA public key with this modulus, as a JWK. Not half of any key pair: configuration can
+/// only check a key's shape and length, and that is what these are for.
 fn rsa_jwk(kid: &str, modulus: &[u8]) -> Jwk {
-    rsa_jwk_with_exponent(kid, modulus, &[1, 0, 1])
-}
-
-/// An RSA public key with this modulus and exponent, as a JWK.
-fn rsa_jwk_with_exponent(kid: &str, modulus: &[u8], exponent: &[u8]) -> Jwk {
     serde_json::from_value(json!({
-        "kty": "RSA", "kid": kid, "n": URL_SAFE_NO_PAD.encode(modulus),
-        "e": URL_SAFE_NO_PAD.encode(exponent),
+        "kty": "RSA", "kid": kid, "n": URL_SAFE_NO_PAD.encode(modulus), "e": "AQAB",
     }))
     .unwrap()
-}
-
-/// `modulus(top, bytes)` with its last byte made even.
-fn even_modulus(top: u8, bytes: usize) -> Vec<u8> {
-    let mut modulus = modulus(top, bytes);
-    *modulus.last_mut().unwrap() = 0xfe;
-    modulus
 }
 
 /// `setup`'s issuer with one key, `key`.
@@ -316,60 +303,6 @@ fn configuration_that_could_never_verify_or_is_ambiguous_is_refused() {
                     issuer: rs_name.clone(),
                     kid: "zero".into(),
                     algorithm: "RS256",
-                },
-            ),
-            (
-                "an RSA key a bit over 4096 bits",
-                with_only(&rs_user, rsa_jwk("long", &modulus(0x01, 513))),
-                ConfigError::UnusableRsaKey {
-                    issuer: rs_name.clone(),
-                    kid: "long".into(),
-                    reason: "modulus too large".into(),
-                },
-            ),
-            (
-                "an RSA key whose modulus is even",
-                with_only(&rs_user, rsa_jwk("even", &even_modulus(0xff, 256))),
-                ConfigError::UnusableRsaKey {
-                    issuer: rs_name.clone(),
-                    kid: "even".into(),
-                    reason: "invalid modulus".into(),
-                },
-            ),
-            (
-                "an RSA key whose exponent is 2^33 + 1",
-                with_only(
-                    &rs_user,
-                    rsa_jwk_with_exponent("big-e", &modulus(0xff, 256), &[2, 0, 0, 0, 1]),
-                ),
-                ConfigError::UnusableRsaKey {
-                    issuer: rs_name.clone(),
-                    kid: "big-e".into(),
-                    reason: "public exponent too large".into(),
-                },
-            ),
-            (
-                "an RSA key whose exponent is 1",
-                with_only(
-                    &rs_user,
-                    rsa_jwk_with_exponent("small-e", &modulus(0xff, 256), &[1]),
-                ),
-                ConfigError::UnusableRsaKey {
-                    issuer: rs_name.clone(),
-                    kid: "small-e".into(),
-                    reason: "public exponent too small".into(),
-                },
-            ),
-            (
-                "an RSA key whose exponent is even",
-                with_only(
-                    &rs_user,
-                    rsa_jwk_with_exponent("even-e", &modulus(0xff, 256), &[1, 0, 0]),
-                ),
-                ConfigError::UnusableRsaKey {
-                    issuer: rs_name.clone(),
-                    kid: "even-e".into(),
-                    reason: "invalid exponent".into(),
                 },
             ),
             (
@@ -678,43 +611,6 @@ fn an_rsa_key_of_2048_bits_is_accepted() {
     ] {
         assert!(build(vec![with_only(&setup, rsa_jwk("long", &modulus))]).is_ok());
     }
-}
-
-/// An RSA key is accepted up to the limits the crypto backend checks when it verifies: a
-/// modulus of 4096 bits, and an exponent from 3 to 2^33 - 1. Outside them it is refused as
-/// configuration (`configuration_that_could_never_verify_or_is_ambiguous_is_refused`), not
-/// left to fail every token as a bad signature.
-#[test]
-fn an_rsa_key_is_accepted_up_to_the_backends_limits() {
-    let setup = setup(SigningAlgorithm::Rs256, Kind::Workload);
-    for (modulus, exponent) in [
-        (modulus(0xff, 512), vec![1, 0, 1]),
-        (modulus(0xff, 256), vec![3]),
-        (modulus(0xff, 256), vec![1, 0xff, 0xff, 0xff, 0xff]),
-    ] {
-        let key = rsa_jwk_with_exponent("edge", &modulus, &exponent);
-        assert!(
-            build(vec![with_only(&setup, key)]).is_ok(),
-            "{} bytes, exponent {exponent:?}",
-            modulus.len()
-        );
-    }
-    // A key the backend refuses is left out like any other, so a token naming it is refused as
-    // naming an unknown key, and never reaches the backend.
-    let mut config = setup.config();
-    config
-        .keys
-        .keys
-        .insert(0, rsa_jwk("long", &modulus(0x01, 513)));
-    let verifier = build(vec![config]).unwrap();
-    assert_eq!(
-        verify(&verifier, &setup.token().build()),
-        Ok(setup.principal())
-    );
-    assert_eq!(
-        verify(&verifier, &setup.token().kid("long").build()),
-        Err(VerifyError::UnknownKeyId)
-    );
 }
 
 /// A key may list the operations it is for, as long as verifying is one of them.
