@@ -424,3 +424,31 @@ async fn finish_does_not_retry_what_trying_again_cannot_fix() {
         }
     );
 }
+
+#[tokio::test]
+async fn a_finish_the_caller_stops_waiting_for_still_completes_its_row() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let row = begun_row(&store, &fixture).await;
+    let lock = lock_table(&db).await;
+    // The caller gives up, as a request handler does when its client goes away.
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        store.finish_within_budget(&row, &completion(Outcome::Ok, 3)),
+    )
+    .await;
+    assert!(gave_up.is_err());
+    release(&lock).await;
+    until(Duration::from_secs(10), "the completion", || async {
+        store.finishes().in_flight == 0
+    })
+    .await;
+    assert_eq!(
+        outcome_of(&admin, row.as_str()).await.as_deref(),
+        Some("ok")
+    );
+}

@@ -211,6 +211,9 @@ const SESSION_OPTIONS: &str = "-c synchronous_commit=on";
 const FIRST_PAUSE: Duration = Duration::from_millis(50);
 const LONGEST_PAUSE: Duration = Duration::from_secs(1);
 
+/// How long a request to cancel a statement may take before the store stops asking.
+const CANCEL_WAIT: Duration = Duration::from_secs(5);
+
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
 /// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE), and call
@@ -226,6 +229,8 @@ const LONGEST_PAUSE: Duration = Duration::from_secs(1);
 ///   [`Budgets::finish_deadline`]. An identical completion written again is accepted, and a
 ///   different one is an error, so the first completion stands and retrying is safe. The
 ///   table's trigger holds the same rule for every role.
+///
+/// If the caller stops waiting for finish, its task still completes the row.
 ///
 /// Must be used inside a Tokio runtime: finish spawns its task there.
 pub struct PgAuditStore {
@@ -274,8 +279,9 @@ impl PgAuditStore {
         let cancel: Canceller = Arc::new(move |token: CancelToken| {
             let tls = tls.clone();
             Box::pin(async move {
-                // Best effort: if the cancel request fails, the statement runs to its end.
-                let _ = token.cancel_query(tls).await;
+                // Best effort: if the cancel request fails, or the server does not answer it in
+                // time, the statement runs to its end.
+                let _ = tokio::time::timeout(CANCEL_WAIT, token.cancel_query(tls)).await;
             })
         });
         Ok(Self {
