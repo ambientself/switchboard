@@ -183,6 +183,24 @@ struct Counters {
     given_up: AtomicU64,
 }
 
+/// A finish that stopped without completing its row, which keeps an empty outcome. Decision
+/// 0009 makes each one a telemetry event naming the row and the outcome's kind.
+#[derive(Debug)]
+pub struct GivenUp<'a> {
+    /// The row finish named.
+    pub row: &'a AuditRowId,
+    /// The outcome it was to record: `ok`, `error` or `refused`.
+    pub outcome: &'static str,
+    /// Why it stopped: [`PgAuditError::Deadline`] when the deadline passed,
+    /// [`PgAuditError::CompletedDifferently`] when the row already had another completion,
+    /// [`PgAuditError::NoSuchRow`] when the row is not there, or another refusal by the
+    /// database.
+    pub error: &'a PgAuditError,
+}
+
+/// What the store calls for each finish that gives up.
+type Report = Arc<dyn Fn(GivenUp<'_>) + Send + Sync>;
+
 /// Counts one finish in flight until dropped.
 struct InFlight(Arc<Counters>);
 
@@ -239,6 +257,7 @@ pub struct PgAuditStore {
     budgets: Budgets,
     cancel: Canceller,
     counters: Arc<Counters>,
+    given_up: Report,
 }
 
 impl PgAuditStore {
@@ -290,6 +309,7 @@ impl PgAuditStore {
             budgets: Budgets::default(),
             cancel,
             counters: Arc::default(),
+            given_up: Arc::new(|_| {}),
         })
     }
 
@@ -297,6 +317,18 @@ impl PgAuditStore {
     #[must_use]
     pub fn with_budgets(self, budgets: Budgets) -> Self {
         Self { budgets, ..self }
+    }
+
+    /// The same store, calling `report` for each finish that gives up, whether or not its
+    /// caller is still waiting, so the gateway can make the telemetry event that names the row.
+    /// Called on the finish's own task, so it must not block. By default nothing is called,
+    /// and the finish is only counted in [`finishes`](Self::finishes).
+    #[must_use]
+    pub fn on_given_up(self, report: impl Fn(GivenUp<'_>) + Send + Sync + 'static) -> Self {
+        Self {
+            given_up: Arc::new(report),
+            ..self
+        }
     }
 
     /// The budgets this store keeps.
@@ -362,10 +394,18 @@ impl PgAuditStore {
         };
         let (sender, receiver) = oneshot::channel();
         let in_flight = InFlight::start(&self.counters);
+        let report = Arc::clone(&self.given_up);
+        let named = row.clone();
+        let outcome = task.finish.outcome;
         tokio::spawn(async move {
             let result = task.run().await;
-            if result.is_err() {
+            if let Err(error) = &result {
                 in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
+                report(GivenUp {
+                    row: &named,
+                    outcome,
+                    error,
+                });
             }
             drop(in_flight);
             // The caller may have stopped waiting, after the answer budget.

@@ -1058,9 +1058,13 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   row is never finished twice, and so does the harness's in-memory store. With #25, the
   in-memory store can also write and then report failure, lose the process between run and
   finish, and keep the answer budget, so the contract suite runs on it.
+- A finish given up names, for a side effect, the vendor's reference (part 2). Today the
+  Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
+  stopped, but no outcome carries a vendor reference yet.
 - Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
   finish pool of its own, finish waiting at most the answer budget and then retrying on its
-  own task until the deadline, an identical repeat finish accepted, and column grants.
+  own task until the deadline, an identical repeat finish accepted, column grants, and the
+  report of each finish given up.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1089,6 +1093,10 @@ off only in a development build, with CI's check of the release artifact; and th
 - Telemetry events that carry the surface and the source address, counters, and a bounded
   queue, with events for `initialize`, `ping`, `server/discover` and bodies that cannot be
   parsed. Today an identity failure is logged with the deployment and the cause only.
+- The telemetry event for each finish given up, made from the audit store's report of it,
+  naming the row and the outcome's kind, with a different second completion logged and counted
+  apart from a finish that ran out of time (decision 0009). Today the Postgres store reports
+  each one through `on_given_up`, and nothing receives the report.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled.
   Today the spawned task always runs to completion.
 - The row's identifier in the result's `_meta`, or in `error.data`.

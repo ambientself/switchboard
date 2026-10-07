@@ -49,4 +49,4 @@ pub use check::{BootCheckError, Problem};
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
-pub use store::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
+pub use store::{Budgets, FinishCounts, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
