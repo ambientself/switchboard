@@ -1,6 +1,6 @@
 # Open questions
 
-Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. When resolved, move their requirements into
+Q1–Q8, Q14–Q16, Q18 and Q19 are settled below. Q9–Q13 and Q17 are open. When resolved, move their requirements into
 [design.md](design.md) and remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
@@ -71,6 +71,13 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   read as a command, and forces a pull request it opens to be a draft. See the 2026-10-04
   amendment to
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
+- **2026-10-07 (Q18):** A turn grant binds its issuer through the key, the deployments it is
+  for (`aud`), a lifetime of at most 15 minutes (`iat`, `exp`), and by stage 3 the sandbox
+  pod. It may be presented again within those bounds, and its digest is recorded. Otto's
+  proposals are allowed only while Otto says the turn is current, which enforces the epoch and
+  allows revoking one turn. Otto is asked to make the changes this needs; none has been agreed
+  with Otto's owners yet, and what waits on them is listed in the decision. See
+  [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -129,7 +136,10 @@ receipts, and the design currently omits Otto's planned retry and fencing contra
   distinguish pending, completed and unknown outcomes. An unknown outcome requires downstream
   reconciliation or supported vendor idempotency; a local receipt alone cannot guarantee
   exactly-once execution. Never automatically replay such a write after reconnect or restart.
-- **Failover:** specify when Otto's fencing epoch is checked and what it stops; keep this
+- **Failover:** [decision 0012](decisions/0012-what-a-turn-grant-binds.md) settles when Otto's
+  fencing epoch is checked: before each proposal, from stage 3, through Otto's resolver. A
+  stale epoch stops proposals, not reads. The check is made once, before the call runs, so a
+  failover during a proposal is not stopped by it; receipts must cover that window. Keep this
   separate from MCP session state. Identify implemented behavior versus future Otto promises
   in the conformance baseline.
 - **Blocks:** audit behavior and the first real write/cutover readiness criteria.
@@ -144,6 +154,10 @@ A definition hash detects interface changes, not a changed implementation behind
   defined maximum age. Deny affected calls when policy freshness cannot be established within
   the agreed bound. Record the policy revision with decisions. Define emergency withdrawal,
   token/group staleness and grant revocation behavior explicitly.
+- **Grant revocation:** [decision 0012](decisions/0012-what-a-turn-grant-binds.md) defines the
+  levers. Removing a team from the allowlist of Otto's sandbox surface, and withdrawing Otto's
+  surfaces, are bounded by the snapshot freshness still to be set here, and are taken as one
+  rollout until then.
 - **Tool approval:** include server identity and routing/credential configuration in the
   approval boundary. Detect drift from the first proxied rollout; define polling and
   propagation bounds, and document the residual interval. Do not claim hash pinning proves
@@ -195,21 +209,6 @@ gateway and ungoverned when it does not.
   employees the honest claim is "the governed path", not "the only path".
 - **Blocks:** milestone 2 for its one workload; milestone 5 for employees.
 
-## Q18. What must a turn grant bind?
-
-Otto's grant names a team, a human, an execution, tools, an epoch and an expiry. It does not
-name the gateway it is for, and it can be presented again until it expires. It is tied to the
-caller only by team: a grant for a team can be presented by any proved workload of that team. Otto signs the
-fencing epoch and does not yet enforce it. Any accepted arguments are allowed for a granted
-tool.
-
-- **Recommendation:** add the issuer, the gateway and deployment it is for, and a unique
-  identifier; keep expiry short. Enforce the epoch. Decide whether a grant may be presented
-  more than once: a turn makes many calls, so the likely answer is yes within one turn, with
-  the identifier recorded so reuse elsewhere is detectable. Test replay, use against another
-  deployment, clock skew, key rotation and emergency revocation.
-- **Blocks:** milestone 4. This is a change in Otto, alongside decision 0004.
-
 ## Review findings not yet reflected in the design
 
 From the independent review of 2026-10-01. Accepted in principle, not yet designed:
@@ -222,5 +221,7 @@ From the independent review of 2026-10-01. Accepted in principle, not yet design
 - Overload behavior for the audit store: admission control, bounded pools, and what an
   authentication flood does to the database (Q12).
 - Freshness and revocation bounds for group claims and team manifests (Q11).
-- Identity and audit opt-outs unavailable outside development builds (Q12).
+- Identity and audit opt-outs unavailable outside development builds (Q12). For turn-grant
+  checking this is decided: it can be turned off only in a development build, enforced at boot
+  ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 - A table tracing each invariant to its decision and its test.

@@ -91,6 +91,14 @@ its internal constructor's behavior. Otto's own unit tests cover that internal b
 New company-wide requirements belong in a separate future suite. They must not be smuggled
 into this baseline as failures against behavior the pinned Go gateway never implemented.
 
+Turn grants change format under
+[decision 0012](../docs/decisions/0012-what-a-turn-grant-binds.md). The Rust target is given
+grants in the new format, with `aud` naming it. The sixteen unverifiable-grant assertions
+carry over unchanged. The new grant checks (replay, audience, pod, clock skew, key rotation,
+currency and revocation) live in the separate company-wide group, not here. When the pin moves
+to Otto's new format (#23), `mintGrant` in `harness_test.go` signs with an Ed25519 key it
+generates, and the `grant_signature` guard in `mutation_check.py` is rewritten.
+
 ## Checking that the tests can fail
 
 ```sh

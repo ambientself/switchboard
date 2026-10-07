@@ -46,6 +46,10 @@ can script, including to fail.
 - **A fake MCP server and a fake vendor API** as a crate, scriptable to list tools, change its
   tool list, stream slowly, hang and return errors. Proxied-server work is tested against it.
 - **A local issuer** that signs user and workload tokens, so nothing waits on Okta.
+- **A local turn-grant minter** beside it, signing Otto's new grant format
+  ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)) with a generated key, and a
+  **scriptable fake of Otto's resolver** that answers current, superseded, ended or revoked,
+  answers slowly, is down, or answers another question. Neither waits on Otto's changes.
 - **One command to run it by hand.** The gateway on fixtures, plus a scripted client that
   runs initialize, list and one call and prints what came back.
 - **A real client from the first day.** Point a real MCP client at the local gateway. The

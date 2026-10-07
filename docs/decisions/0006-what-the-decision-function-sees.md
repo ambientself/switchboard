@@ -1,8 +1,10 @@
 # 0006: What the decision function sees and returns
 
-Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
-on 2026-10-04 (classifications, direct writes and delegation tool lists; see the end), with
-the rule for comments added on 2026-10-06. Status: accepted. Settles the part of Q9 that
+Date: 2026-10-01, amended the same day after the first implementation was reviewed, again
+on 2026-10-04 (classifications, direct writes and delegation tool lists), with the rule for
+comments added on 2026-10-06, and again on 2026-10-07 (currency for Otto's proposals, from
+[decision 0012](0012-what-a-turn-grant-binds.md)). The amendments are at the end. Status:
+accepted. Settles the part of Q9 that
 milestone 1 needs, and with the amendment, what the core needs for employee proposals and
 broad reads. The rest of Q9 stays open: when a proxied tool is eligible for exposure, any write
 policy beyond proposals, whether Otto's comment tools get an exception to the comment rule, and
@@ -271,3 +273,58 @@ checked against their limits. A dedicated field waits for the first such tool.
   and the transition that remain are `write`, to show the denial. A comment tool that comments
   only on what the gateway created for review is `propose` and allowed, to show the other side
   of the comment rule.
+
+## Amended 2026-10-07: currency for Otto's proposals
+
+[Decision 0012](0012-what-a-turn-grant-binds.md) allows a `propose` call under the profile for
+Otto's sandboxes only while Otto says the turn is current. That is, its control plane still
+holds the lease at the grant's epoch, and the turn has not ended or been revoked. This
+amendment puts that rule in the decision function.
+
+### What changes
+
+- **The call context** gains the call's currency: current, not current (superseded, ended or
+  revoked), unconfirmed, or not asked. The Otto adapter fills it, for `tools/call` only. It
+  asks Otto's resolver only when the snapshot's tool is `propose` and the profile requires
+  currency. An adapter that fails to ask leaves "not asked".
+- **The principal** gains, for a Kubernetes workload, the pod UID its token proves. **The
+  delegation** gains its issuer, digest and key ID. The function reads none of these. The
+  audit record keeps them.
+- **A profile** gains a setting: `propose` requires a current control plane. The profile for
+  Otto's sandboxes sets it. The profile for Otto's control-plane surface does not, because
+  Otto's receipts are posted after the turn has ended.
+- **A new check between 5 and 6.** Under such a profile a `propose` call is allowed only if its
+  currency is current. Not current, unconfirmed and not asked are each denied. The check is
+  skipped for `tools/list`, like check 6, and does not apply to `read`.
+- **Two new reason kinds,** each with its sentence: the control plane is not current, and
+  currency is unconfirmed. "Not asked" is denied as unconfirmed. The row records which answer
+  Otto gave.
+
+### Why currency is in the function
+
+The 2026-10-04 amendment kept profiles to a set of classifications, and rejected fields that
+mean something only for some tools and profiles. Currency is such a field. It goes in the
+function anyway, so that the decision table and its properties cover it. The alternative is
+for the adapter to deny before the function runs. That is a second place that decides, which
+this record allows only for a connector's refusal.
+
+### What runs before the function
+
+The turn-grant verifier's own checks run before the function: version, key, encoding,
+signature, audience, lifetime and, once required, pod. Each failure gets the fixed sentence for
+a bad grant, and none is a reason kind here. Check 3 still names a team mismatch. Such a grant
+verified, and the mismatch is usually a rollout fault.
+
+### Consequences
+
+- The Otto adapter asks Otto's resolver before deciding each `propose` call under the profile
+  for Otto's sandboxes, from stage 3. No answer within one second denies the call.
+- The decision table gains a case for each currency value against a `read` and a `propose`
+  tool, under a profile that requires currency and one that does not.
+- A new property: under a profile that requires currency, a `propose` call is never allowed
+  unless its currency is current.
+- New mutations: the currency check skipped, "not asked" treated as current, "unconfirmed"
+  treated as current, and the check applied to `read`.
+- The core changes these need (the currency type in the call context, the profile setting,
+  the check, the reason kinds and the recorded fields) are follow-on code for milestone 4.
+  They are not built yet.

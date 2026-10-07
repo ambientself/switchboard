@@ -1,11 +1,12 @@
 # 0012: What a turn grant binds, and what Otto changes for it
 
-Date: 2026-10-06. Status: proposed. Settles Q18 if accepted and once Otto agrees to the changes
-listed below. Answers what [decision 0004](0004-verify-turn-grants-with-a-public-key.md) left
-open, and changes one of its consequences: the format change is made before stage 1, not with
-the cutover. Written against the 2026-10-04 amendment to
-[decision 0006](0006-what-the-decision-function-sees.md) (pull request #29) and the audit
-record's resource columns (pull request #30), and amends 0006 again.
+Date: 2026-10-06. Status: accepted here; needs changes in Otto. Accepted on 2026-10-07, when
+the owner accepted the recommendations (see the end). Settles Q18. Answers what
+[decision 0004](0004-verify-turn-grants-with-a-public-key.md) left open, and changes one of its
+consequences: the format change is made before stage 1, not with the cutover. Written against
+the 2026-10-04 amendment to [decision 0006](0006-what-the-decision-function-sees.md) and the
+resources recorded on each audit row ([design.md](../design.md), section 11), and amends 0006
+again on 2026-10-07. None of the changes in Otto has been agreed with Otto's owners yet.
 
 ## Context
 
@@ -93,13 +94,14 @@ turn.
 the sandbox when it mints: its driver is handed `exec.Status.SandboxRef`, and the controller
 reads that Sandbox's UID beside it, without failing the turn when the read fails. The projected
 token proves the pod's UID, which is not the Sandbox resource's. What Otto adds is resolving
-the claimed sandbox to its pod's UID before minting, and refusing the turn when it cannot. This
-record recommends `pod` in the first change. If Otto cannot do that, `pod` follows before
-stage 3 in the two steps below, and until then a copied grant can be presented for reads by
-any sandbox of its team, recorded with the pod that did. In stage 3 this gateway makes proposals in
-the acting human's name, and Otto's rule that a requester may not approve their own change
-depends on that name, so the pod is bound before writes move. The binding stops a copied grant
-only while the harness cannot also read the pod's projected token, which Otto has to confirm.
+the claimed sandbox to its pod's UID before minting, and refusing the turn when it cannot. Otto
+is asked for `pod` in the first change. If Otto cannot do that, `pod` follows before stage 3 in
+the two steps below, and until then a copied grant can be presented for reads by any sandbox of
+its team, recorded with the pod that did. The owner accepted that gap for stages 1 and 2. In
+stage 3 this gateway makes proposals in the acting human's name, and Otto's rule that a
+requester may not approve their own change depends on that name, so the pod is bound before
+writes move. The binding stops a copied grant only while the harness cannot also read the pod's
+projected token, which Otto has to confirm.
 
 **One grant, one string.** Each part must be canonical unpadded base64url, so a grant that
 does not re-encode to the same bytes is refused. The signature's S must be canonical, and a
@@ -148,7 +150,7 @@ Otto adapter asks Otto's resolver interface
 ([decision 0003](0003-otto-keeps-its-control-plane-endpoints.md)) one question: is this turn
 (session, execution, turn and epoch) current? Otto answers current, superseded (a newer epoch
 holds the lease), ended, or revoked. The answer is not cached. No answer within a fixed
-budget, proposed at one second, an error, an unknown version, or an answer to another
+budget of one second, an error, an unknown version, or an answer to another
 question counts as unconfirmed, and the call is denied, as 0003 requires.
 
 Otto answers from its durable state: the lease row's holder and epoch, compared on the
@@ -239,8 +241,8 @@ The gateway refuses to start if: the profile for Otto's sandboxes has no grant k
 holds private key material; a key is of small order; the same key is configured twice, or
 under two issuers; a previous key has no end instant; or a surface under that profile serves a
 `propose` tool while `pod` is not required for its issuer. The last holds the pod binding in
-place once writes move. If the owner confirms it, it also refuses to start with grant checking
-turned off outside a development build.
+place once writes move. It also refuses to start with grant checking turned off outside a
+development build.
 
 ### Revocation
 
@@ -340,8 +342,8 @@ lease row is tested in Otto. The cases go in [design.md](../design.md), section 
 - The Kubernetes identity verifier exposes the pod UID its token proves.
 - Stage 1 copies verify here only if they carry the sandbox's own identity token and grant,
   with that token's audience admitting this gateway. How copies are made is #13.
-- If the owner confirms it, grant checking can be turned off only in a development build,
-  which settles that part of Q12 for this gate. Otherwise it stays with Q12.
+- Grant checking can be turned off only in a development build, enforced at boot. That settles
+  that part of Q12 for this gate.
 - The control plane is still trusted for whom it names. A grant proves that Otto said who the
   turn was for, not that the person acted.
 - Verification is offline, so a deleted pod's token and grant verify until they expire or a
@@ -354,37 +356,87 @@ lease row is tested in Otto. The cases go in [design.md](../design.md), section 
   gateway's MCP path is retired; facts fixed for the turn, such as skill pins, once
   `github_skill_body` is built (#12), choosing then between a claim and the resolver as 0003
   says.
-- Until Otto agrees, this record is a proposal, and the three "agree with Otto" criteria in
-  issue #21 stay open.
+- Until Otto agrees, the changes in Otto above are requests, and the three "agree with Otto"
+  criteria in issue #21 stay open. What this gateway does meanwhile is under Still open, below.
 
-## Needs the owner
+## Decided by the owner
 
-- Who takes the Otto change list to Otto's owners, and whether Otto's schedule fits
-  milestone 4. Nothing has been raised in Otto yet.
-- Whether Otto accepts the breaking change before stage 1, rather than with the cutover as
-  decision 0004 had it, which means its Go gateway verifies Ed25519 too.
-- Whether Otto can mint `pod` in the first change, and confirms that the harness cannot read
-  the pod's projected token. If not in the first change, whether copied grants usable for reads
-  within a team, recorded but not refused, are acceptable until stage 3.
-- The lifetime ceiling (15 minutes) and leeway (30 seconds), agreed with Otto. The ceiling has
-  to grow with Otto's timeouts.
-- The resolver's budget (one second) and availability target, and who is paged when it fails.
-- Whether reads stay unfenced, and whether Otto plans a blue/green swap in production or local
-  execution in sandboxes during milestone 4. Otto's agreement to the two departures from its
-  control-plane document.
-- Whether control-plane components that act under the lease send their epoch and are fenced,
-  or duplicate control-plane effects stay with Otto's row claims and the receipts in Q10.
-- Who may revoke a turn in Otto, remove a key here, or remove a team from the allowlist of
-  Otto's sandbox surface, and how fast configuration must reach running instances (Q11).
-- Where Otto's private key is held, and whether that needs IT or security. Who reviews a key
-  change here, and the rotation schedule.
-- Who names this gateway's deployments, given that the names are in Otto's grants.
-- Whether an audience or pod failure pages someone, and whom, and what rate of lifetime
-  failures alerts.
-- Whether Otto adds columns to `gateway_audit` for the new fields or reads them from this
-  gateway's record, and whether Otto records each grant's digest at mint.
-- Whether the digest replaces the unique-identifier claim that issue #21 asks for.
-- Whether grant checking is off only in development builds, enforced at boot, or that is left
-  to Q12.
-- Whether the stage 1 copies (#13) can carry the sandbox's own identity token and grant, with
-  that token's audience admitting this gateway.
+On 2026-10-07 the owner accepted this record's recommendations:
+
+- **The format change comes before stage 1.** Otto is asked to move to Ed25519 in one change,
+  alone, before stage 1, and its Go gateway verifies the new format by the same strict rules.
+  This replaces decision 0004's plan to make the change with the cutover.
+- **`pod` in the first change, if Otto can.** If Otto cannot, stages 1 and 2 may run with
+  copied grants usable for reads by any sandbox of the grant's team, recorded with the pod
+  that presented them and not refused. `pod` is required before stage 3, and a boot gate holds
+  that.
+- **The lifetime ceiling is 15 minutes and the leeway 30 seconds.** The ceiling is raised here
+  before Otto raises its timeouts past it.
+- **The resolver's budget is one second.** No answer within it denies the proposal.
+- **Reads stay unfenced,** until Otto enables a blue/green control-plane swap in production or
+  local execution in sandboxes while this gateway serves its reads.
+- **Control-plane actions are not fenced by turn currency.** Duplicate control-plane effects
+  stay with Otto's row claims and the receipts in Q10, unless Otto's answer below changes that.
+- **Configuration levers take one rollout** until Q11 sets a freshness bound. Removing a grant
+  key, or a team from the allowlist of Otto's sandbox surface, is a reviewed configuration
+  change like any other.
+- **This gateway names its own deployments,** in its deployment configuration. Renaming a
+  deployment that Otto's `aud` names is coordinated with Otto, which mints the new name first.
+- **Audience and pod failures are investigated one by one. Lifetime failures alert on a rate.**
+- **The digest replaces a unique-identifier claim.** Issue #21 asked for an identifier in the
+  grant. The SHA-256 of the canonical grant identifies it with no change in Otto.
+- **Grant checking can be turned off only in a development build,** enforced at boot.
+- **Stage 1 copies carry the sandbox's own identity token and grant,** with the token's
+  audience admitting this gateway. Stage 1 does not start without them.
+
+## Still open
+
+These need someone other than the owner, apart from naming who raises the changes with Otto,
+on which this record made no recommendation. The record holds with them open: each says what
+this gateway does meanwhile.
+
+- **Otto's agreement to the changes above, and whether Otto's schedule fits milestone 4.**
+  Decided by Otto's owners. Nothing has been raised with them yet. Who raises it is for the
+  owner to name. Meanwhile the Otto adapter is built and tested against a local grant minter
+  and a fake resolver, Otto's Go gateway keeps serving Otto, and stage 1 does not start until
+  Otto's breaking change has been rolled.
+- **Whether Otto can mint `pod` in the first change, and whether the harness can read the
+  pod's projected token.** Decided by Otto's owners. Meanwhile `pod` is not required, a copied
+  grant used for reads is recorded with the pod that presented it, and the gateway refuses to
+  start if Otto's sandbox surface serves a `propose` tool while `pod` is not required.
+- **The ceiling and leeway in Otto's minter.** Otto's owners agree to mint `iat` and to refuse
+  a lifetime over 15 minutes. Meanwhile this gateway applies the ceiling and leeway to every
+  grant it verifies.
+- **The resolver's availability target, and who is paged when it fails.** The target is
+  decided by Otto's owners, and paging by the on-call rotation that will carry it. Meanwhile
+  nothing calls the resolver before stage 3. From stage 3 a proposal is denied when the
+  resolver does not answer within one second, and reads keep working.
+- **Whether Otto plans a blue/green swap in production or local execution in sandboxes during
+  milestone 4, and its agreement to the two departures from its control-plane document.**
+  Decided by Otto's owners. Meanwhile reads are not fenced. If either is planned, fencing reads
+  comes back, as Consequences says.
+- **Whether Otto's lease-holding control-plane components send their epoch.** Decided by
+  Otto's owners. Meanwhile the profile for Otto's control-plane surface does not require
+  currency.
+- **Who in Otto may mark a turn revoked.** Decided by Otto's owners. Meanwhile, until Otto
+  answers the currency question, a turn is stopped only by the team, key and surface levers
+  here, each taking one rollout.
+- **Key custody and rotation.** Where Otto's private key is held (a mounted Secret as today, a
+  signer like Otto's GitHub App custodian, or KMS or an HSM), whether that needs IT, who
+  reviews a grant-key change here beyond the ordinary review, and the rotation schedule.
+  Decided by Otto's owners and the security team, and by IT if they require it.
+  Meanwhile this gateway holds only public keys, read at boot, and rotates by the procedure
+  under Keys.
+- **How audience and pod failures and the lifetime-failure rate reach a person.** Whether a
+  failure pages or opens a ticket, for whom, and the rate that alerts. Decided by the on-call
+  rotation for this gateway, with whoever runs logging. Meanwhile each failure kind is logged
+  and counted, and nothing pages.
+- **Reading the new fields back in Otto.** Whether Otto adds columns to `gateway_audit` for the
+  grant digest, issuer, key ID, pod UID and currency answer, or reads them from this gateway's
+  record, and whether Otto records each grant's digest at mint. Decided by Otto's owners, with
+  audit ownership in Q12. Meanwhile the fields are kept only in this gateway's record, and
+  Otto joins on the session and turn.
+- **Otto minting a renamed deployment first.** Otto's owners agree to the order. Meanwhile a
+  deployment named in Otto's `aud` is not renamed.
+- **The audience of the sandbox's identity token for stage 1 copies.** Decided by Otto's
+  owners, in the rollout plan for #13. Meanwhile stage 1 does not start.
