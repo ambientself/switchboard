@@ -27,7 +27,7 @@ use std::process::ExitCode;
 
 use gateway_core::audit::DecisionKind;
 use gateway_dev::client::{Client, caller_name, script, unauthenticated};
-use gateway_dev::tokens::{REMINT_EVERY, write_tokens};
+use gateway_dev::tokens::{self, REMINT_EVERY, write_tokens};
 use gateway_dev::{FixtureGateway, Options, start_fixture_gateway_with};
 use gateway_mcp::Era;
 use gateway_testkit::{Caller, SURFACE_ALL, SURFACE_READ};
@@ -44,17 +44,10 @@ struct Arguments {
     once: bool,
 }
 
-/// `target/switchboard-dev/tokens.json` in the workspace this binary was built from.
-fn default_tokens() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest.ancestors().nth(2).unwrap_or(manifest);
-    workspace.join("target/switchboard-dev/tokens.json")
-}
-
 fn arguments() -> Result<Arguments, String> {
     let mut parsed = Arguments {
         port: DEFAULT_PORT,
-        tokens: default_tokens(),
+        tokens: tokens::default_path(),
         once: false,
     };
     let mut arguments = std::env::args().skip(1);
@@ -162,6 +155,8 @@ fn introduce(gateway: &FixtureGateway, tokens: &Path) {
         "  claude mcp add --transport http switchboard-a {read} \\\n    --header \"Authorization: Bearer $(jq -r .team_a {})\"",
         tokens.display()
     );
+    println!("To run the scripted client against it as team B, in another terminal:");
+    println!("  cargo run -p gateway-dev --bin switchboard-client -- --caller team-b");
     println!("Audit rows are printed below as JSON lines, as they are written.");
     let _ = io::stdout().flush();
 }

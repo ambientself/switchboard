@@ -108,6 +108,23 @@ pub fn caller_name(caller: Caller) -> &'static str {
     }
 }
 
+/// The caller [`caller_name`] names. A hyphen may stand for the underscore, so `team-a` is
+/// team A too.
+pub fn caller_named(name: &str) -> Option<Caller> {
+    [Caller::TeamA, Caller::TeamB, Caller::UserInGroupG]
+        .into_iter()
+        .find(|caller| caller_name(*caller) == name.replace('-', "_"))
+}
+
+/// The era `name` names: `legacy` or `modern`, or the version itself.
+pub fn era_named(name: &str) -> Option<Era> {
+    match name {
+        "legacy" | LEGACY => Some(Era::Legacy),
+        "modern" | MODERN => Some(Era::Modern),
+        _ => None,
+    }
+}
+
 /// A document `caller`'s limits do not reach, which the decision denies by name.
 pub fn other_document(caller: Caller) -> &'static str {
     match caller {

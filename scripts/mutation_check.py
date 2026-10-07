@@ -1286,6 +1286,18 @@ mutate("dev-fixture-lifetime-unbounded", "the fixture gateway accepts tokens tha
        '"max_lifetime_secs": DEFAULT_MAX_LIFETIME,', '"max_lifetime_secs": DEFAULT_MAX_LIFETIME * 48,')
 
 
+# --- gateway-dev: switchboard-client -------------------------------------------------------
+
+DEV_CLIENT_BIN = DEV + "bin/switchboard-client.rs"
+
+mutate("dev-client-bin-caller-ignored", "switchboard-client presents team A's token whatever caller it is asked for", DEV_CLIENT_BIN,
+       "read_token(&arguments.tokens, caller, SURFACE_READ)", "read_token(&arguments.tokens, Caller::TeamA, SURFACE_READ)")
+mutate("dev-client-bin-era-ignored", "switchboard-client runs both eras whatever era it is asked for", DEV_CLIENT_BIN,
+       "    for era in arguments.eras {", "    for era in [Era::Legacy, Era::Modern] {")
+mutate("dev-client-bin-unexpected-exits-0", "switchboard-client exits 0 when an answer was not as expected", DEV_CLIENT_BIN,
+       "    } else {\n        ExitCode::from(1)\n    }", "    } else {\n        ExitCode::SUCCESS\n    }")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 

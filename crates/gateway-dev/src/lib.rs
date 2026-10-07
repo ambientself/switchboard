@@ -14,7 +14,9 @@
 //! - [`client`] is the scripted client: `initialize` or `server/discover`, `tools/list`, an
 //!   allowed call and a denied one, in either MCP era, printed as it goes.
 //!
-//! The `switchboard-dev` binary puts these together in one command.
+//! The `switchboard-dev` binary puts these together in one command. The `switchboard-client`
+//! binary runs the scripted client against a gateway that is already running, as any fixture
+//! caller, with the token from the tokens file.
 //!
 //! Nothing here belongs in a running gateway: it depends on the testkit, whose keys are
 //! generated in process and whose credentials are labelled dummies.
