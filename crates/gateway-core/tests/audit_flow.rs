@@ -9,13 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind,
-    MAX_RECORDED_RESOURCES, Outcome, RequestMetadata,
+    MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, Outcome, RecordedResource, RecordedResources,
+    RequestMetadata,
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
     Classification, Connector, ConnectorName, Decision, Delegation, PolicySnapshot, Principal,
-    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, ReasonKind, RequestedTool, Resource,
-    ResourceDeclaration, Resources, SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, decide,
+    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind, RequestedTool,
+    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, SnapshotData,
+    Surface, TeamId, ToolCall, ToolOutcome, decide,
 };
 use serde_json::json;
 
@@ -92,13 +94,39 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
             classifications: [Classification::Read].into(),
             requires_delegation: true,
         }],
-        limits: Default::default(),
+        limits: limits(),
     })
     .unwrap()
 }
 
 fn snapshot() -> PolicySnapshot {
     snapshot_with(true)
+}
+
+/// A GitHub repository named `org/{name}`.
+fn repository(name: &str) -> Resource {
+    Resource {
+        system: "github".into(),
+        kind: "repository".into(),
+        identifier: format!("org/{name}"),
+    }
+}
+
+/// How many repositories the payments team may reach: more than a row records.
+const PERMITTED: usize = 100;
+
+/// The payments team may reach `org/repo-0` to `org/repo-99`, and nothing else.
+fn limits() -> ResourceLimits {
+    ResourceLimits {
+        teams: [(
+            TeamId::new("payments"),
+            (0..PERMITTED)
+                .map(|n| repository(&format!("repo-{n}")))
+                .collect(),
+        )]
+        .into(),
+        groups: BTreeMap::new(),
+    }
 }
 
 fn principal() -> Principal {
@@ -431,72 +459,235 @@ fn a_long_valid_looking_name_is_cut_at_the_tool_name_limit() {
     assert_eq!(store.last().tool, format!("{}…", "z".repeat(128)));
 }
 
+/// `org/repo-0` onwards: `count` repositories the payments team may reach.
+fn permitted(count: usize) -> Vec<Resource> {
+    assert!(count <= PERMITTED);
+    (0..count)
+        .map(|n| repository(&format!("repo-{n}")))
+        .collect()
+}
+
+/// A resource as a row records it, when nothing in it needs escaping or cutting.
+fn as_recorded(resources: &[Resource]) -> RecordedResources {
+    RecordedResources::Named(
+        resources
+            .iter()
+            .map(|resource| RecordedResource {
+                system: resource.system.clone(),
+                kind: resource.kind.clone(),
+                identifier: resource.identifier.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// Decides and begins a call to `fixture__read` naming `resources`. Returns the refusal, if it
+/// was denied, and what its row records.
+fn record_call(resources: Resources) -> (Option<audit::Refusal>, RecordedResources, usize) {
+    let store = MemoryStore::default();
+    let mut call = call("fixture__read");
+    call.resources = resources;
+    let refusal = match begin(&store, decide(&snapshot(), &call)) {
+        Begun::Allowed(_) => None,
+        Begun::Denied(refusal) => Some(refusal),
+    };
+    let row = store.last();
+    (refusal, row.resources, row.resources_omitted)
+}
+
+/// The identifier a single named resource is recorded with, and its system and kind.
+fn record_one(resource: Resource) -> RecordedResource {
+    match record_call(Resources::Named(vec![resource])).1 {
+        RecordedResources::Named(mut recorded) if recorded.len() == 1 => recorded.remove(0),
+        recorded => panic!("one named resource was recorded as {recorded:?}"),
+    }
+}
+
 #[test]
 fn a_row_records_the_resources_its_call_named() {
-    let store = MemoryStore::default();
-    let repository = |identifier: String| Resource {
-        system: "github".into(),
-        kind: "repository".into(),
-        identifier,
-    };
-    let named = |count: usize| -> Vec<Resource> {
-        (0..count)
-            .map(|n| repository(format!("org/repo-{n}")))
-            .collect()
-    };
-    let record = |resources: Resources| {
-        let mut call = call("fixture__read");
-        call.resources = resources;
-        let _ = begin(&store, decide(&snapshot(), &call));
-        let row = store.last();
-        (row.resources, row.resources_omitted)
-    };
-
-    assert_eq!(record(Resources::Unknown), (Resources::Unknown, 0));
+    let (refusal, recorded, omitted) = record_call(Resources::Unknown);
     assert_eq!(
-        record(Resources::Named(Vec::new())),
-        (Resources::Named(Vec::new()), 0)
+        refusal.map(|refusal| refusal.reason().kind()),
+        Some(ReasonKind::ResourceOutsideLimit)
     );
+    assert_eq!((recorded, omitted), (RecordedResources::Unknown, 0));
 
-    let exactly = named(MAX_RECORDED_RESOURCES);
+    let (refusal, recorded, omitted) = record_call(Resources::Named(Vec::new()));
+    assert!(refusal.is_none());
+    assert_eq!((recorded, omitted), (as_recorded(&[]), 0));
+
+    let exactly = permitted(MAX_RECORDED_RESOURCES);
+    let (refusal, recorded, omitted) = record_call(Resources::Named(exactly.clone()));
+    assert!(refusal.is_none());
     assert_eq!(
-        record(Resources::Named(exactly.clone())),
-        (Resources::Named(exactly.clone()), 0),
+        (recorded, omitted),
+        (as_recorded(&exactly), 0),
         "a call naming exactly the most a row records loses none"
     );
 
-    let mut many = named(MAX_RECORDED_RESOURCES + 6);
-    many[0].identifier = "org/a\nb`c".into();
-    many[1].identifier = "x".repeat(500);
-    many[2].system = "git\rhub".into();
-    many[2].kind = "repo`sitory".into();
-    let (recorded, omitted) = record(Resources::Named(many));
-    assert_eq!(omitted, 6);
-    let Resources::Named(recorded) = recorded else {
-        panic!("named resources were recorded as unknown");
-    };
-    assert_eq!(recorded.len(), MAX_RECORDED_RESOURCES);
-    assert_eq!(recorded[0].identifier, "org/a\\nb\\`c");
-    assert_eq!(recorded[1].identifier, format!("{}…", "x".repeat(128)));
-    assert_eq!(recorded[2].system, "git\\rhub");
-    assert_eq!(recorded[2].kind, "repo\\`sitory");
+    let mut many = permitted(MAX_RECORDED_RESOURCES + 6);
+    many.reverse();
+    let (refusal, recorded, omitted) = record_call(Resources::Named(many.clone()));
+    assert!(refusal.is_none());
     assert_eq!(
-        recorded[3..],
-        exactly[3..],
-        "the rest are kept in the order named"
+        (recorded, omitted),
+        (as_recorded(&many[..MAX_RECORDED_RESOURCES]), 6),
+        "the first named are kept, in the order named, and the rest counted"
     );
+}
+
+/// Naming one resource many times cannot push another off the row: a repeat is recorded once
+/// and not counted.
+#[test]
+fn a_repeated_resource_is_recorded_once() {
+    let [first, second, third] = [0, 1, 2].map(|n| repository(&format!("repo-{n}")));
+    let mut named = vec![first.clone(); MAX_RECORDED_RESOURCES];
+    named.push(second.clone());
+    named.extend(vec![first.clone(); 10]);
+    named.push(third.clone());
+    named.push(second.clone());
+    let (refusal, recorded, omitted) = record_call(Resources::Named(named));
+    assert!(refusal.is_none());
+    assert_eq!(
+        (recorded, omitted),
+        (as_recorded(&[first, second, third]), 0)
+    );
+
+    let outside = repository("outside");
+    let mut named = vec![repository("repo-0"); 200];
+    named.push(outside.clone());
+    let (refusal, recorded, omitted) = record_call(Resources::Named(named));
+    let refusal = refusal.expect("a resource outside the limit was allowed");
+    assert!(refusal.sentence().contains("`org/outside`"), "{refusal:?}");
+    assert_eq!(
+        (recorded, omitted),
+        (as_recorded(&[repository("repo-0"), outside]), 0)
+    );
+}
+
+/// The decision checks every resource a call names, however many: one outside the limit is
+/// denied wherever it falls. The row always records the resource the denial names, taking the
+/// place of the last one kept when it falls past them.
+#[test]
+fn a_resource_outside_the_limit_is_denied_and_recorded_wherever_it_falls() {
+    let outside = repository("outside");
+    for position in [0, 3, 62, 63, 64, 65, 99, PERMITTED] {
+        let mut named = permitted(PERMITTED);
+        named.insert(position, outside.clone());
+        let (refusal, recorded, omitted) = record_call(Resources::Named(named.clone()));
+
+        let refusal = refusal.unwrap_or_else(|| panic!("allowed at position {position}"));
+        match refusal.reason() {
+            Reason::ResourceOutsideLimit(ResourceProblem::Outside { resource, .. }) => {
+                assert_eq!(resource, &outside, "position {position}");
+            }
+            reason => panic!("position {position}: denied for {reason:?}"),
+        }
+        assert!(
+            refusal.sentence().contains("`org/outside`"),
+            "position {position}: {}",
+            refusal.sentence()
+        );
+
+        let mut expected = named[..MAX_RECORDED_RESOURCES].to_vec();
+        if position >= MAX_RECORDED_RESOURCES {
+            expected[MAX_RECORDED_RESOURCES - 1] = outside.clone();
+        }
+        assert_eq!(
+            (recorded, omitted),
+            (
+                as_recorded(&expected),
+                PERMITTED + 1 - MAX_RECORDED_RESOURCES
+            ),
+            "position {position}"
+        );
+    }
+
+    let (refusal, _, _) = record_call(Resources::Named(permitted(PERMITTED)));
+    assert!(
+        refusal.is_none(),
+        "every resource is within the limit, past the cap as well"
+    );
+}
+
+#[test]
+fn recorded_values_are_escaped_reversibly() {
+    let named = |identifier: &str| Resource {
+        identifier: identifier.into(),
+        ..repository("")
+    };
+    assert_eq!(record_one(named("org/a\nb`c")).identifier, "org/a\\nb\\`c");
+    assert_eq!(record_one(named("org/a\\nb")).identifier, "org/a\\\\nb");
+    assert_eq!(record_one(named("caf\u{e9}")).identifier, "caf\\u{e9}");
+    let mut distinct = BTreeSet::new();
+    for raw in [
+        "a\nb", "a\\nb", "a\\\\nb", "a`b", "a\\`b", "\u{e9}", "\\u{e9}",
+    ] {
+        assert!(
+            distinct.insert(record_one(named(raw)).identifier),
+            "{raw:?} is recorded like another identifier"
+        );
+    }
+
+    let recorded = record_one(Resource {
+        system: "git\rhub".into(),
+        kind: "repo`sit\\ory".into(),
+        identifier: "org/a".into(),
+    });
+    assert_eq!(recorded.system, "git\\rhub");
+    assert_eq!(recorded.kind, "repo\\`sit\\\\ory");
+}
+
+/// Every identifier the target systems document fits whole; only a longer one is cut.
+#[test]
+fn recorded_values_are_capped() {
+    let named = |identifier: String| Resource {
+        identifier,
+        ..repository("")
+    };
+    let longest_github = format!("{}/{}", "o".repeat(39), "r".repeat(100));
+    assert_eq!(
+        record_one(named(longest_github.clone())).identifier,
+        longest_github,
+        "the longest GitHub repository name is cut"
+    );
+    for (raw, recorded) in [
+        (
+            "x".repeat(MAX_RECORDED_IDENTIFIER),
+            "x".repeat(MAX_RECORDED_IDENTIFIER),
+        ),
+        (
+            "x".repeat(MAX_RECORDED_IDENTIFIER + 1),
+            format!("{}…", "x".repeat(MAX_RECORDED_IDENTIFIER)),
+        ),
+        (
+            format!("{}\n", "x".repeat(MAX_RECORDED_IDENTIFIER - 1)),
+            format!("{}…", "x".repeat(MAX_RECORDED_IDENTIFIER - 1)),
+        ),
+    ] {
+        assert_eq!(record_one(named(raw)).identifier, recorded);
+    }
+
+    for (raw, recorded) in [
+        ("s".repeat(128), "s".repeat(128)),
+        ("s".repeat(129), format!("{}…", "s".repeat(128))),
+    ] {
+        let resource = record_one(Resource {
+            system: raw.clone(),
+            kind: raw,
+            identifier: "org/a".into(),
+        });
+        assert_eq!(resource.system, recorded);
+        assert_eq!(resource.kind, recorded);
+    }
 }
 
 #[test]
 fn the_record_serializes_under_pinned_names_and_reads_back() {
     let pins = [
-        (json!(Resources::Unknown), json!("unknown")),
+        (json!(RecordedResources::Unknown), json!("unknown")),
         (
-            json!(Resources::Named(vec![Resource {
-                system: "github".into(),
-                kind: "repository".into(),
-                identifier: "org/a".into(),
-            }])),
+            json!(as_recorded(&[repository("a")])),
             json!({"named": [{"system": "github", "kind": "repository", "identifier": "org/a"}]}),
         ),
         (json!(DecisionKind::Allow), json!("allow")),
@@ -534,6 +725,19 @@ fn the_record_serializes_under_pinned_names_and_reads_back() {
     let ran = common::ready(audit::run(&connector, allowed(&store, "fixture__read")));
     let _ = common::ready(audit::finish(&store, ran, 7));
     let _ = denied(&store, decide(&snapshot(), &call("fixture__write")));
+    let mut named = permitted(MAX_RECORDED_RESOURCES + 3);
+    named.insert(1, repository("a\\b\n`c\u{e9}"));
+    let mut resourceful = call("fixture__read");
+    resourceful.resources = Resources::Named(named);
+    let _ = denied(&store, decide(&snapshot(), &resourceful));
+    let row = store.last();
+    assert_eq!(row.resources_omitted, 4);
+    assert!(
+        matches!(&row.resources, RecordedResources::Named(recorded)
+            if recorded[1].identifier == "org/a\\\\b\\n\\`c\\u{e9}"),
+        "{:?}",
+        row.resources
+    );
     for row in store.rows() {
         let text = serde_json::to_string(&row).unwrap();
         let back: AuditRecord = serde_json::from_str(&text).unwrap();

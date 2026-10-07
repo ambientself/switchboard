@@ -21,6 +21,9 @@ use gateway_core::{
     Verdict, decide, list_tools,
 };
 
+use gateway_core::AuditRecord;
+use gateway_core::audit::{self, Begun, RecordedResources};
+
 use common::tool_name;
 use proptest::prelude::*;
 use proptest::sample::{select, subsequence};
@@ -505,48 +508,196 @@ proptest! {
     }
 }
 
+/// Reverses the crate's escaping, written out here independently of it: `\\`, `` \` ``, `\n`,
+/// `\r`, `\t` and `\u{...}`. `None` if `text` is not something the escaping could produce.
+fn unescape(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            if !(character == ' ' || character.is_ascii_graphic()) || character == '`' {
+                return None;
+            }
+            out.push(character);
+            continue;
+        }
+        match chars.next()? {
+            '\\' => out.push('\\'),
+            '`' => out.push('`'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let hex: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// How many characters `character` takes once escaped.
+fn escaped_length(character: char) -> usize {
+    match character {
+        '`' | '\\' | '\n' | '\r' | '\t' => 2,
+        ' ' => 1,
+        c if c.is_ascii_graphic() => 1,
+        c => c.escape_default().count(),
+    }
+}
+
+/// Whether `recorded` is `raw` as a row should hold it: the whole of `raw`, or, when `raw` does
+/// not fit in `cap` characters once escaped, the longest beginning of it that does, marked
+/// with `…`.
+fn records(recorded: &str, raw: &str, cap: usize) -> Result<(), String> {
+    let (kept, cut) = match recorded.strip_suffix('…') {
+        Some(kept) => (kept, true),
+        None => (recorded, false),
+    };
+    let length = kept.chars().count();
+    if length > cap {
+        return Err(format!("{length} characters, more than {cap}"));
+    }
+    let back = unescape(kept).ok_or_else(|| format!("{recorded:?} is not escaped text"))?;
+    if !cut {
+        return if back == raw {
+            Ok(())
+        } else {
+            Err(format!("{recorded:?} reads back as {back:?}, not {raw:?}"))
+        };
+    }
+    if !raw.starts_with(&back) {
+        return Err(format!("{recorded:?} is not a beginning of {raw:?}"));
+    }
+    match raw[back.len()..].chars().next() {
+        Some(next) if length + escaped_length(next) > cap => Ok(()),
+        _ => Err(format!("{recorded:?} is cut where {raw:?} did not need it")),
+    }
+}
+
+/// A resource a call might name: often one the generated limits can hold, so that repeats and
+/// calls that pass the resource check are common, and otherwise arbitrary text, some of it
+/// longer than a row keeps.
+fn any_named_resource() -> impl Strategy<Value = Resource> {
+    // Long text is a short piece repeated, which is much cheaper to generate than long
+    // arbitrary text and reaches the caps just as well.
+    let long = |lengths: std::ops::Range<usize>| {
+        ("\\PC{1,4}|[\\x00-\\x7f]{1,4}|[\\x20-\\x7e]{1,4}", lengths)
+            .prop_map(|(piece, length)| piece.chars().cycle().take(length).collect::<String>())
+    };
+    let text = |lengths| prop_oneof![4 => "\\PC{0,40}|[\\x00-\\x7f]{0,40}", 1 => long(lengths)];
+    let arbitrary = (text(2040..2056), text(120..136), text(120..136)).prop_map(
+        |(identifier, system, kind)| Resource {
+            system,
+            kind,
+            identifier,
+        },
+    );
+    prop_oneof![select(resource_pool()), arbitrary]
+}
+
+/// Writes the row for `call` in `world`, and returns it with the resource a resource denial
+/// named, if there was one.
+fn row_and_denied(world: &World, call: &CallContext) -> (AuditRecord, Option<Resource>) {
+    let store = common::MemoryStore::default();
+    let begun = common::ready(audit::begin(
+        &store,
+        decide(&world.snapshot(), call),
+        serde_json::Value::Null,
+        Default::default(),
+    ))
+    .unwrap();
+    let denied = match &begun {
+        Begun::Denied(refusal) => match refusal.reason() {
+            Reason::ResourceOutsideLimit(ResourceProblem::Outside { resource, .. }) => {
+                Some(resource.clone())
+            }
+            _ => None,
+        },
+        Begun::Allowed(_) => None,
+    };
+    (store.last(), denied)
+}
+
 proptest! {
-    /// Whatever resources a call names, the row records them with no control character, each
-    /// value short, and no more of them than a row holds, with the rest counted.
+    /// Whatever resources a call names, the row records each distinct one once, in the order
+    /// first named, up to the most a row holds, with the one a resource denial names always
+    /// among them and the rest counted. Each recorded value reads back as the value named, or
+    /// as the longest beginning of it that fits, and carries no control character.
     #[test]
-    fn named_resources_never_reach_a_row_raw(
+    fn named_resources_reach_a_row_as_named_and_never_raw(
         world in world(),
-        named in proptest::collection::vec(
-            (
-                "\\PC{0,40}|[\\x00-\\x7f]{0,40}|\\PC{200,400}",
-                "[\\x00-\\x7f]{0,20}|\\PC{200,300}",
-                "[\\x00-\\x7f]{0,20}|\\PC{200,300}",
-            ),
-            0..100,
-        ),
+        named in proptest::collection::vec(any_named_resource(), 0..100),
     ) {
-        let named: Vec<Resource> = named
-            .into_iter()
-            .map(|(identifier, system, kind)| Resource { system, kind, identifier })
-            .collect();
         let mut call = world.call();
         call.resources = Resources::Named(named.clone());
-        let store = common::MemoryStore::default();
-        let _ = common::ready(gateway_core::audit::begin(
-            &store,
-            decide(&world.snapshot(), &call),
-            serde_json::Value::Null,
-            Default::default(),
-        ))
-        .unwrap();
-        let row = store.last();
-        let Resources::Named(recorded) = &row.resources else {
-            return Err(TestCaseError::fail("named resources were recorded as unknown"));
-        };
-        let most = gateway_core::audit::MAX_RECORDED_RESOURCES;
-        prop_assert_eq!(recorded.len(), named.len().min(most));
-        prop_assert_eq!(row.resources_omitted, named.len().saturating_sub(most));
-        for resource in recorded {
-            for text in [&resource.system, &resource.kind, &resource.identifier] {
-                prop_assert!(!text.chars().any(char::is_control), "{text:?}");
-                prop_assert!(text.chars().count() <= 129, "{} characters", text.chars().count());
+        let (row, denied) = row_and_denied(&world, &call);
+
+        let most = audit::MAX_RECORDED_RESOURCES;
+        let mut distinct: Vec<&Resource> = Vec::new();
+        for resource in &named {
+            if !distinct.contains(&resource) {
+                distinct.push(resource);
             }
         }
+        let mut expected: Vec<&Resource> = distinct.iter().copied().take(most).collect();
+        if let Some(denied) = &denied {
+            prop_assert!(distinct.contains(&denied), "the denial names a resource the call did not");
+            if !expected.contains(&denied) {
+                expected.truncate(most - 1);
+                expected.push(denied);
+            }
+        }
+
+        let RecordedResources::Named(recorded) = &row.resources else {
+            return Err(TestCaseError::fail("named resources were recorded as unknown"));
+        };
+        prop_assert_eq!(recorded.len(), expected.len());
+        prop_assert_eq!(row.resources_omitted, distinct.len() - expected.len());
+        for (recorded, raw) in recorded.iter().zip(expected) {
+            for (text, raw, cap) in [
+                (&recorded.system, &raw.system, 128),
+                (&recorded.kind, &raw.kind, 128),
+                (&recorded.identifier, &raw.identifier, audit::MAX_RECORDED_IDENTIFIER),
+            ] {
+                prop_assert!(!text.chars().any(char::is_control), "{text:?}");
+                if let Err(problem) = records(text, raw, cap) {
+                    return Err(TestCaseError::fail(problem));
+                }
+            }
+        }
+    }
+
+    /// Two different identifiers that fit are never recorded alike, and each reads back as
+    /// itself: the escaping can be reversed.
+    #[test]
+    fn different_identifiers_are_recorded_differently(
+        world in world(),
+        one in "\\PC{0,30}|[\\x00-\\x7f]{0,30}",
+        other in "\\PC{0,30}|[\\x00-\\x7f]{0,30}",
+    ) {
+        let record = |identifier: &str| {
+            let mut call = world.call();
+            call.resources = Resources::Named(vec![Resource {
+                system: "github".into(),
+                kind: "repository".into(),
+                identifier: identifier.into(),
+            }]);
+            match row_and_denied(&world, &call).0.resources {
+                RecordedResources::Named(mut recorded) if recorded.len() == 1 => {
+                    recorded.remove(0).identifier
+                }
+                resources => panic!("one named resource was recorded as {resources:?}"),
+            }
+        };
+        let (first, second) = (record(&one), record(&other));
+        prop_assert_eq!(unescape(&first), Some(one.clone()));
+        prop_assert_eq!(unescape(&second), Some(other.clone()));
+        prop_assert_eq!(first == second, one == other, "{:?} and {:?}", one, other);
     }
 }
 

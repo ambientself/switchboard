@@ -528,7 +528,7 @@ for field, old, new in [
     ("profile", "        profile: call.caller.profile.clone(),", '        profile: "x".into(),'),
     ("connector", "        connector: tool.map(|tool| tool.connector.clone()),", "        connector: None,"),
     ("classification", "        classification: tool.map(|tool| tool.classification),", "        classification: None,"),
-    ("resources", "        resources,\n        resources_omitted,", "        resources: { let _ = resources; Resources::Named(Vec::new()) },\n        resources_omitted,"),
+    ("resources", "        resources,\n        resources_omitted,", "        resources: { let _ = resources; RecordedResources::Named(Vec::new()) },\n        resources_omitted,"),
     ("resources-omitted", "        resources_omitted,\n        decision,", "        resources_omitted: { let _ = resources_omitted; 0 },\n        decision,"),
     ("tool-use-id", "        tool_use_id: metadata.tool_use_id,", "        tool_use_id: None,"),
     ("claimed-team", "        claimed_team: metadata.claimed_team,", "        claimed_team: None,"),
@@ -557,15 +557,46 @@ mutate("record-resources-uncapped", "the row records every resource a call names
 mutate("record-resources-cap-short", "the row records one resource fewer than it should", SRC + "audit.rs", RECORDED_TAKE,
        "        .take(MAX_RECORDED_RESOURCES - 1)\n")
 mutate("record-resources-reordered", "the row records resources in reverse order", SRC + "audit.rs",
-       "        .iter()\n" + RECORDED_TAKE, "        .iter()\n        .rev()\n" + RECORDED_TAKE)
+       "        .copied()\n" + RECORDED_TAKE, "        .copied()\n        .rev()\n" + RECORDED_TAKE)
+mutate("record-resources-repeats-kept", "a resource named twice is recorded twice", SRC + "audit.rs",
+       "        .filter(|resource| seen.insert(*resource))\n", "        .filter(|resource| seen.insert(*resource) || true)\n")
+OMITTED = "    let omitted = distinct.len().saturating_sub(kept.len());"
 mutate("record-resources-omitted-miscounted", "the row's omitted count is off by one", SRC + "audit.rs",
-       "    let omitted = named.len().saturating_sub(MAX_RECORDED_RESOURCES);",
-       "    let omitted = named.len().saturating_sub(MAX_RECORDED_RESOURCES - 1);")
+       OMITTED, "    let omitted = (distinct.len() + 1).saturating_sub(kept.len());")
+mutate("record-resources-omitted-counts-repeats", "the row's omitted count includes repeats", SRC + "audit.rs",
+       OMITTED, "    let omitted = named.len().saturating_sub(kept.len());")
 mutate("record-resources-unknown-as-none", "unknown resources are recorded as an empty list", SRC + "audit.rs",
-       "        return (Resources::Unknown, 0);", "        return (Resources::Named(Vec::new()), 0);")
-for field in ("system", "kind", "identifier"):
+       "        return (RecordedResources::Unknown, 0);", "        return (RecordedResources::Named(Vec::new()), 0);")
+DENIED_KEPT = (
+    "    if let Some(denied) = denied\n"
+    "        && !kept.contains(&denied)\n"
+    "    {\n"
+    "        kept.truncate(MAX_RECORDED_RESOURCES - 1);\n"
+    "        kept.push(denied);\n"
+    "    }\n"
+)
+mutate("record-resources-denied-dropped", "a resource denial past the cap leaves its resource off the row", SRC + "audit.rs",
+       DENIED_KEPT, "    let _ = denied;\n")
+mutate("record-resources-denied-not-passed", "begin does not tell the row which resource a denial names", SRC + "audit.rs",
+       "        } => Some(resource),\n        _ => None,\n", "        } => { let _ = resource; None }\n        _ => None,\n")
+mutate("record-resources-denied-appended", "a resource denial past the cap makes the row hold one more than the cap", SRC + "audit.rs",
+       "        kept.truncate(MAX_RECORDED_RESOURCES - 1);\n", "")
+mutate("record-resources-denied-first", "a resource denial past the cap is recorded first, not in the order named", SRC + "audit.rs",
+       "        kept.push(denied);\n", "        kept.insert(0, denied);\n")
+for field, cap in (("system", "sentences::MAX_RENDERED"), ("kind", "sentences::MAX_RENDERED"), ("identifier", "MAX_RECORDED_IDENTIFIER")):
+    line = f"            {field}: sentences::safe(&resource.{field}, {cap}),"
     mutate(f"record-resource-{field}-unescaped", f"a recorded resource's {field} is not made safe", SRC + "audit.rs",
-           f"            {field}: safe(&resource.{field}),", f"            {field}: resource.{field}.clone(),")
+           line, f"            {field}: resource.{field}.clone(),")
+    mutate(f"record-resource-{field}-uncapped", f"a recorded resource's {field} is not cut short", SRC + "audit.rs",
+           line, f"            {field}: sentences::safe(&resource.{field}, usize::MAX),")
+mutate("record-resource-identifier-cap-128", "a recorded identifier is cut at 128 characters, like the tool name", SRC + "audit.rs",
+       "            identifier: sentences::safe(&resource.identifier, MAX_RECORDED_IDENTIFIER),",
+       "            identifier: sentences::safe(&resource.identifier, sentences::MAX_RENDERED),")
+mutate("record-resource-identifier-cap-short", "a recorded identifier is cut one character early", SRC + "audit.rs",
+       "pub const MAX_RECORDED_IDENTIFIER: usize = 2048;", "pub const MAX_RECORDED_IDENTIFIER: usize = 2047;")
+mutate("record-resource-system-kind-swapped", "a recorded resource's system and kind are swapped", SRC + "audit.rs",
+       "            system: sentences::safe(&resource.system, sentences::MAX_RENDERED),\n            kind: sentences::safe(&resource.kind, sentences::MAX_RENDERED),",
+       "            system: sentences::safe(&resource.kind, sentences::MAX_RENDERED),\n            kind: sentences::safe(&resource.system, sentences::MAX_RENDERED),")
 mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: { let _ = recorded; Outcome::Ok },\n            latency_ms,")
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",
