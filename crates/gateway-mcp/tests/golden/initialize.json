@@ -1,0 +1,23 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "capabilities": {
+        "tools": {
+          "listChanged": false
+        }
+      },
+      "instructions": "Dummy instructions for the golden files.",
+      "protocolVersion": "2025-06-18",
+      "serverInfo": {
+        "name": "switchboard",
+        "version": "0.1.0"
+      }
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

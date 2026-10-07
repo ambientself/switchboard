@@ -1,0 +1,44 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "tools": [
+        {
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "description": "Reads one document the caller's team may see.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "document": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "document"
+            ],
+            "type": "object"
+          },
+          "name": "read_document",
+          "title": "Read a document"
+        },
+        {
+          "annotations": {
+            "readOnlyHint": false
+          },
+          "description": "Proposes a change for a person to review.",
+          "inputSchema": {
+            "type": "object"
+          },
+          "name": "propose_change"
+        }
+      ]
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

@@ -1,0 +1,19 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "content": [
+        {
+          "text": "The tool failed: dummy cause.",
+          "type": "text"
+        }
+      ],
+      "isError": true
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

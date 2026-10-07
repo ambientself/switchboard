@@ -1,0 +1,15 @@
+{
+  "body": {
+    "error": {
+      "code": -32600,
+      "message": "Method not allowed: this endpoint takes POST only"
+    },
+    "id": null,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "allow": "POST",
+    "content-type": "application/json"
+  },
+  "status": 405
+}
