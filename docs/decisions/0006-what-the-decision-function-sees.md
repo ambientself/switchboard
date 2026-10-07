@@ -5,7 +5,8 @@ on 2026-10-04 (classifications, direct writes and delegation tool lists; see the
 the rule for comments added on 2026-10-06. Status: accepted. Settles the part of Q9 that
 milestone 1 needs, and with the amendment, what the core needs for employee proposals and
 broad reads. The rest of Q9 stays open: when a proxied tool is eligible for exposure, any write
-policy beyond proposals, and whether Otto's comment tools get an exception to the comment rule.
+policy beyond proposals, whether Otto's comment tools get an exception to the comment rule, and
+whether a comment tool can be `propose` where a CI workflow runs on every comment.
 
 ## Context
 
@@ -70,9 +71,9 @@ with no resources and returns the tools that pass.
 A tool marked as checking its own scope may refuse when it runs, because of what the call
 names. That is recorded as the outcome `refused` on the same audit record, with its sentence.
 Since the 2026-10-04 amendment, a `propose` tool also refuses in the same way a call on
-something the gateway did not create, or one that would take effect on its own. These
-are the only decisions made outside this function, and only a refusal is possible there: a
-connector can never allow what the function denied.
+something the gateway did not create, or one that would take effect on its own, or forces a
+value such as a draft. These are the only decisions made outside this function, and they can
+only restrict: a connector can never allow what the function denied.
 
 ## Consequences
 
@@ -110,8 +111,8 @@ There are now four classifications:
 | Classification | Meaning |
 | --- | --- |
 | `read` | Reads and changes nothing. |
-| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on its own draft pull request or issue. It never changes, transitions, merges or deploys anything else, so nothing it does takes effect until a person acts on it. |
-| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create. |
+| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on something it created for review. It never changes, transitions, merges or deploys anything else, so nothing it does takes effect until a person acts on it. |
+| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create for review. |
 | `destructive` | Destroys something. |
 
 `propose` follows Otto's definition, "open a PR, don't push; comment, don't transition", with
@@ -128,15 +129,27 @@ opened, on a branch under its reserved prefix. A tool that cannot make the check
 whatever its name.
 
 Acting only on what the gateway created is not enough, because a comment on the gateway's own
-pull request can still be a command. A `propose` tool must also refuse, when it runs, anything
-that would take effect without a person acting. Otto's tools show the cases.
-`github_pr_comment` refuses a comment whose first word Atlantis would read as a command, on any
-pull request. `github_create_pr` opens a draft, because the org's Atlantis plans every pull
-request that is not a draft. `github_amend_change` refuses to commit to a pull request a person
-has marked ready for review, because Atlantis would plan the new commit.
+pull request can still be a command. A `propose` tool must also guard, when it runs, against
+anything that would take effect without a person acting. A guard is either a refusal or a value
+the tool forces. Otto's tools show the cases. `github_pr_comment` refuses a comment whose first
+word Atlantis would read as a command, on any pull request. `github_create_pr` forces a draft,
+because the org's Atlantis plans every pull request that is not a draft. `github_amend_change`
+refuses to commit to a pull request a person has marked ready for review, because Atlantis
+would plan the new commit.
 
-Both refusals are recorded as the outcome `refused`, like a connector's scope refusal (see
-What a connector may still do, above).
+A refusal is recorded as the outcome `refused`, like a connector's scope refusal (see What a
+connector may still do, above). A forced value is not a refusal: the call completes with the
+outcome `ok`, and what it created is a draft. Every guard, the forced draft included, gets a
+connector test and a mutation (see Consequences, below).
+
+A `propose` tool has no setting that turns a guard off. Otto's `github_create_pr` has one: the
+operator flag `CreateReadyPRs` makes it open pull requests that are ready for review. That flag
+is not carried over, and a create-PR tool with such a setting is `write`.
+
+The bots whose commands a comment tool refuses are named when the tool is approved: those
+configured for the repositories or projects it can reach, which today is Atlantis. A CI
+workflow that runs on every comment cannot be refused by what the comment says. Whether a
+comment tool can be `propose` in a repository that has one is open in Q9.
 
 ### Comments
 
@@ -144,6 +157,10 @@ Decided by the owner on 2026-10-06. A comment is `propose` only when it is on so
 gateway itself created for review, such as its own draft pull request or an issue it opened.
 A comment anywhere else is `write`. A comment can take effect on its own: a bot reads
 `/deploy` or `atlantis apply` as a command, and a comment can start CI.
+
+The rule is about what the comment is on, not that thing's state. A comment on the gateway's
+own pull request is still `propose` after a person marks it ready for review, if its tool makes
+the guards above.
 
 Of the five write tools Otto serves at `752395a`, three are `propose` under this rule:
 `github_create_pr`, `github_propose_change` and `github_amend_change`. Two are `write`:
@@ -218,15 +235,17 @@ checked against their limits. A dedicated field waits for the first such tool.
 - Approving a tool now includes judging whether it proposes or writes directly. That judgment
   is what keeps production mutation out, so it is part of what the reviewer of an approval
   checks.
-- A `propose` tool's run-time refusals are guards, and this function's tests cannot see them.
-  A built-in tool is approved as `propose` only with a connector test against the fake vendor
-  that fails without each refusal, and a mutation that removes it. Whether a refusal inside a
-  proxied server can make its tool `propose` is part of what stays open in Q9.
+- A `propose` tool's run-time guards, its refusals and any value it forces such as a draft,
+  are guards like any other, and this function's tests cannot see them. A built-in tool is
+  approved as `propose` only with a connector test against the fake vendor that fails without
+  each guard, and a mutation that removes it. Whether a refusal inside a proxied server can
+  make its tool `propose` is part of what stays open in Q9.
 - The rule binds the vendor actions Otto's control plane asks for under
   [decision 0003](0003-otto-keeps-its-control-plane-endpoints.md), since they are ordinary
   tools under a profile. Each must be `read` or `propose`. The receipt comment is posted or
-  edited on a pull request the gateway opened for Otto's proposal, so it is `propose` if its
-  tool refuses any other pull request. If Otto's proposed Jira answer endpoint answers by
+  edited on a pull request the gateway created for Otto's proposal, so it is `propose` if its
+  tool refuses any other pull request and the commands of the bots named when it is approved.
+  That holds after a person marks the pull request ready for review. If Otto's proposed Jira answer endpoint answers by
   commenting on an issue the gateway did not create, that is `write`. An action that needs a
   direct write takes the decision that replaces the section above.
 - Otto's two comment tools are denied to Otto's callers until Q9 settles an exception (see

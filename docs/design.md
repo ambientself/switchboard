@@ -241,33 +241,51 @@ person who approves it. A tool with none never runs; there is no default.
 | Classification | Meaning |
 | --- | --- |
 | `read` | Reads and changes nothing. |
-| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on its own draft pull request or issue. Nothing it does takes effect until a person acts on it. |
-| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create. |
+| `propose` | Creates something for a person to review, or changes only what the gateway itself created for review: a draft pull request, an issue it opens, a commit to its own proposal branch, a comment on something it created for review. Nothing it does takes effect until a person acts on it. |
+| `write` | Changes something directly: a merge, a push to a branch the gateway did not create for a proposal, a status transition, a configuration change, a comment on anything the gateway did not create for review. |
 | `destructive` | Destroys something. |
 
-A comment on something the gateway did not create is `write`, because a comment can take
-effect on its own: a bot reads `/deploy` or `atlantis apply` as a command, and a comment can
-trigger CI. The decision function sees only the classification, not what the gateway created.
-A tool is `propose` only if it refuses, when it runs, to act on anything the gateway did not
-create, by a check such as the author being the gateway's own identity, a reserved branch
-prefix, or a fact from Otto's resolver. A tool that cannot make that check is `write`.
+A comment is `propose` only when it is on something the gateway itself created for review,
+such as its own draft pull request or an issue it opened. A comment anywhere else is `write`,
+because a comment can take effect on its own: a bot reads `/deploy` or `atlantis apply` as a
+command, and a comment can trigger CI. The rule is about what the comment is on, not that
+thing's state: a comment on the gateway's own pull request is still `propose` after a person
+marks it ready for review, if its tool makes the guards below.
+
+The decision function sees only the classification, not what the gateway created. A tool is
+`propose` only if it refuses, when it runs, to act on anything the gateway did not create, by
+a check such as the author being the gateway's own identity, a reserved branch prefix, or a
+fact from Otto's resolver. A tool that cannot make that check is `write`.
 
 Acting only on what the gateway created is not enough. A comment on the gateway's own pull
-request can still be a command. So a `propose` tool must also refuse, when it runs, anything
-that would take effect without a person acting. Otto's tools show the cases. `github_pr_comment`
-refuses a comment whose first word Atlantis would read as a command, on any pull request.
-`github_create_pr` opens a draft, because the org's Atlantis plans every pull request that is
-not a draft, on a server holding an AWS role. `github_amend_change` refuses to commit to a pull
-request a person has marked ready for review, because Atlantis would plan the new commit.
+request can still be a command. So a `propose` tool must also guard, when it runs, against
+anything that would take effect without a person acting. A guard is either a refusal or a
+value the tool forces. Otto's tools show the cases. `github_pr_comment` refuses a comment whose
+first word Atlantis would read as a command, on any pull request. `github_create_pr` forces a
+draft, because the org's Atlantis plans every pull request that is not a draft, on a server
+holding an AWS role. `github_amend_change` refuses to commit to a pull request a person has
+marked ready for review, because Atlantis would plan the new commit.
 
-Both refusals are made by the connector, so the decision function cannot watch them. Each is a
-guard like any other: the tool's connector has a test against the fake vendor that fails
-without the refusal, and a mutation that removes it (section 18).
+A refusal is recorded as the outcome `refused`. A forced value is not a refusal: the call
+completes with the outcome `ok`, and what it created is a draft. A `propose` tool has no
+setting that turns a guard off. Otto has one, `CreateReadyPRs`, an operator flag that makes
+`github_create_pr` open pull requests that are ready for review. It is not carried over; a
+create-PR tool with such a setting is `write`.
+
+The bots whose commands a comment tool refuses are named when the tool is approved: those
+configured for the repositories or projects it can reach. Today that is Atlantis. A CI
+workflow that runs on every comment cannot be refused by what the comment says. Whether a
+comment tool can be `propose` in a repository that has one is open (Q9).
+
+The guards are made by the connector, so the decision function cannot watch them. Each one,
+the forced draft included, is tested like any other guard: the tool's connector has a test
+against the fake vendor that fails without it, and a mutation that removes it (section 18).
 
 Under this rule Otto's `github_pr_comment` and `jira_comment` are `write`: they comment on
-pull requests and issues the gateway did not create. Otto's callers are denied them, which
-loses parity with Otto's gateway. Whether to allow them by a narrow, recorded exception is
-open (Q9).
+pull requests and issues the gateway did not create. So is `addOrEditJiraIssueComment` on
+Atlassian's hosted server, which [systems.md](systems.md) plans for the Jira surface. Otto's
+callers are denied them, which loses parity with Otto's gateway (#12). Whether to allow them by
+a narrow, recorded exception is open (Q9).
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
@@ -280,8 +298,8 @@ Permitting direct writes needs a decision that replaces part of
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
-| Proposals (`propose`) | Allowed. A comment is a proposal only on a pull request or issue the gateway created, and only if no bot would read it as a command. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
-| Direct writes (`write`) | Never. That includes a comment on anything the gateway did not create, so Otto's two comment tools are denied unless Q9 settles an exception. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
+| Proposals (`propose`) | Allowed. A comment is a proposal only on something the gateway created for review, such as its own draft pull request or an issue it opened, and only if its tool refuses the commands of the bots named when it was approved. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
+| Direct writes (`write`) | Never. That includes a comment on anything the gateway did not create for review, so Otto's two comment tools are denied unless Q9 settles an exception. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
@@ -377,7 +395,8 @@ written.
   cannot leave an outcome empty on a call that completed. The answer waits for this for a
   short fixed budget (two seconds in Otto) and then goes out regardless, because withholding
   the result of a write that already happened invites a retry.
-- **Three outcomes:** `ok`, `error` and `refused`, the last for a connector's scope refusal.
+- **Three outcomes:** `ok`, `error` and `refused`, the last for a connector's scope refusal
+  or a `propose` tool's refusal (section 8).
 - **The caller's tool-use identifier is recorded,** so a caller's control plane can look up
   the decision for a call it already knows about. Otto's does.
 - **An empty outcome is evidence** that the gateway allowed the call and never learned what

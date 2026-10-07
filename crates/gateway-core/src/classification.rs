@@ -21,20 +21,22 @@ pub enum Classification {
     Read,
     /// Creates something for a person to review, or changes only what the gateway itself
     /// created for review: a draft pull request, an issue it opens, a commit to its own
-    /// proposal branch, a comment on its own draft pull request or issue. It never changes,
+    /// proposal branch, a comment on something it created for review. It never changes,
     /// transitions, merges or deploys anything else, so nothing it does takes effect until a
     /// person acts on it.
     ///
     /// The decision function cannot see what the gateway created. A tool is `Propose` only if
-    /// it refuses, when it runs, to act on anything else. It must also refuse what would take
-    /// effect on its own even there: a comment a bot would read as a command, a pull request
-    /// that is not a draft, a commit to a pull request a person has marked ready for review.
+    /// it refuses, when it runs, to act on anything else. It must also guard against what
+    /// would take effect on its own even there: it refuses a comment a bot would read as a
+    /// command and a commit to a pull request a person has marked ready for review, and it
+    /// forces a pull request it opens to be a draft. It has no setting that turns a guard off.
     Propose,
     /// Changes something directly: a merge, a push to a branch the gateway did not create for a
     /// proposal, a status transition, a configuration change, a comment on anything the gateway
-    /// did not create. A comment counts because it can take effect on its own, as a bot command
-    /// or a CI trigger. Denied in every profile, which is how production mutation is denied:
-    /// anything that changes production without a person acting is a `Write` or worse.
+    /// did not create for review. A comment counts because it can take effect on its own, as a
+    /// bot command or a CI trigger. Denied in every profile, which is how production mutation
+    /// is denied: anything that changes production without a person acting is a `Write` or
+    /// worse.
     Write,
     /// Destroys something. Denied in every profile.
     Destructive,

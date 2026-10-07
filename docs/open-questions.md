@@ -65,9 +65,11 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   `destructive`. `write` and `destructive` are denied in every profile, which is how
   production mutation is denied initially. A delegation's tool list is required. Broad reads
   use the existing surface allowlists and resource limits. On 2026-10-06 the owner decided
-  that a comment is `propose` only on something the gateway created for review, and `write`
-  anywhere else. A `propose` tool also refuses what would take effect on its own, such as a
-  comment a bot would read as a command. See the 2026-10-04 amendment to
+  that a comment is `propose` only on something the gateway itself created for review, such
+  as its own draft pull request or an issue it opened, and `write` anywhere else. A `propose`
+  tool also guards against what would take effect on its own: it refuses a comment a bot would
+  read as a command, and forces a pull request it opens to be a draft. See the 2026-10-04
+  amendment to
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 ## Q9. What does authorization check beyond tool classification?
@@ -98,6 +100,11 @@ operation might address any repository, Jira project or AWS account available to
   refusal is gateway code, tested and mutated like any guard. Whether a proxied server's own
   refusal can make its tool `propose`, or such a tool is `write` unless a gateway adapter
   makes the check, is not decided.
+- **Open for the owner: comments that start CI.** A CI workflow that runs on every comment
+  cannot be refused by what the comment says, so a comment on the gateway's own pull request
+  can still start one. Whether a comment tool can be `propose` in a repository that has such a
+  workflow is not decided. A comment tool's command refusal covers the bots named when it is
+  approved, which today is Atlantis.
 - **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
   write cutover for its comment tools.
 
