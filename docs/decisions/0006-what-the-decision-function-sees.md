@@ -311,11 +311,12 @@ changes four things here.
 - **The context says whether the request carries a key.** A tool not classified `read` whose
   call carries no key is denied with a reason kind of its own, and a sentence asking for one.
   That is knowable before anything runs, so it belongs in this function. It is a new last
-  check, after check 6 and so after decision 0012's currency check, so a caller is asked for a
-  key only when the call would otherwise be allowed. It is skipped for `tools/list`, as
-  decision 0012's currency check is, because a list request carries no key: a `propose` tool
+  check, after check 5, decision 0012's currency check and check 6, so a caller is asked for a
+  key only when the call would otherwise be allowed. It is skipped for `tools/list`, like
+  check 6 and the currency check, because a list request carries no key: a `propose` tool
   appears in the list and is denied on `tools/call` without a key. The decision table gains
-  that case, and a mutation that applies the check to `tools/list` must be caught.
+  that case, and a mutation that applies the check to `tools/list`, and one that moves it
+  before a permission check, must be caught.
 - **The receipt check is a second decision outside this function.** It is made at begin, when
   a key already has a receipt in its scope. Like a connector's refusal, it cannot make
   anything run. It decides about delivery, not permission.

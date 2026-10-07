@@ -182,12 +182,24 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    team is denied at check 3 too, naming both teams.
 3. **Select the profile** from the issuer, the deployment and the principal.
 4. **Parse** the JSON-RPC message and look up the tool in the surface.
-5. **Decide**, from the tool's classification, the profile's policy and, for Otto, whether the
-   grant lists the tool. For a call of a tool not classified `read` under the profile for
-   Otto's sandboxes, the decision also needs Otto's answer that the turn is current. A side
-   effect, a call to any tool not classified `read`, that carries no key is denied. That is
-   the last check, after the resource check and any currency check, so a caller is asked for a
-   key only when the call would otherwise be allowed.
+5. **Decide**, by the checks of
+   [decision 0006](decisions/0006-what-the-decision-function-sees.md) as amended, in this
+   order, the first that fails giving the reason:
+   - check 0, the profile exists; check 1, the surface is permitted to the principal; check 2,
+     the tool is approved on the surface;
+   - check 3, a delegation is present where the profile requires one, verified, and agreeing
+     with the principal;
+   - check 4, the delegation lists the tool;
+   - check 5, the profile permits the classification. `write` and `destructive` are denied
+     before the profile is read, except a tool named in the profile's list of excepted tools
+     once #12 builds it (decision 0011);
+   - the currency check, under a profile that requires it, such as the profile for Otto's
+     sandboxes: a call of a tool not classified `read` needs Otto's answer that the turn is
+     current (decision 0012);
+   - check 6, each named resource is within the caller's limit;
+   - the key check, last: a call of a tool not classified `read` that carries no key is denied
+     (decision 0009), so a caller is asked for a key only when the call would otherwise be
+     allowed.
 6. **Write the audit row.** The gateway assigns the row a UUIDv7 first. Begin has a budget,
    within which it is retried by that identifier. For a side effect, the receipt is reserved
    in the same transaction, and a reused key is answered there without running anything. If
@@ -219,9 +231,10 @@ through step 6 (section 11). Steps 2 to 4 deny nothing. A denial at step 5 still
 through step 6 before the caller reads it, so an unverifiable delegation is a deny row.
 `initialize`, `ping` and `server/discover` produce telemetry.
 
-`tools/list` runs steps 1 to 5 for every tool in the surface and returns those that pass,
-skipping the key check, since a list request carries no key. A `propose` tool is listed to a
-caller who may call it and denied on `tools/call` without a key. It writes one row of kind
+`tools/list` runs steps 1 to 5 for every tool in the surface and returns those that pass. It
+decides with no resources and no key, and skips check 6, the currency check and the key check.
+A `propose` tool is listed to a caller who may call it and denied on `tools/call` without a
+key. It writes one row of kind
 `list`, complete, naming the tools returned. This is deliberately stricter than Otto's Go
 gateway, which lists every served tool even under a grant that permits only some; whether
 Otto's callers rely on that is checked when Otto's adapter is built.

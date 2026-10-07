@@ -311,11 +311,11 @@ unlikely, and a collision is answered by the reuse table below, never across pri
 
 A side-effecting call that carries no key is denied by the decision function, with a reason
 kind and a sentence of its own asking for one, since that is knowable before anything runs. It
-is the last check, after check 6 and after decision 0012's currency check, so a caller is asked
-for a key only when the call would otherwise be allowed, and every permission denial keeps its
-own reason. It is skipped for `tools/list`, as the currency check is, because a list request
-carries no key: a `propose` tool is listed to a caller who may call it, and denied on
-`tools/call` without a key. With identity disabled there is no principal to scope a key to, so
+is the last check: after check 5 and its exception step, after decision 0012's currency check,
+and after check 6. So a caller is asked for a key only when the call would otherwise be
+allowed, and every permission denial keeps its own reason. It is skipped for `tools/list`,
+like check 6 and the currency check, because a list request carries no key: a `propose` tool
+is listed to a caller who may call it, and denied on `tools/call` without a key. With identity disabled there is no principal to scope a key to, so
 no side effect is served at all (see "Until receipts exist").
 
 ### The argument digest
