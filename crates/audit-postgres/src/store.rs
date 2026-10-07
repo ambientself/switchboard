@@ -90,8 +90,9 @@ pub enum PgAuditError {
 
 impl PgAuditError {
     /// Whether trying again could succeed: the database could not be reached, the connection
-    /// broke, the server is short of something or shutting down, or an attempt took too long.
-    /// A refusal by the database itself, a missing row or a different completion is final.
+    /// broke, the server is short of something, shutting down or read-only, a lock was not had
+    /// in time, or an attempt took too long. A refusal by the database itself, a missing row
+    /// or a different completion is final.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {
@@ -99,9 +100,12 @@ impl PgAuditError {
             }
             Self::Database(error) => match error.code() {
                 // Connection exception, transaction rollback (serialization, deadlock),
-                // insufficient resources, operator intervention, system error.
+                // insufficient resources, operator intervention, system error. Then a server
+                // that has become read-only, as the old primary does in a failover, and a lock
+                // not had within lock_timeout.
                 Some(code) => {
                     matches!(code.code().get(..2), Some("08" | "40" | "53" | "57" | "58"))
+                        || matches!(code.code(), "25006" | "55P03")
                 }
                 None => {
                     error.is_closed()
@@ -250,7 +254,9 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// - Finish writes the completion columns of a row that has none, on a task of its own. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
-///   [`Budgets::finish_deadline`]. An identical completion written again is accepted, and a
+///   [`Budgets::finish_deadline`]. An attempt that fails that way gives up its connection,
+///   so the next makes a new one: after a failover, an old connection may be to a server
+///   that has become read-only. An identical completion written again is accepted, and a
 ///   different one is an error, so the first completion stands and retrying is safe. The
 ///   table's trigger holds the same rule for every role.
 ///
@@ -525,6 +531,12 @@ impl Retry {
             .await
             .map_err(|_| PgAuditError::AttemptTimedOut)??;
         match timeout_at(by, complete_on(&client, &self.row, &self.finish)).await {
+            Ok(Err(error)) if error.is_transient() => {
+                // The next attempt makes a connection of its own. This one may be to a server
+                // that has become a read-only standby, which every attempt on it would find.
+                drop(Object::take(client));
+                Err(error)
+            }
             Ok(completed) => completed,
             Err(_) => {
                 abandon(client, &self.cancel);

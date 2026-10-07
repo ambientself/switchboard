@@ -1216,7 +1216,14 @@ mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported
        "                let _ = (&report, &named, outcome);\n")
 mutate("pg-retry-broken-connection-final", "a connection the server broke off is not retried", PG_STORE,
        'Some("08" | "40" | "53" | "57" | "58")', 'Some("ZZ")')
-mutate("pg-retry-closed-connection-final", "a connection found closed is not retried", PG_STORE,
+mutate("pg-retry-read-only-final", "a server that has become read-only is not retried", PG_STORE,
+       '|| matches!(code.code(), "25006" | "55P03")', '|| matches!(code.code(), "55P03")')
+mutate("pg-retry-lock-timeout-final", "a lock not had within lock_timeout is not retried", PG_STORE,
+       '|| matches!(code.code(), "25006" | "55P03")', '|| matches!(code.code(), "25006")')
+mutate("pg-retry-failed-connection-kept", "a connection whose attempt failed is used again", PG_STORE,
+       "                drop(Object::take(client));\n                Err(error)",
+       "                drop(client);\n                Err(error)")
+mutate("pg-retry-closed-connection-final","a connection found closed is not retried", PG_STORE,
        "                    error.is_closed()\n", "                    false\n")
 mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not retried", PG_STORE,
        "                        || std::error::Error::source(error)\n"

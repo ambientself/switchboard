@@ -368,6 +368,96 @@ async fn finish_tries_again_until_the_database_takes_connections() {
     assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
 }
 
+/// Sets `setting` for new sessions on the test database, or resets it with `None`.
+async fn set_for_new_sessions(server: &Config, name: &str, setting: &str, value: Option<&str>) {
+    let change = match value {
+        Some(value) => format!("SET {setting} = '{value}'"),
+        None => format!("RESET {setting}"),
+    };
+    connect(server)
+        .await
+        .batch_execute(&format!("ALTER DATABASE {name} {change}"))
+        .await
+        .unwrap();
+}
+
+/// A server that has become read-only, as the old primary does in a failover, is a failure
+/// trying again can fix, on a new connection: the one that found the server read-only stays
+/// read-only.
+#[tokio::test]
+async fn finish_tries_again_on_a_new_connection_while_the_server_is_read_only() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        answer: Duration::from_secs(5),
+        ..Budgets::default()
+    };
+    let store = db.store(PoolSizes::default()).with_budgets(budgets);
+    let admin = db.admin().await;
+    let (row, ok) = ran(
+        &store,
+        &fixture,
+        Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT),
+    )
+    .await;
+    let read_only = "default_transaction_read_only";
+    set_for_new_sessions(&db.server, db.name(), read_only, Some("on")).await;
+    let read_only_for = Duration::from_millis(500);
+    let server = db.server.clone();
+    let name = db.name().to_owned();
+    let writable = tokio::spawn(async move {
+        sleep(read_only_for).await;
+        set_for_new_sessions(&server, &name, read_only, None).await;
+    });
+
+    let started = Instant::now();
+    let finished = within(budgets.answer + SLACK, audit::finish(&store, ok, 7)).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    // The first attempts failed: every session was read-only.
+    assert!(started.elapsed() >= read_only_for);
+    writable.await.unwrap();
+    assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
+}
+
+/// A lock not had within `lock_timeout`, which a database or role may set, is tried again.
+#[tokio::test]
+async fn finish_tries_again_when_a_lock_times_out() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    set_for_new_sessions(&db.server, db.name(), "lock_timeout", Some("100ms")).await;
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        answer: Duration::from_secs(5),
+        ..Budgets::default()
+    };
+    let store = db.store(PoolSizes::default()).with_budgets(budgets);
+    let admin = db.admin().await;
+    let (row, ok) = ran(
+        &store,
+        &fixture,
+        Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT),
+    )
+    .await;
+    let lock = lock_table(&db).await;
+    let locked_for = Duration::from_millis(600);
+    let release_later = async {
+        sleep(locked_for).await;
+        release(&lock).await;
+    };
+
+    let started = Instant::now();
+    let (finished, ()) = tokio::join!(
+        within(budgets.answer + SLACK, audit::finish(&store, ok, 7)),
+        release_later
+    );
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert!(started.elapsed() >= locked_for);
+    assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
+}
+
 #[tokio::test]
 async fn finish_gives_up_at_its_deadline() {
     let Some(db) = TestDatabase::create().await else {
