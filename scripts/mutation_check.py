@@ -1074,7 +1074,9 @@ mutate_all(
 # Most of these are caught only by the tests against Postgres, which run when
 # SWITCHBOARD_TEST_DATABASE_URL names a superuser on a throwaway server (see the crate's
 # documentation). Without it they survive. The `pg-columns-*` ones need no server, nor do
-# pg-check-durability-ignored, pg-check-delete-ignored and pg-retry-slow-attempt-final.
+# pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
+# pg-retry-slow-attempt-final, pg-retry-closed-connection-final and
+# pg-retry-socket-failure-final.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 PG_STORE = PG + "src/store.rs"
@@ -1200,6 +1202,23 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) => {")
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
        "                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported", PG_STORE,
+       "                report(GivenUp {\n                    row: &named,\n                    outcome,\n                    error,\n                });\n",
+       "                let _ = (&report, &named, outcome);\n")
+mutate("pg-retry-broken-connection-final", "a connection the server broke off is not retried", PG_STORE,
+       'Some("08" | "40" | "53" | "57" | "58")', 'Some("ZZ")')
+mutate("pg-retry-closed-connection-final", "a connection found closed is not retried", PG_STORE,
+       "                    error.is_closed()\n", "                    false\n")
+mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not retried", PG_STORE,
+       "                        || std::error::Error::source(error)\n"
+       "                            .is_some_and(|source| source.is::<std::io::Error>())\n", "")
+mutate("pg-retry-attempt-past-deadline", "one attempt may run past the finish deadline", PG_STORE,
+       "let by = (Instant::now() + self.attempt).min(self.deadline);", "let by = Instant::now() + self.attempt;")
+mutate("pg-cancel-unbounded", "a cancel the server does not answer is waited for without end", PG_STORE,
+       "let _ = tokio::time::timeout(CANCEL_WAIT, token.cancel_query(tls)).await;",
+       "let _ = CANCEL_WAIT;\n                let _ = token.cancel_query(tls).await;")
+mutate("pg-migrate-unlocked", "two migrators run at once", PG + "src/migrate.rs",
+       'SELECT pg_advisory_xact_lock($1)', 'SELECT $1::bigint')
 mutate("pg-check-durability-ignored", "a server without fsync passes the check", PG_CHECK,
        "    (found != expected).then_some(", "    false.then_some(")
 mutate("pg-check-superuser-ignored", "a superuser passes the check", PG_CHECK,

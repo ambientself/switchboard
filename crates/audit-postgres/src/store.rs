@@ -230,7 +230,7 @@ const FIRST_PAUSE: Duration = Duration::from_millis(50);
 const LONGEST_PAUSE: Duration = Duration::from_secs(1);
 
 /// How long a request to cancel a statement may take before the store stops asking.
-const CANCEL_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
@@ -574,5 +574,61 @@ mod unit {
         ] {
             assert!(!final_error.is_transient(), "{final_error}");
         }
+    }
+
+    /// A port on this machine that nothing listens on.
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// A server that answers a client's startup as if it had logged it in, and then says
+    /// nothing more.
+    async fn server_that_lets_anyone_in() -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let length = socket.read_u32().await.unwrap();
+            let mut startup = vec![0; usize::try_from(length).unwrap() - 4];
+            socket.read_exact(&mut startup).await.unwrap();
+            // AuthenticationOk, then ReadyForQuery.
+            socket
+                .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ = socket.read_to_end(&mut rest).await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_broke_or_was_never_made_is_retried() {
+        // No SQLSTATE: the connection to the server was closed.
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(server_that_lets_anyone_in().await)
+            .user("nobody")
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        drop(connection);
+        let closed = client.simple_query("SELECT 1").await.unwrap_err();
+        assert!(closed.is_closed() && closed.code().is_none(), "{closed}");
+        assert!(PgAuditError::Database(closed).is_transient());
+
+        // No SQLSTATE: the socket failed.
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(closed_port()).user("nobody");
+        let Err(refused) = config.connect(tokio_postgres::NoTls).await else {
+            panic!("a port nothing listens on took a connection");
+        };
+        assert!(
+            !refused.is_closed() && refused.code().is_none(),
+            "{refused}"
+        );
+        assert!(PgAuditError::Database(refused).is_transient());
     }
 }

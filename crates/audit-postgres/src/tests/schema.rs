@@ -106,6 +106,28 @@ async fn only_the_owner_may_migrate() {
     ));
 }
 
+/// Two migrators on one database take turns: one applies the migration, and the other then
+/// finds it applied. Without the lock, both create the schema at once and one fails.
+#[tokio::test]
+async fn two_migrators_at_once_take_turns() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    for _ in 0..5 {
+        admin
+            .batch_execute("DROP SCHEMA switchboard_audit CASCADE")
+            .await
+            .unwrap();
+        let mut first = db.connect_as(OWNER_ROLE).await;
+        let mut second = db.connect_as(OWNER_ROLE).await;
+        let (first, second) = tokio::join!(migrate(&mut first), migrate(&mut second));
+        let mut applied = vec![first.unwrap(), second.unwrap()];
+        applied.sort_unstable();
+        assert_eq!(applied, vec![vec![], vec![1]]);
+    }
+}
+
 #[tokio::test]
 async fn the_owner_owns_the_schema_the_table_and_the_triggers() {
     let Some(db) = TestDatabase::create().await else {
