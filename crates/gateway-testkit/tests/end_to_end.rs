@@ -1,6 +1,9 @@
 //! The gateway's whole path with no HTTP: verifier, decision, audit begin, run, audit finish,
-//! using only the fakes and the fixture. This is the path issue 26 puts behind an endpoint, so
-//! each behaviour the design promises is shown here, in milliseconds, by telling a fake to fail.
+//! using only the fakes and the fixture. Each behaviour the design promises is shown here, in
+//! milliseconds, by telling a fake to fail.
+//!
+//! The `Gateway` below is test code that strings the steps together to exercise the harness.
+//! It is not the gateway's request path: issue 26 builds that, behind its HTTP endpoint.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::pin::pin;
@@ -546,7 +549,10 @@ fn a_caller_who_cannot_be_verified_gets_the_one_sentence_and_nothing_runs() {
         }
     ));
     gateway.assert_nothing_ran();
-    // No principal was proved, so there is nothing to write a row about (see the PR).
+    // The core's audit record needs a proved principal, so this test path writes no row for a
+    // caller who was not verified. Whether issue 26 records identity failures, and how, is
+    // still to be settled: design section 6 says a denial at step 1 also passes through the
+    // audit step, and section 11 asks for a row only once a decision is reached.
     assert!(gateway.store.rows().is_empty());
 }
 
