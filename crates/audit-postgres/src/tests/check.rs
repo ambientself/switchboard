@@ -366,27 +366,109 @@ async fn a_disabled_or_missing_trigger_is_refused() {
     let store = db.store(PoolSizes::default());
     let alter = |change: &str| format!("ALTER TABLE switchboard_audit.call_rows {change}");
 
-    admin
-        .batch_execute(&alter("DISABLE TRIGGER complete_once"))
-        .await
-        .unwrap();
-    assert_eq!(problems(&store).await, vec![Problem::TriggerDisabled]);
-    // A replica trigger does not fire in an ordinary session.
-    admin
-        .batch_execute(&alter("ENABLE REPLICA TRIGGER complete_once"))
-        .await
-        .unwrap();
-    assert_eq!(problems(&store).await, vec![Problem::TriggerDisabled]);
-    // One that fires always is fine.
-    admin
-        .batch_execute(&alter("ENABLE ALWAYS TRIGGER complete_once"))
-        .await
-        .unwrap();
-    store.check_at_boot().await.unwrap();
+    for trigger in ["set_times", "complete_once"] {
+        let disabled = vec![Problem::TriggerDisabled { trigger }];
+        admin
+            .batch_execute(&alter(&format!("DISABLE TRIGGER {trigger}")))
+            .await
+            .unwrap();
+        assert_eq!(problems(&store).await, disabled);
+        // A replica trigger does not fire in an ordinary session.
+        admin
+            .batch_execute(&alter(&format!("ENABLE REPLICA TRIGGER {trigger}")))
+            .await
+            .unwrap();
+        assert_eq!(problems(&store).await, disabled);
+        // One that fires always is fine.
+        admin
+            .batch_execute(&alter(&format!("ENABLE ALWAYS TRIGGER {trigger}")))
+            .await
+            .unwrap();
+        store.check_at_boot().await.unwrap();
+    }
 
     admin
         .batch_execute("DROP TRIGGER complete_once ON switchboard_audit.call_rows")
         .await
         .unwrap();
-    assert_eq!(problems(&store).await, vec![Problem::TriggerMissing]);
+    assert_eq!(problems(&store).await, vec![missing("complete_once")]);
+    admin
+        .batch_execute("DROP TRIGGER set_times ON switchboard_audit.call_rows")
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![missing("set_times"), missing("complete_once")]
+    );
+}
+
+fn missing(trigger: &'static str) -> Problem {
+    let (purpose, fires) = match trigger {
+        "set_times" => (
+            "sets both times from the database's clock",
+            "before each insert",
+        ),
+        _ => ("completes a row at most once", "before each update"),
+    };
+    Problem::TriggerMissing {
+        trigger,
+        purpose,
+        fires,
+    }
+}
+
+/// A trigger of the right name and function that would not fire on every row it must is no
+/// trigger at all.
+#[tokio::test]
+async fn a_trigger_that_fires_at_another_time_or_on_some_rows_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default());
+    for (trigger, replacement) in [
+        ("set_times", "AFTER INSERT"),
+        ("set_times", "BEFORE INSERT OR UPDATE"),
+        ("complete_once", "BEFORE UPDATE OF outcome"),
+        ("complete_once", "BEFORE DELETE"),
+    ] {
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON switchboard_audit.call_rows;
+                 CREATE TRIGGER {trigger} {replacement} ON switchboard_audit.call_rows
+                     FOR EACH ROW EXECUTE FUNCTION switchboard_audit.{trigger}();"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            problems(&store).await,
+            vec![missing(trigger)],
+            "{trigger} {replacement}"
+        );
+        let restored = if trigger == "set_times" {
+            "BEFORE INSERT"
+        } else {
+            "BEFORE UPDATE"
+        };
+        admin
+            .batch_execute(&format!(
+                "DROP TRIGGER {trigger} ON switchboard_audit.call_rows;
+                 CREATE TRIGGER {trigger} {restored} ON switchboard_audit.call_rows
+                     FOR EACH ROW EXECUTE FUNCTION switchboard_audit.{trigger}();"
+            ))
+            .await
+            .unwrap();
+        store.check_at_boot().await.unwrap();
+    }
+    // A condition makes a trigger fire on some rows only.
+    admin
+        .batch_execute(
+            "DROP TRIGGER complete_once ON switchboard_audit.call_rows;
+             CREATE TRIGGER complete_once BEFORE UPDATE ON switchboard_audit.call_rows
+                 FOR EACH ROW WHEN (OLD.decision = 'deny')
+                 EXECUTE FUNCTION switchboard_audit.complete_once();",
+        )
+        .await
+        .unwrap();
+    assert_eq!(problems(&store).await, vec![missing("complete_once")]);
 }

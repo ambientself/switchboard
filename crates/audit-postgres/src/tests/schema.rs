@@ -2,7 +2,9 @@
 
 use tokio_postgres::Client;
 
-use super::{CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, TestDatabase, code, message};
+use super::{
+    CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, TestDatabase, code, message,
+};
 use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, migrate};
 
 /// The begin columns of an allowed call by a workload, as `(column, value)` in SQL.
@@ -13,6 +15,11 @@ const ALLOWED: &[(&str, &str)] = &[
     ("tool", "'fixture__read'"),
     ("connector", "'fixture'"),
     ("classification", "'read'"),
+    (
+        "resources",
+        "'[{\"system\": \"fixture\", \"kind\": \"document\", \"identifier\": \"team-a/notes\"}]'::jsonb",
+    ),
+    ("resources_omitted", "0"),
     ("decision", "'allow'"),
     ("policy_revision", "'fixture-1'"),
     ("proved_issuer", "'https://workload-issuer.fixture.test'"),
@@ -100,35 +107,38 @@ async fn only_the_owner_may_migrate() {
 }
 
 #[tokio::test]
-async fn the_owner_owns_the_schema_the_table_and_the_trigger() {
+async fn the_owner_owns_the_schema_the_table_and_the_triggers() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
     let admin = db.admin().await;
-    let owners = admin
-        .query_one(
-            "SELECT n.nspowner::regrole::text, c.relowner::regrole::text, p.proowner::regrole::text
-             FROM pg_namespace n
-             JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = 'call_rows'
-             JOIN pg_proc p ON p.pronamespace = n.oid AND p.proname = 'complete_once'
-             WHERE n.nspname = 'switchboard_audit'",
-            &[],
-        )
-        .await
-        .unwrap();
-    for column in 0..3 {
-        assert_eq!(owners.get::<_, String>(column), OWNER_ROLE);
+    for function in ["set_times", "complete_once"] {
+        let owners = admin
+            .query_one(
+                "SELECT n.nspowner::regrole::text, c.relowner::regrole::text,
+                        p.proowner::regrole::text
+                 FROM pg_namespace n
+                 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = 'call_rows'
+                 JOIN pg_proc p ON p.pronamespace = n.oid AND p.proname = $1
+                 WHERE n.nspname = 'switchboard_audit'",
+                &[&function],
+            )
+            .await
+            .unwrap();
+        for column in 0..3 {
+            assert_eq!(owners.get::<_, String>(column), OWNER_ROLE, "{function}");
+        }
+        let enabled: String = admin
+            .query_one(
+                "SELECT tgenabled::text FROM pg_trigger
+                 WHERE tgrelid = 'switchboard_audit.call_rows'::regclass AND tgname = $1",
+                &[&function],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(enabled, "O", "the trigger {function} is not enabled");
     }
-    let enabled: String = admin
-        .query_one(
-            "SELECT tgenabled::text FROM pg_trigger
-             WHERE tgrelid = 'switchboard_audit.call_rows'::regclass AND tgname = 'complete_once'",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(enabled, "O", "the trigger is not enabled");
 }
 
 #[tokio::test]
@@ -394,6 +404,59 @@ async fn a_completion_writes_nothing_else_even_for_the_owner() {
     assert!(message(&error).contains("has no outcome"), "{error}");
 }
 
+/// Whether a row's begin time is the last minute's, and whether its completion time is its
+/// begin time, or `None` when it has no completion time.
+async fn times(client: &Client, id: &str) -> (bool, Option<bool>) {
+    let row = client
+        .query_one(
+            &format!(
+                "SELECT begun_at > now() - interval '1 minute', finished_at = begun_at
+                 FROM switchboard_audit.call_rows WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+#[tokio::test]
+async fn an_insert_cannot_choose_its_times_whoever_writes() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    // A row begun with times of its own choosing is begun now, and not complete.
+    let id = insert_row(
+        &owner,
+        &insert(&[
+            ("begun_at", "'2000-01-01T00:00:00Z'"),
+            ("finished_at", "'2000-01-01T00:00:01Z'"),
+        ]),
+    )
+    .await;
+    assert_eq!(times(&owner, &id).await, (true, None));
+    // A row written complete is complete at the moment it was begun.
+    let id = insert_row(
+        &owner,
+        &insert(&[
+            ("begun_at", "'2000-01-01T00:00:00Z'"),
+            ("outcome", "'ok'"),
+            ("latency_ms", "1"),
+        ]),
+    )
+    .await;
+    assert_eq!(times(&owner, &id).await, (true, Some(true)));
+    // Without the trigger nothing sets the begin time, so no row can be stored.
+    db.admin()
+        .await
+        .batch_execute("ALTER TABLE switchboard_audit.call_rows DISABLE TRIGGER set_times")
+        .await
+        .unwrap();
+    let error = owner.query_one(&insert(&[]), &[]).await.unwrap_err();
+    assert_eq!(code(&error), Some(NOT_NULL_VIOLATION), "{error}");
+}
+
 #[tokio::test]
 async fn the_database_sets_both_times() {
     let Some(db) = TestDatabase::create().await else {
@@ -490,10 +553,6 @@ async fn a_row_the_core_could_not_make_is_refused() {
             with(&[("outcome", "'ok'"), ("finished_at", "now()")]),
         ),
         (
-            "an outcome without its time",
-            with(&[("outcome", "'ok'"), ("latency_ms", "1")]),
-        ),
-        (
             "a refusal without its sentence",
             with(&[
                 ("outcome", "'refused'"),
@@ -534,10 +593,27 @@ async fn a_row_the_core_could_not_make_is_refused() {
             "a negative count of resources left out",
             with(&[("resources_omitted", "-1")]),
         ),
+        (
+            "resources left out of resources nobody could name",
+            with(&[
+                ("resources", "'\"unknown\"'::jsonb"),
+                ("resources_omitted", "1"),
+            ]),
+        ),
     ];
     for (case, changes) in cases {
         let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
         assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
+    }
+    for (case, changes) in [
+        ("no resources", with(&[("resources", "")])),
+        (
+            "no count of resources left out",
+            with(&[("resources_omitted", "")]),
+        ),
+    ] {
+        let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(NOT_NULL_VIOLATION), "{case}: {error}");
     }
     // And the shapes the core does make are accepted.
     for changes in [
@@ -550,6 +626,7 @@ async fn a_row_the_core_could_not_make_is_refused() {
         ]),
         with(&[("resources", "'[]'::jsonb")]),
         with(&[("resources", "'\"unknown\"'::jsonb")]),
+        with(&[("resources_omitted", "3")]),
         with(&[
             ("outcome", "'refused'"),
             ("outcome_sentence", "'No.'"),

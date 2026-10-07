@@ -233,3 +233,6 @@ pub(crate) const INSUFFICIENT_PRIVILEGE: &str = "42501";
 
 /// The SQLSTATE for a failed check constraint.
 pub(crate) const CHECK_VIOLATION: &str = "23514";
+
+/// The SQLSTATE for a missing value in a `NOT NULL` column.
+pub(crate) const NOT_NULL_VIOLATION: &str = "23502";

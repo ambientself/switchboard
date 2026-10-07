@@ -3,13 +3,15 @@
 use std::time::Duration;
 
 use gateway_core::audit::{self, AuditRowId, Begun, Completion, Outcome, RequestMetadata};
+use gateway_core::audit::{MAX_RECORDED_RESOURCES, RecordedResources};
 use gateway_core::{
-    AuditRecord, AuditStore, CallContext, Claimed, RequestedTool, TeamId, ToolUseId, decide,
+    AuditRecord, AuditStore, CallContext, Claimed, RequestedTool, Resources, TeamId, ToolUseId,
+    decide,
 };
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
     InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT,
-    TEAM_B_DOCUMENT, WRITE_TOOL,
+    TEAM_B_DOCUMENT, WRITE_TOOL, document,
 };
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
@@ -23,6 +25,8 @@ pub(super) struct Call {
     pub(super) surface: &'static str,
     pub(super) tool: &'static str,
     pub(super) arguments: Value,
+    /// The resources the call names, when not the ones its arguments name.
+    pub(super) resources: Option<Resources>,
     pub(super) metadata: RequestMetadata,
     pub(super) connector_fails: bool,
     pub(super) latency_ms: u64,
@@ -40,6 +44,7 @@ impl Call {
             surface,
             tool,
             arguments: json!({"document": document}),
+            resources: None,
             metadata: RequestMetadata::default(),
             connector_fails: false,
             latency_ms: 17,
@@ -58,7 +63,10 @@ pub(super) async fn through_core(
         connector.fail_next();
     }
     let context = CallContext {
-        resources: FixtureConnector::resources_of(call.tool, &call.arguments),
+        resources: call
+            .resources
+            .clone()
+            .unwrap_or_else(|| FixtureConnector::resources_of(call.tool, &call.arguments)),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
     };
@@ -117,9 +125,10 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         }
         completion
     });
-    // The record does not carry resources yet, so a row records none.
-    assert_eq!(row.get::<_, Option<Value>>("resources"), None);
-    assert_eq!(row.get::<_, i64>("resources_omitted"), 0);
+    let resources = match row.get::<_, Value>("resources") {
+        Value::String(unknown) => json!(unknown),
+        named => json!({ "named": named }),
+    };
     serde_json::from_value(json!({
         "tool_use_id": text("tool_use_id"),
         "deployment": text("deployment"),
@@ -128,6 +137,8 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         "tool": text("tool"),
         "connector": text("connector"),
         "classification": text("classification"),
+        "resources": resources,
+        "resources_omitted": row.get::<_, i64>("resources_omitted"),
         "decision": text("decision"),
         "reason": text("reason"),
         "sentence": text("sentence"),
@@ -204,6 +215,36 @@ async fn rows_read_back_exactly_as_the_core_wrote_them() {
             .any(|o| matches!(o, Some(Outcome::Refused { .. })))
     );
     assert_eq!(outcomes.iter().filter(|o| o.is_none()).count(), 3);
+}
+
+#[tokio::test]
+async fn a_call_naming_more_resources_than_a_row_holds_records_how_many_were_left_out() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+
+    // The team's own document twice, then more than a row holds, one of them a value the core
+    // escapes.
+    let mut named = vec![document(TEAM_A_DOCUMENT), document(TEAM_A_DOCUMENT)];
+    named.push(document("line\nbreak, a \\ and a \"quote\""));
+    named.extend((0..MAX_RECORDED_RESOURCES + 5).map(|n| document(&format!("other-{n}"))));
+    let mut call = Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT);
+    call.resources = Some(Resources::Named(named));
+
+    let memory = InMemoryAuditStore::new();
+    through_core(&memory, &fixture, &call).await;
+    let expected = memory.row(0).unwrap();
+    let RecordedResources::Named(recorded) = &expected.resources else {
+        panic!("{:?}", expected.resources);
+    };
+    assert_eq!(recorded.len(), MAX_RECORDED_RESOURCES);
+    assert_eq!(expected.resources_omitted, 7);
+
+    let row = through_core(&store, &fixture, &call).await;
+    assert_eq!(read_back(&admin, &row).await, expected);
 }
 
 #[tokio::test]

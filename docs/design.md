@@ -1030,8 +1030,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   budget. Today the store assigns the identifier with a column default and gives up at the
   budget.
 - A `BEFORE INSERT` trigger sets the time at begin and the deadline from the database's clock
-  and the allowance the gateway supplies, and the deadline is `NOT NULL`. Today the time is a
-  column default and there is no deadline.
+  and the allowance the gateway supplies, and the deadline is `NOT NULL`. Today the trigger,
+  `set_times`, sets the time at begin (and, for a row inserted complete, the completion time)
+  and there is no deadline.
 - Columns for the instance, the kind and the deadline. For decisions 0011 and 0012: how the
   resources were found, with the reach by reference, the credential identity, the error kind,
   an unverified delegation's failure kind, and a grant's digest, issuer, key ID, pod UID,
@@ -1042,7 +1043,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   that let a row be written complete at begin, for the answers to a reused key. Today the
   outcome allows only `ok`, `error` and `refused`, and the gateway's role cannot insert an
   outcome.
-- The boot check covers all three triggers, not only the one that completes a row once.
+- The boot check covers all three triggers. Today it covers the two on the audit table, the
+  one that sets the times and the one that completes a row once; the third is the receipt
+  table's (part 2).
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
   giving up a guard without running completes its row as `error`. Today a guard can only be
   consumed by running it.
