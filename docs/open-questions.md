@@ -102,10 +102,11 @@ operation might address any repository, Jira project or AWS account available to
   refusal is gateway code, tested and mutated like any guard. Whether a proxied server's own
   refusal can make its tool `propose`, or such a tool is `write` unless a gateway adapter
   makes the check, is not decided.
-- **Open for the owner: comments that start CI.** A CI workflow that runs on every comment
-  cannot be refused by what the comment says, so a comment on the gateway's own pull request
-  can still start one. Whether a comment tool can be `propose` in a repository that has such a
-  workflow is not decided. A comment tool's command refusal covers the bots named when it is
+- **Open for the owner: proposals that start CI.** CI cannot be refused by what starts it. A
+  draft pull request, a push to the gateway's proposal branch and a comment on the gateway's own
+  pull request each start the workflows configured for them. That is acceptable where those
+  workflows only build and test. Whether a proposal stays `propose` in a repository where such a
+  workflow can deploy or holds a production credential is not decided. A comment tool's command refusal covers the bots named when it is
   approved, which today is Atlantis.
 - **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
   write cutover for its comment tools.

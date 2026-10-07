@@ -6,7 +6,8 @@ the rule for comments added on 2026-10-06. Status: accepted. Settles the part of
 milestone 1 needs, and with the amendment, what the core needs for employee proposals and
 broad reads. The rest of Q9 stays open: when a proxied tool is eligible for exposure, any write
 policy beyond proposals, whether Otto's comment tools get an exception to the comment rule, and
-whether a comment tool can be `propose` where a CI workflow runs on every comment.
+whether a proposal stays `propose` where the CI it starts can deploy or holds a production
+credential.
 
 ## Context
 
@@ -147,9 +148,12 @@ operator flag `CreateReadyPRs` makes it open pull requests that are ready for re
 is not carried over, and a create-PR tool with such a setting is `write`.
 
 The bots whose commands a comment tool refuses are named when the tool is approved: those
-configured for the repositories or projects it can reach, which today is Atlantis. A CI
-workflow that runs on every comment cannot be refused by what the comment says. Whether a
-comment tool can be `propose` in a repository that has one is open in Q9.
+configured for the repositories or projects it can reach, which today is Atlantis. CI cannot
+be refused by what starts it: a draft pull request, a push to the gateway's proposal branch and
+a comment each start the workflows configured for them. That is acceptable where those workflows
+only build and test. Whether a proposal stays `propose` in a repository where a workflow that a
+pull request, a push or a comment starts can deploy or holds a production credential is open in
+Q9.
 
 ### Comments
 

@@ -273,9 +273,11 @@ setting that turns a guard off. Otto has one, `CreateReadyPRs`, an operator flag
 create-PR tool with such a setting is `write`.
 
 The bots whose commands a comment tool refuses are named when the tool is approved: those
-configured for the repositories or projects it can reach. Today that is Atlantis. A CI
-workflow that runs on every comment cannot be refused by what the comment says. Whether a
-comment tool can be `propose` in a repository that has one is open (Q9).
+configured for the repositories or projects it can reach. Today that is Atlantis. CI cannot
+be refused by what starts it: a draft pull request, a push to the gateway's proposal branch and
+a comment each start the workflows configured for them. That is acceptable where those workflows
+only build and test. Whether a proposal stays `propose` in a repository where a workflow that a
+pull request, a push or a comment starts can deploy or holds a production credential is open (Q9).
 
 The guards are made by the connector, so the decision function cannot watch them. Each one,
 the forced draft included, is tested like any other guard: the tool's connector has a test
