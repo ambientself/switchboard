@@ -128,8 +128,9 @@ impl Surface {
 pub struct Profile {
     /// The profile's name.
     pub name: ProfileName,
-    /// The classifications this profile permits. Listing `destructive` here has no effect:
-    /// the decision function denies a destructive tool in every profile.
+    /// The classifications this profile permits. Listing `write` or `destructive` here has no
+    /// effect: the decision function denies both in every profile, so what a profile can
+    /// permit is `read` and `propose`.
     pub classifications: BTreeSet<Classification>,
     /// Whether a call under this profile must carry a delegation.
     pub requires_delegation: bool,

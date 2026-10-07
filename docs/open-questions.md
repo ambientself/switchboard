@@ -61,6 +61,16 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   [decision 0007](decisions/0007-serve-two-mcp-revisions-from-a-hand-written-endpoint.md).
 - **2026-10-01 (Q19):** The first slice uses a mock workload and mock server, in kind and
   Docker Compose. See [decision 0008](decisions/0008-mock-the-first-slice.md).
+- **2026-10-04 (part of Q9):** Tools are classified `read`, `propose`, `write` or
+  `destructive`. `write` and `destructive` are denied in every profile, which is how
+  production mutation is denied initially. A delegation's tool list is required. Broad reads
+  use the existing surface allowlists and resource limits. On 2026-10-06 the owner decided
+  that a comment is `propose` only on something the gateway itself created for review, such
+  as its own draft pull request or an issue it opened, and `write` anywhere else. A `propose`
+  tool also guards against what would take effect on its own: it refuses a comment a bot would
+  read as a command, and forces a pull request it opens to be a draft. See the 2026-10-04
+  amendment to
+  [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -78,7 +88,28 @@ operation might address any repository, Jira project or AWS account available to
   broader writes only by a later explicit policy decision.
 - **Boundary:** the gateway owns agent-access policy; downstream systems still enforce their
   own credential and resource permissions. One gateway decision point does not remove them.
-- **Blocks:** policy/connector interfaces and employee data-access enforcement.
+- **Open for the owner: Otto's comment tools.** Otto's `github_pr_comment` and `jira_comment`
+  comment on pull requests and issues the gateway did not create, so they are `write` and are
+  denied to Otto's callers. So is the hosted Atlassian server's
+  `addOrEditJiraIssueComment`, which [systems.md](systems.md) lists to match `jira_comment`.
+  That loses parity with Otto's gateway (#12). The conformance suite's cases that use them
+  become an expected difference: the tool inventory, the comment case and write count in
+  `TestOriginalToolsAndBrokeredCredentials`, three scope and argument cases, and the
+  audit-finish and repeated-write tests (design section 18). A narrow, recorded exception is
+  the likely answer. Until one is recorded, they stay denied.
+- **Open: `propose` refusals inside a proxied server.** A `propose` tool refuses, when it runs,
+  what the gateway did not create and what would act on its own. For a built-in tool that
+  refusal is gateway code, tested and mutated like any guard. Whether a proxied server's own
+  refusal can make its tool `propose`, or such a tool is `write` unless a gateway adapter
+  makes the check, is not decided.
+- **Open for the owner: proposals that start CI.** CI cannot be refused by what starts it. A
+  draft pull request, a push to the gateway's proposal branch and a comment on the gateway's own
+  pull request each start the workflows configured for them. That is acceptable where those
+  workflows only build and test. Whether a proposal stays `propose` in a repository where such a
+  workflow can deploy or holds a production credential is not decided. A comment tool's command refusal covers the bots named when it is
+  approved, which today is Atlantis.
+- **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
+  write cutover for its comment tools.
 
 ## Q10. What happens after execution when recording or delivery fails?
 
@@ -92,7 +123,8 @@ receipts, and the design currently omits Otto's planned retry and fencing contra
   action as safely retryable. Clarify that an empty outcome means no durable outcome exists.
   The fixed audit-unavailable response is the explicit exception to “no answer without a row.”
   Scope the tool audit contract separately from discovery, initialization and malformed requests.
-- **Writes:** introduce durable action receipts before enabling real writes. Bind an
+- **Writes:** introduce durable action receipts before enabling real writes, proposals
+  included (a `propose` tool changes something too). Bind an
   idempotency key to principal, tool and normalized arguments, reject conflicting reuse, and
   distinguish pending, completed and unknown outcomes. An unknown outcome requires downstream
   reconciliation or supported vendor idempotency; a local receipt alone cannot guarantee
