@@ -236,10 +236,10 @@ through step 6 before the caller reads it, so an unverifiable delegation is a de
 `tools/list` runs steps 1 to 5 for every tool in the surface and returns those that pass. It
 decides with no resources and no key, and skips check 6, the currency check and the key check.
 A `propose` tool is listed to a caller who may call it and denied on `tools/call` without a
-key. It writes one row of kind
-`list`, complete, naming the tools returned. This is deliberately stricter than Otto's Go
-gateway, which lists every served tool even under a grant that permits only some; whether
-Otto's callers rely on that is checked when Otto's adapter is built.
+key. It writes one row of kind `list`, complete, naming the tools returned. This is
+deliberately stricter than Otto's Go gateway, which lists every served tool even under a grant
+that permits only some; whether Otto's callers rely on that is checked when Otto's adapter is
+built.
 
 ## 7. Identity
 
@@ -282,11 +282,11 @@ fixed by the Ed25519 key that verifies it, one key per Otto environment. `aud` l
 gateway deployments it is for, two during the cutover. `iat` and `exp` bound its lifetime to
 at most 15 minutes, with 30 seconds of leeway. `pod` binds it to the sandbox pod's UID, by
 stage 3 at the latest. `egress` carries the turn's egress setting, which is recorded (decision
-0010). Within those bounds a grant may be presented any number of times, and
-every row records its digest, so reuse from another pod, or another deployment sharing this
-gateway's audit store, is one query. A call of any tool not classified `read` is also checked for currency: Otto's resolver
-says whether the turn is still current, which enforces the fencing epoch and lets Otto revoke
-one turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves.
+0010). Within those bounds a grant may be presented any number of times, and every row records
+its digest, so reuse from another pod, or another deployment sharing this gateway's audit
+store, is one query. A call of any tool not classified `read` is also checked for currency:
+Otto's resolver says whether the turn is still current, which enforces the fencing epoch and
+lets Otto revoke one turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves.
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -408,8 +408,8 @@ sandboxes.
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
 refused unless the turn's grant lists it. A grant only narrows: check 4 runs before check 5,
 so a grant that lists a `write` tool is still denied, unless the exception decision 0011
-records for Otto's two comment tools names it. Under the profile for Otto's
-sandboxes a call of any tool not classified `read` also needs a current control plane
+records for Otto's two comment tools names it. Under the profile for Otto's sandboxes a call
+of any tool not classified `read` also needs a current control plane
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
 **How a tool's resources are found** is stated in its approval, in one of four ways
@@ -1118,7 +1118,6 @@ Q9 is narrowed to what decision 0011 leaves to others, and Q10 to what complianc
 read auditing; the rest of each is decided. Q17 and Q18 are settled by decisions 0010 and 0012.
 Each of decisions 0009 to 0012 lists what it leaves to Otto's owners, IT, the security team,
 platform owners and others, with who decides and what holds meanwhile. The milestone table
-says which each milestone must settle before it starts. Vendor
-feasibility remains research in
-[systems.md](systems.md). The independent review's findings that are not yet reflected here
+says which each milestone must settle before it starts. Vendor feasibility remains research
+in [systems.md](systems.md). The independent review's findings that are not yet reflected here
 are listed at the end of that file.
