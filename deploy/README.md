@@ -14,6 +14,9 @@ Every check prints PASS or FAIL. The last line counts them, and the script exits
 any check failed or any step could not run. Nothing is retried. It needs docker with compose,
 kind, kubectl, jq and awk.
 
+A run leaves what it started running, so it can be looked at afterwards. `down` takes down
+only what it names: stopping Compose never deletes the cluster.
+
 `demo.sh kind` never touches the cluster `otto-dev` or `~/.kube/config`. It refuses a cluster
 named `otto-dev`, drops `KUBECONFIG`, and names `.demo/kubeconfig` in every kubectl and kind
 call. To use the cluster by hand:
@@ -78,20 +81,23 @@ check that the deployment files load.
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
 | mock-docs | `mock-docs-server`, configured by environment: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`. |
-| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. Its `resources` column stays empty until the core's audit record carries resources (PR #30), so the driver checks a denial by its sentence, which names the project. |
+| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"`; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, and that no allowed row names the other team's project. |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
 ## What a run shows that is not settled
 
-- **A row can outlive a refused call.** In the database outage step the gateway refuses the
-  call after its 2 s begin budget, and nothing runs. The store cancels its insert, but the
-  cancel cannot reach a paused server either; once Postgres is unpaused the insert commits.
-  The table then holds an `allow` row with no outcome for a call that was refused and never
-  ran (`at` within the outage, `outcome` empty). Decision 0009's open-row work (a deadline
-  column, gateway-assigned identifiers) is what tells such a row apart; it is deferred until
-  #29 and #30 merge.
-- **It runs from an unmerged branch.** `agent/first-slice` stacks #25, #26, #10, #14 and #9
-  work that has not been merged. It does not contain the #25 harness's latest head or #29.
+- **A refused call can still leave a row, completed as `error`.** In the database outage
+  step the gateway refuses the call after its 2 s begin budget, and nothing runs. The store
+  asks Postgres to cancel the insert, but a paused server cannot act on that; once it is
+  unpaused the insert commits. The store is still waiting for the insert's answer, so it
+  completes that row as `error` with latency 0, as decision 0009 says: a row may overstate
+  what ran, never understate it. The listing shows it as an `allow` row with outcome `error`
+  inside the outage, and the driver checks that no allowed row is left without an outcome.
+  The rest of decision 0009's row work (gateway-assigned identifiers, a deadline column, the
+  open-row query, `tools/list` rows) is not built.
+- **It runs from an unmerged branch.** `agent/first-slice` stacks #25 (the harness's latest
+  head, PR #35), #26, #10, #14 and #9 work that has not been merged, on top of main with #29
+  and #30.
 
 ## Not done here
 
