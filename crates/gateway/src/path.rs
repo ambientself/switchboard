@@ -1,0 +1,514 @@
+//! The request path, design section 6: from a request that reached the endpoint to its answer.
+//!
+//! [`RequestPath`] holds the [`Gates`] and runs every step after the HTTP layer's own checks
+//! (host, origin and body size). It is split where the body is read, so the HTTP layer can run
+//! identity before it reads a byte of the body:
+//!
+//! 1. [`RequestPath::admit`] takes the method and headers only. It refuses what is not a JSON
+//!    POST (405, 415, 406), then checks the caller's bearer token. A caller who cannot be
+//!    verified gets one 401 whatever the cause; the cause goes to the log and nowhere else.
+//! 2. [`RequestPath::respond`] takes what `admit` let through, the surface from the URL, and
+//!    the headers and body. It parses the request with [`gateway_mcp::parse`] and answers it.
+//!
+//! [`RequestPath::handle`] runs both, in that order.
+//!
+//! What `respond` does with each request:
+//!
+//! - A protocol refusal is answered as [`gateway_mcp`] renders it, and a notification gets 202
+//!   with no body.
+//! - `initialize`, `ping` and `server/discover` are answered with no decision and no audit row.
+//!   They still need a verified caller, because `admit` ran first.
+//! - `tools/list` selects the caller's profile and returns the tools on the surface that pass
+//!   the core's checks, with their catalog definitions. No row.
+//! - `tools/call` reads the call's resources through the adapter registered for the approved
+//!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
+//!   answers. A denial is answered with the sentence the row holds.
+//!
+//! Three gaps in the core shape what happens here:
+//!
+//! - **Identity failures are logged, not audited** (G1). An audit row needs a proved
+//!   principal, which a failed caller does not have. With identity disabled there is no
+//!   principal either, so `tools/list` lists nothing and every `tools/call` is refused with
+//!   [`IDENTITY_DISABLED`], with no row.
+//! - **There is no answer budget** (G2). The core gives out the answer only once the store's
+//!   `finish` returns, so the path waits for it, however long that takes. The budget belongs
+//!   inside the store.
+//! - **The tool-use identifier is bounded here** (G5). It comes from the caller's `_meta` and
+//!   the core writes it to the row as given, so one longer than [`MAX_TOOL_USE_ID`] or holding
+//!   anything but printable ASCII is dropped, with a warning.
+//!
+//! The future [`RequestPath::respond`] returns owns everything it uses and is `Send +
+//! 'static`. The HTTP layer must spawn it as its own task rather than await it on the
+//! request's future: a client that disconnects then cannot stop a call half way, between
+//! running the tool and completing its row.
+
+use std::fmt;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
+use gateway_core::{
+    ApprovedTool, CallContext, CallerContext, Classification, IDENTITY_FAILURE, PolicySnapshot,
+    Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide, list_tools,
+};
+use gateway_identity::{Clock, Verification};
+use gateway_mcp::{
+    Call, HttpResponse, Inbound, Rejection, Reply, Request, ServerInfo, ToolCall, ToolEntry,
+};
+use http::header::AUTHORIZATION;
+use http::{HeaderMap, Method};
+use serde_json::Value;
+
+use crate::boot::{GateState, Gates};
+use crate::catalog::ToolDefinition;
+
+/// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
+pub const MAX_TOOL_USE_ID: usize = 128;
+
+/// The sentence every `tools/call` is refused with while identity is disabled. No principal was
+/// proved, so nothing can be decided and no row can be written.
+pub const IDENTITY_DISABLED: &str = "This gateway is running with identity checking turned off, so it cannot tell who is calling and refuses every tool call. Nothing ran.";
+
+/// What `initialize` and `server/discover` say while identity is disabled.
+pub const IDENTITY_DISABLED_NOTE: &str = "Identity checking is turned off on this gateway: callers are not verified, no tools are listed and every tool call is refused.";
+
+/// What `initialize` and `server/discover` say while audit is disabled.
+pub const AUDIT_DISABLED_NOTE: &str =
+    "Audit is turned off on this gateway: tool calls run with no record of them.";
+
+/// The name the gateway gives itself in `serverInfo`.
+pub const SERVER_NAME: &str = "switchboard";
+
+/// The request path over one configuration that passed the boot gates. Cheap to clone; clones
+/// share the gates.
+#[derive(Clone)]
+pub struct RequestPath {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    gates: Gates,
+    server: ServerInfo,
+}
+
+impl fmt::Debug for RequestPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestPath")
+            .field("gates", &self.inner.gates)
+            .field("server", &self.inner.server)
+            .finish()
+    }
+}
+
+/// A request [`RequestPath::admit`] let through: a JSON POST from a caller who was verified,
+/// or from anyone while identity is disabled.
+///
+/// Its field is private and `admit` is the only way to make one, so [`RequestPath::respond`]
+/// cannot be reached without the identity check having run.
+#[derive(Debug)]
+pub struct Admitted {
+    caller: Caller,
+}
+
+impl Admitted {
+    /// The proved caller, or `None` while identity is disabled.
+    pub fn principal(&self) -> Option<&Proved<Principal>> {
+        match &self.caller {
+            Caller::Proved(principal) => Some(principal),
+            Caller::Unchecked => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Caller {
+    Proved(Proved<Principal>),
+    /// Identity is disabled: nobody was checked.
+    Unchecked,
+}
+
+impl RequestPath {
+    /// The path for `gates`. `serverInfo` names the gateway [`SERVER_NAME`] at this crate's
+    /// version, and its instructions say which gates are turned off.
+    pub fn new(gates: Gates) -> Self {
+        let server = server_info(&gates);
+        Self {
+            inner: Arc::new(Inner { gates, server }),
+        }
+    }
+
+    /// The gates the path serves.
+    pub fn gates(&self) -> &Gates {
+        &self.inner.gates
+    }
+
+    /// How the gateway describes itself to clients.
+    pub fn server_info(&self) -> &ServerInfo {
+        &self.inner.server
+    }
+
+    /// The checks that need only the method and headers, in order: the transport checks
+    /// (405, 415, 406), then identity. Call it before reading the body.
+    ///
+    /// The token is the one `Authorization: Bearer` header; the scheme is matched without
+    /// regard to case. A missing header, two of them, a value that is not text, or another
+    /// scheme count as no token. Every identity failure is the same 401, with the core's one
+    /// sentence and a `Bearer` challenge. Its cause is logged, never sent, and no audit row is
+    /// written (G1).
+    // The error is the response to send, which is large. It is built at most once per request
+    // and sent as it is, so boxing it would only add an allocation.
+    #[allow(clippy::result_large_err)]
+    pub fn admit(&self, method: &Method, headers: &HeaderMap) -> Result<Admitted, HttpResponse> {
+        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;
+        let gates = &self.inner.gates;
+        match gates.identity().check(bearer_token(headers)) {
+            Verification::Proved(principal) => Ok(Admitted {
+                caller: Caller::Proved(principal),
+            }),
+            Verification::Disabled => Ok(Admitted {
+                caller: Caller::Unchecked,
+            }),
+            Verification::Failed(failure) => {
+                tracing::warn!(
+                    deployment = %gates.deployment(),
+                    cause = %failure.detail(),
+                    "refused a caller whose identity was not proved"
+                );
+                Err(Rejection::unauthorized(IDENTITY_FAILURE).response())
+            }
+        }
+    }
+
+    /// Parses the request and returns the future that answers it.
+    ///
+    /// `surface` is the surface the URL named. The parse runs now; the future owns everything
+    /// else it needs and is `Send + 'static`, so the HTTP layer can spawn it, and should, so
+    /// that a client that goes away cannot cancel a call between running the tool and
+    /// completing its row.
+    pub fn respond(
+        &self,
+        admitted: Admitted,
+        surface: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> impl Future<Output = HttpResponse> + Send + 'static + use<> {
+        let parsed = gateway_mcp::parse(&Method::POST, headers, body);
+        let path = self.clone();
+        let surface = SurfaceName::new(surface);
+        async move {
+            match parsed {
+                Err(rejection) => {
+                    tracing::debug!(%rejection, "refused a request at the protocol layer");
+                    rejection.response()
+                }
+                Ok(Inbound::Notification { method }) => {
+                    tracing::debug!(%method, "accepted a notification");
+                    HttpResponse::accepted()
+                }
+                Ok(Inbound::Request(request)) => {
+                    path.answer(admitted.caller, surface, request).await
+                }
+            }
+        }
+    }
+
+    /// [`admit`](Self::admit), then [`respond`](Self::respond): the whole path, for a caller
+    /// that already holds the body.
+    pub async fn handle(
+        &self,
+        method: &Method,
+        headers: &HeaderMap,
+        surface: &str,
+        body: &[u8],
+    ) -> HttpResponse {
+        let admitted = match self.admit(method, headers) {
+            Ok(admitted) => admitted,
+            Err(response) => return response,
+        };
+        self.respond(admitted, surface, headers, body).await
+    }
+
+    async fn answer(self, caller: Caller, surface: SurfaceName, request: Request) -> HttpResponse {
+        let Request { id, era, call } = request;
+        let reply = match call {
+            Call::Initialize => Reply::Initialized,
+            Call::Ping => Reply::Pong,
+            Call::Discover => Reply::Discovered,
+            Call::ToolsList => Reply::Tools(self.list(caller, surface)),
+            Call::ToolsCall(call) => self.call(caller, surface, call).await,
+        };
+        gateway_mcp::render(&self.inner.server, era, &id, reply)
+    }
+
+    /// `tools/list`: design section 6's steps 1 to 5 for every tool on the surface, keeping
+    /// those that pass.
+    fn list(&self, caller: Caller, surface: SurfaceName) -> Vec<ToolEntry> {
+        let Caller::Proved(principal) = caller else {
+            return Vec::new();
+        };
+        let caller = self.caller_context(principal, surface);
+        self.entries(list_tools(self.inner.gates.snapshot(), &caller))
+    }
+
+    fn entries(&self, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
+        let catalog = self.inner.gates.catalog();
+        tools
+            .into_iter()
+            .filter_map(|tool| match catalog.definition(&tool.name) {
+                Some(definition) => Some(entry(tool, definition)),
+                None => {
+                    // The boot gates refuse an approved tool without a definition.
+                    tracing::error!(tool = %tool.name, "an approved tool has no definition");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// `tools/call`: design section 6's steps 1 to 9.
+    async fn call(&self, caller: Caller, surface: SurfaceName, call: ToolCall) -> Reply {
+        let gates = &self.inner.gates;
+        let Caller::Proved(principal) = caller else {
+            tracing::warn!(
+                deployment = %gates.deployment(),
+                "refused a tool call because identity is disabled"
+            );
+            return Reply::Denied(IDENTITY_DISABLED.to_owned());
+        };
+        let snapshot = gates.snapshot().clone();
+        let ToolCall {
+            name,
+            arguments,
+            tool_use_id,
+        } = call;
+        let arguments = Value::Object(arguments);
+        let requested = RequestedTool::new(name);
+        let resources = self.resources(&snapshot, &requested, &arguments);
+        let context = CallContext {
+            caller: self.caller_context(principal, surface),
+            tool: requested,
+            resources,
+        };
+        let decision = decide(&snapshot, &context);
+        let metadata = RequestMetadata {
+            tool_use_id: bounded_tool_use_id(tool_use_id),
+            claimed_team: None,
+        };
+
+        let store = gates.audit_store().as_ref();
+        let guard = match audit::begin(store, decision, arguments, metadata).await {
+            Err(failure) => {
+                tracing::error!(%failure, "refused a tool call: its audit row could not be written");
+                return Reply::Denied(failure.sentence().to_owned());
+            }
+            Ok(Begun::Denied(refusal)) => {
+                tracing::info!(
+                    row = refusal.row().as_str(),
+                    reason = ?refusal.reason().kind(),
+                    "denied a tool call"
+                );
+                return Reply::Denied(refusal.sentence().to_owned());
+            }
+            Ok(Begun::Allowed(guard)) => guard,
+        };
+        let Some(connector) = gates.connector(&guard.tool().connector) else {
+            // The boot gates refuse a tool on a surface whose connector is not registered.
+            tracing::error!(
+                row = guard.row().as_str(),
+                connector = %guard.tool().connector,
+                "an allowed tool's connector is not registered; its row stays open"
+            );
+            return Reply::Internal(
+                "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
+            );
+        };
+
+        let started = gates.clock().now();
+        let ran = audit::run(connector.as_ref(), guard).await;
+        let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
+        // No answer budget (G2): the core gives out the answer when the store's finish returns.
+        let finished = audit::finish(store, ran, latency_ms).await;
+        if let Some(failure) = finished.failure() {
+            tracing::error!(%failure, "a tool call ran but its audit row could not be completed");
+        }
+        match finished.answer().clone() {
+            Answer::Ok(value) => Reply::ToolOk(value),
+            Answer::Error(message) => Reply::ToolError(message),
+            Answer::Refused(sentence) => Reply::Denied(sentence),
+            Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),
+        }
+    }
+
+    /// The resources the call names, from the adapter registered with the connector of the
+    /// approved tool the call names. Never chosen by anything else in the request. A name that
+    /// is not an approved tool names no resources; the decision denies it before it looks.
+    fn resources(
+        &self,
+        snapshot: &PolicySnapshot,
+        requested: &RequestedTool,
+        arguments: &Value,
+    ) -> Resources {
+        let gates = &self.inner.gates;
+        let approved = requested.name().ok().and_then(|name| snapshot.tool(&name));
+        let adapter =
+            approved.and_then(|tool| Some((tool, gates.resource_adapter(&tool.connector)?)));
+        match adapter {
+            Some((tool, adapter)) => adapter.resources(tool, arguments),
+            None => Resources::Named(Vec::new()),
+        }
+    }
+
+    /// Design section 6's step 3: the profile, from the configured rules. There is no
+    /// delegation verifier yet.
+    fn caller_context(&self, principal: Proved<Principal>, surface: SurfaceName) -> CallerContext {
+        let gates = &self.inner.gates;
+        CallerContext {
+            profile: gates.selector().select(principal.get()),
+            principal,
+            delegation: None,
+            surface,
+            deployment: gates.deployment().clone(),
+        }
+    }
+}
+
+/// The token from the one `Authorization: Bearer` header, or `None`.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+}
+
+/// The caller's tool-use identifier, if it is 1 to [`MAX_TOOL_USE_ID`] printable ASCII
+/// characters other than space. Anything else is dropped rather than cut, because a cut
+/// identifier would point the caller's control plane at the wrong row.
+fn bounded_tool_use_id(value: Option<String>) -> Option<ToolUseId> {
+    let value = value?;
+    let acceptable = !value.is_empty()
+        && value.len() <= MAX_TOOL_USE_ID
+        && value.bytes().all(|byte| byte.is_ascii_graphic());
+    if acceptable {
+        Some(ToolUseId::new(value))
+    } else {
+        // The value is the caller's text, so only its length is logged.
+        tracing::warn!(
+            length = value.len(),
+            "dropped a tool-use identifier that is not 1 to {MAX_TOOL_USE_ID} printable ASCII characters"
+        );
+        None
+    }
+}
+
+fn entry(tool: &ApprovedTool, definition: &ToolDefinition) -> ToolEntry {
+    ToolEntry {
+        name: tool.name.to_string(),
+        title: definition.title.clone(),
+        description: definition.description.clone(),
+        input_schema: definition.input_schema.clone(),
+        read_only: tool.classification == Classification::Read,
+    }
+}
+
+fn elapsed_millis(clock: &dyn Clock, since: SystemTime) -> u64 {
+    clock.now().duration_since(since).map_or(0, |elapsed| {
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+fn server_info(gates: &Gates) -> ServerInfo {
+    let mut notes = Vec::new();
+    if gates.identity_state() == GateState::Disabled {
+        notes.push(IDENTITY_DISABLED_NOTE);
+    }
+    if gates.audit_state() == GateState::Disabled {
+        notes.push(AUDIT_DISABLED_NOTE);
+    }
+    ServerInfo {
+        name: SERVER_NAME.to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        instructions: (!notes.is_empty()).then(|| notes.join(" ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use http::HeaderValue;
+
+    fn headers(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn the_bearer_token_is_read_from_one_header_with_any_case_of_scheme() {
+        assert_eq!(bearer_token(&headers(&["Bearer abc"])), Some("abc"));
+        assert_eq!(bearer_token(&headers(&["bearer abc"])), Some("abc"));
+        assert_eq!(bearer_token(&headers(&["BEARER  abc "])), Some("abc"));
+    }
+
+    #[test]
+    fn anything_but_one_bearer_header_is_no_token() {
+        assert_eq!(bearer_token(&headers(&[])), None);
+        assert_eq!(bearer_token(&headers(&["Bearer abc", "Bearer abc"])), None);
+        assert_eq!(bearer_token(&headers(&["Basic abc"])), None);
+        assert_eq!(bearer_token(&headers(&["Bearerabc"])), None);
+        assert_eq!(bearer_token(&headers(&["abc"])), None);
+        let mut binary = HeaderMap::new();
+        binary.insert(
+            AUTHORIZATION,
+            HeaderValue::from_bytes(b"Bearer \xffabc").unwrap(),
+        );
+        assert_eq!(bearer_token(&binary), None);
+    }
+
+    #[test]
+    fn a_tool_use_identifier_is_kept_only_within_its_bound() {
+        let kept = |value: &str| bounded_tool_use_id(Some(value.to_owned()));
+        assert_eq!(kept("toolu_01"), Some(ToolUseId::new("toolu_01")));
+        let longest = "a".repeat(MAX_TOOL_USE_ID);
+        assert_eq!(kept(&longest), Some(ToolUseId::new(longest.clone())));
+        assert_eq!(kept(&"a".repeat(MAX_TOOL_USE_ID + 1)), None);
+        assert_eq!(kept(""), None);
+        assert_eq!(kept("tool use"), None);
+        assert_eq!(kept("toolu\n01"), None);
+        assert_eq!(kept("toolu\u{1b}[31m"), None);
+        assert_eq!(kept("toolu_é"), None);
+        assert_eq!(bounded_tool_use_id(None), None);
+    }
+
+    #[test]
+    fn only_a_read_tool_is_marked_read_only() {
+        let snapshot = gateway_testkit::policy().unwrap();
+        let definition = |name: &str| ToolDefinition {
+            name: name.parse().unwrap(),
+            title: Some("Title".to_owned()),
+            description: "Does a thing.".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        for (name, read_only) in [
+            (gateway_testkit::READ_TOOL, true),
+            (gateway_testkit::SCOPED_READ_TOOL, true),
+            (gateway_testkit::WRITE_TOOL, false),
+        ] {
+            let tool = snapshot.tool(&name.parse().unwrap()).unwrap();
+            let entry = entry(tool, &definition(name));
+            assert_eq!(entry.read_only, read_only, "{name}");
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.title.as_deref(), Some("Title"));
+            assert_eq!(entry.description, "Does a thing.");
+        }
+    }
+}

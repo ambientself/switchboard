@@ -1,8 +1,8 @@
 //! The gateway: the crate that puts the policy core, the identity verifier and the connectors
 //! together and decides whether a deployment may start.
 //!
-//! This is design section 5's `gateway` crate. The HTTP endpoint and the `switchboard` binary
-//! come later; what is here runs before any socket exists:
+//! This is design section 5's `gateway` crate. The HTTP server and the `switchboard` binary
+//! come later; what is here needs no socket:
 //!
 //! - [`Config`] is the deployment's configuration as data: identity, audit, the policy
 //!   snapshot, tool definitions and the rules that select a profile.
@@ -17,6 +17,9 @@
 //! - [`ResourceAdapter`] turns a call's arguments into the resources the decision checks.
 //! - [`DisabledAuditStore`] is the explicit no-op store, made only when configuration opts out
 //!   of audit.
+//! - [`RequestPath`] is design section 6's request path over the [`Gates`]: identity, the MCP
+//!   adapter, profile selection, the decision, the audit row and the connector, from a
+//!   request's method, headers and body to its HTTP response.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +27,7 @@ mod audit;
 pub mod boot;
 mod catalog;
 mod config;
+pub mod path;
 mod resources;
 mod selector;
 
@@ -32,6 +36,10 @@ pub use boot::{BootError, GateState, Gates, Wiring};
 pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
+};
+pub use path::{
+    AUDIT_DISABLED_NOTE, Admitted, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
+    RequestPath, SERVER_NAME,
 };
 pub use resources::ResourceAdapter;
 pub use selector::{

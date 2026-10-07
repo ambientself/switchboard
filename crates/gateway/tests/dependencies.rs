@@ -9,9 +9,11 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-const ALLOWED: [&str; 6] = [
+const ALLOWED: [&str; 8] = [
     "gateway-core",
     "gateway-identity",
+    "gateway-mcp",
+    "http",
     "serde",
     "serde_json",
     "thiserror",

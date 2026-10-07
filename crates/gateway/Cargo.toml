@@ -1,7 +1,7 @@
 [package]
 name = "gateway"
 version = "0.1.0"
-description = "The gateway itself: configuration, the boot gates, profile selection, tool definitions and the wiring that puts the core, identity and connectors together."
+description = "The gateway itself: configuration, the boot gates, profile selection, tool definitions, the request path and the wiring that puts the core, identity and connectors together."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,6 +12,9 @@ publish.workspace = true
 [dependencies]
 gateway-core = { path = "../gateway-core" }
 gateway-identity = { path = "../gateway-identity" }
+gateway-mcp = { path = "../gateway-mcp" }
+# The request vocabulary the MCP adapter speaks: methods, header maps and status codes.
+http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

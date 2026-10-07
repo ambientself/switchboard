@@ -294,7 +294,9 @@ version = "0.1.0"
 dependencies = [
  "gateway-core",
  "gateway-identity",
+ "gateway-mcp",
  "gateway-testkit",
+ "http",
  "serde",
  "serde_json",
  "thiserror",
