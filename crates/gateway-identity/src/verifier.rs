@@ -250,6 +250,8 @@ enum Unfit {
     DoesNotFit,
     /// An RSA key with a modulus of this many bits, fewer than [`MIN_RSA_BITS`].
     Weak(usize),
+    /// An RSA key the crypto backend refuses to build, for this reason.
+    UnusableRsa(String),
 }
 
 impl Unfit {
@@ -267,6 +269,11 @@ impl Unfit {
                 algorithm: algorithm.as_str(),
             },
             Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },
+            Unfit::UnusableRsa(reason) => ConfigError::UnusableRsaKey {
+                issuer,
+                kid,
+                reason,
+            },
         }
     }
 }
@@ -281,6 +288,7 @@ fn decoding_key(jwk: &Jwk, algorithm: SigningAlgorithm) -> Result<DecodingKey, U
         if bits < MIN_RSA_BITS {
             return Err(Unfit::Weak(bits));
         }
+        rsa_key_usable(&params.n, &params.e)?;
     }
     DecodingKey::from_jwk(jwk).map_err(|_| Unfit::DoesNotFit)
 }
@@ -293,6 +301,26 @@ fn modulus_bits(n: &str) -> Option<usize> {
     let top = significant.next()?;
     let unused = usize::try_from(top.leading_zeros()).ok()?;
     Some((significant.count() + 1) * 8 - unused)
+}
+
+/// Builds the public key the crypto backend builds from `n` and `e` each time it verifies an
+/// RS256 signature, and refuses the key if the backend would.
+///
+/// `DecodingKey::from_jwk` keeps `n` and `e` as bytes and checks nothing about them. The
+/// backend, `jsonwebtoken`'s pure-Rust one, calls `RsaPublicKey::new` on every verify, which
+/// refuses a modulus over 4096 bits or even, and an exponent that is even, under 2 or over
+/// 2^33 - 1. `jsonwebtoken` reports that as `InvalidSignature`, the same as a forgery, so a key
+/// it refuses would fail every token under it as [`VerifyError::BadSignature`]. Calling the same
+/// constructor here, from the same crate, refuses that key when it is configured instead.
+fn rsa_key_usable(n: &str, e: &str) -> Result<(), Unfit> {
+    let n = URL_SAFE_NO_PAD.decode(n).map_err(|_| Unfit::DoesNotFit)?;
+    let e = URL_SAFE_NO_PAD.decode(e).map_err(|_| Unfit::DoesNotFit)?;
+    rsa::RsaPublicKey::new(
+        rsa::BigUint::from_bytes_be(&n),
+        rsa::BigUint::from_bytes_be(&e),
+    )
+    .map(|_| ())
+    .map_err(|error| Unfit::UnusableRsa(error.to_string()))
 }
 
 /// Whether a JWK is of the kind `algorithm` needs, and does not say it is for something else.
