@@ -923,6 +923,84 @@ mutate_all(
 )
 
 
+# --- gateway-mcp ---------------------------------------------------------------------------
+
+MCP = "crates/gateway-mcp/src/"
+MCP_PARSE = MCP + "parse.rs"
+MCP_REPLY = MCP + "reply.rs"
+MCP_REJECTION = MCP + "rejection.rs"
+
+mutate("mcp-get-served", "GET is answered", MCP_PARSE,
+       "    if method != Method::POST {", "    if method != Method::POST && method != Method::GET {")
+mutate("mcp-delete-served", "DELETE is answered", MCP_PARSE,
+       "    if method != Method::POST {", "    if method != Method::POST && method != Method::DELETE {")
+mutate("mcp-content-type-ignored", "a body not declared as JSON is served", MCP_PARSE,
+       "    if !content_type_is_json(headers) {", "    if false && !content_type_is_json(headers) {")
+mutate("mcp-accept-ignored", "an Accept excluding JSON is served", MCP_PARSE,
+       "    if !accept_admits_json(headers) {", "    if false && !accept_admits_json(headers) {")
+mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON", MCP + "headers.rs",
+       "is_ok_and(|q| q <= 0.0)", "is_ok_and(|q| q < 0.0)")
+mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
+       '                response\n                    .headers\n                    .insert(ALLOW, HeaderValue::from_static("POST"));\n',
+       "")
+mutate("mcp-challenge-dropped", "a 401 carries no WWW-Authenticate challenge", MCP_REJECTION,
+       "                response\n                    .headers\n                    .insert(WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));\n",
+       "")
+mutate("mcp-batch-accepted", "the first request of a JSON array is processed", MCP_PARSE,
+       '        Value::Array(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: batches are not supported",\n            ));\n        }\n',
+       "        Value::Array(mut batch) if !batch.is_empty() => match batch.remove(0) {\n"
+       "            Value::Object(object) => object,\n"
+       '            _ => return Err(Rejection::invalid_request("not an object")),\n        },\n')
+mutate("mcp-null-id-accepted", "id: null is accepted", MCP_PARSE,
+       '        Some(Value::Null) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: id must not be null",\n            ));\n        }\n',
+       "        Some(Value::Null) => Some(RequestId::Number(0)),\n")
+mutate("mcp-notification-gets-body", "a notification is answered 200", MCP_REPLY,
+       "            status: StatusCode::ACCEPTED,", "            status: StatusCode::OK,")
+mutate("mcp-initialize-era-from-meta", "an initialize carrying a modern _meta version is served as modern", MCP_PARSE,
+       '    if method == "initialize" {\n        return Era::Legacy;\n    }\n', "")
+mutate("mcp-session-id-issued", "initialize gains Mcp-Session-Id", MCP_REPLY,
+       "            return result_response(id, result);\n",
+       "            let mut response = result_response(id, result);\n"
+       '            response.headers.insert(http::HeaderName::from_static("mcp-session-id"), HeaderValue::from_static("dummy-session"));\n'
+       "            return response;\n")
+mutate("mcp-initialize-echoes-version", "initialize answers a version other than 2025-06-18", MCP_REPLY,
+       '"protocolVersion": LEGACY,', '"protocolVersion": MODERN,')
+mutate("mcp-protocol-header-optional-modern", "the modern MCP-Protocol-Version header is not required", MCP_PARSE,
+       "        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one MCP-Protocol-Version header is required",\n',
+       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one MCP-Protocol-Version header is required",\n')
+mutate("mcp-protocol-header-mismatch-accepted", "an MCP-Protocol-Version header that disagrees with _meta is accepted", MCP_PARSE,
+       "        Single::One(header) if header == version => {}", "        Single::One(header) if !header.is_empty() => {}")
+mutate("mcp-unsupported-version-served", "an unsupported version is served", MCP_PARSE,
+       "    if version != MODERN {", "    if version.is_empty() {")
+mutate("mcp-capabilities-not-required", "clientCapabilities is optional", MCP_PARSE,
+       ".is_some_and(Value::is_object)", ".is_none_or(Value::is_object)")
+mutate("mcp-method-header-not-compared", "Mcp-Method is not compared with the body", MCP_PARSE,
+       "        Single::One(header) if header == method => {}", "        Single::One(header) if !header.is_empty() => {}")
+mutate("mcp-name-header-not-compared", "Mcp-Name is not compared with the body", MCP_PARSE,
+       "        Some(decoded) if decoded == name => Ok(()),", "        Some(_) => Ok(()),")
+mutate("mcp-name-sentinel-not-decoded", "the base64 sentinel in Mcp-Name is compared raw", MCP_PARSE,
+       "    match header_name_value(header) {", "    match Some(header.to_owned()) {")
+mutate("mcp-modern-ping-served", "ping is served under 2026-07-28", MCP_PARSE,
+       '        "server/discover" => Ok(Call::Discover),\n',
+       '        "server/discover" => Ok(Call::Discover),\n        "ping" => Ok(Call::Ping),\n')
+mutate("mcp-modern-unknown-method-200", "an unknown modern method is answered 200, not 404", MCP_REJECTION,
+       "            Era::Modern => StatusCode::NOT_FOUND,", "            Era::Modern => StatusCode::OK,")
+mutate("mcp-legacy-any-header-version", "a legacy request accepts any MCP-Protocol-Version", MCP_PARSE,
+       "        Single::One(header) if header == LEGACY => {}", "        Single::One(_) => {}")
+mutate("mcp-cursor-accepted", "a cursor the server never issued is accepted", MCP_PARSE,
+       "        None | Some(Value::Null) => Ok(Call::ToolsList),", "        _ => Ok(Call::ToolsList),")
+mutate("mcp-list-cache-public", "a modern tools/list is marked public", MCP_REPLY,
+       '"cacheScope": "private",', '"cacheScope": "public",')
+mutate("mcp-legacy-structured-non-object", "a legacy result carries structuredContent that is not an object", MCP_REPLY,
+       "            if era == Era::Modern || value.is_object() {", "            if true {")
+mutate("mcp-denial-code-changed", "the denial code becomes -32602", MCP + "constants.rs",
+       "pub const DENIAL_CODE: i64 = -32001;", "pub const DENIAL_CODE: i64 = -32602;")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
