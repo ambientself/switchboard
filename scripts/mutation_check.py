@@ -789,6 +789,8 @@ mutate("identity-config-leeway-unbounded", "an issuer can be configured with any
 mutate("identity-config-leeway-boundary", "a leeway of exactly the maximum is refused", V, LEEWAY, "        if config.leeway >= MAX_LEEWAY {")
 mutate("identity-config-leeway-whole-seconds", "a leeway is compared in whole seconds", V, LEEWAY,
        "        if config.leeway.as_secs() > MAX_LEEWAY.as_secs() {")
+mutate("identity-config-second-user-issuer-allowed", "two user issuers can be configured", V,
+       "                return Err(ConfigError::SecondUserIssuer { first, second });", "                let _ = (first, second);")
 
 # --- The identity gate and the opaque failure ----------------------------------------------
 

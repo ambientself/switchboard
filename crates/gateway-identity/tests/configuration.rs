@@ -15,7 +15,7 @@ use gateway_identity::{
 use gateway_testkit::{FixedClock, SteppableClock};
 use serde_json::json;
 
-use common::{Kind, LEEWAY, NOW, Setup, setups};
+use common::{AUDIENCE, Kind, LEEWAY, NOW, Setup, setups};
 
 fn setup(algorithm: SigningAlgorithm, kind: Kind) -> Setup {
     setups()
@@ -259,6 +259,38 @@ fn a_list_of_issuers_must_be_non_empty_and_name_each_issuer_once() {
         build(vec![config.clone(), different]).unwrap_err(),
         ConfigError::DuplicateIssuer(config.issuer)
     );
+}
+
+/// Decision 0006: group names are not qualified by issuer, so a group name used by two user
+/// issuers would admit the members of both. Until that is settled, a deployment has at most
+/// one user issuer, however many workload issuers it has.
+#[test]
+fn a_deployment_has_at_most_one_user_issuer() {
+    let es_user = setup(SigningAlgorithm::Es256, Kind::User);
+    let rs_user = setup(SigningAlgorithm::Rs256, Kind::User);
+    // A workload issuer with a name of its own: the one the RSA setups keep as "other".
+    let rs_workload = setup(SigningAlgorithm::Rs256, Kind::Workload);
+    let other_workload = rs_workload
+        .other
+        .config(rs_workload.issuer_kind(), &[AUDIENCE]);
+    let refused = ConfigError::SecondUserIssuer {
+        first: es_user.issuer.issuer().into(),
+        second: rs_user.issuer.issuer().into(),
+    };
+    assert_eq!(
+        build(vec![es_user.config(), rs_user.config()]).unwrap_err(),
+        refused
+    );
+    assert_eq!(
+        build(vec![
+            es_user.config(),
+            other_workload.clone(),
+            rs_user.config()
+        ])
+        .unwrap_err(),
+        refused
+    );
+    assert!(build(vec![es_user.config(), other_workload]).is_ok());
 }
 
 #[test]

@@ -55,6 +55,12 @@ fn two_issuers() -> impl Strategy<Value = (usize, usize)> {
     (0..4usize, 0..4usize).prop_filter("two different issuers", |(a, b)| a != b)
 }
 
+/// Whether each of two issuers is a workload issuer. At most one may be a user issuer, so the
+/// pair is never two user issuers.
+fn two_kinds() -> impl Strategy<Value = (bool, bool)> {
+    (any::<bool>(), any::<bool>()).prop_filter("at most one user issuer", |(a, b)| *a || *b)
+}
+
 fn subjects() -> impl Strategy<Value = String> {
     "[a-z0-9:@._/-]{1,32}"
 }
@@ -63,26 +69,27 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     /// A token signed by issuer A is never accepted under issuer B's entry, whatever it claims:
-    /// B's name as its issuer, A's or B's key id, the same subject, the same groups. And with
-    /// both configured, each issuer's honest token proves a principal of its own issuer, and
-    /// the principals for one subject from the two issuers never compare equal.
+    /// B's name as its issuer, A's or B's key id, the same subject, the same groups, the claims
+    /// B's kind needs. And with both configured, each issuer's honest token proves a principal
+    /// of its own issuer, and the principals for one subject from the two issuers never compare
+    /// equal.
     #[test]
     fn a_token_from_one_issuer_is_never_accepted_under_another(
         (a, b) in two_issuers(),
         subject in subjects(),
-        workload in any::<bool>(),
+        (workload_a, workload_b) in two_kinds(),
         claimed_kid in 0..3usize,
         groups in proptest::sample::subsequence(vec!["g1", "g2", "g3"], 0..=3),
     ) {
         let (issuer_a, issuer_b) = (issuers()[a], issuers()[b]);
-        let only_b = TokenVerifier::new(vec![entry(issuer_b, workload, &subject)], clock()).unwrap();
+        let only_b = TokenVerifier::new(vec![entry(issuer_b, workload_b, &subject)], clock()).unwrap();
         let both = TokenVerifier::new(
-            vec![entry(issuer_a, workload, &subject), entry(issuer_b, workload, &subject)],
+            vec![entry(issuer_a, workload_a, &subject), entry(issuer_b, workload_b, &subject)],
             clock(),
         ).unwrap();
 
-        // A forges a token naming B, under whichever key id it likes.
-        let forged = token(issuer_a, workload, &subject, &groups).issuer(issuer_b.issuer());
+        // A forges a token of B's kind naming B, under whichever key id it likes.
+        let forged = token(issuer_a, workload_b, &subject, &groups).issuer(issuer_b.issuer());
         let forged = match claimed_kid {
             0 => forged,
             1 => forged.kid(issuer_b.key_id()),
@@ -101,8 +108,8 @@ proptest! {
         }
 
         // Honest tokens each prove their own issuer's principal.
-        let from_a = prove(&both, &token(issuer_a, workload, &subject, &groups).build()).unwrap();
-        let from_b = prove(&both, &token(issuer_b, workload, &subject, &groups).build()).unwrap();
+        let from_a = prove(&both, &token(issuer_a, workload_a, &subject, &groups).build()).unwrap();
+        let from_b = prove(&both, &token(issuer_b, workload_b, &subject, &groups).build()).unwrap();
         prop_assert_eq!(from_a.get().id.issuer.as_str(), issuer_a.issuer());
         prop_assert_eq!(from_b.get().id.issuer.as_str(), issuer_b.issuer());
         prop_assert_eq!(&from_a.get().id.subject, &from_b.get().id.subject);
@@ -110,7 +117,7 @@ proptest! {
         prop_assert_ne!(from_a.get(), from_b.get());
 
         // And A's honest token is not accepted by a verifier that holds only B.
-        let refusal = prove(&only_b, &token(issuer_a, workload, &subject, &groups).build()).unwrap_err();
+        let refusal = prove(&only_b, &token(issuer_a, workload_a, &subject, &groups).build()).unwrap_err();
         prop_assert_eq!(refusal, VerifyError::UnknownIssuer);
     }
 

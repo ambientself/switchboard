@@ -118,6 +118,19 @@ pub enum ConfigError {
     /// Two entries name the same issuer, so which one a token belongs to is ambiguous.
     #[error("issuer `{0}` is configured more than once")]
     DuplicateIssuer(Issuer),
+    /// A second user issuer. Group names are not qualified by issuer, so a group name used by
+    /// two identity providers would admit the members of both (decision 0006). One user
+    /// issuer per deployment until that is settled.
+    #[error(
+        "user issuers `{first}` and `{second}` are both configured; group names are not \
+         qualified by issuer, so a deployment has at most one"
+    )]
+    SecondUserIssuer {
+        /// The user issuer listed first.
+        first: Issuer,
+        /// The one listed after it.
+        second: Issuer,
+    },
     /// An issuer string that can never match a token.
     #[error("an issuer is configured with an empty name")]
     EmptyIssuer,

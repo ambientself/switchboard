@@ -57,16 +57,26 @@ impl TokenVerifier {
     /// Builds a verifier from a non-empty list of issuers, refusing configuration that could
     /// never verify anything or that is ambiguous. A deployment with such configuration does
     /// not start.
+    ///
+    /// At most one issuer may be a user issuer, because group names are not qualified by issuer
+    /// (decision 0006).
     pub fn new(issuers: Vec<IssuerConfig>, clock: Arc<dyn Clock>) -> Result<Self, ConfigError> {
         if issuers.is_empty() {
             return Err(ConfigError::NoIssuers);
         }
         let mut entries = BTreeMap::new();
+        let mut user_issuer: Option<gateway_core::Issuer> = None;
         for config in issuers {
             let name = config.issuer.as_str().to_owned();
             let entry = Entry::new(config)?;
+            let user = matches!(entry.kind, IssuerKind::User { .. }).then(|| entry.issuer.clone());
             if entries.insert(name.clone(), entry).is_some() {
                 return Err(ConfigError::DuplicateIssuer(name.as_str().into()));
+            }
+            if let Some(second) = user
+                && let Some(first) = user_issuer.replace(second.clone())
+            {
+                return Err(ConfigError::SecondUserIssuer { first, second });
             }
         }
         Ok(Self {
