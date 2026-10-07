@@ -109,6 +109,35 @@ pub(crate) struct Trigger {
 /// Settings that must hold for a committed row to be durable.
 const DURABILITY: &[(&str, &str)] = &[("fsync", "on"), ("full_page_writes", "on")];
 
+/// The predefined roles that reach the server's own files or programs, and so get around every
+/// grant and trigger. PostgreSQL documents each as a way to gain a superuser's powers.
+const SERVER_ROLES: &[(&str, &str)] = &[
+    (
+        "pg_execute_server_program",
+        "runs programs on the database server",
+    ),
+    (
+        "pg_read_server_files",
+        "reads any file on the database server",
+    ),
+    (
+        "pg_write_server_files",
+        "writes any file on the database server",
+    ),
+];
+
+/// The privileges a role may hold on a column. One held with grant option can be passed on to
+/// any other role, so it is checked as a privilege of its own.
+const COLUMN_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "REFERENCES",
+    "SELECT WITH GRANT OPTION",
+    "INSERT WITH GRANT OPTION",
+    "UPDATE WITH GRANT OPTION",
+];
+
 /// One reason the store will not start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {
@@ -166,7 +195,17 @@ pub enum Problem {
         /// The object.
         object: String,
     },
-    /// The session's role holds a privilege the store does not need.
+    /// The session's role is, or can become, a predefined role that reaches the server's files
+    /// or programs.
+    ServerAccess {
+        /// The predefined role.
+        role: &'static str,
+        /// What it lets a member do.
+        reach: &'static str,
+    },
+    /// The session's role, or a role it can become with `SET ROLE`, holds a privilege the store
+    /// does not need. A membership the session does not inherit counts, since `SET ROLE`
+    /// reaches it all the same.
     Extra {
         /// The privilege.
         privilege: String,
@@ -224,9 +263,14 @@ impl fmt::Display for Problem {
                 f,
                 "this session's role owns {object}, or is a member of the role that does"
             ),
+            Self::ServerAccess { role, reach } => write!(
+                f,
+                "this session's role is or can become {role}, which {reach}"
+            ),
             Self::Extra { privilege, object } => write!(
                 f,
-                "this session's role holds {privilege} on {object}, which the gateway must not have"
+                "this session's role, or a role it can become, holds {privilege} on {object}, \
+                 which the gateway must not have"
             ),
             Self::Missing { privilege, object } => write!(
                 f,
@@ -274,14 +318,18 @@ impl PgAuditStore {
     ///   completes a row at most once.
     /// - The role is not a superuser, and cannot create roles or databases, replicate, or
     ///   bypass row security; nor can any role it is a member of.
+    /// - The role is not a member of `pg_execute_server_program`, `pg_read_server_files` or
+    ///   `pg_write_server_files`, which reach the server's programs and files.
     /// - The role does not own the schema, the table, the trigger function or anything else in
     ///   the schema, and is not a member of a role that does.
-    /// - The role holds exactly its own privileges: inserting the first half of a row,
-    ///   updating the completion, selecting the identifier, decision and completion, and using
-    ///   the schema. Nothing on the table as a whole, so it cannot DELETE or TRUNCATE; no
-    ///   CREATE on the schema or the database; nothing on any other table or sequence in the
-    ///   schema; and it cannot set `session_replication_role`, which would silence the
-    ///   trigger.
+    /// - The role holds its own privileges: inserting the first half of a row, updating the
+    ///   completion, selecting the identifier, decision and completion, and using the schema.
+    /// - Neither the role nor any role it is a member of holds more. A membership counts
+    ///   whether or not it is inherited, since `SET ROLE` reaches a role that is not. So none
+    ///   holds the store's privileges with grant option; none holds anything on the table as a
+    ///   whole, so none can DELETE, TRUNCATE or add a trigger; none can CREATE in the schema or
+    ///   the database; none holds anything on any other table or sequence in the schema; and
+    ///   none can set `session_replication_role`, which would silence the trigger.
     ///
     /// Has no time limit: wrap it in one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {
@@ -310,6 +358,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     }
 
     role_attributes(client, &mut problems).await?;
+    server_roles(client, &mut problems).await?;
     ownership(client, &mut problems).await?;
 
     // The catalog is read directly, by name, so a missing schema or table is a problem found
@@ -383,6 +432,37 @@ async fn role_attributes(
         }
     }
     Ok(())
+}
+
+async fn server_roles(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    for (role, reach) in SERVER_ROLES {
+        let member: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT FROM pg_catalog.pg_roles
+                                WHERE rolname = $1 AND pg_has_role(current_user, oid, 'MEMBER'))",
+                &[role],
+            )
+            .await?
+            .get(0);
+        if member {
+            problems.push(Problem::ServerAccess { role, reach });
+        }
+    }
+    Ok(())
+}
+
+/// A condition that holds when `test`, a privilege check on the role `r.oid`, holds for the
+/// session's role or for any role it can become. A privilege function asked about
+/// `current_user` counts only what that role inherits, and `SET ROLE` also reaches a role it
+/// does not inherit.
+fn by_any_role(test: &str) -> String {
+    format!(
+        "EXISTS (SELECT FROM pg_catalog.pg_roles r
+                 WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND {test})"
+    )
 }
 
 async fn ownership(
@@ -515,20 +595,32 @@ async fn column_privileges(
     table: tokio_postgres::types::Oid,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
-    let held = client
+    // What the session's role holds itself, which must include the store's own privileges, and
+    // what it or any role it can become holds, which must include nothing else.
+    let rows = client
         .query(
-            "SELECT a.attname::text, p
-             FROM pg_catalog.pg_attribute a,
-                 unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']) AS p
-             WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped
-                 AND has_column_privilege(current_user, $1::oid, a.attnum, p)",
-            &[&table],
+            &format!(
+                "SELECT a.attname::text, p,
+                        has_column_privilege(current_user, $1::oid, a.attnum, p),
+                        {}
+                 FROM pg_catalog.pg_attribute a, unnest($2::text[]) AS p
+                 WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped",
+                by_any_role("has_column_privilege(r.oid, $1::oid, a.attnum, p)")
+            ),
+            &[&table, &COLUMN_PRIVILEGES],
         )
         .await?;
-    let held: BTreeSet<(String, String)> = held
-        .into_iter()
-        .map(|row| (row.get(1), row.get(0)))
-        .collect();
+    let mut held = BTreeSet::new();
+    let mut reachable = BTreeSet::new();
+    for row in rows {
+        let pair: (String, String) = (row.get(1), row.get(0));
+        if row.get::<_, bool>(2) {
+            held.insert(pair.clone());
+        }
+        if row.get::<_, bool>(3) {
+            reachable.insert(pair);
+        }
+    }
     let mut expected = BTreeSet::new();
     for (privilege, columns) in [
         ("INSERT", INSERTED),
@@ -543,15 +635,17 @@ async fn column_privileges(
     // table, by `other_privileges`.
     let whole: BTreeSet<String> = client
         .query(
-            "SELECT p FROM unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']) AS p
-             WHERE has_table_privilege(current_user, $1::oid, p)",
-            &[&table],
+            &format!(
+                "SELECT p FROM unnest($2::text[]) AS p WHERE {}",
+                by_any_role("has_table_privilege(r.oid, $1::oid, p)")
+            ),
+            &[&table, &COLUMN_PRIVILEGES],
         )
         .await?
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    for (privilege, column) in held.difference(&expected) {
+    for (privilege, column) in reachable.difference(&expected) {
         if !whole.contains(privilege) {
             problems.push(Problem::Extra {
                 privilege: privilege.clone(),
@@ -574,27 +668,32 @@ async fn other_privileges(
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     // Nothing on any table, view or foreign table in the schema as a whole, and nothing at all
-    // on any but call_rows.
+    // on any but call_rows, for the session's role or any role it can become.
     let privileges = table_privileges(version);
     let held = client
         .query(
-            "SELECT n.nspname || '.' || c.relname, p
-             FROM pg_catalog.pg_class c
-                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
-                 unnest($1::text[]) AS p
-             WHERE n.nspname = 'switchboard_audit' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-                 AND (has_table_privilege(current_user, c.oid, p)
-                     OR (c.relname <> 'call_rows'
-                         AND p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
-                         AND has_any_column_privilege(current_user, c.oid, p)))
-             UNION ALL
-             SELECT n.nspname || '.' || c.relname, p
-             FROM pg_catalog.pg_class c
-                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
-                 unnest(ARRAY['USAGE', 'SELECT', 'UPDATE']) AS p
-             WHERE n.nspname = 'switchboard_audit' AND c.relkind = 'S'
-                 AND has_sequence_privilege(current_user, c.oid, p)
-             ORDER BY 1, 2",
+            &format!(
+                "SELECT n.nspname || '.' || c.relname, p
+                 FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
+                     unnest($1::text[]) AS p
+                 WHERE n.nspname = 'switchboard_audit' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                     AND ({}
+                         OR (c.relname <> 'call_rows'
+                             AND p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
+                             AND {}))
+                 UNION ALL
+                 SELECT n.nspname || '.' || c.relname, p
+                 FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
+                     unnest(ARRAY['USAGE', 'SELECT', 'UPDATE']) AS p
+                 WHERE n.nspname = 'switchboard_audit' AND c.relkind = 'S'
+                     AND {}
+                 ORDER BY 1, 2",
+                by_any_role("has_table_privilege(r.oid, c.oid, p)"),
+                by_any_role("has_any_column_privilege(r.oid, c.oid, p)"),
+                by_any_role("has_sequence_privilege(r.oid, c.oid, p)"),
+            ),
             &[&privileges],
         )
         .await?;
@@ -605,11 +704,16 @@ async fn other_privileges(
         });
     }
 
+    // The session's role must use the schema itself. Neither it nor any role it can become may
+    // create in it, or pass on using it.
     let schema = client
         .query_opt(
-            "SELECT has_schema_privilege(current_user, oid, 'USAGE'),
-                    has_schema_privilege(current_user, oid, 'CREATE')
-             FROM pg_catalog.pg_namespace WHERE nspname = 'switchboard_audit'",
+            &format!(
+                "SELECT has_schema_privilege(current_user, n.oid, 'USAGE'), {}, {}
+                 FROM pg_catalog.pg_namespace n WHERE n.nspname = 'switchboard_audit'",
+                by_any_role("has_schema_privilege(r.oid, n.oid, 'CREATE')"),
+                by_any_role("has_schema_privilege(r.oid, n.oid, 'USAGE WITH GRANT OPTION')"),
+            ),
             &[],
         )
         .await?;
@@ -626,12 +730,20 @@ async fn other_privileges(
                 object: "the schema switchboard_audit".into(),
             });
         }
+        if schema.get::<_, bool>(2) {
+            problems.push(Problem::Extra {
+                privilege: "USAGE WITH GRANT OPTION".into(),
+                object: "the schema switchboard_audit".into(),
+            });
+        }
     }
 
     let database = client
         .query_one(
-            "SELECT current_database()::text,
-                    has_database_privilege(current_user, current_database(), 'CREATE')",
+            &format!(
+                "SELECT current_database()::text, {}",
+                by_any_role("has_database_privilege(r.oid, current_database(), 'CREATE')")
+            ),
             &[],
         )
         .await?;
@@ -646,7 +758,12 @@ async fn other_privileges(
     if version >= 150_000 {
         let can_set: bool = client
             .query_one(
-                "SELECT has_parameter_privilege(current_user, 'session_replication_role', 'SET')",
+                &format!(
+                    "SELECT {}",
+                    by_any_role(
+                        "has_parameter_privilege(r.oid, 'session_replication_role', 'SET')"
+                    )
+                ),
                 &[],
             )
             .await?

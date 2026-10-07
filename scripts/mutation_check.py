@@ -1233,7 +1233,10 @@ mutate("pg-check-set-times-unchecked", "the trigger that sets the times is not c
        '    Trigger {\n        name: "set_times",\n        purpose: "sets both times from the database\'s clock",\n'
        '        fires: "before each insert",\n        tgtype: 1 | 2 | 4,\n    },\n', "")
 mutate("pg-check-extra-column-ignored", "a column grant beyond the gateway's passes the check", PG_CHECK,
-       "    for (privilege, column) in held.difference(&expected) {", "    for (privilege, column) in held.difference(&held) {")
+       "    for (privilege, column) in reachable.difference(&expected) {",
+       "    for (privilege, column) in reachable.difference(&reachable) {")
+mutate("pg-check-needed-grant-reachable-only", "a column grant the store needs passes when only SET ROLE reaches it", PG_CHECK,
+       "    for (privilege, column) in expected.difference(&held) {", "    for (privilege, column) in expected.difference(&reachable) {")
 mutate("pg-check-missing-column-grant-ignored", "a column grant the store needs may be missing", PG_CHECK,
        "    for (privilege, column) in expected.difference(&held) {", "    for (privilege, column) in expected.difference(&expected) {")
 mutate("pg-check-whole-table-per-column", "a privilege on the whole table is also reported for every column", PG_CHECK,
@@ -1250,6 +1253,35 @@ mutate("pg-check-database-create-ignored", "CREATE on the database passes the ch
        "    if database.get::<_, bool>(1) {", "    if false {")
 mutate("pg-check-replication-role-ignored", "a role that may set session_replication_role passes the check", PG_CHECK,
        "        if can_set {", "        if false {")
+mutate("pg-check-privileges-own-role-only", "a role the session can become is not checked for privileges", PG_CHECK,
+       "                 WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND {test})",
+       "                 WHERE r.rolname = current_user AND {test})")
+# Each privilege check asked of the session's role alone, one at a time.
+for site, test in [
+    ("column", "has_column_privilege(r.oid, $1::oid, a.attnum, p)"),
+    ("whole-table", "has_table_privilege(r.oid, $1::oid, p)"),
+    ("table", "has_table_privilege(r.oid, c.oid, p)"),
+    ("other-table-column", "has_any_column_privilege(r.oid, c.oid, p)"),
+    ("sequence", "has_sequence_privilege(r.oid, c.oid, p)"),
+    ("schema-create", "has_schema_privilege(r.oid, n.oid, 'CREATE')"),
+    ("schema-grant-option", "has_schema_privilege(r.oid, n.oid, 'USAGE WITH GRANT OPTION')"),
+    ("database-create", "has_database_privilege(r.oid, current_database(), 'CREATE')"),
+    ("replication-role", "has_parameter_privilege(r.oid, 'session_replication_role', 'SET')"),
+]:
+    mutate(f"pg-check-{site}-own-role-only", f"the {site} privilege check asks only of the session's role", PG_CHECK,
+           f'"{test}"', f'"r.rolname = current_user AND {test}"')
+mutate("pg-check-grant-option-ignored", "the gateway's own column privileges with grant option pass the check", PG_CHECK,
+       '    "SELECT WITH GRANT OPTION",\n    "INSERT WITH GRANT OPTION",\n    "UPDATE WITH GRANT OPTION",\n', "")
+mutate("pg-check-schema-grant-option-ignored", "USAGE on the schema with grant option passes the check", PG_CHECK,
+       "        if schema.get::<_, bool>(2) {", "        if false {")
+mutate("pg-check-server-roles-ignored", "a role that reaches the server's files or programs passes the check", PG_CHECK,
+       "            problems.push(Problem::ServerAccess { role, reach });", "            let _ = (role, reach);")
+mutate("pg-check-server-roles-inherited-only", "a server role reached without inheriting it passes the check", PG_CHECK,
+       "WHERE rolname = $1 AND pg_has_role(current_user, oid, 'MEMBER'))",
+       "WHERE rolname = $1 AND pg_has_role(current_user, oid, 'USAGE'))")
+for server_role in ["pg_execute_server_program", "pg_read_server_files", "pg_write_server_files"]:
+    mutate(f"pg-check-{server_role.replace('_', '-')}-ignored", f"a member of {server_role} passes the check", PG_CHECK,
+           f'        "{server_role}",\n', '        "pg_monitor",\n')
 
 
 # --- Running -------------------------------------------------------------------------------

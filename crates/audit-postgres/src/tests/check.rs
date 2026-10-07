@@ -2,7 +2,10 @@
 
 use tokio_postgres::NoTls;
 
+use std::collections::BTreeSet;
+
 use super::{GATEWAY_ROLE, OWNER_ROLE, TestDatabase};
+use crate::check::{INSERTED, SELECTED, UPDATED};
 use crate::{BootCheckError, PgAuditStore, PoolSizes, Problem};
 
 /// The problems the check found, which must be some.
@@ -308,6 +311,214 @@ async fn a_role_that_can_silence_the_trigger_is_refused() {
     assert_eq!(
         problems(&db.store_as(&role)).await,
         vec![extra("SET", "the setting session_replication_role")]
+    );
+}
+
+/// Grants `role` the gateway's own privileges directly, as the migration grants them to the
+/// gateway's role, each followed by `option`.
+async fn grant_the_gateways_own(db: &TestDatabase, role: &str, option: &str) {
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "GRANT USAGE ON SCHEMA switchboard_audit TO {role}{option};
+             GRANT INSERT ({}) ON switchboard_audit.call_rows TO {role}{option};
+             GRANT UPDATE ({}) ON switchboard_audit.call_rows TO {role}{option};
+             GRANT SELECT ({}) ON switchboard_audit.call_rows TO {role}{option};",
+            INSERTED.join(", "),
+            UPDATED.join(", "),
+            SELECTED.join(", "),
+        ))
+        .await
+        .unwrap();
+}
+
+/// A role holding far more than the gateway may: rows it can delete, columns it can read,
+/// things it can create, and a setting that silences the trigger.
+async fn wide_role(db: &TestDatabase) -> String {
+    let wide = db.new_role("NOLOGIN", &[]).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "GRANT USAGE, CREATE ON SCHEMA switchboard_audit TO {wide} WITH GRANT OPTION;
+             GRANT DELETE, TRUNCATE, UPDATE ON switchboard_audit.call_rows TO {wide};
+             GRANT SELECT (proved_subject) ON switchboard_audit.call_rows TO {wide};
+             GRANT SELECT (version) ON switchboard_audit.migrations TO {wide};
+             CREATE SEQUENCE switchboard_audit.extra;
+             GRANT USAGE ON SEQUENCE switchboard_audit.extra TO {wide};
+             GRANT CREATE ON DATABASE {} TO {wide};
+             GRANT SET ON PARAMETER session_replication_role TO {wide};",
+            db.name()
+        ))
+        .await
+        .unwrap();
+    wide
+}
+
+/// The problems a role that can become [`wide_role`] has.
+fn what_the_wide_role_holds(db: &TestDatabase) -> Vec<Problem> {
+    vec![
+        extra("SELECT", "switchboard_audit.call_rows.proved_subject"),
+        extra("DELETE", "switchboard_audit.call_rows"),
+        extra("TRUNCATE", "switchboard_audit.call_rows"),
+        extra("UPDATE", "switchboard_audit.call_rows"),
+        extra("USAGE", "switchboard_audit.extra"),
+        extra("SELECT", "switchboard_audit.migrations"),
+        extra("CREATE", "the schema switchboard_audit"),
+        extra("USAGE WITH GRANT OPTION", "the schema switchboard_audit"),
+        extra("CREATE", &format!("the database {}", db.name())),
+        extra("SET", "the setting session_replication_role"),
+    ]
+}
+
+/// A membership granted without inheritance still lets the role SET ROLE, and then do all the
+/// other role can.
+#[tokio::test]
+async fn a_role_that_can_set_role_to_a_wide_role_without_inheriting_it_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let wide = wide_role(&db).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "GRANT {wide} TO {role} WITH INHERIT FALSE, SET TRUE"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&db.store_as(&role)).await,
+        what_the_wide_role_holds(&db)
+    );
+    // What the check refuses is real: the role can delete rows.
+    db.connect_as(&role)
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {wide}; DELETE FROM switchboard_audit.call_rows"
+        ))
+        .await
+        .unwrap();
+}
+
+/// A role created NOINHERIT inherits nothing from any role it is a member of, and can SET ROLE
+/// to each of them.
+#[tokio::test]
+async fn a_noinherit_role_that_can_become_a_wide_role_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let wide = wide_role(&db).await;
+    let role = db.new_role("LOGIN NOINHERIT", &[]).await;
+    grant_the_gateways_own(&db, &role, "").await;
+    // With its own privileges given to it directly, it passes.
+    db.store_as(&role).check_at_boot().await.unwrap();
+    db.admin()
+        .await
+        .batch_execute(&format!("GRANT {wide} TO {role}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&db.store_as(&role)).await,
+        what_the_wide_role_holds(&db)
+    );
+}
+
+/// The store's own privileges must be the session's without SET ROLE, since the store never
+/// sets a role.
+#[tokio::test]
+async fn a_role_that_does_not_inherit_the_gateways_privileges_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let role = db.new_role("LOGIN NOINHERIT", &[GATEWAY_ROLE]).await;
+    let found = problems(&db.store_as(&role)).await;
+    assert!(
+        found
+            .iter()
+            .all(|problem| matches!(problem, Problem::Missing { .. })),
+        "{found:?}"
+    );
+    assert_eq!(
+        found.len(),
+        INSERTED.len() + UPDATED.len() + SELECTED.len() + 1,
+        "{found:?}"
+    );
+}
+
+/// A role that holds its own privileges with grant option can give them to any other role.
+#[tokio::test]
+async fn the_gateways_own_privileges_with_grant_option_are_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let role = db.new_role("LOGIN", &[]).await;
+    grant_the_gateways_own(&db, &role, " WITH GRANT OPTION").await;
+    let mut expected = BTreeSet::new();
+    for (privilege, columns) in [
+        ("INSERT", INSERTED),
+        ("UPDATE", UPDATED),
+        ("SELECT", SELECTED),
+    ] {
+        for column in columns {
+            expected.insert((format!("{privilege} WITH GRANT OPTION"), *column));
+        }
+    }
+    let mut expected: Vec<Problem> = expected
+        .into_iter()
+        .map(|(privilege, column)| {
+            extra(&privilege, &format!("switchboard_audit.call_rows.{column}"))
+        })
+        .collect();
+    expected.push(extra(
+        "USAGE WITH GRANT OPTION",
+        "the schema switchboard_audit",
+    ));
+    assert_eq!(problems(&db.store_as(&role)).await, expected);
+}
+
+#[tokio::test]
+async fn a_role_that_can_reach_the_servers_files_or_programs_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let writer = db.new_role("NOLOGIN", &["pg_write_server_files"]).await;
+    let role = db
+        .new_role(
+            "LOGIN",
+            &[
+                GATEWAY_ROLE,
+                "pg_execute_server_program",
+                "pg_read_server_files",
+            ],
+        )
+        .await;
+    db.admin()
+        .await
+        .batch_execute(&format!("GRANT {writer} TO {role} WITH INHERIT FALSE"))
+        .await
+        .unwrap();
+    let found = problems(&db.store_as(&role)).await;
+    let roles: Vec<&str> = found
+        .iter()
+        .map(|problem| match problem {
+            Problem::ServerAccess { role, .. } => *role,
+            other => panic!("{other}"),
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            "pg_execute_server_program",
+            "pg_read_server_files",
+            "pg_write_server_files"
+        ]
+    );
+    assert!(
+        found[0]
+            .to_string()
+            .contains("can become pg_execute_server_program, which runs programs"),
+        "{}",
+        found[0]
     );
 }
 
