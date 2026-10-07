@@ -923,6 +923,103 @@ mutate_all(
 )
 
 
+# --- gateway-registry ----------------------------------------------------------------------
+
+REGISTRY = "crates/gateway-registry/"
+RF = REGISTRY + "src/file.rs"
+RR = REGISTRY + "src/registry.rs"
+RA = REGISTRY + "src/adapter.rs"
+RS = REGISTRY + "src/selection.rs"
+RD = REGISTRY + "src/definition.rs"
+
+for struct in ["RegistryFile", "ServerFile", "ToolFile", "SourceFile", "SurfaceFile", "PrincipalIdFile",
+               "ProfileFile", "RuleFile", "LimitsFile", "ResourceFile"]:
+    mutate(f"registry-unknown-field-{struct}", f"{struct} ignores fields it does not know", RF,
+           f"#[serde(deny_unknown_fields)]\npub(crate) struct {struct} {{", f"pub(crate) struct {struct} {{")
+mutate("registry-unknown-field-CredentialFile", "a credential ignores fields it does not know", RF,
+       '#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]', '#[serde(tag = "mode", rename_all = "snake_case")]')
+mutate("registry-empty-text-accepted", "required text may be empty", RR,
+       "    if value.is_empty() {\n        Err(RegistryError::EmptyField {", "    if false {\n        Err(RegistryError::EmptyField {")
+mutate("registry-limit-identifier-empty", "a limit may name the empty identifier", RR,
+       '            require(&resource.identifier, "identifier", place)?;\n', "")
+mutate("registry-credential-reference-empty", "a credential may have no reference", RR,
+       '                require(&reference, "credential.reference", place)?;\n', "")
+mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
+       "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
+mutate("registry-address-unchecked", "any address is accepted", RR, "        if !http {", "        if false {")
+mutate("registry-address-host-unchecked", "an address with no host is accepted", RR,
+       ".is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))", ".is_some()")
+mutate("registry-duplicate-tool-left-to-core", "a tool approved twice is not refused by the loader", RR,
+       "        if definitions.contains_key(&checked.definition.name) {", "        if false {")
+mutate("registry-duplicate-upstream", "one upstream tool may be approved under two names", RR,
+       "        if !upstream.insert((", "        if false && !upstream.insert((")
+mutate("registry-unknown-server", "a tool on an unregistered server takes the first server", RR,
+       "    let Some(server) = servers.get(&tool.server) else {", "    let Some(server) = servers.get(&tool.server).or(servers.values().next()) else {")
+mutate("registry-name-outside-system", "a tool may be named after any system", RR, "    if !under_system {", "    if false {")
+mutate("registry-name-nothing-after-system", "a tool may be named `{system}__` alone", RR,
+       "        .is_some_and(|rest| !rest.is_empty());", "        .is_some();")
+mutate("registry-approved-at-offset", "an approval time may have no offset", RR, "    if at.offset.is_none() {", "    if false {")
+mutate("registry-hash-unchecked", "a definition changed after approval loads", RR,
+       "    if computed != tool.definition_sha256 {", "    if false {")
+mutate("registry-hash-ignores-title", "the approval hash does not cover the title", RD,
+       '        definition.insert("title".into(), Value::String(title.into()));', "        let _ = title;")
+mutate("registry-schema-type-unchecked", "an input schema need not be an object schema", RR,
+       '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
+mutate("registry-schema-keywords-unchecked", "a schema may use keywords the argument check does not follow", RA,
+       ".find(|keyword| object.contains_key(**keyword))", ".find(|keyword| false && object.contains_key(**keyword))")
+mutate("registry-schema-properties-unwalked", "keywords inside a property are not looked for", RA,
+       "            followable(property, &at.child(name))?;", "            let _ = (property, name);")
+mutate("registry-schema-items-unwalked", "keywords inside items are not looked for", RA,
+       '        followable(items, &at.child("items"))?;', "        let _ = items;")
+mutate("registry-schema-properties-not-object", "`properties` may be something other than an object", RA,
+       "            return Err(SchemaProblem::Malformed { at });", "            return Ok(());")
+mutate("registry-schema-node-not-schema", "a property or items may be something other than a schema", RA,
+       "        _ => return Err(SchemaProblem::Malformed { at: at.clone() }),", "        _ => return Ok(()),")
+mutate("registry-adapter-without-sources", "a tool may read its resources from no argument", RR,
+       "            if sources.is_empty() {\n                return Err(RegistryError::AdapterWithoutSources(name));",
+       "            if false {\n                return Err(RegistryError::AdapterWithoutSources(name));")
+mutate("registry-adapter-argument-undeclared", "an adapter may read an argument the schema does not declare", RR,
+       "properties.and_then(|p| p.get(&source.from_argument)) else {",
+       'properties.and_then(|p| p.get(&source.from_argument)).or(tool.input_schema.get("type")) else {')
+mutate("registry-adapter-argument-not-string", "an adapter may read an argument not typed as a string", RR,
+       '                if property.get("type") != Some(&Value::String("string".into())) {', "                if false {")
+mutate("registry-read-only-not-derived", "every definition is shown as read-only", RR,
+       "            read_only: tool.classification == gateway_core::Classification::Read,", "            read_only: true,")
+mutate("registry-declaration-no-resources", "a tool with an adapter is approved as naming no resources", RA,
+       "        if self.sources.is_empty() {\n            ResourceDeclaration::NoResources", "        if true {\n            ResourceDeclaration::NoResources")
+mutate("registry-rule-unknown-profile", "a rule may name a profile that is not defined", RR,
+       "        if snapshot.profile(&rule.profile).is_none() {", "        if false {")
+mutate("registry-duplicate-rule", "two rules may cover the same principals", RR,
+       "        if !covered.insert((rule.issuer.clone(), principal.clone())) {",
+       "        if false && !covered.insert((rule.issuer.clone(), principal.clone())) {")
+mutate("adapter-missing-argument-skipped", "a missing argument drops its resource and keeps the others", RA,
+       "                _ => return Resources::Named(Vec::new()),", "                _ => continue,")
+mutate("adapter-empty-identifier-accepted", "the empty string names a resource", RA,
+       "Some(Value::String(identifier)) if !identifier.is_empty() => {", "Some(Value::String(identifier)) => {")
+mutate("adapter-not-an-object-accepted", "arguments that are not an object pass the check", RA,
+       "        if !arguments.is_object() {", "        if false {")
+mutate("adapter-undeclared-accepted", "an undeclared argument passes the check", RA,
+       "                    None => Some(at.child(key)),", "                    None => None,")
+mutate("adapter-undeclared-not-nested", "nested objects are not checked", RA,
+       "                    Some(property) => undeclared(property, value, &at.child(key)),", "                    Some(_) => None,")
+mutate("adapter-undeclared-not-in-items", "array elements are not checked", RA,
+       "        Value::Array(items) => {", "        Value::Array(items) if false => {")
+mutate("adapter-pointer-unescaped", "a pointer does not escape `~` and `/`", RA,
+       "            token.replace('~', \"~0\").replace('/', \"~1\")", "            token")
+mutate("selection-issuer-ignored", "a rule covers principals of any issuer", RS,
+       "        principal.id.issuer == self.issuer\n", "        true\n")
+mutate("selection-group-ignored", "a group rule covers users in any group", RS,
+       "groups.contains(group)", "!groups.is_empty() || groups.contains(group)")
+mutate("selection-kind-ignored", "a workload rule covers users and a group rule covers workloads", RS,
+       "                _ => false,", "                _ => true,")
+mutate("selection-first-rule-wins", "disagreeing rules resolve to one of them", RS,
+       "            (Some(_), Some(_)) => Err(NoProfile::Ambiguous(profiles)),", "            (Some(first), Some(_)) => Ok(first.clone()),")
+# Moving the dev-dependency leaves Cargo.lock as it is, so the build still runs under --locked.
+mutate("registry-links-testkit", "the registry, and so the gateway, links the testkit", REGISTRY + "Cargo.toml",
+       'toml = "1"\n\n[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n',
+       'toml = "1"\ngateway-testkit = { path = "../gateway-testkit" }\n\n[dev-dependencies]\n')
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
