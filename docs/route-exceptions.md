@@ -189,8 +189,9 @@ record and an entry here.
 - **Conditions:** all of these must hold.
   - Otto's profile only. Services and employees are denied both tools.
   - The tool refuses the commands of the bots named when it is approved. Today that is
-    Atlantis.
-  - It reaches only the team's repositories, or the configured Jira projects.
+    Atlantis. Another bot's commands are refused once that bot is named.
+  - It reaches only the team's repositories, or the configured Jira projects. Check 6 and the
+    connector hold it to them.
   - Every call is audited as usual, and the row gives the exception as the reason the call was
     allowed.
   - Atlassian's hosted `addOrEditJiraIssueComment` gets no exception.
