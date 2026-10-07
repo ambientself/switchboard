@@ -1186,7 +1186,14 @@ mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left run
        "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
 mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
        "    drop(Object::take(client));", "    drop(client);")
-mutate("pg-finish-waits-past-answer-budget", "finish holds the answer until its deadline", PG_STORE,
+# The same two, at finish's call alone: begin's tests do not reach it.
+mutate("pg-finish-timeout-not-cancelled", "a finish attempt that ran out of time is left running", PG_STORE,
+       "                abandon(client, &self.cancel);\n                Err(PgAuditError::AttemptTimedOut)",
+       "                drop(Object::take(client));\n                Err(PgAuditError::AttemptTimedOut)")
+mutate("pg-finish-timeout-connection-kept", "a finish connection that ran out of time goes back to its pool", PG_STORE,
+       "                abandon(client, &self.cancel);\n                Err(PgAuditError::AttemptTimedOut)",
+       "                drop(client);\n                Err(PgAuditError::AttemptTimedOut)")
+mutate("pg-finish-waits-past-answer-budget","finish holds the answer until its deadline", PG_STORE,
        "let answer_by = started + self.budgets.answer;", "let answer_by = started + self.budgets.finish_deadline;")
 mutate("pg-finish-stops-at-answer-budget", "finish stops trying when the answer goes out", PG_STORE,
        "            deadline: started + self.budgets.finish_deadline,", "            deadline: started + self.budgets.answer,")

@@ -516,9 +516,35 @@ async fn an_attempt_ends_at_the_deadline() {
     );
     assert_eq!(
         reports_of(&reports),
-        vec![(row, "ok", "deadline".to_owned())]
+        vec![(row.clone(), "ok", "deadline".to_owned())]
     );
+
+    // The attempt that ran out of time is gone from the finish pool, so no later finish waits
+    // behind its update, and the update was cancelled: once the lock goes, the row the store
+    // gave up on is not completed after all.
+    assert_eq!(store.finish.status().size, 0);
+    let admin = db.admin().await;
+    until(
+        Duration::from_secs(5),
+        "the update's cancellation",
+        || async {
+            count(
+                &admin,
+                &format!(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE usename = '{GATEWAY_ROLE}' AND datname = '{}' AND state = 'active'
+                         AND query LIKE 'UPDATE switchboard_audit.call_rows%'",
+                    db.name()
+                ),
+            )
+            .await
+                == 0
+        },
+    )
+    .await;
     release(&lock).await;
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(outcome_of(&admin, &row).await, None);
 }
 
 /// A connection killed in the middle of an attempt is a failure trying again can fix.
