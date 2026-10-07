@@ -330,18 +330,22 @@ written.
   answered from the rows, for allowed calls as well as denials. The row holds what the call
   named, not only what the decision checked: a call denied before the resource check still
   records them. A tool that checks its own scope may record `unknown` here; what it then
-  reached is not yet recorded.
+  reached is not yet recorded. A row that counts omitted resources cannot rule a resource
+  out, so a query for who reached one must treat such rows as possible matches.
 - **Recorded resources are bounded,** because the caller chooses them through its arguments.
   Each resource is kept once, in the order first named, so repeating one cannot push another
   off the row. A row keeps at most 64 and counts the rest, and the resource a denial names is
   always kept. Each value is escaped so that it can be read back: a backslash is escaped too.
   A system and a kind are capped at 128 characters, like the tool name. An identifier is
-  capped at 2,048, so that every identifier the systems in [systems.md](systems.md) document
-  is recorded whole. The longest is an AWS ARN, at 2,048. The others are shorter: a GitHub
-  repository is at most 140 (a 39-character owner, a slash and a 100-character name), a
-  Confluence space key 255, a MongoDB namespace 255 bytes, and a Sumo Logic source category
-  1,024. Escaping lengthens non-ASCII text, so an identifier with much of it can still be cut;
-  a cut value ends with `…`.
+  capped at 2,048, the longest an AWS ARN can be, so that each identifier length checked in
+  [systems.md](systems.md#identifier-lengths) fits whole. Only AWS, MongoDB, Sumo Logic,
+  Confluence and GitHub were checked, and a self-built server's identifiers have no
+  documented bound. Escaping lengthens non-ASCII text, so an identifier with much of it can
+  still be cut; a cut value ends with `…`.
+- **A row's recorded resources are at most 147,648 characters:** 64 resources, each with a
+  129-character system and kind and a 2,049-character identifier, the `…` included. Any call
+  that gets a row can reach this, a denial included, and the row is written before the tool
+  runs. The size limits and audit latency targets in Q12 must cover a row this large.
 - **An empty outcome is evidence** that the gateway allowed the call and never learned what
   happened.
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.

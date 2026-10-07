@@ -48,9 +48,10 @@ use crate::sentences;
 pub const MAX_RECORDED_RESOURCES: usize = 64;
 
 /// The longest a recorded resource identifier is, in characters after escaping, before it is
-/// cut short. The longest identifier any system in `docs/systems.md` documents is an AWS ARN,
-/// at 2,048 characters, so every documented identifier is recorded whole. A resource's system
-/// and kind are capped at 128 characters, like the tool and surface columns.
+/// cut short. An AWS ARN can be 2,048 characters, the longest of the identifier lengths
+/// checked in `docs/systems.md`, so each of those is recorded whole. Not every system was
+/// checked, and a self-built server's identifiers have no documented bound. A resource's
+/// system and kind are capped at 128 characters, like the tool and surface columns.
 pub const MAX_RECORDED_IDENTIFIER: usize = 2048;
 
 /// A resource as an audit row records it: each value escaped and possibly cut short. It is a
