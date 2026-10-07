@@ -130,6 +130,12 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
 - **Audit operations:** assign storage/migration ownership, retention, access controls and
   redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
   payloads. Define availability and latency targets and measure audit overhead against them.
+  A row's recorded resources alone can reach 147,648 characters
+  ([design.md](design.md), section 11).
+- **Otto's audit table:** Otto's `gateway_audit` table has no column for the resources a call
+  names, so the rows written for Otto's callers do not record them. Decide whether the table
+  gains one, and who adds it. [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md)
+  makes the table's contract a compatibility requirement, so adding a column changes it.
 - **Blocks:** rollout sequencing and production readiness.
 
 ## Q13. Which employee clients and access infrastructure are the acceptance targets?
