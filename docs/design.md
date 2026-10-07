@@ -549,6 +549,14 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
 - The suite does not yet cover the behavior of thirteen newer tools; see
   [otto-baseline.md](otto-baseline.md). Otto's control-plane endpoints stay in Otto, so the
   suite covers the vendor actions they will call once those are defined, not the endpoints.
+- **The comment tools are an expected difference.** The suite's tool inventory requires
+  `github_pr_comment` and `jira_comment` to be served. It uses `github_pr_comment` in its scope
+  refusals, and as the one write in the tests that a failed audit finish does not undo a write
+  and that a repeated write is made twice. Under section 8 the Rust gateway denies Otto's
+  comment tools to Otto's callers, so these cases cannot pass against it until Q9 settles an
+  exception. When the suite is extended in milestone 4, they go in a group of expected
+  differences, and the two audit tests are also run with a `propose` tool against the Rust
+  gateway. This is a difference in policy, not a mapping.
 - How quickly a change can be checked is planned in [feedback-loops.md](feedback-loops.md).
 - `conformance/mutation_check.py` breaks guards in the pinned gateway and requires the named
   test to fail. It is run after every re-pin.

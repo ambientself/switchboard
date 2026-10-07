@@ -230,7 +230,10 @@ checked against their limits. A dedicated field waits for the first such tool.
   commenting on an issue the gateway did not create, that is `write`. An action that needs a
   direct write takes the decision that replaces the section above.
 - Otto's two comment tools are denied to Otto's callers until Q9 settles an exception (see
-  Comments, above).
+  Comments, above). The conformance suite uses `github_pr_comment` in its tool inventory, its
+  scope refusals, and as the only write in its tests of audit-finish failure and repeated
+  writes. Against the Rust gateway those cases are an expected difference until then, and the
+  two audit tests are also run with a `propose` tool, so the write path keeps that coverage.
 - "Write" in plain text, in the design and the open questions, still means any call that
   changes something, `propose` or `write`. Receipts before writes (Q10) cover proposals.
 - The decision table's write tools are reclassified: proposals are `propose`, and the comment
