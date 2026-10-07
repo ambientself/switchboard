@@ -79,6 +79,33 @@ pub(crate) const SELECTED: &[&str] = &[
     "latency_ms",
 ];
 
+/// The triggers on `call_rows`, each calling the schema's function of the same name, and when
+/// each must fire, as `pg_trigger.tgtype` encodes it: for each row (1), before (2), on insert
+/// (4) or on update (16).
+pub(crate) const TRIGGERS: &[Trigger] = &[
+    Trigger {
+        name: "set_times",
+        purpose: "sets both times from the database's clock",
+        fires: "before each insert",
+        tgtype: 1 | 2 | 4,
+    },
+    Trigger {
+        name: "complete_once",
+        purpose: "completes a row at most once",
+        fires: "before each update",
+        tgtype: 1 | 2 | 16,
+    },
+];
+
+/// A trigger the table must have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Trigger {
+    name: &'static str,
+    purpose: &'static str,
+    fires: &'static str,
+    tgtype: i16,
+}
+
 /// Settings that must hold for a committed row to be durable.
 const DURABILITY: &[(&str, &str)] = &[("fsync", "on"), ("full_page_writes", "on")];
 
@@ -110,10 +137,21 @@ pub enum Problem {
         /// The type it must have.
         expected: &'static str,
     },
-    /// The trigger that completes a row at most once is not on the table.
-    TriggerMissing,
-    /// The trigger is on the table but does not fire.
-    TriggerDisabled,
+    /// A trigger the table needs is not on it, or does not fire on every row it must: it
+    /// calls another function, fires at another time, or has a condition or a column list.
+    TriggerMissing {
+        /// The trigger.
+        trigger: &'static str,
+        /// What it does.
+        purpose: &'static str,
+        /// When it must fire.
+        fires: &'static str,
+    },
+    /// A trigger is on the table but does not fire in an ordinary session.
+    TriggerDisabled {
+        /// The trigger.
+        trigger: &'static str,
+    },
     /// The session's role, or a role it can become, has an attribute that lets it around the
     /// grants or the trigger.
     RoleAttribute {
@@ -167,12 +205,16 @@ impl fmt::Display for Problem {
                 f,
                 "the column call_rows.{column} is {found}, not {expected}"
             ),
-            Self::TriggerMissing => write!(
+            Self::TriggerMissing {
+                trigger,
+                purpose,
+                fires,
+            } => write!(
                 f,
-                "the trigger complete_once, which completes a row at most once, is not on call_rows"
+                "the trigger {trigger}, which {purpose}, is not on call_rows to fire {fires} on every row"
             ),
-            Self::TriggerDisabled => {
-                write!(f, "the trigger complete_once on call_rows is disabled")
+            Self::TriggerDisabled { trigger } => {
+                write!(f, "the trigger {trigger} on call_rows is disabled")
             }
             Self::RoleAttribute { role, attribute } => write!(
                 f,
@@ -228,7 +270,8 @@ impl PgAuditStore {
     ///
     /// - The server syncs commits to disk: `fsync` and `full_page_writes` are on.
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
-    ///   write-once trigger, enabled.
+    ///   two triggers, enabled: the one that sets both times at insert, and the one that
+    ///   completes a row at most once.
     /// - The role is not a superuser, and cannot create roles or databases, replicate, or
     ///   bypass row security; nor can any role it is a member of.
     /// - The role does not own the schema, the table, the trigger function or anything else in
@@ -285,7 +328,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
         None => problems.push(Problem::TableMissing),
         Some(table) => {
             columns(client, table, &mut problems).await?;
-            trigger(client, table, &mut problems).await?;
+            triggers(client, table, &mut problems).await?;
             column_privileges(client, table, &mut problems).await?;
         }
     }
@@ -405,32 +448,49 @@ async fn columns(
     Ok(())
 }
 
-async fn trigger(
+async fn triggers(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
-    // The trigger must call the schema's own function. 'O' fires in a normal session and 'A'
-    // always; 'D' never and 'R' only for replication.
-    let found = client
-        .query_opt(
-            "SELECT t.tgenabled::text
-             FROM pg_catalog.pg_trigger t
-                 JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
-                 JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-             WHERE t.tgrelid = $1::oid AND t.tgname = 'complete_once' AND NOT t.tgisinternal
-                 AND n.nspname = 'switchboard_audit' AND p.proname = 'complete_once'",
-            &[&table],
-        )
-        .await?;
-    match found.map(|row| row.get::<_, String>(0)) {
-        None => problems.push(Problem::TriggerMissing),
-        Some(enabled) if enabled != "O" && enabled != "A" => {
-            problems.push(Problem::TriggerDisabled);
-        }
-        Some(_) => {}
+    for trigger in TRIGGERS {
+        // Each trigger must call the schema's own function, at its time, on every row: no
+        // condition and no column list.
+        let found = client
+            .query_opt(
+                "SELECT t.tgenabled::text
+                 FROM pg_catalog.pg_trigger t
+                     JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                 WHERE t.tgrelid = $1::oid AND t.tgname = $2 AND NOT t.tgisinternal
+                     AND n.nspname = 'switchboard_audit' AND p.proname = $2
+                     AND t.tgtype = $3 AND t.tgqual IS NULL
+                     AND cardinality(t.tgattr::int2[]) = 0",
+                &[&table, &trigger.name, &trigger.tgtype],
+            )
+            .await?;
+        problems.extend(trigger_problem(
+            trigger,
+            found.map(|row| row.get::<_, String>(0)).as_deref(),
+        ));
     }
     Ok(())
+}
+
+/// The problem with `trigger`, given how it is enabled, or that it was not found. 'O' fires in
+/// a normal session and 'A' always; 'D' never and 'R' only for replication.
+fn trigger_problem(trigger: &Trigger, enabled: Option<&str>) -> Option<Problem> {
+    match enabled {
+        None => Some(Problem::TriggerMissing {
+            trigger: trigger.name,
+            purpose: trigger.purpose,
+            fires: trigger.fires,
+        }),
+        Some("O" | "A") => None,
+        Some(_) => Some(Problem::TriggerDisabled {
+            trigger: trigger.name,
+        }),
+    }
 }
 
 /// The table-level privileges a role may hold, by server version.
@@ -645,6 +705,46 @@ mod tests {
             "the server has fsync = off, and committed rows are durable only with on"
         );
         assert_eq!(DURABILITY, &[("fsync", "on"), ("full_page_writes", "on")]);
+    }
+
+    #[test]
+    fn a_trigger_must_be_found_and_fire_in_an_ordinary_session() {
+        let trigger = &TRIGGERS[0];
+        assert_eq!(trigger_problem(trigger, Some("O")), None);
+        assert_eq!(trigger_problem(trigger, Some("A")), None);
+        for never_here in ["D", "R"] {
+            assert_eq!(
+                trigger_problem(trigger, Some(never_here)),
+                Some(Problem::TriggerDisabled {
+                    trigger: "set_times"
+                })
+            );
+        }
+        let missing = trigger_problem(trigger, None).unwrap();
+        assert_eq!(
+            missing.to_string(),
+            "the trigger set_times, which sets both times from the database's clock, is not on \
+             call_rows to fire before each insert on every row"
+        );
+    }
+
+    #[test]
+    fn each_trigger_is_checked_for_the_time_the_migration_gives_it() {
+        let sql = MIGRATIONS[0].sql;
+        for trigger in TRIGGERS {
+            let event = match trigger.tgtype {
+                7 => "INSERT",
+                19 => "UPDATE",
+                other => panic!("{}: tgtype {other}", trigger.name),
+            };
+            let created = format!(
+                "CREATE TRIGGER {name}\n    BEFORE {event} ON switchboard_audit.call_rows\n    \
+                 FOR EACH ROW EXECUTE FUNCTION switchboard_audit.{name}();",
+                name = trigger.name
+            );
+            assert!(sql.contains(&created), "{created}");
+        }
+        assert_eq!(sql.matches("CREATE TRIGGER").count(), TRIGGERS.len());
     }
 
     #[test]

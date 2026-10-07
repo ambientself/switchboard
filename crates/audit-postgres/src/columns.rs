@@ -4,6 +4,7 @@
 
 use gateway_core::PrincipalKind;
 use gateway_core::audit::{AuditRecord, Completion, DecisionKind, Outcome, RecordedResources};
+use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
 use crate::store::PgAuditError;
@@ -18,7 +19,7 @@ pub(crate) struct BeginRow {
     pub tool: String,
     pub connector: Option<String>,
     pub classification: Option<&'static str>,
-    pub resources: Option<serde_json::Value>,
+    pub resources: Value,
     pub resources_omitted: i64,
     pub decision: &'static str,
     pub reason: Option<String>,
@@ -61,7 +62,7 @@ impl BeginRow {
                 Some(groups.iter().map(ToString::to_string).collect()),
             ),
         };
-        let (resources, resources_omitted) = resources(record);
+        let (resources, resources_omitted) = resources(record)?;
         Ok(Self {
             tool_use_id: record.tool_use_id.as_ref().map(ToString::to_string),
             deployment: record.deployment.to_string(),
@@ -125,16 +126,15 @@ impl BeginRow {
 }
 
 /// The resources columns: the named resources as a JSON array of `{system, kind, identifier}`,
-/// or the JSON string `"unknown"` when the tool could not say before it ran, and how many were
-/// left out. The column's check constraint accepts exactly these two shapes.
-fn resources(record: &AuditRecord) -> (Option<serde_json::Value>, i64) {
-    use serde_json::Value;
-    let column = match &record.resources {
+/// in the record's order, or the JSON string `"unknown"`; and how many were left out. A count
+/// past the column's range is refused rather than recorded as less than it was.
+fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
+    let resources = match &record.resources {
         RecordedResources::Named(named) => Value::Array(
             named
                 .iter()
                 .map(|resource| {
-                    serde_json::json!({
+                    json!({
                         "system": resource.system,
                         "kind": resource.kind,
                         "identifier": resource.identifier,
@@ -144,10 +144,10 @@ fn resources(record: &AuditRecord) -> (Option<serde_json::Value>, i64) {
         ),
         RecordedResources::Unknown => Value::String("unknown".to_owned()),
     };
-    // No call names 2^63 resources; a count past the column's range is recorded as the most
-    // it can hold rather than refused.
-    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);
-    (Some(column), omitted)
+    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {
+        PgAuditError::Column("a count of resources left out past the column's range")
+    })?;
+    Ok((resources, omitted))
 }
 
 fn decision(kind: DecisionKind) -> &'static str {
@@ -233,7 +233,8 @@ mod tests {
             "connector": "fixture",
             "classification": "write",
             "resources": {"named": [
-                {"system": "fixture", "kind": "project", "identifier": "atlas"}
+                {"system": "fixture", "kind": "document", "identifier": "team-b/notes"},
+                {"system": "fixture", "kind": "document", "identifier": "back\\slash"}
             ]},
             "resources_omitted": 2,
             "decision": "deny",
@@ -292,9 +293,10 @@ mod tests {
                 tool: "fixture__write".into(),
                 connector: Some("fixture".into()),
                 classification: Some("write"),
-                resources: Some(json!([
-                    {"system": "fixture", "kind": "project", "identifier": "atlas"}
-                ])),
+                resources: json!([
+                    {"system": "fixture", "kind": "document", "identifier": "team-b/notes"},
+                    {"system": "fixture", "kind": "document", "identifier": "back\\slash"}
+                ]),
                 resources_omitted: 2,
                 decision: "deny",
                 reason: Some("classification_not_permitted".into()),
@@ -320,16 +322,35 @@ mod tests {
         assert_eq!(row.proved_team.as_deref(), Some("team-a"));
         assert_eq!(row.proved_groups, None);
         assert_eq!((row.reason, row.sentence), (None, None));
-        assert_eq!(row.resources, Some(json!("unknown")));
+    }
+
+    #[test]
+    fn resources_the_tool_could_not_name_are_the_string_unknown() {
+        let row = BeginRow::from_record(&allowed_workload()).unwrap();
+        assert_eq!(row.resources, json!("unknown"));
         assert_eq!(row.resources_omitted, 0);
     }
 
     #[test]
-    fn a_call_naming_nothing_records_an_empty_list_not_none() {
+    fn a_call_that_named_no_resource_records_an_empty_list() {
         let mut record = allowed_workload();
         record.resources = RecordedResources::Named(vec![]);
-        let row = BeginRow::from_record(&record).unwrap();
-        assert_eq!(row.resources, Some(json!([])));
+        assert_eq!(BeginRow::from_record(&record).unwrap().resources, json!([]));
+    }
+
+    #[test]
+    fn a_count_of_resources_left_out_past_the_column_is_refused() {
+        let mut record = allowed_workload();
+        record.resources_omitted = usize::try_from(i64::MAX).unwrap();
+        assert_eq!(
+            BeginRow::from_record(&record).unwrap().resources_omitted,
+            i64::MAX
+        );
+        record.resources_omitted = usize::MAX;
+        assert!(matches!(
+            BeginRow::from_record(&record),
+            Err(PgAuditError::Column(_))
+        ));
     }
 
     #[test]

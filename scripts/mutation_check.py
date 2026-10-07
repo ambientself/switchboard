@@ -1789,6 +1789,32 @@ mutate("pg-columns-workload-team-as-group", "a workload's team is written as a g
        '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![team.to_string()])),')
 mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
        "            && Some(self.latency_ms) == latency_ms\n", "")
+mutate("pg-columns-unknown-as-none", "resources nobody could name are written as none named", PG_COLUMNS,
+       '        RecordedResources::Unknown => Value::String("unknown".to_owned()),',
+       "        RecordedResources::Unknown => Value::Array(vec![]),")
+mutate("pg-columns-resource-kind-as-system", "a resource's kind is written as its system", PG_COLUMNS,
+       '                        "system": resource.system,', '                        "system": resource.kind,')
+mutate("pg-columns-omitted-saturates", "a count of resources left out past the column is cut short", PG_COLUMNS,
+       "    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {\n"
+       "        PgAuditError::Column(\"a count of resources left out past the column's range\")\n"
+       "    })?;",
+       "    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);")
+mutate("pg-sql-resources-nullable", "a row may record no resources at all", PG_SQL,
+       "    resources              jsonb       NOT NULL\n", "    resources              jsonb\n")
+mutate("pg-sql-omitted-nullable", "a row may leave out the count of resources left out", PG_SQL,
+       "    resources_omitted      bigint      NOT NULL CHECK", "    resources_omitted      bigint      CHECK")
+mutate("pg-check-unknown-resources-omitted", "resources nobody could name may have some left out", PG_SQL,
+       "        resources <> '\"unknown\"'::jsonb OR resources_omitted = 0\n", "        true\n")
+mutate("pg-times-begun-at-from-insert", "an insert may choose its begin time", PG_SQL,
+       "    NEW.begun_at := clock_timestamp();\n", "    NEW.begun_at := coalesce(NEW.begun_at, clock_timestamp());\n")
+mutate("pg-times-finished-at-from-insert", "an insert may choose its completion time", PG_SQL,
+       "    NEW.finished_at := CASE WHEN NEW.outcome IS NULL THEN NULL ELSE NEW.begun_at END;\n", "")
+mutate("pg-times-trigger-not-created", "the trigger that sets the times is never attached", PG_SQL,
+       "CREATE TRIGGER set_times\n    BEFORE INSERT ON switchboard_audit.call_rows\n"
+       "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.set_times();\n", "")
+mutate("pg-times-begun-at-default", "the begin time falls back to a default the trigger need not set", PG_SQL,
+       "    begun_at               timestamptz NOT NULL,\n",
+       "    begun_at               timestamptz NOT NULL DEFAULT clock_timestamp(),\n")
 
 # The store's time budgets, and its boot checks.
 PG_CHECK = PG + "src/check.rs"
@@ -1836,9 +1862,20 @@ mutate("pg-check-column-missing-ignored", "a missing column passes the check", P
 mutate("pg-check-column-type-ignored", "a column of another type passes the check", PG_CHECK,
        "                if found != *expected {", "                if false {")
 mutate("pg-check-trigger-missing-ignored", "a missing trigger passes the check", PG_CHECK,
-       "        None => problems.push(Problem::TriggerMissing),", "        None => {}")
+       "        None => Some(Problem::TriggerMissing {\n            trigger: trigger.name,\n"
+       "            purpose: trigger.purpose,\n            fires: trigger.fires,\n        }),",
+       "        None => None,")
 mutate("pg-check-trigger-replica-enabled", "a trigger that fires only for replication passes the check", PG_CHECK,
-       'Some(enabled) if enabled != "O" && enabled != "A" => {', 'Some(enabled) if enabled == "D" => {')
+       'Some("O" | "A") => None,', 'Some("O" | "A" | "R") => None,')
+mutate("pg-check-trigger-time-ignored", "a trigger that fires at another time passes the check", PG_CHECK,
+       "AND t.tgtype = $3 AND", "AND (t.tgtype = $3 OR true) AND")
+mutate("pg-check-trigger-condition-ignored", "a trigger with a condition passes the check", PG_CHECK,
+       "AND t.tgqual IS NULL", "AND (t.tgqual IS NULL OR true)")
+mutate("pg-check-trigger-columns-ignored", "a trigger on some columns only passes the check", PG_CHECK,
+       "AND cardinality(t.tgattr::int2[]) = 0", "AND (cardinality(t.tgattr::int2[]) = 0 OR true)")
+mutate("pg-check-set-times-unchecked", "the trigger that sets the times is not checked", PG_CHECK,
+       '    Trigger {\n        name: "set_times",\n        purpose: "sets both times from the database\'s clock",\n'
+       '        fires: "before each insert",\n        tgtype: 1 | 2 | 4,\n    },\n', "")
 mutate("pg-check-extra-column-ignored", "a column grant beyond the gateway's passes the check", PG_CHECK,
        "    for (privilege, column) in held.difference(&expected) {", "    for (privilege, column) in held.difference(&held) {")
 mutate("pg-check-missing-column-grant-ignored", "a column grant the store needs may be missing", PG_CHECK,

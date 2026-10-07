@@ -19,8 +19,9 @@
 //! - It selects only the identifier, the decision and the completion. It cannot read who
 //!   called what, and it cannot delete.
 //!
-//! And for every role, through a trigger: a row is completed at most once, a denial is never
-//! completed, and a completion writes nothing else.
+//! And for every role, through two triggers: both times come from the database's clock,
+//! whatever an insert or a completion carries; a row is completed at most once, a denial is
+//! never completed, and a completion writes nothing else.
 //!
 //! # Tests against a database
 //!

@@ -89,8 +89,7 @@ and add a mutation for every guard you add.
 
 The audit store's tests in `crates/audit-postgres` that need a database, and the gateway's
 `tests/postgres.rs`, run only when `SWITCHBOARD_TEST_DATABASE_URL` is set; otherwise they pass
-without doing anything. Point it
-at a superuser on a throwaway server only. The tests create and drop a database each, create
+without doing anything. Point it at a superuser on a throwaway server only. The tests create and drop a database each, create
 the two audit roles if they are missing, and give those roles a dummy password. Some also make
 roles of their own, named after their database, and drop them at the end, and some refuse
 connections to their own database for a moment.
@@ -105,6 +104,10 @@ cargo test -p gateway --test postgres
 Add `-- --nocapture` to see the latency test's p50 and p95 for begin and finish. They measure
 your machine, not production.
 
+CI runs both in the job "Audit store against Postgres", against a `postgres:17` service
+container, and fails the job if any of them says it was skipped.
+
 Set it for the mutation check too. Without it, the `pg-` mutations other than `pg-columns-*`
-and the few caught by unit tests survive. CI's `postgres` job sets it and runs both; see
-`docs/ci-postgres-job.md`.
+and the few caught by unit tests survive. When running mutation checks side by side, give each
+run a server of its own: the tests change the two cluster-wide roles, one test at a time
+within a run but not across runs.

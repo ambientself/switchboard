@@ -2,13 +2,15 @@
 --
 -- Applied by `migrate`, as switchboard_owner, inside the schema switchboard_audit, which
 -- `migrate` creates. The columns follow `gateway_core::AuditRecord`. Proved and claimed values
--- are separate columns. The two times are set by the database, never by the gateway.
+-- are separate columns. The two times are set by the database's clock, never by the gateway:
+-- by the trigger set_times at insert and complete_once at completion.
 
 CREATE TABLE switchboard_audit.call_rows (
     -- Assigned by the database when the row is begun.
     id                     uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- The database's time at begin, and at completion. The gateway's role cannot write either.
-    begun_at               timestamptz NOT NULL DEFAULT clock_timestamp(),
+    -- The database's time at begin, and at completion. The gateway's role cannot write either,
+    -- and the triggers overwrite whatever any other role writes.
+    begun_at               timestamptz NOT NULL,
     finished_at            timestamptz,
 
     tool_use_id            text,
@@ -19,13 +21,14 @@ CREATE TABLE switchboard_audit.call_rows (
     connector              text,
     classification         text
         CHECK (classification IN ('read', 'propose', 'write', 'destructive')),
-    -- The resources the call named: a JSON array of {system, kind, identifier}, or the JSON
-    -- string "unknown" when the tool could not say before it ran. Empty when the gateway that
-    -- wrote the row did not record resources.
-    resources              jsonb
+    -- The resources the call named: a JSON array of {system, kind, identifier}, each value
+    -- escaped and capped by the core, or the JSON string "unknown" when the tool could not
+    -- say before it ran.
+    resources              jsonb       NOT NULL
         CHECK (jsonb_typeof(resources) = 'array' OR resources = '"unknown"'::jsonb),
-    -- How many distinct named resources were left out of `resources`.
-    resources_omitted      bigint      NOT NULL DEFAULT 0 CHECK (resources_omitted >= 0),
+    -- How many distinct named resources were left out of `resources`. None can be left out
+    -- of resources nobody could name.
+    resources_omitted      bigint      NOT NULL CHECK (resources_omitted >= 0),
     decision               text        NOT NULL CHECK (decision IN ('allow', 'deny')),
     reason                 text,
     sentence               text,
@@ -50,6 +53,9 @@ CREATE TABLE switchboard_audit.call_rows (
     outcome_sentence       text,
     latency_ms             bigint      CHECK (latency_ms >= 0),
 
+    CONSTRAINT resources_shape CHECK (
+        resources <> '"unknown"'::jsonb OR resources_omitted = 0
+    ),
     CONSTRAINT proved_kind_shape CHECK (
         (proved_kind = 'workload') = (proved_team IS NOT NULL)
         AND (proved_kind = 'user') = (proved_groups IS NOT NULL)
@@ -103,6 +109,26 @@ REVOKE ALL ON FUNCTION switchboard_audit.complete_once() FROM PUBLIC;
 CREATE TRIGGER complete_once
     BEFORE UPDATE ON switchboard_audit.call_rows
     FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();
+
+-- Sets both times from the database's clock at insert, overwriting anything the insert
+-- carried, for every role. A row is begun now. A row written complete at insert, which only
+-- the owner can write, is complete at the same moment.
+CREATE FUNCTION switchboard_audit.set_times() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog
+AS $set_times$
+BEGIN
+    NEW.begun_at := clock_timestamp();
+    NEW.finished_at := CASE WHEN NEW.outcome IS NULL THEN NULL ELSE NEW.begun_at END;
+    RETURN NEW;
+END
+$set_times$;
+
+REVOKE ALL ON FUNCTION switchboard_audit.set_times() FROM PUBLIC;
+
+CREATE TRIGGER set_times
+    BEFORE INSERT ON switchboard_audit.call_rows
+    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.set_times();
 
 -- What the gateway's role may do. It inserts the first half of a row, without the identifier
 -- or the times. It completes a row through the completion columns only. It reads back only
