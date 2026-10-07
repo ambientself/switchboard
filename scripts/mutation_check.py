@@ -923,6 +923,74 @@ mutate_all(
 )
 
 
+# --- mock-docs-server ------------------------------------------------------------------------
+
+MOCK = "crates/mock-docs-server/"
+MS = MOCK + "src/server.rs"
+MC = MOCK + "src/config.rs"
+MD = MOCK + "src/documents.rs"
+mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
+       "                accepted: self.inner.accepted.accepts(token),", "                accepted: true,")
+mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
+       "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
+       "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
+mutate("mock-credential-compares-one-byte", "only the first byte of the digest is compared", MC,
+       "            .zip(self.digest.iter())\n", "            .zip(self.digest.iter())\n            .take(1)\n")
+mutate("mock-scheme-ignored", "any scheme carries the token", MS,
+       '    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())', "    (!scheme.is_empty() && !token.is_empty())")
+mutate("mock-post-refusal-skipped", "POST /mcp answers a caller it did not accept", MS,
+       '    let mut line = request_line("request", &method, &uri, &caller);\n    if !caller.accepted {',
+       '    let mut line = request_line("request", &method, &uri, &caller);\n    if false {')
+mutate("mock-other-refusal-skipped", "other methods and paths answer a caller they did not accept", MS,
+       '        .write(request_line("request", &method, &uri, &caller));\n    if !caller.accepted {',
+       '        .write(request_line("request", &method, &uri, &caller));\n    if false {')
+mutate("mock-admin-get-refusal-skipped", "the admin tool list answers a caller it did not accept", MS,
+       '        .write(request_line("admin", &method, &uri, &caller));\n    if !caller.accepted {',
+       '        .write(request_line("admin", &method, &uri, &caller));\n    if false {')
+mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools for a caller it did not accept", MS,
+       '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
+       '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
+mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
+       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(self.inner.accepted.logged_prefix()),")
+mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
+mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
+       "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
+mutate("mock-documents-keyed-by-name", "a document is found by its name alone, in any project", MD,
+       "        self.0.get(&(project.to_owned(), document.to_owned()))",
+       "        let _ = project;\n        self.0.iter().find(|((_, name), _)| name == document).map(|(_, content)| content)")
+mutate("mock-list-ignores-project", "listing a project lists every project's documents", MD,
+       "            .filter(|(owner, _)| owner == project)", "            .filter(|(owner, _)| !owner.is_empty() || project.is_empty())")
+mutate("mock-withdrawn-tool-callable", "a tool not offered can still be called", MS,
+       "            .filter(|tool| self.offers(*tool))\n", "")
+mutate("mock-extra-argument-accepted", "an argument the tool does not declare is accepted", MS,
+       "        .find(|key| !tool.arguments().contains(&key.as_str()))", "        .find(|key| key.is_empty())")
+mutate("mock-slow-doc-not-slow", "slow-doc answers at once", MS, "                tokio::time::sleep(self.inner.slow).await;\n", "")
+mutate("mock-hang-doc-answers", "hang-doc answers", MS,
+       "            Some(Content::Hang) => std::future::pending().await,", "            Some(Content::Hang) => Ok(text_result(String::new())),")
+mutate("mock-hang-doc-is-slow", "hang-doc answers after slow-doc's delay", MS,
+       "            Some(Content::Hang) => std::future::pending().await,",
+       "            Some(Content::Hang) => {\n                tokio::time::sleep(self.inner.slow).await;\n                Ok(text_result(String::new()))\n            }")
+mutate("mock-fail-doc-succeeds", "fail-doc answers with a result", MS,
+       "            Some(Content::Fail) => Err(RpcError::new(", "            Some(Content::Fail) => Ok(text_result(String::new())).map_err(|_: RpcError| RpcError::new(")
+mutate("mock-huge-doc-half-size", "huge-doc answers with half a mebibyte", MS, '"x".repeat(HUGE_BYTES)', '"x".repeat(HUGE_BYTES / 2)')
+mutate("mock-two-credentials-take-the-file", "with both credential variables set, the file wins", MC,
+       "            (Some(path), None) => read_token_file", "            (Some(path), _) => read_token_file")
+mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part of the token", MC,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
+       "        if tools.contains(&tool) {", "        if false {")
+mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
+       "                if tools.contains(&tool) {", "                if false {")
+# Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
+mutate_all(
+    "mock-dependency-added",
+    "the mock server gains a dependency outside the allowlist",
+    (MOCK + "Cargo.toml", 'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\n',
+     'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n'),
+    (MOCK + "Cargo.toml", '[dev-dependencies]\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n', "[dev-dependencies]\n"),
+)
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
