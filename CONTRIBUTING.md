@@ -34,8 +34,10 @@ and add a mutation for every guard you add.
 
 The audit store's tests in `crates/audit-postgres` that need a database run only when
 `SWITCHBOARD_TEST_DATABASE_URL` is set; otherwise they pass without doing anything. Point it
-at a superuser on a throwaway server only: the tests create and drop a database each, create
-the two audit roles if they are missing, and give those roles a dummy password.
+at a superuser on a throwaway server only. The tests create and drop a database each, create
+the two audit roles if they are missing, and give those roles a dummy password. Some also make
+roles of their own, named after their database, and drop them at the end, and some refuse
+connections to their own database for a moment.
 
 ```sh
 docker run -d --rm --name sb-pg -p 127.0.0.1:25432:5432 -e POSTGRES_PASSWORD=dev postgres:17-alpine
@@ -43,5 +45,9 @@ export SWITCHBOARD_TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:25432/pos
 cargo test -p audit-postgres
 ```
 
+Add `-- --nocapture` to see the latency test's p50 and p95 for begin and finish. They measure
+your machine, not production.
+
 Set it for the mutation check too. Without it, the `pg-` mutations other than `pg-columns-*`
-survive.
+and the few caught by unit tests survive. CI does not set it yet; `docs/ci-postgres-job.md` is
+a draft of the job that would.
