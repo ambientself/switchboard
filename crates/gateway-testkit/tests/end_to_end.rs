@@ -12,7 +12,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use gateway_core::audit::{
-    self, Answer, Begun, Completion, DecisionKind, Outcome, RequestMetadata,
+    self, Answer, Begun, Completion, DecisionKind, Outcome, RecordedResource, RecordedResources,
+    RequestMetadata,
 };
 use gateway_core::{
     CallContext, Classification, IDENTITY_FAILURE, ReasonKind, RequestedTool, decide,
@@ -20,9 +21,9 @@ use gateway_core::{
 use gateway_identity::{Identity, Verification, VerifyError};
 use gateway_testkit::{
     Caller, DRAFT_REFUSAL, DRAFT_TOOL, FOREIGN_DRAFT, FakeCredentialSource, Fixture,
-    FixtureConnector, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, SCOPE_REFUSAL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    WRITE_TOOL, block_on, policy_data, poll_once,
+    FixtureConnector, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND,
+    RESOURCE_SYSTEM, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock,
+    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, block_on, policy_data, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -149,6 +150,21 @@ fn own(caller: Caller) -> Value {
     json!({"document": caller.own_document()})
 }
 
+/// The resources column of a row for a call that named these documents, none of which needs
+/// escaping.
+fn recorded(documents: &[&str]) -> RecordedResources {
+    RecordedResources::Named(
+        documents
+            .iter()
+            .map(|document| RecordedResource {
+                system: RESOURCE_SYSTEM.to_owned(),
+                kind: RESOURCE_KIND.to_owned(),
+                identifier: (*document).to_owned(),
+            })
+            .collect(),
+    )
+}
+
 #[test]
 fn an_allowed_read_returns_the_echo_and_completes_its_row() {
     let gateway = Gateway::new();
@@ -182,6 +198,10 @@ fn an_allowed_read_returns_the_echo_and_completes_its_row() {
     assert_eq!(row.tool, READ_TOOL);
     assert_eq!(row.connector.as_ref().map(|c| c.as_str()), Some("fixture"));
     assert_eq!(row.classification, Some(Classification::Read));
+    assert_eq!(
+        (&row.resources, row.resources_omitted),
+        (&recorded(&[TEAM_A_DOCUMENT]), 0)
+    );
     assert_eq!(row.surface.as_str(), SURFACE_ALL);
     assert_eq!(row.policy_revision.as_str(), "fixture-1");
     assert_eq!(
@@ -295,6 +315,7 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
         ),
     ];
     for (position, (caller, surface, tool, arguments, expected)) in table.into_iter().enumerate() {
+        let named = arguments["document"].as_str().map(str::to_owned);
         let Response::Denied { sentence, reason } = gateway.call(caller, surface, tool, arguments)
         else {
             panic!("{caller:?} {tool} was not denied")
@@ -309,6 +330,13 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
             "the row and the answer say the same"
         );
         assert_eq!(row.completion, None, "a denial's row is complete as begun");
+        // The row records what the call named, whether or not the decision got as far as
+        // checking it. A call that named no document records an empty list, not `unknown`.
+        assert_eq!(
+            (&row.resources, row.resources_omitted),
+            (&recorded(named.as_deref().as_slice()), 0),
+            "{caller:?} {surface} {tool}"
+        );
         gateway.assert_nothing_ran();
     }
     assert_eq!(gateway.store.rows().len(), 7, "one row per denied call");
@@ -512,6 +540,11 @@ fn a_scope_refusal_is_the_outcome_refused_with_one_sentence_in_the_row_and_the_a
         row.decision,
         DecisionKind::Allow,
         "the decision function allowed it"
+    );
+    assert_eq!(
+        (row.resources, row.resources_omitted),
+        (RecordedResources::Unknown, 0),
+        "the tool could not say what the call names before it ran"
     );
     assert_eq!(
         row.completion,
