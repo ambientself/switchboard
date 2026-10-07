@@ -1,0 +1,24 @@
+[package]
+name = "audit-postgres"
+version = "0.1.0"
+description = "The gateway's audit store on Postgres: the schema, its roles and grants, and an AuditStore that writes to it."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# tokio-postgres with deadpool, not sqlx: nothing here needs a database to compile.
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+deadpool-postgres = "0.14"
+serde = "1"
+serde_json = "1"
+thiserror = "2"
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+[dev-dependencies]
+gateway-testkit = { path = "../gateway-testkit" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
