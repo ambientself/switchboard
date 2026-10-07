@@ -783,11 +783,26 @@ fn a_connector_told_to_hang_has_received_the_call_and_done_nothing_until_release
     ));
     assert_eq!(rig.connector.writes().len(), 1);
 
-    // Only the next call hung; hang_all holds every call at one gate.
-    assert!(matches!(
-        rig.answer(Caller::TeamA, READ_TOOL, documents("team-a-notes")),
-        Answer::Ok(_)
-    ));
+    // Only the next call hangs: a second call starts and finishes while the first is held.
+    let gate = rig.connector.hang_next();
+    let held = rig.guard(Caller::TeamA, READ_TOOL, documents("team-a-notes"));
+    let mut held = pin!(audit::run(&rig.connector, held));
+    assert!(poll_once(held.as_mut()).is_pending());
+    let next = rig.guard(Caller::TeamB, READ_TOOL, documents("team-b-notes"));
+    let mut next = pin!(audit::run(&rig.connector, next));
+    assert!(
+        poll_once(next.as_mut()).is_ready(),
+        "a call after the one told to hang was held too"
+    );
+    assert!(
+        poll_once(held.as_mut()).is_pending(),
+        "the held call is still held"
+    );
+    assert_eq!(gate.waiting(), 1);
+    gate.open();
+    assert!(poll_once(held.as_mut()).is_ready());
+
+    // hang_all holds every call at one gate.
     let gate = rig.connector.hang_all();
     let first = rig.guard(Caller::TeamA, READ_TOOL, documents("team-a-notes"));
     let second = rig.guard(Caller::TeamB, READ_TOOL, documents("team-b-notes"));
