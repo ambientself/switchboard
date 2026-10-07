@@ -1085,7 +1085,11 @@ mutate("mcp-content-type-ignored", "a body not declared as JSON is served", MCP_
 mutate("mcp-accept-ignored", "an Accept excluding JSON is served", MCP_PARSE,
        "    if !accept_admits_json(headers) {", "    if false && !accept_admits_json(headers) {")
 mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON", MCP + "headers.rs",
-       "is_ok_and(|q| q <= 0.0)", "is_ok_and(|q| q < 0.0)")
+       ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
+mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
+       ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
+mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
+       ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
 mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
        '                response\n                    .headers\n                    .insert(ALLOW, HeaderValue::from_static("POST"));\n',
        "")

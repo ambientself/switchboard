@@ -73,6 +73,7 @@ fn table() -> Vec<(&'static str, Raw, Expect)> {
         ("an Accept without JSON", legacy_list.clone().header("accept", "text/event-stream"), Refused(NotAcceptable, 406, INVALID_REQUEST)),
         ("an Accept refusing JSON", legacy_list.clone().header("accept", "application/json;q=0"), Refused(NotAcceptable, 406, INVALID_REQUEST)),
         ("an Accept of anything", legacy_list.clone().header("accept", "*/*"), request(1, Legacy, Call::ToolsList)),
+        ("an Accept refusing JSON by name and taking anything else", legacy_list.clone().header("accept", "application/json;q=0, */*;q=1"), Refused(NotAcceptable, 406, INVALID_REQUEST)),
         ("no Accept, as Otto's callers send", legacy_list.clone().without("accept"), request(1, Legacy, Call::ToolsList)),
         // --- The envelope ------------------------------------------------------------------
         ("not JSON", Raw::post("{not json"), Refused(ParseError, 400, PARSE_ERROR)),
