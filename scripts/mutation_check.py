@@ -1228,6 +1228,41 @@ mutate("gw-call-on-request-future", "the answer runs on the request's future, so
        "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
 
 
+# --- gateway-dev ---------------------------------------------------------------------------
+
+DEV = "crates/gateway-dev/src/"
+DEV_START = DEV + "start.rs"
+DEV_PRINTER = DEV + "printer.rs"
+DEV_TOKENS = DEV + "tokens.rs"
+DEV_CLIENT = DEV + "client.rs"
+
+mutate("dev-listens-on-every-interface", "the fixture gateway listens on every interface, not loopback", DEV_START,
+       "pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;", "pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::UNSPECIFIED;")
+mutate("dev-identity-off-by-default", "the fixture gateway starts with identity disabled unless told otherwise", DEV_START,
+       "            identity_disabled: false,", "            identity_disabled: true,")
+mutate("dev-identity-option-ignored", "asking for identity disabled starts it enforced", DEV_START,
+       '        config["identity"] = json!({"disabled": true});\n', "")
+mutate("dev-clock-option-ignored", "the gateway verifies on the system clock whatever clock it is given", DEV_START,
+       "    let mut wiring = Wiring::new(clock.clone()).connector(",
+       "    let mut wiring = Wiring::new(Arc::new(SystemClock)).connector(")
+mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
+       "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
+mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into a row id, so the call runs with no row", DEV_PRINTER,
+       "            begun\n        })", '            begun.or_else(|_| Ok(AuditRowId::new("printed")))\n        })')
+mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
+       "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
+mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
+       "pub const TOKEN_LIFETIME_SECS: u64 = DEFAULT_MAX_LIFETIME;", "pub const TOKEN_LIFETIME_SECS: u64 = DEFAULT_MAX_LIFETIME + 1;")
+mutate("dev-client-prints-token", "the scripted client prints the bearer token", DEV_CLIENT,
+       "\"> authorization: Bearer <{}'s token, not shown>\",\n                self.caller",
+       "\"> authorization: Bearer {}\",\n                self.token")
+mutate("dev-client-ignores-unexpected", "the scripted client passes whatever the answers were", DEV_CLIENT,
+       "            if !exchange.as_expected() {", "            if false && !exchange.as_expected() {")
+mutate("dev-client-any-error-is-a-denial", "the scripted client takes any JSON-RPC error for a denial", DEV_CLIENT,
+       'Expect::Denied => status == 200 && body["error"]["code"] == json!(DENIAL_CODE),',
+       'Expect::Denied => status == 200 && body.get("error").is_some(),')
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
