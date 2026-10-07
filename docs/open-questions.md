@@ -73,10 +73,14 @@ Q1–Q8, Q14–Q16, Q18 and Q19 are settled below. Q9–Q13 and Q17 are open. Wh
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 - **2026-10-07 (Q18):** A turn grant binds its issuer through the key, the deployments it is
   for (`aud`), a lifetime of at most 15 minutes (`iat`, `exp`), and by stage 3 the sandbox
-  pod. It may be presented again within those bounds, and its digest is recorded. Otto's
-  proposals are allowed only while Otto says the turn is current, which enforces the epoch and
-  allows revoking one turn. Otto is asked to make the changes this needs; none has been agreed
-  with Otto's owners yet, and what waits on them is listed in the decision. See
+  pod. It also carries the turn's egress setting, which is recorded. It may be presented again
+  within those bounds, and its digest is recorded. Otto's calls of any tool not classified
+  `read` are allowed only while Otto says the turn is current, which enforces the epoch and
+  allows revoking one turn. Fencing is checked once, before each such call. A failover during
+  the call is not stopped, and the receipts of decision 0009 cover that window. Which grant
+  fields scope an idempotency key stays with decision 0009 (its Still open 8). Otto is asked to
+  make the changes this needs; none has been agreed with Otto's owners yet, and what waits on
+  them is listed in the decision. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
 
 ## Q9. What does authorization check beyond tool classification?
@@ -137,9 +141,10 @@ receipts, and the design currently omits Otto's planned retry and fencing contra
   reconciliation or supported vendor idempotency; a local receipt alone cannot guarantee
   exactly-once execution. Never automatically replay such a write after reconnect or restart.
 - **Failover:** [decision 0012](decisions/0012-what-a-turn-grant-binds.md) settles when Otto's
-  fencing epoch is checked: before each proposal, from stage 3, through Otto's resolver. A
-  stale epoch stops proposals, not reads. The check is made once, before the call runs, so a
-  failover during a proposal is not stopped by it; receipts must cover that window. Keep this
+  fencing epoch is checked: before each call of a tool not classified `read`, from stage 3,
+  through Otto's resolver. A stale epoch stops those calls, not reads. The check is made once,
+  before the call runs, so a failover during the call is not stopped by it; receipts must cover
+  that window. Keep this
   separate from MCP session state. Identify implemented behavior versus future Otto promises
   in the conformance baseline.
 - **Blocks:** audit behavior and the first real write/cutover readiness criteria.
