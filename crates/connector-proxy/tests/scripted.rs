@@ -32,10 +32,19 @@ fn bounded(server: &Scripted) -> connector_proxy::ProxyConnector {
 }
 
 async fn answer_to(steps: impl Fn(&Value) -> Vec<Step> + Send + Sync + 'static) -> Answer {
+    timed_answer_to(steps).await.0
+}
+
+/// The answer, and how long the call alone took.
+async fn timed_answer_to(
+    steps: impl Fn(&Value) -> Vec<Step> + Send + Sync + 'static,
+) -> (Answer, Duration) {
     let server = Scripted::start(steps).await;
-    Harness::new()
-        .call(&bounded(&server), READ_TOOL, arguments())
-        .await
+    let harness = Harness::new();
+    let connector = bounded(&server);
+    let started = Instant::now();
+    let answer = harness.call(&connector, READ_TOOL, arguments()).await;
+    (answer, started.elapsed())
 }
 
 async fn answer_with(body: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Answer {
@@ -374,8 +383,7 @@ async fn a_chunked_answer_one_byte_over_the_cap_is_discarded() {
 
 #[tokio::test]
 async fn an_endless_answer_is_discarded_at_the_cap_not_the_deadline() {
-    let started = Instant::now();
-    let answer = answer_to(|_| {
+    let (answer, took) = timed_answer_to(|_| {
         let mut steps = vec![Step::Write(chunked_head())];
         // Ten times the cap, then nothing more: the connector must stop reading at the cap.
         for _ in 0..10 {
@@ -387,13 +395,12 @@ async fn an_endless_answer_is_discarded_at_the_cap_not_the_deadline() {
     .await;
 
     assert_eq!(answer, Answer::Error(outcome::TOO_LARGE.to_owned()));
-    assert!(started.elapsed() < DEADLINE, "took {:?}", started.elapsed());
+    assert!(took < DEADLINE, "took {took:?}");
 }
 
 #[tokio::test]
 async fn a_declared_length_over_the_cap_is_refused_before_the_body_arrives() {
-    let started = Instant::now();
-    let answer = answer_to(|_| {
+    let (answer, took) = timed_answer_to(|_| {
         vec![
             Step::Write(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
@@ -405,13 +412,12 @@ async fn a_declared_length_over_the_cap_is_refused_before_the_body_arrives() {
     .await;
 
     assert_eq!(answer, Answer::Error(outcome::TOO_LARGE.to_owned()));
-    assert!(started.elapsed() < DEADLINE, "took {:?}", started.elapsed());
+    assert!(took < DEADLINE, "took {took:?}");
 }
 
 #[tokio::test]
 async fn the_deadline_covers_the_body_not_only_the_head() {
-    let started = Instant::now();
-    let answer = answer_to(|request| {
+    let (answer, took) = timed_answer_to(|request| {
         let body = text_result(request, "late").to_string().into_bytes();
         let (first, second) = body.split_at(10);
         vec![
@@ -424,7 +430,6 @@ async fn the_deadline_covers_the_body_not_only_the_head() {
     .await;
 
     assert_eq!(answer, Answer::Error(outcome::TIMED_OUT.to_owned()));
-    let took = started.elapsed();
     assert!(took >= DEADLINE && took < DEADLINE * 3, "took {took:?}");
 }
 
