@@ -588,6 +588,14 @@ async fn a_row_the_core_could_not_make_is_refused() {
             with(&[("reason", "'unknown_tool'")]),
         ),
         (
+            "an allowed call with a sentence",
+            with(&[("sentence", "'Denied.'")]),
+        ),
+        (
+            "a principal of neither kind",
+            with(&[("proved_kind", "'service'"), ("proved_team", "")]),
+        ),
+        (
             "an allowed call with no connector",
             with(&[("connector", "")]),
         ),
@@ -705,4 +713,29 @@ async fn a_row_the_core_could_not_make_is_refused() {
     ] {
         insert_row(&owner, &insert(&changes)).await;
     }
+
+    // The trigger sets the completion time together with the outcome. With it disabled, which
+    // only the owner can do, the constraint still keeps the two together.
+    let set_times = |change: &str| {
+        format!("ALTER TABLE switchboard_audit.call_rows {change} TRIGGER set_times")
+    };
+    owner.batch_execute(&set_times("DISABLE")).await.unwrap();
+    for (case, changes) in [
+        (
+            "an outcome without its time",
+            with(&[
+                ("begun_at", "now()"),
+                ("outcome", "'ok'"),
+                ("latency_ms", "1"),
+            ]),
+        ),
+        (
+            "a time without an outcome",
+            with(&[("begun_at", "now()"), ("finished_at", "now()")]),
+        ),
+    ] {
+        let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
+    }
+    owner.batch_execute(&set_times("ENABLE")).await.unwrap();
 }

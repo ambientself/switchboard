@@ -1121,6 +1121,37 @@ mutate("pg-check-refusal-sentence", "only a refusal carrying a sentence is not c
        "        AND coalesce(outcome = 'refused', false) = (outcome_sentence IS NOT NULL)\n", "")
 mutate("pg-check-resources-shape", "resources may be any JSON", PG_SQL,
        "        CHECK (jsonb_typeof(resources) = 'array' OR resources = '\"unknown\"'::jsonb),", "        CHECK (true),")
+mutate("pg-check-denial-reason", "a denial may lack its reason", PG_SQL,
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
+       "WHEN 'deny' THEN sentence IS NOT NULL AND outcome IS NULL")
+mutate("pg-check-denial-outcome", "a denial may have an outcome", PG_SQL,
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL")
+mutate("pg-check-allowed-reason", "an allowed call may have a reason", PG_SQL,
+       "            ELSE reason IS NULL AND sentence IS NULL\n", "            ELSE sentence IS NULL\n")
+mutate("pg-check-allowed-sentence", "an allowed call may have a sentence", PG_SQL,
+       "            ELSE reason IS NULL AND sentence IS NULL\n", "            ELSE reason IS NULL\n")
+mutate("pg-check-allowed-connector-only", "an allowed call may lack its connector", PG_SQL,
+       "AND connector IS NOT NULL AND classification IS NOT NULL", "AND classification IS NOT NULL")
+mutate("pg-check-allowed-classification-only", "an allowed call may lack its classification", PG_SQL,
+       "AND connector IS NOT NULL AND classification IS NOT NULL", "AND connector IS NOT NULL")
+mutate("pg-check-user-groups", "a user may lack its groups, and a workload have some", PG_SQL,
+       "        AND (proved_kind = 'user') = (proved_groups IS NOT NULL)\n", "")
+mutate("pg-check-completion-latency", "an outcome may lack its latency", PG_SQL,
+       "        (outcome IS NULL) = (latency_ms IS NULL)\n", "        true\n")
+mutate("pg-check-completion-time", "an outcome may lack its time", PG_SQL,
+       "        AND (outcome IS NULL) = (finished_at IS NULL)\n", "")
+for column, values in [
+    ("classification", "'read', 'propose', 'write', 'destructive'"),
+    ("decision", "'allow', 'deny'"),
+    ("proved_kind", "'workload', 'user'"),
+    ("outcome", "'ok', 'error', 'refused'"),
+]:
+    mutate(f"pg-check-{column.replace('_', '-')}-any", f"the {column} column takes any text", PG_SQL,
+           f"CHECK ({column} IN ({values}))", "CHECK (true)")
+for column in ["resources_omitted", "latency_ms"]:
+    mutate(f"pg-check-{column.replace('_', '-')}-negative", f"the {column} column takes a negative number", PG_SQL,
+           f"CHECK ({column} >= 0)", "CHECK (true)")
 mutate("pg-migrate-any-role", "any role may run the migrations", PG + "src/migrate.rs",
        "    if current_user != OWNER_ROLE {", "    if false {")
 mutate("pg-session-not-synchronous", "sessions keep the role's synchronous_commit", PG_STORE,
@@ -1247,7 +1278,10 @@ mutate("pg-check-durability-ignored", "a server without fsync passes the check",
        "    (found != expected).then_some(", "    false.then_some(")
 mutate("pg-check-superuser-ignored", "a superuser passes the check", PG_CHECK,
        '            (1, "SUPERUSER"),\n', "")
-mutate("pg-check-bypassrls-ignored", "a role that bypasses row security passes the check", PG_CHECK,
+for index, attribute in [(2, "CREATEROLE"), (3, "CREATEDB"), (4, "REPLICATION")]:
+    mutate(f"pg-check-{attribute.lower()}-attribute-ignored", f"a role with {attribute} passes the check", PG_CHECK,
+           f'            ({index}, "{attribute}"),\n', "")
+mutate("pg-check-bypassrls-ignored","a role that bypasses row security passes the check", PG_CHECK,
        '            (5, "BYPASSRLS"),\n', "")
 mutate("pg-check-attributes-own-role-only", "a role the session can become is not checked for attributes", PG_CHECK,
        "             WHERE pg_has_role(current_user, oid, 'MEMBER')", "             WHERE rolname = current_user")
