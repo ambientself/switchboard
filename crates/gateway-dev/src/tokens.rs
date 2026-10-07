@@ -2,11 +2,12 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_testkit::{Caller, DEFAULT_MAX_LIFETIME, SURFACE_ALL, SURFACE_READ};
 use serde_json::{Value, json};
+use thiserror::Error;
 
 use crate::client::caller_name;
 use crate::start::FixtureGateway;
@@ -50,6 +51,46 @@ pub fn tokens_document(gateway: &FixtureGateway) -> Value {
         document[caller_name(caller)] = json!(token);
     }
     document
+}
+
+/// Where `switchboard-dev` writes the tokens file and `switchboard-client` reads it unless told
+/// otherwise: `target/switchboard-dev/tokens.json` in the workspace these binaries were built
+/// from.
+pub fn default_path() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.ancestors().nth(2).unwrap_or(manifest);
+    workspace.join("target/switchboard-dev/tokens.json")
+}
+
+/// Why a token could not be read from a tokens file.
+#[derive(Debug, Error)]
+pub enum ReadError {
+    /// The file could not be read.
+    #[error("cannot read the tokens file: {0}")]
+    Io(#[from] io::Error),
+    /// The file is not JSON.
+    #[error("the tokens file is not JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    /// The file has no token for the caller.
+    #[error("the tokens file has no token for {0}")]
+    NoToken(&'static str),
+}
+
+/// The token for `caller` in the tokens file at `path`, and the file's endpoint for `surface`,
+/// if it names one.
+pub fn read_token(
+    path: &Path,
+    caller: Caller,
+    surface: &str,
+) -> Result<(String, Option<String>), ReadError> {
+    let document: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    let name = caller_name(caller);
+    let token = document[name]
+        .as_str()
+        .ok_or(ReadError::NoToken(name))?
+        .to_owned();
+    let url = document["urls"][surface].as_str().map(str::to_owned);
+    Ok((token, url))
 }
 
 /// Writes [`tokens_document`] to `path`, creating its directory.
