@@ -28,7 +28,12 @@ or two and its tests need nothing running.
   proved one is required, a tool run without an audit guard, an unrecognized classification
   registered.
 - **Property tests** for rules that must hold for every input: a tool with no classification
-  never runs; principals from different issuers never compare equal.
+  never runs; principals from different issuers never compare equal; for any snapshot that
+  loads, every admitted team's and group's limit holds the whole reach of every tool on its
+  surfaces whose resources are its reach, or that is proxied with narrowing `none`
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)).
+- **Loader table cases,** one for each of the snapshot loader's nine rules in decision 0011,
+  each with a mutation in `scripts/mutation_check.py`.
 - **Golden files** for JSON-RPC envelopes and denial sentences, so a changed sentence shows up
   as a diff to review.
 - **A watcher** that re-runs the core's tests on save.
@@ -48,6 +53,13 @@ can script, including to fail.
   the same suite in the slow loop.
 - **A fake MCP server and a fake vendor API** as a crate, scriptable to list tools, change its
   tool list, stream slowly, hang and return errors. Proxied-server work is tested against it.
+- **Decision 0011's checks on fakes:** an undeclared argument never reaches the fake MCP
+  server; a `call`-narrowed token request names exactly the call's resources; a fake vendor
+  whose reach is widened between runs causes withdrawal, and later rows carry the
+  withdrawal's own snapshot revision; the AWS account filter holds against
+  hostile parameters; and each built-in `propose` tool changes only refs, pull requests and
+  comments it created or that its receipts or resolver attribute to it, with the fake vendor
+  recording every write's target.
 - **A local issuer** that signs user and workload tokens, so nothing waits on Okta.
 - **One command to run it by hand.** The gateway on fixtures, plus a scripted client that
   runs initialize, list and one call and prints what came back.
@@ -60,7 +72,10 @@ can script, including to fail.
 - **Real Postgres** for the audit store: begin, finish, failure, and the latency the
   synchronous write adds. A local Postgres left running with a fresh database per run can
   bring the audit store's own tests into the per-change loop.
-- **Fuzzing** of JSON-RPC bodies, grants and tool arguments.
+- **Fuzzing** of JSON-RPC bodies, grants and tool arguments, and of the resource adapters
+  that read them.
+- **A vendor reach test** for each proxied connector entry, before exposure and after any
+  vendor-side change to its credential (decision 0011).
 - **The audit store contract suite on Postgres,** the same test functions the fake passes.
 - **Failure runs:** a slow or unavailable database, a hanging upstream, a crash after a vendor
   write and before the audit row is finished. One more, once receipts exist: the gateway is

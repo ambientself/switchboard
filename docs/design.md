@@ -2,7 +2,7 @@
 
 Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
 review, 2026-10-04 and 2026-10-06 for the classifications in section 8, and 2026-10-07 for
-audit and receipts (decision 0009) and decision 0010. Status: draft.
+audit and receipts (decision 0009), decision 0010 and decision 0011. Status: draft.
 Settled questions and the ones still open are in
 [open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
@@ -188,15 +188,25 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    within which it is retried by that identifier. For a side effect, the receipt is reserved
    in the same transaction, and a reused key is answered there without running anything. If
    begin fails or its budget runs out, refuse the call.
-7. **Run the tool** if allowed, with a brokered credential. The connector may still refuse
-   because of what the call names, such as a repository outside the team's scope.
-8. **Complete the audit row** with the outcome (`ok`, `error`, `refused`, `unknown` or
+7. **Check the arguments,** for a proxied tool, against its approved input schema, read as
+   JSON Schema 2020-12. A schema in another dialect is refused or converted at approval. Where
+   an object in the schema lists its properties, any other property is refused, at any depth.
+   The gateway forwards its own serialization of the arguments, never the caller's bytes. A
+   call that fails is completed with outcome `error`, and nothing is forwarded. A built-in
+   connector parses the arguments into its own types instead.
+8. **Run the tool** if allowed, with a brokered credential. The connector, the credential
+   layer and the custodian may still refuse, never allow. A connector may refuse because of
+   what the call names, such as a repository outside the team's scope. The gateway bounds the
+   result's size and duration above any bound of the connector's own. A result over the bound
+   is never cut short silently: for a `read` tool it is outcome `error`, and for a `propose`
+   tool it is an outcome not known (`unknown`, decision 0009).
+9. **Complete the audit row** with the outcome (`ok`, `error`, `refused`, `unknown` or
    `duplicate`) and latency. The answer waits for this for at most the answer budget, and
    finish keeps retrying until its deadline.
-9. **Answer.** A connector's refusal whose completion is not confirmed within the answer
+10. **Answer.** A connector's refusal whose completion is not confirmed within the answer
    budget gets the audit-failure sentence, which is still true: nothing ran.
 
-Steps 6 to 8 run on a task of their own, started before begin, so a client that disconnects
+Steps 6 to 9 run on a task of their own, started before begin, so a client that disconnects
 cannot cancel a write to the store. A disconnect before the connector is called stops the
 call. A disconnect during a read cancels it. A side effect runs to its call deadline.
 
@@ -260,8 +270,10 @@ that needs a proved team cannot be handed a header value by mistake.
 
 ## 8. Policy
 
-Policy has two layers. One function decides from who is calling and which tool; what the call
-names is decided where the arguments are understood, and both land in one audit record.
+Policy has two layers. One function decides from who is calling, which tool and the resources
+the call names; what can be known only while the tool runs is checked by the connector, and
+both land in one audit record
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)).
 
 **Classification, company-wide.** Every tool has exactly one classification, assigned by the
 person who approves it. A tool with none never runs; there is no default.
@@ -305,7 +317,20 @@ configured for the repositories or projects it can reach. Today that is Atlantis
 be refused by what starts it: a draft pull request, a push to the gateway's proposal branch and
 a comment each start the workflows configured for them. That is acceptable where those workflows
 only build and test. Whether a proposal stays `propose` in a repository where a workflow that a
-pull request, a push or a comment starts can deploy or holds a production credential is open (Q9).
+pull request, a push or a comment starts can deploy or holds a production credential is open
+(Q9). It waits on the owners of Atlantis, CI and Jira automation. Until they answer, only
+automation already named, which today is Atlantis comment commands, makes a tool `write`. A
+proposal tool stays `propose` on the position above, and also refuses changes to CI workflow
+files and to Atlantis configuration
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). A proposal
+that changes ordinary code or `.tf` files can still start an Atlantis autoplan, or a pull
+request workflow that runs with the repository's secrets. That stays unguarded until then.
+
+A change to something that exists, such as amending a proposal or editing a comment, is
+`propose` only if the connector checks that the gateway created it for the same principal:
+from the gateway's receipts, or from a delegating control plane's resolver. Without one of
+them it is not `propose`. Decision 0009 goes further: no `propose` tool is served at all
+until a receipt store is configured.
 
 The guards are made by the connector, so the decision function cannot watch them. Each one,
 the forced draft included, is tested like any other guard: the tool's connector has a test
@@ -313,15 +338,27 @@ against the fake vendor that fails without it, and a mutation that removes it (s
 
 Under this rule Otto's `github_pr_comment` and `jira_comment` are `write`: they comment on
 pull requests and issues the gateway did not create. So is `addOrEditJiraIssueComment` on
-Atlassian's hosted server, which [systems.md](systems.md) plans for the Jira surface. Otto's
-callers are denied them, which loses parity with Otto's gateway (#12). Whether to allow them by
-a narrow, recorded exception is open (Q9).
+Atlassian's hosted server, which [systems.md](systems.md) plans for the Jira surface. The owner
+allowed Otto's two tools to Otto's callers by a narrow, recorded exception
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9):
+Otto's profile only; the tool refuses the commands of the bots named when it is approved,
+today Atlantis; it reaches only the team's repositories or the configured Jira projects; every
+call is audited; it is listed in the register of exceptions that decision 0010 keeps, accepted
+by the owner and signed by a named security owner; and it is reviewed every 90 days and when
+Otto's cutover (#13) completes. `addOrEditJiraIssueComment` gets no exception, because it can
+edit other people's comments. The core has no way yet to express the exception. Under #12,
+check 5 itself changes: it denies `write` and `destructive` unless the tool is named in the
+calling profile's list of excepted tools, and an allowed call records the exception as its
+reason. The list names tools, never a classification. Until then Otto's callers are denied
+both tools, which loses parity with Otto's gateway.
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
 profiles. `write` and `destructive` are denied in every profile by the decision function, so
-no profile's data can permit them. That is how production mutation is denied for every profile
-initially: anything that changes production without a person acting is one of the two.
+no profile's data can permit them as a classification. That is how production mutation is
+denied for every profile initially: anything that changes production without a person acting
+is one of the two. The one exception is the recorded one for Otto's two comment tools, above,
+which names tools in Otto's profile and needs a change to check 5.
 Permitting direct writes needs a decision that replaces part of
 [decision 0006](decisions/0006-what-the-decision-function-sees.md). This binds calls through
 the gateway. Where an environment's claim is the governed path, it says nothing about other
@@ -330,8 +367,8 @@ routes ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gate
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
-| Proposals (`propose`) | Allowed. A comment is a proposal only on something the gateway created for review, such as its own draft pull request or an issue it opened, and only if its tool refuses the commands of the bots named when it was approved. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
-| Direct writes (`write`) | Never. That includes a comment on anything the gateway did not create for review, so Otto's two comment tools are denied unless Q9 settles an exception. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
+| Proposals (`propose`) | Allowed. A comment is a proposal only on something the gateway created for review, such as its own draft pull request or an issue it opened, and only if its tool refuses the commands of the bots named when it was approved. | Only approved tools on employee surfaces, always under the employee's own per-user grant, once that system's grant and receipts work (decision 0011). None at launch. | Allowed, with the same limit on comments. |
+| Direct writes (`write`) | Never, except Otto's two comment tools under the recorded exception above, once its mechanism is built (#12). | Denied in every profile. Permitting them needs a decision replacing part of decision 0006. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
@@ -343,20 +380,45 @@ sandboxes.
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
 refused unless the turn's grant lists it.
 
-**Scope is checked in two places.** A tool that declares its resources has them checked by the
-decision function against the caller's limits, before anything runs. A resource outside the
-limit, or none where the tool declares some, is a denial. A tool whose scope can only be seen
-once its arguments are understood is marked as checking its own scope, and its connector
-refuses at run time. That refusal is recorded as the outcome `refused` on an allowed row, as
-is a `propose` tool's refusal of something the gateway did not create or of something that
-would act on its own. "What did the gateway refuse" is therefore a denial or a refused
-outcome. Making the scope check uniform across built-in and proxied tools is Q9.
+**How a tool's resources are found** is stated in its approval, in one of four ways
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 1):
 
-**Reads can need a breadth setting.** A read that shows more than its caller could otherwise
-see, such as AWS inventory across accounts, is opt-in per team or group. That is expressed with
-the existing allowlists: such a tool is served only on surfaces whose allowlist is the opted-in
-teams and groups, and the resources it names are checked against their limits. It gets a
-field of its own only when the first such tool is built.
+- **From the arguments.** The tool's adapter, gateway code, reads them from structured
+  arguments, and the decision function checks each against the caller's limit.
+- **As the reach.** The adapter names its connector entry's whole recorded reach on every call,
+  whatever the arguments, and the decision function checks that.
+- **Checked while running.** Only a built-in connector may do this, for scope that cannot be
+  known before the tool runs, such as which repositories a code search returns. The call's
+  resources are `unknown` and the connector refuses at run time.
+- **None.** The tool reaches nothing a limit applies to.
+
+A resource outside the limit, or none where the tool declares some, is a denial. A run-time
+refusal is recorded as the outcome `refused` on an allowed row, as is a `propose` tool's
+refusal of something the gateway did not create or of something that would act on its own.
+"What did the gateway refuse" is therefore a denial or a refused outcome.
+
+**One function is the only place that can allow a call.** The argument check, the connector,
+the credential layer, the custodian and the vendor may each refuse or fail after it, and none
+may allow. One audit record holds the whole decision for a call, and its policy revision
+identifies the approvals and loader checks the call relied on.
+
+**Broad reads use a breadth resource.** A read that shows more than its caller could otherwise
+see, such as AWS inventory across accounts, takes the accounts as a structured argument. A call
+that names none names the breadth resource instead, such as `aws / organization / o-example`,
+and is allowed only for teams and groups whose limit lists it. Opting in is adding that
+resource, or the accounts, to a limit, approved by the data's owner and a security reviewer.
+Check 6 enforces it on any surface, so the tool needs no surface of its own and there is no
+breadth field. A broad read with free-form arguments, such as the AWS MCP Server's `call_aws`,
+is not exposed.
+
+**Gateway policy and vendor permissions.** Both must allow, and each can only narrow what the
+other allows. The gateway decides which caller may use which tool, on which surface, for which
+resources, under which classification, with which credential. The vendor decides what that
+credential may do, including inside a resource the gateway does not see, such as Jira issue
+security levels and Confluence page restrictions. A vendor permission never stands in for a
+gateway rule: a read-only credential does not make a tool `read`, and a person's admin rights
+do not permit a `write` tool. Examples of each case are in
+[decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 8.
 
 **What Rust adds.** The registry accepts a classification type that can only be built by a
 conversion that fails for anything unrecognized. An enum also has no unset state, which
@@ -397,11 +459,30 @@ preferred to holding a key at all.
 limited to the proved team's repositories, and its accepted direction is one repository per
 write.
 
+**Connector entries.** Each credential is registered as a connector entry with exactly one
+mode ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section
+1). A system reached in two modes, with a service account per team, or with several
+permission sets has several entries. The entry records its narrowing:
+`call`, a token narrowed to the resources the call names; `limit`, narrowed to the caller's
+limit; or `none`. Otto's GitHub tokens are `limit` today, and GitHub names at most 500
+repositories in one token, so a larger request is refused, not cut short. A proxied entry, or
+one serving a tool whose resources are its reach, also records that reach and the dated test
+that showed it holds. A call runs only on the credential its approval names. There is no
+fallback from one mode to another.
+
 Shared identities may serve employee reads only when the data they expose is explicitly
-approved for those employees. Read-only credentials do not establish that permission.
-Where a shared identity would expose additional data, the integration requires a per-user
-grant or remains unavailable to that employee. Initial employee rollout includes only
-integrations that meet this rule; a required grant is a prerequisite, not a deferred safeguard.
+approved for those employees. That approval is the group's resource limit. It approves whole
+resources, such as a Jira project or a Confluence space, not content restricted inside them:
+a shared credential serving employees must be unable to see such content, shown by a
+restricted canary in its test. Read-only credentials do not establish that permission. Where
+a shared identity would expose additional data, the integration requires a per-user grant or
+remains unavailable to that employee. Initial employee rollout includes only integrations that
+meet this rule; a required grant is a prerequisite, not a deferred safeguard. Every employee
+proposal runs on the employee's own per-user grant.
+
+The custodian checks token requests against its own copy of what each team and tool may ask
+for. That copy is generated from the same policy files as the snapshot, and each token request
+carries the policy revision it was decided under.
 
 ## 10. The denial contract
 
@@ -481,6 +562,21 @@ written complete, has no finish, and is never open.
   path, they show who reached a resource through the gateway, not everyone who reached it
   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). For
   Otto's callers, the row records the turn's egress setting once the turn grant carries it.
+- **The recorded resources say how they were found**
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)): named by the
+  call, or the reach of the tool's connector entry. A reach is recorded by reference to the
+  entry, not as a list, since it can hold more resources than a row keeps and the policy
+  revision says exactly what it was.
+- **The credential identity used is recorded:** the mode and the vendor-side principal, never
+  the secret.
+- **An `error` outcome has a kind:** invalid arguments, an oversized or late result, a
+  custodian refusal, or a vendor refusal. How a vendor refusal is recognized is defined per
+  connector. `refused` also covers the credential layer's refusal, such as an employee with no
+  grant.
+- **A tool that checks its own scope reports what it reached** when it finishes, in place of
+  `unknown`. This is required before milestone 4.
+- Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
+  Otto adds them. Whether it does is part of the question about that table in Q12.
 
 **Open rows.** Nothing writes to a row except begin and finish, and nothing marks it
 afterwards. What a row of kind `call` means follows from its columns and the database's clock:
@@ -630,11 +726,29 @@ A connector lists its tools with their classifications and runs a call given a v
 context. There are two kinds, and [systems.md](systems.md) says which each target system is
 likely to use. Callers see them the same way. Policy does not: a built-in connector
 understands its arguments and can limit a call to the resources a caller may touch, and a
-proxied server usually cannot be checked that way. Every tool therefore declares where its
-resource check, argument validation, credential narrowing and output limits happen, and a
-proxied tool is exposed only if one of these holds: the gateway has an adapter for that
-tool's arguments, or its credential and route limit the server to exactly the permitted
-resources.
+proxied server usually cannot be checked that way. The rules are in
+[decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md).
+
+- **What a tool declares.** Its approval says how its resources are found (section 8), and
+  its connector entry says how its credential is narrowed and what it reaches (section 9).
+  Argument validation and output limits follow from the kind of connector and are the
+  gateway's (section 6).
+- **When a proxied tool is exposed.** Only when it is `read`; its resources are read from
+  structured arguments, or are its entry's tested reach, or are none; its credential reaches
+  nothing outside its callers' limits and cannot write; and milestone 3 is in place outside
+  development and test deployments. A proxied tool is never trusted to check its own scope.
+- **What the snapshot loader refuses.** Nine rules refuse approvals that contradict each other
+  or the limits, such as a proxied tool that is not `read`, or a tool whose reach is not inside
+  the limit of every team and group admitted to its surface. A snapshot that breaks one is not
+  loaded, and the previous one keeps serving.
+- **Keeping a reach true.** The registry checks each proxied entry's reach on a schedule, in
+  the drift pass: against the vendor's report of what the credential reaches, or by confirming
+  that a canary outside the reach is refused. Each check is an audited gateway call and never a
+  write. A mismatch withdraws the entry's tools from every surface. A withdrawal does not wait
+  for the next snapshot to load from the policy files: it makes a snapshot of its own, the one
+  in force less the withdrawn tools, with a revision naming both, and swaps it in atomically.
+  How it reaches every replica is Q11. A per-user entry is not checked on a schedule, since its
+  reach is already the whole site; its test shows that another site is refused.
 
 **Built-in connectors** are gateway code calling a vendor API. The GitHub connector is the
 model: it brokers a GitHub App token, limits every call to one organization before any request
@@ -642,7 +756,8 @@ leaves, bounds result sizes, and tags every result as external evidence.
 
 **Proxied servers** are onboarded through the registry:
 
-1. An owner registers the server: address, credential mode, owning team.
+1. An owner registers the server: address, credential mode, credential narrowing and reach,
+   owning team.
 2. The registry sends the server a `tools/call` naming a tool that does not exist, which runs
    nothing, three times: with no credential, with a malformed one, and with a trusted issuer's
    valid token for the server's audience and a subject outside the gateway's identities. The
@@ -655,7 +770,8 @@ leaves, bounds result sizes, and tags every result as external evidence.
 4. A person assigns each tool a classification and approves it. A server is never trusted to
    classify its own tools.
 5. Each approval records a hash of the tool's name, description and input schema, together
-   with the server's identity, its address and its credential configuration.
+   with the server's identity, its address, its credential configuration, the schema's
+   dialect, and the reach and the date of its test. A second reviewer approves it.
 6. Approved tools are added to tool surfaces.
 
 A side-effecting tool's approval also declares how an `unknown` receipt is settled, by a
@@ -694,6 +810,7 @@ the first, for the mock server.
 A surface is a named set of approved tools from any number of connectors and servers, served
 at one URL. Tools are exposed as `{system}__{tool}` so names cannot collide and the route is
 recoverable from the name; names stay within 64 characters of letters, digits, `_` and `-`.
+Where a system has several connector entries, the system part is the entry's name.
 
 Small surfaces matter for two reasons: an agent cannot call what it cannot see, and agents
 choose better from a short list.
@@ -733,6 +850,9 @@ A change that weakens one of these is wrong even if every test passes.
 11. **The whole request path runs with no real credential,** against fakes.
 12. **The gateway never repeats a tool call on its own.**
 13. **A side effect that may have happened is never presented as safe to repeat.**
+14. **Nothing after the decision function can allow a call it denied.**
+15. **A proxied call's credential reaches nothing outside its caller's limit,** as its recorded
+    reach states.
 
 ## 17. Delivery milestones
 
@@ -743,9 +863,9 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. |
-| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. | Freshness and revocation bounds (Q11). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents (Q18). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. Whether Otto's comment tools get an exception to the comment rule (Q9). Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
-| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13). Employee write boundaries (Q9). |
+| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds (Q11). Tool assurance and proxied exposure (decision 0011). |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents (Q18). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. The mechanism for the exception for Otto's comment tools (decision 0011). Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
+| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13). Per-user grants and receipts before any employee proposal for that system (decision 0011). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
 
@@ -796,7 +916,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   through that mapping, like the tool-name mapping. They are not expected differences.
 - **The comment tools are an expected difference.** Under section 8 the Rust gateway denies
   `github_pr_comment` and `jira_comment` to Otto's callers, so the suite's cases that use them
-  cannot pass against it until Q9 settles an exception. They are:
+  cannot pass against it until the mechanism for the exception in decision 0011 is built
+  (#12). They are:
   - the tool inventory, which requires both to be served;
   - `TestOriginalToolsAndBrokeredCredentials`, which calls `github_pr_comment` as an allowed
     call, checks its confirmation, and requires exactly two writes, the comment's among them;
@@ -826,9 +947,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   each of its guards gets an entry in `scripts/mutation_check.py`.
 - A `propose` tool's run-time guards (section 8), refusals and forced values such as a draft,
   are guards like any other. Its connector has a test against the fake vendor that fails
-  without each one, and a mutation that removes it. Where such a guard would sit inside a
-  proxied server, the gateway cannot test it this way; whether it can still make the tool
-  `propose` is part of Q9.
+  without each one, and a mutation that removes it. Such a guard cannot sit inside a proxied
+  server, because a proxied tool is only ever `read` (decision 0011).
 - Audit store tests use a real Postgres. Everything else, including end-to-end tests of the
   gateway, runs on the in-memory fakes with no database.
 
@@ -880,10 +1000,10 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-Q9 to Q13 and Q18 in [open-questions.md](open-questions.md). Q10 is narrowed to what
-compliance requires of read auditing; the rest of it is decision 0009. What decision 0010
-leaves to Otto, IT, the security team and platform owners is listed in that record. The
-milestone table says
-which each milestone must settle before it starts. Vendor feasibility remains research in
+What remains of Q9, and Q10 to Q13 and Q18, in [open-questions.md](open-questions.md). Q10 is
+narrowed to what compliance requires of read auditing; the rest of it is decision 0009. What
+decision 0010 leaves to Otto, IT, the security team and platform owners is listed in that
+record. The milestone table says which each milestone must settle before it starts. Vendor
+feasibility remains research in
 [systems.md](systems.md). The independent review's findings that are not yet reflected here
 are listed at the end of that file.
