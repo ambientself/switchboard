@@ -237,9 +237,11 @@ fn expected_row(
 }
 
 /// The table's own escaping, written out independently of the crate's: the only characters
-/// the table uses that need it are newlines and backticks.
+/// the table uses that need it are backslashes, newlines and backticks.
 fn escape(text: &str) -> String {
-    text.replace('`', "\\`").replace('\n', "\\n")
+    text.replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('\n', "\\n")
 }
 
 #[test]

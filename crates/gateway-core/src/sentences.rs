@@ -11,9 +11,10 @@
 //! failure sentence, which no decision produces, is re-exported as
 //! [`IDENTITY_FAILURE`](crate::IDENTITY_FAILURE).
 //!
-//! Every value put into a sentence passes through [`safe`]: control characters, non-ASCII and
-//! backticks are escaped and the length is capped, because some of these values (the tool and
-//! surface a request names, a resource identifier) are chosen by the caller.
+//! Every value put into a sentence passes through [`safe`]: control characters, non-ASCII,
+//! backticks and backslashes are escaped and the length is capped, because some of these
+//! values (the tool and surface a request names, a resource identifier) are chosen by the
+//! caller.
 
 use crate::classification::Classification;
 use crate::decision::{DelegationProblem, Reason, ResourceProblem};
@@ -242,15 +243,18 @@ enum Piece<'a> {
 }
 
 /// `text` made safe to put inside a sentence or an audit column: printable ASCII stays as it
-/// is, a backtick becomes `` \` `` so it cannot close a code span, and anything else (newlines,
-/// other control characters, non-ASCII) is written as an escape. The result is cut at `cap`
-/// characters and marked with `…`.
+/// is, a backtick becomes `` \` `` so it cannot close a code span, a backslash becomes `\\`,
+/// and anything else (newlines, other control characters, non-ASCII) is written as an escape:
+/// `\n`, `\r`, `\t` or `\u{...}`. Because the backslash is escaped too, two different texts
+/// never give the same result unless they were cut. The result is cut at `cap` characters and
+/// marked with `…`, which cannot otherwise appear, since non-ASCII is escaped.
 pub(crate) fn safe(text: &str, cap: usize) -> String {
     let mut out = String::new();
     let mut length = 0;
     for character in text.chars() {
         let piece: String = match character {
             '`' => "\\`".to_owned(),
+            '\\' => "\\\\".to_owned(),
             ' ' => " ".to_owned(),
             c if c.is_ascii_graphic() => c.to_string(),
             c => c.escape_default().collect(),
@@ -372,6 +376,21 @@ mod tests {
         assert_eq!(safe("a`b", 64), "a\\`b");
         assert_eq!(safe("caf\u{e9}", 64), "caf\\u{e9}");
         assert_eq!(safe("\u{202e}", 64), "\\u{202e}");
+        assert_eq!(safe("a\\b", 64), "a\\\\b");
+    }
+
+    /// Texts that differ before escaping differ after it: a backslash is escaped, so a
+    /// literal `\n` and a newline are told apart.
+    #[test]
+    fn safe_keeps_different_texts_different() {
+        for (one, other) in [
+            ("a\nb", "a\\nb"),
+            ("a`b", "a\\`b"),
+            ("\u{e9}", "\\u{e9}"),
+            ("\\", "\\\\"),
+        ] {
+            assert_ne!(safe(one, 64), safe(other, 64), "{one:?} and {other:?}");
+        }
     }
 
     #[test]

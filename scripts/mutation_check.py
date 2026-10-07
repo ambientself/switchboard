@@ -623,6 +623,8 @@ mutate("safe-no-escape", "control characters are not escaped", SRC + "sentences.
        "            c => c.escape_default().collect(),", "            c => c.to_string(),")
 mutate("safe-backtick", "a backtick is not escaped", SRC + "sentences.rs",
        "            '`' => \"\\\\`\".to_owned(),", "            '`' => \"`\".to_owned(),")
+mutate("safe-backslash", "a backslash is not escaped, so escaping cannot be reversed", SRC + "sentences.rs",
+       "            '\\\\' => \"\\\\\\\\\".to_owned(),\n", "")
 mutate("safe-no-cap", "values are not cut short", SRC + "sentences.rs",
        "        if length + added > cap {", "        if false && length + added > cap {")
 
