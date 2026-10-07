@@ -2,7 +2,8 @@
 
 Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
 review, 2026-10-04 and 2026-10-06 for the classifications in section 8, and 2026-10-07 for
-audit and receipts (decision 0009), decision 0010 and decision 0011. Status: draft.
+decisions 0009 (audit and receipts), 0010 (routes around the gateway), 0011 (resource
+authorization and tool assurance) and 0012 (turn grants). Status: draft.
 Settled questions and the ones still open are in
 [open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
@@ -930,8 +931,8 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. |
 | 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds (Q11). Tool assurance and proxied exposure (decision 0011). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. The mechanism for the exception for Otto's comment tools (decision 0011). Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
-| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13). Per-user grants and receipts before any employee proposal for that system (decision 0011). |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Before stage 3, the pod binding and the currency check (decision 0012). Built-in GitHub and Jira tools, and the exception list in check 5 for Otto's two comment tools (decision 0011, #12). Built-in tools that check their own scope report what they reached (decision 0011). Receipts and the key check before the first side effect reaches a real system (decision 0009, part 2). The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
+| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13), including that each client sends a tool-use identifier or can set the named `_meta` field before it is served a `propose` tool (decision 0009). Per-user grants and receipts before any employee proposal for that system (decision 0011). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
 
@@ -1112,10 +1113,12 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9, and Q10 to Q13, in [open-questions.md](open-questions.md). Q10 is
-narrowed to what compliance requires of read auditing; the rest of it is decision 0009. What
-decision 0010 leaves to Otto, IT, the security team and platform owners is listed in that
-record. The milestone table says which each milestone must settle before it starts. Vendor
+What remains of Q9 and Q10, and Q11 to Q13, are in [open-questions.md](open-questions.md).
+Q9 is narrowed to what decision 0011 leaves to others, and Q10 to what compliance requires of
+read auditing; the rest of each is decided. Q17 and Q18 are settled by decisions 0010 and 0012.
+Each of decisions 0009 to 0012 lists what it leaves to Otto's owners, IT, the security team,
+platform owners and others, with who decides and what holds meanwhile. The milestone table
+says which each milestone must settle before it starts. Vendor
 feasibility remains research in
 [systems.md](systems.md). The independent review's findings that are not yet reflected here
 are listed at the end of that file.

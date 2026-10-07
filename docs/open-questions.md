@@ -1,9 +1,9 @@
 # Open questions
 
-Q1–Q8 and Q14–Q19 are settled below, and so are most of Q9 and Q10 apart from read auditing.
-The rest of Q9, and Q10–Q13, are open; Q10 is narrowed to what compliance requires of read
-auditing. When resolved, move their requirements into [design.md](design.md) and remove the
-open question. Vendor research remains in [systems.md](systems.md).
+Q1–Q8 and Q14–Q19 are settled below, and so is most of Q9 and Q10. Open are what remains of
+Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance requires of read
+auditing; and Q11–Q13. When resolved, move their requirements into [design.md](design.md) and
+remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
 
