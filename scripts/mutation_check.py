@@ -1263,6 +1263,29 @@ mutate("dev-client-any-error-is-a-denial", "the scripted client takes any JSON-R
        'Expect::Denied => status == 200 && body.get("error").is_some(),')
 
 
+# --- gateway-dev end-to-end ----------------------------------------------------------------
+# Guards the end-to-end tests in crates/gateway-dev/tests/ watch: the server's wait for running
+# answers at shutdown, and the fixture world those tests and switchboard-dev share.
+
+DEV_WORLD = DEV + "world.rs"
+
+mutate("gw-shutdown-leaves-answers-running", "the server returns while a call whose client has gone is still running", GW_SERVER,
+       "    answers.finished().await;\n", "")
+mutate("gw-shutdown-answer-not-counted", "an answer stops being counted as soon as its task starts", GW_SERVER,
+       "        let _running = running;\n", "        drop(running);\n")
+mutate("dev-resources-ignore-tool", "the fixture's documents are read as if every tool declared them", DEV_WORLD,
+       "        FixtureConnector::resources_of(tool.name.as_str(), arguments)",
+       "        FixtureConnector::resources_of(gateway_testkit::READ_TOOL, arguments)")
+mutate("dev-fixture-allows-an-origin", "the fixture gateway accepts a browser page on localhost", DEV_WORLD,
+       '"allowed_origins": []}', '"allowed_origins": ["http://localhost:6274"]}')
+mutate("dev-team-b-selects-team-a-profile", "team B's workloads get team A's profile", DEV_WORLD,
+       '"team": TEAM_B, "profile": PROFILE_TEAM_B}', '"team": TEAM_B, "profile": PROFILE_TEAM_A}')
+mutate("dev-fixture-accepts-another-audience", "the fixture gateway accepts tokens meant for someone else", DEV_WORLD,
+       '"audiences": [AUDIENCE],', '"audiences": [AUDIENCE, "someone-else"],')
+mutate("dev-fixture-lifetime-unbounded", "the fixture gateway accepts tokens that live for days", DEV_WORLD,
+       '"max_lifetime_secs": DEFAULT_MAX_LIFETIME,', '"max_lifetime_secs": DEFAULT_MAX_LIFETIME * 48,')
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
