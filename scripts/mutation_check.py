@@ -966,6 +966,12 @@ mutate_all(
     (IDENTITY + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
 )
+mutate_all(
+    "identity-dependency-added-under-spaced-target",
+    "the identity crate gains a dependency outside the allowlist, under a target table spelled with spaces",
+    (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    (IDENTITY + "Cargo.toml", "\n[lints]\n", "\n[ target.'cfg(all())'.dependencies ]\nproptest = \"1\"\n\n[lints]\n"),
+)
 # Enabling `aws_lc_rs` itself would add crates to Cargo.lock, which `--locked` refuses before any
 # test runs, so that mutation could never give a verdict. Any second entry in the feature list
 # fails the same assertion a second backend would, and leaves the lock as it is.
@@ -1066,6 +1072,13 @@ mutate_all(
     "the core gains a dependency outside the allowlist",
     (CRATE + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (CRATE + "Cargo.toml", '[dev-dependencies]\nproptest = "1"\n', "[dev-dependencies]\n"),
+)
+# A table header with spaces is still a table to Cargo, and one under a target is still built.
+mutate_all(
+    "dependency-added-under-spaced-target",
+    "the core gains a dependency outside the allowlist, under a target table spelled with spaces",
+    (CRATE + "Cargo.toml", '[dev-dependencies]\nproptest = "1"\n', "[dev-dependencies]\n"),
+    (CRATE + "Cargo.toml", "\n[lints]\n", "\n[ target.'cfg(all())'.dependencies ]\nproptest = \"1\"\n\n[lints]\n"),
 )
 
 
@@ -1252,6 +1265,15 @@ mutate_all(
     ("crates/gateway/Cargo.toml", 'tracing = "0.1"\n', 'tracing = "0.1"\ngateway-testkit = { path = "../gateway-testkit" }\n'),
     ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
 )
+mutate_all(
+    "gw-dependency-testkit-under-spaced-target",
+    "the gateway depends on the testkit, under a target table spelled with spaces",
+    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+    ("crates/gateway/Cargo.toml", "\n[lints]\n",
+     "\n[ target.'cfg(all())'.dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n"),
+)
+mutate("gw-dependency-testkit-renamed", "the gateway builds with the testkit under an allowed name", "crates/gateway/Cargo.toml",
+       "\n[lints]\n", "\n[ build-dependencies ]\nserde = { package = \"gateway-testkit\", path = \"../gateway-testkit\" }\n\n[lints]\n")
 
 
 # The binary checks its configuration before it binds a socket.
