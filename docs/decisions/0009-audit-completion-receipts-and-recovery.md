@@ -292,12 +292,12 @@ as `error` when the caller disconnected before the connector was called, when be
 confirmed, and when the arguments were refused before anything was sent: by the gateway's
 argument check for a proxied tool ([decision
 0011](0011-resource-authorization-and-tool-assurance.md)), which runs after begin, or by a
-built-in connector's own parsing. In the second case it keeps trying on the finish pool until
-the finish deadline. A refusal by the credential layer or the connector is completed as `refused`, and a
-custodian refusal as `error`, with the receipt `not_performed` in each case. A late finish that
-disagrees with a receipt reconciliation has already settled is written to the row. The
-receipt is left as it is, and the disagreement is logged and counted; alerting waits for Still
-open 9.
+built-in connector's own parsing. Where begin was never confirmed, it keeps trying on the
+finish pool until the finish deadline. A refusal by the credential layer or the connector is completed as
+`refused`, and a custodian refusal as `error`, with the receipt `not_performed` in each case.
+A late finish that disagrees with a receipt reconciliation has already settled is written to
+the row. The receipt is left as it is, and the disagreement is logged and counted; alerting
+waits for Still open 9.
 
 ### The key
 
@@ -334,8 +334,9 @@ is the last check: after check 5 and its exception step, after decision 0012's c
 and after check 6. So a caller is asked for a key only when the call would otherwise be
 allowed, and every permission denial keeps its own reason. It is skipped for `tools/list`,
 like check 6 and the currency check, because a list request carries no key: a `propose` tool
-is listed to a caller who may call it, and denied on `tools/call` without a key. With identity disabled there is no principal to scope a key to, so
-no side effect is served at all (see "Until receipts exist").
+is listed to a caller who may call it, and denied on `tools/call` without a key. With
+identity disabled there is no principal to scope a key to, so no side effect is served at all
+(see "Until receipts exist").
 
 ### The argument digest
 

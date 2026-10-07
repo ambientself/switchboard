@@ -293,10 +293,11 @@ that system, or are not served. The owner accepted this reading of Q3 on 2026-10
 
 **Employees start with `read` only.** The employee profile lists `propose` once, when the first
 system qualifies: its per-user grants work (encrypted storage, connection, refresh and
-revocation) and durable action receipts exist (decision 0009). A profile is a set of classifications
-with no per-system part. Which systems employees may propose in is therefore decided by which
-`propose` tools are put on employee surfaces, and rule 9 keeps those on per-user entries. That
-a system qualifies rests on the reviewer of the change that adds its tools. `write` and
+revocation) and durable action receipts exist (decision 0009). A profile is a set of
+classifications with no per-system part. Which systems employees may propose in is therefore
+decided by which `propose` tools are put on employee surfaces, and rule 9 keeps those on
+per-user entries. That a system qualifies rests on the reviewer of the change that adds its
+tools. `write` and
 `destructive` stay denied in every profile.
 
 **Every employee proposal uses the employee's own per-user grant.** A proposal has an author,
@@ -425,9 +426,9 @@ hold:
   the connector hold it to them, as for any built-in tool.
 - **Every call is audited as usual,** and the row gives the exception as the reason the call
   was allowed.
-- **It is listed in the register of exceptions that [decision 0010](0010-what-stops-an-agent-going-around-the-gateway.md)
-  keeps,** with the owner as the person who accepted it. Like every entry there, it needs
-  the signature of a named security owner, who has not been named yet (see Still open).
+- **It is listed in the register of exceptions that decision 0010 keeps,** with the owner as
+  the person who accepted it. Like every entry there, it needs the signature of a named
+  security owner, who has not been named yet (see Still open).
 - **It is reviewed on the register's cadence:** every 90 days, and when Otto's cutover (#13)
   completes. The review keeps it, narrows it or ends it.
 

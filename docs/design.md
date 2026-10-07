@@ -431,8 +431,8 @@ refusal of something the gateway did not create or of something that would act o
 
 **One function is the only place that can allow a call.** The receipt check at begin, the
 argument check, the connector, the credential layer, the custodian and the vendor may each
-refuse or fail after it, and none may allow. One audit record holds the whole decision for a call, and its policy revision
-identifies the approvals and loader checks the call relied on.
+refuse or fail after it, and none may allow. One audit record holds the whole decision for a
+call, and its policy revision identifies the approvals and loader checks the call relied on.
 
 **Broad reads use a breadth resource.** A read that shows more than its caller could otherwise
 see, such as AWS inventory across accounts, takes the accounts as a structured argument. A call
