@@ -153,14 +153,12 @@ fn base64_decode(text: &str) -> Vec<u8> {
 
 #[test]
 fn the_subcommand_refuses_to_start_without_what_it_needs() {
+    let keys = scratch("refusals").join("jwks.json");
+    let keys_out = format!("--keys-out={}", keys.display());
+    let keys_out = keys_out.as_str();
     for arguments in [
         &["issuer"][..],
-        &[
-            "issuer",
-            "--listen=127.0.0.1:0",
-            "--issuer=x",
-            "--keys-out=/tmp/k",
-        ],
+        &["issuer", "--listen=127.0.0.1:0", "--issuer=x", keys_out],
         &[
             "issuer",
             "--listen=127.0.0.1:0",
@@ -171,14 +169,14 @@ fn the_subcommand_refuses_to_start_without_what_it_needs() {
             "issuer",
             "--listen=nowhere",
             "--issuer=x",
-            "--keys-out=/tmp/k",
+            keys_out,
             "--subject=s",
         ],
         &[
             "issuer",
             "--listen=127.0.0.1:0",
             "--issuer=x",
-            "--keys-out=/tmp/k",
+            keys_out,
             "--subject=s",
             "--subject=s",
         ],
@@ -186,18 +184,40 @@ fn the_subcommand_refuses_to_start_without_what_it_needs() {
             "issuer",
             "--listen=127.0.0.1:0",
             "--issuer=x",
-            "--keys-out=/tmp/k",
+            keys_out,
             "--subject=s",
             "--port=1",
         ],
     ] {
-        let output = Command::new(BINARY).args(arguments).output().unwrap();
+        let output = exit_of(arguments);
         assert_eq!(output.status.code(), Some(2), "{arguments:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("usage:"),
             "{arguments:?}"
         );
     }
+    assert!(!keys.exists(), "a refused start wrote its keys");
+}
+
+/// Runs the subcommand to its exit. One still running after a minute, which is a refused start
+/// that served instead, is killed and fails the test rather than hanging it.
+fn exit_of(arguments: &[&str]) -> std::process::Output {
+    let mut child = Command::new(BINARY)
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("switchboard-dev {arguments:?} started instead of refusing");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
 }
 
 #[tokio::test]

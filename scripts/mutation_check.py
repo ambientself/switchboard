@@ -1827,7 +1827,7 @@ mutate("gw-start-audit-unchecked", "the audit store serves without its boot chec
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
 mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
        "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
-       "        AuditChoice::Postgres { .. } => None,")
+       "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
 
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(sentence) => Box::pin(std::future::ready(ToolOutcome::Refused(sentence))),",
