@@ -1,7 +1,9 @@
 # Open questions
 
-Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. When resolved, move their requirements into
-[design.md](design.md) and remove the open question. Vendor research remains in [systems.md](systems.md).
+Q1–Q8, Q14–Q16 and Q19 are settled below, and so is Q10 apart from read auditing. Q9–Q13,
+Q17 and Q18 are open; Q10 is narrowed to what compliance requires of read auditing. When
+resolved, move their requirements into [design.md](design.md) and remove the open question.
+Vendor research remains in [systems.md](systems.md).
 
 ## Settled
 
@@ -71,6 +73,13 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   read as a command, and forces a pull request it opens to be a draft. See the 2026-10-04
   amendment to
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
+- **2026-10-07 (Q10, apart from read auditing):** Three records: telemetry, audit rows and
+  receipts. What begin and finish guarantee. Open rows are found by their deadline and never
+  marked. Receipts with per-request, single-use keys and reconciliation that only looks, required
+  before the first tool not classified `read` reaches a real system. The gateway never repeats
+  a call. Reads stay synchronous on Q4's acceptance until compliance says what it requires. The
+  owner accepted the recommendations on 2026-10-07. See
+  [decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md). Fencing is in Q18.
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -111,28 +120,34 @@ operation might address any repository, Jira project or AWS account available to
 - **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
   write cutover for its comment tools.
 
-## Q10. What happens after execution when recording or delivery fails?
+## Q10. What does compliance require of read auditing?
 
-The design completes the audit before answering, while Otto's gateway document describes
-completion after the answer. An empty outcome can also mean the completion write failed,
-not necessarily that the gateway never learned the result. Audit records are not idempotency
-receipts, and the design currently omits Otto's planned retry and fencing contract.
+[Decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md) settles the rest of
+Q10. Q4 accepted a synchronous audit write for every call, reads included; nobody has said that
+compliance requires it for reads.
 
-- **Recommendation:** retain synchronous audit begin. Attempt finish on an independent,
-  bounded deadline; record and alert on completion failure without presenting an executed
-  action as safely retryable. Clarify that an empty outcome means no durable outcome exists.
-  The fixed audit-unavailable response is the explicit exception to “no answer without a row.”
-  Scope the tool audit contract separately from discovery, initialization and malformed requests.
-- **Writes:** introduce durable action receipts before enabling real writes, proposals
-  included (a `propose` tool changes something too). Bind an
-  idempotency key to principal, tool and normalized arguments, reject conflicting reuse, and
-  distinguish pending, completed and unknown outcomes. An unknown outcome requires downstream
-  reconciliation or supported vendor idempotency; a local receipt alone cannot guarantee
-  exactly-once execution. Never automatically replay such a write after reconnect or restart.
-- **Failover:** specify when Otto's fencing epoch is checked and what it stops; keep this
-  separate from MCP session state. Identify implemented behavior versus future Otto promises
-  in the conformance baseline.
-- **Blocks:** audit behavior and the first real write/cutover readiness criteria.
+- **Until compliance answers:** reads are written synchronously, on Q4's acceptance. A stricter
+  or looser requirement, on coverage, immutability or retention, would change part 1 of
+  decision 0009.
+- **Also open from decision 0009,** each for someone other than the owner, alone or with the
+  owner. Its "Still open" list says what holds meanwhile.
+  - Otto's owners: whether Otto's adapter still writes rows for identity failures,
+    `initialize` and `ping`; and Otto's key, the grant fields that scope it, whether it stays
+    the same when a turn is replayed, and how read-back treats rows that share a tool-use
+    identifier.
+  - Whoever runs logging: where telemetry goes, how long it is kept, and the compliance
+    system of record.
+  - The security team: whether failed-authentication evidence may be dropped under load.
+  - The owner with the security team: how a person records a resolution.
+  - The security team and the storage owners: tamper evidence for rows and receipts, and who
+    holds the superuser login.
+  - Whoever runs Postgres, probably IT: what "committed" means.
+  - The owner with whoever will own the audit database: who owns the schema (Q12).
+  - Whoever runs the on-call rotation: who is paged, and who settles a receipt by hand.
+- **Blocks:** closing #3. The first side effect reaching a real system waits for decision
+  0009's Still open 9 (who settles by hand) and 10 (how a resolution is recorded); Otto's
+  write cutover also waits for its Still open 8 (Otto's key). Not milestone 2: the interim
+  rule is enough for the first slice.
 
 ## Q11. How quickly do policy changes and revocations take effect?
 
@@ -162,6 +177,13 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
 - **Audit operations:** assign storage/migration ownership, retention, access controls and
   redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
   payloads. Define availability and latency targets and measure audit overhead against them.
+- **Deferred here by decision 0009:** the begin budget, the answer budget and the finish
+  deadline (two, two and thirty seconds until then), call deadlines, pool sizes and alert
+  thresholds; how long rows, receipts and resolution records are kept; and who owns the audit
+  and receipt schema, its grants, triggers and migrations. How long telemetry is kept is for
+  whoever runs logging (decision 0009, Still open 3). An authentication flood
+  no longer writes to the audit store, so the overload question is reduced to begins from
+  proved callers.
 - **Blocks:** rollout sequencing and production readiness.
 
 ## Q13. Which employee clients and access infrastructure are the acceptance targets?
@@ -174,6 +196,10 @@ remain unverified. Publishing discovery metadata alone does not establish intero
   layer together. Preserve required HTTP authentication challenges alongside readable denials.
   Select and pin a supported MCP revision and test initialization, notifications, HTTP
   responses and any supported streaming behavior, even with client sessions disabled.
+- **Keys for side effects:** a side effect without an idempotency key is denied (decision
+  0009). The MCP specification defines no tool-use identifier; Claude Code sends
+  `claudecode/toolUseId` in `_meta`. For each target client, check that it sends a tool-use
+  identifier or can set the named `_meta` field. One that can do neither cannot propose.
 - **Identity:** select verifiers only from configured trusted issuers; an unverified token
   must never select an arbitrary discovery/JWKS URL. Scope subjects by issuer and subject.
   Avoid promising identical timing across all authentication failure modes; preserve opaque
@@ -214,13 +240,9 @@ tool.
 
 From the independent review of 2026-10-01. Accepted in principle, not yet designed:
 
-- Separate three records that the audit section treats as one: telemetry for malformed and
-  unauthenticated traffic, the authorization audit, and idempotency receipts for writes.
-  Decide whether reads need the same synchronous write as mutations (Q10).
-- Crash recovery: a durable way to complete or reconcile a write whose audit row was begun
-  and never finished (Q10).
-- Overload behavior for the audit store: admission control, bounded pools, and what an
-  authentication flood does to the database (Q12).
+- Overload behavior for the audit store: admission control and bounded pools (Q12). An
+  authentication flood no longer reaches the database (decision 0009).
 - Freshness and revocation bounds for group claims and team manifests (Q11).
 - Identity and audit opt-outs unavailable outside development builds (Q12).
-- A table tracing each invariant to its decision and its test.
+- A table tracing each invariant to its decision and its test. One now exists for audit and
+  receipts (design section 18).

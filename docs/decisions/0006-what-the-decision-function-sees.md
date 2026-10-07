@@ -1,13 +1,13 @@
 # 0006: What the decision function sees and returns
 
-Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
-on 2026-10-04 (classifications, direct writes and delegation tool lists; see the end), with
-the rule for comments added on 2026-10-06. Status: accepted. Settles the part of Q9 that
-milestone 1 needs, and with the amendment, what the core needs for employee proposals and
-broad reads. The rest of Q9 stays open: when a proxied tool is eligible for exposure, any write
-policy beyond proposals, whether Otto's comment tools get an exception to the comment rule, and
-whether a proposal stays `propose` where the CI it starts can deploy or holds a production
-credential.
+Date: 2026-10-01, amended the same day after the first implementation was reviewed, again on
+2026-10-04 (classifications, direct writes and delegation tool lists), with the rule for
+comments added on 2026-10-06, and on 2026-10-07 for decision 0009; the amendments are at the
+end. Status: accepted. Settles the part of Q9 that milestone 1 needs, and with the amendment,
+what the core needs for employee proposals and broad reads. The rest of Q9 stays open: when a
+proxied tool is eligible for exposure, any write policy beyond proposals, whether Otto's
+comment tools get an exception to the comment rule, and whether a proposal stays `propose`
+where the CI it starts can deploy or holds a production credential.
 
 ## Context
 
@@ -271,3 +271,34 @@ checked against their limits. A dedicated field waits for the first such tool.
   and the transition that remain are `write`, to show the denial. A comment tool that comments
   only on what the gateway created for review is `propose` and allowed, to show the other side
   of the comment rule.
+
+## Amended 2026-10-07: unverified delegations, keys and receipts
+
+[Decision 0009](0009-audit-completion-receipts-and-recovery.md), accepted on 2026-10-07,
+changes four things here.
+
+- **A delegation can be present and unverified.** The delegation's verifier runs before this
+  function, but does not deny. It passes on a delegation that could not be verified, carrying
+  nothing from it but the kind of failure. Check 3 denies it with a single reason kind of its
+  own, so one place decides, and the caller reads one fixed sentence whatever was wrong with
+  it. The verifier's failure kinds are recorded on the row and are not reason kinds. The audit
+  row holds the proved columns and nothing from the delegation's claims. Where a turn grant's
+  signature verified and only a binding failed (audience, lifetime or pod), decision 0012 also
+  records the grant's digest and which binding failed.
+- **The context says whether the request carries a key.** A tool not classified `read` whose
+  call carries no key is denied with a reason kind of its own, and a sentence asking for one.
+  That is knowable before anything runs, so it belongs in this function. It is a new last
+  check, after check 6 and so after decision 0012's currency check, so a caller is asked for a
+  key only when the call would otherwise be allowed. It is skipped for `tools/list`, as
+  decision 0012's currency check is, because a list request carries no key: a `propose` tool
+  appears in the list and is denied on `tools/call` without a key. The decision table gains
+  that case, and a mutation that applies the check to `tools/list` must be caught.
+- **The receipt check is a second decision outside this function.** It is made at begin, when
+  a key already has a receipt in its scope. Like a connector's refusal, it cannot make
+  anything run. It decides about delivery, not permission.
+- **The outcomes gain `unknown` and `duplicate`.** `unknown` is for side effects only: the
+  request was sent and no definite answer came back. `duplicate` means nothing ran because the
+  same request was already completed.
+
+"Receipts before writes (Q10)" in the consequences above is now decision 0009. Receipts come
+before the first `propose` tool reaches a real system.
