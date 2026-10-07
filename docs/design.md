@@ -343,9 +343,12 @@ written.
   documented bound. Escaping lengthens non-ASCII text, so an identifier with much of it can
   still be cut; a cut value ends with `…`.
 - **A row's recorded resources are at most 147,648 characters:** 64 resources, each with a
-  129-character system and kind and a 2,049-character identifier, the `…` included. Any call
-  that gets a row can reach this, a denial included, and the row is written before the tool
-  runs. The size limits and audit latency targets in Q12 must cover a row this large.
+  129-character system and kind and a 2,049-character identifier, the `…` included. That
+  counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
+  quotes again, so as JSON they reach 297,675 characters, or 298,059 bytes, since `…` takes 3
+  bytes. Any call that gets a row can reach this, a denial included, and the row is written
+  before the tool runs. The size limits and audit latency targets in Q12 must cover a row this
+  large, counted as the store counts it.
 - **An empty outcome is evidence** that the gateway allowed the call and never learned what
   happened.
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.

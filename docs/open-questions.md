@@ -130,8 +130,9 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
 - **Audit operations:** assign storage/migration ownership, retention, access controls and
   redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
   payloads. Define availability and latency targets and measure audit overhead against them.
-  A row's recorded resources alone can reach 147,648 characters
-  ([design.md](design.md), section 11).
+  A row's recorded resources alone can reach 147,648 escaped characters, which serialize to
+  298,059 bytes as JSON ([design.md](design.md), section 11). Set size limits in the units the
+  store counts.
 - **Otto's audit table:** Otto's `gateway_audit` table has no general column for the
   resources a call names. Only `github_skill_body` records them, in `skill_ref_requested`,
   `skill_repo` and `skill_commit`, so the rows for Otto's other calls do not. Decide whether
