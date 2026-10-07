@@ -5,7 +5,8 @@ use std::fmt;
 use gateway_core::IDENTITY_FAILURE;
 use thiserror::Error;
 
-/// A claim a check names.
+/// A claim a check names. Displays as a noun phrase that ends in "claim", so a message reads
+/// the same whether the claim has a fixed name or, like the groups claim, a configured one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claim {
     /// `iss`.
@@ -27,13 +28,13 @@ pub enum Claim {
 impl fmt::Display for Claim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Claim::Issuer => "iss",
-            Claim::Subject => "sub",
-            Claim::Audience => "aud",
-            Claim::ExpiresAt => "exp",
-            Claim::NotBefore => "nbf",
-            Claim::IssuedAt => "iat",
-            Claim::Groups => "the groups claim",
+            Claim::Issuer => "`iss` claim",
+            Claim::Subject => "`sub` claim",
+            Claim::Audience => "`aud` claim",
+            Claim::ExpiresAt => "`exp` claim",
+            Claim::NotBefore => "`nbf` claim",
+            Claim::IssuedAt => "`iat` claim",
+            Claim::Groups => "groups claim",
         })
     }
 }
@@ -77,10 +78,10 @@ pub enum VerifyError {
     #[error("the token's signature does not verify")]
     BadSignature,
     /// A claim a check needs is missing.
-    #[error("the token has no {0} claim")]
+    #[error("the token has no {0}")]
     MissingClaim(Claim),
     /// A claim is present but not the type or shape the check needs.
-    #[error("the token's {0} claim is malformed")]
+    #[error("the token's {0} is malformed")]
     MalformedClaim(Claim),
     /// `exp` is in the past, beyond the leeway.
     #[error("the token has expired")]

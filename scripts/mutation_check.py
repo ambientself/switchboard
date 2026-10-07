@@ -756,7 +756,9 @@ mutate("identity-failure-display-names-the-cause", "the failure displays as its 
        "        write!(f, \"{}\", self.detail)\n    }\n}\n\nimpl std::error::Error")
 mutate("identity-failure-outward-names-the-cause", "the outward sentence differs by cause", IDENTITY_SRC + "error.rs",
        "    pub fn outward(&self) -> &'static str {\n        IDENTITY_FAILURE", "    pub fn outward(&self) -> &'static str {\n        if self.detail == VerifyError::UnknownSubject { \"unknown subject\" } else { IDENTITY_FAILURE }")
-mutate("identity-state-names", "the proved state is recorded under another name", IDENTITY_SRC + "identity.rs",
+mutate("identity-groups-claim-sentence", "the log names the groups claim as `the groups claim claim`", IDENTITY_SRC + "error.rs",
+       '            Claim::Groups => "groups claim",', '            Claim::Groups => "the groups claim claim",')
+mutate("identity-state-names","the proved state is recorded under another name", IDENTITY_SRC + "identity.rs",
        '            VerificationState::Proved => "proved",', '            VerificationState::Proved => "ok",')
 mutate_all(
     "identity-dependency-added",

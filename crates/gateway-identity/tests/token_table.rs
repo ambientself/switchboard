@@ -699,3 +699,34 @@ fn two_local_issuers_never_share_a_key() {
         }
     }
 }
+
+/// A refusal over a claim reads as one sentence in the log, for every claim, including the
+/// groups claim, whose name is configured.
+#[test]
+fn a_refusal_over_a_claim_reads_as_a_sentence() {
+    assert_eq!(
+        VerifyError::MissingClaim(Claim::Groups).to_string(),
+        "the token has no groups claim"
+    );
+    assert_eq!(
+        VerifyError::MalformedClaim(Claim::Subject).to_string(),
+        "the token's `sub` claim is malformed"
+    );
+    for claim in [
+        Claim::Issuer,
+        Claim::Subject,
+        Claim::Audience,
+        Claim::ExpiresAt,
+        Claim::NotBefore,
+        Claim::IssuedAt,
+        Claim::Groups,
+    ] {
+        for sentence in [
+            VerifyError::MissingClaim(claim.clone()).to_string(),
+            VerifyError::MalformedClaim(claim).to_string(),
+        ] {
+            assert_eq!(sentence.matches("claim").count(), 1, "{sentence}");
+            assert!(!sentence.contains("the the"), "{sentence}");
+        }
+    }
+}
