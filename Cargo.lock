@@ -133,6 +133,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-checks"
+version = "0.1.0"
+dependencies = [
+ "gateway-core",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

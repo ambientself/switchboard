@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gateway-core", "crates/gateway-identity", "crates/gateway-testkit"]
+members = ["crates/demo-checks", "crates/gateway-core", "crates/gateway-identity", "crates/gateway-testkit"]
 
 [workspace.package]
 edition = "2024"
