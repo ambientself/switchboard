@@ -4,10 +4,10 @@
 use gateway::{ResourceAdapter, ToolDefinition};
 use gateway_core::{ApprovedTool, Resources};
 use gateway_testkit::{
-    AUDIENCE, DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DOCUMENT_ARGUMENT, FixtureConnector, GROUP_G,
-    GROUP_REVIEW, LocalIssuer, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER,
-    READ_TOOL, SCOPED_READ_TOOL, TEAM_A, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, USER_ISSUER,
-    WORKLOAD_ISSUER, WRITE_TOOL,
+    AUDIENCE, DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DOCUMENT_ARGUMENT, DRAFT_ARGUMENT, DRAFT_TOOL,
+    FixtureConnector, GROUP_G, GROUP_REVIEW, LocalIssuer, PROFILE_REVIEWER, PROFILE_TEAM_A,
+    PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, TEAM_A, TEAM_A_SUBJECT, TEAM_B,
+    TEAM_B_SUBJECT, USER_ISSUER, WORKLOAD_ISSUER, WRITE_TOOL,
 };
 use serde_json::{Value, json};
 
@@ -35,9 +35,26 @@ pub fn catalog_data() -> Value {
             },
         },
         {
+            "name": DRAFT_TOOL,
+            "title": "Propose a change to a document",
+            "description": "Opens a draft against one fixture document for a person to review, or revises a draft this tool opened against it. Nothing is stored; the fixture records the draft.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    DOCUMENT_ARGUMENT: document,
+                    DRAFT_ARGUMENT: {
+                        "type": "string",
+                        "description": "The draft to revise, such as draft-1. Leave it out to open a new draft.",
+                    },
+                    "text": {"type": "string"},
+                },
+                "required": [DOCUMENT_ARGUMENT],
+            },
+        },
+        {
             "name": WRITE_TOOL,
             "title": "Write a document",
-            "description": "Writes to one fixture document. Nothing is stored; the fixture records that the write happened.",
+            "description": "Writes to one fixture document directly. It is classified write, so the gateway denies it to every caller.",
             "input_schema": {
                 "type": "object",
                 "properties": {DOCUMENT_ARGUMENT: document, "text": {"type": "string"}},

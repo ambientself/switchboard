@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use gateway::{AUDIT_DISABLED_NOTE, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE};
 use gateway_core::IDENTITY_FAILURE;
 use gateway_testkit::{
-    AUDIENCE, Fixture, GROUP_G, PROFILE_TEAM_A, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL,
-    SURFACE_READ, TEAM_A, TEAM_A_SUBJECT, USER_ISSUER, WORKLOAD_ISSUER, WRITE_TOOL,
+    AUDIENCE, DRAFT_TOOL, Fixture, GROUP_G, PROFILE_TEAM_A, PROFILE_USER, READ_TOOL,
+    SCOPED_READ_TOOL, SURFACE_READ, TEAM_A, TEAM_A_SUBJECT, USER_ISSUER, WORKLOAD_ISSUER,
+    WRITE_TOOL,
 };
 use serde_json::{Value, json};
 
@@ -40,7 +41,12 @@ fn startable(identity: Value) -> Value {
         "audit": {"disabled": true},
         "http": {"allowed_hosts": ["127.0.0.1"]},
         "policy": policy,
-        "catalog": [definition(READ_TOOL), definition(WRITE_TOOL), definition(SCOPED_READ_TOOL)],
+        "catalog": [
+                definition(READ_TOOL),
+                definition(DRAFT_TOOL),
+                definition(WRITE_TOOL),
+                definition(SCOPED_READ_TOOL),
+            ],
         "profiles": {
             "workloads": [{"issuer": WORKLOAD_ISSUER, "team": TEAM_A, "profile": PROFILE_TEAM_A}],
             "users": [{"issuer": USER_ISSUER, "group": GROUP_G, "profile": PROFILE_USER}],

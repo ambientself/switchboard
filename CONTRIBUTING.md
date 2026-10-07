@@ -60,7 +60,11 @@ claude mcp add --transport http switchboard-a http://127.0.0.1:8471/mcp/fixture-
 The header is read once, when the server is added, so it stops working when that token
 expires an hour later. Add it again with a fresh token.
 
-The endpoints are `/mcp/fixture-read` and `/mcp/fixture-all`. Requests must come to
+The endpoints are `/mcp/fixture-read` and `/mcp/fixture-all`. `fixture-read` serves the two
+read tools to both teams and the user. `fixture-all` serves the teams only, and adds
+`fixture__draft`, a `propose` tool that opens or revises a draft for a person to review, which
+only team A's profile (`workload-propose`) may call, and `fixture__write`, a direct write,
+which is denied to every caller because no profile may write. Requests must come to
 `127.0.0.1` or `localhost`, and a request carrying an `Origin` header is refused, so
 browser-based clients such as the MCP Inspector get 403 by design.
 

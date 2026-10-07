@@ -11,8 +11,8 @@ use gateway::{Config, ResourceAdapter, Wiring, boot, serve_with_shutdown};
 use gateway_core::{ApprovedTool, IDENTITY_FAILURE, Resources};
 use gateway_mcp::{CHALLENGE, DENIAL_CODE};
 use gateway_testkit::{
-    AUDIENCE, CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector, GROUP_G,
-    GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B,
+    AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, FakeCredentialSource, Fixture, FixtureConnector,
+    GROUP_G, GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B,
     PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, TEAM_A, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT,
     USER_ISSUER, WORKLOAD_ISSUER, WRITE_TOOL,
 };
@@ -147,7 +147,12 @@ pub fn config(fixture: &Fixture) -> Value {
             "allowed_origins": [ALLOWED_ORIGIN],
         },
         "policy": gateway_testkit::policy_data(),
-        "catalog": [definition(READ_TOOL), definition(WRITE_TOOL), definition(SCOPED_READ_TOOL)],
+        "catalog": [
+                definition(READ_TOOL),
+                definition(DRAFT_TOOL),
+                definition(WRITE_TOOL),
+                definition(SCOPED_READ_TOOL),
+            ],
         "profiles": {
             "workloads": [
                 {"issuer": WORKLOAD_ISSUER, "team": TEAM_A, "profile": PROFILE_TEAM_A},

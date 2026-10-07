@@ -16,9 +16,10 @@ use gateway_core::{ReasonKind, ToolUseId};
 use gateway_dev::{FixtureGateway, start_fixture_gateway};
 use gateway_mcp::{Era, TOOL_USE_ID_META};
 use gateway_testkit::{
-    AUDIENCE, Caller, FORBIDDEN_DOCUMENT, GROUP_G, GROUP_G_DOCUMENT, GROUP_REVIEW, READ_TOOL,
-    SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B,
-    TEAM_B_DOCUMENT, USER_SUBJECT, WRITE_TOOL,
+    AUDIENCE, Caller, DRAFT_ARGUMENT, DRAFT_REFUSAL, DRAFT_TOOL, FORBIDDEN_DOCUMENT, FOREIGN_DRAFT,
+    GROUP_G, GROUP_G_DOCUMENT, GROUP_REVIEW, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL,
+    SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B, TEAM_B_DOCUMENT, USER_SUBJECT,
+    WRITE_TOOL,
 };
 use serde_json::{Value, json};
 use support::{
@@ -100,7 +101,7 @@ fn denials(gateway: &FixtureGateway) -> Vec<Denial> {
             arguments: document(GROUP_G_DOCUMENT),
             names: "profile",
         },
-        // Check 1: users may not use the surface that serves the write tool.
+        // Check 1: users may not use the surface that serves the draft and write tools.
         Denial {
             kind: ReasonKind::SurfaceNotPermitted,
             token: user.clone(),
@@ -135,14 +136,32 @@ fn denials(gateway: &FixtureGateway) -> Vec<Denial> {
             arguments: document(TEAM_A_DOCUMENT),
             names: WRITE_TOOL,
         },
-        // Check 5: team B's profile only reads.
+        // Check 5: team B's profile only reads, so it may not propose.
+        Denial {
+            kind: ReasonKind::ClassificationNotPermitted,
+            token: team_b.clone(),
+            surface: SURFACE_ALL,
+            tool: DRAFT_TOOL,
+            arguments: document(TEAM_B_DOCUMENT),
+            names: DRAFT_TOOL,
+        },
+        // And a direct write is denied in every profile: to team B, and to team A, whose
+        // profile may propose.
         Denial {
             kind: ReasonKind::ClassificationNotPermitted,
             token: team_b,
             surface: SURFACE_ALL,
             tool: WRITE_TOOL,
             arguments: document(TEAM_B_DOCUMENT),
-            names: WRITE_TOOL,
+            names: "denied in every profile",
+        },
+        Denial {
+            kind: ReasonKind::ClassificationNotPermitted,
+            token: team_a.clone(),
+            surface: SURFACE_ALL,
+            tool: WRITE_TOOL,
+            arguments: document(TEAM_A_DOCUMENT),
+            names: "denied in every profile",
         },
         // Check 6: another team's document, and no document at all.
         Denial {
@@ -196,6 +215,7 @@ async fn a_denied_call_never_reaches_the_connector_and_its_row_holds_its_answer(
     assert_eq!(gateway.store().rows().len(), 2 * cases.len());
     assert_eq!(gateway.store().finish_attempts(), 0);
     assert_eq!(gateway.connector().received(), Vec::new());
+    assert_eq!(gateway.connector().writes(), Vec::new());
     assert_eq!(gateway.credentials().requests(), Vec::new());
 
     // Every kind of reason the fixture can reach without a delegation is covered.
@@ -727,6 +747,80 @@ async fn each_team_reads_its_own_document_with_its_own_credential_and_is_denied_
         };
         assert_eq!(call.arguments, document(expected));
     }
+}
+
+// --- A proposal -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn team_a_proposes_and_revises_its_own_draft_and_a_foreign_draft_is_refused() {
+    let gateway = start_fixture_gateway().await.unwrap();
+    let draft = |extra: Value| {
+        let mut arguments = document(TEAM_A_DOCUMENT);
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        arguments
+    };
+    let (is_error, opened) = call(
+        &gateway,
+        Caller::TeamA,
+        Era::Modern,
+        SURFACE_ALL,
+        DRAFT_TOOL,
+        draft(json!({"text": "A first proposal."})),
+    )
+    .await
+    .tool_result();
+    assert!(!is_error, "{opened}");
+    assert_eq!(opened["structuredContent"]["draft"], json!("draft-1"));
+
+    let (is_error, revised) = call(
+        &gateway,
+        Caller::TeamA,
+        Era::Legacy,
+        SURFACE_ALL,
+        DRAFT_TOOL,
+        draft(json!({DRAFT_ARGUMENT: "draft-1", "text": "A second try."})),
+    )
+    .await
+    .tool_result();
+    assert!(!is_error, "{revised}");
+    assert_eq!(revised["structuredContent"]["draft"], json!("draft-1"));
+
+    // A draft a person opened is refused by the tool when it runs, and recorded as refused.
+    let sentence = call(
+        &gateway,
+        Caller::TeamA,
+        Era::Modern,
+        SURFACE_ALL,
+        DRAFT_TOOL,
+        draft(json!({DRAFT_ARGUMENT: FOREIGN_DRAFT})),
+    )
+    .await
+    .denial();
+    assert_eq!(sentence, DRAFT_REFUSAL);
+
+    let rows = gateway.store().rows();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.decision == DecisionKind::Allow));
+    assert_eq!(outcome(&gateway, 0), Some(Outcome::Ok));
+    assert_eq!(outcome(&gateway, 1), Some(Outcome::Ok));
+    assert_eq!(
+        outcome(&gateway, 2),
+        Some(Outcome::Refused {
+            sentence: DRAFT_REFUSAL.to_owned()
+        })
+    );
+    let writes = gateway.connector().writes();
+    assert_eq!(writes.len(), 2, "the refused revision wrote nothing");
+    assert!(writes.iter().all(|write| write.tool == DRAFT_TOOL));
+    assert!(
+        writes.iter().all(|write| write
+            .credential
+            .starts_with("fake-credential-for-fixture-team-a-")),
+        "{writes:?}"
+    );
 }
 
 // --- A tool that fails -----------------------------------------------------------------------
