@@ -25,6 +25,7 @@
 //! What the types cannot establish is that an [`AuditStore`] implementation really wrote the
 //! row when it says it did. That is the store's contract, and its own tests'.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 
 use serde::{Deserialize, Serialize};
@@ -32,15 +33,53 @@ use thiserror::Error;
 
 use crate::classification::Classification;
 use crate::connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
-use crate::decision::{CallContext, Decision, Reason, ReasonKind, Verdict};
+use crate::decision::{CallContext, Decision, Reason, ReasonKind, ResourceProblem, Verdict};
 use crate::names::{
     ConnectorName, DeploymentName, Person, PolicyRevision, ProfileName, SurfaceName, TeamId,
     ToolUseId,
 };
-use crate::policy::ApprovedTool;
+use crate::policy::{ApprovedTool, Resource, Resources};
 use crate::principal::Principal;
 use crate::proof::{Claimed, WasProved};
 use crate::sentences;
+
+/// The most named resources one audit row records. A call can name any number, so the rest are
+/// counted in [`AuditRecord::resources_omitted`] rather than written out.
+pub const MAX_RECORDED_RESOURCES: usize = 64;
+
+/// The longest a recorded resource identifier is, in characters after escaping, before it is
+/// cut short. An AWS ARN can be 2,048 characters, the longest of the identifier lengths
+/// checked in `docs/systems.md`, so each of those is recorded whole. Not every system was
+/// checked, and a self-built server's identifiers have no documented bound. A resource's
+/// system and kind are capped at 128 characters, like the tool and surface columns.
+pub const MAX_RECORDED_IDENTIFIER: usize = 2048;
+
+/// A resource as an audit row records it: each value escaped and possibly cut short. It is a
+/// record of what the call named, kept apart from [`Resource`] so that it cannot be checked
+/// against a limit or mistaken for the resource that was.
+///
+/// The escaping is reversible: a backslash is written `\\`, so different values are recorded
+/// differently unless they were cut, which ends them with `…`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedResource {
+    /// The system, escaped and capped at 128 characters.
+    pub system: String,
+    /// The kind of thing within the system, escaped and capped at 128 characters.
+    pub kind: String,
+    /// Which one, escaped and capped at [`MAX_RECORDED_IDENTIFIER`] characters.
+    pub identifier: String,
+}
+
+/// The resources a call named, as an audit row records them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordedResources {
+    /// The resources the call named: see [`AuditRecord::resources`].
+    Named(Vec<RecordedResource>),
+    /// The tool could not say which resources the call names until it ran.
+    Unknown,
+}
 
 /// Allow or deny, as the audit record's decision column holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +141,21 @@ pub struct AuditRecord {
     pub connector: Option<ConnectorName>,
     /// The tool's classification, if the surface serves it.
     pub classification: Option<Classification>,
+    /// The resources the call named, or `unknown` when the tool could not say before it ran.
+    /// The caller chose them, through the arguments, so they are bounded:
+    ///
+    /// - Each resource once, in the order first named. A repeat is dropped, not counted.
+    /// - The first [`MAX_RECORDED_RESOURCES`] of those. When a resource denial names one that
+    ///   falls past them, it takes the place of the last, so the resource that caused the
+    ///   denial is always recorded.
+    /// - Each value escaped and capped, as [`RecordedResource`] says.
+    ///
+    /// These are what the call named, not what the decision checked. A call denied before the
+    /// resource check, or at one resource of several, still records the others it named.
+    pub resources: RecordedResources,
+    /// How many distinct named resources were left out of `resources`. Zero when none were.
+    /// Repeats are not counted.
+    pub resources_omitted: usize,
     /// Allow or deny.
     pub decision: DecisionKind,
     /// The kind of reason, for a denial. Unknown tool and tool not on this surface are told
@@ -300,6 +354,14 @@ pub async fn begin(
             tool,
         },
     };
+    let denied_resource = match &decided {
+        Decided::Deny {
+            reason: Reason::ResourceOutsideLimit(ResourceProblem::Outside { resource, .. }),
+            ..
+        } => Some(resource),
+        _ => None,
+    };
+    let (resources, resources_omitted) = recorded(&call.resources, denied_resource);
     let (tool, decision, reason, sentence) = match &decided {
         Decided::Allow(tool) => (Some(tool), DecisionKind::Allow, None, None),
         Decided::Deny {
@@ -324,6 +386,8 @@ pub async fn begin(
         tool: sentences::safe(call.tool.as_str(), sentences::MAX_RENDERED),
         connector: tool.map(|tool| tool.connector.clone()),
         classification: tool.map(|tool| tool.classification),
+        resources,
+        resources_omitted,
         decision,
         reason,
         sentence,
@@ -361,6 +425,40 @@ pub async fn begin(
             sentence,
         }),
     })
+}
+
+/// The resources as a row records them, and how many distinct ones were left out. See
+/// [`AuditRecord::resources`]. `denied` is the resource a resource denial names.
+fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResources, usize) {
+    let Resources::Named(named) = resources else {
+        return (RecordedResources::Unknown, 0);
+    };
+    let mut seen = BTreeSet::new();
+    let distinct: Vec<&Resource> = named
+        .iter()
+        .filter(|resource| seen.insert(*resource))
+        .collect();
+    let mut kept: Vec<&Resource> = distinct
+        .iter()
+        .copied()
+        .take(MAX_RECORDED_RESOURCES)
+        .collect();
+    if let Some(denied) = denied
+        && !kept.contains(&denied)
+    {
+        kept.truncate(MAX_RECORDED_RESOURCES - 1);
+        kept.push(denied);
+    }
+    let omitted = distinct.len().saturating_sub(kept.len());
+    let recorded = kept
+        .into_iter()
+        .map(|resource| RecordedResource {
+            system: sentences::safe(&resource.system, sentences::MAX_RENDERED),
+            kind: sentences::safe(&resource.kind, sentences::MAX_RENDERED),
+            identifier: sentences::safe(&resource.identifier, MAX_RECORDED_IDENTIFIER),
+        })
+        .collect();
+    (RecordedResources::Named(recorded), omitted)
 }
 
 enum Decided {

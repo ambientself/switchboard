@@ -91,6 +91,23 @@ its internal constructor's behavior. Otto's own unit tests cover that internal b
 New company-wide requirements belong in a separate future suite. They must not be smuggled
 into this baseline as failures against behavior the pinned Go gateway never implemented.
 
+Turn grants change format under
+[decision 0012](../docs/decisions/0012-what-a-turn-grant-binds.md). Until the pin moves to
+Otto's new format (#23), `mintGrant` in `harness_test.go` signs `v1` HMAC grants, which the
+Rust gateway never accepts, so the suite cannot run against the Rust target before then. At
+the re-pin, `mintGrant` signs with an Ed25519 key it generates, with `aud` naming the target
+under test, and the `grant_signature` guard in `mutation_check.py` is rewritten. The sixteen
+unverifiable-grant assertions carry over unchanged. The new grant checks (replay, audience,
+pod, clock skew, key rotation, currency and revocation) live in the separate company-wide
+group, not here.
+
+The Rust gateway will refuse to start with grant checking off outside a development build, a
+build with the `test-support` cargo feature (design section 12). That gate is not built yet; it
+comes with the Otto adapter (#22). Its conformance target is a development build, so the cases
+that start the gateway with grant checking off (`-insecure-no-turn-grant` for Otto's: the
+`audit_missing` and `audit_as_owner` boot refusals, and every case started without a grant) run
+against it as they do against Otto's.
+
 ## Checking that the tests can fail
 
 ```sh

@@ -21,9 +21,12 @@ use gateway_core::{
     Verdict, decide, list_tools,
 };
 
+use gateway_core::AuditRecord;
+use gateway_core::audit::{self, Begun, RecordedResources};
+
 use common::tool_name;
 use proptest::prelude::*;
-use proptest::sample::{select, subsequence};
+use proptest::sample::{Index, select, subsequence};
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
@@ -516,6 +519,294 @@ proptest! {
             prop_assert_eq!(Some(refusal.sentence()), row.sentence.as_deref());
         }
     }
+}
+
+/// Reverses the crate's escaping, written out here independently of it: `\\`, `` \` ``, `\n`,
+/// `\r`, `\t` and `\u{...}`. `None` if `text` is not something the escaping could produce.
+fn unescape(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            if !(character == ' ' || character.is_ascii_graphic()) || character == '`' {
+                return None;
+            }
+            out.push(character);
+            continue;
+        }
+        match chars.next()? {
+            '\\' => out.push('\\'),
+            '`' => out.push('`'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let hex: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// How many characters `character` takes once escaped.
+fn escaped_length(character: char) -> usize {
+    match character {
+        '`' | '\\' | '\n' | '\r' | '\t' => 2,
+        ' ' => 1,
+        c if c.is_ascii_graphic() => 1,
+        c => c.escape_default().count(),
+    }
+}
+
+/// Whether `recorded` is `raw` as a row should hold it: the whole of `raw`, or, when `raw` does
+/// not fit in `cap` characters once escaped, the longest beginning of it that does, marked
+/// with `…`.
+fn records(recorded: &str, raw: &str, cap: usize) -> Result<(), String> {
+    let (kept, cut) = match recorded.strip_suffix('…') {
+        Some(kept) => (kept, true),
+        None => (recorded, false),
+    };
+    let length = kept.chars().count();
+    if length > cap {
+        return Err(format!("{length} characters, more than {cap}"));
+    }
+    let back = unescape(kept).ok_or_else(|| format!("{recorded:?} is not escaped text"))?;
+    if !cut {
+        return if back == raw {
+            Ok(())
+        } else {
+            Err(format!("{recorded:?} reads back as {back:?}, not {raw:?}"))
+        };
+    }
+    if !raw.starts_with(&back) {
+        return Err(format!("{recorded:?} is not a beginning of {raw:?}"));
+    }
+    match raw[back.len()..].chars().next() {
+        Some(next) if length + escaped_length(next) > cap => Ok(()),
+        _ => Err(format!("{recorded:?} is cut where {raw:?} did not need it")),
+    }
+}
+
+/// A resource a call might name: often one the generated limits can hold, so that repeats and
+/// calls that pass the resource check are common, and otherwise arbitrary text, some of it
+/// longer than a row keeps.
+fn any_named_resource() -> impl Strategy<Value = Resource> {
+    // Long text is a short piece repeated, which is much cheaper to generate than long
+    // arbitrary text and reaches the caps just as well.
+    let long = |lengths: std::ops::Range<usize>| {
+        ("\\PC{1,4}|[\\x00-\\x7f]{1,4}|[\\x20-\\x7e]{1,4}", lengths)
+            .prop_map(|(piece, length)| piece.chars().cycle().take(length).collect::<String>())
+    };
+    let text = |lengths| prop_oneof![4 => "\\PC{0,40}|[\\x00-\\x7f]{0,40}", 1 => long(lengths)];
+    let arbitrary = (text(2040..2056), text(120..136), text(120..136)).prop_map(
+        |(identifier, system, kind)| Resource {
+            system,
+            kind,
+            identifier,
+        },
+    );
+    prop_oneof![select(resource_pool()), arbitrary]
+}
+
+/// Resources the generated limits never hold. [`widened`] adds all of them to every team's and
+/// group's limit, so that a call can name more distinct permitted resources than a row
+/// records.
+fn wide_pool() -> Vec<Resource> {
+    (0..100)
+        .map(|n| Resource {
+            system: "github".into(),
+            kind: "repository".into(),
+            identifier: format!("wide/{n}"),
+        })
+        .collect()
+}
+
+/// `world`, with every resource in [`wide_pool`] in every team's and group's limit.
+fn widened(mut world: World) -> World {
+    let limits = &mut world.data.limits;
+    for team in TEAMS {
+        let limit = limits.teams.entry(team.into()).or_default();
+        limit.extend(wide_pool());
+    }
+    for group in GROUPS {
+        let limit = limits.groups.entry(group.into()).or_default();
+        limit.extend(wide_pool());
+    }
+    world
+}
+
+/// The resources a call names: up to 249 drawn from [`wide_pool`], so that repeats are common
+/// and a call often names more distinct ones than a row records, with up to three from
+/// [`any_named_resource`] put in anywhere among them. Those are usually outside the limit, so
+/// a resource denial falls at any position, past the most a row records included.
+fn any_named_resources() -> impl Strategy<Value = Vec<Resource>> {
+    (
+        proptest::collection::vec(select(wide_pool()), 0..250),
+        proptest::collection::vec((any::<Index>(), any_named_resource()), 0..4),
+    )
+        .prop_map(|(mut named, others)| {
+            for (at, resource) in others {
+                let at = at.index(named.len() + 1);
+                named.insert(at, resource);
+            }
+            named
+        })
+}
+
+/// Each resource in `named` once, in the order first named.
+fn distinct(named: &[Resource]) -> Vec<&Resource> {
+    let mut distinct: Vec<&Resource> = Vec::new();
+    for resource in named {
+        if !distinct.contains(&resource) {
+            distinct.push(resource);
+        }
+    }
+    distinct
+}
+
+/// Writes the row for `call` in `world`, and returns it with the resource a resource denial
+/// named, if there was one.
+fn row_and_denied(world: &World, call: &CallContext) -> (AuditRecord, Option<Resource>) {
+    let store = common::MemoryStore::default();
+    let begun = common::ready(audit::begin(
+        &store,
+        decide(&world.snapshot(), call),
+        serde_json::Value::Null,
+        Default::default(),
+    ))
+    .unwrap();
+    let denied = match &begun {
+        Begun::Denied(refusal) => match refusal.reason() {
+            Reason::ResourceOutsideLimit(ResourceProblem::Outside { resource, .. }) => {
+                Some(resource.clone())
+            }
+            _ => None,
+        },
+        Begun::Allowed(_) => None,
+    };
+    (store.last(), denied)
+}
+
+proptest! {
+    /// Whatever resources a call names, the row records each distinct one once, in the order
+    /// first named, up to the most a row holds, with the one a resource denial names always
+    /// among them and the rest counted. Each recorded value reads back as the value named, or
+    /// as the longest beginning of it that fits, and carries no control character.
+    /// [`resource_calls_reach_the_cap_and_a_denial_past_it`] shows that the generated calls
+    /// reach the cap, the omitted count and a denial past the cap.
+    #[test]
+    fn named_resources_reach_a_row_as_named_and_never_raw(
+        world in world().prop_map(widened),
+        named in any_named_resources(),
+    ) {
+        let mut call = world.call();
+        call.resources = Resources::Named(named.clone());
+        let (row, denied) = row_and_denied(&world, &call);
+
+        let most = audit::MAX_RECORDED_RESOURCES;
+        let distinct = distinct(&named);
+        let mut expected: Vec<&Resource> = distinct.iter().copied().take(most).collect();
+        if let Some(denied) = &denied {
+            prop_assert!(distinct.contains(&denied), "the denial names a resource the call did not");
+            if !expected.contains(&denied) {
+                expected.truncate(most - 1);
+                expected.push(denied);
+            }
+        }
+
+        let RecordedResources::Named(recorded) = &row.resources else {
+            return Err(TestCaseError::fail("named resources were recorded as unknown"));
+        };
+        prop_assert_eq!(recorded.len(), expected.len());
+        prop_assert_eq!(row.resources_omitted, distinct.len() - expected.len());
+        for (recorded, raw) in recorded.iter().zip(expected) {
+            for (text, raw, cap) in [
+                (&recorded.system, &raw.system, 128),
+                (&recorded.kind, &raw.kind, 128),
+                (&recorded.identifier, &raw.identifier, audit::MAX_RECORDED_IDENTIFIER),
+            ] {
+                prop_assert!(!text.chars().any(char::is_control), "{text:?}");
+                if let Err(problem) = records(text, raw, cap) {
+                    return Err(TestCaseError::fail(problem));
+                }
+            }
+        }
+    }
+
+    /// Two different identifiers that fit are never recorded alike, and each reads back as
+    /// itself: the escaping can be reversed.
+    #[test]
+    fn different_identifiers_are_recorded_differently(
+        world in world(),
+        one in "\\PC{0,30}|[\\x00-\\x7f]{0,30}",
+        other in "\\PC{0,30}|[\\x00-\\x7f]{0,30}",
+    ) {
+        let record = |identifier: &str| {
+            let mut call = world.call();
+            call.resources = Resources::Named(vec![Resource {
+                system: "github".into(),
+                kind: "repository".into(),
+                identifier: identifier.into(),
+            }]);
+            match row_and_denied(&world, &call).0.resources {
+                RecordedResources::Named(mut recorded) if recorded.len() == 1 => {
+                    recorded.remove(0).identifier
+                }
+                resources => panic!("one named resource was recorded as {resources:?}"),
+            }
+        };
+        let (first, second) = (record(&one), record(&other));
+        prop_assert_eq!(unescape(&first), Some(one.clone()));
+        prop_assert_eq!(unescape(&second), Some(other.clone()));
+        prop_assert_eq!(first == second, one == other, "{:?} and {:?}", one, other);
+    }
+}
+
+/// The calls [`named_resources_reach_a_row_as_named_and_never_raw`] is given reach what it
+/// checks: an allowed call with resources left off its row, and resource denials for one
+/// first named inside and past the most a row records. Without this, the property's model of
+/// the cap could be wrong and still pass.
+#[test]
+fn resource_calls_reach_the_cap_and_a_denial_past_it() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = (world().prop_map(widened), any_named_resources());
+    let (mut allowed_with_omitted, mut denied_inside, mut denied_past) = (0, 0, 0);
+    for _ in 0..500 {
+        let (world, named) = strategy
+            .new_tree(&mut runner)
+            .expect("generate a call")
+            .current();
+        let mut call = world.call();
+        call.resources = Resources::Named(named.clone());
+        let (row, denied) = row_and_denied(&world, &call);
+        match denied {
+            None if row.decision == audit::DecisionKind::Allow && row.resources_omitted > 0 => {
+                allowed_with_omitted += 1;
+            }
+            None => {}
+            Some(denied) => {
+                let at = distinct(&named)
+                    .iter()
+                    .position(|resource| **resource == denied)
+                    .expect("the denial names a resource the call did not");
+                if at < audit::MAX_RECORDED_RESOURCES {
+                    denied_inside += 1;
+                } else {
+                    denied_past += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        allowed_with_omitted > 0 && denied_inside > 0 && denied_past > 0,
+        "allowed with resources omitted: {allowed_with_omitted}, denied inside the cap: \
+         {denied_inside}, denied past it: {denied_past}"
+    );
 }
 
 /// Arbitrary worlds, without opening, reach an allow and every kind of reason. Without this,
