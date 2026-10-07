@@ -370,8 +370,10 @@ These need a party other than the owner. The record holds as written while they 
 
 - **Detecting calls that went around the gateway,** by matching vendors' audit logs against
   this gateway's rows for credentials only it holds. The rows cannot yet support it: a tool
-  that checks its own scope records unknown resources, Otto's `gateway_audit` table has no
-  column for them, and Otto's Go gateway holds vendor credentials until it is retired. Revisit
+  that checks its own scope records unknown resources until it reports what it reached, which
+  [decision 0011](0011-resource-authorization-and-tool-assurance.md) requires before
+  milestone 4, Otto's `gateway_audit` table has no column for resources, and Otto's Go gateway
+  holds vendor credentials until it is retired. Revisit
   when a governed-path environment serves real data, and before milestone 5.
 - **Running the route check on a schedule, with alerts.** Revisit with the first real cluster.
 - **Anything that narrows the laptop gap:** managed client configuration, vendor limits on

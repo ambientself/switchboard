@@ -5,9 +5,11 @@ the owner accepted the recommendations (see the end). Settles Q18. Answers what
 [decision 0004](0004-verify-turn-grants-with-a-public-key.md) left open, and changes one of its
 consequences: the format change is made before stage 1, not with the cutover. Written against
 the 2026-10-04 amendment to [decision 0006](0006-what-the-decision-function-sees.md), the
-audit record's resource columns (pull request #30), and decisions 0009, 0010 and 0011 (pull
-requests #33, #31 and #32), accepted the same day. Amends 0006 again on 2026-10-07. None of
-the changes in Otto has been agreed with Otto's owners yet.
+audit record's resource columns (pull request #30, not yet merged), and decisions
+[0009](0009-audit-completion-receipts-and-recovery.md),
+[0010](0010-what-stops-an-agent-going-around-the-gateway.md) and
+[0011](0011-resource-authorization-and-tool-assurance.md), accepted the same day. Amends 0006
+again on 2026-10-07. None of the changes in Otto has been agreed with Otto's owners yet.
 
 ## Context
 
@@ -185,8 +187,11 @@ Otto.
 
 The check is made once, before the call runs. A failover during a side-effecting call does not
 stop it, so two control planes driving one session are made unlikely to act twice, not
-prevented from it. The receipts and idempotency keys of decision 0009 cover that window. Which
-grant fields scope an idempotency key is 0009's question (its Still open 8), not settled here.
+prevented from it. Decision 0009 states what is left of that window, under "What may be
+retried": its receipts cover a resend of the same call, and cover a turn replayed after a
+failover only if Otto's control plane sends a key that stays the same across replays, which
+is its Still open 8. Until Otto's owners agree such a key, two control planes can propose
+twice. Which grant fields scope an idempotency key is also 0009's question, not settled here.
 
 Reads and `tools/list` are not fenced. Otto's model broker already cuts a superseded control
 plane's turns off from the model, so their remaining tool calls are ones the sandbox makes
@@ -260,9 +265,11 @@ covers every tool not classified `read`. The adapter records all five as `write`
 
 The grant does not bind resources. A turn's calls are limited by the team's resource limits
 (check 6) and the connectors' own scope checks, as in Otto. Pull request #30 adds the resources
-a call named to its row, where the tool could say before it ran; there a tool that checks its
-own scope records `unknown`, and a row keeps at most 64. A per-turn resource list would need
-Otto to know at mint time every repository a turn may touch, and connectors that narrow by it.
+a call named to its row, at most 64. A tool that checks its own scope has no resources before
+it runs, and its row says `unknown` only until it reports what it reached when it finishes,
+which [decision 0011](0011-resource-authorization-and-tool-assurance.md) requires before
+milestone 4. A per-turn resource list would need Otto to know at mint time every repository a
+turn may touch, and connectors that narrow by it.
 
 ### Keys
 
@@ -388,12 +395,9 @@ run against the Rust target before the re-pin.
   binding and the currency check are live, alongside the receipts of decision 0009.
 - Decision 0004's open paragraph is answered and its requirement stands: Otto's cutover waits
   for the asymmetric signature. Its drain consequence changes: the format change is made
-  alone, before stage 1, and Otto's Go gateway verifies the new format. Decision 0010 says
-  the egress claim is best made with the signing change that 0004 tied to the cutover; that
-  change now comes before stage 1.
-- Decision 0009 sends fencing, and part of how an idempotency key is scoped, to Q18. Q18 is
-  settled here, so for fencing those pointers now mean this record. Which grant fields scope a
-  key stays open in 0009 (its Still open 8).
+  alone, before stage 1, and Otto's Go gateway verifies the new format.
+- Decision 0009 leaves fencing to this record. Which grant fields scope a key stays open in
+  0009 (its Still open 8).
 - From stage 3, every side-effecting Otto call through this gateway depends on Otto's resolver
   and fails closed when it does not answer. Decision 0003 accepted that for some Otto tools; it
   is now true of Otto's three `propose` tools, and of its two comment tools once decision

@@ -111,8 +111,10 @@ open question. Vendor research remains in [systems.md](systems.md).
   within those bounds, and its digest is recorded. Otto's calls of any tool not classified
   `read` are allowed only while Otto says the turn is current, which enforces the epoch and
   allows revoking one turn. Fencing is checked once, before each such call. A failover during
-  the call is not stopped, and the receipts of decision 0009 cover that window. Which grant
-  fields scope an idempotency key stays with decision 0009 (its Still open 8). Otto is asked to
+  the call is not stopped. Decision 0009's receipts cover a resend of the same call, and a
+  turn replayed after a failover only if Otto's control plane sends a key that stays the same
+  across replays; that key, and which grant fields scope it, stay with decision 0009 (its
+  Still open 8). Otto is asked to
   make the changes this needs; none has been agreed with Otto's owners yet, and what waits on
   them is listed in the decision. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
