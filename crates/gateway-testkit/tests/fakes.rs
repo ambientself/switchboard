@@ -9,8 +9,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{self, Answer, Begun, Completion, Outcome, RequestMetadata};
 use gateway_core::{
-    AuditGuard, CallContext, ConnectorName, CredentialError, CredentialSource, Principal,
-    RequestedTool, Resources, decide,
+    AuditGuard, CallContext, ConnectorName, CredentialError, CredentialHandle, CredentialSource,
+    Principal, Proved, RequestedTool, Resources, decide,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
@@ -53,8 +53,16 @@ fn guard_for(
     }
 }
 
-fn principal(fixture: &Fixture, caller: Caller) -> gateway_core::Proved<Principal> {
+fn principal(fixture: &Fixture, caller: Caller) -> Proved<Principal> {
     fixture.principal(caller).unwrap()
+}
+
+/// Asks `source` for the fixture connector's credential for `caller`, as a connector would.
+fn ask(
+    source: &FakeCredentialSource,
+    caller: &Proved<Principal>,
+) -> Result<CredentialHandle, CredentialError> {
+    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))
 }
 
 // --- Clocks ---------------------------------------------------------------------------------
@@ -409,17 +417,11 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
 #[test]
 fn credentials_are_labelled_by_connector_team_and_count_and_every_request_is_recorded() {
     let (fixture, source) = (fixture(), FakeCredentialSource::new());
-    let connector = ConnectorName::from("fixture");
     let team_a = principal(&fixture, Caller::TeamA);
     let team_b = principal(&fixture, Caller::TeamB);
     let user = principal(&fixture, Caller::UserInGroupG);
 
-    let label = |caller| {
-        block_on(source.credential_for(&connector, caller))
-            .unwrap()
-            .label()
-            .to_owned()
-    };
+    let label = |caller| ask(&source, caller).unwrap().label().to_owned();
     assert_eq!(label(&team_a), "fake-credential-for-fixture-team-a-1");
     assert_eq!(label(&team_b), "fake-credential-for-fixture-team-b-2");
     assert_eq!(label(&team_a), "fake-credential-for-fixture-team-a-3");
@@ -442,9 +444,8 @@ fn credentials_are_labelled_by_connector_team_and_count_and_every_request_is_rec
 #[test]
 fn a_credential_source_told_to_refuse_refuses_and_still_records_the_request() {
     let (fixture, source) = (fixture(), FakeCredentialSource::new());
-    let connector = ConnectorName::from("fixture");
     let caller = principal(&fixture, Caller::TeamA);
-    let ask = || block_on(source.credential_for(&connector, &caller));
+    let ask = || ask(&source, &caller);
 
     source.refuse_next();
     assert!(matches!(ask(), Err(CredentialError::Refused(_))));
