@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod budgets;
+mod check;
 mod schema;
 mod store;
 
@@ -36,6 +37,8 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct TestDatabase {
     server: Config,
     name: String,
+    /// Roles made for this test alone, dropped with the database.
+    roles: std::sync::Mutex<Vec<String>>,
 }
 
 impl TestDatabase {
@@ -53,7 +56,11 @@ impl TestDatabase {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let database = Self { server, name };
+        let database = Self {
+            server,
+            name,
+            roles: std::sync::Mutex::default(),
+        };
         {
             let _one_at_a_time = SETUP.lock().await;
             let server = connect(&database.server).await;
@@ -115,6 +122,51 @@ impl TestDatabase {
     pub(crate) fn store(&self, sizes: PoolSizes) -> PgAuditStore {
         PgAuditStore::connect(self.config_as(GATEWAY_ROLE), NoTls, sizes).unwrap()
     }
+
+    /// Makes a role of this test's own, with `attributes` as `CREATE ROLE` spells them, a
+    /// member of each of `member_of` (inheriting what they hold), and the dummy password.
+    /// Roles belong to the whole server, so a test that needs a role unlike the gateway's
+    /// makes one rather than changing the gateway's role under other tests. Dropped with the
+    /// database.
+    pub(crate) async fn new_role(&self, attributes: &str, member_of: &[&str]) -> String {
+        let role = {
+            let mut roles = self.roles.lock().unwrap();
+            let role = format!("{}_role_{}", self.name, roles.len());
+            roles.push(role.clone());
+            role
+        };
+        let _one_at_a_time = SETUP.lock().await;
+        let admin = self.admin().await;
+        admin
+            .batch_execute(&format!(
+                "CREATE ROLE {role} PASSWORD '{DUMMY_PASSWORD}' {attributes}"
+            ))
+            .await
+            .unwrap();
+        for group in member_of {
+            admin
+                .batch_execute(&format!("GRANT {group} TO {role}"))
+                .await
+                .unwrap();
+        }
+        role
+    }
+
+    /// A store connected as a new role with `attributes` that holds whatever the gateway's
+    /// role holds, through membership, and is a member of `also` besides.
+    pub(crate) async fn store_like_gateway(&self, attributes: &str, also: &[&str]) -> PgAuditStore {
+        let mut member_of = vec![GATEWAY_ROLE];
+        member_of.extend_from_slice(also);
+        let role = self
+            .new_role(&format!("LOGIN {attributes}"), &member_of)
+            .await;
+        self.store_as(&role)
+    }
+
+    /// A store connected as `role`.
+    pub(crate) fn store_as(&self, role: &str) -> PgAuditStore {
+        PgAuditStore::connect(self.config_as(role), NoTls, PoolSizes::default()).unwrap()
+    }
 }
 
 impl Drop for TestDatabase {
@@ -123,6 +175,7 @@ impl Drop for TestDatabase {
         // dropped from a thread with a runtime of its own.
         let server = self.server.clone();
         let name = self.name.clone();
+        let roles = std::mem::take(&mut *self.roles.lock().unwrap_or_else(|e| e.into_inner()));
         let dropped = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -132,12 +185,25 @@ impl Drop for TestDatabase {
                 let server = connect(&server).await;
                 server
                     .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-                    .await
+                    .await?;
+                // The database is gone, and with it everything granted in it. DROP OWNED
+                // revokes what a role holds on things the whole server shares, such as a
+                // setting, so the role can then be dropped.
+                let _one_at_a_time = SETUP.lock().await;
+                for role in roles {
+                    server
+                        .batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+                        .await?;
+                }
+                Ok::<(), tokio_postgres::Error>(())
             })
         })
         .join();
         if !matches!(dropped, Ok(Ok(()))) {
-            eprintln!("the test database {} was not dropped", self.name);
+            eprintln!(
+                "the test database {} or one of its roles was not dropped",
+                self.name
+            );
         }
     }
 }

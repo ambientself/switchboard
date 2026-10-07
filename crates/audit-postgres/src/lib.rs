@@ -8,6 +8,8 @@
 //! - [`PgAuditStore`] is the core's [`AuditStore`](gateway_core::AuditStore) on that table.
 //!   Begin and finish each keep a time budget ([`Budgets`]). Finish keeps trying, on a task of
 //!   its own, after its answer budget has passed, until a deadline.
+//! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
+//!   is as the store expects and the role it connects as can do no more than the store needs.
 //!
 //! What the database itself enforces, for the gateway's role:
 //!
@@ -34,6 +36,7 @@
 
 #![forbid(unsafe_code)]
 
+mod check;
 mod columns;
 mod migrate;
 mod store;
@@ -41,6 +44,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+pub use check::{BootCheckError, Problem};
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };

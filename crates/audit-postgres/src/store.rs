@@ -213,7 +213,8 @@ const LONGEST_PAUSE: Duration = Duration::from_secs(1);
 
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
-/// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE). The database assigns each row its
+/// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE), and call
+/// [`check_at_boot`](Self::check_at_boot) before serving. The database assigns each row its
 /// identifier and both its times.
 ///
 /// - Begin inserts the first half of a row and returns once the insert is committed. It has
@@ -238,7 +239,7 @@ pub struct PgAuditStore {
 impl PgAuditStore {
     /// A store that connects with `config` and `tls`, opening connections as they are first
     /// needed, with the default [`Budgets`]. Nothing connects here, so a database that is down
-    /// is found by the first call.
+    /// is found by the first call, or by [`check_at_boot`](Self::check_at_boot).
     ///
     /// Each session sets `synchronous_commit` to `on`, after any options `config` carries.
     pub fn connect<T>(
