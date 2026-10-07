@@ -92,9 +92,11 @@ operation might address any repository, Jira project or AWS account available to
   comment on pull requests and issues the gateway did not create, so they are `write` and are
   denied to Otto's callers. So is the hosted Atlassian server's
   `addOrEditJiraIssueComment`, which [systems.md](systems.md) lists to match `jira_comment`.
-  That loses parity with Otto's gateway (#12), and the conformance suite's cases that use
-  them become an expected difference (design section 18). A narrow, recorded exception is the
-  likely answer. Until one is recorded, they stay denied.
+  That loses parity with Otto's gateway (#12). The conformance suite's cases that use them
+  become an expected difference: the tool inventory, the comment case and write count in
+  `TestOriginalToolsAndBrokeredCredentials`, three scope and argument cases, and the
+  audit-finish and repeated-write tests (design section 18). A narrow, recorded exception is
+  the likely answer. Until one is recorded, they stay denied.
 - **Open: `propose` refusals inside a proxied server.** A `propose` tool refuses, when it runs,
   what the gateway did not create and what would act on its own. For a built-in tool that
   refusal is gateway code, tested and mutated like any guard. Whether a proxied server's own

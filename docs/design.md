@@ -568,23 +568,41 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
 - The suite does not yet cover the behavior of thirteen newer tools; see
   [otto-baseline.md](otto-baseline.md). Otto's control-plane endpoints stay in Otto, so the
   suite covers the vendor actions they will call once those are defined, not the endpoints.
-- **The comment tools are an expected difference.** The suite's tool inventory requires
-  `github_pr_comment` and `jira_comment` to be served. It uses `github_pr_comment` in its scope
-  refusals, and as the one write in the tests that a failed audit finish does not undo a write
-  and that a repeated write is made twice. Under section 8 the Rust gateway denies Otto's
-  comment tools to Otto's callers, so these cases cannot pass against it until Q9 settles an
-  exception. When the suite is extended in milestone 4, they go in a group of expected
-  differences, and the two audit tests are also run with a `propose` tool against the Rust
-  gateway. This is a difference in policy, not a mapping.
+- **Classifications are mapped.** The suite compares the classification each tool is served
+  and recorded with: in the tool inventory, and in the provenance and audit row of each call
+  in the brokered-credentials test. It pins `write` for `github_create_pr`,
+  `github_propose_change` and `github_amend_change`, which are `propose` here. The Otto
+  adapter reports and records `propose` as `write` (decision 0006), so these checks pass
+  through that mapping, like the tool-name mapping. They are not expected differences.
+- **The comment tools are an expected difference.** Under section 8 the Rust gateway denies
+  `github_pr_comment` and `jira_comment` to Otto's callers, so the suite's cases that use them
+  cannot pass against it until Q9 settles an exception. They are:
+  - the tool inventory, which requires both to be served;
+  - `TestOriginalToolsAndBrokeredCredentials`, which calls `github_pr_comment` as an allowed
+    call, checks its confirmation, and requires exactly two writes, the comment's among them;
+  - the three cases in `TestScopeRefusalsAndArgumentErrors` that use `github_pr_comment`:
+    another organization, an Atlantis command, and an empty body;
+  - `TestAuditFinishFailureDoesNotUndoSuccess` and `TestRepeatedCommentIsWrittenTwice`, where
+    it is the only write.
+
+  When the suite is extended in milestone 4, these go in a group of expected differences, and
+  their coverage is kept. In the brokered-credentials test only the comment case and the
+  write count move; its `github_create_pr` case still runs against the Rust gateway, with the
+  token-scope checks and the check that the pull request is opened as a draft. The two audit
+  tests are also run with a `propose` tool. The Atlantis command refusal is the guard a
+  `propose` comment tool needs, and is tested as section 8 says. The brokered-credentials test
+  calls a comment a proposal write ("non-proposal write"); that is Otto's definition, not this
+  gateway's. This is a difference in policy, not a mapping.
 - How quickly a change can be checked is planned in [feedback-loops.md](feedback-loops.md).
 - `conformance/mutation_check.py` breaks guards in the pinned gateway and requires the named
   test to fail. It is run after every re-pin.
 - Each invariant in section 16 gets a test that is shown to fail when its guard is removed.
   Where the guard is a type, the test is a compile-fail test.
-- A `propose` tool's run-time refusals (section 8) are guards. Its connector has a test
-  against the fake vendor that fails without each one, and a mutation that removes it. Where
-  such a refusal would sit inside a proxied server, the gateway cannot test it this way;
-  whether it can still make the tool `propose` is part of Q9.
+- A `propose` tool's run-time guards (section 8), refusals and forced values such as a draft,
+  are guards like any other. Its connector has a test against the fake vendor that fails
+  without each one, and a mutation that removes it. Where such a guard would sit inside a
+  proxied server, the gateway cannot test it this way; whether it can still make the tool
+  `propose` is part of Q9.
 - Audit store tests use a real Postgres. Everything else, including end-to-end tests of the
   gateway, runs on the in-memory fakes with no database.
 
