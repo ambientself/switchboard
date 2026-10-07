@@ -26,8 +26,7 @@ The team that benefits from an entry never accepts it alone. The security team h
 named the security owner, so entries the owner has accepted are marked as awaiting that
 signature.
 
-Every entry is reviewed every 90 days, and before each milestone's rollout, whichever comes
-first.
+Every entry is reviewed every 90 days, and before each milestone's rollout.
 
 ## Routes around the gateway
 
@@ -37,13 +36,16 @@ the gateway accepted.
 ### Otto's Go gateway
 
 - **Environment:** Otto sandboxes.
-- **Route:** Otto's Go gateway serves the tools not yet moved to this gateway.
-- **Breaks:** none. It decides and audits, under Otto's rules, and its rows are in Otto's
-  `gateway_audit` table, not this gateway's.
-- **What an agent could do:** call the tools the Go gateway still serves.
+- **Route:** Otto's Go gateway serves the tools not yet moved to this gateway, writes
+  included, with Org's authority.
+- **Breaks:** 2. It is a second route, outside this gateway's decision and audit. It decides
+  and audits under Otto's rules, and its rows are in Otto's `gateway_audit` table, not this
+  gateway's. While its MCP path serves any tool, no Otto turn has the only path, and decision
+  0006's denial of `write` and `destructive` does not bind the calls it serves.
+- **What an agent could do:** call the tools the Go gateway still serves, writes included.
 - **Why accepted:** the cutover is staged
   ([decision 0002](decisions/0002-replace-ottos-mcp-gateway.md)).
-- **Owner:** this project and Otto.
+- **Owner:** this project, and Otto once Otto's owners agree.
 - **Accepted:** by the owner, 2026-10-07. Awaiting the security owner's signature.
 - **Next review:** 2027-01-05.
 - **Ends when:** the Go gateway's MCP path is retired.
@@ -59,9 +61,10 @@ the gateway accepted.
   token, directly. Git over HTTPS to `github.com` can push.
 - **Why accepted:** turns with egress open need public hosts for toolchain fetches (Otto's
   ADR-0010).
-- **Owner:** Otto.
-- **Accepted:** not yet. Otto's owners decide, under issue 21, whether the proxy refuses these
-  hosts, and whether they or this project accept this entry.
+- **Owner:** Otto, once Otto's owners agree. Until then, this project.
+- **Accepted:** not yet. Otto's owners decide whether the proxy refuses these hosts, and
+  whether they own this entry. Nothing has been raised with them yet. This project's owner
+  accepts the entry, with the security owner's signature.
 - **Next review:** 2027-01-05.
 - **Ends when:** the proxy refuses every host that accepts a target system's credential, by
   resolved address as well as by name, or each hard case (`github.com`, AWS) has an entry of
@@ -76,10 +79,12 @@ the gateway accepted.
 - **What an agent could do:** obtain credentials for that role. What they authorize rests on
   the role having no policy, and on no resource policy granting it anything.
 - **Why accepted:** not yet decided. Otto is asked to remove the association and its rule.
-- **Owner:** Otto.
+- **Owner:** Otto, once Otto's owners agree. Until then, this project.
 - **Accepted:** not yet. If Otto keeps the association, this entry needs evidence from outside
-  the sandbox: the role's policies, a permissions boundary or service control policy that
-  denies everything, and an IAM Access Analyzer finding.
+  the sandbox: the role's policies, and a permissions boundary or service control policy that
+  explicitly denies everything. An explicit deny overrides any allow in a resource policy. IAM
+  Access Analyzer's external-access findings cannot show that, because they cover only access
+  from outside the account or organization.
 - **Next review:** 2027-01-05.
 - **Ends when:** the association and its rule are removed.
 
@@ -93,7 +98,7 @@ the gateway accepted.
   gateway deciding or auditing it.
 - **Why accepted:** decision 0003 is scoped to the vendor actions it moves to the gateway
   (noted on 2026-10-07).
-- **Owner:** Otto.
+- **Owner:** Otto, once Otto's owners agree. Until then, this project.
 - **Accepted:** by the owner, 2026-10-07. Awaiting the security owner's signature.
 - **Next review:** at each re-pin of Otto, from the credentials each control-plane component
   mounts, and by 2027-01-05.
@@ -108,8 +113,10 @@ the gateway accepted.
 - **What an agent could do:** whatever the employee can, with nothing recorded by the gateway.
 - **Why accepted:** that access is granted by vendors and IT, and device management is out of
   scope. Employees are told the gateway is "the governed path".
-- **Owner:** IT security.
-- **Accepted:** not yet. IT security accepts it before milestone 5's rollout.
+- **Owner:** IT security, once it agrees. Until then, this project.
+- **Accepted:** not yet. This project's owner accepts it, with the security owner's signature,
+  before milestone 5's rollout. Milestone 5 does not roll out until IT security owns it and it
+  is accepted.
 - **Next review:** before milestone 5's rollout.
 - **Ends when:** not under decision 0010.
 
@@ -123,8 +130,10 @@ the gateway accepted.
   gateway.
 - **Why accepted:** they are part of the employee's client and provider account, which IT
   manages.
-- **Owner:** IT security.
-- **Accepted:** not yet. IT security accepts it before milestone 5's rollout.
+- **Owner:** IT security, once it agrees. Until then, this project.
+- **Accepted:** not yet. This project's owner accepts it, with the security owner's signature,
+  before milestone 5's rollout. Milestone 5 does not roll out until IT security owns it and it
+  is accepted.
 - **Next review:** before milestone 5's rollout.
 - **Ends when:** the client or provider account can switch them off, and does.
 
@@ -146,8 +155,9 @@ the gateway accepted.
 
 - **Environment:** every cluster.
 - **Route:** `kubectl port-forward` and `exec` reach a pod past network policy.
-- **Breaks:** 2, for anyone holding those permissions. The route check shows the workload's
-  own ServiceAccount does not.
+- **Breaks:** 2, for anyone holding those permissions. The route check shows, by
+  SubjectAccessReview, that the workload's own ServiceAccount holds neither `pods/portforward`
+  nor `pods/exec`.
 - **What an agent could do:** nothing, unless it is given those permissions.
 - **Why accepted:** cluster operators need them.
 - **Owner:** each cluster's owner. This project for the kind cluster. For real clusters,

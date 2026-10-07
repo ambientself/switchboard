@@ -5,7 +5,10 @@ Q1–Q8, Q14–Q17 and Q19 are settled below. Q9–Q13 and Q18 are open. When re
 
 ## Settled
 
-- **2026-09-30:** The gateway is the one MCP path for Org. Otto is one caller of it.
+- **2026-09-30:** The gateway is the one MCP path for Org. Otto is one caller of it. Noted on
+  2026-10-07: scoped by
+  [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md) to a claim
+  per environment, "the only path" or "the governed path".
 - **2026-09-30:** Target systems are GitHub, Atlassian, New Relic, Sumo Logic, Akamai, AWS and
   self-built MCP servers. See [systems.md](systems.md).
 - **2026-09-30:** Both built-in connectors and proxied servers are needed, because self-built
@@ -74,8 +77,9 @@ Q1–Q8, Q14–Q17 and Q19 are settled below. Q9–Q13 and Q18 are open. When re
 - **2026-10-07 (Q17):** Each environment that serves agents carries "the only path" or "the
   governed path". The only path needs three controls, shown by dated evidence from inside the
   environment with a positive control in the same run. The first slice in kind is the only path
-  to the mock server. Real services and Otto's sandboxes start on the governed path, and a real
-  workload passes the route check before it sees real data. Laptops stay on the governed path.
+  to the mock server once the kind run's evidence is current. Real services and Otto's
+  sandboxes start on the governed path, and a real workload passes the route check before it
+  sees real data. Laptops stay on the governed path.
   Known routes around the gateway, with owners, are in [route-exceptions.md](route-exceptions.md).
   What Otto, IT, the security team and platform owners decide is listed in the record. See
   [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md).
@@ -199,9 +203,7 @@ fencing epoch and does not yet enforce it. Any accepted arguments are allowed fo
 tool.
 
 - **Recommendation:** add the issuer, the gateway and deployment it is for, and a unique
-  identifier; keep expiry short. Carry the turn's egress setting, so the audit row can tell a
-  sealed turn from one with egress open
-  ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). Enforce the epoch. Decide whether a grant may be presented
+  identifier; keep expiry short. Enforce the epoch. Decide whether a grant may be presented
   more than once: a turn makes many calls, so the likely answer is yes within one turn, with
   the identifier recorded so reuse elsewhere is detectable. Test replay, use against another
   deployment, clock skew, key rotation and emergency revocation.

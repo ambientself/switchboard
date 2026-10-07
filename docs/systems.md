@@ -62,8 +62,10 @@ confirm" step below also records, with its source:
 - whether sign-in to the vendor's hosted MCP server can be restricted.
 - whether the vendor's audit log attributes actions to the gateway's credential.
 
-A self-built server identifies the gateway by a token for the gateway's own workload identity,
-with the server as audience, accepted for the gateway's subject only, never by source address.
+A self-built server identifies the gateway by a token for one of the gateway's own workload
+identities, with the server as audience. It accepts only those identities, one for each
+deployment and one for each team service identity registered for it, never a source address
+or any other subject.
 
 ## Summary
 
@@ -78,7 +80,7 @@ with the server as audience, accepted for the gateway's subject only, never by s
 | Akamai | Configuration and delivery data. | Built-in, reads only. | Yes, EdgeGrid API client. | Yes, per API. |
 | Salesforce | Read records. | Not yet. | No for the hosted server. Yes for the REST API. | Yes. |
 | MongoDB Atlas | Read cluster and collection data. | Proxy the vendor's hosted server. | Yes, service account. | Yes. |
-| Self-built | Whatever an Org team exposes. | Proxied, by definition. | The server accepts the gateway's own workload token, with the server as audience, for the gateway's subject only (decision 0010). Milestone 3 builds it. | Each tool's classification is assigned by a person. |
+| Self-built | Whatever an Org team exposes. | Proxied, by definition. | The server accepts only the gateway's own workload identities, by a token with the server as audience (decision 0010). Milestone 2 builds the first, for the mock server. | Each tool's classification is assigned by a person. |
 
 "Service identity: yes" is what the vendor documents. It stays unproven until the test named in
 each section has been run.
