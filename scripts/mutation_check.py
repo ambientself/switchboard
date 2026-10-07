@@ -804,9 +804,10 @@ mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measure
 mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
        "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
        "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
-mutate("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer", V,
-       "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
-       "                Err(unfit) => {\n                    return Err(unfit.error(issuer, kid, config.algorithm));\n                }")
+mutate_all("identity-config-unfit-key-refuses-issuer", "one key that cannot verify refuses its whole issuer",
+           (V, "                Err(unfit) => {\n                    first_unfit.get_or_insert((kid, unfit));\n                }",
+            "                Err(unfit) => {\n                    return Err(unfit.error(issuer.clone(), kid, config.algorithm));\n                }"),
+           (V, "        let mut first_unfit = None;\n", "        let mut first_unfit: Option<(String, Unfit)> = None;\n"))
 mutate("identity-config-no-usable-key-allowed", "an issuer none of whose keys can verify is configured", V,
        "        if keys.is_empty() {", "        if keys.is_empty() && first_unfit.is_none() {")
 mutate("identity-config-last-unfit-key-reported", "the last key that cannot verify is reported, not the first", V,
