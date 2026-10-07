@@ -230,13 +230,25 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
 - **Audit operations:** assign storage/migration ownership, retention, access controls and
   redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
   payloads. Define availability and latency targets and measure audit overhead against them.
+  A row's recorded resources alone can reach 147,648 escaped characters, which serialize to
+  298,059 bytes as JSON ([design.md](design.md), section 11). Set size limits in the units the
+  store counts.
+- **Otto's audit table:** Otto's `gateway_audit` table has no column for the resources an
+  allowed call names. A denial's or refusal's sentence names the one resource that caused it,
+  as prose capped at 1,024 characters. `github_skill_body` records its skill ref, repository
+  and commit, but only on an allowed call, on the best-effort finish write. Decide whether the
+  table gains a general column, and who adds it.
+  [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md) makes the table's contract a
+  compatibility requirement, so adding a column changes it. Otto's rule for this table, stated
+  in its migration 0036, is typed columns and not one JSONB bag, so a new column must be
+  typed. Otto's writer bounds each text column in bytes.
 - **Deferred here by decision 0009:** the begin budget, the answer budget and the finish
   deadline (two, two and thirty seconds until then), call deadlines, pool sizes and alert
   thresholds; how long rows, receipts and resolution records are kept; and who owns the audit
   and receipt schema, its grants, triggers and migrations. How long telemetry is kept is for
-  whoever runs logging (decision 0009, Still open 3). An authentication flood
-  no longer writes to the audit store, so the overload question is reduced to begins from
-  proved callers.
+  whoever runs logging (decision 0009, Still open 3). An authentication flood no longer
+  writes to the audit store, so the overload question is reduced to begins from proved
+  callers.
 - **Blocks:** rollout sequencing and production readiness.
 
 ## Q13. Which employee clients and access infrastructure are the acceptance targets?

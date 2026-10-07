@@ -10,11 +10,11 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use gateway_core::audit::{self, Begun, DecisionKind, RequestMetadata};
+use gateway_core::audit::{self, Begun, DecisionKind, MAX_RECORDED_RESOURCES, RequestMetadata};
 use gateway_core::{
     AuditRecord, CallContext, CallerContext, Claimed, Delegation, DeploymentName, PolicySnapshot,
-    Principal, ProfileName, ReasonKind, RequestedTool, Resources, SnapshotData, SurfaceName,
-    TeamId, ToolName, WasProved, decide, list_tools,
+    Principal, ProfileName, ReasonKind, RequestedTool, Resource, Resources, SnapshotData,
+    SurfaceName, TeamId, ToolName, WasProved, decide, list_tools,
 };
 use serde::Deserialize;
 
@@ -49,7 +49,7 @@ struct Caller<'a> {
     surface: &'a SurfaceName,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Case {
     name: String,
@@ -99,7 +99,7 @@ impl ListCase {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
 enum Expected {
     Allow,
@@ -213,6 +213,30 @@ fn expected_row(
         "tool": escape(case.tool.as_str()),
         "connector": served.as_ref().map(|tool| tool.connector.clone()),
         "classification": served.as_ref().map(|tool| tool.classification),
+        // Each resource once, in the order first named. No case names more distinct resources
+        // than a row records, so none are omitted; a case that did would be refused here.
+        "resources": match &case.resources {
+            Resources::Unknown => serde_json::json!("unknown"),
+            Resources::Named(named) => {
+                let mut distinct: Vec<&Resource> = Vec::new();
+                for resource in named {
+                    if !distinct.contains(&resource) {
+                        distinct.push(resource);
+                    }
+                }
+                assert!(
+                    distinct.len() <= MAX_RECORDED_RESOURCES,
+                    "case `{}` names more distinct resources than a row records",
+                    case.name
+                );
+                serde_json::json!({ "named": distinct.iter().map(|resource| serde_json::json!({
+                    "system": escape(&resource.system),
+                    "kind": escape(&resource.kind),
+                    "identifier": escape(&resource.identifier),
+                })).collect::<Vec<_>>() })
+            }
+        },
+        "resources_omitted": 0,
         "decision": decision,
         "reason": reason,
         "sentence": sentence,
@@ -227,14 +251,85 @@ fn expected_row(
 }
 
 /// The table's own escaping, written out independently of the crate's: the only characters
-/// the table uses that need it are newlines and backticks.
+/// the table uses that need it are backslashes, newlines and backticks.
 fn escape(text: &str) -> String {
-    text.replace('`', "\\`").replace('\n', "\\n")
+    text.replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace('\n', "\\n")
 }
 
 #[test]
 fn every_decision_case_holds() {
     let (world, cases, _) = load();
+    let failures = check_cases(&world, &cases);
+    assert!(
+        failures.is_empty(),
+        "{} of {} decision cases failed:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+}
+
+/// A call can name any number of resources, and a row records at most
+/// [`MAX_RECORDED_RESOURCES`] distinct ones. The decision is not bounded the same way: these
+/// cases, made from the table's own, name a resource many times over and put the one outside
+/// the limit past the most a row records. Each is checked like a table case, row included.
+#[test]
+fn resources_past_what_a_row_records_are_still_decided() {
+    let (world, cases, _) = load();
+    let find = |name: &str| {
+        cases
+            .iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("the table has no case `{name}`"))
+    };
+    let allowed = find("otto read inside the team's limit is allowed");
+    let outside = find("another team's repository is outside the limit");
+    let named = |case: &Case| match &case.resources {
+        Resources::Named(named) if named.len() == 1 => named[0].clone(),
+        _ => panic!("case `{}` does not name one resource", case.name),
+    };
+    let (inside, beyond) = (named(allowed), named(outside));
+    let padded = vec![inside.clone(); MAX_RECORDED_RESOURCES * 2];
+
+    let mut repeated = padded.clone();
+    repeated.push(inside.clone());
+    let mut denied = padded.clone();
+    denied.push(beyond.clone());
+    let mut denied_then_more = padded;
+    denied_then_more.extend([beyond.clone(), inside, beyond]);
+
+    let made: Vec<Case> = [
+        (
+            allowed,
+            "a resource repeated past what a row records is allowed",
+            repeated,
+        ),
+        (
+            outside,
+            "a resource outside the limit is denied past what a row records",
+            denied,
+        ),
+        (
+            outside,
+            "a resource outside the limit is denied however much follows it",
+            denied_then_more,
+        ),
+    ]
+    .into_iter()
+    .map(|(from, name, resources)| Case {
+        name: name.to_owned(),
+        resources: Resources::Named(resources),
+        ..from.clone()
+    })
+    .collect();
+    let failures = check_cases(&world, &made);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Runs each case the whole way, and describes every one that fails.
+fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
     let mut failures = Vec::new();
     for (index, case) in cases.iter().enumerate() {
         let (snapshot, caller) = match world.caller(case.caller()) {
@@ -280,7 +375,7 @@ fn every_decision_case_holds() {
             continue;
         }
         let rows = store.rows();
-        let want = expected_row(&world, snapshot, case, &metadata);
+        let want = expected_row(world, snapshot, case, &metadata);
         if rows != [want.clone()] {
             failures.push(format!(
                 "case `{}`: the audit row is wrong\n    expected {want:?}\n    got      {rows:?}",
@@ -288,13 +383,7 @@ fn every_decision_case_holds() {
             ));
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{} of {} decision cases failed:\n{}",
-        failures.len(),
-        cases.len(),
-        failures.join("\n")
-    );
+    failures
 }
 
 #[test]

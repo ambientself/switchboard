@@ -597,6 +597,29 @@ written complete, has no finish, and is never open.
   the decision for a call it already knows about. Otto's does. The MCP specification defines
   no such identifier: Claude Code sends `claudecode/toolUseId` in `_meta`, and other clients
   may send none.
+- **The resources a call names are recorded,** so "who reached this repository" can be
+  answered from the rows, for allowed calls as well as denials. The row holds what the call
+  named, not only what the decision checked: a call denied before the resource check still
+  records them. A tool that checks its own scope may record `unknown` here, until it reports
+  what it reached (below). A row that counts omitted resources cannot rule a resource out, so
+  a query for who reached one must treat such rows as possible matches.
+- **Recorded resources are bounded,** because the caller chooses them through its arguments.
+  Each resource is kept once, in the order first named, so repeating one cannot push another
+  off the row. A row keeps at most 64 and counts the rest, and the resource a denial names is
+  always kept. Each value is escaped so that it can be read back: a backslash is escaped too.
+  A system and a kind are capped at 128 characters, like the tool name. An identifier is
+  capped at 2,048, the longest an AWS ARN can be, so that each identifier length checked in
+  [systems.md](systems.md#identifier-lengths) fits whole. Only AWS, MongoDB, Sumo Logic,
+  Confluence and GitHub were checked, and a self-built server's identifiers have no
+  documented bound. Escaping lengthens non-ASCII text, so an identifier with much of it can
+  still be cut; a cut value ends with `…`.
+- **A row's recorded resources are at most 147,648 characters:** 64 resources, each with a
+  129-character system and kind and a 2,049-character identifier, the `…` included. That
+  counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
+  quotes again, so as JSON they reach 297,675 characters, or 298,059 bytes, since `…` takes 3
+  bytes. Any call that gets a row can reach this, a denial included, and the row is written
+  before the tool runs. The size limits and audit latency targets in Q12 must cover a row this
+  large, counted as the store counts it.
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **Proved and claimed are separate columns.**
 - **No foreign key to anything a caller owns,** so a caller's data retention cannot delete its
@@ -669,11 +692,17 @@ before more callers are added. Reads are written synchronously on Q4's acceptanc
 compliance says what it requires of read auditing (Q10). An audit row is not an idempotency
 record; receipts are (below).
 
-For Otto's callers the row must match the existing `gateway_audit` table. That table's
-classification column allows only `read`, `write` and `destructive`, so Otto's adapter records
-a `propose` tool as `write` there, an explicit mapping like its tool names. The table has no
-`unknown` and no `duplicate`: the adapter writes `unknown` as an empty outcome, never `error`,
-and `duplicate` as `ok`, since the effect exists.
+For Otto's callers the row must match the existing `gateway_audit` table. That table has no
+column for the resources an allowed call names. A denial's or refusal's sentence names the one
+resource that caused it, as prose capped at 1,024 characters (`deny_reason`, `refusal_reason`).
+`github_skill_body` also records the skill ref it was asked for (`skill_ref_requested`) and the
+repository and commit it read (`skill_repo`, `skill_commit`), but only on an allowed call, and
+those columns travel on the finish write, which Otto makes best-effort. Whether the table gains
+a general column, and who adds it, is open (Q12). The table's classification column allows only
+`read`, `write` and `destructive`, so Otto's adapter records a `propose` tool as `write` there,
+an explicit mapping like its tool names. The table has no `unknown` and no `duplicate`: the
+adapter writes `unknown` as an empty outcome, never `error`, and `duplicate` as `ok`, since
+the effect exists.
 
 **What Rust adds.** The begin step returns a guard value that the tool-running code requires
 as an argument, so a call path that skips the audit write does not compile.
