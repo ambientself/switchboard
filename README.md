@@ -17,12 +17,14 @@ Gateway
 `752395a` (re-pinned 2026-10-01). It covers Otto's contract only, and not all of it; the
 gaps are listed in [docs/otto-baseline.md](docs/otto-baseline.md). The Rust gateway's policy
 core exists (`crates/gateway-core`: the decision function, its table of cases and the audit
-record type). The gateway serves MCP over HTTP in both revisions (`crates/gateway`), but only
-on test fakes: it has no durable audit store and no real connectors yet. The Postgres audit
-store (`crates/audit-postgres`), the registry (`crates/gateway-registry`), the proxy
-connector (`crates/connector-proxy`) and a mock document server exist as crates, and the
-demo's deployment is in [deploy/](deploy/README.md), but the `switchboard` binary does not
-use them yet.
+record type). The gateway serves MCP over HTTP in both revisions (`crates/gateway`). The
+`switchboard` binary runs the first slice (decision 0008) from files: identity from
+configured issuers' keys and a team manifest, policy and tool definitions from the registry
+file (`crates/gateway-registry`, reloaded when it changes), audit rows in Postgres
+(`crates/audit-postgres`), and calls forwarded by the proxy connector
+(`crates/connector-proxy`) with the gateway's own credential. The demo's deployment, against a
+mock document server, is in [deploy/](deploy/README.md): `deploy/demo/demo.sh compose` and
+`deploy/demo/demo.sh kind` run it. It runs from an unmerged branch; see the deploy README.
 
 Run the baseline with `python3 conformance/run.py --otto-source /path/to/otto`.
 See [conformance setup and coverage](conformance/README.md).

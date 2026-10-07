@@ -316,3 +316,23 @@ fn the_server_bearer_check_admits_only_the_gateways_credential() {
         run.transcript()
     );
 }
+
+#[test]
+fn the_outage_step_counts_only_requests_mock_docs_accepted() {
+    // The health checks run every 2 s and carry no bearer; were they counted, the count before
+    // and after the outage would differ whatever the gateway did.
+    require(&["jq"]);
+    let lines = [
+        r#"{"event":"request","http_method":"GET","path":"/mcp","bearer_sha256":null,"accepted":false}"#,
+        r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#,
+        r#"{"event":"boot","listen":"0.0.0.0:8080"}"#,
+        r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"aaaaaaaaaaaa","accepted":false}"#,
+        r#"{"event":"request","http_method":"GET","path":"/mcp","bearer_sha256":null,"accepted":false}"#,
+        r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#,
+    ];
+    let run = sourced(&format!(
+        "dc() {{ printf '%s\\n' '{}'; }}\nmock_docs_requests",
+        lines.join("\n")
+    ));
+    assert_eq!(run.stdout.trim(), "2", "{}", run.transcript());
+}

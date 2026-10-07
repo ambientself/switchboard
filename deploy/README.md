@@ -76,8 +76,20 @@ check that the deployment files load.
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
 | mock-docs | `mock-docs-server`, configured by environment: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`. |
-| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources` (jsonb), `decision`, `reason`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. |
+| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. Its `resources` column stays empty until the core's audit record carries resources (PR #30), so the driver checks a denial by its sentence, which names the project. |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
+
+## What a run shows that is not settled
+
+- **A row can outlive a refused call.** In the database outage step the gateway refuses the
+  call after its 2 s begin budget, and nothing runs. The store cancels its insert, but the
+  cancel cannot reach a paused server either; once Postgres is unpaused the insert commits.
+  The table then holds an `allow` row with no outcome for a call that was refused and never
+  ran (`at` within the outage, `outcome` empty). Decision 0009's open-row work (a deadline
+  column, gateway-assigned identifiers) is what tells such a row apart; it is deferred until
+  #29 and #30 merge.
+- **It runs from an unmerged branch.** `agent/first-slice` stacks #25, #26, #10, #14 and #9
+  work that has not been merged. It does not contain the #25 harness's latest head or #29.
 
 ## Not done here
 

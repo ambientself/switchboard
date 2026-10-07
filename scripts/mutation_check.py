@@ -1061,9 +1061,14 @@ mutate("gw-catalog-schema-not-checked", "an input schema that is not an object s
 mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
        "        if !connectors.contains_key(&tool.connector) {", "        if false && !connectors.contains_key(&tool.connector) {")
 mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice keeps the last one", BOOT,
+       "    for (name, registered) in registrations {\n"
        "        if connectors.insert(name.clone(), registered).is_some() {\n"
        "            return Err(BootError::DuplicateConnector(name));\n        }\n",
-       "        connectors.insert(name, registered);\n")
+       "    for (name, registered) in registrations {\n        connectors.insert(name, registered);\n")
+mutate("gw-boot-registry-duplicate-connector-accepted", "a proxied connector registered twice keeps the last one", BOOT,
+       "        };\n        if connectors.insert(name.clone(), registered).is_some() {\n"
+       "            return Err(BootError::DuplicateConnector(name));\n        }\n",
+       "        };\n        connectors.insert(name, registered);\n")
 
 # Profile selection: the rules, and the checks on them at boot.
 mutate("gw-selector-first-group-only", "only the user's first group selects a profile", SELECTOR,
@@ -1107,7 +1112,7 @@ mutate_all(
 
 GW_PATH = GW + "path.rs"
 LIST_SURFACE = (
-    "self.entries(snapshot.surface(&surface).map(|surface| surface.tools.iter()"
+    "entries(&self.inner.gates.policy(), snapshot.surface(&surface).map(|surface| surface.tools.iter()"
     ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
 )
 
@@ -1156,8 +1161,8 @@ mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tool
        "            let snapshot = self.inner.gates.snapshot();\n"
        f"            return {LIST_SURFACE};\n        }};\n")
 mutate("gw-list-unfiltered", "tools/list returns every tool on the surface, undecided", GW_PATH,
-       "        let caller = self.caller_context(principal, surface);\n"
-       "        self.entries(list_tools(self.inner.gates.snapshot(), &caller))\n",
+       "        let caller = self.caller_context(&policy, principal, surface);\n"
+       "        entries(&policy, list_tools(policy.snapshot(), &caller))\n",
        "        let _ = principal;\n        let snapshot = self.inner.gates.snapshot();\n"
        f"        {LIST_SURFACE}\n")
 mutate("gw-disabled-identity-unannounced", "initialize does not say identity is disabled", GW_PATH,
@@ -1349,7 +1354,7 @@ mutate("mock-fail-doc-succeeds", "fail-doc answers with a result", MS,
        "            Some(Content::Fail) => Err(RpcError::new(", "            Some(Content::Fail) => Ok(text_result(String::new())).map_err(|_: RpcError| RpcError::new(")
 mutate("mock-huge-doc-half-size", "huge-doc answers with half a mebibyte", MS, '"x".repeat(HUGE_BYTES)', '"x".repeat(HUGE_BYTES / 2)')
 mutate("mock-two-credentials-take-the-file", "with both credential variables set, the file wins", MC,
-       "            (Some(path), None) => read_token_file", "            (Some(path), _) => read_token_file")
+       "            (Some(path), None, None) => read_token_file", "            (Some(path), _, _) => read_token_file")
 mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part of the token", MC,
        "    let token = text.trim();", "    let token = text.as_str();")
 mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
@@ -1756,7 +1761,7 @@ mutate("demo-driver-workload-exit-ignored", "a workload's non-zero exit without 
 mutate("demo-driver-result-ignores-failures", "the RESULT passes with FAILs counted", DRIVER,
        """  if [ "$FAILS" -eq 0 ] && [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""", """  if [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""")
 mutate("demo-driver-any-bearer-is-the-gateways", "mock-docs' accepted bearers are not compared with the gateway's", DRIVER,
-       """'$1 == "200" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ }""", """'$1 == "200" && 0 { n++ }""")
+       """'$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ }""", """'$1 == "accepted" && 0 { n++ }""")
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
        '"127.0.0.1:18080:8080"', '"18080:8080"')
 mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
@@ -1768,6 +1773,123 @@ mutate("demo-policy-in-base", "the base applies the network policy before the di
        "  - workloads.yaml\n", "  - workloads.yaml\n  - ../policy\n")
 mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
        "35078c7e636169b1", "35078c7e636169b2")
+
+
+# --- gateway: the first slice from files ---------------------------------------------------
+# The deployment file, the wiring that builds the gateway from it, the registry-mode boot gates
+# and reload, the mock server's digest file, the development issuer and the demo driver's
+# request count.
+
+DEPLOY = GW + "deployment.rs"
+START = GW + "start.rs"
+PROXIED = GW + "proxied.rs"
+RELOAD = GW + "reload.rs"
+POLICY_RS = GW + "policy.rs"
+DEV_ISSUER = "crates/gateway-dev/src/issuer.rs"
+DEV_BIN = "crates/gateway-dev/src/bin/switchboard-dev.rs"
+MOCK_CONFIG = "crates/mock-docs-server/src/config.rs"
+
+for struct in ["DeploymentFile", "RegistrySection", "IssuerFile", "TeamManifest"]:
+    mutate(f"gw-deploy-unknown-field-{struct}", f"{struct} ignores fields it does not know", DEPLOY,
+           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
+mutate_all("gw-deploy-disabled-identity-takes-anything", "identity disabled ignores issuers still listed",
+           (DEPLOY, "    /// names a unit variant, so `mode = \"disabled\"` with issuers still listed would load.\n    Disabled {},",
+            "    /// names a unit variant, so `mode = \"disabled\"` with issuers still listed would load.\n    Disabled,"),
+           (DEPLOY, "            IdentityFile::Disabled {} => IdentitySection {", "            IdentityFile::Disabled => IdentitySection {"))
+mutate_all("gw-deploy-disabled-audit-takes-anything", "audit disabled ignores a URL variable still given",
+           (DEPLOY, "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled {},",
+            "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled,"),
+           (DEPLOY, "            AuditFile::Disabled {} => AuditChoice::Disabled,", "            AuditFile::Disabled => AuditChoice::Disabled,"))
+mutate("gw-deploy-poll-zero", "the registry may be read again never", DEPLOY,
+       "        if file.registry.poll_seconds == 0 {", "        if false {")
+mutate("gw-deploy-workload-without-manifest", "a workload issuer with no team manifest gets an empty one", DEPLOY,
+       "        (IssuerKindName::Workload, None, _) => {\n            return Err(DeploymentError::NoManifest(issuer.issuer));\n        }",
+       "        (IssuerKindName::Workload, None, _) => IssuerKindEntry::Workload {\n            subjects: BTreeMap::new(),\n        },")
+mutate("gw-deploy-groups-on-workload", "a workload issuer may carry a groups claim", DEPLOY,
+       "        (IssuerKindName::Workload, Some(manifest), None) => IssuerKindEntry::Workload {",
+       "        (IssuerKindName::Workload, Some(manifest), _) => IssuerKindEntry::Workload {")
+mutate("gw-deploy-manifest-for-user", "a user issuer may carry a team manifest", DEPLOY,
+       "        (IssuerKindName::User, None, groups_claim) => IssuerKindEntry::User {",
+       "        (IssuerKindName::User, _, groups_claim) => IssuerKindEntry::User {")
+mutate("gw-deploy-empty-database-url", "an empty database URL is taken as one", DEPLOY,
+       "                Some(url) if !url.is_empty() => AuditChoice::Postgres { url },",
+       "                Some(url) => AuditChoice::Postgres { url },")
+mutate("gw-deploy-paths-not-relative-to-file", "the registry path is read from the working directory", DEPLOY,
+       "            registry_file: base.join(file.registry.file),", "            registry_file: file.registry.file,")
+
+mutate("gw-start-credential-any-file", "a server whose reference has no file takes another", START,
+       "        let Some(path) = files.get(reference) else {", "        let Some(path) = files.get(reference).or(files.values().next()) else {")
+mutate("gw-start-credential-unused", "a credential file no server uses is accepted", START,
+       "    if let Some(unused) = files.keys().find(|reference| !used.contains(*reference)) {",
+       "    if let Some(unused) = files.keys().find(|reference| !used.contains(*reference)).filter(|_| false) {")
+mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
+       "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
+       "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
+mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
+       "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
+       "        AuditChoice::Postgres { .. } => None,")
+
+mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
+       "            Err(sentence) => Box::pin(std::future::ready(ToolOutcome::Refused(sentence))),",
+       "            Err(_sentence) => self.inner.run(call),")
+mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
+       "            None => Err(withdrawn_while_deciding(tool.as_str())),", "            None => Ok(()),")
+mutate("gw-proxied-resources-never-named", "the registry's adapter is not asked for resources", PROXIED,
+       "            (Some(adapter), Some(arguments)) => adapter.resources(arguments),",
+       "            (Some(_adapter), Some(_arguments)) => Resources::Named(Vec::new()),")
+
+mutate("gw-boot-registry-connector-unwrapped", "a proxied connector runs without the argument check", BOOT,
+       "            connector: Arc::new(CheckedArguments::new(connector, live.clone())),", "            connector,")
+mutate("gw-boot-registry-server-unconnected", "a registry server with no connector starts", BOOT,
+       "        if !basis.connectors.contains(&route.server) {", "        if false {")
+mutate("gw-boot-registry-rule-issuer-unchecked", "a registry rule may name an untrusted issuer", BOOT,
+       "            if !configured.contains(&rule.issuer) {", "            if false {")
+mutate("gw-boot-registry-reserved-profile", "a registry may define the reserved profile", BOOT,
+       "        .profile(&ProfileName::new(NO_PROFILE))\n        .is_some()\n    {",
+       "        .profile(&ProfileName::new(NO_PROFILE))\n        .is_some()\n        && false\n    {")
+mutate("gw-boot-proxied-without-registry", "a proxied connector starts with no registry to read its arguments", BOOT,
+       "        return Err(BootError::ProxiedWithoutRegistry(name));\n", "")
+mutate("gw-boot-adapter-beside-registry", "a connector's own adapter is taken beside the registry", BOOT,
+       "        return Err(BootError::AdapterBesideRegistry(name));\n", "")
+
+mutate("gw-reload-servers-unchecked", "a reload may change a server the connectors were built for", RELOAD,
+       "        if registry.servers() != started.servers() {", "        if false {")
+mutate("gw-reload-routes-unchecked", "a reload may route a tool somewhere new", RELOAD,
+       "            if started.routes().get(tool) != Some(route) {", "            if false {")
+mutate("gw-reload-gates-skipped", "a reload skips the boot gates", RELOAD,
+       "        check_registry_policy(registry, &policy, &self.basis)?;\n", "")
+mutate("gw-reload-never-reads-again", "the watcher never serves a new file", RELOAD,
+       "            if bytes == seen {", "            if true {")
+
+mutate("gw-policy-no-rule-gets-a-profile", "a caller no registry rule covers gets the demo's profile", POLICY_RS,
+       "                    ProfileName::new(NO_PROFILE)\n", "                    ProfileName::new(\"workload-read\")\n")
+mutate("gw-path-identity-failure-unnamed", "an identity failure's log line has no event name", GW + "path.rs",
+       "                    event = \"identity_failed\",\n", "")
+
+mutate("mock-digest-file-beside-token", "a digest file and a token file may both be set", MOCK_CONFIG,
+       "            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,",
+       "            (_, _, Some(path)) => read_digest_file(Path::new(&path))?,")
+mutate("mock-digest-file-read-as-token", "a digest file is read as the token itself", MOCK_CONFIG,
+       "            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,",
+       "            (None, None, Some(path)) => read_token_file(Path::new(&path))?,")
+
+mutate("dev-issuer-any-subject", "the development issuer signs for any subject", DEV_ISSUER,
+       "        self.subjects.contains(subject).then(|| {", "        true.then(|| {")
+mutate("dev-issuer-unknown-parameter", "the development issuer ignores parameters it does not know", DEV_ISSUER,
+       "            _ => return Err(format!(\"unknown parameter `{name}`\")),", "            _ => continue,")
+mutate("dev-issuer-repeated-parameter", "a parameter given twice takes the last value", DEV_ISSUER,
+       "        if slot.replace(value).is_some() {", "        if slot.replace(value).is_some() && false {")
+mutate("dev-issuer-empty-values", "an empty subject or audience is signed", DEV_ISSUER,
+       "        (Some(subject), Some(audience)) if !subject.is_empty() && !audience.is_empty() => {",
+       "        (Some(subject), Some(audience)) => {")
+mutate("dev-issuer-no-subject", "the development issuer starts with no subjects", DEV_BIN,
+       "        subjects: (!subjects.is_empty())", "        subjects: (true)")
+
+mutate("demo-driver-health-checks-counted", "the outage step counts health checks as requests", DRIVER,
+       "select(.accepted == true)' | awk 'END { print NR }'", "select(.event == \"request\")' | awk 'END { print NR }'")
+mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,
+       "      - issuer-keys:/shared/issuer\n    healthcheck:",
+       "      - issuer-keys:/shared/issuer\n    ports:\n      - \"127.0.0.1:18090:8090\"\n    healthcheck:")
 
 
 # --- Running -------------------------------------------------------------------------------

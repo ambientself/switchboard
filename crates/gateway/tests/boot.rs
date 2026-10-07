@@ -551,6 +551,18 @@ fn a_connector_registered_twice_is_refused() {
     );
 }
 
+#[test]
+fn a_proxied_connector_needs_the_policy_to_come_from_the_registry() {
+    // Nothing in this configuration reads a proxied server's arguments, so it is refused.
+    let world = World::new();
+    let wiring = world.wiring().proxied("proxied", world.connector.clone());
+    let booted = world.boot(world.config(), wiring);
+    assert!(
+        matches!(&booted, Err(BootError::ProxiedWithoutRegistry(name)) if name.as_str() == "proxied"),
+        "{booted:?}"
+    );
+}
+
 // --- Profile selection ---------------------------------------------------------------------
 
 #[test]

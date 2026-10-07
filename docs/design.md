@@ -156,7 +156,7 @@ lines only once the interfaces between them have settled.
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
 | `gateway-mcp` | The MCP protocol adapter: JSON-RPC envelopes, the two revisions, header checks, rendering. No policy types. |
-| `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, wiring. |
+| `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, the deployment file, wiring, registry reload. |
 | `gateway-dev` | The gateway on the test fakes (`switchboard-dev`), a scripted client, and the end-to-end tests. |
 | `mock-docs-server` | A mock document server that plays a proxied MCP server in tests and the demo. Shares no code with the gateway. |
 | `demo-checks` | Tests for the demo's scripts and manifests in `deploy/`. No code of its own. |
