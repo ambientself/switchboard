@@ -250,6 +250,42 @@ async fn an_allowed_row_that_commits_after_its_budget_is_completed_as_error() {
 }
 
 #[tokio::test]
+async fn an_insert_with_no_answer_by_the_finish_deadline_is_given_up_and_its_connection_dropped() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_millis(300),
+        finish_deadline: Duration::from_secs(1),
+    };
+    let store = db
+        .store(PoolSizes::default())
+        .with_budgets(budgets)
+        .without_cancelling();
+    let lock = lock_table(&db).await;
+
+    let failure = within(budgets.begin + SLACK, begin_read(&store, &fixture))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    // The lock outlasts the finish deadline, so the insert never answers in time.
+    until(
+        Duration::from_secs(5),
+        "the insert to be given up",
+        || async { store.finishes().given_up == 1 },
+    )
+    .await;
+    // Its connection, still waiting on the lock, is not handed to a later begin.
+    assert_eq!(store.begin.status().size, 0);
+    release(&lock).await;
+}
+
+#[tokio::test]
 async fn a_denied_row_that_commits_after_its_budget_is_left_as_it_is() {
     let Some(db) = TestDatabase::create().await else {
         return;
