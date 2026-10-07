@@ -22,7 +22,7 @@ use gateway_testkit::{
     Caller, DRAFT_REFUSAL, DRAFT_TOOL, FOREIGN_DRAFT, FakeCredentialSource, Fixture,
     FixtureConnector, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, SCOPE_REFUSAL,
     SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    WRITE_TOOL, block_on, poll_once,
+    WRITE_TOOL, block_on, policy_data, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -315,11 +315,27 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
     assert_eq!(gateway.store.finish_attempts(), 0);
 }
 
-/// A direct write is denied in every profile, with its own sentence, which points the caller at
-/// proposing instead. The same change proposed is allowed where the profile permits proposals.
+/// The fixture policy with `write` added to every profile's classifications. No profile can
+/// permit a direct write, so this changes no decision; it is here so that a write denied under
+/// it is denied by that rule and not because the profile leaves `write` out.
+fn with_every_profile_listing_write(gateway: &mut Gateway) {
+    let mut data = policy_data();
+    for profile in data["profiles"].as_array_mut().unwrap() {
+        profile["classifications"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("write"));
+    }
+    gateway.fixture.policy = serde_json::from_value(data).unwrap();
+}
+
+/// A direct write is denied in every profile, even one that lists `write`, with its own
+/// sentence, which points the caller at proposing instead. The same change proposed is allowed
+/// where the profile permits proposals.
 #[test]
 fn a_direct_write_is_denied_to_every_caller_and_the_same_change_proposed_is_allowed() {
-    let gateway = Gateway::new();
+    let mut gateway = Gateway::new();
+    with_every_profile_listing_write(&mut gateway);
     for caller in [Caller::TeamA, Caller::TeamB] {
         let Response::Denied { sentence, reason } =
             gateway.call(caller, SURFACE_ALL, WRITE_TOOL, own(caller))
