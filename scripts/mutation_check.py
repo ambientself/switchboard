@@ -1184,6 +1184,50 @@ mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
        "read_only: tool.classification == Classification::Read,", "read_only: true,")
 
 
+# --- gateway server ------------------------------------------------------------------------
+
+GW_SERVER = GW + "server.rs"
+HOST_CHECK = (
+    "    if let Err(rejection) = check_host(gates, parts) {\n"
+    "        return refused(&rejection);\n    }\n"
+)
+ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers) {\n"
+
+mutate("gw-host-check-skipped", "a request for any Host is served", GW_SERVER, HOST_CHECK, "")
+mutate_all(
+    "gw-host-after-identity",
+    "the Host is checked after identity",
+    (GW_SERVER, HOST_CHECK, ""),
+    (GW_SERVER, "    let Ok(Path(surface)) =", HOST_CHECK + "    let Ok(Path(surface)) ="),
+)
+mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
+       "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
+mutate("gw-host-first-of-two", "the first of two Host headers is checked", GW_SERVER,
+       "        (Some(_), Some(_)) => None,", "        (Some(value), Some(_)) => value.to_str().ok(),")
+mutate("gw-host-prefix-match", "a Host that starts with an allowed one is allowed", GW_SERVER,
+       ".any(|allowed| allowed.eq_ignore_ascii_case(host))", ".any(|allowed| host.starts_with(allowed.as_str()))")
+mutate("gw-origin-check-skipped", "a request from any Origin is served", GW_SERVER,
+       "    if let Err(rejection) = check_origin(gates, &parts.headers) {\n        return refused(&rejection);\n    }\n", "")
+mutate("gw-origin-required", "a request with no Origin is refused, which shuts out command-line clients", GW_SERVER,
+       "    let Some(first) = values.next() else {\n        return Ok(());",
+       "    let Some(first) = values.next() else {\n        return Err(Rejection::forbidden_origin());")
+mutate("gw-origin-first-of-two", "the first of two Origin headers is checked", GW_SERVER,
+       "    let allowed = values.next().is_none()\n        && first", "    let allowed = first")
+mutate("gw-declared-length-not-checked", "a declared length over the limit reaches identity", GW_SERVER,
+       "    if declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {",
+       "    if false && declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {")
+mutate("gw-declared-length-limit-exclusive", "a body of exactly the limit is refused", GW_SERVER,
+       "|length| length > MAX_BODY_BYTES)", "|length| length >= MAX_BODY_BYTES)")
+mutate("gw-body-unlimited", "a body with no declared length is read whatever its size", GW_SERVER,
+       "axum::body::to_bytes(body, MAX_BODY_BYTES)", "axum::body::to_bytes(body, usize::MAX)")
+mutate("gw-body-read-before-identity", "the body is read before identity is checked", GW_SERVER, ADMIT,
+       "    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {\n"
+       "        Ok(body) => Body::from(body),\n        Err(_) => return unreadable(),\n    };\n" + ADMIT)
+mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
+       "    match tokio::spawn(answering.instrument(span)).await {",
+       "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
