@@ -76,12 +76,12 @@ gateway sees, and the principal is proved, so there is someone to record. One pl
 The delegation's verifier runs before the decision function, as
 [decision 0012](0012-what-a-turn-grant-binds.md) describes for turn grants, but it does not
 deny. It passes the delegation on as unverified, carrying only the kind of failure, and the
-decision function denies it at check 3 with a single reason kind of its own. The verifier's
-failure kinds are recorded on the row and are not reason kinds. The row holds the proved
-columns and nothing from the grant's claims. Where the signature verified and only a binding
-failed (audience, lifetime or pod), decision 0012 also records the grant's digest and which
-binding failed. The caller reads one fixed sentence whatever was wrong with the grant, as in
-Otto.
+decision function denies it at check 3 with a single reason kind of its own. The row records
+the failure kind, which is also logged and counted. Failure kinds are not reason kinds, and
+the caller never reads one. The row holds the proved columns and nothing from the grant's
+claims. Where the signature verified and only a binding failed (audience, lifetime or pod),
+the row also records the grant's digest (decision 0012). The caller reads one fixed sentence
+whatever was wrong with the grant, as in Otto.
 
 **`tools/list` is an audit row of its own kind.** It reaches decisions: it tells a caller what
 it may call. A list row has kind `list` where a call's row has kind `call`. It holds the policy
@@ -544,11 +544,10 @@ this table are also in section 18 of the design.
 - Decision 0006 gets a dated amendment. The delegation in the call context can be present and
   unverified. The verifier passes it on with only the kind of failure, and check 3 denies it
   with a single reason kind of its own; the verifier never denies on its own. Decision 0012's
-  amendment to 0006, accepted the same day, says the verifier's checks run before the function
-  and none of their failures is a reason kind. Both hold under this model, and 0012's paragraph
-  is to say that the function then denies at check 3. The context says whether the request
-  carries a key, and a tool not classified `read` without one is denied with a reason kind of
-  its own, by a last check after check 6 that is skipped for `tools/list`. The receipt check is
+  amendment to 0006, accepted the same day, applies this to turn grants. The context says
+  whether the request carries a key, and a tool not classified `read` without one is denied
+  with a reason kind of its own, by a last check after check 6 and the currency check, skipped
+  for `tools/list` as they are. The receipt check is
   a second decision made outside the function. Like a connector's refusal it cannot make
   anything run, and it decides about delivery, not permission. The outcome set gains `unknown`
   and `duplicate`.

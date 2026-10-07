@@ -304,10 +304,10 @@ changes four things here.
   function, but does not deny. It passes on a delegation that could not be verified, carrying
   nothing from it but the kind of failure. Check 3 denies it with a single reason kind of its
   own, so one place decides, and the caller reads one fixed sentence whatever was wrong with
-  it. The verifier's failure kinds are recorded on the row and are not reason kinds. The audit
-  row holds the proved columns and nothing from the delegation's claims. Where a turn grant's
-  signature verified and only a binding failed (audience, lifetime or pod), decision 0012 also
-  records the grant's digest and which binding failed.
+  it. The row records the failure kind, which is also logged and counted. Failure kinds are
+  not reason kinds. The audit row holds the proved columns and nothing from the delegation's
+  claims. Where a turn grant's signature verified and only a binding failed (audience,
+  lifetime or pod), the row also records the grant's digest (decision 0012).
 - **The context says whether the request carries a key.** A tool not classified `read` whose
   call carries no key is denied with a reason kind of its own, and a sentence asking for one.
   That is knowable before anything runs, so it belongs in this function. It is a new last
@@ -368,16 +368,16 @@ this record allows only for refusals that can never allow: a connector's, and th
 ### What runs before the function
 
 The turn-grant verifier's own checks run before the function: version, key, encoding,
-signature, audience, lifetime and, once required, pod. A grant that fails any of them reaches
-the function as a delegation that is present and unverified, and check 3 denies it under the
-reason kind decision 0009 (pull request #33) gives an unverified delegation. The caller reads
-the fixed sentence for a bad grant. Which of the verifier's checks failed is logged and
-counted, and is not a reason kind. The row holds the proved columns and nothing from the
-grant's claims. When the signature verified and a binding failed (audience, lifetime or pod),
-the row also records the grant's digest and which binding failed. That is the one exception
-to 0009's rule that such a row holds nothing from the grant: a digest is not a claim. Check 3
-still names a team mismatch. Such a grant verified, and the mismatch is usually a rollout
-fault.
+signature, audience, lifetime and, once required, pod. The verifier does not deny. A grant
+that fails any of them reaches the function as a delegation that is present and unverified,
+carrying only which check failed, and check 3 denies it under the single reason kind the
+amendment for decision 0009, above, gives an unverified delegation. The caller reads the fixed
+sentence for a bad grant. Which check failed is recorded on the row, logged and counted, and is
+not a reason kind. The row holds the proved columns and nothing from the grant's claims. When
+the signature verified and a binding failed (audience, lifetime or pod), the row also records
+the grant's digest. That is the one exception to 0009's rule that such a row holds nothing
+from the grant: a digest is not a claim. Check 3 still names a team mismatch. Such a grant
+verified, and the mismatch is usually a rollout fault.
 
 ### Consequences
 

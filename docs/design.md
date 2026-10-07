@@ -176,9 +176,10 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    are fetched from.
 2. **Verify the delegation,** where the profile requires one. For Otto this is the turn grant:
    its version, key, canonical encoding, signature, audience, lifetime and, once required, pod
-   are checked. A grant whose team contradicts the proved team is refused. A delegation that
-   cannot be verified is passed on as unverified, with only the kind of failure; the verifier
-   does not deny it, and step 5 denies it at check 3 with a single reason of its own.
+   are checked. The verifier does not deny. A delegation that cannot be verified is passed on
+   as unverified, carrying only the kind of failure, and step 5 denies it at check 3 with a
+   single reason kind of its own. A grant that verifies but names a team other than the proved
+   team is denied at check 3 too, naming both teams.
 3. **Select the profile** from the issuer, the deployment and the principal.
 4. **Parse** the JSON-RPC message and look up the tool in the surface.
 5. **Decide**, from the tool's classification, the profile's policy and, for Otto, whether the
@@ -214,9 +215,9 @@ cannot cancel a write to the store. A disconnect before the connector is called 
 call. A disconnect during a read cancels it. A side effect runs to its call deadline.
 
 A failure at step 1, and a body that cannot be parsed, are telemetry events and do not pass
-through step 6 (section 11). A denial at steps 2 to 5 still passes through step 6 before the
-caller reads it; an unverifiable delegation is a deny row. `initialize`, `ping` and
-`server/discover` produce telemetry.
+through step 6 (section 11). Steps 2 to 4 deny nothing. A denial at step 5 still passes
+through step 6 before the caller reads it, so an unverifiable delegation is a deny row.
+`initialize`, `ping` and `server/discover` produce telemetry.
 
 `tools/list` runs steps 1 to 5 for every tool in the surface and returns those that pass,
 skipping the key check, since a list request carries no key. A `propose` tool is listed to a
@@ -594,8 +595,8 @@ written complete, has no finish, and is never open.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
   presented), issuer, key ID, the pod UID, the turn's egress setting and, for a call of a tool
   not classified `read`, Otto's currency answer. A grant that fails verification is denied at
-  check 3 as an unverified delegation. If its signature verified, its row records its digest
-  and the binding that failed, and no claims.
+  check 3 as an unverified delegation. Its row records which check failed and no claims, and,
+  if its signature verified, its digest.
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
   Otto adds them. Whether it does is part of the question about that table in Q12.
 
@@ -1027,9 +1028,11 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
     superseded control plane that is still running answers superseded for its own turns.
   - Revocation. A revoked turn's next proposal denied. A removed key, and a team removed from
     the allowlist, each taking effect within one rollout until Q11 sets a bound.
-  - Failures. A grant that fails verification denied at check 3 as an unverified delegation.
-    An audience or pod failure recorded with the grant's digest and the failed binding, and no
-    claims; a bad signature recorded with neither. A lifetime failure counted by kind.
+  - Failures. A grant that fails verification denied at check 3 as an unverified delegation,
+    under one reason kind, with a deny row that records which check failed and no claims. An
+    audience or pod failure also recorded with the grant's digest; a bad signature recorded
+    with no digest. A lifetime failure counted by kind. A verifier that denies on its own, and
+    a failure kind used as a reason kind, are mutations that must be caught.
   - Composition. A grant that lists a `write` tool no exception names, denied at check 5. Once
     decision 0011's exception exists, a grant that lists an excepted comment tool, allowed only
     while current. A name with no mapping, which permits nothing. The mapping is one-to-one. An

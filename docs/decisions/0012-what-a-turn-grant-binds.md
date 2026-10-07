@@ -128,15 +128,17 @@ verifiers ignore claims they do not know. This needs no second drain as long as 
 grants to the harness the same way. Requiring `pod` or `egress` is a setting per issuer in
 this gateway's configuration, so turning it on needs no release.
 
-**Failures.** A grant that fails any of these checks reaches the decision function as a
-delegation that is present and unverified, and check 3 denies it under the reason kind
-decision 0009 gives an unverified delegation. The caller reads Otto's one fixed sentence for a
-bad grant. Which check failed is logged and counted, never returned, and is not a reason kind.
-The row holds the proved columns and nothing from the grant's claims. When the signature
-verified and a binding failed (audience, lifetime or pod), the row also records the grant's
-digest and which binding failed. That is the one exception to 0009's rule that such a row
-holds nothing from the grant. A digest is not a claim, and it matches a refused use of a grant
-with the rows where the same grant was accepted. Honest sandboxes produce lifetime failures,
+**Failures.** The verifier makes these checks before the decision function, and does not
+deny. A grant that fails any of them is passed on as a delegation that is present and
+unverified, carrying only which check failed, and check 3 denies it under the single reason
+kind [decision 0009](0009-audit-completion-receipts-and-recovery.md) gives an unverified
+delegation. One place decides, and a deny row is written. The caller reads Otto's one fixed
+sentence for a bad grant. Which check failed is recorded on the row, logged and counted, never
+returned, and is not a reason kind. The row holds the proved columns and nothing from the
+grant's claims. When the signature verified and a binding failed (audience, lifetime or pod),
+the row also records the grant's digest. That is the one exception to 0009's rule that such a
+row holds nothing from the grant. A digest is not a claim, and it matches a refused use of a
+grant with the rows where the same grant was accepted. Honest sandboxes produce lifetime failures,
 from a call just after the deadline or a node whose clock is off, so those are counted and
 alerted on by rate. An audience or pod failure comes from a copied grant or a configuration
 fault, never from an honest sandbox under a correct configuration, so each one is
@@ -231,8 +233,9 @@ Amendments to 0006:
   gains the pod UID for a Kubernetes workload. The function reads none of these. The audit
   record keeps them.
 - **A grant that fails verification** reaches the function as a delegation that is present and
-  unverified, and check 3 denies it, as decision 0009 amends 0006. Its row may also hold the
-  digest and the failed binding (Failures, above).
+  unverified, carrying only which check failed, and check 3 denies it, as decision 0009 amends
+  0006. Its row records which check failed and, when the signature verified, the digest
+  (Failures, above).
 
 ### Tools and resources
 
@@ -363,9 +366,9 @@ run against the Rust target before the re-pin.
   broker has already cut off from the model.
 - **Caching currency answers.** A superseded turn's side-effecting calls would pass for as
   long as the cache lived.
-- **Refusing a failed grant before the decision function.** The core writes an audit row only
-  from a decision, so that path would leave no row, and it would be a second place that
-  decides. Decision 0009 routes it through check 3 instead.
+- **Refusing a failed grant in the verifier, before the decision function.** The core writes
+  an audit row only from a decision, so that path would leave no row, and it would be a second
+  place that decides. Decision 0009 routes it through check 3 instead.
 - **Fencing `propose` calls only.** Decision 0011 lets two `write` comment tools through by
   exception. A superseded, ended or revoked turn could then still comment.
 - **Reading Otto's lease table directly,** as Otto's model broker does. Decision 0003 says this
