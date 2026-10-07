@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32602,
+      "message": "Invalid params: tools/call needs a name, as a string"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

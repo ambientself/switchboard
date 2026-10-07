@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32603,
+      "message": "Internal error"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 500
+}

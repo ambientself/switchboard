@@ -1,0 +1,27 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "_meta": {
+        "io.modelcontextprotocol/serverInfo": {
+          "name": "switchboard",
+          "version": "0.1.0"
+        }
+      },
+      "content": [
+        {
+          "text": "\"plain\"",
+          "type": "text"
+        }
+      ],
+      "isError": false,
+      "resultType": "complete",
+      "structuredContent": "plain"
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

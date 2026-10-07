@@ -1,0 +1,15 @@
+{
+  "body": {
+    "error": {
+      "code": -32001,
+      "message": "Dummy identity sentence for the golden files."
+    },
+    "id": null,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json",
+    "www-authenticate": "Bearer realm=\"switchboard\""
+  },
+  "status": 401
+}
