@@ -106,7 +106,8 @@ receipts, and the design currently omits Otto's planned retry and fencing contra
   action as safely retryable. Clarify that an empty outcome means no durable outcome exists.
   The fixed audit-unavailable response is the explicit exception to “no answer without a row.”
   Scope the tool audit contract separately from discovery, initialization and malformed requests.
-- **Writes:** introduce durable action receipts before enabling real writes. Bind an
+- **Writes:** introduce durable action receipts before enabling real writes, proposals
+  included (a `propose` tool changes something too). Bind an
   idempotency key to principal, tool and normalized arguments, reject conflicting reuse, and
   distinguish pending, completed and unknown outcomes. An unknown outcome requires downstream
   reconciliation or supported vendor idempotency; a local receipt alone cannot guarantee

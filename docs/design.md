@@ -109,6 +109,7 @@ must be identified and tested before employee rollout (Q13).
 | Connector | Code that implements a group of tools against one external system. |
 | Proxied server | A separate MCP server the gateway forwards to. |
 | Classification | A tool's fixed label: `read`, `propose`, `write` or `destructive` (section 8). |
+| A write | Any call that changes something: a `propose` tool or a `write` tool. Written as code, `write` is only the classification for direct writes. Receipts and recovery (Q10) apply to every write. |
 | Tool surface | The named set of tools one endpoint exposes. |
 | Brokering | The gateway attaches a credential on the server side; the caller never holds it. |
 
@@ -293,9 +294,19 @@ teams and groups, and the resources it names are checked against their limits. I
 field of its own only when the first such tool is built.
 
 **What Rust adds.** The registry accepts a classification type that can only be built by a
-conversion that fails for anything unrecognized, and the decision function refuses a `write`
-or `destructive` tool before it reads the profile. An enum also has no unset state, which
-removes the zero-value case the Go gateway has to guard against.
+conversion that fails for anything unrecognized. An enum also has no unset state, which
+removes the zero-value case the Go gateway has to guard against. A tool runs only with a
+guard that only an allow from the decision function produces, and code that skips either
+does not compile.
+
+An earlier version of this section said a destructive tool could be held only in a type the
+Otto profile's run path does not accept. That was not built, and it has been dropped. Every
+profile shares one run path, so a type per profile would need a run path per profile, and the
+rule is about every profile, not Otto's. Instead the decision function refuses a `write` or
+`destructive` tool before it reads the profile. That is a runtime check, and tests watch it:
+a property that such a tool is never allowed or listed, decision-table cases for each
+profile, and mutations that remove each half of the check
+([decision 0006](decisions/0006-what-the-decision-function-sees.md), amended 2026-10-04).
 
 ## 9. Credentials
 

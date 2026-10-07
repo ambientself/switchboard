@@ -3,8 +3,9 @@
 Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
 on 2026-10-04 (classifications, direct writes and delegation tool lists; see the end), with
 the rule for comments added on 2026-10-06. Status: accepted. Settles the part of Q9 that
-milestone 1 needs. The rest of Q9 (tool assurance for proxied servers, employee writes,
-breadth of reads) stays open.
+milestone 1 needs, and with the amendment, what the core needs for employee proposals and
+broad reads. The rest of Q9 stays open: when a proxied tool is eligible for exposure, any write
+policy beyond proposals, and whether Otto's comment tools get an exception to the comment rule.
 
 ## Context
 
@@ -87,9 +88,9 @@ connector can never allow what the function denied.
   the connector, so what runs is what was decided.
 - Group names are not yet qualified by issuer. Two identity providers that use the same group
   name would collide; this must be settled before a second user issuer is added.
-- Open in Q9 and unaffected by this: when a proxied tool is eligible for exposure. Employee
-  write permissions and opt-in for broad reads were open here too; the amendment below
-  settles what the core needs of each.
+- Open in Q9 and unaffected by this: when a proxied tool is eligible for exposure, and any
+  write policy beyond proposals. Employee proposals and opt-in for broad reads were open here
+  too; the amendment below settles what the core needs of each.
 
 ## Amended 2026-10-04: classifications, direct writes and delegation tool lists
 
@@ -158,6 +159,16 @@ every profile's weakest setting. Permitting direct writes takes a decision recor
 replaces this section, and a change to check 5. That decision must first settle how the
 gateway tells production from everything else.
 
+This replaces what the design said before: that a destructive tool could be held only in a
+type the Otto profile's run path does not accept. That type was never built. Every profile
+shares one run path, so a type per profile would need a run path per profile, and the rule is
+about every profile, not only Otto's. The type system still makes sure a tool runs only on an
+allow from this function (the compile-fail tests `decision_without_decide`,
+`guard_without_begin` and `run_without_guard`). That an allow is never given for a `write` or
+`destructive` tool is a runtime check. The property that such a tool is never allowed or
+listed watches it, as do decision-table cases for each profile and the mutations
+`write-permitted-by-profile`, `destructive-permitted-by-profile` and `check-5-removed`.
+
 ### A delegation's tool list is required
 
 Check 4 already said that a delegation always carries a tool list. The first implementation
@@ -203,5 +214,7 @@ checked against their limits. A dedicated field waits for the first such tool.
   direct write takes the decision that replaces the section above.
 - Otto's two comment tools are denied to Otto's callers until Q9 settles an exception (see
   Comments, above).
+- "Write" in plain text, in the design and the open questions, still means any call that
+  changes something, `propose` or `write`. Receipts before writes (Q10) cover proposals.
 - The decision table's write tools are reclassified: proposals are `propose`, and the comment
   and the transition that remain are `write`, to show the denial.
