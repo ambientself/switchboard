@@ -316,6 +316,14 @@ fn cases() -> Vec<Case> {
         refused("nbf as null", MalformedClaim(NotBefore), |t, _| {
             t.claim("nbf", serde_json::Value::Null)
         }),
+        refused(
+            "nbf as a string of digits",
+            MalformedClaim(NotBefore),
+            |t, _| t.claim("nbf", json!(NOW.to_string())),
+        ),
+        refused("nbf as a fraction", MalformedClaim(NotBefore), |t, _| {
+            t.claim("nbf", json!(NOW as f64 + 0.5))
+        }),
         // --- Audience.
         refused("another audience", AudienceMismatch, |t, _| {
             t.audience("another-gateway")
@@ -345,6 +353,9 @@ fn cases() -> Vec<Case> {
             MalformedClaim(Audience),
             |t, _| t.claim("aud", json!([AUDIENCE, 1])),
         ),
+        refused("aud as null", MalformedClaim(Audience), |t, _| {
+            t.claim("aud", serde_json::Value::Null)
+        }),
         // --- Lifetime.
         refused(
             "a lifetime one over the ceiling",
@@ -359,6 +370,14 @@ fn cases() -> Vec<Case> {
         }),
         refused("iat as a string", MalformedClaim(IssuedAt), |t, _| {
             t.claim("iat", json!("yesterday"))
+        }),
+        refused(
+            "iat as a string of digits",
+            MalformedClaim(IssuedAt),
+            |t, _| t.claim("iat", json!(NOW.to_string())),
+        ),
+        refused("iat as a fraction", MalformedClaim(IssuedAt), |t, _| {
+            t.claim("iat", json!(NOW as f64 + 0.5))
         }),
         refused("exp before iat", ExpiresBeforeIssue, |t, _| {
             t.issued_at(NOW + 10).expires_at(NOW + 5)
@@ -375,6 +394,9 @@ fn cases() -> Vec<Case> {
         }),
         refused("sub as a number", MalformedClaim(Subject), |t, _| {
             t.claim("sub", json!(5))
+        }),
+        refused("sub as null", MalformedClaim(Subject), |t, _| {
+            t.claim("sub", serde_json::Value::Null)
         }),
         refused("a subject not in the table", UnknownSubject, |t, _| {
             t.subject("system:serviceaccount:other:thing")

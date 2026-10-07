@@ -672,7 +672,42 @@ mutate("identity-exp-before-iat-wraps", "exp before iat is read as a lifetime of
        "        .checked_sub(issued_at)\n        .ok_or(VerifyError::ExpiresBeforeIssue)?;", "        .checked_sub(issued_at)\n        .unwrap_or(0);")
 mutate("identity-sub-optional", "a token with no sub is accepted with an empty subject", V,
        "        None => Err(VerifyError::MissingClaim(Claim::Subject)),", '        None => Ok("".into()),')
-mutate("identity-kid-not-required", "the header's kid is ignored and the first key is used", V,
+
+# --- The identity verifier: the shape of each claim ----------------------------------------
+
+DATE = "        Some(value) => value.as_u64().ok_or(VerifyError::MalformedClaim(claim)),"
+mutate("identity-date-fraction-truncated", "a fractional date is rounded down", V, DATE,
+       "        Some(value) => value.as_u64().or_else(|| value.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)).ok_or(VerifyError::MalformedClaim(claim)),")
+mutate("identity-date-digits-parsed", "a date written as a string of digits is read as a number", V, DATE,
+       "        Some(value) => value.as_u64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).ok_or(VerifyError::MalformedClaim(claim)),")
+mutate("identity-date-negative-is-epoch", "a negative date reads as the epoch", V, DATE,
+       "        Some(value) => value.as_u64().or_else(|| value.as_i64().map(|_| 0)).ok_or(VerifyError::MalformedClaim(claim)),")
+mutate("identity-nbf-null-is-absent", "an nbf of null is treated as no nbf", V,
+       '    if !claims.contains_key("nbf") {', '    if claims.get("nbf").is_none_or(Value::is_null) {')
+mutate("identity-iss-array-read", "an iss that is an array is read from its first element", V,
+       '            .get("iss")\n            .and_then(Value::as_str)',
+       '            .get("iss")\n            .and_then(|v| v.as_str().or_else(|| v.get(0).and_then(Value::as_str)))')
+mutate("identity-aud-array-skips-non-strings", "an aud array's non-string members are skipped", V,
+       "            .map(Value::as_str)\n            .collect::<Option<_>>()\n            .ok_or(VerifyError::MalformedClaim(Claim::Audience))?,",
+       "            .filter_map(Value::as_str)\n            .collect(),")
+mutate("identity-aud-other-type-names-none", "an aud of another type names no audience rather than being malformed", V,
+       "        Some(_) => return Err(VerifyError::MalformedClaim(Claim::Audience)),", "        Some(_) => Vec::new(),")
+mutate("identity-sub-may-be-empty", "an empty sub is accepted", V,
+       "        Some(Value::String(subject)) if !subject.is_empty() => Ok(subject.as_str().into()),",
+       "        Some(Value::String(subject)) => Ok(subject.as_str().into()),")
+mutate("identity-sub-any-type-read-as-text", "a sub that is not a string is read as its JSON text", V,
+       "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Subject)),", "        Some(other) => Ok(other.to_string().as_str().into()),")
+mutate("identity-groups-skip-non-strings", "a groups array's non-string members are skipped", V,
+       "            .map(|group| group.as_str().map(GroupId::from))\n            .collect::<Option<_>>()\n            .ok_or(VerifyError::MalformedClaim(Claim::Groups)),",
+       "            .filter_map(|group| group.as_str().map(GroupId::from))\n            .map(Ok::<_, VerifyError>)\n            .collect(),")
+mutate("identity-groups-null-is-none", "a groups claim of null is a user in no group", V,
+       "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}",
+       "        Some(Value::Null) => Ok(BTreeSet::new()),\n        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}")
+mutate("identity-groups-string-is-one-group", "a groups claim that is a string is one group", V,
+       "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}",
+       "        Some(Value::String(one)) => Ok([GroupId::from(one.as_str())].into()),\n        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}")
+
+mutate("identity-kid-not-required","the header's kid is ignored and the first key is used", V,
        "        let kid = header.kid.as_deref().ok_or(VerifyError::MissingKeyId)?;\n"
        "        let key = entry.keys.get(kid).ok_or(VerifyError::UnknownKeyId)?;\n",
        "        let _ = &header.kid;\n        let key = entry.keys.values().next().ok_or(VerifyError::UnknownKeyId)?;\n")
