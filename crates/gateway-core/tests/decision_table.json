@@ -69,7 +69,7 @@
     }
   },
   "delegations": {
-    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
+    "payments-turn": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__comment_on_own_proposal", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
     "payments-turn-narrow": { "acting_person": "requester@example.test", "team": "payments", "tools": ["github__get_file"] },
     "payments-turn-empty": { "acting_person": "requester@example.test", "team": "payments", "tools": [] },
     "search-turn": { "acting_person": "requester@example.test", "team": "search", "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"] },
@@ -85,6 +85,7 @@
         { "name": "github__search_code", "classification": "read", "connector": "github", "resources": "checks_own_scope" },
         { "name": "github__list_org_repos", "classification": "read", "connector": "github", "resources": "declared" },
         { "name": "github__open_pull_request", "classification": "propose", "connector": "github", "resources": "declared" },
+        { "name": "github__comment_on_own_proposal", "classification": "propose", "connector": "github", "resources": "declared" },
         { "name": "github__delete_branch", "classification": "destructive", "connector": "github", "resources": "declared" },
         { "name": "github__delete_repository", "classification": "destructive", "connector": "github", "resources": "declared" },
         { "name": "jira__get_issue", "classification": "read", "connector": "jira", "resources": "declared" },
@@ -97,7 +98,7 @@
       "surfaces": [
         {
           "name": "otto-sandbox",
-          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"],
+          "tools": ["github__get_file", "github__search_code", "github__list_org_repos", "github__open_pull_request", "github__comment_on_own_proposal", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"],
           "teams": ["payments", "search"],
           "principals": "any_in_teams_and_groups"
         },
@@ -166,6 +167,13 @@
       "name": "otto proposal inside the team's limit is allowed",
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a comment tool that comments only on what the gateway created for review is a proposal, allowed in the otto profile",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__comment_on_own_proposal",
       "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
       "expect": { "decision": "allow" }
     },
@@ -766,7 +774,7 @@
       "name": "otto sees the reads and proposals on its surface, and no direct write or destructive tool",
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto", "surface": "otto-sandbox",
-      "expect": ["github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
+      "expect": ["github__comment_on_own_proposal", "github__get_file", "github__list_org_repos", "github__open_pull_request", "github__search_code", "jira__create_issue", "jira__get_issue"]
     },
     {
       "name": "a profile whose data lists every classification still lists no direct write or destructive tool",

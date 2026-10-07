@@ -264,4 +264,6 @@ checked against their limits. A dedicated field waits for the first such tool.
 - "Write" in plain text, in the design and the open questions, still means any call that
   changes something, `propose` or `write`. Receipts before writes (Q10) cover proposals.
 - The decision table's write tools are reclassified: proposals are `propose`, and the comment
-  and the transition that remain are `write`, to show the denial.
+  and the transition that remain are `write`, to show the denial. A comment tool that comments
+  only on what the gateway created for review is `propose` and allowed, to show the other side
+  of the comment rule.
