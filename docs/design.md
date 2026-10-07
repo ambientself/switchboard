@@ -1,21 +1,26 @@
 # MCP gateway design
 
 Date: 2026-09-30, revised 2026-10-01 against Otto `752395a` and after an independent design
-review, and 2026-10-04 and 2026-10-06 for the classifications in section 8. Status: draft.
+review, 2026-10-04 and 2026-10-06 for the classifications in section 8, and 2026-10-07 for
+decision 0010. Status: draft.
 Settled questions and the ones still open are in
 [open-questions.md](open-questions.md); open ones are not yet accepted requirements.
 
 ## 1. Purpose
 
-This is the one MCP path for Org. Every agent in the company, whoever runs it, reaches
-tools through this gateway. The gateway proves who is calling, decides
+This is the one MCP path for Org: every agent the gateway serves is offered it as its path to
+tools. The gateway proves who is calling, decides
 whether the call is allowed, shows each caller only the tools it may use, attaches the
 credential on the server side, and writes an audit row before it answers.
 
 "The one path" is a property of the environments agents run in, not of this service alone. It
-holds only where an agent has no other route to a vendor: no vendor credential in the caller,
-egress that reaches vendors only through the gateway, and downstream MCP servers that accept
-only the gateway's identity. Which environments meet that, and the exceptions, is Q17.
+holds only where three controls hold: nothing provisioned to the agent holds or yields a
+credential for a target system; the agent reaches target systems and self-built MCP servers
+only through the gateway; and each self-built server the gateway proxies accepts only the
+gateway's credential. Each environment that serves agents carries one of two claims, "the only
+path" or "the governed path", shown by evidence from inside it; employees' laptops are the
+governed path. See [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)
+and [route-exceptions.md](route-exceptions.md).
 
 This is built to find out what such a gateway looks like, without a comparison against
 extending Otto's gateway or adopting an existing one first; see
@@ -58,14 +63,15 @@ serve different purposes; writing an audit record does not itself prevent duplic
 
 ## 2. Callers
 
-| Caller | How it proves itself | Who it acts for | Status |
-| --- | --- | --- | --- |
-| Internal service or scheduled automation | A workload token from a configured, trusted issuer. | A team (proved). | First: the first slice serves a mock one, then a real one. |
-| Otto sandbox | Kubernetes ServiceAccount token, checked against the cluster's OIDC issuer, plus a signed per-turn grant from Otto's control plane. | A team (proved from the token) and a human (attested by the control plane in the grant). | Exists; served by the Go gateway until its staged cutover. |
-| Otto control plane | A workload token for a subject that is not a sandbox. | Otto itself, performing vendor actions for its own endpoints. | With Otto's cutover. |
-| Employee's own agent, such as a coding assistant on a laptop | An access token for this gateway from the company identity provider, Okta. | That employee (proved). | After Otto. |
+| Caller | How it proves itself | Who it acts for | Status | Claim (decision 0010) |
+| --- | --- | --- | --- | --- |
+| Internal service or scheduled automation | A workload token from a configured, trusted issuer. | A team (proved). | First: the first slice serves a mock one, then a real one. | The mock workload in kind: the only path, to the mock server. A real workload: the governed path until the route check passes in its own namespace, which it must before it sees real data. |
+| Otto sandbox | Kubernetes ServiceAccount token, checked against the cluster's OIDC issuer, plus a signed per-turn grant from Otto's control plane. | A team (proved from the token) and a human (attested by the control plane in the grant). | Exists; served by the Go gateway until its staged cutover. | The governed path. A sealed turn rises to the only path once its evidence exists and the audit row tells it from a turn with egress open. |
+| Otto control plane | A workload token for a subject that is not a sandbox. | Otto itself, performing vendor actions for its own endpoints. | With Otto's cutover. | None: not an agent. |
+| Employee's own agent, such as a coding assistant on a laptop | An access token for this gateway from the company identity provider, Okta. | That employee (proved). | After Otto. | The governed path. |
 
-Agents hosted by outside vendors that would call in from the internet are deferred.
+Agents hosted by outside vendors that would call in from the internet are deferred, and CI
+runners are not served. Serving either would start with the governed path.
 
 Employees connect through the company's private network or existing zero-trust access layer.
 The laptop-facing deployment is separate from Otto's in-cluster deployment, sharing the
@@ -295,7 +301,9 @@ profiles. `write` and `destructive` are denied in every profile by the decision 
 no profile's data can permit them. That is how production mutation is denied for every profile
 initially: anything that changes production without a person acting is one of the two.
 Permitting direct writes needs a decision that replaces part of
-[decision 0006](decisions/0006-what-the-decision-function-sees.md).
+[decision 0006](decisions/0006-what-the-decision-function-sees.md). This binds calls through
+the gateway. Where an environment's claim is the governed path, it says nothing about other
+routes ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)).
 
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
@@ -353,7 +361,7 @@ or more credential modes:
 | Team service identity | The gateway, per team. | Otto and services. The default. |
 | Gateway-held token | The gateway, one for everyone. | Read-only systems with no per-team distinction. |
 | Per-user grant | The gateway, encrypted, per user. | Employees' agents where vendor permissions or authorship require it; introduced system by system. |
-| Minted short-lived credential | Issued by the gateway to the caller. | CLI-shaped tools. No listed system needs it now that Otto plans AWS as brokered tools; kept as a named mode, not built. |
+| Minted short-lived credential | Issued by the gateway to the caller. | CLI-shaped tools. No listed system needs it now that Otto plans AWS as brokered tools; kept as a named mode, not built. An environment served this way cannot have the only path claim (decision 0010). |
 
 **Long-lived keys sit in a custodian, not in the gateway process.** Otto moved its GitHub App
 key into a separate process that only exchanges it for short-lived tokens, so a compromised
@@ -407,6 +415,10 @@ written.
 - **Proved and claimed are separate columns.**
 - **No foreign key to anything a caller owns,** so a caller's data retention cannot delete its
   audit trail.
+- **Rows show what went through the gateway.** Where an environment's claim is the governed
+  path, they show who reached a resource through the gateway, not everyone who reached it
+  ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). For
+  Otto's callers, the row records the turn's egress setting once the turn grant carries it.
 
 This puts Postgres on the path of every call for the whole company. Its availability becomes
 the gateway's availability, and that is an accepted cost of the rule. The first slice
@@ -455,12 +467,17 @@ leaves, bounds result sizes, and tags every result as external evidence.
 **Proxied servers** are onboarded through the registry:
 
 1. An owner registers the server: address, credential mode, owning team.
-2. The registry reads the server's tool list.
-3. A person assigns each tool a classification and approves it. A server is never trusted to
+2. The registry sends the server a `tools/call` naming a tool that does not exist, which runs
+   nothing, three times: with no credential, with a malformed one, and with a trusted issuer's
+   valid token for the server's audience and another subject. Each must get HTTP 401 with an
+   authentication challenge, or the server is not registered
+   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)).
+3. The registry reads the server's tool list.
+4. A person assigns each tool a classification and approves it. A server is never trusted to
    classify its own tools.
-4. Each approval records a hash of the tool's name, description and input schema, together
+5. Each approval records a hash of the tool's name, description and input schema, together
    with the server's identity, its address and its credential configuration.
-5. Approved tools are added to tool surfaces.
+6. Approved tools are added to tool surfaces.
 
 **Drift.** The registry re-reads each server's tool list on a schedule. A tool whose
 definition no longer matches its hash is withdrawn from every surface until it is approved
@@ -469,6 +486,12 @@ interface and a possible attack. The hash detects a changed interface. It does n
 changed implementation behind the same interface; that remains a risk, covered by the owner's
 accountability, monitoring and emergency withdrawal.
 
+The three calls of step 2 repeat on each poll. A server that starts answering any of them is
+recorded as open, and its owner and the owner of [route-exceptions.md](route-exceptions.md)
+are told. Each environment whose current evidence does not show that server refused drops to
+the governed path until it is closed. Its tools stay listed: withdrawing them would close the
+governed route and leave the open one.
+
 **Where the gateway will connect** is limited to approved destinations, with the server's
 identity verified, redirects refused and internal addresses unreachable through a registered
 URL.
@@ -476,7 +499,9 @@ URL.
 **Descriptions shown to agents** are the approved ones, never the live ones.
 
 **The caller's token is never forwarded** to a proxied server. The gateway presents its own
-credential for that server.
+credential for that server. Downstream servers identify the gateway by that credential, never
+by source address. For a self-built server it is a token for the gateway's own workload
+identity with the server as audience, accepted for the gateway's subject only.
 
 ## 14. Tool surfaces
 
@@ -504,7 +529,8 @@ A change that weakens one of these is wrong even if every test passes.
 
 1. **This gateway is the only place that decides authorization for tool calls it serves.**
    Calls from an environment are governed only where that environment has no route around
-   the gateway (Q17).
+   the gateway ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)).
+   A route that contradicts an environment's claim and is not in the register is a defect.
 2. **No caller holds a downstream credential,** except a minted short-lived one issued
    deliberately.
 3. **A caller's own token is never sent downstream.**
@@ -527,10 +553,10 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | Milestone | Turns on | Decides first |
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
-| 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail ([decision 0008](decisions/0008-mock-the-first-slice.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one. | Audit semantics for reads (Q10). |
-| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection. | Freshness and revocation bounds (Q11). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. Whether Otto's comment tools get an exception to the comment rule (Q9). |
-| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. | Clients and access (Q13). Employee write boundaries (Q9). |
+| 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one and its route check passes. | Audit semantics for reads (Q10). |
+| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's token for self-built servers. | Freshness and revocation bounds (Q11). |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Built-in GitHub and Jira tools. The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents (Q18). Action receipts before writes (Q10). The vendor actions Otto's control plane needs. Whether Otto's comment tools get an exception to the comment rule (Q9). Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
+| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path; IT security accepts the laptop register entries before rollout. | Clients and access (Q13). Employee write boundaries (Q9). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
 
@@ -600,6 +626,12 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   test to fail. It is run after every re-pin.
 - Each invariant in section 16 gets a test that is shown to fail when its guard is removed.
   Where the guard is a type, the test is a compile-fail test.
+- **A refused route is shown beside one that works**
+  ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The kind
+  run's direct call first connects and is refused by the server, and the gateway's call
+  succeeds before and after the network policy. The route check has its own tests in kind,
+  with each control present and then removed. When milestone 3 builds the registry's probe,
+  each of its guards gets an entry in `scripts/mutation_check.py`.
 - A `propose` tool's run-time guards (section 8), refusals and forced values such as a draft,
   are guards like any other. Its connector has a test against the fake vendor that fails
   without each one, and a mutation that removes it. Where such a guard would sit inside a
@@ -610,7 +642,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
 
 ## 19. Still open
 
-Q9 to Q13, Q17 and Q18 in [open-questions.md](open-questions.md). The milestone table says
+Q9 to Q13 and Q18 in [open-questions.md](open-questions.md). What decision 0010 leaves to
+Otto, IT, the security team and platform owners is listed in that record. The milestone table says
 which each milestone must settle before it starts. Vendor feasibility remains research in
 [systems.md](systems.md). The independent review's findings that are not yet reflected here
 are listed at the end of that file.

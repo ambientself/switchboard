@@ -1,25 +1,28 @@
 # 0010: What stops an agent going around the gateway
 
-Date: 2026-10-06. Status: proposed. Would settle Q17.
+Date: 2026-10-06. Status: accepted on 2026-10-07, when the owner accepted the recommendations
+made for each question this record raised. Settles Q17.
 [Decision 0008](0008-mock-the-first-slice.md) answered it for the first slice in kind; this
-record says what that test must show, and covers the other environments.
+record says what that test must show, and covers the other environments. Some questions need a
+party other than the owner. They are listed under "Still open", with who decides and what
+holds until they do.
 
 ## Context
 
 The gateway decides and audits the calls it receives. It cannot decide a call it never sees.
 An agent that holds a credential for a target system, or can reach a target system or a
 self-built MCP server directly, is governed when it uses the gateway and ungoverned when it
-does not. Design section 1 says "the one path" is a property of each environment, and leaves
+does not. Design section 1 said "the one path" is a property of each environment, and left
 to Q17 which environments meet it.
 
 The gateway's rules have the same limit. Under
 [decision 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04, `write` and
 `destructive` tools are denied in every profile, which is how Q4's denial of production
-mutation is enforced, and audit rows record the resources each call named. Both describe calls
-through the gateway and nothing else. This record assumes both changes, under review when it
-was written, are accepted as proposed.
+mutation is enforced. Audit rows are to record the resources each call named, a change under
+review when this record was accepted. Both describe calls through the gateway and nothing
+else. What this record says about the resources on audit rows applies once that column exists.
 
-Q17 says Otto's sandboxes already have default-deny egress. At the pinned Otto commit
+Q17 said Otto's sandboxes already have default-deny egress. At the pinned Otto commit
 `752395a` that is true of a sealed turn only. Under Otto's ADR-0010, a turn whose token
 carries a public-egress claim reaches the public internet through one logged proxy. That token
 is not the grant this gateway sees. The proxy resolves each name and refuses internal ranges
@@ -61,6 +64,10 @@ Each environment that serves agents carries one of two claims, stated in the des
 An environment has the governed path claim until its evidence for the only path exists and is
 current. There is no third claim. An environment that serves no agent carries none.
 
+The only path is defined by authority, not by hosts. A stricter definition, no route to any
+host a target system runs, was not taken: it would also refuse hosts that serve only public
+content, and cost toolchains more.
+
 ### Three controls
 
 The only path holds where all three of these hold for the agents in an environment.
@@ -82,10 +89,11 @@ The only path holds where all three of these hold for the agents in an environme
    gateway's credential: never a source address, and never a valid token from a trusted
    issuer for another subject. Vendor-hosted servers cannot be held to this. Admin controls
    such as Slack's approval of apps narrow what they accept, so for vendors the only path
-   rests on controls 1 and 2. Where a vendor can limit one credential to source addresses
+   rests on controls 1 and 2. Some vendors can limit one credential to source addresses
    (Slack apps and MongoDB Atlas MCP configurations; Atlassian's allowlist covers the whole
-   organization), the gateway's credential is limited to its egress addresses as defence in
-   depth, worth nothing where those addresses are shared.
+   organization). Limiting the gateway's credential to its egress addresses would be defence
+   in depth, worth nothing where those addresses are shared. Whether to do it is for IT and
+   the vendors' administrators (see "Still open"). No claim rests on it.
 
 A credential also reaches an agent through what it reads: a token committed to a repository,
 pasted into an issue or printed in a job log, which the gateway's own read tools may serve it.
@@ -106,12 +114,14 @@ resolve is not a refusal at the server's address. Each result is kept in an evid
 beside the register, with the claim it supports, so the claim that held at any past time can
 be read from the log.
 
-A claim lapses to the governed path when a check fails, when its evidence is older than a
-fixed age (proposed: seven days), or after a change that could open a route: to the network
-policy, the network plugin or its settings (add-on upgrades included), credentials or identity
-bindings, or the registered self-built servers. Until the route check runs on a schedule, the
-fixed age is what catches a change nobody noticed. Renewing evidence after a change is a step
-in the environment owner's change process.
+A claim lapses to the governed path when a check fails, when its evidence is older than seven
+days, or after a change that could open a route: to the network policy, the network plugin or
+its settings (add-on upgrades included), credentials or identity bindings, or the registered
+self-built servers. Until the route check runs on a schedule, the seven-day age is what catches
+a change nobody noticed. Renewing evidence after a change is a step in the environment owner's
+change process. For the kind run that owner is this project. For a real cluster it is the
+platform owner (see "Still open"); until that owner adds the step, only the seven-day age
+catches a change.
 
 ### The route check
 
@@ -146,11 +156,19 @@ step's credential checks beside it.
 | --- | --- | --- | --- |
 | First slice, in kind | The only path, to the mock server. | The kind run, below. | The first slice is called done (milestone 2). |
 | First slice, Docker Compose | None. It is run by hand, serves no agent, and is never given a real credential. | None. | — |
-| Real internal services and scheduled automations | The governed path, until the route check passes in the workload's own namespace. Then the only path. | The route check, run by the environment's owner. | Exposure to real data, unless the register holds an accepted entry for the workload. |
+| Real internal services and scheduled automations | The governed path, until the route check passes in the workload's own namespace. Then the only path. | The route check, run by the environment's owner. | Exposure to real data. A register entry does not stand in for it. |
 | Otto sandboxes | The governed path. A sealed turn has the only path once its evidence exists and the audit row tells it from a turn with egress open. A turn with egress open keeps the governed path until Otto's proxy refuses every host that accepts a target system's credential, by address as well as by name. | Otto's `make egress-check` from a real sandbox, with a refused row for each such host and for the Pod Identity endpoint, and the operator step's credential checks. | Any Otto turn is said to have the only path. |
 | Otto control plane | Not an agent, so no claim. After the cutover stage that moves its vendor actions, it holds no credential for them ([decision 0003](0003-otto-keeps-its-control-plane-endpoints.md)). | The credentials each control-plane component mounts, read from Otto's deploy tree at each re-pin. | That stage. |
 | Employees' laptops | The governed path, permanently under this decision. | None for the claim. | Milestone 5. |
-| CI runners, externally hosted agents, anything else | Not served, so no claim. Adding one needs a row here, and it starts with the governed path. | — | — |
+| CI runners, externally hosted agents, anything else | Not served, so no claim. None is a planned caller. Adding one needs a row here, and it starts with the governed path. A CI runner always holds a repository token, so it cannot have the only path. | — | — |
+
+**Real internal workloads.** A real workload sees real data through the gateway only after the
+route check passes in its own namespace. That narrows the candidates for the first real
+workload. A workload that holds a target-system credential for work that is not an agent's
+cannot pass control 1. It gives the credential up, or runs its agent in a workload that holds
+none, before it onboards. Which clusters real workloads run in, and who runs the check there,
+is for platform owners (see "Still open"). Until a check has passed in such a cluster, no real
+workload sees real data through the gateway.
 
 **Otto's sandboxes.** Before stage 2 of Otto's cutover, Otto's agents use Otto's Go gateway
 and this record makes no claim about them. Stage 2 does not wait for the only path: moving
@@ -183,6 +201,8 @@ command-line tool's login, a personal token, another MCP server on the laptop, a
 model provider runs on its own side. That access is granted by vendors and IT, and removing it
 is not this project's to do. Limits on clients and sign-in do not close the shell, so they do
 not change the claim. Material for employees says "the governed path", never "the only path".
+The two laptop entries in the register are owned by IT security, and IT security accepts both
+before milestone 5's rollout. Milestone 5 does not roll out until it has.
 
 ### Self-built servers at registration
 
@@ -196,30 +216,108 @@ current evidence does not show that server refused has the governed path claim u
 closed, and the register's owner records which. Its tools stay listed: withdrawing them closes
 the governed route and leaves the open one.
 
-How a self-built server identifies the gateway is open in [systems.md](../systems.md), and
-milestone 3 decides it. The proposal is a token for the gateway's own workload identity with
-the server as audience, accepted for the gateway's subject only.
+A self-built server identifies the gateway by a token for the gateway's own workload identity,
+with the server as its audience, and accepts it for the gateway's subject only. It never
+identifies the gateway by source address. Milestone 3 builds it, with the probe, and
+[systems.md](../systems.md) records it.
 
 ### The register
 
-Known routes around the gateway are kept in `docs/route-exceptions.md`, with the evidence log,
-and changed only by pull request. Each entry gives the environment, the route, the control it
-breaks, what an agent could do with it, why it is accepted, its owner, who accepted it and
-when, the next review date, and what would end it. An entry without an owner or a review date
-is not accepted. A route that contradicts an environment's claim and is not in the register is
-a defect. The first entries, with owners proposed:
+Known routes around the gateway are kept in [route-exceptions.md](../route-exceptions.md),
+with the evidence log, and changed only by pull request. Each entry gives the environment, the
+route, the control it breaks, what an agent could do with it, why it is accepted, its owner,
+who accepted it and when, the next review date, and what would end it. An entry without an
+owner or a review date is not accepted. A route that contradicts an environment's claim and is
+not in the register is a defect.
 
-| Route | Environment | Breaks | Proposed owner |
+**Who accepts an entry.** This project's owner accepts an entry for the company, and a named
+security owner signs it. The team that benefits from an entry never accepts it alone. Until
+the security team names the security owner, an entry the owner accepts is recorded as awaiting
+that signature. This project's owner keeps `route-exceptions.md` and the evidence log.
+
+**Review.** Each entry is reviewed every 90 days, and before each milestone's rollout.
+
+The register also lists the exceptions granted to the gateway's own rules, with who approved
+each and its conditions. The first is the exception for Otto's comment tools, granted by
+decision 0011.
+
+The first route entries and their owners:
+
+| Route | Environment | Breaks | Owner |
 | --- | --- | --- | --- |
 | Otto's Go gateway, serving the tools not yet moved until its MCP path is retired. It decides and audits. | Otto sandboxes | None | This project and Otto |
-| Target systems' hosts through Otto's egress proxy, by their own names or any name that resolves to them. | Otto, turns with egress open | 2 | Otto |
-| The sandbox's AWS identity, if Otto keeps the Pod Identity association. | Otto sandboxes | 1 | Otto |
+| Target systems' hosts through Otto's egress proxy, by their own names or any name that resolves to them. | Otto, turns with egress open | 2 | Otto, once Otto's owners accept it |
+| The sandbox's AWS identity, if Otto keeps the Pod Identity association. | Otto sandboxes | 1 | Otto, once Otto's owners accept it |
 | Credentials for Otto's conversation surfaces, such as its Slack app. No sandbox can reach them. | Otto control plane | 1, for a component that is not an agent | Otto |
 | The employee's own vendor sign-ins, tokens and command-line tools, and MCP servers configured on the laptop. | Laptops | 1 and 2 | IT security |
 | Tools the model provider runs on its own side. | Laptops | 2 | IT security |
 | Vendor-hosted MCP servers accept credentials other than the gateway's. | All | 3 | This project, per vendor |
-| `kubectl port-forward` and `exec` reach a pod past network policy. | Every cluster | 2, for anyone holding those permissions | Each cluster's owner |
-| A new pod is outside its policy for about its first second; kindnet keeps connections opened before a policy applied. | Every cluster | 2 | Each cluster's owner |
+| `kubectl port-forward` and `exec` reach a pod past network policy. | Every cluster | 2, for anyone holding those permissions | Each cluster's owner: this project for kind |
+| A new pod is outside its policy for about its first second; kindnet keeps connections opened before a policy applied. | Every cluster | 2 | Each cluster's owner: this project for kind |
+
+### Decided by the owner on 2026-10-07
+
+The owner accepted the recommendation on each question this record raised:
+
+- **What "the only path" means.** An agent can act on a target system with Org's authority
+  only through the gateway. Reading what anyone may read is outside the claim.
+- **How long evidence lasts.** Seven days, until the route check runs on a schedule, and it is
+  renewed after any change that could open a route. Register entries are reviewed every 90
+  days and before each milestone's rollout.
+- **Who accepts register entries.** This project's owner, for the company, with a named
+  security owner signing. The team that benefits never accepts an entry alone. This project's
+  owner keeps `route-exceptions.md` and the evidence log.
+- **The laptop entries.** IT security owns both, and accepts them before milestone 5's rollout.
+- **The write denial where the claim is the governed path.** The company accepts that
+  decision 0006's denial of `write` and `destructive`, and Q4 with it, binds only calls
+  through the gateway there: on laptops, on Otto's turns with egress open, and for real
+  services before their route check passes.
+- **Real workloads.** A real workload passes the route check before it sees real data. A
+  register entry does not stand in for it. A workload that holds a target-system credential
+  for other work gives it up, or runs its agent in a workload that holds none, before it
+  onboards.
+- **Stage 2 of Otto's cutover** does not wait for evidence that sealed turns have the only
+  path. Otto starts on the governed path, and the claim rises when the evidence exists.
+- **A self-built server found open on a drift poll** keeps its tools listed. Each environment
+  whose evidence does not show that server refused drops to the governed path.
+- **How a self-built server identifies the gateway.** By a token for the gateway's own
+  workload identity, with the server as audience, accepted for the gateway's subject only.
+- **Decision 0003 and Otto's Slack credential.** 0003's "never holds a vendor credential" is
+  scoped to the vendor actions it moves to the gateway. The credential for Otto's Slack app,
+  and any other conversation surface, is a register entry. 0003 carries a dated note.
+- **CI runners and externally hosted agents.** Neither is a planned caller.
+
+### Still open
+
+These need a party other than the owner. The record holds as written while they are open.
+
+- **Otto's owners**, raised under issue 21: whether Otto's proxy refuses every host that
+  accepts a target system's credential, by resolved address as well as by name; what to do
+  about `github.com` and AWS's hosts; whether `make egress-check` gains a refused row for each;
+  whether the sandbox's Pod Identity association and its rule go, or stay with evidence from
+  outside the sandbox; whether the turn grant carries the turn's egress setting; and whether
+  Otto's owners or this project accept the register entry for turns with egress open. Until
+  they decide, every Otto turn has the governed path, and the register's entries for Otto's
+  proxy and the sandbox's AWS identity name Otto as owner and are not yet accepted.
+- **IT and each vendor's administrators:** whether to limit the gateway's own credentials to
+  its egress addresses, where a vendor can limit one credential. That needs fixed egress
+  addresses per deployment, shared with nothing else. Until they decide, the credentials are
+  not limited, and no claim rests on it.
+- **IT:** whether the zero-trust access layer filters laptop egress; whether to push managed
+  client settings that limit which MCP servers a managed client may use; and whether vendor
+  administrators limit sign-in to hosted MCP servers, personal tokens and tools the provider
+  runs. The laptop claim is the governed path whatever IT decides.
+- **IT security:** accepting the two laptop entries. Until it does, milestone 5 does not roll
+  out.
+- **The security team:** naming the security owner who signs register entries. Until it does,
+  entries the owner accepts are recorded as awaiting that signature.
+- **Platform owners:** which clusters real services and scheduled automations will run in, who
+  runs the route check there, who owns each cluster's residual entries (the enforcement
+  setting, port-forward and exec permissions, and the window at pod start), and making renewal
+  of evidence a step in their change process. Until they decide, real workloads have the
+  governed path and see no real data through the gateway.
+- **IT or security,** when detection of calls around the gateway comes back (below): access to
+  vendors' audit logs, and who matches them against the gateway's rows.
 
 ### Deferred, and what brings each back
 
@@ -275,12 +373,14 @@ a defect. The first entries, with owners proposed:
   and Q4 with it, describes what an agent may do through the gateway, not what it can do, and
   audit rows show who reached a resource through the gateway, not who reached it. That holds
   on laptops, on Otto's turns with egress open, where git over HTTPS can push, and for real
-  services before their route check passes. An incident review reads which claim held from
-  the evidence log.
+  services before their route check passes. The owner accepted this for the company on
+  2026-10-07. An incident review reads which claim held from the evidence log.
 - The gateway needs no new code for milestone 2. The kind run gains the positive controls, the
   server's own refusal and the credential checks, and is the route check's first user.
-- Milestone 3 adds the registration and drift probe, and decides how a self-built server
-  identifies the gateway.
+- Milestone 3 adds the registration and drift probe, and builds the gateway's token for
+  self-built servers.
+- The first real workload is narrowed to one that can pass the route check: one with no
+  target-system credential, in a cluster whose owner runs the check.
 - Otto is asked for four things: its proxy refuses every host that accepts a target system's
   credential, by address as well as by name, which ADR-0010 already says the list should
   cover; `make egress-check` gains a row for each; the Pod Identity association and its rule
@@ -290,11 +390,12 @@ a defect. The first entries, with owners proposed:
 - `github.com` and AWS are the hard cases for Otto. Both serve toolchains and accept
   credentials, and AWS shares its addresses with much else. Refusing them breaks fetches;
   allowing them leaves a route. Which to do is Otto's call, recorded in the register.
-- Where the gateway's vendor credentials are limited to its egress addresses, each deployment
-  needs fixed addresses, changed only after every vendor allowlist naming them is updated.
-- Milestone 5 ships with the claim "the governed path", and the laptop entries are accepted by
-  their owners before rollout.
+- If IT and the vendors' administrators limit the gateway's vendor credentials to its egress
+  addresses, each deployment needs fixed addresses, changed only after every vendor allowlist
+  naming them is updated.
+- Milestone 5 ships with the claim "the governed path", and IT security accepts the laptop
+  entries before rollout.
 - Decision 0003 says Otto's control plane never holds a vendor credential. Slack is now a
-  target system and that control plane holds a Slack app credential, so either 0003 is scoped
-  to the vendor actions it moves, or the credential is a conflict to resolve.
+  target system and that control plane holds a Slack app credential. 0003 is scoped to the
+  vendor actions it moves, by a dated note, and the Slack credential is a register entry.
 - Decision 0008 gets a dated note pointing here. Its body is unchanged.
