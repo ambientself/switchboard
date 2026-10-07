@@ -1,6 +1,7 @@
 # Open questions
 
-Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. When resolved, move their requirements into
+Q1–Q8, Q14–Q16 and Q19 are settled below, and most of Q9. The rest of Q9, Q10–Q13, Q17 and
+Q18 are open. When resolved, move their requirements into
 [design.md](design.md) and remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
@@ -71,45 +72,46 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   read as a command, and forces a pull request it opens to be a draft. See the 2026-10-04
   amendment to
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
+- **2026-10-07 (most of Q9):** Every tool's approval says how its resources are found: from
+  its arguments, as its credential's tested reach, by a built-in connector at run time, or
+  none. Argument validation and output limits are the gateway's. A proxied tool is exposed only
+  as a read whose credential reaches nothing outside its callers' limits, and is never trusted
+  to check its own scope. Only the decision function can allow a call; everything after it can
+  only refuse or fail. Employees start read-only and propose only under their own per-user
+  grant, with no fallback. A group's limit approves whole resources, not content restricted
+  inside them. Broad reads are opted into by a breadth resource in a limit. Otto's
+  `github_pr_comment` and `jira_comment` are allowed to Otto's callers by a narrow, recorded
+  exception, once the core can express it (#12); the hosted `addOrEditJiraIssueComment` gets
+  none. The owner accepted the record's recommendations. See
+  [decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
-The current decision function considers classification and profile, with surface allowlists.
-It does not fully specify restrictions on the resources named by tool arguments. One read
-operation might address any repository, Jira project or AWS account available to its credential.
+Settled by [decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md),
+except the parts below, which need people other than the owner or had no recommendation. The
+record says what holds until each is answered. When they are answered, retire Q9.
 
-- **Settled for the core:** what the decision function sees and returns is
-  [decision 0006](decisions/0006-what-the-decision-function-sees.md). It sees the resources a
-  call names, not its arguments.
-- **Recommendation for the rest:** make resource restrictions enforceable for built-in and
-  proxied tools.
-  If a generic proxy cannot establish the permitted scope, require a constrained server or
-  connector before exposing that tool. Keep initial employee writes proposal-shaped; grant
-  broader writes only by a later explicit policy decision.
-- **Boundary:** the gateway owns agent-access policy; downstream systems still enforce their
-  own credential and resource permissions. One gateway decision point does not remove them.
-- **Open for the owner: Otto's comment tools.** Otto's `github_pr_comment` and `jira_comment`
-  comment on pull requests and issues the gateway did not create, so they are `write` and are
-  denied to Otto's callers. So is the hosted Atlassian server's
-  `addOrEditJiraIssueComment`, which [systems.md](systems.md) lists to match `jira_comment`.
-  That loses parity with Otto's gateway (#12). The conformance suite's cases that use them
-  become an expected difference: the tool inventory, the comment case and write count in
-  `TestOriginalToolsAndBrokeredCredentials`, three scope and argument cases, and the
-  audit-finish and repeated-write tests (design section 18). A narrow, recorded exception is
-  the likely answer. Until one is recorded, they stay denied.
-- **Open: `propose` refusals inside a proxied server.** A `propose` tool refuses, when it runs,
-  what the gateway did not create and what would act on its own. For a built-in tool that
-  refusal is gateway code, tested and mutated like any guard. Whether a proxied server's own
-  refusal can make its tool `propose`, or such a tool is `write` unless a gateway adapter
-  makes the check, is not decided.
-- **Open for the owner: proposals that start CI.** CI cannot be refused by what starts it. A
-  draft pull request, a push to the gateway's proposal branch and a comment on the gateway's own
-  pull request each start the workflows configured for them. That is acceptable where those
-  workflows only build and test. Whether a proposal stays `propose` in a repository where such a
-  workflow can deploy or holds a production credential is not decided. A comment tool's command refusal covers the bots named when it is
-  approved, which today is Atlantis.
-- **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
-  write cutover for its comment tools.
+- **Which downstream automation makes a proposal a direct write:** Atlantis comment commands
+  and autoplan, comment-triggered workflows, push and pull request workflows that run with
+  repository secrets on proposal branches, changes to workflow files on those branches, and
+  Jira automation rules. This includes whether a proposal stays `propose` in a repository
+  where a workflow it starts can deploy or holds a production credential. For the owners of
+  Atlantis, CI and Jira automation. Until they answer, a `propose` tool also refuses changes to
+  CI workflow files and Atlantis configuration, as well as command text.
+- **Which AWS accounts are in scope** for broad reads and employees. For the cloud platform
+  team. Until then no AWS account is in any limit.
+- **Who the security reviewer of data approvals is.** For the security team. Until then no
+  resource is added to a group's limit and no breadth resource to a team's.
+- **Whether group limits and broad-read opt-ins expire** and are recertified, and how often.
+  For the owner with the security team, before milestone 5. Until then an approval stands
+  until a reviewed change removes it.
+- **Asks of IT, vendor administrators and Otto's owners,** listed in the record: narrow service
+  accounts and who owns them, OAuth applications for per-user grants, ownership of the Okta
+  groups, and the review of Otto's eighteen tool declarations.
+- Whether a per-user rate limit must come before employee proposals is part of Q12, and how
+  often the reach check runs is part of Q11.
+- **Blocks:** milestone 5's employee proposals and any broad read; Otto's proposal tools at
+  milestone 4, if the automation answer asks more of them.
 
 ## Q10. What happens after execution when recording or delivery fails?
 

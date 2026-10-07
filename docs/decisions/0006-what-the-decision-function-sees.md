@@ -2,12 +2,13 @@
 
 Date: 2026-10-01, amended the same day after the first implementation was reviewed, and again
 on 2026-10-04 (classifications, direct writes and delegation tool lists; see the end), with
-the rule for comments added on 2026-10-06. Status: accepted. Settles the part of Q9 that
-milestone 1 needs, and with the amendment, what the core needs for employee proposals and
-broad reads. The rest of Q9 stays open: when a proxied tool is eligible for exposure, any write
-policy beyond proposals, whether Otto's comment tools get an exception to the comment rule, and
-whether a proposal stays `propose` where the CI it starts can deploy or holds a production
-credential.
+the rule for comments added on 2026-10-06, and again on 2026-10-07 by
+[decision 0011](0011-resource-authorization-and-tool-assurance.md). Status: accepted. Settles
+the part of Q9 that milestone 1 needs, and with the amendment, what the core needs for
+employee proposals and broad reads. The rest of Q9 is settled by decision 0011, including a
+narrow, recorded exception for Otto's two comment tools, except what that record lists as
+still open. Among those is whether a proposal stays `propose` where the CI it starts can
+deploy or holds a production credential.
 
 ## Context
 
@@ -73,8 +74,10 @@ A tool marked as checking its own scope may refuse when it runs, because of what
 names. That is recorded as the outcome `refused` on the same audit record, with its sentence.
 Since the 2026-10-04 amendment, a `propose` tool also refuses in the same way a call on
 something the gateway did not create, or one that would take effect on its own, or forces a
-value such as a draft. These are the only decisions made outside this function, and they can
-only restrict: a connector can never allow what the function denied.
+value such as a draft. The gateway's argument check, the connector, the credential layer and
+the custodian may each refuse outside this function, and none may allow
+([decision 0011](0011-resource-authorization-and-tool-assurance.md)). A connector can never
+allow what the function denied.
 
 ## Consequences
 
@@ -92,9 +95,11 @@ only restrict: a connector can never allow what the function denied.
   the connector, so what runs is what was decided.
 - Group names are not yet qualified by issuer. Two identity providers that use the same group
   name would collide; this must be settled before a second user issuer is added.
-- Open in Q9 and unaffected by this: when a proxied tool is eligible for exposure, and any
-  write policy beyond proposals. Employee proposals and opt-in for broad reads were open here
-  too; the amendment below settles what the core needs of each.
+- When a proxied tool may be exposed, and what employees may do besides read, are settled by
+  [decision 0011](0011-resource-authorization-and-tool-assurance.md), without changing this
+  function. `checks_own_scope` is available only to built-in connectors. A `declared` tool's
+  adapter may name its connector entry's whole recorded reach in place of resources read from
+  the arguments. Direct writes stay denied (see the amendment below).
 
 ## Amended 2026-10-04: classifications, direct writes and delegation tool lists
 
@@ -174,8 +179,10 @@ hosted server, the comment write in the Jira surface [systems.md](../systems.md)
 match Otto's.
 
 Otto's callers are therefore denied both comment tools, and the gateway does not reach parity
-with Otto's gateway for them (#12). No exception is made here. Whether to allow them by a narrow,
-recorded exception is open in Q9 for the owner.
+with Otto's gateway for them (#12). No exception is made here. On 2026-10-07 the owner allowed
+them to Otto's callers by a narrow, recorded exception, set out in
+[decision 0011](0011-resource-authorization-and-tool-assurance.md), section 9. The core needs
+a mechanism for it, built under #12. Until then they stay denied.
 
 ### Direct writes are denied in every profile
 
@@ -191,7 +198,9 @@ The denial is in code, not left out of each profile's data, for the reason Otto'
 gives for its own hard denial: a per-profile opt-in makes the company's posture the union of
 every profile's weakest setting. Permitting direct writes takes a decision record that
 replaces this section, and a change to check 5. That decision must first settle how the
-gateway tells production from everything else.
+gateway tells production from everything else. Decision 0011 does not replace this section. It
+records one narrow exception, for Otto's two comment tools in Otto's profile, checked after
+this rule and naming tools, never a classification.
 
 This replaces what the design said before: that a destructive tool could be held only in a
 type the Otto profile's run path does not accept. That type was never built. Every profile
@@ -218,6 +227,10 @@ inventory across accounts, can be expressed with what exists. Such a tool is ser
 surfaces whose allowlist is the opted-in teams and groups, and the resources it names are
 checked against their limits. A dedicated field waits for the first such tool.
 
+Decision 0011 settles this with no field: the breadth is a resource, such as
+`aws / organization / o-example`, in the limits of the teams and groups that opt in. Check 6
+enforces it on any surface, so a surface of its own is not required.
+
 ### Alternatives rejected
 
 - **A separate write-shape attribute on each tool, and a setting on each profile for which
@@ -242,8 +255,8 @@ checked against their limits. A dedicated field waits for the first such tool.
 - A `propose` tool's run-time guards, its refusals and any value it forces such as a draft,
   are guards like any other, and this function's tests cannot see them. A built-in tool is
   approved as `propose` only with a connector test against the fake vendor that fails without
-  each guard, and a mutation that removes it. Whether a refusal inside a proxied server can
-  make its tool `propose` is part of what stays open in Q9.
+  each guard, and a mutation that removes it. A refusal inside a proxied server cannot make
+  its tool `propose`: decision 0011 exposes a proxied tool only as `read`.
 - The rule binds the vendor actions Otto's control plane asks for under
   [decision 0003](0003-otto-keeps-its-control-plane-endpoints.md), since they are ordinary
   tools under a profile. Each must be `read` or `propose`. The receipt comment is posted or
@@ -252,9 +265,9 @@ checked against their limits. A dedicated field waits for the first such tool.
   That holds after a person marks the pull request ready for review. If Otto's proposed Jira answer endpoint answers by
   commenting on an issue the gateway did not create, that is `write`. An action that needs a
   direct write takes the decision that replaces the section above.
-- Otto's two comment tools are denied to Otto's callers until Q9 settles an exception (see
-  Comments, above). The conformance suite requires both in its tool inventory. It calls
-  `github_pr_comment` as an allowed call in `TestOriginalToolsAndBrokeredCredentials` and
+- Otto's two comment tools are denied to Otto's callers until the mechanism for the exception
+  in decision 0011 is built (#12; see Comments, above). The conformance suite requires both in
+  its tool inventory. It calls `github_pr_comment` as an allowed call in `TestOriginalToolsAndBrokeredCredentials` and
   counts its write there, uses it in three of its scope and argument cases, and makes it the
   only write in its tests of audit-finish failure and repeated writes. Against the Rust
   gateway those cases are an expected difference until then (design section 18). Their

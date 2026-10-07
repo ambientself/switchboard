@@ -1,9 +1,10 @@
 # 0011: Resource authorization and tool assurance
 
-Date: 2026-10-06. Status: proposed. Would settle the rest of Q9, after
-[decision 0006](0006-what-the-decision-function-sees.md) and its 2026-10-04 amendment. Written
-against that amendment (pull request 29) and the audit row's resources column (pull request
-30, design.md section 11), on the assumption that both merge.
+Date: 2026-10-06. Status: accepted on 2026-10-07, when the owner accepted the recommendations
+(see Decided by the owner). Settles the rest of Q9 after
+[decision 0006](0006-what-the-decision-function-sees.md) and the 2026-10-04 amendment to it,
+except the parts under Still open, which wait on other people. Written against that amendment
+and the audit row's resources column (design.md section 11).
 
 ## Context
 
@@ -266,7 +267,7 @@ restrict content inside them, with Jira issue security levels and Confluence pag
 restrictions. Approving a project for a group does not approve restricted content in it. A
 shared credential that serves employees must be unable to see such content, shown by a
 restricted canary inside the reach in its test. Otherwise employees use a per-user grant on
-that system, or are not served. Whether this is the right reading of Q3 is the owner's call.
+that system, or are not served. The owner accepted this reading of Q3 on 2026-10-07.
 
 **Employees start with `read` only.** The employee profile lists `propose` once, when the first
 system qualifies: its per-user grants work (encrypted storage, connection, refresh and
@@ -305,7 +306,9 @@ workflow that runs with the repository's secrets on a proposal branch, a workflo
 on that branch, or an Atlantis autoplan that runs provider code. Such a tool is `propose` only
 if its connector refuses content that would set the automation off, as Otto's GitHub connector
 does for Atlantis comment commands, or the automation does not run on the gateway's
-proposals. Otherwise it is `write`. Which automation counts needs its owners.
+proposals. Otherwise it is `write`. Which automation counts needs its owners and is still
+open. Until they answer, a `propose` tool also refuses changes to CI workflow files and to
+Atlantis configuration, as well as command text.
 
 ### 7. Reads that show more than the caller could otherwise see
 
@@ -364,9 +367,48 @@ get around them.
 | A team that has not opted in asks for AWS inventory across every account. | Denies at check 6: the organization is not in its limit. | Not asked. | Denied. |
 | Atlassian's hosted `addOrEditJiraIssueComment`. | Classified `write`: it can edit a comment the gateway did not create, and a proxied server cannot be checked for that. Denied in every profile, and refused at load as a proxied tool that is not `read`. | Not asked. | Never served. |
 | `call_aws` on the AWS MCP Server. | Not exposed: it runs any API operation, and its reach is the whole role. | Not asked. | Never served. |
+| An Otto turn comments with `github_pr_comment` on a person's pull request in its team's repository. | Allows under the exception in section 9, once its mechanism is built. Until then denies at check 5. | Allows. | `ok`, with the exception as the reason on the row. |
+| The same tool, with a comment that starts `atlantis apply`. | Allows under the exception. | Not asked. | `refused` by the connector. |
 
 Resource identifiers are literal strings matched exactly. `_sourceCategory=inventory/*` above
 is the role's filter as written, not a pattern.
+
+### 9. Otto's comment tools: a recorded exception
+
+Decided by the owner on 2026-10-07, taking the recommendation in Q9. Otto's
+`github_pr_comment` comments on any pull request in the team's repositories, and `jira_comment`
+on any issue in the configured Jira projects. Under the comment rule in decision 0006 both are
+`write`, because they comment on things the gateway did not create. They stay `write`. They are
+allowed to Otto's callers by a narrow, recorded exception, and only while all of these hold:
+
+- **Otto's profile only.** No other profile has an exception. Services and employees are
+  denied both tools.
+- **The tool refuses the commands of the bots named when it is approved.** Today that is
+  Atlantis: a comment such as `atlantis apply` is refused, as Otto's `github_pr_comment`
+  refuses it now. A command another bot reads, such as `/deploy`, is refused once that bot is
+  named. If the owners of CI and Atlantis name more commands (see Still open), they are added
+  when the tool is approved again.
+- **It reaches only the team's repositories, or the configured Jira projects.** Check 6 and
+  the connector hold it to them, as for any built-in tool.
+- **Every call is audited as usual,** and the row gives the exception as the reason the call
+  was allowed.
+- **It is listed in decision 0010's register of known exceptions,** with the owner as the
+  person who accepted it.
+- **It is reviewed when Otto's cutover (#13) completes.** The review keeps it, narrows it or
+  ends it.
+
+Atlassian's hosted `addOrEditJiraIssueComment` gets no exception. It can edit comments other
+people wrote, and as a proxied tool it could not be held to the conditions above.
+
+This is not the decision that permits direct writes, which decision 0006 says must replace its
+section on them. Check 5 still denies `write` and `destructive` before the profile is read. The
+core has no way yet to express an exception. It needs one: for example, a per-profile list of
+excepted tools, checked after the classification rule, that allows the call with a reason of
+its own on the audit row. The list names tools, never a classification, so it cannot permit
+`write` in general, and adding a tool to it takes a decision record and a register entry, as
+this one does. It is built under #12 with Otto's GitHub and Jira tools, not now. Until it
+exists, both tools stay denied to Otto's callers, and the conformance cases that use them stay
+an expected difference (design.md section 18).
 
 ### What each guarantee costs, and what stays unguarded
 
@@ -386,7 +428,9 @@ reaching more of its caller's limit than a call named, which the row does not sh
 vendor-side change to a reach between scheduled checks, and any added resource a canary cannot
 see; a connector bug that reaches resources the call did not name; a self-built server shared
 by several teams carrying one team's data to another in its own state; anything the reviewer
-gets wrong in the third column above; and, on laptops, other routes to the vendor (Q17).
+gets wrong in the third column above; Otto's two comment tools, which act on pull requests
+and issues the gateway did not create, within the exception in section 9; and, on laptops,
+other routes to the vendor (Q17).
 
 ## Alternatives rejected
 
@@ -457,8 +501,8 @@ gets wrong in the third column above; and, on laptops, other routes to the vendo
   result, a custodian refusal or a vendor refusal. `refused` now covers the credential
   layer's refusal as well as the connector's. Otto's `gateway_audit` table has none of these
   columns, so they stay in this gateway's own record unless Otto adds them.
-- Built-in `checks_own_scope` tools should report the resources they reached when they
-  finish, the follow-up the resources column left, before milestone 4 brings Otto's code
+- Built-in `checks_own_scope` tools report the resources they reached when they finish, the
+  follow-up the resources column left. This is required before milestone 4 brings Otto's code
   search over.
 - Decision 0006 says a connector's scope refusal is the only decision made outside the
   function. That becomes: the argument check, the connector, the credential layer and the
@@ -490,74 +534,95 @@ gets wrong in the third column above; and, on laptops, other routes to the vendo
   narrow credential, often one per team, and run the test before any of its tools can be
   exposed. Changes to that credential go through the tool's approval; otherwise the reach
   check withdraws the tool.
-- Otto's behavior does not change, unless the answer on automation requires its proposal
-  tools to refuse more. Otto's owners review the declarations for its eighteen tools in this
+- Otto's behavior does not change, except that its proposal tools, when this gateway serves
+  them, refuse changes to CI workflow files and Atlantis configuration until the automation
+  owners answer. Otto's owners review the declarations for its eighteen tools in this
   repository, and each team's repositories become its resource limit in the snapshot when
   Otto's adapter is built. Nothing is added to `conformance/mutation_check.py`.
 - Milestone 5 builds section 6. Section 7 is built with the first breadth tool, AWS
   inventory.
+- Milestone 4 (#12) builds the exception mechanism in section 9, with a decision-table case for
+  each of Otto's two comment tools, a case showing the same tools denied in every other
+  profile, a case showing `addOrEditJiraIssueComment` denied, and a mutation that removes the
+  list check. When it is built, the conformance cases that use the two tools move out of the
+  expected differences.
 
-## Needs the owner
+## Decided by the owner
 
-Recommendations are given; each is the owner's call and is removed from this list when
-decided.
+On 2026-10-07 the owner accepted the recommendations this record made. Where a question also
+needs someone else, the owner's part is decided here and the rest is under Still open.
 
-1. **Who approves a tool's classification, declaration, credential entry and reach test,**
-   and whether every approval needs a second reviewer. Much of this record rests on that
-   reviewer. Recommended: a second reviewer, enforced by code owners on the policy files.
-2. **Who approves data for employees and broad reads,** by putting resources in a group's
-   limit or a breadth resource in a team's, and which AWS accounts are in scope. Recommended:
-   the owner of the data, such as the cloud platform team for AWS, alongside a security
-   reviewer.
-3. **Whether group limits and broad-read opt-ins expire** and are recertified, and how often.
-4. **Whether putting a resource in a group's limit is the explicit approval Q3 requires,** and
-   whether it extends to content restricted inside the resource, such as Jira issues under a
-   security level or restricted Confluence pages. Recommended: it approves the resource, not
-   restricted content in it. A shared credential serving employees must be unable to see
-   restricted content, shown by a canary in its test, or employees use per-user grants on
-   that system.
-5. **Whether every employee proposal must use a per-user grant,** or a shared identity is
-   acceptable for some systems. Recommended: always per-user. This tightens design.md's
-   "per-user grants where authorship or permissions require them".
-6. **What employee launch includes,** and what gates the first proposal tool. Recommended:
-   reads only at launch; then GitHub draft pull requests and new comments for engineering,
-   then Jira comments, one system at a time once its per-user grant and receipts work. Also
-   whether a per-user rate limit (Q12) is a prerequisite, and whether asking an employee for
-   two grants on one system is acceptable.
-7. **Whether a proxied read under an employee's own grant may be exposed with no adapter,**
-   its reach being the whole site in the group's limit, so the agent reaches whatever the
-   employee can. Recommended: yes, for reads only.
-8. **Which downstream automation makes a tool `write` rather than `propose`:** Atlantis
-   comment commands and autoplan, comment-triggered workflows, push and pull request workflows
-   that run with repository secrets on proposal branches, changes to workflow files on those
-   branches, and Jira automation rules. Needs the owners of Atlantis, CI and Jira automation.
-   Recommended: until they answer, a `propose` tool refuses changes to CI workflow files and
-   Atlantis configuration as well as command text. That may change Otto's proposal tools.
-9. **Self-built servers:** whether one may serve more than one team, how its backend
-   credentials are assured, and whether self-built servers stay read-only until a later
-   decision. Recommended: one team per server until its owner shows it keeps no state between
-   calls; the owner states the backend's permissions in the approval and rule 4 applies to
-   that statement; read-only until receipts exist (Q10) and a later decision says what an
-   owner must show for a server to propose.
-10. **How often the reach check runs,** which bounds how long a widened service account goes
-    unnoticed (Q11), and whether a mismatch withdraws or only alerts. Recommended: withdraw.
-11. **Whether built-in `checks_own_scope` tools must report what they reached before milestone
-    4,** or `unknown` on those rows is accepted for longer. Recommended: before milestone 4,
-    since otherwise the rows cannot say which repositories Otto's code search reached.
-12. **Asks of IT and vendor administrators:** who creates and owns the gateway's narrow
-    service accounts in Atlassian, Sumo Logic, MongoDB Atlas and AWS; agreement that changes
-    to them go through the tool's approval; any administrative credential the reach check
-    needs to read a vendor's report; the OAuth applications per-user grants need in GitHub and
-    Atlassian; confirmed ownership of the Okta groups that limits name; and how many service
-    accounts are acceptable, since one per distinct limit may cost licences or seats.
-13. **How long policy snapshots are kept,** so the declaration and reach in force can be read
-    for any row (Q12). A reach recorded by reference depends on it. Recommended: as long as
-    the rows.
-14. **Asks of Otto's owners:** review the declarations for Otto's eighteen tools; agree that
-    each team's repositories move from the team manifest into the snapshot's limits; check
-    Otto's proposal tools against the answer to item 8; and decide whether `gateway_audit`
-    gains resource and credential-identity columns.
-15. **Whether to retire Q9 on acceptance,** or keep its milestone 5 parts (employee proposals,
-    broad reads) open until Okta access and the first per-user grant are in hand, and whether
-    sections 6 and 7 should become a record of their own for milestone 5. Recommended: retire
-    Q9; split only if the owner wants to accept sections 1 to 5 first.
+- **Every approval has a second reviewer.** An approval of a tool's classification,
+  declaration, credential entry or reach test needs a second reviewer, enforced by code owners
+  on the policy files. Much of this record rests on that reviewer.
+- **Data for employees and broad reads is approved by its owner and a security reviewer.**
+  Putting a resource in a group's limit, or a breadth resource in a team's, needs the owner of
+  the data, such as the cloud platform team for AWS, and a security reviewer.
+- **A group's limit approves the resource, not restricted content in it.** That is the
+  explicit approval Q3 requires. A shared credential serving employees must be unable to see
+  restricted content, such as Jira issues under a security level or restricted Confluence
+  pages, shown by a canary in its test. Otherwise employees use per-user grants on that
+  system.
+- **Every employee proposal uses a per-user grant.** No system is an exception. This tightens
+  design.md's "per-user grants where authorship or permissions require them".
+- **Employee launch is reads only.** Proposal tools follow one system at a time, each once its
+  per-user grant and receipts work: first GitHub draft pull requests, and comments on pull
+  requests the gateway created, for engineering; then Jira comments on issues the gateway
+  created. Asking an employee for two grants on one system, as section 6 requires, is
+  accepted.
+- **A proxied read under an employee's own grant may be exposed with no adapter,** its reach
+  being the whole site in the group's limit, so the agent reaches whatever the employee can.
+  Reads only.
+- **Until the automation owners answer, a `propose` tool refuses changes to CI workflow files
+  and Atlantis configuration,** as well as command text. That may change Otto's proposal tools.
+- **Self-built servers:** one team per server until its owner shows it keeps no state between
+  calls. The owner states the backend's permissions in the approval, and rule 4 applies to
+  that statement. Self-built servers stay read-only until receipts exist (Q10) and a later
+  decision says what an owner must show for a server to propose.
+- **A reach mismatch withdraws** the entry's tools. It does not only alert.
+- **Built-in `checks_own_scope` tools report what they reached before milestone 4,** so the
+  rows can say which repositories Otto's code search reached.
+- **Policy snapshots are kept as long as the audit rows** they explain, so the declaration and
+  reach in force can be read for any row. How long rows are kept is Q12.
+- **One record.** Sections 6 and 7 are not split into a record of their own. Q9 is narrowed to
+  what is still open below, and retired once that is answered.
+- **Otto's comment tools get the narrow, recorded exception** in section 9.
+
+## Still open
+
+These need someone other than the owner, or had no recommendation. The record reads correctly
+while they are open: each says what holds until it is answered.
+
+- **Which downstream automation makes a tool `write` rather than `propose`:** Atlantis
+  comment commands and autoplan, comment-triggered workflows, push and pull request workflows
+  that run with repository secrets on proposal branches, changes to workflow files on those
+  branches, and Jira automation rules. This includes the question decision 0006 left open:
+  whether a proposal stays `propose` in a repository where a workflow it starts can deploy or
+  holds a production credential. Decided by the owners of Atlantis, CI and Jira automation.
+  Until then, the interim refusals above apply.
+- **Which AWS accounts are in scope** for broad reads and employees. Decided by the cloud
+  platform team, as the data's owner. Until then no AWS account and no breadth resource is in
+  any limit, so AWS inventory is served to no one.
+- **Who the security reviewer is** for data approvals. Decided by the security team. Until
+  then no resource is added to a group's limit and no breadth resource to a team's.
+- **Whether group limits and broad-read opt-ins expire** and are recertified, and how often.
+  No recommendation was made. Decided by the owner with the security team, before
+  milestone 5. Until then an approval stands until a reviewed change removes it.
+- **Whether a per-user rate limit is a prerequisite** for employee proposals. Part of Q12,
+  for the owner. It is answered before the first employee proposal tool is approved.
+- **How often the reach check runs,** which bounds how long a widened service account goes
+  unnoticed. Part of Q11, for the owner. A proxied entry is not exposed outside development
+  and test deployments until it is set.
+- **Asks of IT and vendor administrators:** who creates and owns the gateway's narrow service
+  accounts in Atlassian, Sumo Logic, MongoDB Atlas and AWS; agreement that changes to them go
+  through the tool's approval; any administrative credential the reach check needs to read a
+  vendor's report; the OAuth applications per-user grants need in GitHub and Atlassian;
+  confirmed ownership of the Okta groups that limits name; and how many service accounts are
+  acceptable, since one per distinct limit may cost licences or seats. Decided by IT and each
+  vendor's administrators. Until then no proxied entry is exposed, since none has a narrow
+  credential or a recorded test, and no per-user grant exists.
+- **Asks of Otto's owners:** review the declarations for Otto's eighteen tools; agree that
+  each team's repositories move from the team manifest into the snapshot's limits; check
+  Otto's proposal tools against the interim automation refusals; and decide whether
+  `gateway_audit` gains resource and credential-identity columns. Decided by Otto's owners,
+  before milestone 4. Until then this gateway serves none of Otto's tools.
