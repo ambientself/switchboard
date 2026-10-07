@@ -583,15 +583,16 @@ written complete, has no finish, and is never open.
     refusal is recognized is defined per connector. A side-effecting connector reports `error`
     only when it knows the vendor did nothing.
   - `refused`: a refusal after the decision that can never allow: a connector's scope refusal,
-    a `propose` tool's refusal (section 8), or the credential layer's refusal, such as an
-    employee with no grant. Nothing was sent.
+    a `propose` tool's refusal (section 8), the credential layer's refusal, such as an employee
+    with no grant, or the receipt check's refusal of a reused key. Nothing was sent.
   - `unknown`: a side effect sent with no definite answer, including a result over the
     gateway's bound from a tool not classified `read`. A read never reports it. A proxied
     tool's error is `unknown` unless its approval says its errors are safe.
   - `duplicate`: nothing ran because the same request was already completed.
 
   For a side effect, `ok` settles the receipt as `completed`, `error` and `refused` as
-  `not_performed`, and `unknown` as `unknown`.
+  `not_performed`, and `unknown` as `unknown`. A call answered by the receipt check reserves
+  no receipt of its own and leaves the earlier one as it is.
 - **The caller's tool-use identifier is recorded,** so a caller's control plane can look up
   the decision for a call it already knows about. Otto's does. The MCP specification defines
   no such identifier: Claude Code sends `claudecode/toolUseId` in `_meta`, and other clients

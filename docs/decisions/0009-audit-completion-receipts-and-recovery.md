@@ -178,8 +178,9 @@ There are five outcomes. This is the one statement of them; design section 11 re
   side-effecting connector reports `error` only when it knows the vendor did nothing, because
   the request failed before it was sent or the vendor definitely rejected it.
 - `refused`: a refusal made after the decision that can never allow: a connector's scope
-  refusal, a `propose` tool's refusal (decision 0006), or the credential layer's refusal, such
-  as an employee with no grant (decision 0011). Nothing was sent.
+  refusal, a `propose` tool's refusal (decision 0006), the credential layer's refusal, such as
+  an employee with no grant (decision 0011), or the receipt check's refusal of a reused key
+  (part 2). Nothing was sent.
 - `unknown`, new, for side effects only: the connector sent the request and got no definite
   answer. That covers a timeout, a dropped connection, a server error after the request was
   sent, and a result over the gateway's size or duration bound from a tool not classified
@@ -188,7 +189,9 @@ There are five outcomes. This is the one statement of them; design section 11 re
 - `duplicate`, new, part 2: nothing ran, because the same request was already completed.
 
 For a side effect, the outcome settles the receipt (part 2): `ok` as `completed`, `error` and
-`refused` as `not_performed`, and `unknown` as `unknown`.
+`refused` as `not_performed`, and `unknown` as `unknown`. A call answered by the receipt check,
+as `refused` or `duplicate`, reserves no receipt of its own and leaves the earlier one as it
+is.
 
 ### Open rows
 
