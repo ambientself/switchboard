@@ -62,7 +62,7 @@ of two ways, chosen per fact when the tool is built:
   [decision 0006](0006-what-the-decision-function-sees.md), each must be classified `read` or
   `propose`: a direct write is denied in every profile, these included. A comment is
   `propose` only on a pull request the gateway opened, such as the one carrying Otto's
-  receipt.
+  receipt, and only if no bot would read it as a command.
 - A sandbox's subject is never admitted to the control-plane surface, so a model cannot ask
   for instruction-position text or edit its own receipt.
 - There is no Otto extension crate holding endpoints or Otto's tables. What is specific to

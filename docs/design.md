@@ -252,6 +252,18 @@ A tool is `propose` only if it refuses, when it runs, to act on anything the gat
 create, by a check such as the author being the gateway's own identity, a reserved branch
 prefix, or a fact from Otto's resolver. A tool that cannot make that check is `write`.
 
+Acting only on what the gateway created is not enough. A comment on the gateway's own pull
+request can still be a command. So a `propose` tool must also refuse, when it runs, anything
+that would take effect without a person acting. Otto's tools show the cases. `github_pr_comment`
+refuses a comment whose first word Atlantis would read as a command, on any pull request.
+`github_create_pr` opens a draft, because the org's Atlantis plans every pull request that is
+not a draft, on a server holding an AWS role. `github_amend_change` refuses to commit to a pull
+request a person has marked ready for review, because Atlantis would plan the new commit.
+
+Both refusals are made by the connector, so the decision function cannot watch them. Each is a
+guard like any other: the tool's connector has a test against the fake vendor that fails
+without the refusal, and a mutation that removes it (section 18).
+
 Under this rule Otto's `github_pr_comment` and `jira_comment` are `write`: they comment on
 pull requests and issues the gateway did not create. Otto's callers are denied them, which
 loses parity with Otto's gateway. Whether to allow them by a narrow, recorded exception is
@@ -268,7 +280,7 @@ Permitting direct writes needs a decision that replaces part of
 | Rule | Otto profile | Employee profile | Service profile |
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
-| Proposals (`propose`) | Allowed. A comment is a proposal only on a pull request or issue the gateway created. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
+| Proposals (`propose`) | Allowed. A comment is a proposal only on a pull request or issue the gateway created, and only if no bot would read it as a command. | Only explicitly approved tools; per-user grants where authorship or permissions require them. | Allowed, with the same limit on comments. |
 | Direct writes (`write`) | Never. That includes a comment on anything the gateway did not create, so Otto's two comment tools are denied unless Q9 settles an exception. | Denied initially, in every profile. Broader write policy remains Q9. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
@@ -285,9 +297,10 @@ refused unless the turn's grant lists it.
 decision function against the caller's limits, before anything runs. A resource outside the
 limit, or none where the tool declares some, is a denial. A tool whose scope can only be seen
 once its arguments are understood is marked as checking its own scope, and its connector
-refuses at run time. That refusal is recorded as the outcome `refused` on an allowed row.
-"What did the gateway refuse" is therefore a denial or a refused outcome. Making the scope
-check uniform across built-in and proxied tools is Q9.
+refuses at run time. That refusal is recorded as the outcome `refused` on an allowed row, as
+is a `propose` tool's refusal of something the gateway did not create or of something that
+would act on its own. "What did the gateway refuse" is therefore a denial or a refused
+outcome. Making the scope check uniform across built-in and proxied tools is Q9.
 
 **Reads can need a breadth setting.** A read that shows more than its caller could otherwise
 see, such as AWS inventory across accounts, is opt-in per team or group. That is expressed with
@@ -541,6 +554,10 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   test to fail. It is run after every re-pin.
 - Each invariant in section 16 gets a test that is shown to fail when its guard is removed.
   Where the guard is a type, the test is a compile-fail test.
+- A `propose` tool's run-time refusals (section 8) are guards. Its connector has a test
+  against the fake vendor that fails without each one, and a mutation that removes it. Where
+  such a refusal would sit inside a proxied server, the gateway cannot test it this way;
+  whether it can still make the tool `propose` is part of Q9.
 - Audit store tests use a real Postgres. Everything else, including end-to-end tests of the
   gateway, runs on the in-memory fakes with no database.
 

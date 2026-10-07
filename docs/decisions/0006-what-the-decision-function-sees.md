@@ -69,7 +69,9 @@ with no resources and returns the tools that pass.
 
 A tool marked as checking its own scope may refuse when it runs, because of what the call
 names. That is recorded as the outcome `refused` on the same audit record, with its sentence.
-It is the only decision made outside this function, and only a refusal is possible there: a
+Since the 2026-10-04 amendment, a `propose` tool also refuses in the same way a call on
+something the gateway did not create, or one that would take effect on its own. These
+are the only decisions made outside this function, and only a refusal is possible there: a
 connector can never allow what the function denied.
 
 ## Consequences
@@ -124,6 +126,17 @@ resolver ([decision 0003](0003-otto-keeps-its-control-plane-endpoints.md)). Otto
 `github_amend_change` makes this check: it commits only to an open pull request its own App
 opened, on a branch under its reserved prefix. A tool that cannot make the check is `write`,
 whatever its name.
+
+Acting only on what the gateway created is not enough, because a comment on the gateway's own
+pull request can still be a command. A `propose` tool must also refuse, when it runs, anything
+that would take effect without a person acting. Otto's tools show the cases.
+`github_pr_comment` refuses a comment whose first word Atlantis would read as a command, on any
+pull request. `github_create_pr` opens a draft, because the org's Atlantis plans every pull
+request that is not a draft. `github_amend_change` refuses to commit to a pull request a person
+has marked ready for review, because Atlantis would plan the new commit.
+
+Both refusals are recorded as the outcome `refused`, like a connector's scope refusal (see
+What a connector may still do, above).
 
 ### Comments
 
@@ -205,6 +218,10 @@ checked against their limits. A dedicated field waits for the first such tool.
 - Approving a tool now includes judging whether it proposes or writes directly. That judgment
   is what keeps production mutation out, so it is part of what the reviewer of an approval
   checks.
+- A `propose` tool's run-time refusals are guards, and this function's tests cannot see them.
+  A built-in tool is approved as `propose` only with a connector test against the fake vendor
+  that fails without each refusal, and a mutation that removes it. Whether a refusal inside a
+  proxied server can make its tool `propose` is part of what stays open in Q9.
 - The rule binds the vendor actions Otto's control plane asks for under
   [decision 0003](0003-otto-keeps-its-control-plane-endpoints.md), since they are ordinary
   tools under a profile. Each must be `read` or `propose`. The receipt comment is posted or

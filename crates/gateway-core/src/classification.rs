@@ -26,7 +26,9 @@ pub enum Classification {
     /// person acts on it.
     ///
     /// The decision function cannot see what the gateway created. A tool is `Propose` only if
-    /// it refuses, when it runs, to act on anything else.
+    /// it refuses, when it runs, to act on anything else. It must also refuse what would take
+    /// effect on its own even there: a comment a bot would read as a command, a pull request
+    /// that is not a draft, a commit to a pull request a person has marked ready for review.
     Propose,
     /// Changes something directly: a merge, a push to a branch the gateway did not create for a
     /// proposal, a status transition, a configuration change, a comment on anything the gateway

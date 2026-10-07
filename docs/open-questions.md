@@ -66,7 +66,8 @@ Q1–Q8, Q14–Q16 and Q19 are settled below. Q9–Q13, Q17 and Q18 are open. Wh
   production mutation is denied initially. A delegation's tool list is required. Broad reads
   use the existing surface allowlists and resource limits. On 2026-10-06 the owner decided
   that a comment is `propose` only on something the gateway created for review, and `write`
-  anywhere else. See the 2026-10-04 amendment to
+  anywhere else. A `propose` tool also refuses what would take effect on its own, such as a
+  comment a bot would read as a command. See the 2026-10-04 amendment to
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
 ## Q9. What does authorization check beyond tool classification?
@@ -91,6 +92,11 @@ operation might address any repository, Jira project or AWS account available to
   `addOrEditJiraIssueComment`, which [systems.md](systems.md) lists to match `jira_comment`.
   That loses parity with Otto's gateway (#12). A narrow, recorded exception is the likely
   answer. Until one is recorded, they stay denied.
+- **Open: `propose` refusals inside a proxied server.** A `propose` tool refuses, when it runs,
+  what the gateway did not create and what would act on its own. For a built-in tool that
+  refusal is gateway code, tested and mutated like any guard. Whether a proxied server's own
+  refusal can make its tool `propose`, or such a tool is `write` unless a gateway adapter
+  makes the check, is not decided.
 - **Blocks:** policy/connector interfaces and employee data-access enforcement, and Otto's
   write cutover for its comment tools.
 
