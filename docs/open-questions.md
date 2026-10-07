@@ -129,19 +129,25 @@ compliance requires it for reads.
 - **Until compliance answers:** reads are written synchronously, on Q4's acceptance. A stricter
   or looser requirement, on coverage, immutability or retention, would change part 1 of
   decision 0009.
-- **Also open from decision 0009,** each for someone other than the owner. Its "Still open"
-  list says what holds meanwhile.
+- **Also open from decision 0009,** each for someone other than the owner, alone or with the
+  owner. Its "Still open" list says what holds meanwhile.
   - Otto's owners: whether Otto's adapter still writes rows for identity failures,
-    `initialize` and `ping`; and Otto's key and the grant fields that scope it.
-  - Whoever runs logging: where telemetry goes, and the compliance system of record.
-  - The security team: whether failed-authentication evidence may be dropped under load, and
-    how a person records a resolution.
-  - The security team and the storage owners: tamper evidence, and who holds the superuser
-    login.
+    `initialize` and `ping`; and Otto's key, the grant fields that scope it, whether it stays
+    the same when a turn is replayed, and how read-back treats rows that share a tool-use
+    identifier.
+  - Whoever runs logging: where telemetry goes, how long it is kept, and the compliance
+    system of record.
+  - The security team: whether failed-authentication evidence may be dropped under load.
+  - The owner with the security team: how a person records a resolution.
+  - The security team and the storage owners: tamper evidence for rows and receipts, and who
+    holds the superuser login.
   - Whoever runs Postgres, probably IT: what "committed" means.
-  - The audit database's owner: who owns the schema (Q12).
+  - The owner with whoever will own the audit database: who owns the schema (Q12).
   - Whoever runs the on-call rotation: who is paged, and who settles a receipt by hand.
-- **Blocks:** closing #3. Not milestone 2: the interim rule is enough for the first slice.
+- **Blocks:** closing #3. The first side effect reaching a real system waits for decision
+  0009's Still open 9 (who settles by hand) and 10 (how a resolution is recorded); Otto's
+  write cutover also waits for its Still open 8 (Otto's key). Not milestone 2: the interim
+  rule is enough for the first slice.
 
 ## Q11. How quickly do policy changes and revocations take effect?
 
@@ -173,8 +179,9 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
   payloads. Define availability and latency targets and measure audit overhead against them.
 - **Deferred here by decision 0009:** the begin budget, the answer budget and the finish
   deadline (two, two and thirty seconds until then), call deadlines, pool sizes and alert
-  thresholds; how long rows, receipts, resolution records and telemetry are kept; and who owns
-  the audit and receipt schema, its grants, triggers and migrations. An authentication flood
+  thresholds; how long rows, receipts and resolution records are kept; and who owns the audit
+  and receipt schema, its grants, triggers and migrations. How long telemetry is kept is for
+  whoever runs logging (decision 0009, Still open 3). An authentication flood
   no longer writes to the audit store, so the overload question is reduced to begins from
   proved callers.
 - **Blocks:** rollout sequencing and production readiness.
@@ -189,6 +196,10 @@ remain unverified. Publishing discovery metadata alone does not establish intero
   layer together. Preserve required HTTP authentication challenges alongside readable denials.
   Select and pin a supported MCP revision and test initialization, notifications, HTTP
   responses and any supported streaming behavior, even with client sessions disabled.
+- **Keys for side effects:** a side effect without an idempotency key is denied (decision
+  0009). The MCP specification defines no tool-use identifier; Claude Code sends
+  `claudecode/toolUseId` in `_meta`. For each target client, check that it sends a tool-use
+  identifier or can set the named `_meta` field. One that can do neither cannot propose.
 - **Identity:** select verifiers only from configured trusted issuers; an unverified token
   must never select an arbitrary discovery/JWKS URL. Scope subjects by issuer and subject.
   Avoid promising identical timing across all authentication failure modes; preserve opaque

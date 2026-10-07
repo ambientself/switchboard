@@ -277,13 +277,22 @@ checked against their limits. A dedicated field waits for the first such tool.
 [Decision 0009](0009-audit-completion-receipts-and-recovery.md), accepted on 2026-10-07,
 changes four things here.
 
-- **A delegation can be present and unverified.** The context carries a delegation that could
-  not be verified, with nothing from it but the fact. Check 3 denies it with a reason kind of
-  its own, and the caller reads one fixed sentence whatever was wrong with it. The audit row
-  holds the proved columns and nothing from the delegation.
+- **A delegation can be present and unverified.** The delegation's verifier runs before this
+  function, but does not deny. It passes on a delegation that could not be verified, carrying
+  nothing from it but the kind of failure. Check 3 denies it with a single reason kind of its
+  own, so one place decides, and the caller reads one fixed sentence whatever was wrong with
+  it. The verifier's failure kinds are recorded on the row and are not reason kinds. The audit
+  row holds the proved columns and nothing from the delegation's claims. Where a turn grant's
+  signature verified and only a binding failed (audience, lifetime or pod), decision 0012 also
+  records the grant's digest and which binding failed.
 - **The context says whether the request carries a key.** A tool not classified `read` whose
   call carries no key is denied with a reason kind of its own, and a sentence asking for one.
-  That is knowable before anything runs, so it belongs in this function.
+  That is knowable before anything runs, so it belongs in this function. It is a new last
+  check, after check 6 and so after decision 0012's currency check, so a caller is asked for a
+  key only when the call would otherwise be allowed. It is skipped for `tools/list`, as
+  decision 0012's currency check is, because a list request carries no key: a `propose` tool
+  appears in the list and is denied on `tools/call` without a key. The decision table gains
+  that case, and a mutation that applies the check to `tools/list` must be caught.
 - **The receipt check is a second decision outside this function.** It is made at begin, when
   a key already has a receipt in its scope. Like a connector's refusal, it cannot make
   anything run. It decides about delivery, not permission.
