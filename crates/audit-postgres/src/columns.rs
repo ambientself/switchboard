@@ -1,6 +1,11 @@
 //! What each column of `switchboard_audit.call_rows` holds, taken from the core's record.
 //!
 //! No I/O here, so the mapping is tested without a database.
+//!
+//! Postgres text, text arrays and jsonb cannot hold U+0000, and one such value fails the whole
+//! statement. Callers choose some values, such as their tool-use identifier, so every text
+//! value is written with each U+0000 replaced by U+FFFD, the replacement character, rather
+//! than lose the row.
 
 use gateway_core::PrincipalKind;
 use gateway_core::audit::{AuditRecord, Completion, DecisionKind, Outcome, RecordedResources};
@@ -55,45 +60,53 @@ impl BeginRow {
         }
         let principal = record.proved_principal.get();
         let (proved_kind, proved_team, proved_groups) = match &principal.kind {
-            PrincipalKind::Workload { team } => ("workload", Some(team.to_string()), None),
+            PrincipalKind::Workload { team } => ("workload", Some(storable(team.as_str())), None),
             PrincipalKind::User { groups } => (
                 "user",
                 None,
-                Some(groups.iter().map(ToString::to_string).collect()),
+                Some(
+                    groups
+                        .iter()
+                        .map(|group| storable(group.as_str()))
+                        .collect(),
+                ),
             ),
         };
         let (resources, resources_omitted) = resources(record)?;
         Ok(Self {
-            tool_use_id: record.tool_use_id.as_ref().map(ToString::to_string),
-            deployment: record.deployment.to_string(),
-            surface: record.surface.to_string(),
-            profile: record.profile.to_string(),
-            tool: record.tool.clone(),
-            connector: record.connector.as_ref().map(ToString::to_string),
+            tool_use_id: record.tool_use_id.as_ref().map(|id| storable(id.as_str())),
+            deployment: storable(record.deployment.as_str()),
+            surface: storable(record.surface.as_str()),
+            profile: storable(record.profile.as_str()),
+            tool: storable(&record.tool),
+            connector: record
+                .connector
+                .as_ref()
+                .map(|connector| storable(connector.as_str())),
             classification: record.classification.map(|c| c.as_str()),
             resources,
             resources_omitted,
             decision: decision(record.decision),
             reason: record.reason.map(|kind| name_of(&kind)).transpose()?,
-            sentence: record.sentence.clone(),
-            policy_revision: record.policy_revision.to_string(),
-            proved_issuer: principal.id.issuer.to_string(),
-            proved_subject: principal.id.subject.to_string(),
+            sentence: record.sentence.as_deref().map(storable),
+            policy_revision: storable(record.policy_revision.as_str()),
+            proved_issuer: storable(principal.id.issuer.as_str()),
+            proved_subject: storable(principal.id.subject.as_str()),
             proved_kind,
             proved_team,
             proved_groups,
             proved_delegation_team: record
                 .proved_delegation_team
                 .as_ref()
-                .map(|team| team.get().to_string()),
+                .map(|team| storable(team.get().as_str())),
             claimed_acting_person: record
                 .claimed_acting_person
                 .as_ref()
-                .map(|person| person.get().to_string()),
+                .map(|person| storable(person.get().as_str())),
             claimed_team: record
                 .claimed_team
                 .as_ref()
-                .map(|team| team.get().to_string()),
+                .map(|team| storable(team.get().as_str())),
         })
     }
 
@@ -135,9 +148,9 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
                 .iter()
                 .map(|resource| {
                     json!({
-                        "system": resource.system,
-                        "kind": resource.kind,
-                        "identifier": resource.identifier,
+                        "system": storable(&resource.system),
+                        "kind": storable(&resource.kind),
+                        "identifier": storable(&resource.identifier),
                     })
                 })
                 .collect(),
@@ -148,6 +161,11 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
         PgAuditError::Column("a count of resources left out past the column's range")
     })?;
     Ok((resources, omitted))
+}
+
+/// `text` as a column can hold it: each U+0000 replaced by U+FFFD.
+fn storable(text: &str) -> String {
+    text.replace('\0', "\u{FFFD}")
 }
 
 fn decision(kind: DecisionKind) -> &'static str {
@@ -190,7 +208,7 @@ impl FinishRow {
         let (outcome, outcome_sentence) = match &completion.outcome {
             Outcome::Ok => ("ok", None),
             Outcome::Error => ("error", None),
-            Outcome::Refused { sentence } => ("refused", Some(sentence.clone())),
+            Outcome::Refused { sentence } => ("refused", Some(storable(sentence))),
         };
         Self {
             outcome,
@@ -312,6 +330,58 @@ mod tests {
                 claimed_team: Some("team-c".into()),
             }
         );
+    }
+
+    #[test]
+    fn a_nul_in_any_text_value_is_written_as_the_replacement_character() {
+        let nul = |text: &str| format!("{text}\u{0}x");
+        let mut value = serde_json::to_value(denied_user_with_delegation()).unwrap();
+        for field in [
+            "tool_use_id",
+            "deployment",
+            "surface",
+            "profile",
+            "tool",
+            "connector",
+            "sentence",
+            "policy_revision",
+            "proved_delegation_team",
+            "claimed_acting_person",
+            "claimed_team",
+        ] {
+            value[field] = json!(nul(field));
+        }
+        value["proved_principal"]["id"] =
+            json!({"issuer": nul("issuer"), "subject": nul("subject")});
+        value["proved_principal"]["groups"] = json!([nul("group")]);
+        value["resources"] = json!({"named": [
+            {"system": nul("system"), "kind": nul("kind"), "identifier": nul("identifier")}
+        ]});
+        let row = BeginRow::from_record(&record(value)).unwrap();
+        assert_eq!(row.tool_use_id.as_deref(), Some("tool_use_id\u{FFFD}x"));
+        assert_eq!(row.proved_groups, Some(vec!["group\u{FFFD}x".to_owned()]));
+        // Debug shows a NUL as \0, and no value here has a backslash of its own.
+        let shown = format!("{row:?}");
+        assert!(!shown.contains("\\0"), "{shown}");
+        assert_eq!(shown.matches('\u{FFFD}').count(), 17, "{shown}");
+
+        let mut workload = allowed_workload();
+        workload.proved_principal = serde_json::from_value(json!({
+            "id": {"issuer": "https://workload-issuer.fixture.test", "subject": "sa"},
+            "kind": "workload",
+            "team": nul("team")
+        }))
+        .unwrap();
+        let row = BeginRow::from_record(&workload).unwrap();
+        assert_eq!(row.proved_team.as_deref(), Some("team\u{FFFD}x"));
+
+        let refused = FinishRow::from_completion(&Completion {
+            outcome: Outcome::Refused {
+                sentence: nul("No."),
+            },
+            latency_ms: 1,
+        });
+        assert_eq!(refused.outcome_sentence.as_deref(), Some("No.\u{FFFD}x"));
     }
 
     #[test]

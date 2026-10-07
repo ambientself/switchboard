@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use gateway_core::audit::{self, AuditRowId, Begun, Completion, Outcome, RequestMetadata};
+use gateway_core::audit::{
+    self, AuditRowId, Begun, Completion, DecisionKind, Outcome, RequestMetadata,
+};
 use gateway_core::audit::{MAX_RECORDED_RESOURCES, RecordedResources};
 use gateway_core::{
     AuditRecord, AuditStore, CallContext, Claimed, RequestedTool, Resources, TeamId, ToolUseId,
@@ -245,6 +247,57 @@ async fn a_call_naming_more_resources_than_a_row_holds_records_how_many_were_lef
 
     let row = through_core(&store, &fixture, &call).await;
     assert_eq!(read_back(&admin, &row).await, expected);
+}
+
+/// Postgres text cannot hold U+0000, and a caller chooses its tool-use identifier and the team
+/// it states. A denial carrying one is still recorded, with U+FFFD in its place, and so is a
+/// connector's refusal whose sentence carries one.
+#[tokio::test]
+async fn a_nul_in_a_value_does_not_stop_its_row_being_written() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+
+    let mut call = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
+    call.metadata = RequestMetadata {
+        tool_use_id: Some(ToolUseId::new("toolu_\u{0}x")),
+        claimed_team: Some(Claimed::new(TeamId::new("team\u{0}x"))),
+    };
+    let row = through_core(&store, &fixture, &call).await;
+    let recorded = read_back(&admin, &row).await;
+    assert_eq!(recorded.decision, DecisionKind::Deny);
+    assert_eq!(
+        recorded.tool_use_id,
+        Some(ToolUseId::new("toolu_\u{FFFD}x"))
+    );
+    assert_eq!(
+        recorded.claimed_team,
+        Some(Claimed::new(TeamId::new("team\u{FFFD}x")))
+    );
+
+    let row = begun_row(&store, &fixture).await;
+    let refused = completion(
+        Outcome::Refused {
+            sentence: "Not that one.\u{0}".into(),
+        },
+        3,
+    );
+    store.finish_within_budget(&row, &refused).await.unwrap();
+    let sentence: Option<String> = admin
+        .query_one(
+            "SELECT outcome_sentence FROM switchboard_audit.call_rows
+             WHERE id = ($1::text)::uuid",
+            &[&row.as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(sentence.as_deref(), Some("Not that one.\u{FFFD}"));
+    // The same completion again is found to be the one written.
+    store.finish_within_budget(&row, &refused).await.unwrap();
 }
 
 #[tokio::test]

@@ -1145,20 +1145,28 @@ mutate("pg-columns-complete-record-begun", "begin drops a completion it was hand
 mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
        "            claimed_team: record\n                .claimed_team", "            claimed_team: record\n                .proved_delegation_team")
 mutate("pg-columns-workload-team-as-group", "a workload's team is written as a group", PG_COLUMNS,
-       '            PrincipalKind::Workload { team } => ("workload", Some(team.to_string()), None),',
-       '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![team.to_string()])),')
+       '            PrincipalKind::Workload { team } => ("workload", Some(storable(team.as_str())), None),',
+       '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![storable(team.as_str())])),')
 mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
        "            && Some(self.latency_ms) == latency_ms\n", "")
 mutate("pg-columns-unknown-as-none", "resources nobody could name are written as none named", PG_COLUMNS,
        '        RecordedResources::Unknown => Value::String("unknown".to_owned()),',
        "        RecordedResources::Unknown => Value::Array(vec![]),")
 mutate("pg-columns-resource-kind-as-system", "a resource's kind is written as its system", PG_COLUMNS,
-       '                        "system": resource.system,', '                        "system": resource.kind,')
+       '                        "system": storable(&resource.system),', '                        "system": storable(&resource.kind),')
 mutate("pg-columns-omitted-saturates", "a count of resources left out past the column is cut short", PG_COLUMNS,
        "    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {\n"
        "        PgAuditError::Column(\"a count of resources left out past the column's range\")\n"
        "    })?;",
        "    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);")
+mutate("pg-columns-nul-kept", "a NUL in a text value is written as it is", PG_COLUMNS,
+       """    text.replace('\\0', "\\u{FFFD}")""", "    text.to_owned()")
+mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is written as it is", PG_COLUMNS,
+       "tool_use_id: record.tool_use_id.as_ref().map(|id| storable(id.as_str())),",
+       "tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
+mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is written as it is", PG_COLUMNS,
+       'Outcome::Refused { sentence } => ("refused", Some(storable(sentence))),',
+       'Outcome::Refused { sentence } => ("refused", Some(sentence.clone())),')
 mutate("pg-sql-resources-nullable", "a row may record no resources at all", PG_SQL,
        "    resources              jsonb       NOT NULL\n", "    resources              jsonb\n")
 mutate("pg-sql-omitted-nullable", "a row may leave out the count of resources left out", PG_SQL,
