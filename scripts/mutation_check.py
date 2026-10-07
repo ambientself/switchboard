@@ -986,6 +986,12 @@ mutate("fake-audit-finish-hold-ignored", "a held finish is not held", A, "      
 mutate("fake-audit-begin-attempts-not-counted", "begin attempts are not counted", A, "            state.begin_attempts += 1;\n", "")
 mutate("fake-audit-finish-attempts-not-counted", "finish attempts are not counted", A, "            state.finish_attempts += 1;\n", "")
 mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "            if row.completion.is_some() {", "            if false {")
+mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A,
+       "            state.rows.push(record.clone());",
+       "            state.rows.push(AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() });")
+mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A,
+       "            row.completion = Some(completion.completion().clone());",
+       "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted += 1;")
 mutate("fake-audit-row-ids-not-positions", "every row has the same identifier", A, "            Ok(AuditRowId::new(position.to_string()))", '            Ok(AuditRowId::new("0"))')
 
 C = TESTKIT_SRC + "credentials.rs"

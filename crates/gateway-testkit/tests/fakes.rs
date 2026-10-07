@@ -8,8 +8,8 @@ use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    self, Answer, AuditRowId, Begun, Completion, Outcome, RequestMetadata, RowCompletion,
-    StoreError,
+    self, Answer, AuditRowId, Begun, Completion, Outcome, RecordedResource, RecordedResources,
+    RequestMetadata, RowCompletion, StoreError,
 };
 use gateway_core::{
     AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, ConnectorName, CredentialError,
@@ -19,9 +19,9 @@ use gateway_identity::Clock;
 use gateway_testkit::{
     Caller, DRAFT_REFUSAL, DRAFT_TOOL, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FOREIGN_DRAFT,
     FakeCredentialSource, FixedClock, Fixture, FixtureConnector, GROUP_G_DOCUMENT, Gate,
-    InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL,
-    SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, WriteRecord,
-    block_on, policy_data, poll_once,
+    InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM, SCOPE_REFUSAL,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+    WRITE_TOOL, WriteRecord, block_on, policy_data, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -167,12 +167,33 @@ fn rows_come_back_in_the_order_they_were_begun_with_completions_filled_in() {
     );
     assert_eq!(store.rows().len(), 2);
     assert!(store.rows().iter().all(|row| row.completion.is_none()));
+    let begun = store.rows();
+    assert_eq!(
+        (&begun[0].resources, begun[0].resources_omitted),
+        (
+            &RecordedResources::Named(vec![RecordedResource {
+                system: RESOURCE_SYSTEM.to_owned(),
+                kind: RESOURCE_KIND.to_owned(),
+                identifier: "team-a-notes".to_owned(),
+            }]),
+            0
+        ),
+        "the row keeps the resources the begin step recorded"
+    );
 
     // Finishing the second first completes the second row, and only that one.
     let ran = block_on(audit::run(&connector, second));
     block_on(audit::finish(&store, ran, 5));
     let rows = store.rows();
-    assert_eq!(rows[0].completion, None);
+    assert_eq!(rows[0], begun[0], "the other row is untouched");
+    assert_eq!(
+        AuditRecord {
+            completion: None,
+            ..rows[1].clone()
+        },
+        begun[1],
+        "finishing a row fills in its completion and changes nothing else"
+    );
     assert_eq!(
         rows[1].completion,
         Some(Completion {
