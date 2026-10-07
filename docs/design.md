@@ -429,9 +429,9 @@ refusal is recorded as the outcome `refused` on an allowed row, as is a `propose
 refusal of something the gateway did not create or of something that would act on its own.
 "What did the gateway refuse" is therefore a denial or a refused outcome.
 
-**One function is the only place that can allow a call.** The argument check, the connector,
-the credential layer, the custodian and the vendor may each refuse or fail after it, and none
-may allow. One audit record holds the whole decision for a call, and its policy revision
+**One function is the only place that can allow a call.** The receipt check at begin, the
+argument check, the connector, the credential layer, the custodian and the vendor may each
+refuse or fail after it, and none may allow. One audit record holds the whole decision for a call, and its policy revision
 identifies the approvals and loader checks the call relied on.
 
 **Broad reads use a breadth resource.** A read that shows more than its caller could otherwise

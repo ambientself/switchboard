@@ -463,9 +463,10 @@ On 2026-10-07 the owner accepted this record's recommendations:
 ## Still for the owner
 
 - **Who takes the changes in Otto to Otto's owners.** This record made no recommendation on
-  it, so accepting the recommendations did not settle it. Decisions 0009 and 0010 raise their
-  Otto questions under issue #21. Meanwhile nothing has been raised, and the first item below
-  waits on it.
+  it, so accepting the recommendations did not settle it. Decision 0009 tracks its Otto
+  questions under issues #21 and #22. Decision 0010 sends its Otto questions with this record's
+  changes, as one list, raised by whoever the owner names. Meanwhile nothing has been raised,
+  and the first item below waits on it.
 
 ## Still open
 

@@ -239,12 +239,13 @@ sits with a maximum snapshot age, are Q11's.
 
 | Part | Made by | When | Can it allow? | On the audit record |
 | --- | --- | --- | --- | --- |
-| Who is calling, and for whom | The identity and delegation verifiers. | Before the decision. | No. | Proved and claimed columns; an opaque denial on failure. |
+| Who is calling, and for whom | The identity and delegation verifiers. | Before the decision. | No. | Proved and claimed columns. An identity failure is telemetry with an opaque answer, and no row. A delegation that fails is passed on unverified and denied at check 3, with a row ([decision 0009](0009-audit-completion-receipts-and-recovery.md)). |
 | Classification, declaration, credential entry and reach | The person approving the tool, checked by the approval's reviewer. | Approval. | No. They are inputs. | Policy revision. |
 | Whether the approvals fit together | The snapshot loader, with the rules above. | When a snapshot loads. | No. A snapshot that breaks a rule is never served. | Policy revision. |
 | Which resources the call names, or the reach | The tool's resource adapter, gateway code. | Before the decision. | No. Finding none denies a `declared` tool. | Resources, or the connector entry marked as a reach. |
-| Profile, surface, tool, delegation, classification, resource limit | The decision function. | Before the row is begun. | Yes. The only place that can. | Decision, reason, sentence. |
+| Profile, surface, tool, delegation, classification, currency, resource limit, key | The decision function, with the currency check of [decision 0012](0012-what-a-turn-grant-binds.md) and the key check of decision 0009. | Before the row is begun. | Yes. The only place that can. | Decision, reason, sentence. |
 | Arguments against the approved schema | The gateway, for proxied tools; the connector's own types, for built-in ones. | After the row is begun, before the vendor. | No. | Outcome `error`, invalid arguments; nothing is forwarded, and a side effect's receipt is `not_performed`. |
+| Whether a key was already used | The receipt check (decision 0009). | At begin. | No. It decides about delivery. | An allowed row written complete, `refused` or `duplicate`. |
 | Scope known only when running | A built-in connector, for `checks_own_scope` tools. | While running. | No. | Outcome `refused`, with its sentence. |
 | Which credential, narrowed how | The credential layer and the custodian, in the approved mode. | While running. | No. | `refused` when no grant exists; `error`, a custodian refusal, when the custodian refuses; the credential identity used. |
 | What the credential may do | The vendor. | While running. | No. | Outcome `error`; a vendor refusal where the connector can tell. |
