@@ -150,13 +150,16 @@ lines only once the interfaces between them have settled.
 | --- | --- |
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
-| `gateway-audit` | The audit store over Postgres, and the explicit no-op store. |
+| `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
 | `connector-github` | GitHub tools, and the client for the key custodian. |
 | `otto-adapter` | Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
+| `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
 | `gateway-mcp` | The MCP protocol adapter: JSON-RPC envelopes, the two revisions, header checks, rendering. No policy types. |
 | `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, wiring. |
 | `gateway-dev` | The gateway on the test fakes (`switchboard-dev`), a scripted client, and the end-to-end tests. |
+| `mock-docs-server` | A mock document server that plays a proxied MCP server in tests and the demo. Shares no code with the gateway. |
+| `demo-checks` | Tests for the demo's scripts and manifests in `deploy/`. No code of its own. |
 | `registry` | The control-plane binary, once it exists. |
 | `conformance` | The black-box suite, a fake vendor API and a fake MCP server. |
 

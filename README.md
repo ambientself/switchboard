@@ -18,7 +18,11 @@ Gateway
 gaps are listed in [docs/otto-baseline.md](docs/otto-baseline.md). The Rust gateway's policy
 core exists (`crates/gateway-core`: the decision function, its table of cases and the audit
 record type). The gateway serves MCP over HTTP in both revisions (`crates/gateway`), but only
-on test fakes: it has no durable audit store and no real connectors yet.
+on test fakes: it has no durable audit store and no real connectors yet. The Postgres audit
+store (`crates/audit-postgres`), the registry (`crates/gateway-registry`), the proxy
+connector (`crates/connector-proxy`) and a mock document server exist as crates, and the
+demo's deployment is in [deploy/](deploy/README.md), but the `switchboard` binary does not
+use them yet.
 
 Run the baseline with `python3 conformance/run.py --otto-source /path/to/otto`.
 See [conformance setup and coverage](conformance/README.md).
