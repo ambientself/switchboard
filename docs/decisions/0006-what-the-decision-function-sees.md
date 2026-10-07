@@ -311,8 +311,8 @@ changed the sections above in place. In summary:
 - **Check 5 gains an exception step,** once #12 builds it. Check 5 denies `write` and
   `destructive` unless the tool is named in the calling profile's list of excepted tools. The
   first entries are Otto's `github_pr_comment` and `jira_comment`, in Otto's profile only. An
-  allow under the exception gives the exception as its reason (Comments, and Direct writes are
-  denied in every profile). Until #12 builds it, both tools stay denied.
+  allow under the exception gives the exception as its reason. Until #12 builds it, both tools
+  stay denied. See the sections on comments and on direct writes, above.
 - **Resources.** `checks_own_scope` is available only to built-in connectors, and a `declared`
   tool's adapter may name its connector entry's whole recorded reach (Consequences). Broad
   reads use a breadth resource in a limit, with no field of their own (Broad reads).

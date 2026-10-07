@@ -140,13 +140,13 @@ returned, and is not a reason kind. The row holds the proved columns and nothing
 grant's claims. When the signature verified and a binding failed (audience, lifetime or pod),
 the row also records the grant's digest. That is the one exception to 0009's rule that such a
 row holds nothing from the grant. A digest is not a claim, and it matches a refused use of a
-grant with the rows where the same grant was accepted. Honest sandboxes produce lifetime failures,
-from a call just after the deadline or a node whose clock is off, so those are counted and
-alerted on by rate. An audience or pod failure comes from a copied grant or a configuration
-fault, never from an honest sandbox under a correct configuration, so each one is
-investigated. A team mismatch is still named, by check 3, because such a grant verified and
-the mismatch is usually a rollout fault. A pod mismatch is not named, because naming it helps
-only the copier.
+grant with the rows where the same grant was accepted. Honest sandboxes produce lifetime
+failures, from a call just after the deadline or a node whose clock is off, so those are
+counted and alerted on by rate. An audience or pod failure comes from a copied grant or a
+configuration fault, never from an honest sandbox under a correct configuration, so each one
+is investigated. A team mismatch is still named, by check 3, because such a grant verified
+and the mismatch is usually a rollout fault. A pod mismatch is not named, because naming it
+helps only the copier.
 
 ### Presenting a grant more than once
 

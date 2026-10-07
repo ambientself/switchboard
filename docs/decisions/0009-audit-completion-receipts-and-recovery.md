@@ -293,11 +293,11 @@ confirmed, and when the arguments were refused before anything was sent: by the 
 argument check for a proxied tool ([decision
 0011](0011-resource-authorization-and-tool-assurance.md)), which runs after begin, or by a
 built-in connector's own parsing. Where begin was never confirmed, it keeps trying on the
-finish pool until the finish deadline. A refusal by the credential layer or the connector is completed as
-`refused`, and a custodian refusal as `error`, with the receipt `not_performed` in each case.
-A late finish that disagrees with a receipt reconciliation has already settled is written to
-the row. The receipt is left as it is, and the disagreement is logged and counted; alerting
-waits for Still open 9.
+finish pool until the finish deadline. A refusal by the credential layer or the connector is
+completed as `refused`, and a custodian refusal as `error`, with the receipt `not_performed`
+in each case. A late finish that disagrees with a receipt reconciliation has already settled
+is written to the row. The receipt is left as it is, and the disagreement is logged and
+counted; alerting waits for Still open 9.
 
 ### The key
 
