@@ -27,6 +27,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # Reads a token's claims back.
 base64 = "0.22"
+# The MCP SDK as a client, in its three lifecycle modes (decision 0007). A test tool only, pinned
+# so an SDK release cannot change what the tests show without a change here.
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+# The HTTP client rmcp's transport is built on. The tests make their own, with no proxy, and
+# wrap it to record what went over the wire.
+rmcp-reqwest = { package = "reqwest", version = "0.13", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
