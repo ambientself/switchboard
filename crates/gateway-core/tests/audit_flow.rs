@@ -651,18 +651,19 @@ fn recorded_values_are_capped() {
         longest_github,
         "the longest GitHub repository name is cut"
     );
+    // The longest AWS ARN, written as a number: the constant is what is under test, so
+    // comparing it with itself would prove nothing.
+    let longest_arn = 2048;
+    assert_eq!(MAX_RECORDED_IDENTIFIER, longest_arn);
     for (raw, recorded) in [
+        ("x".repeat(longest_arn), "x".repeat(longest_arn)),
         (
-            "x".repeat(MAX_RECORDED_IDENTIFIER),
-            "x".repeat(MAX_RECORDED_IDENTIFIER),
+            "x".repeat(longest_arn + 1),
+            format!("{}…", "x".repeat(longest_arn)),
         ),
         (
-            "x".repeat(MAX_RECORDED_IDENTIFIER + 1),
-            format!("{}…", "x".repeat(MAX_RECORDED_IDENTIFIER)),
-        ),
-        (
-            format!("{}\n", "x".repeat(MAX_RECORDED_IDENTIFIER - 1)),
-            format!("{}…", "x".repeat(MAX_RECORDED_IDENTIFIER - 1)),
+            format!("{}\n", "x".repeat(longest_arn - 1)),
+            format!("{}…", "x".repeat(longest_arn - 1)),
         ),
     ] {
         assert_eq!(record_one(named(raw)).identifier, recorded);
