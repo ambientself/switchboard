@@ -68,8 +68,8 @@ async fn the_fixture_gateway_serves_a_call_on_loopback_and_records_it() {
 #[tokio::test]
 async fn each_fixture_caller_is_proved_and_gets_its_own_profile() {
     let gateway = start_fixture_gateway().await.unwrap();
-    // Team A's profile may propose; team B's and the user's may not, and the user has no
-    // access to the surface that serves the draft tool. No profile may write.
+    // Team A's profile may propose; team B's and the user's may not, no profile may write, and
+    // the user has no access to the surface that serves the draft and write tools.
     let tools = |caller| {
         let token = gateway.token(caller);
         let url = gateway.url(SURFACE_ALL);

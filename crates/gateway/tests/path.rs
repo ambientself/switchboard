@@ -27,11 +27,12 @@ use gateway_mcp::{
     TOOL_USE_ID_META,
 };
 use gateway_testkit::{
-    AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, FakeCredentialSource, Fixture, FixtureConnector,
-    GROUP_G, GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B,
-    PROFILE_USER, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A,
-    TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT, TEAM_B_SUBJECT, USER_ISSUER,
-    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, document, poll_once,
+    AUDIENCE, CONNECTOR, Caller, DRAFT_REFUSAL, DRAFT_TOOL, FOREIGN_DRAFT, FakeCredentialSource,
+    Fixture, FixtureConnector, GROUP_G, GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER,
+    PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL,
+    SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT,
+    TEAM_B_SUBJECT, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, document,
+    poll_once,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use serde_json::{Value, json};
@@ -493,6 +494,51 @@ fn the_two_teams_documents_are_separate() {
     );
 }
 
+#[test]
+fn an_allowed_proposal_runs_under_the_callers_credential_and_completes_its_row() {
+    let world = World::new();
+    let arguments = json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."});
+    let result = world
+        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, arguments.clone())
+        .result();
+    assert_eq!(result["isError"], json!(false));
+    assert_eq!(result["structuredContent"]["draft"], json!("draft-1"));
+    let row = world.row(0);
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(row.classification, Some(Classification::Propose));
+    assert_eq!(row.completion.map(|c| c.outcome), Some(Outcome::Ok));
+    let writes = world.connector.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].tool, DRAFT_TOOL);
+    assert_eq!(writes[0].arguments, arguments);
+    assert_eq!(writes[0].credential, "fake-credential-for-fixture-team-a-1");
+
+    // A draft the gateway did not open is refused by the connector when it runs, and the row
+    // records the refusal.
+    let sentence = world
+        .call(
+            Caller::TeamA,
+            SURFACE_ALL,
+            DRAFT_TOOL,
+            json!({"document": TEAM_A_DOCUMENT, "draft": FOREIGN_DRAFT}),
+        )
+        .denial();
+    assert_eq!(sentence, DRAFT_REFUSAL);
+    let row = world.row(1);
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(
+        row.completion.map(|c| c.outcome),
+        Some(Outcome::Refused {
+            sentence: DRAFT_REFUSAL.to_owned()
+        })
+    );
+    assert_eq!(
+        world.connector.writes().len(),
+        1,
+        "the refused revision wrote nothing"
+    );
+}
+
 // --- Denials --------------------------------------------------------------------------------
 
 #[test]
@@ -509,7 +555,7 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
     let team_a = world.token(Caller::TeamA);
     let team_b = world.token(Caller::TeamB);
     let user = world.token(Caller::UserInGroupG);
-    let table: [(&str, &str, &str, Value, ReasonKind); 9] = [
+    let table: [(&str, &str, &str, Value, ReasonKind); 11] = [
         (
             &ambiguous_user,
             SURFACE_READ,
@@ -559,6 +605,21 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
             own(Caller::TeamB),
             ClassificationNotPermitted,
         ),
+        // A direct write is denied in every profile, even to team A, whose profile may propose.
+        (
+            &team_a,
+            SURFACE_ALL,
+            WRITE_TOOL,
+            own(Caller::TeamA),
+            ClassificationNotPermitted,
+        ),
+        (
+            &team_b,
+            SURFACE_ALL,
+            DRAFT_TOOL,
+            own(Caller::TeamB),
+            ClassificationNotPermitted,
+        ),
         (
             &team_b,
             SURFACE_ALL,
@@ -590,7 +651,7 @@ fn a_denied_call_never_reaches_the_connector_and_its_row_is_the_denial() {
         world.assert_nothing_ran();
     }
     assert_eq!(world.row(0).profile.as_str(), gateway::NO_PROFILE);
-    assert_eq!(world.store.rows().len(), 9, "one row per denied call");
+    assert_eq!(world.store.rows().len(), 11, "one row per denied call");
     assert_eq!(world.store.finish_attempts(), 0);
 }
 
@@ -970,9 +1031,28 @@ fn every_identity_failure_is_the_same_401_and_nothing_runs() {
     world.assert_nothing_ran();
     assert!(
         world.store.rows().is_empty(),
-        "identity failures are logged, not audited"
+        "identity failures are telemetry, not audit rows"
     );
     assert_eq!(world.store.begin_attempts(), 0);
+}
+
+#[test]
+fn during_an_audit_outage_an_identity_failure_is_still_the_same_401() {
+    // Decision 0009: an identity failure writes no row, so an audit outage does not change its
+    // answer, and a caller who is not verified cannot tell that the store is down.
+    let world = World::new();
+    world.store.fail_all_begins();
+    let got = world.send(None, SURFACE_ALL, tools_call(READ_TOOL, own(Caller::TeamA)));
+    assert_eq!(got.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(got.json()["error"]["message"], json!(IDENTITY_FAILURE));
+    assert_eq!(world.store.begin_attempts(), 0);
+
+    // A verified caller in the same outage is refused with the audit sentence.
+    let sentence = world
+        .call(Caller::TeamA, SURFACE_ALL, READ_TOOL, own(Caller::TeamA))
+        .denial();
+    assert_eq!(sentence, AUDIT_FAILURE);
+    world.assert_nothing_ran();
 }
 
 #[test]
@@ -1112,7 +1192,12 @@ fn tools_list_returns_only_what_the_caller_may_call() {
     assert_eq!(
         list(Caller::TeamB, SURFACE_ALL),
         [READ_TOOL, SCOPED_READ_TOOL],
-        "team B may not write"
+        "team B may not propose, and nobody may write"
+    );
+    assert_eq!(
+        list(Caller::TeamA, SURFACE_ALL),
+        [DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL],
+        "team A may propose, and nobody may write"
     );
     assert_eq!(
         list(Caller::UserInGroupG, SURFACE_READ),

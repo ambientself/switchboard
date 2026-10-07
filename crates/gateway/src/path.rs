@@ -15,29 +15,33 @@
 //! What `respond` does with each request:
 //!
 //! - A protocol refusal is answered as [`gateway_mcp`] renders it, and a notification gets 202
-//!   with no body.
-//! - `initialize`, `ping` and `server/discover` are answered with no decision and no audit row.
-//!   They still need a verified caller, because `admit` ran first.
+//!   with no body. Neither writes a row.
+//! - `initialize`, `ping` and `server/discover` are answered with no decision and no audit row:
+//!   decision 0009 makes them telemetry. They still need a verified caller, because `admit` ran
+//!   first.
 //! - `tools/list` selects the caller's profile and returns the tools on the surface that pass
-//!   the core's checks, with their catalog definitions. No row.
-//!
-//! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
-//! everything from it, so a registry reload never splits one request across two versions.
+//!   the core's checks, with their catalog definitions. It writes no row yet; decision 0009
+//!   asks for a row of kind `list`, which needs the core's list record (#10).
 //! - `tools/call` reads the call's resources through the adapter registered for the approved
 //!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
 //!   answers. A denial is answered with the sentence the row holds.
 //!
-//! Three gaps in the core shape what happens here:
+//! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
+//! everything from it, so a registry reload never splits one request across two versions.
 //!
-//! - **Identity failures are logged, not audited** (G1). An audit row needs a proved
-//!   principal, which a failed caller does not have. With identity disabled there is no
-//!   principal either, so `tools/list` lists nothing and every `tools/call` is refused with
-//!   [`IDENTITY_DISABLED`], with no row.
-//! - **There is no answer budget** (G2). The core gives out the answer only once the store's
+//! What the path does not do yet, and why:
+//!
+//! - **Identity failures are logged, not audited**, as decision 0009 records: they are
+//!   telemetry, and an audit row needs a proved principal, which a failed caller does not have.
+//!   The log event carries the deployment and the cause; the surface, the source address,
+//!   counters and a bounded queue are still to come (design section 17). With identity
+//!   disabled there is no principal either, so `tools/list` lists nothing and every
+//!   `tools/call` is refused with [`IDENTITY_DISABLED`], with no row.
+//! - **There is no answer budget.** The core gives out the answer only once the store's
 //!   `finish` returns, so the path waits for it, however long that takes. The budget belongs
-//!   inside the store.
-//! - **The tool-use identifier is bounded here** (G5). It comes from the caller's `_meta` and
-//!   the core writes it to the row as given, so one longer than [`MAX_TOOL_USE_ID`] or holding
+//!   inside the store (#10).
+//! - **The tool-use identifier is bounded here.** It comes from the caller's `_meta` and the
+//!   core writes it to the row as given, so one longer than [`MAX_TOOL_USE_ID`] or holding
 //!   anything but printable ASCII is dropped, with a warning.
 //!
 //! The future [`RequestPath::respond`] returns owns everything it uses and is `Send +
@@ -159,7 +163,7 @@ impl RequestPath {
     /// regard to case. A missing header, two of them, a value that is not text, or another
     /// scheme count as no token. Every identity failure is the same 401, with the core's one
     /// sentence and a `Bearer` challenge. Its cause is logged, never sent, and no audit row is
-    /// written (G1).
+    /// written: decision 0009 makes an identity failure telemetry.
     // The error is the response to send, which is large. It is built at most once per request
     // and sent as it is, so boxing it would only add an allocation.
     #[allow(clippy::result_large_err)]
@@ -363,7 +367,7 @@ impl RequestPath {
         let ran = audit::run(connector.as_ref(), guard).await;
         let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
-        // No answer budget (G2): the core gives out the answer when the store's finish returns.
+        // No answer budget: the core gives out the answer when the store's finish returns.
         let finishing = Instant::now();
         let finished = audit::finish(store, ran, latency_ms).await;
         let finish_us = micros(finishing.elapsed());
@@ -570,6 +574,7 @@ mod tests {
         for (name, read_only) in [
             (gateway_testkit::READ_TOOL, true),
             (gateway_testkit::SCOPED_READ_TOOL, true),
+            (gateway_testkit::DRAFT_TOOL, false),
             (gateway_testkit::WRITE_TOOL, false),
         ] {
             let tool = snapshot.tool(&name.parse().unwrap()).unwrap();

@@ -37,12 +37,15 @@ pub fn catalog_data() -> Value {
         {
             "name": DRAFT_TOOL,
             "title": "Propose a change to a document",
-            "description": "Opens a draft against one fixture document for a person to review, or revises a draft it opened. It refuses a draft it did not open.",
+            "description": "Opens a draft against one fixture document for a person to review, or revises a draft this tool opened against it. Nothing is stored; the fixture records the draft.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     DOCUMENT_ARGUMENT: document,
-                    DRAFT_ARGUMENT: {"type": "string", "description": "A draft this tool opened, to revise it."},
+                    DRAFT_ARGUMENT: {
+                        "type": "string",
+                        "description": "The draft to revise, such as draft-1. Leave it out to open a new draft.",
+                    },
                     "text": {"type": "string"},
                 },
                 "required": [DOCUMENT_ARGUMENT],
@@ -51,7 +54,7 @@ pub fn catalog_data() -> Value {
         {
             "name": WRITE_TOOL,
             "title": "Write a document",
-            "description": "Writes to one fixture document. Nothing is stored; the fixture records that the write happened.",
+            "description": "Writes to one fixture document directly. It is classified write, so the gateway denies it to every caller.",
             "input_schema": {
                 "type": "object",
                 "properties": {DOCUMENT_ARGUMENT: document, "text": {"type": "string"}},

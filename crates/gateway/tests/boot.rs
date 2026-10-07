@@ -462,10 +462,10 @@ fn policy_the_core_refuses_is_refused_at_boot() {
 fn an_approved_tool_without_a_definition_is_refused() {
     let world = World::new();
     let mut config = world.config();
-    config["catalog"].as_array_mut().unwrap().remove(2);
+    config["catalog"].as_array_mut().unwrap().remove(1);
     let booted = world.boot(config, world.wiring());
     assert!(
-        matches!(&booted, Err(BootError::Catalog(CatalogError::Missing(tool))) if tool.as_str() == WRITE_TOOL),
+        matches!(&booted, Err(BootError::Catalog(CatalogError::Missing(tool))) if tool.as_str() == DRAFT_TOOL),
         "{booted:?}"
     );
 }
