@@ -1253,6 +1253,19 @@ mutate("pg-check-database-create-ignored", "CREATE on the database passes the ch
        "    if database.get::<_, bool>(1) {", "    if false {")
 mutate("pg-check-replication-role-ignored", "a role that may set session_replication_role passes the check", PG_CHECK,
        "        if can_set {", "        if false {")
+for privilege in ["TRUNCATE", "REFERENCES", "TRIGGER"]:
+    mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
+           f'        "{privilege}",\n', "")
+mutate("pg-check-maintain-ignored", "MAINTAIN on the table passes the check", PG_CHECK,
+       '        privileges.push("MAINTAIN");', "")
+mutate("pg-check-trigger-function-any-schema", "a trigger calling a function of the same name in another schema passes the check", PG_CHECK,
+       "AND n.nspname = 'switchboard_audit' AND p.proname = $2", "AND p.proname = $2")
+mutate("pg-check-schema-owner-membership-ignored", "a member of the schema's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, n.nspowner, 'MEMBER')",
+       "                 AND n.nspowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-function-owner-membership-ignored", "a member of the trigger functions' owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, p.proowner, 'MEMBER')",
+       "                 AND p.proowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
 mutate("pg-check-privileges-own-role-only", "a role the session can become is not checked for privileges", PG_CHECK,
        "                 WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND {test})",
        "                 WHERE r.rolname = current_user AND {test})")

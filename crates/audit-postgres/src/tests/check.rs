@@ -99,12 +99,19 @@ async fn a_role_that_can_become_the_owner_is_refused() {
         .unwrap();
     let store = db.store_like_gateway("", &[&role]).await;
     let found = problems(&store).await;
-    assert!(
-        found.contains(&Problem::Owns {
-            object: "the relation switchboard_audit.call_rows".into()
-        }),
-        "{found:?}"
-    );
+    for object in [
+        "the schema switchboard_audit",
+        "the relation switchboard_audit.call_rows",
+        "the function switchboard_audit.complete_once",
+        "the function switchboard_audit.set_times",
+    ] {
+        assert!(
+            found.contains(&Problem::Owns {
+                object: object.into()
+            }),
+            "{object}: {found:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -135,15 +142,32 @@ async fn a_role_that_can_become_a_wide_role_is_refused() {
     assert_eq!(problems(&store).await, vec![attribute(&wide, "CREATEDB")]);
 }
 
+/// The server's version, as `server_version_num` gives it.
+async fn version(db: &TestDatabase) -> i32 {
+    db.admin()
+        .await
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
 #[tokio::test]
-async fn delete_and_truncate_are_refused() {
+async fn each_privilege_on_the_whole_table_is_refused() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
+    // TRIGGER would let the role add a trigger of its own that rewrites a row after
+    // complete_once has passed it.
+    let mut granted = vec!["DELETE", "REFERENCES", "TRIGGER", "TRUNCATE"];
+    if version(&db).await >= 170_000 {
+        granted.push("MAINTAIN");
+    }
     db.admin()
         .await
         .batch_execute(&format!(
-            "GRANT DELETE, TRUNCATE ON switchboard_audit.call_rows TO {GATEWAY_ROLE}"
+            "GRANT {} ON switchboard_audit.call_rows TO {GATEWAY_ROLE}",
+            granted.join(", ")
         ))
         .await
         .unwrap();
@@ -152,13 +176,12 @@ async fn delete_and_truncate_are_refused() {
     let BootCheckError::Unfit { problems, .. } = &error else {
         panic!("{error}");
     };
-    assert_eq!(
-        problems,
-        &vec![
-            extra("DELETE", "switchboard_audit.call_rows"),
-            extra("TRUNCATE", "switchboard_audit.call_rows"),
-        ]
-    );
+    granted.sort_unstable();
+    let expected: Vec<Problem> = granted
+        .iter()
+        .map(|privilege| extra(privilege, "switchboard_audit.call_rows"))
+        .collect();
+    assert_eq!(problems, &expected);
     assert!(
         error
             .to_string()
@@ -667,6 +690,35 @@ async fn a_trigger_that_fires_at_another_time_or_on_some_rows_is_refused() {
                  CREATE TRIGGER {trigger} {restored} ON switchboard_audit.call_rows
                      FOR EACH ROW EXECUTE FUNCTION switchboard_audit.{trigger}();"
             ))
+            .await
+            .unwrap();
+        store.check_at_boot().await.unwrap();
+    }
+    // A trigger of the right name, at the right time, that calls a function of the same name in
+    // another schema, which need not do anything.
+    for (trigger, time) in [
+        ("set_times", "BEFORE INSERT"),
+        ("complete_once", "BEFORE UPDATE"),
+    ] {
+        let create = |schema: &str| {
+            format!(
+                "DROP TRIGGER {trigger} ON switchboard_audit.call_rows;
+                 CREATE TRIGGER {trigger} {time} ON switchboard_audit.call_rows
+                     FOR EACH ROW EXECUTE FUNCTION {schema}.{trigger}();"
+            )
+        };
+        admin
+            .batch_execute(&format!(
+                "CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql
+                     AS $$ BEGIN RETURN NEW; END $$;
+                 {}",
+                create("public")
+            ))
+            .await
+            .unwrap();
+        assert_eq!(problems(&store).await, vec![missing(trigger)], "{trigger}");
+        admin
+            .batch_execute(&create("switchboard_audit"))
             .await
             .unwrap();
         store.check_at_boot().await.unwrap();
