@@ -939,7 +939,8 @@ mutate_all(
 
 # Most of these are caught only by the tests against Postgres, which run when
 # SWITCHBOARD_TEST_DATABASE_URL names a superuser on a throwaway server (see the crate's
-# documentation). Without it they survive. The `pg-columns-*` ones need no server.
+# documentation). Without it they survive. The `pg-columns-*` ones need no server, nor do
+# pg-check-durability-ignored, pg-check-delete-ignored and pg-retry-slow-attempt-final.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 PG_STORE = PG + "src/store.rs"
@@ -989,18 +990,18 @@ mutate("pg-session-not-synchronous", "sessions keep the role's synchronous_commi
 mutate("pg-session-options-replaced", "the caller's session options are dropped", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', "SESSION_OPTIONS.to_owned()")
 mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
-       "        let client = self.finish.get().await?;", "        let client = self.begin.get().await?;")
+       "            pool: self.finish.clone(),", "            pool: self.begin.clone(),")
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
        "WHERE id = ($1::text)::uuid AND outcome IS NULL", "WHERE id = ($1::text)::uuid")
 mutate("pg-finish-same-again-refused", "the same completion written again is an error", PG_STORE,
-       "            Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),",
-       "            Some(outcome) if false && finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),")
+       "        Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),",
+       "        Some(outcome) if false && finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),")
 mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
-       "            _ => Err(PgAuditError::CompletedDifferently {\n                row: row.as_str().to_owned(),\n            }),",
-       "            _ => Ok(()),")
+       "        _ => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
+       "        _ => Ok(()),")
 mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succeeds", PG_STORE,
-       "            return Err(PgAuditError::NoSuchRow {\n                row: row.as_str().to_owned(),\n            });",
-       "            return Ok(());")
+       "        return Err(PgAuditError::NoSuchRow {\n            row: row.to_owned(),\n        });",
+       "        return Ok(());")
 mutate("pg-columns-complete-record-begun", "begin drops a completion it was handed", PG_COLUMNS,
        "        if record.completion.is_some() {", "        if false {")
 mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
@@ -1010,6 +1011,74 @@ mutate("pg-columns-workload-team-as-group", "a workload's team is written as a g
        '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![team.to_string()])),')
 mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
        "            && Some(self.latency_ms) == latency_ms\n", "")
+
+# The store's time budgets, and its boot checks.
+PG_CHECK = PG + "src/check.rs"
+mutate("pg-begin-pool-wait-unbounded", "begin waits for a connection past its budget", PG_STORE,
+       "timeout_at(deadline, self.begin.get())", "timeout_at(deadline + Duration::from_secs(3600), self.begin.get())")
+mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget", PG_STORE,
+       "timeout_at(deadline, insert_on(&client, &row))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, &row))")
+mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
+       "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
+mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
+       "    drop(Object::take(client));", "    drop(client);")
+mutate("pg-finish-waits-past-answer-budget", "finish holds the answer until its deadline", PG_STORE,
+       "let answer_by = started + self.budgets.answer;", "let answer_by = started + self.budgets.finish_deadline;")
+mutate("pg-finish-stops-at-answer-budget", "finish stops trying when the answer goes out", PG_STORE,
+       "            deadline: started + self.budgets.finish_deadline,", "            deadline: started + self.budgets.answer,")
+mutate("pg-finish-no-retry", "finish gives up after one failed attempt", PG_STORE,
+       "                Err(error) => error,", "                Err(error) => return Err(error),")
+mutate("pg-finish-retries-final-errors", "finish retries a failure that trying again cannot fix", PG_STORE,
+       "                Err(error) if !error.is_transient() => return Err(error),", "                Err(error) if false => return Err(error),")
+mutate("pg-finish-no-deadline", "finish keeps trying past its deadline", PG_STORE,
+       "            if now >= self.deadline {", "            if false {")
+mutate("pg-retry-connect-failure-final", "a connection that could not be made is not retried", PG_STORE,
+       "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
+       "            Self::Pool(PoolError::Timeout(_)) | Self::AttemptTimedOut => {")
+mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not retried", PG_STORE,
+       "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
+       "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) => {")
+mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
+       "                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+mutate("pg-check-durability-ignored", "a server without fsync passes the check", PG_CHECK,
+       "    (found != expected).then_some(", "    false.then_some(")
+mutate("pg-check-superuser-ignored", "a superuser passes the check", PG_CHECK,
+       '            (1, "SUPERUSER"),\n', "")
+mutate("pg-check-bypassrls-ignored", "a role that bypasses row security passes the check", PG_CHECK,
+       '            (5, "BYPASSRLS"),\n', "")
+mutate("pg-check-attributes-own-role-only", "a role the session can become is not checked for attributes", PG_CHECK,
+       "             WHERE pg_has_role(current_user, oid, 'MEMBER')", "             WHERE rolname = current_user")
+mutate("pg-check-owner-membership-ignored", "a member of the table's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, c.relowner, 'MEMBER')",
+       "                 AND c.relowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-table-missing-ignored", "a missing table passes the check", PG_CHECK,
+       "        None => problems.push(Problem::TableMissing),", "        None => {}")
+mutate("pg-check-column-missing-ignored", "a missing column passes the check", PG_CHECK,
+       "            None => problems.push(Problem::ColumnMissing { column }),", "            None => {}")
+mutate("pg-check-column-type-ignored", "a column of another type passes the check", PG_CHECK,
+       "                if found != *expected {", "                if false {")
+mutate("pg-check-trigger-missing-ignored", "a missing trigger passes the check", PG_CHECK,
+       "        None => problems.push(Problem::TriggerMissing),", "        None => {}")
+mutate("pg-check-trigger-replica-enabled", "a trigger that fires only for replication passes the check", PG_CHECK,
+       'Some(enabled) if enabled != "O" && enabled != "A" => {', 'Some(enabled) if enabled == "D" => {')
+mutate("pg-check-extra-column-ignored", "a column grant beyond the gateway's passes the check", PG_CHECK,
+       "    for (privilege, column) in held.difference(&expected) {", "    for (privilege, column) in held.difference(&held) {")
+mutate("pg-check-missing-column-grant-ignored", "a column grant the store needs may be missing", PG_CHECK,
+       "    for (privilege, column) in expected.difference(&held) {", "    for (privilege, column) in expected.difference(&expected) {")
+mutate("pg-check-whole-table-per-column", "a privilege on the whole table is also reported for every column", PG_CHECK,
+       "        if !whole.contains(privilege) {", "        if true {")
+mutate("pg-check-delete-ignored", "DELETE on the table passes the check", PG_CHECK,
+       '        "DELETE",\n', "")
+mutate("pg-check-other-tables-ignored", "column grants on another table in the schema pass the check", PG_CHECK,
+       "                     OR (c.relname <> 'call_rows'", "                     OR (false")
+mutate("pg-check-schema-usage-ignored", "a role without USAGE on the schema passes the check", PG_CHECK,
+       "        if !schema.get::<_, bool>(0) {", "        if false {")
+mutate("pg-check-schema-create-ignored", "CREATE on the schema passes the check", PG_CHECK,
+       "        if schema.get::<_, bool>(1) {", "        if false {")
+mutate("pg-check-database-create-ignored", "CREATE on the database passes the check", PG_CHECK,
+       "    if database.get::<_, bool>(1) {", "    if false {")
+mutate("pg-check-replication-role-ignored", "a role that may set session_replication_role passes the check", PG_CHECK,
+       "        if can_set {", "        if false {")
 
 
 # --- Running -------------------------------------------------------------------------------

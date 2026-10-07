@@ -249,6 +249,27 @@ async fn a_grant_the_store_needs_and_lacks_is_refused() {
 }
 
 #[tokio::test]
+async fn a_role_that_cannot_use_the_schema_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "REVOKE USAGE ON SCHEMA switchboard_audit FROM {GATEWAY_ROLE}"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&db.store(PoolSizes::default())).await,
+        vec![Problem::Missing {
+            privilege: "USAGE".into(),
+            object: "the schema switchboard_audit".into()
+        }]
+    );
+}
+
+#[tokio::test]
 async fn any_privilege_on_another_table_in_the_schema_is_refused() {
     let Some(db) = TestDatabase::create().await else {
         return;
