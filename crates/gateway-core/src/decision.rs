@@ -94,7 +94,7 @@ pub enum Reason {
         /// The proved caller.
         principal: Principal,
     },
-    /// The delegation lists the tools it permits, and this is not one of them.
+    /// This tool is not among the tools the delegation permits.
     ToolNotInDelegation {
         /// The tool the call named.
         tool: ToolName,
@@ -102,8 +102,8 @@ pub enum Reason {
     /// The delegation is missing where the profile requires one, or disagrees with the
     /// principal.
     DelegationDisagrees(DelegationProblem),
-    /// The profile does not permit the tool's classification. Always the case for a
-    /// destructive tool.
+    /// The profile does not permit the tool's classification. Always the case for a `write`
+    /// or `destructive` tool.
     ClassificationNotPermitted {
         /// The tool the call named.
         tool: ToolName,
@@ -444,24 +444,30 @@ fn delegation_agrees(
     }
 }
 
-/// Check 4.
+/// Check 4. A delegation always lists its tools, so one that is present always narrows.
 fn delegation_lists_tool(
     delegation: Option<&Proved<Delegation>>,
     tool: &ApprovedTool,
 ) -> Result<(), Reason> {
-    match delegation.and_then(|delegation| delegation.get().tools.as_ref()) {
-        Some(permitted) if !permitted.contains(&tool.name) => Err(Reason::ToolNotInDelegation {
-            tool: tool.name.clone(),
-        }),
+    match delegation {
+        Some(delegation) if !delegation.get().tools.contains(&tool.name) => {
+            Err(Reason::ToolNotInDelegation {
+                tool: tool.name.clone(),
+            })
+        }
         _ => Ok(()),
     }
 }
 
-/// Check 5. Destructive is refused before the profile is consulted, so no profile data can
-/// permit it.
+/// Check 5. A direct write and a destructive tool are refused before the profile is consulted,
+/// so no profile data can permit either. Permitting direct writes takes a decision record that
+/// replaces this part of decision 0006, and a change here.
 fn classification_is_permitted(profile: &Profile, tool: &ApprovedTool) -> Result<(), Reason> {
-    let permitted = tool.classification != Classification::Destructive
-        && profile.classifications.contains(&tool.classification);
+    let denied_everywhere = matches!(
+        tool.classification,
+        Classification::Write | Classification::Destructive
+    );
+    let permitted = !denied_everywhere && profile.classifications.contains(&tool.classification);
     if permitted {
         Ok(())
     } else {
