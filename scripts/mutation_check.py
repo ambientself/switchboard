@@ -1463,6 +1463,19 @@ mutate("dev-client-bin-unexpected-exits-0", "switchboard-client exits 0 when an 
        "    } else {\n        ExitCode::from(1)\n    }", "    } else {\n        ExitCode::SUCCESS\n    }")
 
 
+
+# --- gateway-dev: switchboard-dev ----------------------------------------------------------
+
+DEV_BIN = DEV + "bin/switchboard-dev.rs"
+
+mutate("dev-bin-unexpected-answer-ignored", "switchboard-dev's script passes whatever the answers were", DEV_BIN,
+       "            as_expected = false;\n", "")
+mutate("dev-bin-once-unexpected-exits-0", "switchboard-dev --once exits 0 when an answer was not as expected", DEV_BIN,
+       '    if !as_expected {\n        return Err("an answer was not as expected".to_owned());\n    }\n',
+       "    let _ = as_expected;\n")
+mutate("dev-bin-once-unclean-stop-exits-0", "switchboard-dev --once exits 0 when the gateway did not stop cleanly", DEV_BIN,
+       "    if let Err(error) = stopped {", "    if let (Err(error), false) = (stopped, true) {")
+
 # --- Running -------------------------------------------------------------------------------
 
 

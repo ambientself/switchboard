@@ -114,15 +114,12 @@ async fn main() -> ExitCode {
     }
     introduce(&gateway, &arguments.tokens);
 
-    let as_expected = run_script(&gateway).await;
+    let as_expected = run_script(&gateway, SURFACE_READ).await;
     if arguments.once {
-        if let Err(error) = gateway.shutdown().await {
-            return fail(&format!("did not stop cleanly: {error}"));
-        }
-        return if as_expected {
-            ExitCode::SUCCESS
-        } else {
-            fail("an answer was not as expected")
+        let stopped = gateway.shutdown().await;
+        return match once_outcome(as_expected, stopped) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(problem) => fail(&problem),
         };
     }
 
@@ -139,6 +136,18 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(&format!("did not stop cleanly: {error}")),
     }
+}
+
+/// How `--once` ends: well only when every answer was as expected and the gateway stopped
+/// cleanly. Otherwise, what went wrong.
+fn once_outcome(as_expected: bool, stopped: io::Result<()>) -> Result<(), String> {
+    if let Err(error) = stopped {
+        return Err(format!("did not stop cleanly: {error}"));
+    }
+    if !as_expected {
+        return Err("an answer was not as expected".to_owned());
+    }
+    Ok(())
 }
 
 fn introduce(gateway: &FixtureGateway, tokens: &Path) {
@@ -161,12 +170,12 @@ fn introduce(gateway: &FixtureGateway, tokens: &Path) {
     let _ = io::stdout().flush();
 }
 
-/// The scripted client as team A on `fixture-read`, in each era, then with no token. Whether
-/// every answer was as expected.
-async fn run_script(gateway: &FixtureGateway) -> bool {
+/// The scripted client as team A on `surface`, in each era, then with no token. Whether every
+/// answer was as expected. The binary runs it on `fixture-read`.
+async fn run_script(gateway: &FixtureGateway, surface: &str) -> bool {
     let caller = Caller::TeamA;
     let client = match Client::new(
-        gateway.url(SURFACE_READ),
+        gateway.url(surface),
         caller_name(caller),
         gateway.token(caller),
     ) {
@@ -241,5 +250,37 @@ async fn interrupted() {
     tokio::select! {
         () = interrupt => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use gateway_dev::start_fixture_gateway;
+
+    #[tokio::test]
+    async fn the_script_passes_on_fixture_read_and_fails_where_an_answer_is_not_as_expected() {
+        let gateway = start_fixture_gateway().await.unwrap();
+        assert!(run_script(&gateway, SURFACE_READ).await);
+        // A surface the policy does not have: team A's read of its own document is denied.
+        assert!(!run_script(&gateway, "no-such-surface").await);
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn once_ends_well_only_when_every_answer_was_as_expected_and_the_gateway_stopped() {
+        assert_eq!(once_outcome(true, Ok(())), Ok(()));
+        assert_eq!(
+            once_outcome(false, Ok(())),
+            Err("an answer was not as expected".to_owned())
+        );
+        let stuck = || Err(io::Error::other("stuck"));
+        assert_eq!(
+            once_outcome(true, stuck()),
+            Err("did not stop cleanly: stuck".to_owned())
+        );
+        assert!(once_outcome(false, stuck()).is_err());
     }
 }
