@@ -1,0 +1,25 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+description = "The gateway itself: configuration, the boot gates, profile selection, tool definitions and the wiring that puts the core, identity and connectors together."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# What a running gateway is built from. The testkit's fakes and the MCP SDK are test tools: they
+# stay in [dev-dependencies], and tests/dependencies.rs holds this list to an allowlist.
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+gateway-identity = { path = "../gateway-identity" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+gateway-testkit = { path = "../gateway-testkit" }
+trybuild = "1"
+
+[lints]
+workspace = true
