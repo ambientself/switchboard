@@ -21,7 +21,9 @@ use gateway_testkit::{
     TEAM_B_DOCUMENT, USER_SUBJECT, WRITE_TOOL,
 };
 use serde_json::{Value, json};
-use support::{AUDIT_FAILURE, Answer, Request, call, call_params, client, document, eventually};
+use support::{
+    AUDIT_FAILURE, Answer, PATIENCE, Request, call, call_params, client, document, eventually,
+};
 
 const ERAS: [Era; 2] = [Era::Legacy, Era::Modern];
 
@@ -464,7 +466,11 @@ async fn shutting_down_waits_for_a_call_in_flight_and_answers_it() {
     gate.open();
     let (is_error, _) = sending.await.unwrap().tool_result();
     assert!(!is_error);
-    stopping.await.unwrap().unwrap();
+    tokio::time::timeout(PATIENCE, stopping)
+        .await
+        .expect("the server stopped in time")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store.row(0).unwrap().completion.map(|c| c.outcome),
         Some(Outcome::Ok)
@@ -498,7 +504,11 @@ async fn shutting_down_waits_for_a_call_whose_client_has_gone_to_complete_its_ro
         "stopped while a call was still running"
     );
     gate.open();
-    stopping.await.unwrap().unwrap();
+    tokio::time::timeout(PATIENCE, stopping)
+        .await
+        .expect("the server stopped in time")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store.row(0).unwrap().completion.map(|c| c.outcome),
         Some(Outcome::Ok),
