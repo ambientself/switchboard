@@ -50,7 +50,9 @@ pub enum PgAuditError {
         row: String,
     },
     /// Begin did not have a connection and a committed row within its budget. The call is
-    /// refused. The insert, if it was sent, was cancelled.
+    /// refused. If the insert was sent, the store asked the server to cancel it, but a cancel
+    /// is best effort: the row may still have been written, as decision 0009 allows for a
+    /// begin reported as failed.
     #[error("the audit row was not written within the begin budget of {budget:?}")]
     BeginBudget {
         /// The budget that ran out.
@@ -239,8 +241,12 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// identifier and both its times.
 ///
 /// - Begin inserts the first half of a row and returns once the insert is committed. It has
-///   [`Budgets::begin`], counted from asking for a connection. Past it, the insert is
-///   cancelled, the connection is discarded, and begin fails, so the core refuses the call.
+///   [`Budgets::begin`], counted from asking for a connection. Past it, begin fails, so the
+///   core refuses the call, and the connection is discarded. The store asks the server to
+///   cancel the insert, which stops one still waiting, for example on a lock. One that has
+///   already committed, or commits before the cancel arrives, stays: a begin reported as
+///   failed may still have written its row (decision 0009). Until that row is completed as
+///   `error` (design section 17), it keeps an empty outcome.
 /// - Finish writes the completion columns of a row that has none, on a task of its own. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
@@ -473,8 +479,9 @@ async fn complete_on(
 }
 
 /// Gives up on a connection whose statement ran out of time: asks the server to cancel the
-/// statement, so it does not go on to write after the caller was told it failed, and takes the
-/// connection out of its pool, so no later call waits behind it.
+/// statement, so that one still waiting does not go on to write after the caller was told it
+/// failed, and takes the connection out of its pool, so no later call waits behind it. The
+/// cancel does not wait, and does not undo a statement that has already finished.
 fn abandon(client: Object, cancel: &Canceller) {
     tokio::spawn(cancel(client.cancel_token()));
     drop(Object::take(client));

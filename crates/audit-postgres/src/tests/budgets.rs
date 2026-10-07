@@ -157,7 +157,7 @@ async fn outcome_of(admin: &Client, row: &str) -> Option<String> {
 }
 
 #[tokio::test]
-async fn begin_gives_up_at_its_budget_and_its_insert_never_lands() {
+async fn begin_gives_up_at_its_budget_and_cancels_an_insert_still_waiting() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
@@ -187,7 +187,8 @@ async fn begin_gives_up_at_its_budget_and_its_insert_never_lands() {
     // behind its statement.
     assert_eq!(store.begin.status().size, 0);
 
-    // The insert was cancelled: once the lock goes, nothing is written for a refused call.
+    // The insert, still waiting on the lock, was cancelled: once the lock goes, nothing is
+    // written for the refused call.
     until(
         Duration::from_secs(5),
         "the insert's cancellation",
