@@ -1,0 +1,10 @@
+# The demo cluster. One node, kind's default network plugin (kindnet).
+# kindnet enforces NetworkPolicy on kind v0.32.0 with this node image; that was checked with a
+# throwaway test before the demo was written. demo.sh still fails the run if a direct call gets
+# through after the policy is applied, so a cluster that does not enforce is caught.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: switchboard-demo
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5

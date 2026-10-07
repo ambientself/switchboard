@@ -1,0 +1,6 @@
+# The network policies, kept apart from ../base so demo.sh can show a direct call connecting
+# before they exist and timing out after.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - networkpolicies.yaml

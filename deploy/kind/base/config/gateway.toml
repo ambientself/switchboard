@@ -1,0 +1,36 @@
+# The gateway's configuration for the kind demo.
+#
+# TODO(integration): the shape follows plan26.md section 5 (#26 boot gates) and planDemo.md
+# (#9a identity loader, #10 audit, #14b registry, #14e reload). Keep it in step with
+# deploy/compose/config/gateway.toml; only the issuer, its keys, the subjects and the hosts differ.
+
+listen = "0.0.0.0:8080"
+deployment = "kind-demo"
+allowed_hosts = ["gateway.switchboard.svc.cluster.local", "gateway.switchboard.svc"]
+allowed_origins = []
+
+[registry]
+directory = "/etc/switchboard/registry"
+poll_seconds = 2
+
+[identity]
+# The cluster's own ServiceAccount issuer. demo.sh checks that the cluster reports exactly this
+# issuer and copies its keys into ConfigMap cluster-issuer-keys at deploy time. The keys are
+# copied once and not rotated or fetched.
+[[identity.enforce]]
+issuer = "https://kubernetes.default.svc.cluster.local"
+kind = "workload"
+audiences = ["switchboard"]
+algorithm = "RS256"
+keys_file = "/etc/switchboard/issuer/jwks.json"
+max_lifetime_seconds = 3600
+leeway_seconds = 30
+
+# The team manifest. team-a's `stranger` ServiceAccount is deliberately absent.
+[identity.enforce.subjects]
+"system:serviceaccount:team-a:mock-workload" = "team-a"
+"system:serviceaccount:team-b:mock-workload" = "team-b"
+
+[audit]
+store = "postgres"
+url_env = "SWITCHBOARD_DATABASE_URL"

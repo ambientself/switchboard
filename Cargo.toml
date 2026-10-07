@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/audit-postgres", "crates/connector-proxy", "crates/gateway", "crates/gateway-core", "crates/gateway-dev", "crates/gateway-identity", "crates/gateway-mcp", "crates/gateway-registry", "crates/gateway-testkit", "crates/mock-docs-server"]
+members = ["crates/audit-postgres", "crates/connector-proxy", "crates/demo-checks", "crates/gateway", "crates/gateway-core", "crates/gateway-dev", "crates/gateway-identity", "crates/gateway-mcp", "crates/gateway-registry", "crates/gateway-testkit", "crates/mock-docs-server"]
 
 [workspace.package]
 edition = "2024"

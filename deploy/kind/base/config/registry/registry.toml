@@ -1,0 +1,80 @@
+# The demo registry for kind: the mock docs server, its two approved tools, the `docs`
+# surface, the profile, each team's resource limit, and which profile each caller gets.
+#
+# TODO(integration): the shape follows planDemo.md #14b (registry loader) and #14d (resource
+# adapter). The loader decides the real field names; change this file to match, and the
+# Compose copies in deploy/compose/config/ with it.
+
+revision = "demo-1"
+
+[[servers]]
+name = "docs"
+owner = "platform-demo"
+address = "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"
+credential_mode = "gateway"
+# Secret switchboard/docs-credential, a dummy value. The proxy sends it upstream; the workload never sees it.
+credential_file = "/var/run/secrets/switchboard/docs-credential"
+
+[[tools]]
+name = "docs__list_documents"
+server = "docs"
+upstream_name = "list_documents"
+classification = "read"
+resources = "declared"
+description = "List the documents in one project."
+approved_by = "demo-owner"
+approved_at = "2026-10-06"
+# TODO(integration): the sha256 of the approved definition, as the loader computes it.
+definition_sha256 = "TODO"
+resource_adapter = { from_argument = "project", system = "docs", kind = "project" }
+[tools.input_schema]
+type = "object"
+required = ["project"]
+additionalProperties = false
+[tools.input_schema.properties.project]
+type = "string"
+
+[[tools]]
+name = "docs__read_document"
+server = "docs"
+upstream_name = "read_document"
+classification = "read"
+resources = "declared"
+description = "Read one document from one project."
+approved_by = "demo-owner"
+approved_at = "2026-10-06"
+definition_sha256 = "TODO"
+resource_adapter = { from_argument = "project", system = "docs", kind = "project" }
+[tools.input_schema]
+type = "object"
+required = ["project", "document"]
+additionalProperties = false
+[tools.input_schema.properties.project]
+type = "string"
+[tools.input_schema.properties.document]
+type = "string"
+
+[[surfaces]]
+name = "docs"
+tools = ["docs__list_documents", "docs__read_document"]
+teams = ["team-a", "team-b"]
+principals = "any_in_teams_and_groups"
+
+[[profiles]]
+name = "workload-read"
+classifications = ["read"]
+requires_delegation = false
+
+[limits.teams]
+team-a = [{ system = "docs", kind = "project", identifier = "atlas" }]
+team-b = [{ system = "docs", kind = "project", identifier = "borealis" }]
+
+[[selection]]
+issuer = "https://kubernetes.default.svc.cluster.local"
+team = "team-a"
+profile = "workload-read"
+
+[[selection]]
+issuer = "https://kubernetes.default.svc.cluster.local"
+team = "team-b"
+profile = "workload-read"

@@ -1720,6 +1720,56 @@ mutate("pg-check-replication-role-ignored", "a role that may set session_replica
        "        if can_set {", "        if false {")
 
 
+# --- demo-checks ---------------------------------------------------------------------------
+# The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
+
+WORKLOAD = "deploy/demo/workload.sh"
+DRIVER = "deploy/demo/demo.sh"
+COMPOSE = "deploy/compose/compose.yaml"
+POLICY = "deploy/kind/policy/networkpolicies.yaml"
+
+mutate("demo-workload-check-always-passes", "every workload check passes whatever it got", WORKLOAD,
+       """  if [ "$1" = "$2" ]; then pass "$3"; else fail""", """  if true; then pass "$3"; else fail""")
+mutate("demo-workload-exits-zero-on-failure", "the workload exits 0 after a FAIL", WORKLOAD,
+       """  echo "RESULT: FAIL ($FAILS of $total failed)"\n  exit 1\n""", """  echo "RESULT: FAIL ($FAILS of $total failed)"\n  exit 0\n""")
+mutate("demo-workload-iserror-defaults-false", "an answer with no result reads as isError false", WORKLOAD,
+       """body '.result.isError')""", """body '.result.isError // false')""")
+mutate("demo-workload-limit-sentence-unchecked", "any denial sentence passes as the resource-limit one", WORKLOAD,
+       """grep -c "^Tool \\`$READ_TOOL\\` names docs project \\`$OTHER_PROJECT\\`, which is outside what .*\\. Name only resources within that limit\\.$")" 1""",
+       """grep -c ".")" 1""")
+mutate("demo-workload-identity-sentence-unchecked", "an identity refusal's sentence is not checked", WORKLOAD,
+       """  check "$(body '.error.message')" "$IDENTITY_FAILURE" "$2: sentence"\n""", "")
+mutate("demo-workload-direct-any-failure", "any failed direct call passes, not only a timeout", WORKLOAD,
+       """    check "$?" 28 "direct""", """    check "$([ $? -ne 0 ] && echo 28)" 28 "direct""")
+mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
+       """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
+mutate("demo-driver-otto-dev-allowed", "the driver runs against otto-dev", DRIVER,
+       """if [ "$CLUSTER" = "otto-dev" ]; then""", """if false; then""")
+mutate("demo-driver-keeps-kubeconfig-env", "the caller's KUBECONFIG reaches kubectl and kind", DRIVER,
+       "\nunset KUBECONFIG\n", "\n: unset KUBECONFIG\n")
+mutate("demo-driver-default-kubeconfig", "kubectl uses whatever kubeconfig is the default", DRIVER,
+       """k() { kubectl --kubeconfig "$KCFG" --context""", """k() { kubectl --context""")
+mutate("demo-driver-down-default-kubeconfig", "down deletes the cluster through the default kubeconfig", DRIVER,
+       """  kind delete cluster --name "$CLUSTER" --kubeconfig "$KCFG"\n""", """  kind delete cluster --name "$CLUSTER"\n""")
+mutate("demo-driver-workload-exit-ignored", "a workload's non-zero exit without a FAIL line is not counted", DRIVER,
+       """  elif [ "$status" -ne 0 ] && [ "$failed" -eq 0 ]; then""", """  elif false; then""")
+mutate("demo-driver-result-ignores-failures", "the RESULT passes with FAILs counted", DRIVER,
+       """  if [ "$FAILS" -eq 0 ] && [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""", """  if [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""")
+mutate("demo-driver-any-bearer-is-the-gateways", "mock-docs' accepted bearers are not compared with the gateway's", DRIVER,
+       """'$1 == "200" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ }""", """'$1 == "200" && 0 { n++ }""")
+mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
+       '"127.0.0.1:18080:8080"', '"18080:8080"')
+mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
+       "    image: postgres:17-alpine\n", "    image: postgres:17-alpine\n    ports:\n      - \"127.0.0.1:15433:5432\"\n")
+mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switchboard namespace", POLICY,
+       "              kubernetes.io/metadata.name: switchboard\n          podSelector:\n            matchLabels:\n              app: gateway\n",
+       "              kubernetes.io/metadata.name: switchboard\n")
+mutate("demo-policy-in-base", "the base applies the network policy before the direct call is shown", "deploy/kind/base/kustomization.yaml",
+       "  - workloads.yaml\n", "  - workloads.yaml\n  - ../policy\n")
+mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
+       "35078c7e636169b1", "35078c7e636169b2")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
