@@ -13,7 +13,8 @@ use common::{Run, repo, require, scratch, write};
 
 /// A directory of fake tools. Each appends one line per call to `calls.log`:
 /// `<tool> KUBECONFIG=<value> <args...>`. `kind get clusters` lists switchboard-demo, `docker
-/// version` prints an architecture, `kubectl` fails, and everything else succeeds silently.
+/// version` prints an architecture, `docker image inspect` an image ID, `kubectl` fails, and
+/// everything else succeeds silently.
 fn fake_tools(dir: &Path) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -35,7 +36,7 @@ fn fake_tools(dir: &Path) -> PathBuf {
     );
     script(
         "docker",
-        "if [ \"$1\" = version ]; then echo arm64; fi\nexit 0",
+        "if [ \"$1\" = version ]; then echo arm64; fi\nif [ \"$1 $2\" = 'image inspect' ]; then echo sha256:0123456789abcdef0123; fi\nexit 0",
     );
     script(
         "kubectl",
@@ -352,4 +353,69 @@ fn the_outage_step_counts_only_requests_mock_docs_accepted() {
         lines.join("\n")
     ));
     assert_eq!(run.stdout.trim(), "2", "{}", run.transcript());
+}
+
+#[test]
+fn a_kind_run_tags_the_image_with_its_own_id() {
+    let run = sourced(
+        "docker() { case \"$1 $2\" in 'image inspect') echo sha256:90d73467ace7aabbccdd ;; *) echo \"docker $*\" ;; esac; }\nrun_image\necho \"tag=$IMG_RUN\"",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout
+            .contains("docker tag switchboard-demo:dev switchboard-demo:90d73467ace7"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains("tag=switchboard-demo:90d73467ace7"),
+        "{}",
+        run.transcript()
+    );
+
+    // Without an image ID there is no tag to deploy, and the run must stop.
+    for answer in ["", "sha256:not-hex"] {
+        let run = sourced(&format!(
+            "docker() {{ echo '{answer}'; }}\nrun_image && echo \"tag=$IMG_RUN\""
+        ));
+        assert_ne!(run.status, Some(0), "{answer:?}: {}", run.transcript());
+        assert!(
+            !run.stdout.contains("tag="),
+            "{answer:?}: {}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
+    // What kustomize renders: two pods on the demo image, one on Postgres.
+    let rendered = "      - image: switchboard-demo:dev\n      - image: postgres:17-alpine\n          image: switchboard-demo:dev\n";
+    let run = sourced(&format!(
+        "k() {{ case \"$1\" in kustomize) printf '%s' '{rendered}' ;; apply) echo \"applied: $*\"; cat ;; esac; }}\nIMG_RUN=switchboard-demo:90d73467ace7\napply_base"
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout.contains("applied: apply -f -"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(
+        run.stdout
+            .matches("image: switchboard-demo:90d73467ace7\n")
+            .count(),
+        2,
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        !run.stdout.contains("switchboard-demo:dev"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains("image: postgres:17-alpine\n"),
+        "{}",
+        run.transcript()
+    );
 }

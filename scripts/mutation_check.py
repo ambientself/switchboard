@@ -2045,6 +2045,19 @@ mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes 
        "      compose) down_compose ;;", "      compose) down_compose && down_kind ;;")
 
 
+# --- first slice: the kind run's image ---------------------------------------------------------
+# A kind run deploys its image under a tag taken from the image's ID, so a run on an existing
+# cluster replaces the previous build's pods.
+
+mutate("demo-driver-kind-fixed-tag", "a kind run deploys the manifests' fixed tag", DRIVER,
+       r'''  k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -''',
+       r'''  k kustomize "$ROOT/deploy/kind/base" | k apply -f -''')
+mutate("demo-driver-kind-tag-not-from-id", "the run's tag is not taken from the image's ID", DRIVER,
+       "  IMG_RUN=${IMG%:*}:${image_id:0:12}\n", "  IMG_RUN=$IMG\n")
+mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's ID", DRIVER,
+       "    '' | *[!0-9a-f]*)\n", "    __never__)\n")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 

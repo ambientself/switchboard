@@ -67,6 +67,11 @@ same pod must still reach the gateway and get an allowed read through it.
 pulled with several platforms (`ctr: content digest ... not found`). The driver saves this
 platform's images to an archive and loads that with `kind load image-archive` instead.
 
+The manifests name `switchboard-demo:dev`. In kind the driver deploys the image under a tag
+taken from its own ID (`switchboard-demo:<12 hex digits>`) and checks that the gateway and
+mock-docs run that tag. With one fixed tag, a run on an existing cluster would leave the
+previous build's pods running, because `kubectl apply` sees no change.
+
 ## What runs
 
 Every command and file below is the real one; `crates/demo-checks` and the gateway's own tests

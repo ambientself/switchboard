@@ -42,6 +42,7 @@ fi
 DEMO_DIR=$ROOT/.demo
 KCFG=$DEMO_DIR/kubeconfig
 IMG=switchboard-demo:dev
+IMG_RUN=$IMG
 COMPOSE_FILE=$ROOT/deploy/compose/compose.yaml
 KIND_ISSUER=https://kubernetes.default.svc.cluster.local
 AUDIT_TABLE=switchboard_audit.call_rows
@@ -334,13 +335,36 @@ can_i_no() {
   check "$answer" no "team-a's workload may not: $*"
 }
 
+# run_image: tags the image just built with its own ID and sets IMG_RUN to that tag. The
+# manifests name $IMG; the cluster runs the image under this tag instead, so a run on an
+# existing cluster replaces every pod that runs it. With one fixed tag, kubectl apply would see
+# no change and leave the previous build's pods running.
+run_image() {
+  local image_id
+  image_id=$(docker image inspect --format '{{.Id}}' "$IMG")
+  image_id=${image_id#sha256:}
+  case "$image_id" in
+    '' | *[!0-9a-f]*)
+      echo "cannot read the ID of the image $IMG (got '$image_id')" >&2
+      return 1
+      ;;
+  esac
+  IMG_RUN=${IMG%:*}:${image_id:0:12}
+  docker tag "$IMG" "$IMG_RUN"
+}
+
+# apply_base: applies the base manifests with every pod that runs $IMG on this run's tag.
+apply_base() {
+  k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -
+}
+
 load_images() {
   local arch
   arch=$(docker version --format '{{.Server.Arch}}')
   docker image inspect postgres:17-alpine >/dev/null 2>&1 || docker pull postgres:17-alpine
   # `kind load docker-image` fails on Docker's containerd image store with multi-platform
   # images, so save this platform's images to an archive and load that.
-  docker save --platform "linux/$arch" -o "$DEMO_DIR/images.tar" "$IMG" postgres:17-alpine
+  docker save --platform "linux/$arch" -o "$DEMO_DIR/images.tar" "$IMG_RUN" postgres:17-alpine
   kind load image-archive "$DEMO_DIR/images.tar" --name "$CLUSTER"
   rm -f "$DEMO_DIR/images.tar"
 }
@@ -357,6 +381,8 @@ kind_run() {
 
   step "build the image and load it into the cluster"
   docker build -t "$IMG" -f "$ROOT/deploy/Dockerfile" --build-arg REQUIRE_ALL_BINS=true "$ROOT"
+  run_image
+  echo "this run's image: $IMG_RUN"
   load_images
 
   step "the cluster's issuer and keys (copied once, not rotated or fetched)"
@@ -376,13 +402,17 @@ kind_run() {
   k -n team-a delete job -l app=mock-workload --ignore-not-found
   k -n team-a delete job -l app=stranger-workload --ignore-not-found
   k -n team-b delete job -l app=mock-workload --ignore-not-found
-  k apply -k "$ROOT/deploy/kind/base"
+  apply_base
   k -n switchboard rollout status deploy/postgres --timeout=120s
   wait_job switchboard migrate 180
   k -n switchboard logs job/migrate | sed 's/^/    /'
   check "$JOB_STATUS" 0 "the migration completed"
   k -n mock-docs rollout status deploy/mock-docs --timeout=120s
   k -n switchboard rollout status deploy/gateway --timeout=240s
+  check "$(k -n switchboard get deploy/gateway -o jsonpath='{.spec.template.spec.containers[0].image}')" \
+    "$IMG_RUN" "the gateway runs this run's image"
+  check "$(k -n mock-docs get deploy/mock-docs -o jsonpath='{.spec.template.spec.containers[0].image}')" \
+    "$IMG_RUN" "mock-docs runs this run's image"
   mark_start
 
   step "the gateway's boot lines"
