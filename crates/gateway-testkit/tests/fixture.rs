@@ -10,7 +10,7 @@ use gateway_core::{
 };
 use gateway_identity::{SigningAlgorithm, VerifyError};
 use gateway_testkit::{
-    AUDIENCE, Caller, DEPLOYMENT, Fixture, FixtureConnector, GROUP_G, GROUP_REVIEW,
+    AUDIENCE, Caller, DEPLOYMENT, DRAFT_TOOL, Fixture, FixtureConnector, GROUP_G, GROUP_REVIEW,
     PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL,
     SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT,
     UNKNOWN_PROFILE, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, policy, policy_data,
@@ -39,6 +39,11 @@ fn the_policy_loads_through_the_validated_path_and_has_the_shape_the_fixture_pro
             ResourceDeclaration::Declared,
         ),
         (
+            DRAFT_TOOL,
+            Classification::Propose,
+            ResourceDeclaration::Declared,
+        ),
+        (
             WRITE_TOOL,
             Classification::Write,
             ResourceDeclaration::Declared,
@@ -56,7 +61,24 @@ fn the_policy_loads_through_the_validated_path_and_has_the_shape_the_fixture_pro
     }
     let surface = |name: &str| snapshot.surface(&name.into()).unwrap();
     assert_eq!(surface(SURFACE_READ).tools.len(), 2);
-    assert_eq!(surface(SURFACE_ALL).tools.len(), 3);
+    assert_eq!(surface(SURFACE_ALL).tools.len(), 4);
+    // Profiles list only what a profile can permit: no profile lists `write`, which every
+    // profile denies, and only team A's lists `propose`.
+    for (profile, classifications) in [
+        (
+            PROFILE_TEAM_A,
+            &[Classification::Read, Classification::Propose][..],
+        ),
+        (PROFILE_TEAM_B, &[Classification::Read]),
+        (PROFILE_USER, &[Classification::Read]),
+        (PROFILE_REVIEWER, &[Classification::Read]),
+    ] {
+        let listed = &snapshot.profile(&profile.into()).unwrap().classifications;
+        assert!(
+            listed.iter().eq(classifications.iter()),
+            "{profile}: {listed:?}"
+        );
+    }
     assert_eq!(surface(SURFACE_READ).groups.len(), 1);
     assert!(surface(SURFACE_ALL).groups.is_empty());
 
@@ -292,10 +314,11 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
     };
     let own = |caller: Caller| json!({"document": caller.own_document()});
 
-    // Allowed: each caller, on a surface that serves the tool, reading its own document.
+    // Allowed: each caller, on a surface that serves the tool, reading its own document, and
+    // team A proposing a change to it.
     for (caller, surface, name) in [
         (Caller::TeamA, SURFACE_ALL, READ_TOOL),
-        (Caller::TeamA, SURFACE_ALL, WRITE_TOOL),
+        (Caller::TeamA, SURFACE_ALL, DRAFT_TOOL),
         (Caller::TeamB, SURFACE_ALL, READ_TOOL),
         (Caller::UserInGroupG, SURFACE_READ, READ_TOOL),
         (Caller::TeamA, SURFACE_READ, SCOPED_READ_TOOL),
@@ -326,12 +349,22 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
             .map(|reason| reason.kind())
     };
     use ReasonKind::*;
+    // Team B's profile does not permit proposals.
     assert_eq!(
-        denied(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, own(Caller::TeamB)),
+        denied(Caller::TeamB, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamB)),
         Some(ClassificationNotPermitted)
     );
+    // No profile permits a direct write, so the write tool is denied to every caller it is
+    // served to, team A included.
+    for caller in [Caller::TeamA, Caller::TeamB] {
+        assert_eq!(
+            denied(caller, SURFACE_ALL, WRITE_TOOL, own(caller)),
+            Some(ClassificationNotPermitted),
+            "{caller:?}"
+        );
+    }
     assert_eq!(
-        denied(Caller::TeamA, SURFACE_READ, WRITE_TOOL, own(Caller::TeamA)),
+        denied(Caller::TeamA, SURFACE_READ, DRAFT_TOOL, own(Caller::TeamA)),
         Some(ToolNotOnSurface)
     );
     assert_eq!(
@@ -392,6 +425,15 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
         denied(Caller::TeamA, SURFACE_ALL, READ_TOOL, json!({})),
         Some(ResourceOutsideLimit)
     );
+    assert_eq!(
+        denied(
+            Caller::TeamA,
+            SURFACE_ALL,
+            DRAFT_TOOL,
+            json!({"document": TEAM_B_DOCUMENT})
+        ),
+        Some(ResourceOutsideLimit)
+    );
     // A call whose profile the snapshot does not hold: the context is built by hand, since the
     // fixture's helpers always select a known one.
     let mut caller = fixture.team_a_workload(SURFACE_ALL).unwrap();
@@ -423,12 +465,13 @@ fn tools_list_shows_each_caller_what_its_surface_and_profile_allow() {
     };
     assert_eq!(
         listed(Caller::TeamA, SURFACE_ALL),
-        [READ_TOOL, SCOPED_READ_TOOL, WRITE_TOOL]
+        [DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL],
+        "no profile permits the write tool"
     );
     assert_eq!(
         listed(Caller::TeamB, SURFACE_ALL),
         [READ_TOOL, SCOPED_READ_TOOL],
-        "team B's profile does not permit writes"
+        "team B's profile does not permit proposals"
     );
     assert_eq!(
         listed(Caller::UserInGroupG, SURFACE_READ),

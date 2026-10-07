@@ -8,8 +8,8 @@ use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    self, Answer, AuditRowId, Begun, Completion, Outcome, RequestMetadata, RowCompletion,
-    StoreError,
+    self, Answer, AuditRowId, Begun, Completion, Outcome, RecordedResource, RecordedResources,
+    RequestMetadata, RowCompletion, StoreError,
 };
 use gateway_core::{
     AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, ConnectorName, CredentialError,
@@ -17,10 +17,11 @@ use gateway_core::{
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
-    Caller, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FakeCredentialSource, FixedClock, Fixture,
-    FixtureConnector, GROUP_G_DOCUMENT, Gate, InMemoryAuditStore, READ_TOOL, SCOPE_REFUSAL,
+    Caller, DRAFT_REFUSAL, DRAFT_TOOL, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FOREIGN_DRAFT,
+    FakeCredentialSource, FixedClock, Fixture, FixtureConnector, GROUP_G_DOCUMENT, Gate,
+    InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM, SCOPE_REFUSAL,
     SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    WRITE_TOOL, block_on, poll_once,
+    WRITE_TOOL, WriteRecord, block_on, policy_data, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -166,12 +167,33 @@ fn rows_come_back_in_the_order_they_were_begun_with_completions_filled_in() {
     );
     assert_eq!(store.rows().len(), 2);
     assert!(store.rows().iter().all(|row| row.completion.is_none()));
+    let begun = store.rows();
+    assert_eq!(
+        (&begun[0].resources, begun[0].resources_omitted),
+        (
+            &RecordedResources::Named(vec![RecordedResource {
+                system: RESOURCE_SYSTEM.to_owned(),
+                kind: RESOURCE_KIND.to_owned(),
+                identifier: "team-a-notes".to_owned(),
+            }]),
+            0
+        ),
+        "the row keeps the resources the begin step recorded"
+    );
 
     // Finishing the second first completes the second row, and only that one.
     let ran = block_on(audit::run(&connector, second));
     block_on(audit::finish(&store, ran, 5));
     let rows = store.rows();
-    assert_eq!(rows[0].completion, None);
+    assert_eq!(rows[0], begun[0], "the other row is untouched");
+    assert_eq!(
+        AuditRecord {
+            completion: None,
+            ..rows[1].clone()
+        },
+        begun[1],
+        "finishing a row fills in its completion and changes nothing else"
+    );
     assert_eq!(
         rows[1].completion,
         Some(Completion {
@@ -647,26 +669,112 @@ fn the_read_tool_echoes_its_arguments_and_the_credential_label() {
 }
 
 #[test]
-fn the_write_tool_records_that_a_write_happened_under_the_callers_team_credential() {
+fn the_draft_tool_opens_a_draft_and_records_a_write_under_the_callers_team_credential() {
     let rig = rig();
     assert!(rig.connector.writes().is_empty());
-    let answer = rig.answer(
-        Caller::TeamA,
-        WRITE_TOOL,
-        json!({"document": "team-a-notes", "text": "hi"}),
-    );
-    assert!(matches!(answer, Answer::Ok(_)));
-    let writes = rig.connector.writes();
-    assert_eq!(writes.len(), 1);
+    let arguments = json!({"document": "team-a-notes", "text": "hi"});
+    let answer = rig.answer(Caller::TeamA, DRAFT_TOOL, arguments.clone());
     assert_eq!(
-        writes[0].arguments,
-        json!({"document": "team-a-notes", "text": "hi"})
+        answer,
+        Answer::Ok(json!({
+            "tool": DRAFT_TOOL,
+            "draft": "draft-1",
+            "credential": "fake-credential-for-fixture-team-a-1",
+        }))
     );
-    assert_eq!(writes[0].credential, "fake-credential-for-fixture-team-a-1");
     assert_eq!(
-        writes[0].principal,
-        rig.fixture.principal(Caller::TeamA).unwrap().get().id
+        rig.connector.writes(),
+        [WriteRecord {
+            tool: DRAFT_TOOL.to_owned(),
+            arguments,
+            credential: "fake-credential-for-fixture-team-a-1".to_owned(),
+            principal: rig
+                .fixture
+                .principal(Caller::TeamA)
+                .unwrap()
+                .get()
+                .id
+                .clone(),
+        }]
     );
+    // A call that names no draft opens another.
+    let Answer::Ok(second) = rig.answer(Caller::TeamA, DRAFT_TOOL, documents("team-a-notes"))
+    else {
+        panic!("the second draft was not opened")
+    };
+    assert_eq!(second["draft"], "draft-2");
+    assert_eq!(rig.connector.writes().len(), 2);
+}
+
+/// The fixture policy with team B's profile permitting proposals too, so that two teams each
+/// open drafts.
+fn with_team_b_proposing(rig: &mut Rig) {
+    let mut data = policy_data();
+    let profiles = data["profiles"].as_array_mut().unwrap();
+    let team_b = profiles
+        .iter_mut()
+        .find(|profile| profile["name"] == PROFILE_TEAM_B)
+        .unwrap();
+    team_b["classifications"] = json!(["read", "propose"]);
+    rig.fixture.policy = serde_json::from_value(data).unwrap();
+}
+
+/// A `propose` tool acts only on what the gateway created. The decision function cannot see
+/// that, so it allows each of these calls, and the connector refuses them when they run.
+#[test]
+fn the_draft_tool_revises_only_a_draft_the_gateway_opened_for_the_same_document() {
+    let mut rig = rig();
+    with_team_b_proposing(&mut rig);
+    let open =
+        |caller: Caller| match rig.answer(caller, DRAFT_TOOL, documents(caller.own_document())) {
+            Answer::Ok(answer) => answer["draft"].clone(),
+            other => panic!("{caller:?} could not open a draft: {other:?}"),
+        };
+    let revise = |caller: Caller, draft: &Value| {
+        rig.answer(
+            caller,
+            DRAFT_TOOL,
+            json!({"document": caller.own_document(), "draft": draft, "text": "again"}),
+        )
+    };
+    let team_a_draft = open(Caller::TeamA);
+    let team_b_draft = open(Caller::TeamB);
+    assert_eq!(
+        (&team_a_draft, &team_b_draft),
+        (&json!("draft-1"), &json!("draft-2"))
+    );
+
+    let Answer::Ok(revised) = revise(Caller::TeamA, &team_a_draft) else {
+        panic!("team A could not revise its own draft")
+    };
+    assert_eq!(revised["draft"], "draft-1");
+    assert!(matches!(
+        revise(Caller::TeamB, &team_b_draft),
+        Answer::Ok(_)
+    ));
+    assert_eq!(rig.connector.writes().len(), 4);
+
+    let refused = Answer::Refused(DRAFT_REFUSAL.to_owned());
+    for (caller, draft) in [
+        // A draft a person opened.
+        (Caller::TeamA, json!(FOREIGN_DRAFT)),
+        // A draft not opened yet.
+        (Caller::TeamA, json!("draft-3")),
+        // Another team's draft, named with the caller's own document, which its limit allows.
+        (Caller::TeamA, team_b_draft.clone()),
+        (Caller::TeamB, team_a_draft.clone()),
+        // Something that is not a draft's name.
+        (Caller::TeamA, json!(1)),
+        (Caller::TeamA, Value::Null),
+    ] {
+        assert_eq!(revise(caller, &draft), refused, "{caller:?} {draft}");
+    }
+    assert_eq!(
+        rig.connector.writes().len(),
+        4,
+        "a refused call writes nothing"
+    );
+    assert_eq!(rig.connector.received().len(), 10, "and was received");
 }
 
 /// Runs the scoped tool for `caller` on a surface open to it, to its answer. The scoped tool
@@ -765,6 +873,10 @@ fn a_resource_adapter_finds_the_document_a_call_names() {
         Resources::Named(vec![document("x")])
     );
     assert_eq!(
+        FixtureConnector::resources_of(DRAFT_TOOL, &json!({"document": "x", "draft": "y"})),
+        Resources::Named(vec![document("x")])
+    );
+    assert_eq!(
         FixtureConnector::resources_of(WRITE_TOOL, &json!({})),
         Resources::Named(vec![])
     );
@@ -798,7 +910,7 @@ fn the_connector_records_every_call_it_receives_in_order() {
 fn a_connector_told_to_fail_errors_without_doing_the_work_and_is_still_recorded() {
     let rig = rig();
     rig.connector.fail_next();
-    let failed = rig.answer(Caller::TeamA, WRITE_TOOL, documents("team-a-notes"));
+    let failed = rig.answer(Caller::TeamA, DRAFT_TOOL, documents("team-a-notes"));
     assert_eq!(
         failed,
         Answer::Error("the fixture connector was told to fail".into())
@@ -837,7 +949,7 @@ fn a_connector_told_to_fail_errors_without_doing_the_work_and_is_still_recorded(
 fn a_connector_whose_credential_is_refused_errors_and_does_not_write() {
     let rig = rig();
     rig.source.refuse_next();
-    let answer = rig.answer(Caller::TeamA, WRITE_TOOL, documents("team-a-notes"));
+    let answer = rig.answer(Caller::TeamA, DRAFT_TOOL, documents("team-a-notes"));
     assert_eq!(
         answer,
         Answer::Error("the fixture connector could not get a credential".into())
@@ -850,7 +962,7 @@ fn a_connector_whose_credential_is_refused_errors_and_does_not_write() {
 fn a_connector_told_to_hang_has_received_the_call_and_done_nothing_until_released() {
     let rig = rig();
     let gate = rig.connector.hang_next();
-    let guard = rig.guard(Caller::TeamA, WRITE_TOOL, documents("team-a-notes"));
+    let guard = rig.guard(Caller::TeamA, DRAFT_TOOL, documents("team-a-notes"));
     let mut run = pin!(audit::run(&rig.connector, guard));
     assert!(poll_once(run.as_mut()).is_pending());
     assert_eq!(rig.connector.received().len(), 1, "the call arrived");

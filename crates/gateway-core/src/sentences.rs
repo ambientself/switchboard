@@ -11,9 +11,10 @@
 //! failure sentence, which no decision produces, is re-exported as
 //! [`IDENTITY_FAILURE`](crate::IDENTITY_FAILURE).
 //!
-//! Every value put into a sentence passes through [`safe`]: control characters, non-ASCII and
-//! backticks are escaped and the length is capped, because some of these values (the tool and
-//! surface a request names, a resource identifier) are chosen by the caller.
+//! Every value put into a sentence passes through [`safe`]: control characters, non-ASCII,
+//! backticks and backslashes are escaped and the length is capped, because some of these
+//! values (the tool and surface a request names, a resource identifier) are chosen by the
+//! caller.
 
 use crate::classification::Classification;
 use crate::decision::{DelegationProblem, Reason, ResourceProblem};
@@ -49,6 +50,10 @@ const DELEGATION_WITHOUT_TEAM: &str = "The delegation was issued for team `{dele
 /// The tool is destructive. Its own sentence, because no profile can change the answer.
 const DESTRUCTIVE: &str = "Tool `{tool}` is classified `destructive`, and destructive tools are denied in every profile. Ask a person to make this change.";
 
+/// The tool is a direct write. Its own sentence, because no profile can change the answer, and
+/// because the caller can usually do what it wanted by proposing instead.
+const DIRECT_WRITE: &str = "Tool `{tool}` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it.";
+
 /// The profile does not permit the tool's classification.
 const CLASSIFICATION_NOT_PERMITTED: &str = "Tool `{tool}` is classified `{classification}`, which profile `{profile}` does not permit. Choose a tool whose classification this profile permits.";
 
@@ -80,7 +85,7 @@ pub(crate) const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 15] = [
+const SENTENCES: [&str; 16] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -90,6 +95,7 @@ const SENTENCES: [&str; 15] = [
     DELEGATION_TEAM_MISMATCH,
     DELEGATION_WITHOUT_TEAM,
     DESTRUCTIVE,
+    DIRECT_WRITE,
     CLASSIFICATION_NOT_PERMITTED,
     RESOURCE_OUTSIDE_LIMIT,
     RESOURCES_UNKNOWN,
@@ -169,6 +175,11 @@ pub(crate) fn render(reason: &Reason) -> String {
         } => fill(DESTRUCTIVE, &[("tool", Text(tool.as_str()))]),
         Reason::ClassificationNotPermitted {
             tool,
+            classification: Classification::Write,
+            ..
+        } => fill(DIRECT_WRITE, &[("tool", Text(tool.as_str()))]),
+        Reason::ClassificationNotPermitted {
+            tool,
             classification,
             profile,
         } => fill(
@@ -242,15 +253,18 @@ enum Piece<'a> {
 }
 
 /// `text` made safe to put inside a sentence or an audit column: printable ASCII stays as it
-/// is, a backtick becomes `` \` `` so it cannot close a code span, and anything else (newlines,
-/// other control characters, non-ASCII) is written as an escape. The result is cut at `cap`
-/// characters and marked with `…`.
+/// is, a backtick becomes `` \` `` so it cannot close a code span, a backslash becomes `\\`,
+/// and anything else (newlines, other control characters, non-ASCII) is written as an escape:
+/// `\n`, `\r`, `\t` or `\u{...}`. Because the backslash is escaped too, two different texts
+/// never give the same result unless they were cut. The result is cut at `cap` characters and
+/// marked with `…`, which cannot otherwise appear, since non-ASCII is escaped.
 pub(crate) fn safe(text: &str, cap: usize) -> String {
     let mut out = String::new();
     let mut length = 0;
     for character in text.chars() {
         let piece: String = match character {
             '`' => "\\`".to_owned(),
+            '\\' => "\\\\".to_owned(),
             ' ' => " ".to_owned(),
             c if c.is_ascii_graphic() => c.to_string(),
             c => c.escape_default().collect(),
@@ -372,6 +386,21 @@ mod tests {
         assert_eq!(safe("a`b", 64), "a\\`b");
         assert_eq!(safe("caf\u{e9}", 64), "caf\\u{e9}");
         assert_eq!(safe("\u{202e}", 64), "\\u{202e}");
+        assert_eq!(safe("a\\b", 64), "a\\\\b");
+    }
+
+    /// Texts that differ before escaping differ after it: a backslash is escaped, so a
+    /// literal `\n` and a newline are told apart.
+    #[test]
+    fn safe_keeps_different_texts_different() {
+        for (one, other) in [
+            ("a\nb", "a\\nb"),
+            ("a`b", "a\\`b"),
+            ("\u{e9}", "\\u{e9}"),
+            ("\\", "\\\\"),
+        ] {
+            assert_ne!(safe(one, 64), safe(other, 64), "{one:?} and {other:?}");
+        }
     }
 
     #[test]

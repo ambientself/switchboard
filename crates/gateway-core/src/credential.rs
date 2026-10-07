@@ -11,6 +11,14 @@
 //! the call was decided or audited. `Proved` is `Clone`, and any code holding one can ask. A
 //! connector's principal comes from its [`ToolCall`](crate::ToolCall), which only the audited
 //! path makes; the decision and the audit guard are enforced there, not here.
+//!
+//! Not here yet: the question names the connector and the caller, but not the tool or what the
+//! call acts on. Design section 9 has the custodian check each request against what that team
+//! and tool may ask for, and narrow a token per call (for GitHub, to the team's repositories,
+//! and one repository per write). Neither can be built on this signature, because an
+//! implementation cannot see the tool or the call. Both arrive with the custodian client
+//! (#12), and [`CredentialSource::credential_for`] gains the arguments they need then; how a
+//! call's resources are named is not settled until then.
 
 use std::fmt;
 
