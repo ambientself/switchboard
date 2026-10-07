@@ -190,6 +190,47 @@ fn it_refuses_to_start_on_what_the_boot_gates_refuse() {
     );
 }
 
+/// The configuration is checked before a socket is bound. With the address already taken, a
+/// configuration the binary refuses is refused for its own reason, not for the address.
+#[test]
+fn a_refused_configuration_is_refused_before_the_address_is_bound() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = held.local_addr().unwrap().to_string();
+
+    // The address really is taken: a configuration that passes cannot listen on it.
+    let path = config_file("held-startable", &startable(json!({"disabled": true})));
+    let started = run(&["--listen", &address, path.to_str().unwrap()]);
+    assert_eq!(started.status.code(), Some(1));
+    assert!(
+        stderr(&started).contains("cannot listen on"),
+        "{}",
+        stderr(&started)
+    );
+
+    let mut audit_not_disabled = startable(json!({"disabled": true}));
+    audit_not_disabled["audit"] = json!({});
+    for (name, config, reason) in [
+        (
+            "held-identity-unconfigured",
+            startable(json!({})),
+            "identity is not configured",
+        ),
+        (
+            "held-audit-not-disabled",
+            audit_not_disabled,
+            "no durable audit store",
+        ),
+    ] {
+        let path = config_file(name, &config);
+        let output = run(&["--listen", &address, path.to_str().unwrap()]);
+        let said = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{name}: {said}");
+        assert!(said.contains(reason), "{name}: {said}");
+        assert!(!said.contains("cannot listen on"), "{name}: {said}");
+    }
+    drop(held);
+}
+
 /// The binary running, with each line of its standard output parsed as JSON.
 struct Running {
     child: Child,

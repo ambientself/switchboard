@@ -1243,6 +1243,27 @@ mutate_all(
 )
 
 
+# The binary checks its configuration before it binds a socket.
+GW_BIN = GW + "bin/switchboard.rs"
+BIN_GATES = (
+    "    let gates = match boot::check(config, Wiring::new(Arc::new(SystemClock))) {\n"
+    "        Ok(gates) => gates,\n        Err(error) => return refuse(&error.to_string()),\n    };\n"
+)
+BIN_BIND = (
+    "    let listener = match TcpListener::bind(arguments.listen).await {\n"
+    "        Ok(listener) => listener,\n"
+    '        Err(error) => return refuse(&format!("cannot listen on {}: {error}", arguments.listen)),\n'
+    "    };\n"
+)
+mutate("gw-bin-binds-before-boot-gates", "switchboard binds its socket before the boot gates run", GW_BIN,
+       BIN_GATES + "\n" + BIN_BIND, BIN_BIND + BIN_GATES)
+mutate_all(
+    "gw-bin-binds-before-audit-refusal",
+    "switchboard binds its socket before it refuses a configuration that keeps audit on",
+    (GW_BIN, "\n" + BIN_BIND, ""),
+    (GW_BIN, "    if !config.audit.disabled {\n", BIN_BIND + "    if !config.audit.disabled {\n"),
+)
+
 # --- gateway path --------------------------------------------------------------------------
 
 GW_PATH = GW + "path.rs"
