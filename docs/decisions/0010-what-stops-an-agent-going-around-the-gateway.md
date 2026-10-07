@@ -1,11 +1,12 @@
 # 0010: What stops an agent going around the gateway
 
 Date: 2026-10-06. Status: accepted on 2026-10-07, when the owner accepted the recommendations
-made for each question this record raised. Settles Q17.
+made for each question this record raised. Settles Q17, except the parts under "Still open", to
+which Q17 is narrowed so that they are tracked outside this record.
 [Decision 0008](0008-mock-the-first-slice.md) answered it for the first slice in kind; this
 record says what that test must show, and covers the other environments. Some questions need a
-party other than the owner. They are listed under "Still open", with who decides and what
-holds until they do.
+party other than the owner. They are listed under "Still open", with who decides and what holds
+until they do.
 
 ## Context
 
@@ -17,10 +18,11 @@ to Q17 which environments meet it.
 
 The gateway's rules have the same limit. Under
 [decision 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04, `write` and
-`destructive` tools are denied in every profile, which is how Q4's denial of production
-mutation is enforced. Audit rows are to record the resources each call named, a change under
-review when this record was accepted. Both describe calls through the gateway and nothing
-else. What this record says about the resources on audit rows applies once that column exists.
+`destructive` tools are denied in every profile, which is how Q4's denial of production mutation
+is enforced. Audit rows are to record the resources each call named, a change under review when
+this record was accepted. Both describe calls through the gateway and nothing else. What this
+record says about the resources on audit rows applies once that column exists. Pull request #30,
+merged on 2026-10-07, added it.
 
 Q17 said Otto's sandboxes already have default-deny egress. At the pinned Otto commit
 `752395a` that is true of a sealed turn only. Under Otto's ADR-0010, a turn whose token
@@ -129,11 +131,12 @@ catches a change.
 
 ### The route check
 
-This repository provides one small program in two parts, each with only the access it needs.
-**The operator step** runs outside the workload. It needs `get` and `list` on what it reads,
-`create` on `subjectaccessreviews`, and `patch` on `pods/ephemeralcontainers` in the
-workload's namespace, to start the probe. It changes nothing else. It picks a running pod of
-the workload, and records and checks:
+This repository is to provide one small program in two parts, each with only the access it
+needs. It does not exist yet; it is built with the kind run (#14). **The operator step** runs
+outside the workload. It needs `get` and `list` on what it reads, `create` on
+`subjectaccessreviews`, and `patch` on `pods/ephemeralcontainers` in the workload's namespace,
+to start the probe. It changes nothing else. It picks a running pod of the workload, and records
+and checks:
 
 - the network plugin and, where enforcement is a setting, that setting as read from the
   plugin's running agent on the pod's node. It fails if enforcement is off.
@@ -276,9 +279,13 @@ that signature. This project's owner keeps `route-exceptions.md` and the evidenc
 
 **Review.** Each entry is reviewed every 90 days, and before each milestone's rollout.
 
-The register also lists the exceptions granted to the gateway's own rules, with who approved
-each and its conditions. The first is the exception for Otto's comment tools, granted by
-decision 0011.
+The register also lists the exceptions granted to the gateway's own rules, with the same fields
+as a route, the rule excepted taking the place of the route and the control it breaks, and with
+the record that granted it and its conditions. Unlike a route, which exists whether or not it is
+accepted, an exception to a rule is what lets the gateway allow a call, so it comes into force
+only once it is accepted and signed. The first is the exception for Otto's comment tools,
+granted by decision 0011. It is reviewed on this cadence too, so before milestone 4's rollout,
+when it would first come into force.
 
 The first route entries and their owners:
 
@@ -336,15 +343,15 @@ These need a party other than the owner. The record holds as written while they 
 - **Otto's owners:** whether Otto's proxy refuses every host that accepts a target system's
   credential, by resolved address as well as by name; what to do about `github.com` and AWS's
   hosts; whether `make egress-check` gains a refused row for each; whether the sandbox's Pod
-  Identity association and its rule go, or stay with evidence from outside the sandbox;
-  whether the turn grant carries the turn's egress setting; and whether Otto's owners agree to
-  own the register entries for Otto's proxy, the sandbox's AWS identity and Otto's
-  conversation surfaces, and to share the one for the Go gateway. None of this has been raised
-  with them yet. It goes to them with decision 0012's changes, as one list, raised by whoever
-  the owner names for those. Until they decide, every Otto turn has the governed path, this
-  project owns those entries, and the entries for Otto's proxy and the sandbox's AWS identity
-  are not yet accepted. Acceptance stays with this project's owner, with the security owner's
-  signature.
+  Identity association and its rule go, or stay with evidence from outside the sandbox; whether
+  the turn grant carries the turn's egress setting; and whether Otto's owners agree to own the
+  register entries for Otto's proxy, the sandbox's AWS identity and Otto's conversation
+  surfaces, and to share the one for the Go gateway. None of this has been raised with them yet.
+  It goes to them in the one list of Otto requests that decision 0012 describes, with the
+  requests of decisions 0009, 0011 and 0012, raised by whoever the owner names. Until they
+  decide, every Otto turn has the governed path, this project owns those entries, and the
+  entries for Otto's proxy and the sandbox's AWS identity are not yet accepted. Acceptance stays
+  with this project's owner, with the security owner's signature.
 - **IT and each vendor's administrators:** whether to limit the gateway's own credentials to
   its egress addresses, where a vendor can limit one credential. That needs fixed egress
   addresses per deployment, shared with nothing else. Until they decide, the credentials are
@@ -417,13 +424,15 @@ These need a party other than the owner. The record holds as written while they 
 ## Consequences
 
 - Design section 1 and the callers table in section 2 state the claim per environment.
-  Invariant 1 points here. Q17 is retired, and its statement about Otto's egress is corrected.
-- Where the claim is the governed path, decision 0006's denial of `write` and `destructive`,
-  and Q4 with it, describes what an agent may do through the gateway, not what it can do, and
-  audit rows show who reached a resource through the gateway, not who reached it. That holds
-  on laptops, on Otto's turns with egress open, where git over HTTPS can push, on Otto's turns
-  that use Otto's Go gateway, and for real services before their route check passes. The owner accepted this for the company on
-  2026-10-07. An incident review reads which claim held from the evidence log.
+  Invariant 1 points here. Q17 is narrowed to the parts under "Still open", and retired once
+  they are answered. Its statement about Otto's egress is corrected.
+- Where the claim is the governed path, decision 0006's denial of `write` and `destructive`, and
+  Q4 with it, describes what an agent may do through the gateway, not what it can do, and audit
+  rows show who reached a resource through the gateway, not who reached it. That holds on
+  laptops, on Otto's turns with egress open, where git over HTTPS can push, on Otto's turns that
+  use Otto's Go gateway, and for real services before their route check passes. The owner
+  accepted this for the company on 2026-10-07. An incident review reads which claim held from
+  the evidence log.
 - Milestone 2 adds one thing to the gateway: its connector presents a projected token for the
   gateway's ServiceAccount, with the mock server as audience. The mock server accepts only that
   identity. The kind run gains the positive controls, the server's own refusal and the

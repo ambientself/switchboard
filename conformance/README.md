@@ -101,11 +101,12 @@ unverifiable-grant assertions carry over unchanged. The new grant checks (replay
 pod, clock skew, key rotation, currency and revocation) live in the separate company-wide
 group, not here.
 
-The Rust gateway refuses to start with grant checking off outside a development build. Its
-conformance target is a development build, so the cases that start the gateway with grant
-checking off (`-insecure-no-turn-grant` for Otto's: the `audit_missing` and `audit_as_owner`
-boot refusals, and every case started without a grant) run against it as they do against
-Otto's.
+The Rust gateway will refuse to start with grant checking off outside a development build, a
+build with the `test-support` cargo feature (design section 12). That gate is not built yet; it
+comes with the Otto adapter (#22). Its conformance target is a development build, so the cases
+that start the gateway with grant checking off (`-insecure-no-turn-grant` for Otto's: the
+`audit_missing` and `audit_as_owner` boot refusals, and every case started without a grant) run
+against it as they do against Otto's.
 
 ## Checking that the tests can fail
 

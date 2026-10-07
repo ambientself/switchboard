@@ -1,8 +1,9 @@
 # Open questions
 
-Q1–Q8 and Q14–Q19 are settled below, and so is most of Q9 and Q10. Open are what remains of
-Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance requires of read
-auditing; and Q11–Q13. When resolved, move their requirements into [design.md](design.md) and
+Q1–Q8, Q14–Q16 and Q19 are settled below, and so is most of Q9, Q10, Q17 and Q18. Open are
+what remains of Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance
+requires of read auditing; Q11–Q13; and what remains of Q17 and Q18, which decisions 0010 and
+0012 leave to others. When resolved, move their requirements into [design.md](design.md) and
 remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
@@ -78,20 +79,20 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 - **2026-10-07 (Q10, apart from read auditing):** Three records: telemetry, audit rows and
   receipts. What begin and finish guarantee. Open rows are found by their deadline and never
-  marked. Receipts with per-request, single-use keys and reconciliation that only looks, required
-  before the first tool not classified `read` reaches a real system. The gateway never repeats
-  a call. Reads stay synchronous on Q4's acceptance until compliance says what it requires. The
-  owner accepted the recommendations on 2026-10-07. See
+  marked. Receipts with per-request, single-use keys and reconciliation that only looks,
+  required before the first tool not classified `read` reaches a real system. The gateway never
+  repeats a call. Reads stay synchronous on Q4's acceptance until compliance says what it
+  requires. The owner accepted the recommendations on 2026-10-07. See
   [decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md). Fencing is
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
 - **2026-10-07 (Q17):** Each environment that serves agents carries "the only path" or "the
   governed path". The only path needs three controls, shown by dated evidence from inside the
   environment with a positive control in the same run. The first slice in kind is the only path
-  to the mock server once the kind run's evidence is current. Real services and Otto's
-  sandboxes start on the governed path, and a real workload passes the route check before it
-  sees real data. Laptops stay on the governed path.
-  Known routes around the gateway, with owners, are in [route-exceptions.md](route-exceptions.md).
-  What Otto, IT, the security team and platform owners decide is listed in the record. See
+  to the mock server once the kind run's evidence is current. Real services and Otto's sandboxes
+  start on the governed path, and a real workload passes the route check before it sees real
+  data. Laptops stay on the governed path. Known routes around the gateway, with owners, are in
+  [route-exceptions.md](route-exceptions.md). What Otto's owners, IT, IT security, the security
+  team and platform owners decide is listed in the record and under Q17 below. See
   [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md).
 - **2026-10-07 (most of Q9):** Every tool's approval says how its resources are found: from
   its arguments, as its credential's tested reach, by a built-in connector at run time, or
@@ -105,18 +106,17 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   exception, once the core can express it (#12); the hosted `addOrEditJiraIssueComment` gets
   none. The owner accepted the record's recommendations. See
   [decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md).
-- **2026-10-07 (Q18):** A turn grant binds its issuer through the key, the deployments it is
-  for (`aud`), a lifetime of at most 15 minutes (`iat`, `exp`), and by stage 3 the sandbox
-  pod. It also carries the turn's egress setting, which is recorded. It may be presented again
-  within those bounds, and its digest is recorded. Otto's calls of any tool not classified
-  `read` are allowed only while Otto says the turn is current, which enforces the epoch and
-  allows revoking one turn. Fencing is checked once, before each such call. A failover during
-  the call is not stopped. Decision 0009's receipts cover a resend of the same call, and a
-  turn replayed after a failover only if Otto's control plane sends a key that stays the same
-  across replays; that key, and which grant fields scope it, stay with decision 0009 (its
-  Still open 8). Otto is asked to
-  make the changes this needs; none has been agreed with Otto's owners yet, and what waits on
-  them is listed in the decision. See
+- **2026-10-07 (Q18):** A turn grant binds its issuer through the key, the deployments it is for
+  (`aud`), a lifetime of at most 15 minutes (`iat`, `exp`), and by stage 3 the sandbox pod. It
+  also carries the turn's egress setting, which is recorded. It may be presented again within
+  those bounds, and its digest is recorded. Otto's calls of any tool not classified `read` are
+  allowed only while Otto says the turn is current, which enforces the epoch and allows revoking
+  one turn. Fencing is checked once, before each such call. A failover during the call is not
+  stopped. Decision 0009's receipts cover a resend of the same call, and a turn replayed after a
+  failover only if Otto's control plane sends a key that stays the same across replays; that
+  key, and which grant fields scope it, stay with decision 0009 (its Still open 8). Otto is
+  asked to make the changes this needs; none has been agreed with Otto's owners yet, and what
+  waits on them is listed in the decision and under Q18 below. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
 
 ## Q9. What does authorization check beyond tool classification?
@@ -148,12 +148,17 @@ record says what holds until each is answered. When they are answered, retire Q9
   until a reviewed change removes it.
 - **Asks of IT, vendor administrators and Otto's owners,** listed in the record: narrow service
   accounts and who owns them, OAuth applications for per-user grants, ownership of the Okta
-  groups, and the review of Otto's eighteen tool declarations.
+  groups, and the review of Otto's eighteen tool declarations. The asks of Otto's owners go in
+  the one list of Otto requests under Q18.
 - Whether a per-user rate limit must come before employee proposals is tracked in Q12, and
   how often the reach check runs in Q11. Whether Otto's `gateway_audit` table gains this
   record's audit columns is part of the question about that table in Q12.
-- **Blocks:** milestone 5's employee proposals and any broad read; Otto's proposal tools at
-  milestone 4, if the automation answer asks more of them.
+- **Blocks:** every policy file, and so milestone 2, until the code owners and the branch rule
+  exist; every employee read and any broad read, until the security reviewer is named, since
+  no resource enters a group's limit before then; milestone 5's employee proposals; every Otto
+  tool at milestone 4, until Otto's owners review the declarations; Otto's two comment tools,
+  until the security owner signs the exception's register entry; and Otto's proposal tools,
+  if the automation answer asks more of them.
 
 ## Q10. What does compliance require of read auditing?
 
@@ -272,6 +277,55 @@ remain unverified. Publishing discovery metadata alone does not establish intero
 - **References:** [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
   and [transport specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports).
 - **Blocks:** employee client acceptance tests and deployment setup.
+
+## Q17. What do others decide about routes around the gateway?
+
+Settled by [decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md),
+except the parts below, which need parties other than the owner. The record says what holds
+until each is answered. When they are answered, retire Q17.
+
+- **Otto's owners:** whether Otto's proxy refuses every host that accepts a target system's
+  credential, by address as well as by name, and what to do about `github.com` and AWS;
+  whether `make egress-check` gains a refused row for each; whether the sandbox's Pod Identity
+  association goes; whether the grant carries the turn's egress setting; and whether they own
+  or share the register entries for Otto. These go in the one list of Otto requests under Q18.
+  Until they answer, every Otto turn has the governed path.
+- **IT and vendor administrators:** whether to limit the gateway's credentials to its egress
+  addresses; whether the zero-trust access layer filters laptop egress; managed client
+  settings; and limits on sign-in to hosted MCP servers, personal tokens and provider-run
+  tools.
+- **IT security:** whether it owns the two laptop entries in the register. Until it does,
+  milestone 5 does not roll out.
+- **The security team:** naming the security owner who signs register entries.
+- **Platform owners:** which clusters real workloads run in, who runs the route check there,
+  who owns each cluster's residual entries, renewal of evidence in their change process, and
+  the registry's probe permission. Until then no real workload sees real data.
+- **Blocks:** milestone 5's rollout (IT security); real workloads seeing real data (platform
+  owners); any Otto turn having the only path (Otto's owners).
+
+## Q18. What do Otto's owners agree for turn grants, and who asks them?
+
+Settled by [decision 0012](decisions/0012-what-a-turn-grant-binds.md), except the parts below.
+
+- **Who raises the Otto requests.** For the owner; the record made no recommendation. Every
+  request of Otto's owners from decisions 0009 to 0012 goes to them as one list, raised by
+  whoever the owner names: decision 0009's Still open 2 and 8, decision 0010's requests,
+  decision 0011's asks of Otto's owners, and decision 0012's changes and questions. Nothing
+  has been raised yet, and every item below waits on it.
+- **Otto's owners:** agreement to the breaking change before stage 1 and whether Otto's
+  schedule fits milestone 4; `pod` in the first change, and whether the harness can read the
+  pod's projected token; `egress`; the ceiling and leeway in Otto's minter; the resolver's
+  availability target; any blue/green swap or local execution during milestone 4, and the two
+  departures from Otto's control-plane document; whether lease-holding control-plane
+  components send their epoch; who in Otto may mark a turn revoked; key custody and rotation;
+  reading the new row fields back in Otto; minting a renamed deployment first; and the
+  audience of the sandbox's identity token for stage 1 copies.
+- **The on-call rotation, with whoever runs logging:** how audience and pod failures and the
+  lifetime-failure rate reach a person, and the rate that alerts. Until then nothing pages and
+  the counts are reviewed at each stage's go/no-go.
+- **The security team:** whether a grant-key change needs review beyond the ordinary.
+- **Blocks:** milestone 4. Stage 1 waits for Otto's breaking change, and stage 3 for the pod
+  binding and the currency answer.
 
 ## Review findings not yet reflected in the design
 

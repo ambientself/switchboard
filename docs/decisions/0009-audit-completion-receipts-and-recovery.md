@@ -9,7 +9,7 @@ until then. Fencing is not decided here; it is [decision
 0012](0012-what-a-turn-grant-binds.md). Written against [decision
 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04 (`propose`, and `write`
 and `destructive` denied in every profile), and against the resources column on the audit
-record proposed in pull request #30, which is not yet merged.
+record that pull request #30 added, merged on 2026-10-07.
 
 Part 1 covers every audit row and is needed before milestone 2. Part 2 covers receipts and is
 needed before the first tool not classified `read` reaches a real system. Both are accepted.
@@ -59,35 +59,39 @@ What is already true:
 | Audit row | Every request that reaches a decision, from a proved principal or with identity checking explicitly disabled: each `tools/call`, allowed or denied, including one denied because its delegation could not be verified; and each `tools/list`. | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect (part 2). | Postgres, in the same transaction as the call's begin. | The same: the call is refused. |
 
-**Identity failures are telemetry.** If an unauthenticated request caused a synchronous
-database write, anyone who can reach the gateway could load the store that every call in the
-company depends on. During a database outage every 401 would also become the audit-failure
-sentence, which tells an unauthenticated caller how healthy the store is. The event records
-the time, the deployment, the surface, the source address and which check failed, for
-operators only, as section 10 already requires. It records the issuer and subject the token
-claimed, as claims, escaped and capped, and never the token. "We were not checking" is still a
-row with identity `disabled`; "someone tried and was refused" is a telemetry event. The cost is
-that failed authentication is kept less durably than the audit, can be dropped under load, and
-an incident review joins two sources. Whether that loss is acceptable is the security team's
-call (Still open 4), and where telemetry goes is for whoever runs logging (Still open 3).
+**Identity failures are telemetry.** If an unauthenticated request caused a synchronous database
+write, anyone who can reach the gateway could load the store that every call in the company
+depends on. During a database outage every 401 would also become the audit-failure sentence,
+which tells an unauthenticated caller how healthy the store is. The event records the time, the
+deployment, the surface, the source address and which check failed, for operators only, as
+section 10 already requires. It records the issuer and subject the token claimed, as claims,
+escaped and capped, and never the token. The identity verifier built for #9 keeps every value
+from the token out of its errors, so that a refusal cannot put attacker-chosen text into a log
+line; it is to expose the claimed issuer and subject beside the error, for this event only (#9).
+"We were not checking" is still a row with identity `disabled`; "someone tried and was refused"
+is a telemetry event. The cost is that failed authentication is kept less durably than the
+audit, can be dropped under load, and an incident review joins two sources. Whether that loss is
+acceptable is the security team's call (Still open 4), and where telemetry goes is for whoever
+runs logging (Still open 3).
 
 **A delegation that cannot be verified is an audit row.** A forged or expired turn grant
 presented under a proved workload identity is one of the most security-relevant events the
-gateway sees, and the principal is proved, so there is someone to record. One place decides.
-The delegation's verifier runs before the decision function, as
-[decision 0012](0012-what-a-turn-grant-binds.md) describes for turn grants, but it does not
-deny. It passes the delegation on as unverified, carrying only the kind of failure, and the
-decision function denies it at check 3 with a single reason kind of its own. The row records
-the failure kind, which is also logged and counted. Failure kinds are not reason kinds, and
-the caller never reads one. The row holds the proved columns and nothing from the grant's
-claims. Where the signature verified and only a binding failed (audience, lifetime or pod),
-the row also records the grant's digest (decision 0012). The caller reads one fixed sentence
-whatever was wrong with the grant, as in Otto.
+gateway sees, and the principal is proved, so there is someone to record. One place decides. The
+delegation's verifier runs before the decision function on any delegation the request carries,
+whether or not the profile requires one, as [decision 0012](0012-what-a-turn-grant-binds.md)
+describes for turn grants, but it does not deny. It passes the delegation on as unverified,
+carrying the kind of failure and, for a turn grant whose signature verified, the grant's digest,
+and nothing from its claims. The decision function denies it at check 3 with a single reason
+kind of its own. The row records the failure kind, which is also logged and counted. Failure
+kinds are not reason kinds, and the caller never reads one. The row holds the proved columns and
+nothing from the grant's claims. Where the signature verified and only a binding failed
+(audience, lifetime or pod), the row also records the grant's digest (decision 0012). The caller
+reads one fixed sentence whatever was wrong with the grant, as in Otto.
 
 **`tools/list` is an audit row of its own kind.** It reaches decisions: it tells a caller what
 it may call. A list row has kind `list` where a call's row has kind `call`. It holds the policy
 revision and the names of the tools returned, each made safe, at most 64 with the rest
-counted, as the resources column proposed in pull request #30 is bounded. It is written
+counted, as the resources column that pull request #30 added is bounded. It is written
 complete before the answer, has no deadline and no finish, and is never open.
 
 ### Row identifiers
@@ -122,11 +126,12 @@ quote it.
   included. If begin fails or the budget runs out, nothing runs and the caller reads the
   audit-failure sentence.
 - A begin reported as failed may still have committed, if the confirmation was lost. The
-  instance knows nothing ran, so it completes that row as `error`, as it does when a guard is
-  given up without running, and settles a side effect's receipt as `not_performed` in the same
-  transaction. It keeps trying on the finish pool until the finish deadline; if the row never
-  committed, there is nothing to complete. Only a row it could not complete by then reads as
-  open once its deadline passes. A row can overstate what ran. It never understates it.
+  instance knows nothing ran, so it completes that row as `error`, as it will when a guard is
+  given up without running (neither is built yet; design section 17), and settles a side
+  effect's receipt as `not_performed` in the same transaction. It keeps trying on the finish
+  pool until the finish deadline; if the row never committed, there is nothing to complete. Only
+  a row it could not complete by then reads as open once its deadline passes. A row can
+  overstate what ran. It never understates it.
 
 ### Where a call runs
 
@@ -331,15 +336,18 @@ is too wide. Within its scope a key is unique across all tools. Without a delega
 clients of one principal can still choose the same key. With tool-use identifiers that is
 unlikely, and a collision is answered by the reuse table below, never across principals.
 
-A side-effecting call that carries no key is denied by the decision function, with a reason
-kind and a sentence of its own asking for one, since that is knowable before anything runs. It
-is the last check: after check 5 and its exception step, after decision 0012's currency check,
-and after check 6. So a caller is asked for a key only when the call would otherwise be
-allowed, and every permission denial keeps its own reason. It is skipped for `tools/list`,
-like check 6 and the currency check, because a list request carries no key: a `propose` tool
-is listed to a caller who may call it, and denied on `tools/call` without a key. With
-identity disabled there is no principal to scope a key to, so no side effect is served at all
-(see "Until receipts exist").
+A side-effecting call that carries no key is denied by the decision function, with a reason kind
+and a sentence of its own asking for one, since that is knowable before anything runs. It is the
+last check: after check 5 and its exception step, after decision 0012's currency check, and
+after check 6. So a caller is asked for a key only when the call would otherwise be allowed, and
+every permission denial keeps its own reason. It is skipped for `tools/list`, like check 6 and
+the currency check, because a list request carries no key: a `propose` tool is listed to a
+caller who may call it, and denied on `tools/call` without a key. With identity disabled there
+is no principal to scope a key to, so no side effect is served at all (see "Until receipts
+exist"). Reads are served, each with a row whose identity is `disabled`. The built path does
+less, and stricter: with identity disabled it refuses every `tools/call` and lists nothing, with
+no row. It keeps doing so until the core and store can record a row with identity `disabled`
+(design section 17).
 
 ### The argument digest
 
@@ -427,14 +435,14 @@ cannot see stays `unknown` until a person settles it.
 The gateway binary refuses a snapshot that serves any tool not classified `read` unless a
 receipt store is configured, audit is on and identity is on. It checks at boot and at every
 snapshot swap, whatever the snapshot's source. The check is in the binary, not in policy data,
-so no profile setting can change it. Only the harness's test builds are exempt, so proposals
-can still be tested against fixture connectors. `#[cfg(test)]` cannot provide that exemption,
-because the harness runs the gateway end to end from integration tests and other crates,
-which do not see it. The exemption is a test-support cargo feature that the release build
-never enables. Since a feature can be turned on in any build, CI checks the release artifact
-itself: started with a snapshot holding a `propose` tool and no receipt store, it must refuse.
-The rule holds whatever Q12 decides about opt-outs, which it recommends allowing only in
-development builds.
+so no profile setting can change it. Only development builds are exempt, as design section 12
+defines them, so proposals can still be tested against fixture connectors. `#[cfg(test)]` cannot
+provide that exemption, because the harness runs the gateway end to end from integration tests
+and other crates, which do not see it. The exemption is the `test-support` cargo feature that
+the release build never enables, which is what makes a build a development build. Since a
+feature can be turned on in any build, CI checks the release artifact itself: started with a
+snapshot holding a `propose` tool and no receipt store, it must refuse. The rule holds whatever
+Q12 decides about opt-outs, which it recommends allowing only in development builds.
 
 Decision 0011 says a proposal that changes something existing is `propose` only if its
 connector checks, from the gateway's receipts or a delegating control plane's resolver, that
@@ -566,23 +574,25 @@ this table are also in section 18 of the design.
   deadline, and a list form that names the tools returned. `RequestMetadata` gains the key.
   Connectors for side-effecting tools must tell "not sent" apart from "sent, with no answer".
 - Decision 0006 gets a dated amendment. The delegation in the call context can be present and
-  unverified. The verifier passes it on with only the kind of failure, and check 3 denies it
-  with a single reason kind of its own; the verifier never denies on its own. Decision 0012's
-  amendment to 0006, accepted the same day, applies this to turn grants. The context says
-  whether the request carries a key, and a tool not classified `read` without one is denied
-  with a reason kind of its own, by a last check after check 6 and the currency check, skipped
-  for `tools/list` as they are. The receipt check is
-  a second decision made outside the function. Like a connector's refusal it cannot make
-  anything run, and it decides about delivery, not permission. The outcome set gains `unknown`
-  and `duplicate`.
+  unverified. The verifier passes it on with the kind of failure and, for a turn grant whose
+  signature verified, its digest, and check 3 denies it with a single reason kind of its own;
+  the verifier never denies on its own. Decision 0012's amendment to 0006, accepted the same
+  day, applies this to turn grants. The context says whether the request carries a key, and a
+  tool not classified `read` without one is denied with a reason kind of its own, by a last
+  check after check 6 and the currency check, skipped for `tools/list` as they are. Two decision
+  properties are restated with it: `tools_list_is_decide_run_once_per_tool` excepts the key
+  check as it does check 6, and `an_opened_world_is_allowed` gives its call a key. The receipt
+  check is a second decision made outside the function. Like a connector's refusal it cannot
+  make anything run, and it decides about delivery, not permission. The outcome set gains
+  `unknown` and `duplicate`.
 - Otto parity changes, to be agreed with Otto when its adapter is built. This gateway writes no
   row for identity failures, `initialize` or `ping`, and a 401 during an audit outage carries
   the opaque identity sentence, not the audit-failure one. Otto's `gateway_audit` table has no
-  `unknown`, no `duplicate` and no deadline. The adapter leaves the outcome empty for
-  `unknown`, never `error`, and writes `ok` for `duplicate`, since the effect exists. Open rows
-  are found from this gateway's own record. A side effect is no longer cancelled when the
-  client disconnects. `TestRepeatedCommentIsWrittenTwice` fails on purpose once receipts are on
-  for Otto's profile, and moves to the existing-behavior group with the divergence recorded.
+  `unknown`, no `duplicate` and no deadline. The adapter leaves the outcome empty for `unknown`,
+  never `error`, and writes `ok` for `duplicate`, since the effect exists. Open rows are found
+  from this gateway's own record. A side effect is no longer cancelled when the client
+  disconnects. `TestRepeatedCommentIsWrittenTwice` fails on purpose once receipts are on for
+  Otto's profile, and moves to the group of expected differences with the divergence recorded.
   Otto's control plane reads rows back by tool-use identifier. A `duplicate` row, and a row
   refused as reuse, carry the same tool-use identifier as the original call, so that read can
   return more than one row; how it picks one is agreed with Otto's owners (Still open 8).
@@ -605,6 +615,12 @@ this table are also in section 18 of the design.
   only while its receipt is kept.
 - Deployments set their termination grace period and readiness delay explicitly.
 - The resources a self-scoping tool actually reached belong in finish when they are added.
+- Code already built does not yet do what this record requires. The Postgres store built for
+  #10 lets the database assign identifiers and times, has no instance, kind or deadline
+  column, cannot store a row written complete at begin, gives up begin at its budget without
+  retrying by identifier, and checks one trigger, not three. The HTTP path built for #26
+  writes no row for `tools/list`. Each change is listed by issue in design section 17, so none
+  is assumed to exist.
 - The grants and triggers do not protect rows against a database superuser who rewrites them.
 - Fencing is decision 0012. Nothing here depends on it. The window it leaves for a replayed
   turn is stated once, under "What may be retried".
@@ -622,17 +638,17 @@ was the owner's to answer. Each answer carries the proposal's number.
 - **9. The provisional values are the defaults:** two seconds for begin, two seconds for the
   answer to wait, and thirty seconds for finish. Q12 sets the final values from the
   measurements.
-- **12. The key's carriers** are the tool-use identifier, a named `_meta` field, and a header only
-  from a profile that declares its callers set it per request, in that order. A side effect
-  that carries no key is denied. What Otto's control plane sends, and which grant fields
-  scope a key, need Otto's owners (Still open 8).
+- **12. The key's carriers** are the tool-use identifier, a named `_meta` field, and a header
+  only from a profile that declares its callers set it per request, in that order. A side effect
+  that carries no key is denied. What Otto's control plane sends, and which grant fields scope a
+  key, need Otto's owners (Still open 8).
 - **13. A `propose` tool may be approved with no lookup.** A duplicate proposal reaches a
   person before it acts. A `write` tool allowed under a recorded exception (decision 0011)
   declares a lookup by marker unless its exception says otherwise. Whether any other `write`
   tool could be approved without one is left to the decision that permits direct writes.
 - **14. The argument digest does not count as storing the arguments** under Q12's rule.
-- **15. Receipts come before the first `propose` tool** reaches a real system, not only before the
-  first `write` tool. The risk of a duplicate draft pull request or comment is not accepted.
+- **15. Receipts come before the first `propose` tool** reaches a real system, not only before
+  the first `write` tool. The risk of a duplicate draft pull request or comment is not accepted.
 - **16. Both parts are accepted now.** Q10 is narrowed to what compliance requires of read
   auditing.
 
@@ -649,9 +665,9 @@ for 8.
    acceptance. A stricter or looser requirement would change part 1. Issue #3 stays open until
    it answers. (Proposal 1.)
 2. **Whether Otto's adapter still writes identity failures, `initialize` and `ping` into
-   `gateway_audit`.** Otto's owners decide, when the adapter is built (#22, #23). Until then
-   this gateway writes no row for them, and that is a recorded parity difference.
-   (Proposal 3.)
+   `gateway_audit`.** Otto's owners decide, when the adapter is built (#22, #23). It goes to
+   them in the one list of Otto requests decision 0012 describes. Until then this gateway writes
+   no row for them, and that is a recorded parity difference. (Proposal 3.)
 3. **Where telemetry goes, how long it is kept, and who can read it,** and whether the audit
    table is the compliance system of record or is exported to one, such as Sumo Logic.
    Whoever runs logging decides, with compliance for the system of record. Until then
@@ -675,14 +691,14 @@ for 8.
    resources, for example by finding a key through a keyed hash. The security team and the
    storage owners decide. Until then the grants and triggers are the only protection, they do
    not stop a superuser, and the gateway's role can read receipts. (Proposal 8.)
-8. **Otto's key:** the carrier Otto's control plane uses, Otto's tool-use identifier as its
-   key, and which grant fields scope a key. The session and the turn are recommended. Otto's
-   owners are also asked whether the scope needs the execution; whether the control plane can
-   send a key that stays the same when it replays a turn, without which receipts do not cover a
-   replay; and how its read-back by tool-use identifier treats the `duplicate` and reuse rows
-   that share one with the original call. Otto's owners decide (#21, #22). Until then Otto's
-   callers make every side effect through Otto's Go gateway: the cutover of writes waits for
-   this answer. (Proposal 12.)
+8. **Otto's key:** the carrier Otto's control plane uses, Otto's tool-use identifier as its key,
+   and which grant fields scope a key. The session and the turn are recommended. Otto's owners
+   are also asked whether the scope needs the execution; whether the control plane can send a
+   key that stays the same when it replays a turn, without which receipts do not cover a replay;
+   and how its read-back by tool-use identifier treats the `duplicate` and reuse rows that share
+   one with the original call. Otto's owners decide (#21, #22), from the one list of Otto
+   requests decision 0012 describes. Until then Otto's callers make every side effect through
+   Otto's Go gateway: the cutover of writes waits for this answer. (Proposal 12.)
 9. **Who is paged, and on whose rotation,** for begin failures, open rows and unknown receipts,
    and who settles a receipt by hand once reconciliation gives up, including whether the
    owning team in the registry is accountable for it. Whoever runs the on-call rotation

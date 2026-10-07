@@ -175,12 +175,15 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
 1. **Verify the caller** against the issuers configured for this deployment, and resolve the
    principal. A token naming any other issuer is refused; a token never chooses where keys
    are fetched from.
-2. **Verify the delegation,** where the profile requires one. For Otto this is the turn grant:
-   its version, key, canonical encoding, signature, audience, lifetime and, once required, pod
-   are checked. The verifier does not deny. A delegation that cannot be verified is passed on
-   as unverified, carrying only the kind of failure, and step 5 denies it at check 3 with a
-   single reason kind of its own. A grant that verifies but names a team other than the proved
-   team is denied at check 3 too, naming both teams.
+2. **Verify any delegation the request carries,** whether or not the profile requires one; the
+   verifier needs no profile. For Otto this is the turn grant: its version, key, canonical
+   encoding, signature, audience, lifetime and, once required, pod are checked. The verifier
+   does not deny. A delegation that cannot be verified is passed on as unverified, carrying the
+   kind of failure and, for a grant whose signature verified, its digest, and step 5 denies it
+   at check 3 with a single reason kind of its own. That holds under a profile that does not
+   require a delegation too: check 3 denies any delegation that is present and unverified. A
+   grant that verifies but names a team other than the proved team is denied at check 3 too,
+   naming both teams.
 3. **Select the profile** from the issuer, the deployment and the principal.
 4. **Parse** the JSON-RPC message and look up the tool in the surface.
 5. **Decide**, by the checks of
@@ -188,8 +191,8 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    order, the first that fails giving the reason:
    - check 0, the profile exists; check 1, the surface is permitted to the principal; check 2,
      the tool is approved on the surface;
-   - check 3, a delegation is present where the profile requires one, verified, and agreeing
-     with the principal;
+   - check 3, a delegation is present where the profile requires one, and any delegation that
+     is present is verified and agrees with the principal;
    - check 4, the delegation lists the tool;
    - check 5, the profile permits the classification. `write` and `destructive` are denied
      before the profile is read, except a tool named in the profile's list of excepted tools
@@ -229,7 +232,8 @@ cannot cancel a write to the store. A disconnect before the connector is called 
 call. A disconnect during a read cancels it. A side effect runs to its call deadline.
 
 A failure at step 1, and a body that cannot be parsed, are telemetry events and do not pass
-through step 6 (section 11). Steps 2 to 4 deny nothing. A denial at step 5 still passes
+through step 6 (section 11). Steps 2 and 3 deny nothing, and step 4 refuses only a body it
+cannot parse, as telemetry. A denial at step 5 still passes
 through step 6 before the caller reads it, so an unverifiable delegation is a deny row.
 `initialize`, `ping` and `server/discover` produce telemetry.
 
@@ -249,18 +253,19 @@ a verified token to a principal, which is identified by issuer and subject toget
 
 | Principal | Proved facts | From |
 | --- | --- | --- |
-| Workload | Subject, and the team the manifest maps it to, and, for a pod's token, the pod UID. | A ServiceAccount token. |
+| Workload | Subject, and the team the manifest maps it to, and, for a pod's token, the pod UID once the verifier exposes it (milestone 4). | A ServiceAccount token. |
 | User | Subject and group memberships. | An identity-provider token. |
 
 **Verification is strict and offline.** One signing algorithm, a key ID required, signing
 keys fetched only from the issuer's own host, expiry and not-before checked with leeway,
 audience membership required, and a ceiling on token lifetime.
 
-**Verification has three states:** `proved`, `disabled` (checking was explicitly turned off)
-and `failed`. An incident review must be able to tell "we were not checking" from "someone
-tried and was refused". "We were not checking" is a row with identity `disabled`. For identity,
-"someone tried and was refused" is a telemetry event (section 11); for a delegation, it is a
-deny row.
+**Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
+`failed`. An incident review must be able to tell "we were not checking" from "someone tried and
+was refused". "We were not checking" is a row with identity `disabled`. For identity, "someone
+tried and was refused" is a telemetry event (section 11); for a delegation, it is a deny row.
+The core cannot yet record a row with identity `disabled`, so until it can, the built path
+refuses every `tools/call` with identity disabled and lists nothing, with no row (section 17).
 
 **A wrong guess costs the same as a right one.** An unknown subject pays for the signature
 check before it is refused, so response time does not reveal which subjects exist.
@@ -278,15 +283,16 @@ sign them asymmetrically so this gateway holds only a public key; see
 delegates to this gateway signs with a key the gateway cannot use to sign.
 
 What a grant binds is [decision 0012](decisions/0012-what-a-turn-grant-binds.md). Its issuer is
-fixed by the Ed25519 key that verifies it, one key per Otto environment. `aud` lists the
-gateway deployments it is for, two during the cutover. `iat` and `exp` bound its lifetime to
-at most 15 minutes, with 30 seconds of leeway. `pod` binds it to the sandbox pod's UID, by
-stage 3 at the latest. `egress` carries the turn's egress setting, which is recorded (decision
-0010). Within those bounds a grant may be presented any number of times, and every row records
-its digest, so reuse from another pod, or another deployment sharing this gateway's audit
-store, is one query. A call of any tool not classified `read` is also checked for currency:
-Otto's resolver says whether the turn is still current, which enforces the fencing epoch and
-lets Otto revoke one turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves.
+fixed by the Ed25519 key that verifies it, one key per Otto environment. `aud` lists the gateway
+deployments it is for, two during the cutover. `iat` and `exp` bound its lifetime to at most 15
+minutes, with 30 seconds of leeway. `pod` binds it to the sandbox pod's UID, by stage 3 at the
+latest. `egress` carries the turn's egress setting, which is recorded (decision 0010). Within
+those bounds a grant may be presented any number of times, and every row records its digest, so
+reuse from another pod, or another deployment sharing this gateway's audit store, is one query.
+A call of any tool not classified `read` is also checked for currency: Otto's resolver says
+whether the turn is still current, which enforces the fencing epoch and lets Otto revoke one
+turn. Reads are not fenced. The Kubernetes verifier is to expose the pod UID its token proves,
+and the principal to carry it; neither does yet (section 17).
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -368,17 +374,23 @@ Under this rule Otto's `github_pr_comment` and `jira_comment` are `write`: they 
 pull requests and issues the gateway did not create. So is `addOrEditJiraIssueComment` on
 Atlassian's hosted server, which [systems.md](systems.md) plans for the Jira surface. The owner
 allowed Otto's two tools to Otto's callers by a narrow, recorded exception
-([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9):
-Otto's profile only; the tool refuses the commands of the bots named when it is approved,
-today Atlantis; it reaches only the team's repositories or the configured Jira projects; every
-call is audited; it is listed in the register of exceptions that decision 0010 keeps, accepted
-by the owner and signed by a named security owner; and it is reviewed every 90 days and when
-Otto's cutover (#13) completes. `addOrEditJiraIssueComment` gets no exception, because it can
-edit other people's comments. The core has no way yet to express the exception. Under #12,
-check 5 itself changes: it denies `write` and `destructive` unless the tool is named in the
-calling profile's list of excepted tools, and an allowed call records the exception as its
-reason. The list names tools, never a classification. Until then Otto's callers are denied
-both tools, which loses parity with Otto's gateway.
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9).
+It is in the profile for Otto's sandboxes only, which requires currency, so each call is also
+fenced (decision 0012); the profile for Otto's control-plane surface has no exception, and the
+loader refuses an exception list on a profile that does not require currency. The tool refuses
+the commands of the bots named when it is approved, today Atlantis; it reaches only the team's
+repositories or the configured Jira projects; every call is audited; and it is listed in the
+register of exceptions that decision 0010 keeps, with this project as its owner, accepted by
+the owner, and to be signed by a named security owner, who has not yet been named. It is
+reviewed every 90 days and before each milestone's rollout, so before milestone 4, when it
+first comes into force, and when Otto's cutover (#13) completes. `addOrEditJiraIssueComment`
+gets no exception, because it can edit other people's comments. The core has no way yet to
+express the exception. Under #12, check 5 itself changes: it denies `write` and `destructive`
+unless the tool is named in the calling profile's list of excepted tools, and an allowed call
+records the exception that allowed it in a field of its own, not as a reason. The list names
+tools, never a classification. The exception comes into force only once #12 has built it and
+the security owner has signed its entry. Until then Otto's callers are denied both tools,
+which loses parity with Otto's gateway.
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
@@ -386,7 +398,7 @@ profiles. `write` and `destructive` are denied in every profile by the decision 
 no profile's data can permit them as a classification. That is how production mutation is
 denied for every profile initially: anything that changes production without a person acting
 is one of the two. The one exception is the recorded one for Otto's two comment tools, above,
-which names tools in Otto's profile and needs a change to check 5.
+which names tools in the profile for Otto's sandboxes and needs a change to check 5.
 Permitting direct writes needs a decision that replaces part of
 [decision 0006](decisions/0006-what-the-decision-function-sees.md). This binds calls through
 the gateway. Where an environment's claim is the governed path, it says nothing about other
@@ -396,7 +408,7 @@ routes ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gate
 | --- | --- | --- | --- |
 | Reads | Allowed. | Within the user's groups and approved data access; see section 9. | Allowed, within the team's surfaces. |
 | Proposals (`propose`) | Allowed. A comment is a proposal only on something the gateway created for review, such as its own draft pull request or an issue it opened, and only if its tool refuses the commands of the bots named when it was approved. | Only approved tools on employee surfaces, always under the employee's own per-user grant, once that system's grant and receipts work (decision 0011). None at launch. | Allowed, with the same limit on comments. |
-| Direct writes (`write`) | Never, except Otto's two comment tools under the recorded exception above, once its mechanism is built (#12). | Denied in every profile. Permitting them needs a decision replacing part of decision 0006. | Never. |
+| Direct writes (`write`) | Never, except Otto's two comment tools under the profile for Otto's sandboxes, by the recorded exception above, once it is in force (#12). | Denied in every profile. Permitting them needs a decision replacing part of decision 0006. | Never. |
 | Destructive | Never. | Denied initially; future expansion needs a separate decision and approval design. | Never. |
 | Acting as a named user | Never. | Allowed through a gateway-held per-user grant where needed. | Never. |
 
@@ -530,6 +542,8 @@ Every refusal is a sentence a model can act on, never a bare status code or a st
 - **Receipts** have sentences of their own: the outcome is unknown and the call must not be
   repeated; one for each answer to a reused key (section 11); a key reused with a different
   tool-use identifier; and a side effect sent without a key, asking for one.
+- **Currency** has two: a side-effecting Otto call whose turn is not current, and one whose
+  currency could not be confirmed ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
 The row's identifier is returned in the result's `_meta`, or in `error.data` for a JSON-RPC
 error, so a person reporting a problem can quote it.
@@ -711,13 +725,14 @@ as an argument, so a call path that skips the audit write does not compile.
 `turn_id` and `fencing_epoch`, and no column for a grant's digest, issuer, key ID, pod UID,
 egress setting or currency answer. Those are kept in this gateway's record unless Otto adds
 columns ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Grant verification
-failures are counted by kind: version, unknown key, retired key, encoding, signature, malformed, expired,
-not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Also counted: accepted
-grants by key ID, which shows a rotation's progress, currency answers by result, and the
-resolver's latency and timeouts. Each audience or pod failure is investigated, because an
-honest sandbox under a correct configuration never produces one. Lifetime failures alert on a
-rate, because honest sandboxes produce them. Until it is decided how these reach a person, the
-gateway's maintainers review the counts as part of each cutover stage's go/no-go.
+failures are counted by kind: version, unknown key, retired key, encoding, signature, malformed,
+expired, not yet valid, lifetime over the ceiling, wrong audience and wrong pod. Also counted:
+accepted grants by key ID, which shows a rotation's progress, currency answers by result, and
+the resolver's latency and timeouts. Each audience or pod failure is investigated, because an
+honest sandbox under a correct configuration never produces one. Lifetime failures are to alert
+on a rate, because honest sandboxes produce them, once the on-call rotation sets the rate and
+who is told. Until then nothing pages, and the gateway's maintainers review the counts as part
+of each cutover stage's go/no-go.
 
 ### Receipts
 
@@ -774,10 +789,11 @@ was established, and the gateway never deletes a receipt.
   each make a new call. Receipts cover a replayed turn only if Otto's control plane sends a key
   that stays the same across replays, which is agreed with Otto's owners.
 
-Until receipts exist, the gateway refuses any snapshot that serves a tool not classified
-`read` (section 12), so no proposal is served, including one that creates something. The
-first side effect to reach a real system also waits until someone is named to settle a
-receipt by hand and a way to record that exists (decision 0009, Still open 9 and 10).
+Until receipts exist, the gateway refuses any snapshot that serves a tool not classified `read`
+(section 12; not built yet, see section 17), so no proposal is served, including one that
+creates something. The first side effect to reach a real system also waits until someone is
+named to settle a receipt by hand and a way to record that exists (decision 0009, Still open 9
+and 10).
 
 ## 12. Boot gates
 
@@ -800,20 +816,27 @@ decision 0009's on the audit or receipt table.
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
 swap, whatever the snapshot's source. The check is in the binary, not in policy data, so no
-profile can change it. Only the harness's test builds are exempt, through a test-support
-cargo feature that the release build never enables. `#[cfg(test)]` cannot do this, because
-the harness runs the gateway from integration tests. CI starts the release artifact with a
-`propose` snapshot and no receipt store, and requires it to refuse.
+profile can change it. Only development builds are exempt.
+
+**A development build** is a build of the gateway with the `test-support` cargo feature, which
+the release build never enables. The harness's test builds and the Rust target of the
+conformance suite are development builds. A development build carries two exemptions: it may
+serve a snapshot holding a tool not classified `read` with no receipt store, and it may run with
+turn-grant checking off. `#[cfg(test)]` cannot provide them, because the harness runs the
+gateway from integration tests and other crates. Since a feature can be turned on in any build,
+CI checks the release artifact itself: started with a `propose` snapshot and no receipt store,
+and started with grant checking off, it must refuse both.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
 the profile for Otto's sandboxes has no grant key, a key file holds private key material, a key
 is of small order, the same key is configured twice or under two issuers, a previous key has no
-end instant, or a surface under that profile serves a tool not classified `read` while `pod`
-is not required for its issuer. Surfaces change with the snapshot, so the last is also checked
-when a snapshot is loaded: a snapshot that breaks it is refused, and the running snapshot is
-kept. The gateway also refuses to start with grant checking turned off outside a development
-build. The Rust target of the conformance suite is a development build.
+end instant, or a tool not classified `read` is served on any surface whose allowlist admits a
+team that a profile-selector rule maps to the profile for Otto's sandboxes, while `pod` is not
+required for that rule's issuer. Surfaces change with the snapshot, so the last is also
+checked when a snapshot is loaded, reading the selector rules beside it: a snapshot that
+breaks it is refused, and the running snapshot is kept. The gateway also refuses to start with
+grant checking turned off outside a development build.
 
 ## 13. Connectors and proxied servers
 
@@ -959,10 +982,10 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | Milestone | Turns on | Decides first |
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
-| 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. |
+| 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. The gateway refuses, at boot and at each snapshot swap, a snapshot serving a tool not classified `read` without a receipt store (decision 0009), and CI checks the release artifact for it. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. The code owners of the policy files and the branch rule requiring their review, since no policy file lands before them (decision 0011). |
 | 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds (Q11). Tool assurance and proxied exposure (decision 0011). |
-| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Before stage 3, the pod binding and the currency check (decision 0012). Built-in GitHub and Jira tools, and the exception list in check 5 for Otto's two comment tools (decision 0011, #12). Built-in tools that check their own scope report what they reached (decision 0011). Receipts and the key check before the first side effect reaches a real system (decision 0009, part 2). The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The vendor actions Otto's control plane needs. Otto's answers to decision 0010: its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant. |
-| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13), including that each client sends a tool-use identifier or can set the named `_meta` field before it is served a `propose` tool (decision 0009). Per-user grants and receipts before any employee proposal for that system (decision 0011). |
+| 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Before stage 3, the pod binding and the currency check (decision 0012). Built-in GitHub and Jira tools, and the exception list in check 5 for Otto's two comment tools (decision 0011, #12). Built-in tools that check their own scope report what they reached (decision 0011). Receipts and the key check before the first side effect reaches a real system (decision 0009, part 2). The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Who the owner names to raise the one list of Otto requests from decisions 0009 to 0012 (Q18); nothing reaches Otto's owners before then. Otto's owners' answers to decision 0011: the review of the declarations for Otto's eighteen tools, team repositories moving into the snapshot's limits, and the proposal tools checked against the interim automation refusals; until then this gateway serves none of Otto's tools. Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The security owner named and the comment-tool exception's register entry signed, before Otto's two comment tools are served (decision 0011). The vendor actions Otto's control plane needs. Asked but not blocking: Otto's answers to decision 0010 (its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant). Until they come, every Otto turn has the governed path. |
+| 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13), including that each client sends a tool-use identifier or can set the named `_meta` field before it is served a `propose` tool (decision 0009). The security reviewer of data approvals, named by the security team, since no resource enters a group's limit, and so no employee read works, until then (decision 0011). Whether group limits and broad-read opt-ins expire (decision 0011). Per-user grants and receipts before any employee proposal for that system (decision 0011), and whether a per-user rate limit must come first (Q12). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
 | Later | The remaining systems; brokered AWS inventory tools; human approval of individual calls. | — |
 
@@ -983,6 +1006,102 @@ been agreed with Otto yet ([decision 0012](decisions/0012-what-a-turn-grant-bind
 
 Alert thresholds, routing and paging for audit and receipts come before the first production
 deployment, whichever milestone that is (decision 0009).
+
+### What the records require that the built code does not do yet
+
+Decisions 0009 to 0012 were accepted after some of the code was written. This list names, by
+issue, each change they need in that code, so that none is assumed to exist. Part 1 of
+decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception and decision
+0012 are needed for milestone 4.
+
+**#9, identity.**
+
+- The principal carries a Kubernetes workload's pod UID, read from its projected token
+  (decision 0012). Today neither the verifier nor the principal has it.
+- The claimed issuer and subject are available beside a verification error, escaped and
+  capped, for the identity-failure telemetry event (decision 0009). The error itself still
+  carries nothing from the token, as today.
+- With #10 and #26: a principal state for identity checking turned off, which a row can record
+  as `disabled`.
+
+**#10, audit and receipts** (the core, the Postgres store built for #10, and the test stores).
+
+- The gateway assigns each row a UUIDv7 and begin takes it, retrying by identifier within its
+  budget. Today the store assigns the identifier with a column default and gives up at the
+  budget.
+- A `BEFORE INSERT` trigger sets the time at begin and the deadline from the database's clock
+  and the allowance the gateway supplies, and the deadline is `NOT NULL`. Today the time is a
+  column default and there is no deadline.
+- Columns for the instance, the kind and the deadline. For decisions 0011 and 0012: how the
+  resources were found, with the reach by reference, the credential identity, the error kind,
+  an unverified delegation's failure kind, and a grant's digest, issuer, key ID, pod UID,
+  egress setting and currency answer. With #12, a column for the exception that allowed a
+  call, since the row's shape constraint rightly allows no reason on an allowed row.
+- Rows of kind `list`, written complete, with a list form of the record in the core.
+- For part 2: the outcomes `unknown` and `duplicate`, and an insert grant and shape constraint
+  that let a row be written complete at begin, for the answers to a reused key. Today the
+  outcome allows only `ok`, `error` and `refused`, and the gateway's role cannot insert an
+  outcome.
+- The boot check covers all three triggers, not only the one that completes a row once.
+- A row whose begin confirmation was lost is completed as `error` on the finish pool, and
+  giving up a guard without running completes its row as `error`. Today a guard can only be
+  consumed by running it.
+- In the core: `begin` takes the identifier; `Begun` gains the answers to a reused key;
+  `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
+  key check joins `decide` after check 6, skipped for `tools/list`; and the properties
+  `tools_list_is_decide_run_once_per_tool` and `an_opened_world_is_allowed` are restated for
+  it (decision 0006, amended 2026-10-07).
+- The core's test store accepts an identical second completion, where today it asserts that a
+  row is never finished twice, and so does the harness's in-memory store. With #25, the
+  in-memory store can also write and then report failure, lose the process between run and
+  finish, and keep the answer budget, so the contract suite runs on it.
+- Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
+  finish pool of its own, finish waiting at most the answer budget and then retrying on its
+  own task until the deadline, an identical repeat finish accepted, and column grants.
+
+**#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
+consulting it; the column for the exception that allowed a call (with #10); the loader's
+refusal of that list on a profile that does not require currency; the restated property; a
+decision-table case for each comment tool, a case showing them denied in every other profile,
+and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
+that removes the exception-list check.
+
+**#14, the first slice.** The mock server's own refusal of anything but the gateway's projected
+token; the route-check program, its operator step and its probe (decision 0010); the
+termination grace period and readiness delay set explicitly in the manifests; the signals of
+section 11 exported; and the open-row query.
+
+**#22, the Otto adapter.** The Ed25519 turn-grant verifier with strict encoding; a delegation in
+the call context that is present and unverified, carrying the failure kind and an optional
+digest, and its reason kind; currency in the call context, the profile setting, the currency
+check between check 5 and check 6, skipped for `tools/list`, and its two reason kinds and
+sentences; the resolver client with its one-second budget; the grant-key and pod-required gates
+at boot and at snapshot load, reading the selector rules; the gate that allows grant checking
+off only in a development build, with CI's check of the release artifact; and the row fields
+(with #10).
+
+**#26, the HTTP path.**
+
+- A row of kind `list` before answering `tools/list`.
+- Telemetry events that carry the surface and the source address, counters, and a bounded
+  queue, with events for `initialize`, `ping`, `server/discover` and bodies that cannot be
+  parsed. Today an identity failure is logged with the deployment and the cause only.
+- On a disconnect, the connector is not called if it has not been, and a read is cancelled.
+  Today the spawned task always runs to completion.
+- The row's identifier in the result's `_meta`, or in `error.data`.
+- The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
+  harness enables and CI's check of the release artifact. Today boot accepts a tool not
+  classified `read` even with audit off, and the harness serves a `propose` fixture tool.
+- A readiness endpoint that fails first on shutdown.
+- An allowed call whose connector is not registered completes its row as `error`, where today
+  the row stays open.
+- The key read from its carriers, the tool-use identifier and the named `_meta` field.
+- With identity disabled, reads served with rows whose identity is `disabled` (with #9 and
+  #10). Until then the path refuses every `tools/call` and lists nothing, with no row, which
+  is stricter.
+- Already built and matching: identity failures write no row and keep the opaque sentence
+  during an audit outage; begin, run and finish run on a spawned task the client cannot
+  cancel; and shutdown waits for running answers.
 
 ## 18. Testing
 
@@ -1018,8 +1137,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   through that mapping, like the tool-name mapping. They are not expected differences.
 - **The comment tools are an expected difference.** Under section 8 the Rust gateway denies
   `github_pr_comment` and `jira_comment` to Otto's callers, so the suite's cases that use them
-  cannot pass against it until the mechanism for the exception in decision 0011 is built
-  (#12). They are:
+  cannot pass against it until the exception in decision 0011 is in force: built (#12) and
+  its register entry signed. They are:
   - the tool inventory, which requires both to be served;
   - `TestOriginalToolsAndBrokeredCredentials`, which calls `github_pr_comment` as an allowed
     call, checks its confirmation, and requires exactly two writes, the comment's among them;
@@ -1143,11 +1262,14 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9 and Q10, and Q11 to Q13, are in [open-questions.md](open-questions.md).
-Q9 is narrowed to what decision 0011 leaves to others, and Q10 to what compliance requires of
-read auditing; the rest of each is decided. Q17 and Q18 are settled by decisions 0010 and 0012.
-Each of decisions 0009 to 0012 lists what it leaves to Otto's owners, IT, the security team,
-platform owners and others, with who decides and what holds meanwhile. The milestone table
-says which each milestone must settle before it starts. Vendor feasibility remains research
-in [systems.md](systems.md). The independent review's findings that are not yet reflected here
-are listed at the end of that file.
+What remains of Q9, Q10, Q17 and Q18, and Q11 to Q13, are in
+[open-questions.md](open-questions.md). Q9 is narrowed to what decision 0011 leaves to others,
+Q10 to what compliance requires of read auditing, Q17 to what decision 0010 leaves to others,
+and Q18 to what decision 0012 leaves to Otto's owners and to the owner; the rest of each is
+decided. Each of decisions 0009 to 0012 lists what it leaves to Otto's owners, IT, IT security,
+the security team, platform owners and others, with who decides and what holds meanwhile. Every
+request of Otto's owners goes to them as one list, raised by whoever the owner names
+(decision 0012). The milestone table says which each milestone must settle before it starts, and
+section 17 lists the changes the records need in code already built. Vendor feasibility remains
+research in [systems.md](systems.md). The independent review's findings that are not yet
+reflected here are listed at the end of that file.

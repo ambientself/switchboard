@@ -1,11 +1,13 @@
 # 0012: What a turn grant binds, and what Otto changes for it
 
-Date: 2026-10-06. Status: accepted here; needs changes in Otto. Accepted on 2026-10-07, when
-the owner accepted the recommendations (see the end). Settles Q18. Answers what
-[decision 0004](0004-verify-turn-grants-with-a-public-key.md) left open, and changes one of its
-consequences: the format change is made before stage 1, not with the cutover. Written against
-the 2026-10-04 amendment to [decision 0006](0006-what-the-decision-function-sees.md), the
-audit record's resource columns (pull request #30, not yet merged), and decisions
+Date: 2026-10-06. Status: accepted here; needs changes in Otto. Accepted on 2026-10-07, when the
+owner accepted the recommendations (see the end). Settles Q18, except what Otto's owners and
+others still decide, under "Still for the owner" and "Still open", to which Q18 is narrowed.
+Answers what [decision 0004](0004-verify-turn-grants-with-a-public-key.md) left open, and
+changes one of its consequences: the format change is made before stage 1, not with the cutover.
+Written against the 2026-10-04 amendment to
+[decision 0006](0006-what-the-decision-function-sees.md), the audit record's resource columns
+(pull request #30, merged on 2026-10-07), and decisions
 [0009](0009-audit-completion-receipts-and-recovery.md),
 [0010](0010-what-stops-an-agent-going-around-the-gateway.md) and
 [0011](0011-resource-authorization-and-tool-assurance.md), accepted the same day. Amends 0006
@@ -130,23 +132,25 @@ verifiers ignore claims they do not know. This needs no second drain as long as 
 grants to the harness the same way. Requiring `pod` or `egress` is a setting per issuer in
 this gateway's configuration, so turning it on needs no release.
 
-**Failures.** The verifier makes these checks before the decision function, and does not
-deny. A grant that fails any of them is passed on as a delegation that is present and
-unverified, carrying only which check failed, and check 3 denies it under the single reason
-kind [decision 0009](0009-audit-completion-receipts-and-recovery.md) gives an unverified
-delegation. One place decides, and a deny row is written. The caller reads Otto's one fixed
-sentence for a bad grant. Which check failed is recorded on the row, logged and counted, never
-returned, and is not a reason kind. The row holds the proved columns and nothing from the
-grant's claims. When the signature verified and a binding failed (audience, lifetime or pod),
-the row also records the grant's digest. That is the one exception to 0009's rule that such a
-row holds nothing from the grant. A digest is not a claim, and it matches a refused use of a
-grant with the rows where the same grant was accepted. Honest sandboxes produce lifetime
-failures, from a call just after the deadline or a node whose clock is off, so those are
-counted and alerted on by rate. An audience or pod failure comes from a copied grant or a
-configuration fault, never from an honest sandbox under a correct configuration, so each one
-is investigated. A team mismatch is still named, by check 3, because such a grant verified
-and the mismatch is usually a rollout fault. A pod mismatch is not named, because naming it
-helps only the copier.
+**Failures.** The verifier makes these checks before the decision function, on any grant the
+request carries, and does not deny. A grant that fails any of them is passed on as a delegation
+that is present and unverified, carrying which check failed and, if its signature verified, its
+digest, and nothing from its claims. Check 3 denies it under the single reason kind
+[decision 0009](0009-audit-completion-receipts-and-recovery.md) gives an unverified delegation.
+One place decides, and a deny row is written. The caller reads Otto's one fixed sentence for a
+bad grant. Which check failed is recorded on the row, logged and counted, never returned, and is
+not a reason kind. The row holds the proved columns and nothing from the grant's claims. When
+the signature verified and a binding failed (audience, lifetime or pod), the row also records
+the grant's digest. That is the one exception to 0009's rule that such a row holds nothing from
+the grant. A digest is not a claim, and it matches a refused use of a grant with the rows where
+the same grant was accepted. Honest sandboxes produce lifetime failures, from a call just after
+the deadline or a node whose clock is off, so those are counted and are to alert by rate, not
+one by one. The rate and who is told are not set yet (Still open); until they are, the counts
+are reviewed at each stage's go/no-go. An audience or pod failure comes from a copied grant or a
+configuration fault, never from an honest sandbox under a correct configuration, so each one is
+investigated. A team mismatch is still named, by check 3, because such a grant verified and the
+mismatch is usually a rollout fault. A pod mismatch is not named, because naming it helps only
+the copier.
 
 ### Presenting a grant more than once
 
@@ -238,9 +242,9 @@ Amendments to 0006:
   gains the pod UID for a Kubernetes workload. The function reads none of these. The audit
   record keeps them.
 - **A grant that fails verification** reaches the function as a delegation that is present and
-  unverified, carrying only which check failed, and check 3 denies it, as decision 0009 amends
-  0006. Its row records which check failed and, when the signature verified, the digest
-  (Failures, above).
+  unverified, carrying which check failed and, if its signature verified, its digest, and
+  check 3 denies it, as decision 0009 amends 0006. Its row records which check failed and, when
+  the signature verified, the digest (Failures, above).
 
 ### Tools and resources
 
@@ -254,22 +258,23 @@ this surface does not serve, is dropped; in stage 2 that drops every write still
 gateway.
 
 A grant only narrows. Check 4 runs before check 5, so a grant that lists a `write` or
-`destructive` tool is still denied, naming the classification, unless decision 0011's
-exception names that tool for this profile. Of the five write tools Otto serves at `752395a`,
-three are `propose`: `github_create_pr`, `github_propose_change` and `github_amend_change`.
-Two are `write` under 0006's comment rule: `github_pr_comment` and `jira_comment`. The two are
-denied until 0011's exception mechanism is built. From then they are allowed only through it,
-and fenced like the three, because the currency check runs after the exception step and
-covers every tool not classified `read`. The adapter records all five as `write` in
-`gateway_audit`.
+`destructive` tool is still denied, naming the classification, unless decision 0011's exception
+names that tool for this profile. Of the five write tools Otto serves at `752395a`, three are
+`propose`: `github_create_pr`, `github_propose_change` and `github_amend_change`. Two are
+`write` under 0006's comment rule: `github_pr_comment` and `jira_comment`. The two are denied
+until 0011's exception is in force. From then they are allowed only through it, and fenced like
+the three, because the exception sits only in the profile for Otto's sandboxes, which requires
+currency, and the currency check runs after the exception step and covers every tool not
+classified `read`. The loader refuses an exception list on a profile that does not require
+currency. The adapter records all five as `write` in `gateway_audit`.
 
 The grant does not bind resources. A turn's calls are limited by the team's resource limits
-(check 6) and the connectors' own scope checks, as in Otto. Pull request #30 adds the resources
-a call named to its row, at most 64. A tool that checks its own scope has no resources before
-it runs, and its row says `unknown` only until it reports what it reached when it finishes,
-which [decision 0011](0011-resource-authorization-and-tool-assurance.md) requires before
-milestone 4. A per-turn resource list would need Otto to know at mint time every repository a
-turn may touch, and connectors that narrow by it.
+(check 6) and the connectors' own scope checks, as in Otto. Pull request #30 added the resources
+a call named to its row, at most 64. A tool that checks its own scope has no resources before it
+runs, and its row says `unknown` only until it reports what it reached when it finishes, which
+[decision 0011](0011-resource-authorization-and-tool-assurance.md) requires before milestone 4.
+A per-turn resource list would need Otto to know at mint time every repository a turn may touch,
+and connectors that narrow by it.
 
 ### Keys
 
@@ -284,14 +289,16 @@ signs with it; after one lifetime ceiling the old key's end instant passes and i
 
 The gateway refuses to start if: the profile for Otto's sandboxes has no grant key; a key file
 holds private key material; a key is of small order; the same key is configured twice, or
-under two issuers; a previous key has no end instant; or a surface under that profile serves a
-tool not classified `read` while `pod` is not required for its issuer. The last holds the pod
-binding in place once writes move. Surfaces and their tools are snapshot data and change while
-the gateway runs, so the last is also checked when a snapshot is loaded: a snapshot that breaks
-it is refused, and the running snapshot is kept. The gateway also refuses to start with grant
-checking turned off outside a development build. The Rust target of the conformance suite is a
-development build, so the suite's cases that start the gateway with grant checking off still
-run there.
+under two issuers; a previous key has no end instant; or a tool not classified `read` is served
+on any surface whose allowlist admits a team that a profile-selector rule maps to the profile
+for Otto's sandboxes, while `pod` is not required for that rule's issuer. The last holds the
+pod binding in place once writes move. Surfaces and their tools are snapshot data and change
+while the gateway runs, so the last is also checked when a snapshot is loaded, reading the
+selector rules from configuration beside the snapshot: a snapshot that breaks it is refused,
+and the running snapshot is kept. The gateway also refuses to start with grant checking turned
+off outside a development build, a build with the `test-support` cargo feature that design
+section 12 defines. The Rust target of the conformance suite is a development build, so the
+suite's cases that start the gateway with grant checking off still run there.
 
 ### Revocation
 
@@ -406,13 +413,15 @@ run against the Rust target before the re-pin.
 - This gateway's audit record gains the grant digest, issuer, key ID, pod UID, egress setting
   and currency answer. Otto's `gateway_audit` has `session_id`, `turn_id` and `fencing_epoch`
   and no column for these, so they are kept only here unless Otto adds them, as with the
-  resources pull request #30 adds.
-- The Kubernetes identity verifier exposes the pod UID its token proves.
+  resources pull request #30 added.
+- The Kubernetes identity verifier is to expose the pod UID its token proves, and the principal
+  is to carry it. Neither does yet (#9).
 - Stage 1 copies verify here only if they carry the sandbox's own identity token and grant,
   with that token's audience admitting this gateway. How copies are made is #13.
 - Grant checking can be turned off only in a development build, enforced at boot. That settles
   that part of Q12 for this gate. The Rust target of the conformance suite is a development
-  build.
+  build. CI checks the release artifact for this gate as it does for receipts: started with
+  grant checking off, it must refuse.
 - The control plane is still trusted for whom it names. A grant proves that Otto said who the
   turn was for, not that the person acted.
 - Verification is offline, so a deleted pod's token and grant verify until they expire or a
@@ -453,7 +462,8 @@ On 2026-10-07 the owner accepted this record's recommendations:
   change like any other.
 - **This gateway names its own deployments,** in its deployment configuration. Renaming a
   deployment that Otto's `aud` names is coordinated with Otto, which mints the new name first.
-- **Audience and pod failures are investigated one by one. Lifetime failures alert on a rate.**
+- **Audience and pod failures are investigated one by one. Lifetime failures are to alert on a
+  rate,** not one by one. The rate and who is told are under Still open.
 - **The digest replaces a unique-identifier claim.** Issue #21 asked for an identifier in the
   grant. The SHA-256 of the canonical grant identifies it with no change in Otto.
 - **Grant checking can be turned off only in a development build,** enforced at boot.
@@ -463,10 +473,15 @@ On 2026-10-07 the owner accepted this record's recommendations:
 ## Still for the owner
 
 - **Who takes the changes in Otto to Otto's owners.** This record made no recommendation on
-  it, so accepting the recommendations did not settle it. Decision 0009 tracks its Otto
-  questions under issues #21 and #22. Decision 0010 sends its Otto questions with this record's
-  changes, as one list, raised by whoever the owner names. Meanwhile nothing has been raised,
-  and the first item below waits on it.
+  it, so accepting the recommendations did not settle it. Every request of Otto's owners from
+  decisions 0009 to 0012 goes to them as one list, raised by whoever the owner names: decision
+  0009's Still open 2 (rows for identity failures, `initialize` and `ping`) and 8 (Otto's key),
+  tracked under issues #21 and #22; decision 0010's requests of Otto's owners; decision 0011's
+  (the review of the eighteen tool declarations, team repositories moving into the snapshot's
+  limits, and Otto's proposal tools checked against the interim automation refusals); and this
+  record's changes and questions. Meanwhile nothing has been raised. Every item for Otto's
+  owners in these four records waits on it, and so does milestone 4. It is tracked in
+  open-questions.md under Q18.
 
 ## Still open
 
@@ -480,8 +495,8 @@ this gateway does meanwhile.
 - **Whether Otto can mint `pod` in the first change, and whether the harness can read the
   pod's projected token.** Decided by Otto's owners. Meanwhile `pod` is not required, a copied
   grant used for reads is recorded with the pod that presented it, and the gateway refuses to
-  start, or to load a snapshot, if Otto's sandbox surface serves a tool not classified `read`
-  while `pod` is not required.
+  start, or to load a snapshot, if a surface admitting a team mapped to the profile for Otto's
+  sandboxes serves a tool not classified `read` while `pod` is not required.
 - **Whether the grant carries the turn's egress setting, and in which change.** Decided by
   Otto's owners, with decision 0010's other requests. Meanwhile `egress` is not required, rows
   record no egress setting, and every Otto turn is taken to have the governed path, not the

@@ -19,12 +19,15 @@ route that contradicts an environment's claim and is not listed here is a defect
 
 Each entry gives the environment, the route or rule, the control it breaks, what an agent
 could do with it, why it is accepted, its owner, who accepted it and when, the next review
-date, and what would end it. An entry without an owner or a review date is not accepted.
+date, and what would end it. An entry without an owner or a review date is not accepted. An
+exception to the gateway's own rules gives the rule it excepts in place of the route and the
+control it breaks, and also the record that granted it and its conditions.
 
 This project's owner accepts an entry for the company, and a named security owner signs it.
 The team that benefits from an entry never accepts it alone. The security team has not yet
 named the security owner, so entries the owner has accepted are marked as awaiting that
-signature.
+signature. A route exists whether or not its entry is accepted. An exception to a rule is what
+lets the gateway allow a call, so it comes into force only once it is accepted and signed.
 
 Every entry is reviewed every 90 days, and before each milestone's rollout.
 
@@ -190,24 +193,38 @@ record and an entry here.
 
 ### Otto's comment tools
 
+- **Environment:** Otto sandboxes.
 - **Tools:** Otto's `github_pr_comment` and `jira_comment`.
 - **Rule excepted:** they comment on pull requests and issues the gateway did not create, so
   they are `write`, which [decision 0006](decisions/0006-what-the-decision-function-sees.md)
   denies in every profile. They stay `write`.
-- **Granted by:** decision 0011.
-- **Approved:** by the owner, 2026-10-07. Awaiting the security owner's signature.
+- **What an agent could do:** comment on any pull request in its team's repositories, or any
+  issue in the configured Jira projects, including ones a person wrote, other than with a
+  command of a bot named when the tool was approved. A comment can start CI.
+- **Why accepted:** parity with Otto's gateway, which serves both tools to Otto's turns today
+  (issue 12).
+- **Granted by:** [decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md),
+  section 9.
+- **Owner:** this project, and Otto once Otto's owners agree to share it.
+- **Accepted:** by the owner, 2026-10-07. Awaiting the security owner's signature.
 - **Conditions:** all of these must hold.
-  - Otto's profile only. Services and employees are denied both tools.
+  - The profile for Otto's sandboxes only. The profile for Otto's control-plane surface has no
+    exception, and services and employees are denied both tools. The profile for Otto's
+    sandboxes requires currency, so each call is also allowed only while Otto says the turn is
+    current ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The loader refuses
+    an exception list on a profile that does not require currency.
   - The tool refuses the commands of the bots named when it is approved. Today that is
     Atlantis. Another bot's commands are refused once that bot is named.
   - It reaches only the team's repositories, or the configured Jira projects. Check 6 and the
     connector hold it to them.
-  - Every call is audited as usual, and the row gives the exception as the reason the call was
-    allowed.
+  - Every call is audited as usual, and the row records this exception as what allowed the
+    call, in a field of its own.
   - Atlassian's hosted `addOrEditJiraIssueComment` gets no exception.
-- **In force:** not yet. The core has no way to express an exception until milestone 4 builds
-  one (issue 12). Until then both tools stay denied to Otto's callers.
-- **Next review:** when Otto's cutover (issue 13) completes, and by 2027-01-05.
+- **In force:** not yet. It comes into force only when both hold: milestone 4 has built the
+  core's way to express an exception (issue 12), and the security owner has signed this entry.
+  Until then both tools stay denied to Otto's callers.
+- **Next review:** before each milestone's rollout, so before milestone 4, when it would first
+  come into force; when Otto's cutover (issue 13) completes; and by 2027-01-05.
 - **Ends when:** the review ends it.
 
 ## Evidence log

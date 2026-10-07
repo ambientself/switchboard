@@ -4,9 +4,9 @@ Date: 2026-10-06. Status: accepted on 2026-10-07, when the owner accepted the re
 (see Decided by the owner). Settles the rest of Q9 after
 [decision 0006](0006-what-the-decision-function-sees.md) and the 2026-10-04 amendment to it,
 except the parts under Still open, which wait on other people. Written against that amendment
-and the audit row's resources column (pull request #30, design.md section 11), on the
-assumption that pull request #30 merges first. Its 64-resource bound, and its question about
-Otto's `gateway_audit` table in Q12, are used below.
+and the audit row's resources column (pull request #30, merged on 2026-10-07; design.md
+section 11). Its 64-resource bound, and its question about Otto's `gateway_audit` table in
+Q12, are used below.
 
 ## Context
 
@@ -398,7 +398,7 @@ get around them.
 | A team that has not opted in asks for AWS inventory across every account. | Denies at check 6: the organization is not in its limit. | Not asked. | Denied. |
 | Atlassian's hosted `addOrEditJiraIssueComment`. | Classified `write`: it can edit a comment the gateway did not create, and a proxied server cannot be checked for that. Denied in every profile, and refused at load as a proxied tool that is not `read`. | Not asked. | Never served. |
 | `call_aws` on the AWS MCP Server. | Not exposed: it runs any API operation, and its reach is the whole role. | Not asked. | Never served. |
-| An Otto turn comments with `github_pr_comment` on a person's pull request in its team's repository. | Allows under the exception in section 9, once its mechanism is built. Until then denies at check 5. | Allows. | `ok`, with the exception as the reason on the row. |
+| An Otto turn comments with `github_pr_comment` on a person's pull request in its team's repository. | Allows under the exception in section 9, once it is in force, and only while Otto says the turn is current. Until then denies at check 5. | Allows. | `ok`, with the exception that allowed it on the row. |
 | The same tool, with a comment that starts `atlantis apply`. | Allows under the exception. | Not asked. | `refused` by the connector. |
 
 Resource identifiers are literal strings matched exactly. `_sourceCategory=inventory/*` above
@@ -407,16 +407,19 @@ is the role's filter as written, not a pattern.
 ### 9. Otto's comment tools: a recorded exception
 
 On 2026-10-07 the owner accepted a narrow, recorded exception for these tools, the answer Q9
-called likely. This record sets its conditions. Otto's `github_pr_comment` comments on any
-pull request in the team's repositories, and `jira_comment` on any issue in the configured
-Jira projects. Under the comment rule in decision 0006 both are `write`, because they comment
-on things the gateway did not create. They stay `write`. Otto's other three writes,
-`github_create_pr`, `github_propose_change` and `github_amend_change`, are `propose` and need
-no exception. The two comment tools are allowed to Otto's callers only while all of these
-hold:
+called likely. This record sets its conditions. Otto's `github_pr_comment` comments on any pull
+request in the team's repositories, and `jira_comment` on any issue in the configured Jira
+projects. Under the comment rule in decision 0006 both are `write`, because they comment on
+things the gateway did not create. They stay `write`. Otto's other three writes,
+`github_create_pr`, `github_propose_change` and `github_amend_change`, are `propose` and need no
+exception. The two comment tools are allowed to Otto's callers only while all of these hold:
 
-- **Otto's profile only.** No other profile has an exception. Services and employees are
-  denied both tools.
+- **The profile for Otto's sandboxes only.** No other profile has an exception. The profile for
+  Otto's control-plane surface has none, and services and employees are denied both tools. The
+  profile for Otto's sandboxes requires currency, so each call is also allowed only while Otto
+  says the turn is current ([decision 0012](0012-what-a-turn-grant-binds.md)). The snapshot
+  loader refuses a list of excepted tools on any profile that does not require currency, so the
+  exception can never sit where calls are not fenced.
 - **The tool refuses the commands of the bots named when it is approved.** Today that is
   Atlantis: a comment such as `atlantis apply` is refused, as Otto's `github_pr_comment`
   refuses it now. A command another bot reads, such as `/deploy`, is refused once that bot is
@@ -424,13 +427,17 @@ hold:
   when the tool is approved again.
 - **It reaches only the team's repositories, or the configured Jira projects.** Check 6 and
   the connector hold it to them, as for any built-in tool.
-- **Every call is audited as usual,** and the row gives the exception as the reason the call
-  was allowed.
-- **It is listed in the register of exceptions that decision 0010 keeps,** with the owner as
-  the person who accepted it. Like every entry there, it needs the signature of a named
-  security owner, who has not been named yet (see Still open).
-- **It is reviewed on the register's cadence:** every 90 days, and when Otto's cutover (#13)
-  completes. The review keeps it, narrows it or ends it.
+- **Every call is audited as usual,** and the row records the exception that allowed the
+  call, in a field of its own. It is not a reason kind, which belongs to a denial.
+- **It is listed in the register of exceptions that decision 0010 keeps,** with an owner, as
+  every entry there has: this project, and Otto once Otto's owners agree to share it. The
+  owner accepted it. Like every entry there, it needs the signature of a named security owner,
+  who has not been named yet (see Still open).
+- **It comes into force only when both hold:** #12 has built its mechanism, and the security
+  owner has signed its register entry. Until then both tools stay denied.
+- **It is reviewed on the register's cadence:** every 90 days and before each milestone's
+  rollout, so before milestone 4, when it first comes into force. It is also reviewed when
+  Otto's cutover (#13) completes. The review keeps it, narrows it or ends it.
 
 Atlassian's hosted `addOrEditJiraIssueComment` gets no exception. It can edit comments other
 people wrote, and as a proxied tool it could not be held to the conditions above.
@@ -440,8 +447,8 @@ section on them. The core has no way yet to express an exception, and it needs a
 check 5 itself. Checks stop at the first that denies, and check 5 denies `write` before any
 later check runs, so a list checked after it could never allow. Under #12, check 5 denies
 `write` and `destructive` unless the tool is named in the calling profile's list of excepted
-tools. The profile gains that list, and an allowed decision gains a reason: the exception that
-allowed it, which the audit row records. The property
+tools. The profile gains that list, and an allowed decision names the exception that allowed
+it, which the audit row records in a field of its own, not as a reason. The property
 `a_write_or_destructive_tool_is_never_allowed` is restated as "never allowed, except a tool
 named in its profile's exception list", and check 5's comment changes with it.
 
@@ -451,9 +458,9 @@ company's posture becomes the union of every profile's weakest setting. A settin
 a classification permits every tool of that kind, including ones approved later. A name permits
 one tool, and adding one takes a decision record and a register entry, as this one does. Every
 exception to the company's posture is then in the register, read in one place. The list is
-built under #12 with Otto's GitHub and Jira tools, not now. Until it exists, both tools stay
-denied to Otto's callers, and the conformance cases that use them stay an expected difference
-(design.md section 18).
+built under #12 with Otto's GitHub and Jira tools, not now. Until it exists and the register
+entry is signed, both tools stay denied to Otto's callers, and the conformance cases that use
+them stay an expected difference (design.md section 18).
 
 ### What each guarantee costs, and what stays unguarded
 
@@ -529,13 +536,14 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
 ## Consequences
 
 - Sections 1 to 8 do not change `ResourceDeclaration`, check 6, or the function's inputs and
-  reasons. Section 9 changes check 5 under #12: the profile gains its list of excepted tools,
-  an allowed decision gains the exception as its reason, and the property that a `write` or
-  `destructive` tool is never allowed is restated to except the tools on that list. The
-  snapshot gains a table of connector entries (kind, credential mode, narrowing, reach, what
-  the credential permits, the reach test's date) and, for each `declared` tool, its entry and
-  whether its adapter reads the arguments or names the reach. The loader gains nine rules,
-  each with a table case and a mutation in `scripts/mutation_check.py`.
+  reasons. Section 9 changes check 5 under #12: the profile gains its list of excepted tools, an
+  allowed decision names the exception that allowed it, recorded in a column of its own and not
+  as a reason, and the property that a `write` or `destructive` tool is never allowed is
+  restated to except the tools on that list. The loader refuses that list on a profile that does
+  not require currency. The snapshot gains a table of connector entries (kind, credential mode,
+  narrowing, reach, what the credential permits, the reach test's date) and, for each `declared`
+  tool, its entry and whether its adapter reads the arguments or names the reach. The loader
+  gains nine rules, each with a table case and a mutation in `scripts/mutation_check.py`.
 - A property joins the decision properties: for any snapshot that loads, every admitted
   team's and group's limit holds the whole reach of every tool on its surfaces that is
   `declared` as the reach, or is proxied with narrowing `none`.
@@ -552,7 +560,7 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
   credential layer's refusal as well as the connector's. An oversized or late result from any
   other tool is `unknown`. The five outcomes are stated once, in decision 0009. Otto's
   `gateway_audit` table has none of these columns, so they stay in this gateway's own record
-  unless Otto adds them. Whether it gains them is part of the question pull request #30 puts
+  unless Otto adds them. Whether it gains them is part of the question pull request #30 put
   in Q12, whether that table gains a general column and who adds it. That is its one home.
 - Built-in `checks_own_scope` tools report the resources they reached when they finish, the
   follow-up the resources column of pull request #30 left. This is required before milestone 4
@@ -564,7 +572,8 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
   That is what enforces the second reviewer.
 - Decision 0006 says a connector's scope refusal is the only decision made outside the
   function. That becomes: the argument check, the connector, the credential layer and the
-  custodian may each refuse outside it, and none may allow.
+  custodian may each refuse outside it, and none may allow. Decision 0009 adds the receipt
+  check at begin to that list.
 - `checks_own_scope` is available only to built-in connectors. Otto's `github_amend_change`
   is `propose` only because Otto's resolver confirms the pull request is Otto's proposal;
   without that answer it is refused, as decision 0003 says.
@@ -601,9 +610,10 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
   inventory.
 - Milestone 4 (#12) builds the exception mechanism in section 9, with a decision-table case for
   each of Otto's two comment tools, a case showing the same tools denied in every other
-  profile, a case showing `addOrEditJiraIssueComment` denied, the restated property, and a
-  mutation that removes the list check. When it is built, the conformance cases that use the
-  two tools move out of the expected differences.
+  profile, a case showing `addOrEditJiraIssueComment` denied, the restated property, a
+  mutation that removes the list check, and a loader case refusing the list on a profile that
+  does not require currency. When the exception is in force, the conformance cases that use
+  the two tools move out of the expected differences.
 
 ## Decided by the owner
 
@@ -673,8 +683,8 @@ while they are open: each says what holds until it is answered.
   and the named security owner who signs entries in decision 0010's register, including the
   exception in section 9. Decided by the security team. Until then no resource is added to a
   group's limit and no breadth resource to a team's, and the exception's register entry is
-  marked as awaiting that signature. The exception cannot be in force before #12 builds its
-  mechanism in any case.
+  marked as awaiting that signature. The exception is not in force until it is signed, even
+  once #12 has built its mechanism.
 - **Who the code owners of the policy files are,** and the branch rule that requires their
   review. Set by the repository administrator, with the owner naming the code owners. Until
   then no policy file lands.
@@ -695,9 +705,10 @@ while they are open: each says what holds until it is answered.
   acceptable, since one per distinct limit may cost licences or seats. Decided by IT and each
   vendor's administrators. Until then no proxied entry is exposed, since none has a narrow
   credential or a recorded test, and no per-user grant exists.
-- **Asks of Otto's owners:** review the declarations for Otto's eighteen tools; agree that
-  each team's repositories move from the team manifest into the snapshot's limits; and check
-  Otto's proposal tools against the interim automation refusals. Decided by Otto's owners,
-  before milestone 4. Until then this gateway serves none of Otto's tools. Whether
-  `gateway_audit` gains columns for resources, the credential identity and the error kind is
-  not asked here: it is the question about Otto's audit table in Q12.
+- **Asks of Otto's owners:** review the declarations for Otto's eighteen tools; agree that each
+  team's repositories move from the team manifest into the snapshot's limits; and check Otto's
+  proposal tools against the interim automation refusals. Decided by Otto's owners, before
+  milestone 4. These go to them in the one list of Otto requests that decision 0012 describes,
+  raised by whoever the owner names. Until then this gateway serves none of Otto's tools.
+  Whether `gateway_audit` gains columns for resources, the credential identity and the error
+  kind is not asked here: it is the question about Otto's audit table in Q12.

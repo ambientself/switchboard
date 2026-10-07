@@ -225,7 +225,7 @@ three tools Otto has today. The comment write is classified `write`, not `propos
 comments on issues the gateway did not create, it can edit comments the gateway did not
 create, and a comment can act as a command. It is denied in every profile, and as a proxied
 tool that is not `read` it is refused at load. It gets no exception: Otto's built-in
-`jira_comment` has a narrow one for Otto's callers
+`jira_comment` has a narrow one, in the profile for Otto's sandboxes
 ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9), and
 this tool does not. A Jira comment proposal therefore stays built-in. If employees will use this
 server's entry, its test adds a restricted issue or page as a canary that must not be

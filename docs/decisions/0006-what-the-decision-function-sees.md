@@ -49,8 +49,14 @@ this principal, tool not permitted by the delegation, delegation missing or disa
 the principal, classification not permitted by the profile, resource outside the caller's
 limit. An unknown tool and a tool that exists on another surface are different kinds in the
 audit record and the same sentence to the caller, so the answer does not reveal which tool
-names exist. The sentence returned to the
-caller and the one written to the audit record are the same text.
+names exist. The sentence returned to the caller and the one written to the audit record are
+the same text.
+
+The 2026-10-07 amendments add four reason kinds: an unverified delegation, a control plane that
+is not current, unconfirmed currency, and a missing key. Once #12 builds decision 0011's
+exception, an allow under it also names the exception that allowed it. That is not a reason
+kind, and the audit record keeps it in a field of its own. Both are set out at the end of this
+record.
 
 ### The order of checks
 
@@ -75,14 +81,15 @@ the order they leave is at the end of this record.
 
 ### What a connector may still do
 
-A tool marked as checking its own scope may refuse when it runs, because of what the call
-names. That is recorded as the outcome `refused` on the same audit record, with its sentence.
-Since the 2026-10-04 amendment, a `propose` tool also refuses in the same way a call on
-something the gateway did not create, or one that would take effect on its own, or forces a
-value such as a draft. The gateway's argument check, the connector, the credential layer and
-the custodian may each refuse outside this function, and none may allow
-([decision 0011](0011-resource-authorization-and-tool-assurance.md)). A connector can never
-allow what the function denied.
+A tool marked as checking its own scope may refuse when it runs, because of what the call names.
+That is recorded as the outcome `refused` on the same audit record, with its sentence. Since
+the 2026-10-04 amendment, a `propose` tool also refuses in the same way a call on something the
+gateway did not create, or one that would take effect on its own, or forces a value such as a
+draft. The receipt check at begin
+([decision 0009](0009-audit-completion-receipts-and-recovery.md)), the gateway's argument check,
+the connector, the credential layer and the custodian may each refuse outside this function, and
+none may allow ([decision 0011](0011-resource-authorization-and-tool-assurance.md)). A connector
+can never allow what the function denied.
 
 ## Consequences
 
@@ -185,9 +192,10 @@ match Otto's.
 
 Otto's callers are therefore denied both comment tools, and the gateway does not reach parity
 with Otto's gateway for them (#12). No exception is made here. On 2026-10-07 the owner allowed
-them to Otto's callers by a narrow, recorded exception, set out in
+them under the profile for Otto's sandboxes by a narrow, recorded exception, set out in
 [decision 0011](0011-resource-authorization-and-tool-assurance.md), section 9. The core needs
-a mechanism for it, built under #12. Until then they stay denied.
+a mechanism for it, built under #12, and its register entry needs the security owner's
+signature. Until both are done they stay denied.
 
 ### Direct writes are denied in every profile
 
@@ -204,9 +212,10 @@ gives for its own hard denial: a per-profile opt-in makes the company's posture 
 every profile's weakest setting. Permitting direct writes takes a decision record that
 replaces this section, and a change to check 5. That decision must first settle how the
 gateway tells production from everything else. Decision 0011 does not replace this section. It
-records one narrow exception, for Otto's two comment tools in Otto's profile, checked within
-check 5: once #12 builds it, check 5 denies `write` and `destructive` unless the tool is named
-in the calling profile's list of excepted tools. A list checked after this rule could never
+records one narrow exception, for Otto's two comment tools in the profile for Otto's sandboxes
+only, checked within check 5: once #12 builds it, check 5 denies `write` and `destructive`
+unless the tool is named in the calling profile's list of excepted tools. The profile for
+Otto's control-plane surface has no such list. A list checked after this rule could never
 allow, since the checks stop at the first denial. The list names tools, never a
 classification, so it does not reopen the objection above. A setting that permits a
 classification permits every tool of that kind, including tools approved later. A name
@@ -222,9 +231,10 @@ allow from this function (the compile-fail tests `decision_without_decide`,
 `guard_without_begin` and `run_without_guard`). That an allow is never given for a `write` or
 `destructive` tool is a runtime check. The property that such a tool is never allowed or
 listed watches it, as do decision-table cases for each profile and the mutations
-`write-permitted-by-profile`, `destructive-permitted-by-profile` and `check-5-removed`. When
-#12 builds decision 0011's exception, the property becomes "never allowed or listed, except a
-tool named in its profile's exception list".
+`write-permitted-by-profile` and `destructive-permitted-by-profile`. When #12 builds decision
+0011's exception, the property becomes "never allowed or listed, except a tool named in its
+profile's exception list", and #12 adds two mutations: `check-5-removed`, which removes the
+check whole, and one that removes the exception-list check.
 
 ### A delegation's tool list is required
 
@@ -276,19 +286,20 @@ enforces it on any surface, so a surface of its own is not required.
   tools under a profile. Each must be `read` or `propose`. The receipt comment is posted or
   edited on a pull request the gateway created for Otto's proposal, so it is `propose` if its
   tool refuses any other pull request and the commands of the bots named when it is approved.
-  That holds after a person marks the pull request ready for review. If Otto's proposed Jira answer endpoint answers by
-  commenting on an issue the gateway did not create, that is `write`. An action that needs a
-  direct write takes the decision that replaces the section above.
-- Otto's two comment tools are denied to Otto's callers until the mechanism for the exception
-  in decision 0011 is built (#12; see Comments, above). The conformance suite requires both in
-  its tool inventory. It calls `github_pr_comment` as an allowed call in `TestOriginalToolsAndBrokeredCredentials` and
-  counts its write there, uses it in three of its scope and argument cases, and makes it the
-  only write in its tests of audit-finish failure and repeated writes. Against the Rust
-  gateway those cases are an expected difference until then (design section 18). Their
-  coverage is kept: the brokered-credentials test's `github_create_pr` case, with its
-  token-scope and draft checks, still runs against the Rust gateway, and the two audit tests
-  are also run with a `propose` tool. That test calls a comment a proposal write; that is
-  Otto's definition, not this record's.
+  That holds after a person marks the pull request ready for review. If Otto's proposed Jira
+  answer endpoint answers by commenting on an issue the gateway did not create, that is
+  `write`. An action that needs a direct write takes the decision that replaces the section
+  above.
+- Otto's two comment tools are denied to Otto's callers until the exception in decision 0011 is
+  in force: its mechanism built (#12) and its register entry signed (see Comments, above). The
+  conformance suite requires both in its tool inventory. It calls `github_pr_comment` as an
+  allowed call in `TestOriginalToolsAndBrokeredCredentials` and counts its write there, uses it
+  in three of its scope and argument cases, and makes it the only write in its tests of
+  audit-finish failure and repeated writes. Against the Rust gateway those cases are an expected
+  difference until then (design section 18). Their coverage is kept: the brokered-credentials
+  test's `github_create_pr` case, with its token-scope and draft checks, still runs against the
+  Rust gateway, and the two audit tests are also run with a `propose` tool. That test calls a
+  comment a proposal write; that is Otto's definition, not this record's.
 - The suite also compares classifications, and pins `write` for the three tools that are
   `propose` here. Those checks pass through the adapter's mapping of `propose` to `write`, the
   first item in this list. They are not expected differences.
@@ -306,13 +317,19 @@ changed the sections above in place. In summary:
 
 - **More may refuse outside this function, and still none may allow.** The gateway's argument
   check, the connector, the credential layer and the custodian may each refuse after the
-  decision (What a connector may still do). The credential layer's refusal, such as an
-  employee with no grant, is recorded as `refused`, like a connector's.
+  decision (What a connector may still do), as may decision 0009's receipt check. The
+  credential layer's refusal, such as an employee with no grant, is recorded as `refused`,
+  like a connector's.
 - **Check 5 gains an exception step,** once #12 builds it. Check 5 denies `write` and
   `destructive` unless the tool is named in the calling profile's list of excepted tools. The
-  first entries are Otto's `github_pr_comment` and `jira_comment`, in Otto's profile only. An
-  allow under the exception gives the exception as its reason. Until #12 builds it, both tools
-  stay denied. See the sections on comments and on direct writes, above.
+  first entries are Otto's `github_pr_comment` and `jira_comment`, in the profile for Otto's
+  sandboxes only. The profile for Otto's control-plane surface has no exception, and the
+  snapshot loader refuses a list of excepted tools on any profile that does not require
+  currency (decision 0012), so an excepted tool is always fenced. An allow under the exception
+  names the exception that allowed it. That is not a reason kind: the audit record keeps it in
+  a field of its own, since a reason belongs to a denial. Until #12 builds the step and the
+  security owner signs the exception's register entry, both tools stay denied. See the sections
+  on comments and on direct writes, above.
 - **Resources.** `checks_own_scope` is available only to built-in connectors, and a `declared`
   tool's adapter may name its connector entry's whole recorded reach (Consequences). Broad
   reads use a breadth resource in a limit, with no field of their own (Broad reads).
@@ -325,13 +342,16 @@ changed the sections above in place. In summary:
 changes four things here.
 
 - **A delegation can be present and unverified.** The delegation's verifier runs before this
-  function, but does not deny. It passes on a delegation that could not be verified, carrying
-  nothing from it but the kind of failure. Check 3 denies it with a single reason kind of its
-  own, so one place decides, and the caller reads one fixed sentence whatever was wrong with
-  it. The row records the failure kind, which is also logged and counted. Failure kinds are
-  not reason kinds. The audit row holds the proved columns and nothing from the delegation's
-  claims. Where a turn grant's signature verified and only a binding failed (audience,
-  lifetime or pod), the row also records the grant's digest (decision 0012).
+  function, on any delegation the request carries, whether or not the profile requires one,
+  and does not deny. It passes on a delegation that could not be verified, carrying the kind
+  of failure and, for a turn grant whose signature verified, the grant's digest, and nothing
+  from its claims. Check 3 denies it with a single reason kind of its own, so one place
+  decides, and the caller reads one fixed sentence whatever was wrong with it. The row records
+  the failure kind, which is also logged and counted. Failure kinds are not reason kinds. The
+  audit row holds the proved columns and nothing from the delegation's claims. Where a turn
+  grant's signature verified and only a binding failed (audience, lifetime or pod), the row
+  also records the grant's digest (decision 0012). The call context today holds only a
+  verified delegation, so it gains this third state (#22).
 - **The context says whether the request carries a key.** A tool not classified `read` whose
   call carries no key is denied with a reason kind of its own, and a sentence asking for one.
   That is knowable before anything runs, so it belongs in this function. It is a new last
@@ -340,7 +360,10 @@ changes four things here.
   check 6 and the currency check, because a list request carries no key: a `propose` tool
   appears in the list and is denied on `tools/call` without a key. The decision table gains
   that case, and a mutation that applies the check to `tools/list`, and one that moves it
-  before a permission check, must be caught.
+  before a permission check, must be caught. Two existing properties are restated with it
+  (#10): `tools_list_is_decide_run_once_per_tool` becomes "the list is what `decide` allows,
+  except check 6, the currency check and the key check", and `an_opened_world_is_allowed`
+  gives its call a key and a current turn. As written, both fail once the key check exists.
 - **The receipt check is a second decision outside this function.** It is made at begin, when
   a key already has a receipt in its scope. Like a connector's refusal, it cannot make
   anything run. It decides about delivery, not permission.
@@ -392,17 +415,17 @@ this record allows only for refusals that can never allow: a connector's, and th
 
 ### What runs before the function
 
-The turn-grant verifier's own checks run before the function: version, key, encoding,
-signature, audience, lifetime and, once required, pod. The verifier does not deny. A grant
-that fails any of them reaches the function as a delegation that is present and unverified,
-carrying only which check failed, and check 3 denies it under the single reason kind the
-amendment for decision 0009, above, gives an unverified delegation. The caller reads the fixed
-sentence for a bad grant. Which check failed is recorded on the row, logged and counted, and is
-not a reason kind. The row holds the proved columns and nothing from the grant's claims. When
-the signature verified and a binding failed (audience, lifetime or pod), the row also records
-the grant's digest. That is the one exception to 0009's rule that such a row holds nothing
-from the grant: a digest is not a claim. Check 3 still names a team mismatch. Such a grant
-verified, and the mismatch is usually a rollout fault.
+The turn-grant verifier's own checks run before the function: version, key, encoding, signature,
+audience, lifetime and, once required, pod. The verifier does not deny. A grant that fails any
+of them reaches the function as a delegation that is present and unverified, carrying which
+check failed and, if its signature verified, its digest, and check 3 denies it under the single
+reason kind the amendment for decision 0009, above, gives an unverified delegation. The caller
+reads the fixed sentence for a bad grant. Which check failed is recorded on the row, logged and
+counted, and is not a reason kind. The row holds the proved columns and nothing from the grant's
+claims. When the signature verified and a binding failed (audience, lifetime or pod), the row
+also records the grant's digest. That is the one exception to 0009's rule that such a row holds
+nothing from the grant: a digest is not a claim. Check 3 still names a team mismatch. Such a
+grant verified, and the mismatch is usually a rollout fault.
 
 ### Consequences
 
@@ -416,6 +439,8 @@ verified, and the mismatch is usually a rollout fault.
   `read` is never allowed unless its currency is current.
 - New mutations: the currency check skipped, "not asked" treated as current, "unconfirmed"
   treated as current, the check applied to `read`, and the check applied to `propose` alone.
+- The two properties restated for the key check are restated for currency too: the list skips
+  the currency check, and an opened world's call is current.
 - The core changes these need (the currency type in the call context, the profile setting,
   the check, the reason kinds and the recorded fields) are follow-on code for milestone 4.
   They are not built yet.
@@ -433,7 +458,8 @@ In this order, the first check that fails giving the reason:
 - **Check 4.** The delegation, if present, lists the tool.
 - **Check 5.** The profile permits the classification. `write` and `destructive` are denied
   before the profile is read, unless the tool is named in the profile's list of excepted
-  tools, once #12 builds that list (decision 0011).
+  tools, once #12 builds that list (decision 0011). Only the profile for Otto's sandboxes has
+  such a list.
 - **The currency check.** Under a profile that requires it, a tool not classified `read` needs
   a current control plane (decision 0012).
 - **Check 6.** Each named resource is within the caller's limit.
