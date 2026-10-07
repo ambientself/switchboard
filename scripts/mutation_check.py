@@ -705,6 +705,9 @@ mutate("identity-subject-looked-up-before-signature", "an unknown subject is ref
 mutate("identity-exp-not-checked", "exp is read but not checked", V,
        "        let expires_at = check_not_expired(&claims, now, entry.leeway)?;\n",
        '        let expires_at = date(&claims, "exp", Claim::ExpiresAt)?;\n')
+mutate("identity-exp-optional", "a token with no exp never expires", V,
+       '    let expires_at = date(claims, "exp", Claim::ExpiresAt)?;\n',
+       '    let expires_at = if claims.contains_key("exp") { date(claims, "exp", Claim::ExpiresAt)? } else { u64::MAX };\n')
 mutate("identity-exp-boundary", "a token is valid at exactly exp plus leeway", V,
        "    if now >= expires_at.saturating_add(leeway) {", "    if now > expires_at.saturating_add(leeway) {")
 mutate("identity-exp-ignores-leeway", "exp is checked with no leeway", V,
