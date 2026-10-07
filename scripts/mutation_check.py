@@ -623,6 +623,10 @@ mutate_all(
     (TESTKIT_SRC + "credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
     (TESTKIT_SRC + "credentials.rs", "        let principal = caller.get();\n", "        let principal = caller;\n"),
     (TESTKIT_SRC + "connector.rs", "self.credentials.credential_for(&connector, &caller).await", "self.credentials.credential_for(&connector, caller.get()).await"),
+    # The tests that call the source directly are changed to match, so that what is left to
+    # fail is the compile-fail case for a claimed principal, which is the guard under test.
+    (TESTKIT + "tests/fakes.rs", "        block_on(source.credential_for(&connector, caller))", "        block_on(source.credential_for(&connector, caller.get()))"),
+    (TESTKIT + "tests/fakes.rs", "    let ask = || block_on(source.credential_for(&connector, &caller));", "    let ask = || block_on(source.credential_for(&connector, caller.get()));"),
 )
 
 # --- The identity verifier: the order and each check ---------------------------------------
