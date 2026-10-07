@@ -1,0 +1,111 @@
+# The demo registry (planDemo 14b): one mock server, two read tools, one surface, two teams.
+#
+# Written for the kind run. The issuer is the cluster's own ServiceAccount issuer and the
+# address is the mock server's in-cluster Service. For Compose, change `issuer` under
+# [[profile_rules]] to the dev issuer's and `address` under [[servers]] to the Compose
+# service; nothing else differs.
+#
+# Every value here is a dummy. The credential reference is a label the gateway's credential
+# source resolves to a secret it holds; the secret is never in this file.
+
+# Recorded with every decision made from this file. Change it with every edit.
+revision = "demo-1"
+
+# --- Servers -------------------------------------------------------------------------------
+# A proxied MCP server, registered by its owner. `system` is the first part of every exposed
+# name of its tools: docs__list_documents, docs__read_document.
+
+[[servers]]
+name = "mock-docs"
+system = "docs"
+owner = "platform"
+identity = "mock-docs"
+address = "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"
+credential = { mode = "bearer", reference = "docs-credential" }
+
+# --- Tools ---------------------------------------------------------------------------------
+# Each tool is approved by a person, who assigns its classification and records the SHA-256
+# of its definition (upstream name, title, description, input schema; see
+# `gateway_registry::definition_sha256`). The loader refuses a definition that no longer
+# hashes to what was approved.
+#
+# `resources` is either "no_resources" or { from_arguments = [...] }: each entry names a string
+# argument whose value is the identifier of a resource of that system and kind. There is no
+# default: a tool must say which.
+
+[[tools]]
+name = "docs__list_documents"
+server = "mock-docs"
+upstream_name = "list_documents"
+classification = "read"
+title = "List documents"
+description = "Lists the documents in one project."
+approved_by = "demo-approver@example.test"
+approved_at = 2026-10-06T00:00:00Z
+definition_sha256 = "453ea692bdf92bc95d262085a1f6b3a54c25ac3d132e844029a49ff5ffaf536d"
+resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+
+[tools.input_schema]
+type = "object"
+required = ["project"]
+additionalProperties = false
+
+[tools.input_schema.properties.project]
+type = "string"
+description = "The project, such as `atlas`."
+
+[[tools]]
+name = "docs__read_document"
+server = "mock-docs"
+upstream_name = "read_document"
+classification = "read"
+title = "Read a document"
+description = "Reads one document from one project."
+approved_by = "demo-approver@example.test"
+approved_at = 2026-10-06T00:00:00Z
+definition_sha256 = "933716f7c43f229c6a246bfa2114812f8c24855b9d38afe28e9c90a04b743cb9"
+resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+
+[tools.input_schema]
+type = "object"
+required = ["project", "document"]
+additionalProperties = false
+
+[tools.input_schema.properties.project]
+type = "string"
+description = "The project, such as `atlas`."
+
+[tools.input_schema.properties.document]
+type = "string"
+description = "The document's name within the project."
+
+# --- Surfaces ------------------------------------------------------------------------------
+# Served at /mcp/{name}. Who may use it is an allowlist of teams and groups.
+
+[[surfaces]]
+name = "docs"
+tools = ["docs__list_documents", "docs__read_document"]
+teams = ["team-a", "team-b"]
+principals = "any_in_teams_and_groups"
+
+# --- Profiles and how they are selected ----------------------------------------------------
+# A rule matches the issuer exactly, and either every workload it vouches for
+# (principal = "workload") or every user in a group (principal = { user_in_group = "..." }).
+# When rules covering one principal disagree, no profile is selected and the call is refused.
+
+[[profiles]]
+name = "workload-read"
+classifications = ["read"]
+requires_delegation = false
+
+[[profile_rules]]
+issuer = "https://kubernetes.default.svc.cluster.local"
+principal = "workload"
+profile = "workload-read"
+
+# --- Resource limits -----------------------------------------------------------------------
+# Exact matches on system, kind and identifier. Each team reads its own project only.
+
+[limits.teams]
+team-a = [{ system = "docs", kind = "project", identifier = "atlas" }]
+team-b = [{ system = "docs", kind = "project", identifier = "borealis" }]

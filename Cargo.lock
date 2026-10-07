@@ -574,6 +574,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-registry"
+version = "0.1.0"
+dependencies = [
+ "gateway-core",
+ "gateway-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "gateway-testkit"
 version = "0.1.0"
 dependencies = [
