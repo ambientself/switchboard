@@ -162,6 +162,18 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
 - **Audit operations:** assign storage/migration ownership, retention, access controls and
   redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
   payloads. Define availability and latency targets and measure audit overhead against them.
+  A row's recorded resources alone can reach 147,648 escaped characters, which serialize to
+  298,059 bytes as JSON ([design.md](design.md), section 11). Set size limits in the units the
+  store counts.
+- **Otto's audit table:** Otto's `gateway_audit` table has no column for the resources an
+  allowed call names. A denial's or refusal's sentence names the one resource that caused it,
+  as prose capped at 1,024 characters. `github_skill_body` records its skill ref, repository
+  and commit, but only on an allowed call, on the best-effort finish write. Decide whether the
+  table gains a general column, and who adds it.
+  [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md) makes the table's contract a
+  compatibility requirement, so adding a column changes it. Otto's rule for this table, stated
+  in its migration 0036, is typed columns and not one JSONB bag, so a new column must be
+  typed. Otto's writer bounds each text column in bytes.
 - **Blocks:** rollout sequencing and production readiness.
 
 ## Q13. Which employee clients and access infrastructure are the acceptance targets?

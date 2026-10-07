@@ -716,6 +716,20 @@ the access list fails.
 Okta is the identity provider for employees' agents (milestone 5, issue 15). It is not a tool
 target and is not researched here.
 
+## Identifier lengths
+
+Read on 2026-10-07, for the cap on an identifier in an audit row ([design.md](design.md),
+section 11). Only these were checked. Jira, New Relic, Slack, Akamai and Salesforce were
+not. A self-built server chooses its own identifiers, so they have no documented bound.
+
+| System | Identifier | Longest | Source |
+| --- | --- | --- | --- |
+| AWS | ARN | 2,048 characters | [IAM API reference, `Role`](https://docs.aws.amazon.com/IAM/latest/APIReference/API_Role.html): "Maximum length of 2048". |
+| Sumo Logic | Source category | 1,024 characters | [Metadata naming conventions](https://www.sumologic.com/help/docs/send-data/reference-information/metadata-naming-conventions/). |
+| MongoDB | Namespace (`<database>.<collection>`) | 255 bytes, 235 for a sharded collection | [MongoDB limits and thresholds](https://www.mongodb.com/docs/manual/reference/limits/). |
+| Confluence | Space key | 255 characters | [Space keys](https://confluence.atlassian.com/doc/space-keys-829076188.html), for Data Center. No figure for Cloud was found. |
+| GitHub | `owner/repository` | 140 characters (39, a slash and 100) | Not verified. No GitHub page found states either limit. |
+
 ## What this changes
 
 - **Could be among the first proxied servers.** Two have a vendor-documented service identity,
