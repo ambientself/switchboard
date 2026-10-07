@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gateway::{AUDIT_DISABLED_NOTE, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE};
 use gateway_core::IDENTITY_FAILURE;
@@ -70,8 +70,42 @@ fn config_file(name: &str, config: &Value) -> PathBuf {
     path
 }
 
+/// Runs the binary to its exit. One that is still running after [`PATIENCE`] is killed and
+/// fails the test, so a configuration that should be refused but starts a server fails at once
+/// rather than hanging the test.
 fn run(arguments: &[&str]) -> Output {
-    Command::new(BINARY).args(arguments).output().unwrap()
+    let mut child = Command::new(BINARY)
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("switchboard {arguments:?} was still running after {PATIENCE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 fn stderr(output: &Output) -> String {
