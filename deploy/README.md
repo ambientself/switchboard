@@ -29,14 +29,14 @@ Every password and credential under `deploy/` is a dummy value for the demo.
 
 | Path | What it is |
 | --- | --- |
-| `Dockerfile` | One image for every role: the workspace's binaries, `workload.sh`, `migrate.sh`, `roles.sql` and the audit migrations. `BINS` lists the binaries; `REQUIRE_ALL_BINS=true` refuses to build without all of them. |
+| `Dockerfile` | One image for every role: the workspace's binaries, `workload.sh`, `migrate.sh` and `roles.sql`. The audit migrations are inside `switchboard`. `BINS` lists the binaries; `REQUIRE_ALL_BINS=true` refuses to build without all of them. |
 | `compose/compose.yaml` | `postgres` (not published), `migrate`, `dev-issuer`, `mock-docs`, `gateway` on `127.0.0.1:18080`, and `workload` under `profiles: [demo]`. |
-| `compose/config/` | The gateway's config, the registry directory it polls, and the registry with `docs__read_document` withdrawn. |
+| `compose/config/` | The gateway's deployment file, the team manifest, the registry directory it polls, and the registry with `docs__read_document` withdrawn. |
 | `kind/cluster.yaml` | One node, kindnet, the node image kind v0.32.0 uses. |
 | `kind/base/` | Namespaces `switchboard`, `mock-docs`, `team-a`, `team-b`; ServiceAccounts; Postgres; the migration Job; mock-docs; the gateway; suspended CronJobs holding each workload's Job template. No network policy. |
 | `kind/policy/` | The network policies: mock-docs admits only the gateway, Postgres only the gateway and the migration, the gateway only the two teams. |
 | `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn`. |
-| `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, applies each migration once as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
+| `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, runs `switchboard migrate` as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
 | `demo/demo.sh` | The driver. |
 
 `crates/demo-checks` tests the scripts and manifests: the workload against a fake gateway that
@@ -62,20 +62,21 @@ same pod must still reach the gateway and get an allowed read through it.
 pulled with several platforms (`ctr: content digest ... not found`). The driver saves this
 platform's images to an archive and loads that with `kind load image-archive` instead.
 
-## Interfaces the demo assumes
+## What runs
 
-The binaries are being written alongside this. Each assumption below is marked
-`TODO(integration)` where it is used; `grep -rn 'TODO(integration)' deploy` lists them.
+Every command and file below is the real one; `crates/demo-checks` and the gateway's own tests
+check that the deployment files load.
 
-| Piece | Assumed |
+| Piece | How it runs |
 | --- | --- |
-| Binaries | `switchboard` (#26), `switchboard-dev` (#26), `mock-docs-server` (#14a), built by `cargo build --release --workspace --bins`. |
-| Gateway | `switchboard --config=<file>`; listens on `0.0.0.0:8080`; serves `POST /mcp/docs`; config fields as in `compose/config/gateway.toml`; database URL from `SWITCHBOARD_DATABASE_URL`; registry directory polled every 2 s. |
-| Gateway logs | JSON lines. A boot line with `"identity":"enforce"` and one with `"audit":"postgres"`; one line containing `identity_failed` per identity failure. |
-| Registry | TOML as in `compose/config/registry/registry.toml`: servers, tools with definitions and a resource adapter, surfaces, profiles, limits, profile-selection rules, revision `demo-1` (`demo-2` once withdrawn). |
-| Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json`; `GET /token?subject=<s>&audience=<a>` answers with the bare token. Workload subjects are `workload:<team>:mock-workload`. |
-| mock-docs | `mock-docs-server --listen=0.0.0.0:8080 --accept-token-sha256-file=<file>`; `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer; one JSON log line per request with `bearer_sha256` (a hex prefix) and `status`. |
-| Audit schema | SQL files under `crates/*/migrations/`, applied in name order as `switchboard_owner`; table `switchboard_audit.call_rows` with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources` (jsonb), `decision`, `reason`, `outcome`, `latency_ms`, `policy_revision`. |
+| Binaries | `switchboard` (crates/gateway), `switchboard-dev` (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server), built by `cargo build --release --workspace --bins`. `switchboard` links nothing from the testkit. |
+| Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with its keys file and team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server. Missing, partial or unknown fields refuse to start. |
+| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. |
+| Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-1`; `compose/config/registry-withdrawn.toml` is revision `demo-2` without `docs__read_document`. A new version that changes a server or a tool's route is refused until a restart. |
+| Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
+| Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
+| mock-docs | `mock-docs-server`, configured by environment: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`. |
+| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources` (jsonb), `decision`, `reason`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
 ## Not done here

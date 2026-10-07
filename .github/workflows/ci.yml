@@ -35,3 +35,51 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # The tests that need Postgres skip themselves without SWITCHBOARD_TEST_DATABASE_URL, which
+  # the job above does not set. This job sets it. Approved by the owner from the draft in
+  # docs/ci-postgres-job.md.
+  postgres:
+    name: Audit store against Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # A dummy password for this throwaway service container only. Not a credential.
+          POSTGRES_PASSWORD: dummy-ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      SWITCHBOARD_TEST_DATABASE_URL: postgres://postgres:dummy-ci-password@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      # A test with no server says "skipped" and passes. Here that would mean the job checked
+      # nothing, so the job fails if any test says it.
+      - name: Test the audit store against Postgres
+        run: |
+          set -o pipefail
+          cargo test -p audit-postgres --locked -- --nocapture 2>&1 | tee test-output.txt
+          if grep -q 'skipped: SWITCHBOARD_TEST_DATABASE_URL is not set' test-output.txt; then
+            echo "a Postgres test was skipped, so SWITCHBOARD_TEST_DATABASE_URL did not reach it"
+            exit 1
+          fi
+      # The gateway built from files, writing its rows as its own role.
+      - name: Test the gateway's audit wiring against Postgres
+        run: |
+          set -o pipefail
+          cargo test -p gateway --test postgres --locked -- --nocapture 2>&1 | tee gateway-output.txt
+          if grep -q 'skipped: SWITCHBOARD_TEST_DATABASE_URL is not set' gateway-output.txt; then
+            echo "the gateway's Postgres test was skipped, so SWITCHBOARD_TEST_DATABASE_URL did not reach it"
+            exit 1
+          fi

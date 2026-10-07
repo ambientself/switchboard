@@ -1,6 +1,5 @@
 # The mock docs server (#14a). It accepts only the gateway's credential, of which it holds
 # only the sha256, and logs the sha256 prefix of every bearer it receives.
-# TODO(integration): flags assumed for crates/mock-docs-server.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,10 +28,10 @@ spec:
         - name: mock-docs
           image: switchboard-demo:dev
           imagePullPolicy: Never
-          command:
-            - mock-docs-server
-            - --listen=0.0.0.0:8080
-            - --accept-token-sha256-file=/var/run/secrets/mock-docs/docs-credential.sha256
+          command: ["mock-docs-server"]
+          env:
+            - {name: MOCK_DOCS_LISTEN, value: "0.0.0.0:8080"}
+            - {name: MOCK_DOCS_TOKEN_SHA256_FILE, value: /var/run/secrets/mock-docs/docs-credential.sha256}
           ports:
             - containerPort: 8080
               name: http

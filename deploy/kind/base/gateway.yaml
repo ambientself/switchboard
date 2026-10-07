@@ -1,7 +1,7 @@
 # The gateway. It verifies projected ServiceAccount tokens against the cluster's own issuer
 # keys (ConfigMap cluster-issuer-keys, which demo.sh creates), writes audit rows to Postgres as
 # switchboard_gateway, and forwards allowed calls to mock-docs with its own dummy credential.
-# TODO(integration): the command line is assumed for the `switchboard` binary (#26).
+# Its deployment file (ConfigMap gateway-config) names everything else it reads.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

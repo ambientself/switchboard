@@ -1,7 +1,11 @@
-# Draft: a CI job for the audit store against Postgres
+# A CI job for the audit store against Postgres
 
-Status: a draft for the owner to approve. Nothing here is applied. `.github/workflows/ci.yml` is
-unchanged.
+Status: approved by the owner on 2026-10-07 and applied: the `postgres` job in
+`.github/workflows/ci.yml`. It runs the job below, plus one more step for the gateway's own
+database-backed test (`cargo test -p gateway --test postgres`), which builds the gateway from
+files, connects as `switchboard_gateway`, and checks the rows a call leaves. The same check that
+nothing was skipped applies to it. Making the job a required check on `main` is still the
+owner's step.
 
 ## Why
 

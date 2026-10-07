@@ -27,9 +27,10 @@
 #   DIRECT_URL       the server's own address, bypassing the gateway
 #   DIRECT_TIMEOUT   seconds to wait on DIRECT_URL, default 3
 #
-# TODO(integration): the tool names, their arguments, the `plan` document and the projects
-# follow planDemo.md (#14a mock-docs-server, #14b registry). The sentences are the core's
-# (crates/gateway-core/src/sentences.rs); crates/demo-checks tests that they still match.
+# The tool names and their arguments are the demo registry's (deploy/*/config/registry); the
+# `plan` document and the projects `atlas` and `borealis` are the mock server's
+# (crates/mock-docs-server). The sentences are the core's (crates/gateway-core/src/sentences.rs);
+# crates/demo-checks tests that they still match.
 set -u
 
 MODE=${1:-full}

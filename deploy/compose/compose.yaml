@@ -3,11 +3,12 @@
 # `demo` profile. Compose proves the mechanics and makes no claim about network routes
 # (draft 0010): every service here shares one network.
 #
-# Only the gateway is published, on 127.0.0.1:18080. Postgres is not published at all.
+# Only the gateway is published, on 127.0.0.1:18080. Postgres is not published at all, and
+# neither is the dev issuer, which signs for anyone who can reach it.
 # Every password and credential below is a dummy value for this demo.
 #
-# TODO(integration): each command line and flag below is assumed from the plans (plan26.md,
-# planDemo.md); change them to what the binaries accept.
+# The commands are the image's binaries: `switchboard` (crates/gateway), `switchboard-dev issuer`
+# (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server).
 
 name: switchboard-demo
 
@@ -49,20 +50,24 @@ services:
 
   dev-issuer:
     <<: *demo-image
-    # Development only. It writes its key set to the shared volume and answers
-    # GET /token?subject=...&audience=... on the Compose network; it is not published.
-    # TODO(integration): planDemo.md asks for a small binary wrapping LocalIssuer; this assumes
-    # it is a `switchboard-dev issuer` subcommand.
+    # Development only. It makes a key pair at start, writes the public half to the shared
+    # volume, and answers GET /token?subject=...&audience=... on the Compose network for the
+    # subjects below; it is not published. The two strangers are signed so the demo can show
+    # the gateway refusing a real token whose subject is not in the team manifest.
     command:
       - switchboard-dev
       - issuer
       - --listen=0.0.0.0:8090
       - --issuer=https://dev-issuer.switchboard.test
       - --keys-out=/shared/issuer/jwks.json
+      - --subject=workload:team-a:mock-workload
+      - --subject=workload:team-b:mock-workload
+      - --subject=workload:team-a:stranger
+      - --subject=workload:team-b:stranger
     volumes:
       - issuer-keys:/shared/issuer
     healthcheck:
-      test: ["CMD-SHELL", "test -s /shared/issuer/jwks.json && curl -so /dev/null http://127.0.0.1:8090/"]
+      test: ["CMD-SHELL", "test -s /shared/issuer/jwks.json && curl -fso /dev/null http://127.0.0.1:8090/healthz"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -71,11 +76,10 @@ services:
     <<: *demo-image
     # Accepts only the gateway's credential: it is given the credential's sha256, never the
     # credential. It logs the sha256 prefix of every bearer it receives.
-    # TODO(integration): flags assumed for crates/mock-docs-server (#14a).
-    command:
-      - mock-docs-server
-      - --listen=0.0.0.0:8080
-      - --accept-token-sha256-file=/run/secrets/docs-credential-sha256
+    command: ["mock-docs-server"]
+    environment:
+      MOCK_DOCS_LISTEN: 0.0.0.0:8080
+      MOCK_DOCS_TOKEN_SHA256_FILE: /run/secrets/docs-credential-sha256
     secrets:
       - docs-credential-sha256
     healthcheck:
@@ -91,7 +95,8 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         REQUIRE_ALL_BINS: "true"
-    # TODO(integration): the flag is assumed for the `switchboard` binary (#26).
+    # The deployment file names everything else: the registry, the dev issuer's keys, the team
+    # manifest, the audit database's URL variable and the credential file.
     command: ["switchboard", "--config=/etc/switchboard/gateway.toml"]
     ports:
       - "127.0.0.1:18080:8080"
@@ -100,6 +105,7 @@ services:
       RUST_LOG: info
     volumes:
       - ./config/gateway.toml:/etc/switchboard/gateway.toml:ro
+      - ./config/teams.toml:/etc/switchboard/teams.toml:ro
       # demo.sh mounts a copy under .demo/, so withdrawing a tool never edits the repository.
       - ${SWITCHBOARD_REGISTRY_DIR:-./config/registry}:/etc/switchboard/registry:ro
       - issuer-keys:/shared/issuer:ro

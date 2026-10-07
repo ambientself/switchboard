@@ -1,0 +1,221 @@
+//! The gateway built from files with its audit rows in Postgres, as the demo runs it: the store
+//! passes its boot checks as the gateway's role, an allowed call, a denial and a refusal each
+//! leave their row, and a connection as a superuser refuses to start.
+//!
+//! Runs only when `SWITCHBOARD_TEST_DATABASE_URL` names a superuser on a throwaway server, as
+//! the audit store's own database tests do; otherwise it says it was skipped and passes. It
+//! makes a database of its own and drops it afterwards, creates the two audit roles if they
+//! are missing, and gives them a dummy password.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod files;
+
+use std::sync::Arc;
+
+use audit_postgres::{GATEWAY_ROLE, OWNER_ROLE, ROLES, migrate};
+use files::{
+    AUDIENCE, Files, LIST_TOOL, READ_TOOL, TEAM_A_SA, call, cluster_issuer, kubernetes_token,
+};
+use gateway::path::RequestPath;
+use gateway::start::prepare;
+use gateway_identity::SystemClock;
+use mock_docs_server::{AcceptedCredential, Config};
+use serde_json::json;
+use tokio_postgres::{Client, NoTls};
+
+const URL_VARIABLE: &str = "SWITCHBOARD_TEST_DATABASE_URL";
+
+/// Given to both audit roles on the throwaway test server. A dummy value for tests only.
+const DUMMY_PASSWORD: &str = "dummy-password-for-tests-only";
+
+async fn connect(config: &tokio_postgres::Config) -> Client {
+    let (client, connection) = config.connect(NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+}
+
+fn url(config: &tokio_postgres::Config, user: &str, password: &str, database: &str) -> String {
+    let host = match &config.get_hosts()[0] {
+        tokio_postgres::config::Host::Tcp(host) => host.clone(),
+        #[cfg(unix)]
+        tokio_postgres::config::Host::Unix(path) => path.display().to_string(),
+    };
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    format!("postgres://{user}:{password}@{host}:{port}/{database}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gateway_writes_its_rows_to_postgres_as_its_own_role_and_no_other() {
+    let Ok(server_url) = std::env::var(URL_VARIABLE) else {
+        eprintln!("skipped: {URL_VARIABLE} is not set");
+        return;
+    };
+    let server: tokio_postgres::Config = server_url.parse().unwrap();
+    let database = format!("switchboard_gateway_test_{}", std::process::id());
+    let admin = connect(&server).await;
+    // Two statements, not one batch: a batch runs as one transaction, which DROP DATABASE and
+    // CREATE DATABASE refuse.
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+        .await
+        .unwrap();
+    admin
+        .batch_execute(&format!("CREATE DATABASE {database}"))
+        .await
+        .unwrap();
+    let mut in_database = server.clone();
+    in_database.dbname(&database);
+    let setup = connect(&in_database).await;
+    setup.batch_execute(ROLES).await.unwrap();
+    for role in [OWNER_ROLE, GATEWAY_ROLE] {
+        setup
+            .batch_execute(&format!("ALTER ROLE {role} PASSWORD '{DUMMY_PASSWORD}'"))
+            .await
+            .unwrap();
+    }
+    let mut owner = in_database.clone();
+    owner.user(OWNER_ROLE).password(DUMMY_PASSWORD);
+    migrate(&mut connect(&owner).await).await.unwrap();
+
+    let outcome = run(&server, &database, &setup).await;
+    drop(setup);
+    admin
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+        .await
+        .unwrap();
+    outcome.unwrap();
+}
+
+async fn run(
+    server: &tokio_postgres::Config,
+    database: &str,
+    setup: &Client,
+) -> Result<(), String> {
+    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+        .await
+        .unwrap();
+    let issuer = cluster_issuer();
+    let files = Files::new("postgres", &issuer.jwks_document(), &mock.url());
+    files.write(
+        "gateway.toml",
+        &files::deployment_file("[audit]\nmode = \"postgres\"\nurl_env = \"AUDIT_URL\"\n"),
+    );
+
+    // As a superuser the store's boot checks refuse, and the gateway does not start.
+    let superuser = server.get_user().unwrap().to_owned();
+    let superuser_password = String::from_utf8(server.get_password().unwrap().to_vec()).unwrap();
+    let as_superuser = url(server, &superuser, &superuser_password, database);
+    let deployment = files.load_with(&[("AUDIT_URL", &as_superuser)]).unwrap();
+    let refused = prepare(deployment, Arc::new(SystemClock))
+        .await
+        .err()
+        .ok_or("a superuser was accepted")?;
+    let said = refused.to_string();
+    if !said.contains("the audit store will not start") || !said.contains("has SUPERUSER") {
+        return Err(format!("refused for the wrong reason: {said}"));
+    }
+
+    // As the gateway's role it starts.
+    let as_gateway = url(server, GATEWAY_ROLE, DUMMY_PASSWORD, database);
+    let deployment = files.load_with(&[("AUDIT_URL", &as_gateway)]).unwrap();
+    let prepared = prepare(deployment, Arc::new(SystemClock))
+        .await
+        .map_err(|error| error.to_string())?;
+    assert!(prepared.store.is_some());
+    let path = RequestPath::new(prepared.gates);
+    let token = kubernetes_token(&issuer, TEAM_A_SA, &[AUDIENCE]);
+
+    let allowed = call(
+        &path,
+        &token,
+        READ_TOOL,
+        json!({"project": "atlas", "document": "plan"}),
+    )
+    .await;
+    assert_eq!(
+        allowed.body["result"]["isError"],
+        json!(false),
+        "{}",
+        allowed.body
+    );
+    let denied = call(
+        &path,
+        &token,
+        READ_TOOL,
+        json!({"project": "borealis", "document": "plan"}),
+    )
+    .await;
+    assert_eq!(
+        denied.body["error"]["code"],
+        json!(-32001),
+        "{}",
+        denied.body
+    );
+    let refused = call(
+        &path,
+        &token,
+        LIST_TOOL,
+        json!({"project": "atlas", "extra": 1}),
+    )
+    .await;
+    assert_eq!(
+        refused.body["error"]["code"],
+        json!(-32001),
+        "{}",
+        refused.body
+    );
+
+    // `resources` stays empty: the core's audit record carries no resources until PR #30, so
+    // the denial is told apart by its sentence, which names the project.
+    let rows = setup
+        .query(
+            "SELECT tool, decision, coalesce(reason, ''), coalesce(outcome, ''), proved_subject,
+                    proved_team, coalesce(sentence, ''), coalesce(outcome_sentence, ''),
+                    policy_revision
+               FROM switchboard_audit.call_rows ORDER BY begun_at",
+            &[],
+        )
+        .await
+        .unwrap();
+    let rows: Vec<[String; 9]> = rows
+        .iter()
+        .map(|row| std::array::from_fn(|column| row.get(column)))
+        .collect();
+    let no_resources = setup
+        .query_one(
+            "SELECT bool_and(resources IS NULL) FROM switchboard_audit.call_rows",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0);
+    assert!(no_resources, "rows now carry resources; check them here");
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    let expected = [
+        [READ_TOOL, "allow", "", "ok", "", ""],
+        [
+            READ_TOOL,
+            "deny",
+            "resource_outside_limit",
+            "",
+            "`borealis`",
+            "",
+        ],
+        [LIST_TOOL, "allow", "", "refused", "", "does not declare"],
+    ];
+    for (row, [tool, decision, reason, outcome, sentence, outcome_sentence]) in
+        rows.iter().zip(expected)
+    {
+        assert_eq!(
+            [&row[0], &row[1], &row[2], &row[3]].map(String::as_str),
+            [tool, decision, reason, outcome],
+            "{row:?}"
+        );
+        assert_eq!(row[4], TEAM_A_SA);
+        assert_eq!(row[5], "team-a");
+        assert!(row[6].contains(sentence), "{row:?}");
+        assert!(row[7].contains(outcome_sentence), "{row:?}");
+        assert_eq!(row[8], "demo-1");
+    }
+    Ok(())
+}

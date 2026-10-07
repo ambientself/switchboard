@@ -20,6 +20,7 @@ configMapGenerator:
     namespace: switchboard
     files:
       - gateway.toml=config/gateway.toml
+      - teams.toml=config/teams.toml
   # Not hashed: the gateway mounts this directory without subPath and polls it, so an edit to the
   # ConfigMap reaches the running gateway (kubelet takes roughly a minute) without a restart.
   - name: registry

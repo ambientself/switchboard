@@ -18,8 +18,14 @@
 #
 # Needs docker (with compose), kind, kubectl, jq and awk on the host.
 #
-# TODO(integration): the log lines it reads (boot, identity_failed, mock-docs' bearer_sha256
-# and status) and the audit columns it queries are assumed from the plans; see deploy/README.md.
+# What it reads, and where each comes from:
+#   - the gateway's JSON log lines (crates/gateway): one `"event":"boot"` line per gate, with
+#     `"identity":"enforce"` and `"audit":"postgres"`, and one `"event":"identity_failed"` line
+#     per caller refused for identity;
+#   - mock-docs' JSON log lines (crates/mock-docs-server): one per request, with
+#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, and `accepted`;
+#   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
+#     switchboard_reader.
 set -euo pipefail
 unset KUBECONFIG
 
@@ -132,29 +138,29 @@ mark_start() {
   echo "audit rows from this run start at epoch $SINCE"
 }
 
-# TODO(integration): the audit columns follow planDemo.md #10a.
+# The columns are crates/audit-postgres's (sql/migrations/0001_call_rows.sql). The rows carry
+# no resources yet: the core's audit record gains them with PR #30, and until then the
+# `resources` column is empty. A denial's sentence names the project it refused, so that is
+# what is checked; an allowed read's row does not say which project it read.
 audit_rows() {
   step "audit rows from this run"
   psql_reader -c "select to_char(begun_at, 'HH24:MI:SS') as at, proved_subject, proved_team as team,
-      tool, resources, decision, reason, outcome, latency_ms as ms, policy_revision as rev
+      tool, decision, reason, outcome, latency_ms as ms, policy_revision as rev
     from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE) order by begun_at"
-  local team own other
+  local team other
   for team in team-a team-b; do
-    if [ "$team" = team-a ]; then own=atlas other=borealis; else own=borealis other=atlas; fi
+    if [ "$team" = team-a ]; then other=borealis; else other=atlas; fi
     check_at_least "$(audit_count "proved_team = '$team' and tool = '$READ_TOOL' and decision = 'allow'
-        and outcome = 'ok' and resources::text like '%\"$own\"%'")" 1 \
-      "audit: $team's read of $own is an allow row with outcome ok"
+        and outcome = 'ok'")" 1 \
+      "audit: $team's read of its own project is an allow row with outcome ok"
     check_at_least "$(audit_count "proved_team = '$team' and tool = '$READ_TOOL' and decision = 'deny'
-        and reason = 'resource_outside_limit' and resources::text like '%\"$other\"%'")" 1 \
+        and reason = 'resource_outside_limit' and sentence like '%\`$other\`%'")" 1 \
       "audit: $team's read of $other is a deny row naming the resource limit"
-    check "$(audit_count "proved_team = '$team' and decision = 'allow' and resources::text like '%\"$other\"%'")" 0 \
-      "audit: no allow row for $team names $other"
   done
   check "$(audit_count "proved_subject like '%stranger%'")" 0 "audit: no row for the ServiceAccount outside the manifest"
 }
 
 # check_boot LOGS: the gateway says at boot that identity is enforced and audit is in Postgres.
-# TODO(integration): the boot lines' fields are assumed from planDemo.md section 3.
 check_boot() {
   printf '%s\n' "$1" | grep -E '"event":"boot"' | sed 's/^/    /' || echo "    (no boot lines)"
   check_at_least "$(count_lines '"identity":"enforce"' "$1")" 1 "the gateway enforces identity"
@@ -163,17 +169,18 @@ check_boot() {
 }
 
 # check_server_bearers LOGS SHA256 MIN SCOPE: what mock-docs received. Every request it accepted
-# (status 200) carried the gateway's credential, which is SHA256; with SCOPE=all, so did every
-# request carrying any bearer. MIN is the fewest accepted requests the run must have made.
-# TODO(integration): mock-docs' JSON log fields bearer_sha256 (a hex prefix) and status.
+# carried the gateway's credential, which is SHA256; with SCOPE=all, so did every request carrying
+# any bearer. MIN is the fewest accepted requests the run must have made. Requests with no bearer
+# (the health checks) are not counted.
 check_server_bearers() {
   local logs=$1 sha=$2 min=$3 scope=$4 lines
-  lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.bearer_sha256 != null) | "\(.status) \(.bearer_sha256)"')
-  echo "    requests seen by mock-docs, by status and bearer sha256 prefix (the gateway's is ${sha:0:12}...):"
+  lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.bearer_sha256 != null)
+    | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256)"')
+  echo "    requests seen by mock-docs, by answer and bearer sha256 prefix (the gateway's is ${sha:0:12}...):"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
   local good bad stray
-  good=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "200" && length($2) >= 8 && index(sha, $2) == 1 { n++ } END { print n + 0 }')
-  bad=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "200" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
+  good=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "accepted" && length($2) >= 8 && index(sha, $2) == 1 { n++ } END { print n + 0 }')
+  bad=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
   stray=$(printf '%s\n' "$lines" | awk -v sha="$sha" 'NF == 2 && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
   check_at_least "$good" "$min" "mock-docs accepted the gateway's credential"
   check "$bad" 0 "mock-docs accepted no other bearer"
@@ -200,7 +207,11 @@ compose_workload() { # LABEL MODE TEAM: runs the workload service once
   tally_workload "$label" "$status" "$output"
 }
 
-mock_docs_requests() { count_lines '"bearer_sha256"' "$(dc logs --no-log-prefix mock-docs)"; }
+# mock_docs_requests: how many requests mock-docs has accepted. Its health checks carry no bearer
+# and are not accepted, so they do not count.
+mock_docs_requests() {
+  dc logs --no-log-prefix mock-docs | jq -cR 'fromjson? | select(.accepted == true)' | awk 'END { print NR }'
+}
 
 swap_registry() { # FILE: replaces the mounted registry file in one rename
   cp "$1" "$DEMO_DIR/compose-registry/.registry.toml.new"
@@ -393,8 +404,8 @@ kind_run() {
   gateway_logs=$(k -n switchboard logs deploy/gateway)
   printf '%s\n' "$gateway_logs" | grep 'identity_failed' | sed 's/^/    /' || echo "    (none)"
   # Two teams refused three ways each (no token, not a token, the default API token), and the
-  # stranger once. TODO(integration): the event name is assumed.
-  check_at_least "$(count_lines 'identity_failed' "$gateway_logs")" 7 "the gateway logged every identity failure"
+  # stranger once.
+  check_at_least "$(count_lines '"event":"identity_failed"' "$gateway_logs")" 7 "the gateway logged every identity failure"
 
   audit_rows
   FINISHED=1

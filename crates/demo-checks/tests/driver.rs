@@ -273,14 +273,16 @@ fn a_run_that_stopped_early_fails_even_with_every_check_passing() {
 #[test]
 fn the_server_bearer_check_admits_only_the_gateways_credential() {
     let sha = "35078c7e636169b1ad9e5a04af03cb483f59535baaf71232f48d8a6181a93bd4";
-    let good = r#"{"status":200,"bearer_sha256":"35078c7e6361"}"#;
-    let refused = r#"{"status":401,"bearer_sha256":"aaaaaaaaaaaa"}"#;
-    let accepted_other = r#"{"status":200,"bearer_sha256":"bbbbbbbbbbbb"}"#;
+    // Lines as mock-docs writes them: one per request, with `accepted` and the bearer's prefix.
+    let good = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#;
+    let refused = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"aaaaaaaaaaaa","accepted":false}"#;
+    let health_check = r#"{"event":"request","http_method":"GET","path":"/mcp","bearer_sha256":null,"accepted":false}"#;
+    let accepted_other = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"bbbbbbbbbbbb","accepted":true}"#;
     let logs = |lines: &[&str]| lines.join("\n");
 
     let run = sourced(&format!(
         "check_server_bearers '{}' {sha} 2 accepted\nFINISHED=1\nresult 0",
-        logs(&[good, good, refused])
+        logs(&[good, health_check, good, refused])
     ));
     assert_eq!(run.status, Some(0), "{}", run.transcript());
 

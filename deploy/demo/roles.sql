@@ -6,8 +6,10 @@
 --   switchboard_gateway  the gateway's role; the migrations grant it what it needs, and no more
 --   switchboard_reader   reads audit rows for the demo's closing query
 --
--- TODO(integration): the role names follow planDemo.md (#10a). If the audit migrations create
--- these roles themselves, drop the CREATE ROLE statements here.
+-- The first two are the roles crates/audit-postgres names (OWNER_ROLE and GATEWAY_ROLE). Its own
+-- sql/roles.sql creates them too, with no password; this file also sets the dummy passwords,
+-- creates the reader and the database, and takes every privilege on the database from PUBLIC.
+-- The gateway checks its role at boot and refuses to start if it can do more than it needs.
 
 \set ON_ERROR_STOP on
 
@@ -16,9 +18,9 @@ SELECT format('CREATE ROLE %I LOGIN', name)
  WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = name)
 \gexec
 
-ALTER ROLE switchboard_owner NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'owner_password';
-ALTER ROLE switchboard_gateway NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'gateway_password';
-ALTER ROLE switchboard_reader NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'reader_password';
+ALTER ROLE switchboard_owner NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'owner_password';
+ALTER ROLE switchboard_gateway NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'gateway_password';
+ALTER ROLE switchboard_reader NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'reader_password';
 
 SELECT 'CREATE DATABASE switchboard OWNER switchboard_owner'
  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'switchboard')
