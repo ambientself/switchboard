@@ -80,3 +80,25 @@ workspace, and requires the test suite to fail. It needs Python 3.12 or later an
 the working tree, and prints one line per mutation. It takes a long while (a full test run per
 mutation), so CI does not run it; run it after changing a guard or the tests that watch one,
 and add a mutation for every guard you add.
+
+## Tests against Postgres
+
+The audit store's tests in `crates/audit-postgres` that need a database run only when
+`SWITCHBOARD_TEST_DATABASE_URL` is set; otherwise they pass without doing anything. Point it
+at a superuser on a throwaway server only. The tests create and drop a database each, create
+the two audit roles if they are missing, and give those roles a dummy password. Some also make
+roles of their own, named after their database, and drop them at the end, and some refuse
+connections to their own database for a moment.
+
+```sh
+docker run -d --rm --name sb-pg -p 127.0.0.1:25432:5432 -e POSTGRES_PASSWORD=dev postgres:17-alpine
+export SWITCHBOARD_TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:25432/postgres
+cargo test -p audit-postgres
+```
+
+Add `-- --nocapture` to see the latency test's p50 and p95 for begin and finish. They measure
+your machine, not production.
+
+Set it for the mutation check too. Without it, the `pg-` mutations other than `pg-columns-*`
+and the few caught by unit tests survive. CI does not set it yet; `docs/ci-postgres-job.md` is
+a draft of the job that would.
