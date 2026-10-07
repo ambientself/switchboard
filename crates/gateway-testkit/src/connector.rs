@@ -1,16 +1,17 @@
 //! A connector with three tools, that records what reaches it and can be told to fail or hang.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use gateway_core::{
-    BoxFuture, Connector, ConnectorName, CredentialSource, PrincipalId, Resource, Resources,
-    TeamId, ToolCall, ToolOutcome,
+    BoxFuture, Connector, ConnectorName, CredentialSource, GroupId, PrincipalId, PrincipalKind,
+    Resource, Resources, TeamId, ToolCall, ToolOutcome,
 };
 use serde_json::{Value, json};
 
 use crate::clock::SteppableClock;
+use crate::fixture::{GROUP_G, GROUP_G_DOCUMENT, TEAM_A, TEAM_A_DOCUMENT, TEAM_B, TEAM_B_DOCUMENT};
 use crate::gate::Gate;
 
 /// The connector's name in policy data and in audit rows.
@@ -19,7 +20,8 @@ pub const CONNECTOR: &str = "fixture";
 pub const READ_TOOL: &str = "fixture__read";
 /// A write tool: records that a write happened.
 pub const WRITE_TOOL: &str = "fixture__write";
-/// A read tool that checks its own scope, and refuses a forbidden document when it runs.
+/// A read tool that checks its own scope, and refuses a document outside the caller's scope
+/// when it runs.
 pub const SCOPED_READ_TOOL: &str = "fixture__scoped_read";
 /// The argument that names the document a call reaches.
 pub const DOCUMENT_ARGUMENT: &str = "document";
@@ -27,8 +29,12 @@ pub const DOCUMENT_ARGUMENT: &str = "document";
 pub const RESOURCE_SYSTEM: &str = "fixture";
 /// The kind of resource a document is.
 pub const RESOURCE_KIND: &str = "document";
-/// The document the scoped tool refuses unless told otherwise.
+/// A document in no caller's scope, which the scoped tool refuses unless told otherwise.
 pub const FORBIDDEN_DOCUMENT: &str = "restricted-notes";
+/// The sentence the scoped tool refuses with. It does not repeat the document, which is text
+/// the caller chose.
+pub const SCOPE_REFUSAL: &str =
+    "The fixture connector refused this call: the document it names is outside the caller's scope.";
 
 /// One call that reached the connector.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +81,8 @@ struct State {
     writes: Vec<WriteRecord>,
     failing: Failing,
     hang: Hang,
-    forbidden: BTreeSet<String>,
+    team_scopes: BTreeMap<TeamId, BTreeSet<String>>,
+    group_scopes: BTreeMap<GroupId, BTreeSet<String>>,
     work: Option<(SteppableClock, Duration)>,
 }
 
@@ -86,8 +93,12 @@ struct State {
 /// - It asks its [`CredentialSource`] for the caller's credential, as a real connector would,
 ///   and answers with an error if none is issued. The read tools echo the credential's label
 ///   back.
-/// - The scoped tool refuses, with a sentence, a document it was told is forbidden. That is
-///   the connector-side refusal the audit record calls `refused`.
+/// - The scoped tool serves a document only to a caller whose scope holds it, and refuses any
+///   other with [`SCOPE_REFUSAL`]. That is the connector-side refusal the audit record calls
+///   `refused`. A workload's scope is its team's documents; a user's is the documents of all
+///   of its groups. To begin with, each team and group G hold their own document from the
+///   fixture policy, and [`FORBIDDEN_DOCUMENT`] is in no one's scope. A call that names no
+///   document is served.
 /// - It can be told to fail, once or always, and to hang until a [`Gate`] opens. A hung call
 ///   has been received but has done nothing yet, so a held write has not happened.
 pub struct FixtureConnector {
@@ -105,7 +116,14 @@ impl FixtureConnector {
                 writes: Vec::new(),
                 failing: Failing::Never,
                 hang: Hang::Never,
-                forbidden: BTreeSet::from([FORBIDDEN_DOCUMENT.to_owned()]),
+                team_scopes: BTreeMap::from([
+                    (TEAM_A.into(), BTreeSet::from([TEAM_A_DOCUMENT.to_owned()])),
+                    (TEAM_B.into(), BTreeSet::from([TEAM_B_DOCUMENT.to_owned()])),
+                ]),
+                group_scopes: BTreeMap::from([(
+                    GROUP_G.into(),
+                    BTreeSet::from([GROUP_G_DOCUMENT.to_owned()]),
+                )]),
                 work: None,
             }),
         }
@@ -125,9 +143,22 @@ impl FixtureConnector {
         self.state().writes.clone()
     }
 
-    /// The scoped tool refuses `document` too.
-    pub fn forbid(&self, document: &str) {
-        self.state().forbidden.insert(document.to_owned());
+    /// The scoped tool serves `document` to `team`'s workloads too.
+    pub fn grant_to_team(&self, team: &str, document: &str) {
+        self.state()
+            .team_scopes
+            .entry(team.into())
+            .or_default()
+            .insert(document.to_owned());
+    }
+
+    /// The scoped tool serves `document` to users in `group` too.
+    pub fn grant_to_group(&self, group: &str, document: &str) {
+        self.state()
+            .group_scopes
+            .entry(group.into())
+            .or_default()
+            .insert(document.to_owned());
     }
 
     /// The next call returns an error, and later ones work.
@@ -202,7 +233,7 @@ impl Connector for FixtureConnector {
 
         // Recorded before anything else, and before the future is first polled: a call that
         // was handed to this connector is on the record whatever it then does.
-        let (hang, fail, forbidden, work) = {
+        let (hang, fail, scope, work) = {
             let mut state = self.state();
             state.received.push(ReceivedCall {
                 tool: tool.clone(),
@@ -227,7 +258,20 @@ impl Connector for FixtureConnector {
                 }
                 Failing::Always => true,
             };
-            (hang, fail, state.forbidden.clone(), state.work.clone())
+            // What the caller may reach through the scoped tool, read now so that a held call
+            // is checked against the scope it was received under.
+            let scope: BTreeSet<String> = match &caller.get().kind {
+                PrincipalKind::Workload { team } => {
+                    state.team_scopes.get(team).cloned().unwrap_or_default()
+                }
+                PrincipalKind::User { groups } => groups
+                    .iter()
+                    .filter_map(|group| state.group_scopes.get(group))
+                    .flatten()
+                    .cloned()
+                    .collect(),
+            };
+            (hang, fail, scope, state.work.clone())
         };
 
         Box::pin(async move {
@@ -262,12 +306,8 @@ impl Connector for FixtureConnector {
                 }
                 SCOPED_READ_TOOL => {
                     let named = arguments.get(DOCUMENT_ARGUMENT).and_then(Value::as_str);
-                    match named.filter(|name| forbidden.contains(*name)) {
-                        // Echoes the document only because it is one the connector itself
-                        // was told is forbidden, never text the caller chose.
-                        Some(name) => ToolOutcome::Refused(format!(
-                            "The fixture connector refused this call: the document `{name}` is outside the scope of the caller's team."
-                        )),
+                    match named.filter(|name| !scope.contains(*name)) {
+                        Some(_) => ToolOutcome::Refused(SCOPE_REFUSAL.to_owned()),
                         None => ToolOutcome::Ok(echo(&tool, &arguments, &credential)),
                     }
                 }

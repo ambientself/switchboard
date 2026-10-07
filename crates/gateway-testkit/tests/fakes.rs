@@ -17,9 +17,10 @@ use gateway_core::{
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
-    Caller, FIXTURE_NOW, FakeCredentialSource, FixedClock, Fixture, FixtureConnector, Gate,
-    InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SteppableClock, WRITE_TOOL,
-    block_on, poll_once,
+    Caller, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FakeCredentialSource, FixedClock, Fixture,
+    FixtureConnector, GROUP_G_DOCUMENT, Gate, InMemoryAuditStore, READ_TOOL, SCOPE_REFUSAL,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+    WRITE_TOOL, block_on, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -668,40 +669,92 @@ fn the_write_tool_records_that_a_write_happened_under_the_callers_team_credentia
     );
 }
 
-#[test]
-fn the_scoped_tool_refuses_a_forbidden_document_and_serves_any_other() {
-    let rig = rig();
-    let refused = rig.answer(
-        Caller::TeamA,
-        SCOPED_READ_TOOL,
-        documents("restricted-notes"),
-    );
-    let Answer::Refused(sentence) = refused else {
-        panic!("{refused:?}")
+/// Runs the scoped tool for `caller` on a surface open to it, to its answer. The scoped tool
+/// checks its own scope, so the decision allows any document and only the connector refuses.
+fn scoped(rig: &Rig, caller: Caller, document: &str) -> Answer {
+    let surface = if caller == Caller::UserInGroupG {
+        SURFACE_READ
+    } else {
+        SURFACE_ALL
     };
-    assert_eq!(
-        sentence,
-        "The fixture connector refused this call: the document `restricted-notes` is outside the scope of the caller's team."
-    );
-    assert!(matches!(
-        rig.answer(Caller::TeamA, SCOPED_READ_TOOL, documents("team-a-notes")),
-        Answer::Ok(_)
-    ));
-    // Other forbidden documents can be added, and are then refused.
-    assert!(matches!(
-        rig.answer(Caller::TeamA, SCOPED_READ_TOOL, documents("payroll")),
-        Answer::Ok(_)
-    ));
-    rig.connector.forbid("payroll");
-    assert!(matches!(
-        rig.answer(Caller::TeamA, SCOPED_READ_TOOL, documents("payroll")),
-        Answer::Refused(_)
-    ));
-    // A call that names no document is not a forbidden one.
+    let arguments = documents(document);
+    let call = CallContext {
+        caller: rig.fixture.caller_context(caller, surface).unwrap(),
+        tool: RequestedTool::new(SCOPED_READ_TOOL),
+        resources: FixtureConnector::resources_of(SCOPED_READ_TOOL, &arguments),
+    };
+    let decision = decide(&rig.fixture.policy, &call);
+    let Begun::Allowed(guard) = block_on(audit::begin(
+        &rig.store,
+        decision,
+        arguments,
+        RequestMetadata::default(),
+    ))
+    .unwrap() else {
+        panic!("the scoped tool was denied to {caller:?}")
+    };
+    let ran = block_on(audit::run(&rig.connector, guard));
+    block_on(audit::finish(&rig.store, ran, 0)).answer().clone()
+}
+
+#[test]
+fn the_scoped_tool_serves_each_caller_its_own_documents_and_refuses_the_rest() {
+    let rig = rig();
+    let refused = Answer::Refused(SCOPE_REFUSAL.to_owned());
+    for (caller, own, others) in [
+        (
+            Caller::TeamA,
+            TEAM_A_DOCUMENT,
+            [TEAM_B_DOCUMENT, GROUP_G_DOCUMENT],
+        ),
+        (
+            Caller::TeamB,
+            TEAM_B_DOCUMENT,
+            [TEAM_A_DOCUMENT, GROUP_G_DOCUMENT],
+        ),
+        (
+            Caller::UserInGroupG,
+            GROUP_G_DOCUMENT,
+            [TEAM_A_DOCUMENT, TEAM_B_DOCUMENT],
+        ),
+    ] {
+        assert!(
+            matches!(scoped(&rig, caller, own), Answer::Ok(_)),
+            "{caller:?} {own}"
+        );
+        for other in others.into_iter().chain([FORBIDDEN_DOCUMENT]) {
+            assert_eq!(scoped(&rig, caller, other), refused, "{caller:?} {other}");
+        }
+    }
+    // A call that names no document reaches nothing outside the caller's scope.
     assert!(matches!(
         rig.answer(Caller::TeamA, SCOPED_READ_TOOL, json!({})),
         Answer::Ok(_)
     ));
+}
+
+#[test]
+fn the_scoped_tool_serves_a_granted_document_to_the_team_or_group_it_was_granted_to_only() {
+    let rig = rig();
+    let refused = Answer::Refused(SCOPE_REFUSAL.to_owned());
+    assert_eq!(scoped(&rig, Caller::TeamA, "payroll"), refused);
+    rig.connector.grant_to_team("team-a", "payroll");
+    assert!(matches!(
+        scoped(&rig, Caller::TeamA, "payroll"),
+        Answer::Ok(_)
+    ));
+    assert_eq!(scoped(&rig, Caller::TeamB, "payroll"), refused);
+    assert_eq!(scoped(&rig, Caller::UserInGroupG, "payroll"), refused);
+
+    // A grant to a group the user is not in does not reach the user.
+    rig.connector.grant_to_group("group-review", "review-notes");
+    assert_eq!(scoped(&rig, Caller::UserInGroupG, "review-notes"), refused);
+    rig.connector.grant_to_group("group-g", "review-notes");
+    assert!(matches!(
+        scoped(&rig, Caller::UserInGroupG, "review-notes"),
+        Answer::Ok(_)
+    ));
+    assert_eq!(scoped(&rig, Caller::TeamA, "review-notes"), refused);
 }
 
 #[test]

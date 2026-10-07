@@ -37,7 +37,8 @@ pub use audit::InMemoryAuditStore;
 pub use clock::{FIXTURE_NOW, FixedClock, SteppableClock};
 pub use connector::{
     CONNECTOR, DOCUMENT_ARGUMENT, FORBIDDEN_DOCUMENT, FixtureConnector, READ_TOOL, RESOURCE_KIND,
-    RESOURCE_SYSTEM, ReceivedCall, SCOPED_READ_TOOL, WRITE_TOOL, WriteRecord, document,
+    RESOURCE_SYSTEM, ReceivedCall, SCOPE_REFUSAL, SCOPED_READ_TOOL, WRITE_TOOL, WriteRecord,
+    document,
 };
 pub use credentials::{CredentialRequest, FakeCredentialSource};
 pub use exec::{block_on, poll_once};

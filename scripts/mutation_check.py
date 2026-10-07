@@ -888,7 +888,11 @@ mutate("fake-connector-hang-next-is-hang-all", "a hang meant for the next call i
 mutate("fake-connector-calls-not-recorded", "calls are not recorded", K, "            state.received.push(ReceivedCall {", "            let _ = (ReceivedCall {")
 mutate("fake-connector-write-not-recorded", "a write is not recorded", K, "                    self.state().writes.push(WriteRecord {", "                    drop(WriteRecord {")
 mutate("fake-connector-scope-ignored", "the scoped tool refuses nothing", K,
-       "                    match named.filter(|name| forbidden.contains(*name)) {", "                    match named.filter(|name| false && forbidden.contains(*name)) {")
+       "                    match named.filter(|name| !scope.contains(*name)) {", "                    match named.filter(|name| false && !scope.contains(*name)) {")
+mutate("fake-connector-scope-any-team", "a workload may reach any team's documents through the scoped tool", K,
+       "                    state.team_scopes.get(team).cloned().unwrap_or_default()", "                    state.team_scopes.values().flatten().cloned().collect()")
+mutate("fake-connector-scope-any-group", "a user may reach any group's documents through the scoped tool", K,
+       "                    .filter_map(|group| state.group_scopes.get(group))", "                    .flat_map(|_| state.group_scopes.values())")
 mutate("fake-connector-credential-refusal-ignored", "a refused credential does not stop the call", K,
        "                Err(_) => {\n                    return ToolOutcome::Error(\n                        \"the fixture connector could not get a credential\".into(),\n                    );\n                }",
        "                Err(_) => String::new(),")

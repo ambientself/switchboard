@@ -17,8 +17,8 @@ use gateway_core::{
 use gateway_identity::{Identity, Verification, VerifyError};
 use gateway_testkit::{
     Caller, FakeCredentialSource, Fixture, FixtureConnector, InMemoryAuditStore, READ_TOOL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    WRITE_TOOL, block_on, poll_once,
+    SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT,
+    TEAM_B_DOCUMENT, WRITE_TOOL, block_on, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -393,11 +393,13 @@ fn a_failure_to_finish_the_row_does_not_undo_a_success() {
 #[test]
 fn a_scope_refusal_is_the_outcome_refused_with_one_sentence_in_the_row_and_the_answer() {
     let gateway = Gateway::new();
+    // Team A asks the tool that checks its own scope for team B's document. The decision
+    // function cannot see that, so it allows the call, and the connector refuses it.
     let response = gateway.call(
         Caller::TeamA,
         SURFACE_ALL,
         SCOPED_READ_TOOL,
-        json!({"document": "restricted-notes"}),
+        json!({"document": TEAM_B_DOCUMENT}),
     );
     let Response::Answered {
         answer: Answer::Refused(sentence),
@@ -406,10 +408,7 @@ fn a_scope_refusal_is_the_outcome_refused_with_one_sentence_in_the_row_and_the_a
     else {
         panic!("{response:?}")
     };
-    assert_eq!(
-        sentence,
-        "The fixture connector refused this call: the document `restricted-notes` is outside the scope of the caller's team."
-    );
+    assert_eq!(sentence, SCOPE_REFUSAL);
     let row = gateway.store.row(0).unwrap();
     assert_eq!(
         row.decision,
