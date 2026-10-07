@@ -326,11 +326,22 @@ written.
 - **Three outcomes:** `ok`, `error` and `refused`, the last for a connector's scope refusal.
 - **The caller's tool-use identifier is recorded,** so a caller's control plane can look up
   the decision for a call it already knows about. Otto's does.
-- **The resources a call names are recorded,** as the decision checked them, so "who reached
-  this repository" can be answered from the rows, for allowed calls as well as denials. The
-  caller chooses them through its arguments, so each value is escaped and capped like the
-  tool name, and a row keeps at most 64 and counts the rest. A tool that checks its own scope
-  may record `unknown` here; what it then reached is not yet recorded.
+- **The resources a call names are recorded,** so "who reached this repository" can be
+  answered from the rows, for allowed calls as well as denials. The row holds what the call
+  named, not only what the decision checked: a call denied before the resource check still
+  records them. A tool that checks its own scope may record `unknown` here; what it then
+  reached is not yet recorded.
+- **Recorded resources are bounded,** because the caller chooses them through its arguments.
+  Each resource is kept once, in the order first named, so repeating one cannot push another
+  off the row. A row keeps at most 64 and counts the rest, and the resource a denial names is
+  always kept. Each value is escaped so that it can be read back: a backslash is escaped too.
+  A system and a kind are capped at 128 characters, like the tool name. An identifier is
+  capped at 2,048, so that every identifier the systems in [systems.md](systems.md) document
+  is recorded whole. The longest is an AWS ARN, at 2,048. The others are shorter: a GitHub
+  repository is at most 140 (a 39-character owner, a slash and a 100-character name), a
+  Confluence space key 255, a MongoDB namespace 255 bytes, and a Sumo Logic source category
+  1,024. Escaping lengthens non-ASCII text, so an identifier with much of it can still be cut;
+  a cut value ends with `…`.
 - **An empty outcome is evidence** that the gateway allowed the call and never learned what
   happened.
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
@@ -345,8 +356,8 @@ before more callers are added. An audit row is not an idempotency record: it doe
 write being made twice (Q10).
 
 For Otto's callers the row must match the existing `gateway_audit` table. That table has no
-column for the resources a call names, so they are kept only in this gateway's own record
-unless Otto adds one.
+column for the resources a call names, so an Otto call's resources are not recorded until
+Otto adds one.
 
 **What Rust adds.** The begin step returns a guard value that the tool-running code requires
 as an argument, so a call path that skips the audit write does not compile.
