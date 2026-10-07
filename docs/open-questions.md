@@ -96,20 +96,28 @@ record says what holds until each is answered. When they are answered, retire Q9
   repository secrets on proposal branches, changes to workflow files on those branches, and
   Jira automation rules. This includes whether a proposal stays `propose` in a repository
   where a workflow it starts can deploy or holds a production credential. For the owners of
-  Atlantis, CI and Jira automation. Until they answer, a `propose` tool also refuses changes to
-  CI workflow files and Atlantis configuration, as well as command text.
+  Atlantis, CI and Jira automation. Until they answer, only Atlantis comment commands make a
+  tool `write`, and a `propose` tool also refuses changes to CI workflow files and Atlantis
+  configuration, as well as command text. A proposal can still start an Atlantis autoplan or
+  a pull request workflow that runs with the repository's secrets.
 - **Which AWS accounts are in scope** for broad reads and employees. For the cloud platform
   team. Until then no AWS account is in any limit.
-- **Who the security reviewer of data approvals is.** For the security team. Until then no
-  resource is added to a group's limit and no breadth resource to a team's.
+- **Who the security reviewer of data approvals is, and the security owner** who signs
+  entries in decision 0010's register, Otto's comment-tool exception among them. For the
+  security team. Until then no resource is added to a group's limit and no breadth resource to
+  a team's, and the exception's entry awaits that signature.
+- **Who the code owners of the policy files are,** and the branch rule requiring their review.
+  For the repository administrator, with the owner naming the code owners. Until then no
+  policy file lands.
 - **Whether group limits and broad-read opt-ins expire** and are recertified, and how often.
   For the owner with the security team, before milestone 5. Until then an approval stands
   until a reviewed change removes it.
 - **Asks of IT, vendor administrators and Otto's owners,** listed in the record: narrow service
   accounts and who owns them, OAuth applications for per-user grants, ownership of the Okta
   groups, and the review of Otto's eighteen tool declarations.
-- Whether a per-user rate limit must come before employee proposals is part of Q12, and how
-  often the reach check runs is part of Q11.
+- Whether a per-user rate limit must come before employee proposals is tracked in Q12, and
+  how often the reach check runs in Q11. Whether Otto's `gateway_audit` table gains this
+  record's audit columns is part of the question about that table in Q12.
 - **Blocks:** milestone 5's employee proposals and any broad read; Otto's proposal tools at
   milestone 4, if the automation answer asks more of them.
 
@@ -150,6 +158,15 @@ A definition hash detects interface changes, not a changed implementation behind
   approval boundary. Detect drift from the first proxied rollout; define polling and
   propagation bounds, and document the residual interval. Do not claim hash pinning proves
   the downstream implementation is unchanged.
+- **How often the reach check runs**
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 4).
+  It bounds how long a widened service account goes unnoticed. For the owner; no
+  recommendation was made. Until it is set, no proxied entry is exposed outside development
+  and test deployments.
+- **How a withdrawal reaches every replica.** A reach mismatch withdraws tools by making a
+  snapshot of its own, with its own revision, swapped in atomically (decision 0011). How fast
+  every replica serves it, and what a replica does when it cannot learn of it, belong with
+  the maximum age above.
 - **Blocks:** the first production proxy deployment and its revocation guarantee.
 
 ## Q12. Which operational controls belong before broad rollout?
@@ -161,6 +178,11 @@ employee access. Explicit identity/audit opt-outs also lack a production deploym
   per-team/vendor quotas and isolation of failing upstreams with the first real connectors.
   Restrict insecure opt-outs to local development and test deployments. Keep registry API/UI
   work later, driven by onboarding needs.
+- **Before employee proposals:** whether a per-user rate limit must be in place before the
+  first employee proposal tool is approved
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). For the
+  owner; no recommendation was made. It is answered before that tool is approved. Policy
+  snapshots are kept as long as the audit rows they explain, so that retention covers both.
 - **Audit operations:** assign storage/migration ownership, retention, access controls and
   redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
   payloads. Define availability and latency targets and measure audit overhead against them.

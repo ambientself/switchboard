@@ -52,7 +52,8 @@ can script, including to fail.
   tool list, stream slowly, hang and return errors. Proxied-server work is tested against it.
 - **Decision 0011's checks on fakes:** an undeclared argument never reaches the fake MCP
   server; a `call`-narrowed token request names exactly the call's resources; a fake vendor
-  whose reach is widened between runs causes withdrawal; the AWS account filter holds against
+  whose reach is widened between runs causes withdrawal, and later rows carry the
+  withdrawal's own snapshot revision; the AWS account filter holds against
   hostile parameters; and each built-in `propose` tool changes only refs, pull requests and
   comments it created or that its receipts or resolver attribute to it, with the fake vendor
   recording every write's target.

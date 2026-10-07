@@ -199,8 +199,15 @@ gives for its own hard denial: a per-profile opt-in makes the company's posture 
 every profile's weakest setting. Permitting direct writes takes a decision record that
 replaces this section, and a change to check 5. That decision must first settle how the
 gateway tells production from everything else. Decision 0011 does not replace this section. It
-records one narrow exception, for Otto's two comment tools in Otto's profile, checked after
-this rule and naming tools, never a classification.
+records one narrow exception, for Otto's two comment tools in Otto's profile, checked within
+check 5: once #12 builds it, check 5 denies `write` and `destructive` unless the tool is named
+in the calling profile's list of excepted tools. A list checked after this rule could never
+allow, since the checks stop at the first denial. The list names tools, never a
+classification, so it does not reopen the objection above. A setting that permits a
+classification permits every tool of that kind, including tools approved later. A name
+permits one tool, and adding one takes a decision record and an entry in the register of
+exceptions, so every exception to the company's posture is in that register, read in one
+place.
 
 This replaces what the design said before: that a destructive tool could be held only in a
 type the Otto profile's run path does not accept. That type was never built. Every profile
@@ -210,7 +217,9 @@ allow from this function (the compile-fail tests `decision_without_decide`,
 `guard_without_begin` and `run_without_guard`). That an allow is never given for a `write` or
 `destructive` tool is a runtime check. The property that such a tool is never allowed or
 listed watches it, as do decision-table cases for each profile and the mutations
-`write-permitted-by-profile`, `destructive-permitted-by-profile` and `check-5-removed`.
+`write-permitted-by-profile`, `destructive-permitted-by-profile` and `check-5-removed`. When
+#12 builds decision 0011's exception, the property becomes "never allowed or listed, except a
+tool named in its profile's exception list".
 
 ### A delegation's tool list is required
 

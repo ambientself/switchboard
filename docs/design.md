@@ -176,7 +176,7 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    grant lists the tool.
 6. **Write the audit row.** If this fails, refuse the call.
 7. **Check the arguments,** for a proxied tool, against its approved input schema, read as
-   JSON Schema 2020-12. Where an object in the schema lists its properties, any other property
+   JSON Schema 2020-12. A schema in another dialect is refused or converted at approval. Where an object in the schema lists its properties, any other property
    is refused, at any depth. The gateway forwards its own serialization of the arguments, never
    the caller's bytes. A call that fails is completed with outcome `error`, and nothing is
    forwarded. A built-in connector parses the arguments into its own types instead.
@@ -290,14 +290,19 @@ be refused by what starts it: a draft pull request, a push to the gateway's prop
 a comment each start the workflows configured for them. That is acceptable where those workflows
 only build and test. Whether a proposal stays `propose` in a repository where a workflow that a
 pull request, a push or a comment starts can deploy or holds a production credential is open
-(Q9). It waits on the owners of Atlantis, CI and Jira automation. Until they answer, a
-`propose` tool also refuses changes to CI workflow files and to Atlantis configuration
-([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)).
+(Q9). It waits on the owners of Atlantis, CI and Jira automation. Until they answer, only
+automation already named, which today is Atlantis comment commands, makes a tool `write`. A
+proposal tool stays `propose` on the position above, and also refuses changes to CI workflow
+files and to Atlantis configuration
+([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). A proposal
+that changes ordinary code or `.tf` files can still start an Atlantis autoplan, or a pull
+request workflow that runs with the repository's secrets. That stays unguarded until then.
 
 A change to something that exists, such as amending a proposal or editing a comment, is
 `propose` only if the connector checks that the gateway created it for the same principal:
-from the gateway's receipts, or from a delegating control plane's resolver. Until receipts
-exist, only proposals that create something are served to employees and services.
+from the gateway's receipts, or from a delegating control plane's resolver. Without one of
+them it is not `propose`. The proposed answer to Q10 goes further: no `propose` tool is served
+at all until a receipt store is configured.
 
 The guards are made by the connector, so the decision function cannot watch them. Each one,
 the forced draft included, is tested like any other guard: the tool's connector has a test
@@ -310,19 +315,22 @@ allowed Otto's two tools to Otto's callers by a narrow, recorded exception
 ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 9):
 Otto's profile only; the tool refuses the commands of the bots named when it is approved,
 today Atlantis; it reaches only the team's repositories or the configured Jira projects; every
-call is audited; it is listed in decision 0010's register of known exceptions, with the owner
-as the person who accepted it; and it is reviewed when Otto's cutover (#13) completes.
-`addOrEditJiraIssueComment` gets no exception, because it can edit other people's comments.
-The core has no way yet to express the exception. A per-profile list of excepted tools,
-checked after the classification rule and audited with its own reason, is built under #12.
-Until then Otto's callers are denied both tools, which loses parity with Otto's gateway.
+call is audited; it is listed in the register of exceptions that decision 0010 keeps, accepted
+by the owner and signed by a named security owner; and it is reviewed every 90 days and when
+Otto's cutover (#13) completes. `addOrEditJiraIssueComment` gets no exception, because it can
+edit other people's comments. The core has no way yet to express the exception. Under #12,
+check 5 itself changes: it denies `write` and `destructive` unless the tool is named in the
+calling profile's list of excepted tools, and an allowed call records the exception as its
+reason. The list names tools, never a classification. Until then Otto's callers are denied
+both tools, which loses parity with Otto's gateway.
 
 **Profile rules, per caller type.** Classification, proved versus claimed identity, the denial
 contract, audit before execution or ordinary denial, and fail-closed enforcement apply to all
 profiles. `write` and `destructive` are denied in every profile by the decision function, so
 no profile's data can permit them as a classification. That is how production mutation is
 denied for every profile initially: anything that changes production without a person acting
-is one of the two. The one exception is the recorded one for Otto's two comment tools, above.
+is one of the two. The one exception is the recorded one for Otto's two comment tools, above,
+which names tools in Otto's profile and needs a change to check 5.
 Permitting direct writes needs a decision that replaces part of
 [decision 0006](decisions/0006-what-the-decision-function-sees.md).
 
@@ -480,20 +488,21 @@ written.
 - **Proved and claimed are separate columns.**
 - **No foreign key to anything a caller owns,** so a caller's data retention cannot delete its
   audit trail.
-- **A row says how its resources were found**
-  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). Resources
-  named by the call are marked as named. A reach is marked as a reach and recorded by
-  reference to its connector entry, since the policy revision says exactly what it was.
+- **The recorded resources say how they were found**
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)): named by the
+  call, or the reach of the tool's connector entry. A reach is recorded by reference to the
+  entry, not as a list, since it can hold more resources than a row keeps and the policy
+  revision says exactly what it was.
 - **The credential identity used is recorded:** the mode and the vendor-side principal, never
   the secret.
 - **An `error` outcome has a kind:** invalid arguments, an oversized or late result, a
   custodian refusal, or a vendor refusal. How a vendor refusal is recognized is defined per
   connector. `refused` also covers the credential layer's refusal, such as an employee with no
   grant.
-- **A tool that checks its own scope reports what it reached** when it finishes. This is
-  required before milestone 4.
+- **A tool that checks its own scope reports what it reached** when it finishes, in place of
+  `unknown`. This is required before milestone 4.
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
-  Otto adds them.
+  Otto adds them. Whether it does is part of the question about that table in Q12.
 
 This puts Postgres on the path of every call for the whole company. Its availability becomes
 the gateway's availability, and that is an accepted cost of the rule. The first slice
@@ -547,8 +556,11 @@ proxied server usually cannot be checked that way. The rules are in
 - **Keeping a reach true.** The registry checks each proxied entry's reach on a schedule, in
   the drift pass: against the vendor's report of what the credential reaches, or by confirming
   that a canary outside the reach is refused. Each check is an audited gateway call and never a
-  write. A mismatch withdraws the entry's tools from every surface. Withdrawals are applied to
-  the snapshot in force and do not wait for the next one to load.
+  write. A mismatch withdraws the entry's tools from every surface. A withdrawal does not wait
+  for the next snapshot to load from the policy files: it makes a snapshot of its own, the one
+  in force less the withdrawn tools, with a revision naming both, and swaps it in atomically.
+  How it reaches every replica is Q11. A per-user entry is not checked on a schedule, since its
+  reach is already the whole site; its test shows that another site is refused.
 
 **Built-in connectors** are gateway code calling a vendor API. The GitHub connector is the
 model: it brokers a GitHub App token, limits every call to one organization before any request
@@ -562,8 +574,8 @@ leaves, bounds result sizes, and tags every result as external evidence.
 3. A person assigns each tool a classification and approves it. A server is never trusted to
    classify its own tools.
 4. Each approval records a hash of the tool's name, description and input schema, together
-   with the server's identity, its address, its credential configuration, and the reach and
-   the date of its test. A second reviewer approves it.
+   with the server's identity, its address, its credential configuration, the schema's
+   dialect, and the reach and the date of its test. A second reviewer approves it.
 5. Approved tools are added to tool surfaces.
 
 **Drift.** The registry re-reads each server's tool list on a schedule. A tool whose

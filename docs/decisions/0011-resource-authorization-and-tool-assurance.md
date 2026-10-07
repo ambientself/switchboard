@@ -4,7 +4,9 @@ Date: 2026-10-06. Status: accepted on 2026-10-07, when the owner accepted the re
 (see Decided by the owner). Settles the rest of Q9 after
 [decision 0006](0006-what-the-decision-function-sees.md) and the 2026-10-04 amendment to it,
 except the parts under Still open, which wait on other people. Written against that amendment
-and the audit row's resources column (design.md section 11).
+and the audit row's resources column (pull request 30, design.md section 11), on the
+assumption that pull request 30 merges first. Its 64-resource bound, and its question about
+Otto's `gateway_audit` table in Q12, are used below.
 
 ## Context
 
@@ -98,13 +100,20 @@ backend, and rest on the reviewer.
 **Argument validation follows from the kind of connector.** A built-in connector parses the
 arguments into its own types and returns `error` for malformed input; an argument it does not
 read cannot change what it does. For a proxied tool, the gateway validates the arguments
-against the approved input schema, read as JSON Schema 2020-12, MCP's default dialect since
-revision 2025-11-25. Where an object in the schema lists its properties, any other property is
-refused, at any depth, whatever the schema says about additional properties. An object the
-schema leaves open, such as a map or a MongoDB filter, is accepted as one value, and the
-reviewer treats it as free text. The gateway forwards its own serialization of the arguments
-the audit guard carries, never the caller's bytes. A call that fails validation is completed
-with outcome `error` and is never forwarded.
+against the approved input schema, read as JSON Schema 2020-12. Revision `2025-06-18`, which
+this gateway serves ([decision
+0007](0007-serve-two-mcp-revisions-from-a-hand-written-endpoint.md)), names no default dialect,
+and servers of that era often publish draft-07 schemas. Read as 2020-12, a draft-07 schema can
+mean something else: the array form of `items` is invalid, `definitions` is not `$defs`, and
+`dependencies` was split in two. So at approval a schema whose `$schema` names another dialect,
+or that uses a form valid only in an earlier draft, is refused or converted to 2020-12, and the
+converted schema is the one approved. The dialect is part of the approval's hash. Where an
+object in the schema lists its properties, any other property is refused, at any depth,
+whatever the schema says about additional properties. An object the schema leaves open, such as
+a map or a MongoDB filter, is accepted as one value, and the reviewer treats it as free text.
+The gateway forwards its own serialization of the arguments the audit guard carries, never the
+caller's bytes. A call that fails validation is completed with outcome `error` and is never
+forwarded.
 
 Without this, an adapter could check `project` while the server acted on a second argument
 the adapter never read. It covers undeclared arguments only. That no declared free-text
@@ -136,9 +145,10 @@ A proxied tool is exposed only when all of these hold.
   adapter is gateway code, with cases built from the tool's real argument shapes.
 - **As the reach:** the reach has been shown to hold. The approval records a dated test
   showing that a call outside the reach fails: for a vendor server, the test its section of
-  systems.md names under "To confirm"; for a self-built server, one its owner runs. The
-  loader can check that a test is recorded. It cannot check that the test was right; the
-  reviewer does.
+  systems.md names under "To confirm"; for a self-built server, one its owner runs. For a
+  per-user entry, whose reach is the whole site or workspace, the test shows that a call to
+  another site or workspace fails. The loader can check that a test is recorded. It cannot
+  check that the test was right; the reviewer does.
 - **Its credential reaches nothing outside its callers' limits.** The entry narrows per `call`
   or to the caller's `limit`, or its whole reach lies within the limit of every team and group
   admitted to every surface that serves the tool. A server that ignores its arguments then
@@ -192,7 +202,8 @@ Both fail when called. That is accepted.
 
 A reach rests on facts outside this repository. An administrator can widen a service account
 or add a scope to a key without touching an approval. The registry therefore checks each
-proxied connector entry's reach on a schedule, in the same pass as drift detection.
+proxied connector entry's reach on a schedule, in the same pass as drift detection, except a
+per-user entry's (below).
 
 - Where the vendor can report what a credential reaches or which scopes it holds, as GitHub
   lists an installation's repositories, the check compares the report with the recorded reach
@@ -209,10 +220,18 @@ proxied connector entry's reach on a schedule, in the same pass as drift detecti
   credential is a connector entry of its own, `read`, served only on that surface.
 - A mismatch withdraws the entry's tools from every surface, as a changed definition does,
   and alerts the owning team. They return only through a new approval.
+- A per-user proxied entry is not checked on a schedule. Its reach is already the whole site
+  or workspace, and the registry has no person's grant to call with. Its test, which shows
+  that a call to another site or workspace fails, is what holds it.
 
-A withdrawal does not wait for the next snapshot to load. It is applied as removals from the
-snapshot in force, which can only narrow what is allowed, so an unrelated change that breaks a
-loader rule cannot hold it up. How this sits with a maximum snapshot age is Q11's.
+A withdrawal does not wait for the next snapshot to load from the policy files. It makes a new
+snapshot of its own: the snapshot in force with the withdrawn tools removed. That snapshot has
+its own revision, naming the base revision and the withdrawal set, and replaces the one in
+force atomically, like any other snapshot. The loader's rules are not run again, since a
+removal can only narrow what is allowed, so an unrelated change that breaks a loader rule
+cannot hold it up. Rows decided after it record its revision, so the revision on a row still
+says exactly what was in force. How a withdrawal reaches every gateway replica, and how it
+sits with a maximum snapshot age, are Q11's.
 
 ### 5. Where each part of the decision is made
 
@@ -296,8 +315,10 @@ inside it.
 **A proposal that changes something existing** (amending a proposal, editing a comment) is
 `propose` only if the connector checks that the gateway created it for the same principal:
 from the gateway's receipts, or, for a delegating control plane, from its resolver, as in
-[decision 0003](0003-otto-keeps-its-control-plane-endpoints.md). Until receipts exist, only
-proposals that create something are served to employees and services.
+[decision 0003](0003-otto-keeps-its-control-plane-endpoints.md). Without receipts or such a
+resolver, a change to something existing is not `propose`. Decision 0009 (proposed in pull
+request 33) goes further: no `propose` tool is served at all until a receipt store is
+configured.
 
 **Automation that acts on a proposal.** A tool is `propose` only if nothing it creates takes
 effect before a person acts. Automation can break that: a comment that Atlantis or a
@@ -306,9 +327,16 @@ workflow that runs with the repository's secrets on a proposal branch, a workflo
 on that branch, or an Atlantis autoplan that runs provider code. Such a tool is `propose` only
 if its connector refuses content that would set the automation off, as Otto's GitHub connector
 does for Atlantis comment commands, or the automation does not run on the gateway's
-proposals. Otherwise it is `write`. Which automation counts needs its owners and is still
-open. Until they answer, a `propose` tool also refuses changes to CI workflow files and to
-Atlantis configuration, as well as command text.
+proposals. Otherwise it is `write`.
+
+Which automation counts needs its owners and is still open. Until they answer, "otherwise it
+is `write`" applies only to automation already named, which today is Atlantis comment
+commands. Otto's proposal tools and other built-in `propose` tools stay `propose` under the
+position in design.md section 8, that a proposal starting CI is acceptable where those
+workflows only build and test. They also refuse changes to CI workflow files and to Atlantis
+configuration, as well as command text. A proposal that changes ordinary code or `.tf` files
+can still start an Atlantis autoplan, or a pull request workflow that runs with the
+repository's secrets. That gap is listed under what stays unguarded.
 
 ### 7. Reads that show more than the caller could otherwise see
 
@@ -375,11 +403,14 @@ is the role's filter as written, not a pattern.
 
 ### 9. Otto's comment tools: a recorded exception
 
-Decided by the owner on 2026-10-07, taking the recommendation in Q9. Otto's
-`github_pr_comment` comments on any pull request in the team's repositories, and `jira_comment`
-on any issue in the configured Jira projects. Under the comment rule in decision 0006 both are
-`write`, because they comment on things the gateway did not create. They stay `write`. They are
-allowed to Otto's callers by a narrow, recorded exception, and only while all of these hold:
+On 2026-10-07 the owner accepted a narrow, recorded exception for these tools, the answer Q9
+called likely. This record sets its conditions. Otto's `github_pr_comment` comments on any
+pull request in the team's repositories, and `jira_comment` on any issue in the configured
+Jira projects. Under the comment rule in decision 0006 both are `write`, because they comment
+on things the gateway did not create. They stay `write`. Otto's other three writes,
+`github_create_pr`, `github_propose_change` and `github_amend_change`, are `propose` and need
+no exception. The two comment tools are allowed to Otto's callers only while all of these
+hold:
 
 - **Otto's profile only.** No other profile has an exception. Services and employees are
   denied both tools.
@@ -392,23 +423,34 @@ allowed to Otto's callers by a narrow, recorded exception, and only while all of
   the connector hold it to them, as for any built-in tool.
 - **Every call is audited as usual,** and the row gives the exception as the reason the call
   was allowed.
-- **It is listed in decision 0010's register of known exceptions,** with the owner as the
-  person who accepted it.
-- **It is reviewed when Otto's cutover (#13) completes.** The review keeps it, narrows it or
-  ends it.
+- **It is listed in the register of exceptions that decision 0010 keeps** (proposed in pull
+  request 31), with the owner as the person who accepted it. Like every entry there, it needs
+  the signature of a named security owner, who has not been named yet (see Still open).
+- **It is reviewed on the register's cadence:** every 90 days, and when Otto's cutover (#13)
+  completes. The review keeps it, narrows it or ends it.
 
 Atlassian's hosted `addOrEditJiraIssueComment` gets no exception. It can edit comments other
 people wrote, and as a proxied tool it could not be held to the conditions above.
 
 This is not the decision that permits direct writes, which decision 0006 says must replace its
-section on them. Check 5 still denies `write` and `destructive` before the profile is read. The
-core has no way yet to express an exception. It needs one: for example, a per-profile list of
-excepted tools, checked after the classification rule, that allows the call with a reason of
-its own on the audit row. The list names tools, never a classification, so it cannot permit
-`write` in general, and adding a tool to it takes a decision record and a register entry, as
-this one does. It is built under #12 with Otto's GitHub and Jira tools, not now. Until it
-exists, both tools stay denied to Otto's callers, and the conformance cases that use them stay
-an expected difference (design.md section 18).
+section on them. The core has no way yet to express an exception, and it needs a change to
+check 5 itself. Checks stop at the first that denies, and check 5 denies `write` before any
+later check runs, so a list checked after it could never allow. Under #12, check 5 denies
+`write` and `destructive` unless the tool is named in the calling profile's list of excepted
+tools. The profile gains that list, and an allowed decision gains a reason: the exception that
+allowed it, which the audit row records. The property
+`a_write_or_destructive_tool_is_never_allowed` is restated as "never allowed, except a tool
+named in its profile's exception list", and check 5's comment changes with it.
+
+The list names tools, never a classification, so it cannot permit `write` in general. That is
+why it does not reopen the objection in decision 0006 to a per-profile opt-in, that the
+company's posture becomes the union of every profile's weakest setting. A setting that permits
+a classification permits every tool of that kind, including ones approved later. A name permits
+one tool, and adding one takes a decision record and a register entry, as this one does. Every
+exception to the company's posture is then in the register, read in one place. The list is
+built under #12 with Otto's GitHub and Jira tools, not now. Until it exists, both tools stay
+denied to Otto's callers, and the conformance cases that use them stay an expected difference
+(design.md section 18).
 
 ### What each guarantee costs, and what stays unguarded
 
@@ -429,8 +471,10 @@ vendor-side change to a reach between scheduled checks, and any added resource a
 see; a connector bug that reaches resources the call did not name; a self-built server shared
 by several teams carrying one team's data to another in its own state; anything the reviewer
 gets wrong in the third column above; Otto's two comment tools, which act on pull requests
-and issues the gateway did not create, within the exception in section 9; and, on laptops,
-other routes to the vendor (Q17).
+and issues the gateway did not create, within the exception in section 9; until the
+automation owners answer, a proposal that starts an Atlantis autoplan or a pull request
+workflow that runs with the repository's secrets; and, on laptops, other routes to the vendor
+(Q17).
 
 ## Alternatives rejected
 
@@ -481,7 +525,10 @@ other routes to the vendor (Q17).
 
 ## Consequences
 
-- `ResourceDeclaration`, check 6 and the function's inputs and reasons do not change. The
+- Sections 1 to 8 do not change `ResourceDeclaration`, check 6, or the function's inputs and
+  reasons. Section 9 changes check 5 under #12: the profile gains its list of excepted tools,
+  an allowed decision gains the exception as its reason, and the property that a `write` or
+  `destructive` tool is never allowed is restated to except the tools on that list. The
   snapshot gains a table of connector entries (kind, credential mode, narrowing, reach, what
   the credential permits, the reach test's date) and, for each `declared` tool, its entry and
   whether its adapter reads the arguments or names the reach. The loader gains nine rules,
@@ -500,10 +547,17 @@ other routes to the vendor (Q17).
   principal, never the secret); and an error kind: invalid arguments, an oversized or late
   result, a custodian refusal or a vendor refusal. `refused` now covers the credential
   layer's refusal as well as the connector's. Otto's `gateway_audit` table has none of these
-  columns, so they stay in this gateway's own record unless Otto adds them.
+  columns, so they stay in this gateway's own record unless Otto adds them. Whether it gains
+  them is part of the question pull request 30 puts in Q12, whether that table gains a general
+  column and who adds it. That is its one home.
 - Built-in `checks_own_scope` tools report the resources they reached when they finish, the
-  follow-up the resources column left. This is required before milestone 4 brings Otto's code
-  search over.
+  follow-up the resources column of pull request 30 left. This is required before milestone 4
+  brings Otto's code search over.
+- A withdrawal makes a snapshot with a revision of its own (section 4), so the snapshot type
+  gains a way to be derived from another by removal.
+- Before the first policy file lands, the repository gains a `CODEOWNERS` entry for the policy
+  files and a branch rule requiring code-owner review. The repository administrator sets both.
+  That is what enforces the second reviewer.
 - Decision 0006 says a connector's scope refusal is the only decision made outside the
   function. That becomes: the argument check, the connector, the credential layer and the
   custodian may each refuse outside it, and none may allow.
@@ -526,10 +580,10 @@ other routes to the vendor (Q17).
   again whenever its vendor-side configuration changes. The per-change loop shows an
   undeclared argument never reaching the fake MCP server; a `call`-narrowed token request
   naming exactly the call's resources; a fake vendor whose reach is widened between runs
-  causing withdrawal; the AWS account filter holding against hostile parameters; and each
-  built-in `propose` tool changing only refs, pull requests and comments it created in that
-  call or that its receipts or resolver attribute to it, with the fake vendor recording the
-  target of every write.
+  causing withdrawal, with later rows carrying the withdrawal's own revision; the AWS account
+  filter holding against hostile parameters; and each built-in `propose` tool changing only
+  refs, pull requests and comments it created in that call or that its receipts or resolver
+  attribute to it, with the fake vendor recording the target of every write.
 - Onboarding a proxied server is slower: someone with vendor admin rights must create a
   narrow credential, often one per team, and run the test before any of its tools can be
   exposed. Changes to that credential go through the tool's approval; otherwise the reach
@@ -543,18 +597,20 @@ other routes to the vendor (Q17).
   inventory.
 - Milestone 4 (#12) builds the exception mechanism in section 9, with a decision-table case for
   each of Otto's two comment tools, a case showing the same tools denied in every other
-  profile, a case showing `addOrEditJiraIssueComment` denied, and a mutation that removes the
-  list check. When it is built, the conformance cases that use the two tools move out of the
-  expected differences.
+  profile, a case showing `addOrEditJiraIssueComment` denied, the restated property, and a
+  mutation that removes the list check. When it is built, the conformance cases that use the
+  two tools move out of the expected differences.
 
 ## Decided by the owner
 
-On 2026-10-07 the owner accepted the recommendations this record made. Where a question also
-needs someone else, the owner's part is decided here and the rest is under Still open.
+On 2026-10-07 the owner accepted the recommendations this record made, with one departure,
+on Q9, below. Where a question also needs someone else, the owner's part is decided here and
+the rest is under Still open.
 
 - **Every approval has a second reviewer.** An approval of a tool's classification,
   declaration, credential entry or reach test needs a second reviewer, enforced by code owners
-  on the policy files. Much of this record rests on that reviewer.
+  on the policy files and a branch rule (see Consequences). Much of this record rests on that
+  reviewer.
 - **Data for employees and broad reads is approved by its owner and a security reviewer.**
   Putting a resource in a group's limit, or a breadth resource in a team's, needs the owner of
   the data, such as the cloud platform team for AWS, and a security reviewer.
@@ -568,13 +624,14 @@ needs someone else, the owner's part is decided here and the rest is under Still
 - **Employee launch is reads only.** Proposal tools follow one system at a time, each once its
   per-user grant and receipts work: first GitHub draft pull requests, and comments on pull
   requests the gateway created, for engineering; then Jira comments on issues the gateway
-  created. Asking an employee for two grants on one system, as section 6 requires, is
-  accepted.
+  created. An employee may need two grants on one system. That follows from sections 2 and 6
+  as accepted: an entry has one credential, and a proxied entry's credential cannot write.
 - **A proxied read under an employee's own grant may be exposed with no adapter,** its reach
   being the whole site in the group's limit, so the agent reaches whatever the employee can.
   Reads only.
 - **Until the automation owners answer, a `propose` tool refuses changes to CI workflow files
-  and Atlantis configuration,** as well as command text. That may change Otto's proposal tools.
+  and Atlantis configuration,** as well as command text, and stays `propose` (section 6). That
+  may change Otto's proposal tools.
 - **Self-built servers:** one team per server until its owner shows it keeps no state between
   calls. The owner states the backend's permissions in the approval, and rule 4 applies to
   that statement. Self-built servers stay read-only until receipts exist (Q10) and a later
@@ -584,9 +641,13 @@ needs someone else, the owner's part is decided here and the rest is under Still
   rows can say which repositories Otto's code search reached.
 - **Policy snapshots are kept as long as the audit rows** they explain, so the declaration and
   reach in force can be read for any row. How long rows are kept is Q12.
-- **One record.** Sections 6 and 7 are not split into a record of their own. Q9 is narrowed to
-  what is still open below, and retired once that is answered.
-- **Otto's comment tools get the narrow, recorded exception** in section 9.
+- **One record.** Sections 6 and 7 are not split into a record of their own.
+- **Q9 is narrowed, not retired.** This is the one departure from the record's
+  recommendation, which was to retire Q9 on acceptance. Its remaining parts, under Still open,
+  need people other than the owner, and retiring it now would leave them tracked only inside
+  this record. Q9 is retired once they are answered.
+- **Otto's comment tools get a narrow, recorded exception.** The owner accepted the exception
+  Q9 called likely. Its conditions are the ones section 9 sets.
 
 ## Still open
 
@@ -599,20 +660,29 @@ while they are open: each says what holds until it is answered.
   branches, and Jira automation rules. This includes the question decision 0006 left open:
   whether a proposal stays `propose` in a repository where a workflow it starts can deploy or
   holds a production credential. Decided by the owners of Atlantis, CI and Jira automation.
-  Until then, the interim refusals above apply.
+  Until then, only Atlantis comment commands make a tool `write`; built-in proposal tools stay
+  `propose` with the interim refusals in section 6, and the gap it names stays unguarded.
 - **Which AWS accounts are in scope** for broad reads and employees. Decided by the cloud
   platform team, as the data's owner. Until then no AWS account and no breadth resource is in
   any limit, so AWS inventory is served to no one.
-- **Who the security reviewer is** for data approvals. Decided by the security team. Until
-  then no resource is added to a group's limit and no breadth resource to a team's.
+- **Who the security reviewer and the security owner are:** the reviewer of data approvals,
+  and the named security owner who signs entries in decision 0010's register, including the
+  exception in section 9. Decided by the security team. Until then no resource is added to a
+  group's limit and no breadth resource to a team's, and the exception's register entry is
+  marked as awaiting that signature. The exception cannot be in force before #12 builds its
+  mechanism in any case.
+- **Who the code owners of the policy files are,** and the branch rule that requires their
+  review. Set by the repository administrator, with the owner naming the code owners. Until
+  then no policy file lands.
 - **Whether group limits and broad-read opt-ins expire** and are recertified, and how often.
   No recommendation was made. Decided by the owner with the security team, before
   milestone 5. Until then an approval stands until a reviewed change removes it.
-- **Whether a per-user rate limit is a prerequisite** for employee proposals. Part of Q12,
-  for the owner. It is answered before the first employee proposal tool is approved.
+- **Whether a per-user rate limit is a prerequisite** for employee proposals. No
+  recommendation was made. Tracked in Q12, for the owner. It is answered before the first
+  employee proposal tool is approved.
 - **How often the reach check runs,** which bounds how long a widened service account goes
-  unnoticed. Part of Q11, for the owner. A proxied entry is not exposed outside development
-  and test deployments until it is set.
+  unnoticed. No recommendation was made. Tracked in Q11, for the owner. A proxied entry is not
+  exposed outside development and test deployments until it is set.
 - **Asks of IT and vendor administrators:** who creates and owns the gateway's narrow service
   accounts in Atlassian, Sumo Logic, MongoDB Atlas and AWS; agreement that changes to them go
   through the tool's approval; any administrative credential the reach check needs to read a
@@ -622,7 +692,8 @@ while they are open: each says what holds until it is answered.
   vendor's administrators. Until then no proxied entry is exposed, since none has a narrow
   credential or a recorded test, and no per-user grant exists.
 - **Asks of Otto's owners:** review the declarations for Otto's eighteen tools; agree that
-  each team's repositories move from the team manifest into the snapshot's limits; check
-  Otto's proposal tools against the interim automation refusals; and decide whether
-  `gateway_audit` gains resource and credential-identity columns. Decided by Otto's owners,
-  before milestone 4. Until then this gateway serves none of Otto's tools.
+  each team's repositories move from the team manifest into the snapshot's limits; and check
+  Otto's proposal tools against the interim automation refusals. Decided by Otto's owners,
+  before milestone 4. Until then this gateway serves none of Otto's tools. Whether
+  `gateway_audit` gains columns for resources, the credential identity and the error kind is
+  not asked here: it is the question about Otto's audit table in Q12.
