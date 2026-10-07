@@ -1103,6 +1103,87 @@ mutate_all(
 )
 
 
+# --- gateway path --------------------------------------------------------------------------
+
+GW_PATH = GW + "path.rs"
+LIST_SURFACE = (
+    "self.entries(snapshot.surface(&surface).map(|surface| surface.tools.iter()"
+    ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
+)
+
+mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
+       "        let admitted = match self.admit(method, headers) {\n",
+       "        if let Err(rejection) = gateway_mcp::parse(method, headers, body) {\n"
+       "            return rejection.response();\n        }\n"
+       "        let admitted = match self.admit(method, headers) {\n")
+mutate("gw-transport-after-identity", "identity is checked before the transport checks", GW_PATH,
+       "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n"
+       "        let gates = &self.inner.gates;\n",
+       "        let gates = &self.inner.gates;\n"
+       "        if let Verification::Failed(_) = gates.identity().check(bearer_token(headers)) {\n"
+       "            return Err(Rejection::unauthorized(IDENTITY_FAILURE).response());\n        }\n"
+       "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n")
+mutate("gw-identity-detail-returned", "the identity failure's cause goes to the caller", GW_PATH,
+       "Err(Rejection::unauthorized(IDENTITY_FAILURE).response())",
+       "Err(Rejection::unauthorized(&failure.detail().to_string()).response())")
+mutate("gw-missing-token-distinct", "a caller with no token gets a different body", GW_PATH,
+       "Err(Rejection::unauthorized(IDENTITY_FAILURE).response())",
+       "Err(Rejection::unauthorized(if *failure.detail() == gateway_identity::VerifyError::MissingToken "
+       '{ "No token was presented." } else { IDENTITY_FAILURE }).response())')
+mutate("gw-bearer-duplicate-accepted", "the first of two Authorization headers is used", GW_PATH,
+       "    if values.next().is_some() {\n        return None;\n    }\n", "")
+mutate("gw-bearer-scheme-case-sensitive", "only `Bearer` spelled with one capital is accepted", GW_PATH,
+       '.eq_ignore_ascii_case("bearer")', '.eq("Bearer")')
+mutate("gw-bearer-any-scheme", "a token under any scheme is accepted", GW_PATH,
+       '.eq_ignore_ascii_case("bearer")', '.ne("")')
+mutate("gw-tool-use-id-unbounded", "a tool-use identifier of any length reaches the row", GW_PATH,
+       "        && value.len() <= MAX_TOOL_USE_ID\n", "")
+mutate("gw-tool-use-id-any-characters", "a tool-use identifier with control characters reaches the row", GW_PATH,
+       "\n        && value.bytes().all(|byte| byte.is_ascii_graphic());", ";")
+mutate("gw-tool-use-id-dropped", "the tool-use identifier never reaches the row", GW_PATH,
+       "tool_use_id: bounded_tool_use_id(tool_use_id),",
+       "tool_use_id: bounded_tool_use_id(tool_use_id).filter(|_| false),")
+mutate("gw-resources-always-empty", "the resource adapter is ignored", GW_PATH,
+       "            Some((tool, adapter)) => adapter.resources(tool, arguments),",
+       "            Some(_) => Resources::Named(Vec::new()),")
+mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the requested name", GW_PATH,
+       "gates.resource_adapter(&tool.connector)?",
+       "gates.resource_adapter(&gateway_core::ConnectorName::new(requested.as_str()))"
+       ".or(gates.resource_adapter(&tool.connector))?")
+mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
+       "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
+       "        let Caller::Proved(principal) = caller else {\n"
+       "            let snapshot = self.inner.gates.snapshot();\n"
+       f"            return {LIST_SURFACE};\n        }};\n")
+mutate("gw-list-unfiltered", "tools/list returns every tool on the surface, undecided", GW_PATH,
+       "        let caller = self.caller_context(principal, surface);\n"
+       "        self.entries(list_tools(self.inner.gates.snapshot(), &caller))\n",
+       "        let _ = principal;\n        let snapshot = self.inner.gates.snapshot();\n"
+       f"        {LIST_SURFACE}\n")
+mutate("gw-disabled-identity-unannounced", "initialize does not say identity is disabled", GW_PATH,
+       "        notes.push(IDENTITY_DISABLED_NOTE);\n", "")
+mutate("gw-disabled-audit-unannounced", "initialize does not say audit is disabled", GW_PATH,
+       "        notes.push(AUDIT_DISABLED_NOTE);\n", "")
+mutate("gw-refusal-answered-as-success", "a scope refusal is answered as a result with isError false", GW_PATH,
+       "Answer::Refused(sentence) => Reply::Denied(sentence),",
+       "Answer::Refused(sentence) => Reply::ToolOk(Value::from(sentence)),")
+mutate("gw-audit-failed-as-tool-error", "an unrecorded scope refusal is answered as a tool error", GW_PATH,
+       "Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),",
+       "Answer::AuditFailed { sentence } => Reply::ToolError(sentence.to_owned()),")
+mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a result", GW_PATH,
+       "Answer::Error(message) => Reply::ToolError(message),",
+       "Answer::Error(message) => Reply::Denied(message),")
+mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
+       "        if let Some(failure) = finished.failure() {\n",
+       "        if let Some(failure) = finished.failure() {\n"
+       "            return Reply::Denied(failure.sentence().to_owned());\n")
+mutate("gw-latency-not-measured", "every call is recorded as taking no time", GW_PATH,
+       "let latency_ms = elapsed_millis(gates.clock().as_ref(), started);",
+       "let latency_ms = 0;")
+mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
+       "read_only: tool.classification == Classification::Read,", "read_only: true,")
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
