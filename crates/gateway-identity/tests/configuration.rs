@@ -7,12 +7,15 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use gateway_core::{IDENTITY_FAILURE, Principal, Verifier};
 use gateway_identity::{
-    ConfigError, Identity, IdentityConfig, IssuerConfig, IssuerKind, MAX_LEEWAY, SigningAlgorithm,
-    TokenVerifier, Verification, VerificationState, VerifyError,
+    ConfigError, Identity, IdentityConfig, IssuerConfig, IssuerKind, MAX_LEEWAY, MIN_RSA_BITS,
+    SigningAlgorithm, TokenVerifier, Verification, VerificationState, VerifyError,
 };
 use gateway_testkit::{FixedClock, SteppableClock};
+use jsonwebtoken::jwk::{Jwk, KeyAlgorithm, KeyOperations, PublicKeyUse};
 use serde_json::json;
 
 use common::{AUDIENCE, Kind, LEEWAY, NOW, Setup, setups};
@@ -34,12 +37,36 @@ fn verify(verifier: &TokenVerifier, token: &str) -> Result<Principal, VerifyErro
         .map_err(|failure| failure.detail().clone())
 }
 
+/// An RSA modulus of `bytes` bytes whose first byte is `top` and the rest all ones.
+fn modulus(top: u8, bytes: usize) -> Vec<u8> {
+    let mut modulus = vec![0xff; bytes];
+    modulus[0] = top;
+    modulus
+}
+
+/// An RSA public key with this modulus, as a JWK. Not half of any key pair: configuration can
+/// only check a key's shape and length, and that is what these are for.
+fn rsa_jwk(kid: &str, modulus: &[u8]) -> Jwk {
+    serde_json::from_value(json!({
+        "kty": "RSA", "kid": kid, "n": URL_SAFE_NO_PAD.encode(modulus), "e": "AQAB",
+    }))
+    .unwrap()
+}
+
+/// `setup`'s issuer with one key, `key`.
+fn with_only(setup: &Setup, key: Jwk) -> IssuerConfig {
+    let mut config = setup.config();
+    config.keys.keys = vec![key];
+    config
+}
+
 #[test]
 fn configuration_that_could_never_verify_or_is_ambiguous_is_refused() {
     let es_user = setup(SigningAlgorithm::Es256, Kind::User);
     let es_workload = setup(SigningAlgorithm::Es256, Kind::Workload);
     let rs_user = setup(SigningAlgorithm::Rs256, Kind::User);
     let name: gateway_core::Issuer = es_user.issuer.issuer().into();
+    let rs_name: gateway_core::Issuer = rs_user.issuer.issuer().into();
     let table: Vec<(&str, IssuerConfig, ConfigError)> =
         vec![
             (
@@ -237,6 +264,98 @@ fn configuration_that_could_never_verify_or_is_ambiguous_is_refused() {
                     issuer: name.clone(),
                     kid: "bad-base64".into(),
                     algorithm: "ES256",
+                },
+            ),
+            (
+                "a 512-bit RSA key",
+                with_only(&rs_user, rsa_jwk("short", &modulus(0xff, 64))),
+                ConfigError::WeakKey {
+                    issuer: rs_name.clone(),
+                    kid: "short".into(),
+                    bits: 512,
+                },
+            ),
+            (
+                "an RSA key one bit short",
+                with_only(&rs_user, rsa_jwk("short", &modulus(0x7f, 256))),
+                ConfigError::WeakKey {
+                    issuer: rs_name.clone(),
+                    kid: "short".into(),
+                    bits: 2047,
+                },
+            ),
+            (
+                "an RSA key a byte short, written with a leading zero byte",
+                with_only(
+                    &rs_user,
+                    rsa_jwk("short", &[&[0][..], &modulus(0xff, 255)].concat()),
+                ),
+                ConfigError::WeakKey {
+                    issuer: rs_name.clone(),
+                    kid: "short".into(),
+                    bits: 2040,
+                },
+            ),
+            (
+                "an RSA key whose modulus is zero",
+                with_only(&rs_user, rsa_jwk("zero", &[0; 256])),
+                ConfigError::KeyDoesNotFit {
+                    issuer: rs_name.clone(),
+                    kid: "zero".into(),
+                    algorithm: "RS256",
+                },
+            ),
+            (
+                "an RSA key that says it is for another algorithm",
+                {
+                    let mut config = rs_user.config();
+                    config.keys.keys[0].common.key_algorithm = Some(KeyAlgorithm::RS512);
+                    config
+                },
+                ConfigError::KeyDoesNotFit {
+                    issuer: rs_name.clone(),
+                    kid: rs_user.issuer.key_id().to_owned(),
+                    algorithm: "RS256",
+                },
+            ),
+            (
+                "an RSA key that says it is for encryption",
+                {
+                    let mut config = rs_user.config();
+                    config.keys.keys[0].common.public_key_use = Some(PublicKeyUse::Encryption);
+                    config
+                },
+                ConfigError::KeyDoesNotFit {
+                    issuer: rs_name.clone(),
+                    kid: rs_user.issuer.key_id().to_owned(),
+                    algorithm: "RS256",
+                },
+            ),
+            (
+                "a key whose operations are for encryption",
+                {
+                    let mut config = es_user.config();
+                    config.keys.keys[0].common.key_operations =
+                        Some(vec![KeyOperations::Encrypt, KeyOperations::WrapKey]);
+                    config
+                },
+                ConfigError::KeyDoesNotFit {
+                    issuer: name.clone(),
+                    kid: es_user.issuer.key_id().to_owned(),
+                    algorithm: "ES256",
+                },
+            ),
+            (
+                "a key listed only for signing",
+                {
+                    let mut config = rs_user.config();
+                    config.keys.keys[0].common.key_operations = Some(vec![KeyOperations::Sign]);
+                    config
+                },
+                ConfigError::KeyDoesNotFit {
+                    issuer: rs_name.clone(),
+                    kid: rs_user.issuer.key_id().to_owned(),
+                    algorithm: "RS256",
                 },
             ),
         ];
@@ -477,4 +596,39 @@ fn leeway_is_at_most_five_minutes() {
         build(vec![config]).unwrap_err(),
         ConfigError::LeewayTooLarge(setup.issuer.issuer().into())
     );
+}
+
+/// An RSA key of exactly [`MIN_RSA_BITS`] is accepted, counted in bits and not in bytes, and a
+/// leading zero byte in its modulus is not counted.
+#[test]
+fn an_rsa_key_of_2048_bits_is_accepted() {
+    assert_eq!(MIN_RSA_BITS, 2048);
+    let setup = setup(SigningAlgorithm::Rs256, Kind::Workload);
+    for modulus in [
+        modulus(0x80, 256),
+        [&[0][..], &modulus(0x80, 256)].concat(),
+        modulus(0xff, 512),
+    ] {
+        assert!(build(vec![with_only(&setup, rsa_jwk("long", &modulus))]).is_ok());
+    }
+}
+
+/// A key may list the operations it is for, as long as verifying is one of them.
+#[test]
+fn a_key_listing_verify_among_its_operations_is_used() {
+    for setup in setups() {
+        for operations in [
+            vec![KeyOperations::Verify],
+            vec![KeyOperations::Sign, KeyOperations::Verify],
+        ] {
+            let mut config = setup.config();
+            config.keys.keys[0].common.key_operations = Some(operations);
+            let verifier = build(vec![config]).unwrap();
+            assert_eq!(
+                verify(&verifier, &setup.token().build()),
+                Ok(setup.principal()),
+                "{setup:?}"
+            );
+        }
+    }
 }

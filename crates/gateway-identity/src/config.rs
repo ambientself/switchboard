@@ -18,6 +18,11 @@ pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
 /// would turn the time checks off without anyone having said so.
 pub const MAX_LEEWAY: Duration = Duration::from_secs(300);
 
+/// The smallest RSA modulus accepted, in bits. Keys shorter than this have been retired for
+/// signatures since 2013 (NIST SP 800-131A), and identity providers publish 2048-bit keys or
+/// longer.
+pub const MIN_RSA_BITS: usize = 2048;
+
 /// The one signing algorithm an issuer's tokens may use. Deliberately only two: a token's
 /// header never chooses its algorithm, the issuer's configuration does, and there is no
 /// `none` and no HMAC to choose.
@@ -164,7 +169,7 @@ pub enum ConfigError {
         kid: String,
     },
     /// A key that is not of the kind, or on the curve, the issuer's algorithm needs, or that
-    /// declares itself for another algorithm or another use.
+    /// declares itself for another algorithm, use or operation, or is not a key at all.
     #[error("issuer `{issuer}` key `{kid}` cannot verify {algorithm} signatures")]
     KeyDoesNotFit {
         /// The issuer.
@@ -173,5 +178,18 @@ pub enum ConfigError {
         kid: String,
         /// The algorithm the issuer is configured with.
         algorithm: &'static str,
+    },
+    /// An RSA key shorter than [`MIN_RSA_BITS`].
+    #[error(
+        "issuer `{issuer}` key `{kid}` is a {bits}-bit RSA key, shorter than {} bits",
+        MIN_RSA_BITS
+    )]
+    WeakKey {
+        /// The issuer.
+        issuer: Issuer,
+        /// The key.
+        kid: String,
+        /// The length of its modulus.
+        bits: usize,
     },
 }

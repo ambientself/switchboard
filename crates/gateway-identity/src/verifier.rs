@@ -7,12 +7,16 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use gateway_core::{GroupId, Principal, PrincipalId, PrincipalKind, Verifier};
-use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm, KeyOperations, PublicKeyUse,
+};
 use jsonwebtoken::{DecodingKey, Validation};
 use serde_json::{Map, Value};
 
 use crate::clock::{Clock, unix_seconds};
-use crate::config::{ConfigError, IssuerConfig, IssuerKind, MAX_LEEWAY, SigningAlgorithm};
+use crate::config::{
+    ConfigError, IssuerConfig, IssuerKind, MAX_LEEWAY, MIN_RSA_BITS, SigningAlgorithm,
+};
 use crate::error::{Claim, IdentityFailure, VerifyError};
 
 /// The largest token accepted, in bytes. Larger than any token an identity provider issues for
@@ -206,14 +210,9 @@ impl Entry {
                 .key_id
                 .clone()
                 .ok_or_else(|| ConfigError::KeyWithoutId(issuer.clone()))?;
-            let fits = key_fits(jwk, config.algorithm);
-            let decoded = DecodingKey::from_jwk(jwk).ok().filter(|_| fits);
-            let Some(decoded) = decoded else {
-                return Err(ConfigError::KeyDoesNotFit {
-                    issuer,
-                    kid,
-                    algorithm: config.algorithm.as_str(),
-                });
+            let decoded = match decoding_key(jwk, config.algorithm) {
+                Ok(decoded) => decoded,
+                Err(unfit) => return Err(unfit.error(issuer, kid, config.algorithm)),
             };
             if keys.insert(kid.clone(), decoded).is_some() {
                 return Err(ConfigError::DuplicateKeyId { issuer, kid });
@@ -231,8 +230,59 @@ impl Entry {
     }
 }
 
+/// Why a key cannot verify an issuer's signatures.
+enum Unfit {
+    /// Not of the kind the algorithm needs, declared for something else, or not a key.
+    DoesNotFit,
+    /// An RSA key with a modulus of this many bits, fewer than [`MIN_RSA_BITS`].
+    Weak(usize),
+}
+
+impl Unfit {
+    /// The configuration error that reports this key.
+    fn error(
+        self,
+        issuer: gateway_core::Issuer,
+        kid: String,
+        algorithm: SigningAlgorithm,
+    ) -> ConfigError {
+        match self {
+            Unfit::DoesNotFit => ConfigError::KeyDoesNotFit {
+                issuer,
+                kid,
+                algorithm: algorithm.as_str(),
+            },
+            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },
+        }
+    }
+}
+
+/// The key a JWK gives for verifying `algorithm` signatures, or why it gives none.
+fn decoding_key(jwk: &Jwk, algorithm: SigningAlgorithm) -> Result<DecodingKey, Unfit> {
+    if !key_fits(jwk, algorithm) {
+        return Err(Unfit::DoesNotFit);
+    }
+    if let AlgorithmParameters::RSA(params) = &jwk.algorithm {
+        let bits = modulus_bits(&params.n).ok_or(Unfit::DoesNotFit)?;
+        if bits < MIN_RSA_BITS {
+            return Err(Unfit::Weak(bits));
+        }
+    }
+    DecodingKey::from_jwk(jwk).map_err(|_| Unfit::DoesNotFit)
+}
+
+/// The length in bits of an RSA modulus written as base64url, not counting leading zeros.
+/// `None` if it is not base64url, or is zero.
+fn modulus_bits(n: &str) -> Option<usize> {
+    let bytes = URL_SAFE_NO_PAD.decode(n).ok()?;
+    let mut significant = bytes.iter().skip_while(|&&byte| byte == 0);
+    let top = significant.next()?;
+    let unused = usize::try_from(top.leading_zeros()).ok()?;
+    Some((significant.count() + 1) * 8 - unused)
+}
+
 /// Whether a JWK is of the kind `algorithm` needs, and does not say it is for something else.
-fn key_fits(jwk: &jsonwebtoken::jwk::Jwk, algorithm: SigningAlgorithm) -> bool {
+fn key_fits(jwk: &Jwk, algorithm: SigningAlgorithm) -> bool {
     let shape = match (&jwk.algorithm, algorithm) {
         (AlgorithmParameters::RSA(_), SigningAlgorithm::Rs256) => true,
         (AlgorithmParameters::EllipticCurve(params), SigningAlgorithm::Es256) => {
@@ -250,7 +300,14 @@ fn key_fits(jwk: &jsonwebtoken::jwk::Jwk, algorithm: SigningAlgorithm) -> bool {
         jwk.common.public_key_use,
         None | Some(PublicKeyUse::Signature)
     );
-    shape && declared_algorithm && declared_use
+    // `key_ops`, when present, must include verifying: a key listed only for encrypting, or
+    // only for signing, is not one a verifier should use.
+    let declared_operations = jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_none_or(|operations| operations.contains(&KeyOperations::Verify));
+    shape && declared_algorithm && declared_use && declared_operations
 }
 
 /// Why `jsonwebtoken` could not parse a token's header.

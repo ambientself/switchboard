@@ -28,7 +28,7 @@ mod verifier;
 pub use clock::{Clock, SystemClock};
 pub use config::{
     ConfigError, DEFAULT_GROUPS_CLAIM, IdentityConfig, IssuerConfig, IssuerKind, MAX_LEEWAY,
-    SigningAlgorithm,
+    MIN_RSA_BITS, SigningAlgorithm,
 };
 pub use error::{Claim, IdentityFailure, VerifyError};
 pub use identity::{Identity, Verification, VerificationState};

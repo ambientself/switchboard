@@ -776,14 +776,34 @@ mutate("identity-config-key-without-kid-allowed", "a key with no kid is given a 
        "                .ok_or_else(|| ConfigError::KeyWithoutId(issuer.clone()))?;", "                .unwrap_or_default();")
 mutate("identity-config-duplicate-kid-allowed", "two keys can share a kid", V,
        "            if keys.insert(kid.clone(), decoded).is_some() {", "            if keys.insert(kid.clone(), decoded).is_some() && false {")
+FITS = "    shape && declared_algorithm && declared_use && declared_operations"
 mutate("identity-config-key-shape-ignored", "a key of the wrong type is accepted for the issuer's algorithm", V,
-       "    shape && declared_algorithm && declared_use", "    declared_algorithm && declared_use")
+       FITS, "    declared_algorithm && declared_use && declared_operations")
 mutate("identity-config-key-curve-ignored", "an EC key on another curve is accepted for ES256", V,
        "            params.curve == EllipticCurve::P256", "            true")
 mutate("identity-config-key-algorithm-ignored", "a key that declares another algorithm is accepted", V,
-       "    shape && declared_algorithm && declared_use", "    shape && declared_use")
+       FITS, "    shape && declared_use && declared_operations")
 mutate("identity-config-key-use-ignored", "a key that declares itself for encryption is accepted", V,
-       "    shape && declared_algorithm && declared_use", "    shape && declared_algorithm")
+       FITS, "    shape && declared_algorithm && declared_operations")
+mutate("identity-config-key-ops-ignored", "a key whose key_ops leave out verify is accepted", V,
+       FITS, "    shape && declared_algorithm && declared_use")
+mutate("identity-config-key-ops-any-listed", "a key that lists any operation is accepted", V,
+       "        .is_none_or(|operations| operations.contains(&KeyOperations::Verify));",
+       "        .is_none_or(|operations| !operations.is_empty());")
+RSA_LENGTH = "        if bits < MIN_RSA_BITS {"
+mutate("identity-config-rsa-length-unchecked", "an RSA key of any length is accepted", V, RSA_LENGTH, "        if false {")
+mutate("identity-config-rsa-length-boundary", "an RSA key of exactly the minimum length is refused", V, RSA_LENGTH,
+       "        if bits <= MIN_RSA_BITS {")
+MODULUS_BITS = "    Some((significant.count() + 1) * 8 - unused)"
+mutate("identity-config-rsa-length-in-bytes", "an RSA modulus is measured in whole bytes, leading zeros and all", V, MODULUS_BITS,
+       "    Some(bytes.len() * 8 + 0 * unused + 0 * significant.count())")
+mutate("identity-config-rsa-length-ignores-top-byte", "the unused bits of a modulus's top byte are counted", V, MODULUS_BITS,
+       "    Some((significant.count() + 1) * 8 + 0 * unused)")
+mutate("identity-config-rsa-zero-modulus-allowed", "a modulus of zero is measured as one byte", V,
+       "    let top = significant.next()?;", "    let top = significant.next().unwrap_or(&0xff);")
+mutate("identity-config-weak-key-reported-as-unfit", "a short RSA key is reported as a key of the wrong kind", V,
+       "            Unfit::Weak(bits) => ConfigError::WeakKey { issuer, kid, bits },",
+       "            Unfit::Weak(_) => ConfigError::KeyDoesNotFit { issuer, kid, algorithm: algorithm.as_str() },")
 LEEWAY = "        if config.leeway > MAX_LEEWAY {"
 mutate("identity-config-leeway-unbounded", "an issuer can be configured with any leeway", V, LEEWAY, "        if false {")
 mutate("identity-config-leeway-boundary", "a leeway of exactly the maximum is refused", V, LEEWAY, "        if config.leeway >= MAX_LEEWAY {")
