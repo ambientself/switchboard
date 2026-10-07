@@ -1,0 +1,391 @@
+//! The HTTP endpoint over loopback: the gateway serves the testkit's world on `127.0.0.1:0`, and
+//! each test talks to it over a TCP socket with hand-written HTTP/1.1.
+//!
+//! The request path's own behaviour is tested in `path.rs`. These tests cover what the HTTP
+//! layer adds: the host and origin checks, the body limit, identity before the body is read, a
+//! task per answer that a disconnect cannot cancel, and shutting down.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
+
+use std::time::Duration;
+
+use gateway::MAX_BODY_BYTES;
+use gateway_core::audit::{Completion, DecisionKind, Outcome};
+use gateway_mcp::{LEGACY, MODERN, PARSE_ERROR};
+use gateway_testkit::{Caller, READ_TOOL, SURFACE_READ, TEAM_B_DOCUMENT};
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+
+use support::{ALLOWED_ORIGIN, Http, PATIENCE, Server, eventually, exchange, legacy, read_answer};
+
+const FORBIDDEN_HOST: &str = "Forbidden: host not allowed";
+const FORBIDDEN_ORIGIN: &str = "Forbidden: origin not allowed";
+
+// --- The endpoint answers --------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_client_is_answered_and_its_calls_recorded_over_loopback() {
+    let server = Server::start().await;
+    let token = server.token(Caller::TeamA);
+
+    let initialized = server
+        .post(
+            SURFACE_READ,
+            &legacy(
+                "initialize",
+                json!({"protocolVersion": MODERN, "capabilities": {}}),
+            ),
+        )
+        .bearer(&token)
+        .send(&server)
+        .await;
+    assert_eq!(initialized.header("content-type"), Some("application/json"));
+    assert_eq!(initialized.result()["protocolVersion"], json!(LEGACY));
+
+    let notified = server
+        .post(
+            SURFACE_READ,
+            &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .bearer(&token)
+        .send(&server)
+        .await;
+    assert_eq!(notified.status, 202, "{notified:?}");
+    assert!(notified.body.is_empty());
+
+    let listed = server
+        .post(SURFACE_READ, &legacy("tools/list", json!({})))
+        .bearer(&token)
+        .send(&server)
+        .await;
+    let tools = listed.result()["tools"].clone();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&READ_TOOL), "{names:?}");
+
+    // The 2026-07-28 era, over the same endpoint with no session.
+    let modern = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": {
+        "io.modelcontextprotocol/protocolVersion": MODERN,
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }}});
+    let listed = server
+        .post(SURFACE_READ, &modern)
+        .header("mcp-protocol-version", MODERN)
+        .header("mcp-method", "tools/list")
+        .bearer(&token)
+        .send(&server)
+        .await;
+    assert_eq!(listed.result()["cacheScope"], json!("private"));
+
+    let read = server
+        .call(
+            Caller::TeamA,
+            SURFACE_READ,
+            READ_TOOL,
+            json!({"document": Caller::TeamA.own_document()}),
+        )
+        .send(&server)
+        .await;
+    assert_eq!(read.result()["isError"], json!(false));
+    assert_eq!(read.result()["structuredContent"]["tool"], json!(READ_TOOL));
+
+    let denied = server
+        .call(
+            Caller::TeamA,
+            SURFACE_READ,
+            READ_TOOL,
+            json!({"document": TEAM_B_DOCUMENT}),
+        )
+        .send(&server)
+        .await;
+    let sentence = denied.denial();
+    assert!(sentence.contains(TEAM_B_DOCUMENT), "{sentence}");
+
+    let rows = server.store.rows();
+    assert_eq!(rows.len(), 2, "one row per call, none for anything else");
+    assert_eq!(rows[0].decision, DecisionKind::Allow);
+    assert_eq!(
+        rows[0].completion.as_ref().map(|c| c.outcome.clone()),
+        Some(Outcome::Ok)
+    );
+    assert_eq!(rows[1].decision, DecisionKind::Deny);
+    assert_eq!(server.connector.received().len(), 1);
+}
+
+#[tokio::test]
+async fn a_path_that_is_not_a_surface_is_not_found() {
+    let server = Server::start().await;
+    let token = server.token(Caller::TeamA);
+    for target in [
+        "/",
+        "/mcp",
+        "/mcp/",
+        "/other/fixture-read",
+        "/mcp/fixture-read/extra",
+    ] {
+        let mut request = server
+            .post(SURFACE_READ, &legacy("ping", json!({})))
+            .bearer(&token);
+        request.target = target.to_owned();
+        assert_eq!(request.send(&server).await.status, 404, "{target}");
+    }
+    server.assert_nothing_ran();
+}
+
+// --- Host and Origin ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_host_that_is_not_allowed_is_refused_before_identity() {
+    let server = Server::start().await;
+    let port = server.address.port();
+    let ping = || {
+        server
+            .post(SURFACE_READ, &legacy("ping", json!({})))
+            .without("host")
+    };
+
+    for host in [
+        "evil.example".to_owned(),
+        format!("evil.example:{port}"),
+        format!("localhost.evil.example:{port}"),
+        format!("127.0.0.2:{port}"),
+    ] {
+        let answer = ping().header("host", &host).send(&server).await;
+        answer.assert_forbidden(FORBIDDEN_HOST);
+    }
+    ping().send(&server).await.assert_forbidden(FORBIDDEN_HOST);
+    ping()
+        .header("host", &format!("localhost:{port}"))
+        .header("host", "evil.example")
+        .send(&server)
+        .await
+        .assert_forbidden(FORBIDDEN_HOST);
+    server.assert_nothing_ran();
+
+    // An allowed host, with or without its port and in any case, reaches identity.
+    for host in [format!("LocalHost:{port}"), "127.0.0.1".to_owned()] {
+        ping()
+            .header("host", &host)
+            .send(&server)
+            .await
+            .assert_unauthorized();
+    }
+}
+
+#[tokio::test]
+async fn an_origin_that_is_not_allowed_is_refused_before_identity() {
+    let server = Server::start().await;
+    let ping = || server.post(SURFACE_READ, &legacy("ping", json!({})));
+
+    for origin in ["http://evil.example", "null", "http://localhost:3001"] {
+        let answer = ping().header("origin", origin).send(&server).await;
+        answer.assert_forbidden(FORBIDDEN_ORIGIN);
+    }
+    ping()
+        .header("origin", ALLOWED_ORIGIN)
+        .header("origin", "http://evil.example")
+        .send(&server)
+        .await
+        .assert_forbidden(FORBIDDEN_ORIGIN);
+    server.assert_nothing_ran();
+
+    // An allowed origin reaches identity, and with a token is served.
+    ping()
+        .header("origin", ALLOWED_ORIGIN)
+        .send(&server)
+        .await
+        .assert_unauthorized();
+    let served = ping()
+        .header("origin", ALLOWED_ORIGIN)
+        .bearer(&server.token(Caller::TeamA))
+        .send(&server)
+        .await;
+    assert_eq!(served.result(), json!({}));
+}
+
+#[tokio::test]
+async fn a_request_with_no_origin_is_served() {
+    let server = Server::start().await;
+    let answer = server
+        .post(SURFACE_READ, &legacy("ping", json!({})))
+        .bearer(&server.token(Caller::TeamB))
+        .send(&server)
+        .await;
+    assert_eq!(answer.result(), json!({}));
+}
+
+// --- Transport and size ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn what_is_not_a_json_post_is_refused_before_identity() {
+    let server = Server::start().await;
+    let ping = || server.post(SURFACE_READ, &legacy("ping", json!({})));
+    for method in ["GET", "DELETE", "PUT"] {
+        let mut request = ping();
+        request.method = method.to_owned();
+        let answer = request.send(&server).await;
+        assert_eq!(answer.status, 405, "{method}: {answer:?}");
+        assert_eq!(answer.header("allow"), Some("POST"));
+    }
+    let answer = ping()
+        .without("content-type")
+        .header("content-type", "text/plain")
+        .send(&server)
+        .await;
+    assert_eq!(answer.status, 415, "{answer:?}");
+    let answer = ping()
+        .without("accept")
+        .header("accept", "text/event-stream")
+        .send(&server)
+        .await;
+    assert_eq!(answer.status, 406, "{answer:?}");
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn a_body_declared_too_large_is_refused_before_identity() {
+    let server = Server::start().await;
+    let request = server
+        .post(SURFACE_READ, &json!({}))
+        .header("content-length", &(MAX_BODY_BYTES + 1).to_string());
+    // The head only: the body is never sent, and is never waited for.
+    let answer = exchange(server.address, &request.head()).await;
+    assert_eq!(answer.status, 413, "{answer:?}");
+    assert_eq!(answer.error_message(), "Payload too large");
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn a_body_of_the_largest_size_is_read() {
+    let server = Server::start().await;
+    // Exactly the limit, declared and sent: read, and refused only because it is not JSON.
+    let answer = server
+        .post(SURFACE_READ, &json!({}))
+        .bearer(&server.token(Caller::TeamA))
+        .body(vec![b'x'; MAX_BODY_BYTES])
+        .send(&server)
+        .await;
+    assert_eq!(answer.status, 400, "{answer:?}");
+    assert_eq!(answer.json()["error"]["code"], json!(PARSE_ERROR));
+    server.assert_nothing_ran();
+}
+
+/// A chunked body: no length is declared, so the limit applies as the body is read.
+fn chunked(request: Http, size: usize) -> Vec<u8> {
+    let mut bytes = request.header("transfer-encoding", "chunked").head();
+    let chunk = 64 * 1024;
+    let mut left = size;
+    while left > 0 {
+        let this = left.min(chunk);
+        bytes.extend_from_slice(format!("{this:x}\r\n").as_bytes());
+        bytes.extend(std::iter::repeat_n(b'x', this));
+        bytes.extend_from_slice(b"\r\n");
+        left -= this;
+    }
+    bytes.extend_from_slice(b"0\r\n\r\n");
+    bytes
+}
+
+#[tokio::test]
+async fn a_body_that_grows_too_large_is_refused() {
+    let server = Server::start().await;
+    let token = server.token(Caller::TeamA);
+    let request = || {
+        server
+            .post(SURFACE_READ, &json!({}))
+            .bearer(&token)
+            .body(Vec::new())
+    };
+
+    let answer = exchange(server.address, &chunked(request(), MAX_BODY_BYTES + 1)).await;
+    assert_eq!(answer.status, 413, "{answer:?}");
+    assert_eq!(answer.error_message(), "Payload too large");
+
+    let answer = exchange(server.address, &chunked(request(), MAX_BODY_BYTES)).await;
+    assert_eq!(answer.status, 400, "the largest body is read: {answer:?}");
+    assert_eq!(answer.json()["error"]["code"], json!(PARSE_ERROR));
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn identity_is_checked_before_the_body_is_read() {
+    let server = Server::start().await;
+    // A body that has started and never finishes. Without a token the answer comes at once.
+    let mut bytes = server
+        .post(SURFACE_READ, &json!({}))
+        .header("transfer-encoding", "chunked")
+        .head();
+    bytes.extend_from_slice(b"10\r\n{\"jsonrpc\":\"2.0\"");
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    read_answer(&mut stream).await.assert_unauthorized();
+    server.assert_nothing_ran();
+}
+
+// --- The answer runs on its own task --------------------------------------------------------
+
+#[tokio::test]
+async fn a_tool_call_completes_its_row_after_its_client_has_gone() {
+    let server = Server::start().await;
+    let gate = server.connector.hang_next();
+    let request = server.call(
+        Caller::TeamA,
+        SURFACE_READ,
+        READ_TOOL,
+        json!({"document": Caller::TeamA.own_document()}),
+    );
+    let length = request.body.len().to_string();
+    let request = request.header("content-length", &length);
+    let mut bytes = request.head();
+    bytes.extend_from_slice(&request.body);
+
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    eventually("the call reaching the connector", || gate.waiting() == 1).await;
+    let row = server.store.row(0).unwrap();
+    assert_eq!((row.decision, row.completion), (DecisionKind::Allow, None));
+
+    // The client goes away while the tool is running, and the server notices.
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    gate.open();
+    eventually("the row's completion", || {
+        server.store.row(0).unwrap().completion.is_some()
+    })
+    .await;
+    assert_eq!(
+        server.store.row(0).unwrap().completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 0
+        })
+    );
+    assert_eq!(server.store.finish_attempts(), 1);
+}
+
+// --- Shutting down --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_server_stops_when_told_to() {
+    let mut server = Server::start().await;
+    let answer = server
+        .post(SURFACE_READ, &legacy("ping", json!({})))
+        .bearer(&server.token(Caller::TeamA))
+        .send(&server)
+        .await;
+    assert_eq!(answer.status, 200);
+
+    server.stop.take().unwrap().send(()).unwrap();
+    let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    stopped.expect("the server stopped").unwrap().unwrap();
+    assert!(
+        TcpStream::connect(server.address).await.is_err(),
+        "still listening"
+    );
+}
