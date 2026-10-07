@@ -281,7 +281,7 @@ fixed by the Ed25519 key that verifies it, one key per Otto environment. `aud` l
 gateway deployments it is for, two during the cutover. `iat` and `exp` bound its lifetime to
 at most 15 minutes, with 30 seconds of leeway. `pod` binds it to the sandbox pod's UID, by
 stage 3 at the latest. `egress` carries the turn's egress setting, which is recorded (decision
-0010, pull request #31). Within those bounds a grant may be presented any number of times, and
+0010). Within those bounds a grant may be presented any number of times, and
 every row records its digest, so reuse from another pod, or another deployment sharing this
 gateway's audit store, is one query. A call of any tool not classified `read` is also checked for currency: Otto's resolver
 says whether the turn is still current, which enforces the fencing epoch and lets Otto revoke
@@ -406,8 +406,8 @@ sandboxes.
 
 **A delegation can narrow further.** For an Otto turn, a tool the surface serves is still
 refused unless the turn's grant lists it. A grant only narrows: check 4 runs before check 5,
-so a grant that lists a `write` tool is still denied, unless the exception decision 0011 (pull
-request #32) records for Otto's two comment tools names it. Under the profile for Otto's
+so a grant that lists a `write` tool is still denied, unless the exception decision 0011
+records for Otto's two comment tools names it. Under the profile for Otto's
 sandboxes a call of any tool not classified `read` also needs a current control plane
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 

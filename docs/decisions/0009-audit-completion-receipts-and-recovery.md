@@ -5,10 +5,11 @@ Date: 2026-10-06, accepted 2026-10-07. Status: accepted. The owner accepted both
 owner's answers). Settles Q10, except what compliance requires of read auditing, which stays
 open (Still open 1); Q10 is narrowed to it. Other details need someone other than the owner,
 alone or with the owner. They are listed under Still open, with who decides and what holds
-until then. Fencing is not decided here; it moved to Q18. Written against [decision
+until then. Fencing is not decided here; it is [decision
+0012](0012-what-a-turn-grant-binds.md). Written against [decision
 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04 (`propose`, and `write`
 and `destructive` denied in every profile), and against the resources column on the audit
-record proposed in #30, which is not yet merged.
+record proposed in pull request #30, which is not yet merged.
 
 Part 1 covers every audit row and is needed before milestone 2. Part 2 covers receipts and is
 needed before the first tool not classified `read` reaches a real system. Both are accepted.
@@ -86,8 +87,8 @@ whatever was wrong with the grant, as in Otto.
 **`tools/list` is an audit row of its own kind.** It reaches decisions: it tells a caller what
 it may call. A list row has kind `list` where a call's row has kind `call`. It holds the policy
 revision and the names of the tools returned, each made safe, at most 64 with the rest
-counted, as the resources column proposed in #30 is bounded. It is written complete before the
-answer, has no deadline and no finish, and is never open.
+counted, as the resources column proposed in pull request #30 is bounded. It is written
+complete before the answer, has no deadline and no finish, and is never open.
 
 ### Row identifiers
 
@@ -431,10 +432,11 @@ itself: started with a snapshot holding a `propose` tool and no receipt store, i
 The rule holds whatever Q12 decides about opt-outs, which it recommends allowing only in
 development builds.
 
-Decision 0011 says that until receipts exist, only proposals that create something are served
-to employees and services. This record supersedes that sentence: until receipts exist no
-proposal is served at all. Once they exist, a proposal that changes something existing also
-needs the connector's creation check that decision 0011 describes.
+Decision 0011 says a proposal that changes something existing is `propose` only if its
+connector checks, from the gateway's receipts or a delegating control plane's resolver, that
+the gateway created it. This record goes further: until receipts exist no proposal is served
+at all, including one that creates something. Once they exist, a proposal that changes
+something existing also needs that creation check.
 
 ## How it is tested
 
@@ -600,8 +602,8 @@ this table are also in section 18 of the design.
 - Deployments set their termination grace period and readiness delay explicitly.
 - The resources a self-scoping tool actually reached belong in finish when they are added.
 - The grants and triggers do not protect rows against a database superuser who rewrites them.
-- Fencing is decided under Q18 (decision 0012). Nothing here depends on it. The window it
-  leaves for a replayed turn is stated once, under "What may be retried".
+- Fencing is decision 0012. Nothing here depends on it. The window it leaves for a replayed
+  turn is stated once, under "What may be retried".
 
 ## The owner's answers
 

@@ -4,8 +4,8 @@ Date: 2026-10-06. Status: accepted on 2026-10-07, when the owner accepted the re
 (see Decided by the owner). Settles the rest of Q9 after
 [decision 0006](0006-what-the-decision-function-sees.md) and the 2026-10-04 amendment to it,
 except the parts under Still open, which wait on other people. Written against that amendment
-and the audit row's resources column (pull request 30, design.md section 11), on the
-assumption that pull request 30 merges first. Its 64-resource bound, and its question about
+and the audit row's resources column (pull request #30, design.md section 11), on the
+assumption that pull request #30 merges first. Its 64-resource bound, and its question about
 Otto's `gateway_audit` table in Q12, are used below.
 
 ## Context
@@ -162,7 +162,8 @@ A proxied tool is exposed only when all of these hold.
   `read`, and it says nothing about which data the tool may show.
 - **Milestone 3 is in place,** outside development and test deployments: approval bound to
   the server's identity, route and credential configuration, destination limits and drift
-  detection. A self-built server accepts only the gateway's identity (Q17).
+  detection. A self-built server accepts only the gateway's own identities
+  ([decision 0010](0010-what-stops-an-agent-going-around-the-gateway.md)).
 
 Some arguments name a resource only through something the vendor resolves. An issue key names
 its project, and Jira keeps an issue's old key after the issue moves, so `OLD-123` may now be
@@ -291,7 +292,7 @@ that system, or are not served. The owner accepted this reading of Q3 on 2026-10
 
 **Employees start with `read` only.** The employee profile lists `propose` once, when the first
 system qualifies: its per-user grants work (encrypted storage, connection, refresh and
-revocation) and durable action receipts exist (Q10). A profile is a set of classifications
+revocation) and durable action receipts exist (decision 0009). A profile is a set of classifications
 with no per-system part. Which systems employees may propose in is therefore decided by which
 `propose` tools are put on employee surfaces, and rule 9 keeps those on per-user entries. That
 a system qualifies rests on the reviewer of the change that adds its tools. `write` and
@@ -423,8 +424,8 @@ hold:
   the connector hold it to them, as for any built-in tool.
 - **Every call is audited as usual,** and the row gives the exception as the reason the call
   was allowed.
-- **It is listed in the register of exceptions that decision 0010 keeps** (proposed in pull
-  request 31), with the owner as the person who accepted it. Like every entry there, it needs
+- **It is listed in the register of exceptions that [decision 0010](0010-what-stops-an-agent-going-around-the-gateway.md)
+  keeps,** with the owner as the person who accepted it. Like every entry there, it needs
   the signature of a named security owner, who has not been named yet (see Still open).
 - **It is reviewed on the register's cadence:** every 90 days, and when Otto's cutover (#13)
   completes. The review keeps it, narrows it or ends it.
@@ -474,7 +475,7 @@ gets wrong in the third column above; Otto's two comment tools, which act on pul
 and issues the gateway did not create, within the exception in section 9; until the
 automation owners answer, a proposal that starts an Atlantis autoplan or a pull request
 workflow that runs with the repository's secrets; and, on laptops, other routes to the vendor
-(Q17).
+(decision 0010).
 
 ## Alternatives rejected
 
@@ -547,12 +548,12 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
   principal, never the secret); and an error kind: invalid arguments, an oversized or late
   result from a `read` tool, a custodian refusal or a vendor refusal. `refused` now covers the
   credential layer's refusal as well as the connector's. An oversized or late result from any
-  other tool is `unknown`. The five outcomes are stated once, in decision 0009. Otto's `gateway_audit` table has none of these
-  columns, so they stay in this gateway's own record unless Otto adds them. Whether it gains
-  them is part of the question pull request 30 puts in Q12, whether that table gains a general
-  column and who adds it. That is its one home.
+  other tool is `unknown`. The five outcomes are stated once, in decision 0009. Otto's
+  `gateway_audit` table has none of these columns, so they stay in this gateway's own record
+  unless Otto adds them. Whether it gains them is part of the question pull request #30 puts
+  in Q12, whether that table gains a general column and who adds it. That is its one home.
 - Built-in `checks_own_scope` tools report the resources they reached when they finish, the
-  follow-up the resources column of pull request 30 left. This is required before milestone 4
+  follow-up the resources column of pull request #30 left. This is required before milestone 4
   brings Otto's code search over.
 - A withdrawal makes a snapshot with a revision of its own (section 4), so the snapshot type
   gains a way to be derived from another by removal.
@@ -635,8 +636,8 @@ the rest is under Still open.
   may change Otto's proposal tools.
 - **Self-built servers:** one team per server until its owner shows it keeps no state between
   calls. The owner states the backend's permissions in the approval, and rule 4 applies to
-  that statement. Self-built servers stay read-only until receipts exist (Q10) and a later
-  decision says what an owner must show for a server to propose.
+  that statement. Self-built servers stay read-only until receipts exist (decision 0009) and a
+  later decision says what an owner must show for a server to propose.
 - **A reach mismatch withdraws** the entry's tools. It does not only alert.
 - **Built-in `checks_own_scope` tools report what they reached before milestone 4,** so the
   rows can say which repositories Otto's code search reached.
