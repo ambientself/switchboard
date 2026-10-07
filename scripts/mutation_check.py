@@ -1132,6 +1132,17 @@ mutate("mcp-method-header-not-compared", "Mcp-Method is not compared with the bo
        "        Single::One(header) if header == method => {}", "        Single::One(header) if !header.is_empty() => {}")
 mutate("mcp-name-header-not-compared", "Mcp-Name is not compared with the body", MCP_PARSE,
        "        Some(decoded) if decoded == name => Ok(()),", "        Some(_) => Ok(()),")
+mutate("mcp-method-header-optional", "a modern request with no Mcp-Method header is served", MCP_PARSE,
+       '        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n'
+       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n',
+       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n')
+mutate("mcp-name-header-optional", "a modern tools/call with no Mcp-Name header is served", MCP_PARSE,
+       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n",
+       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n"
+       "    if matches!(single(headers, NAME_HEADER), Single::Absent) {\n        return Ok(());\n    }\n")
+mutate("mcp-duplicate-header-first-used", "the first of two copies of a single-valued MCP header is used", MCP + "headers.rs",
+       "    if values.next().is_some() {\n        return Single::Malformed;\n    }\n", "")
 mutate("mcp-name-sentinel-not-decoded", "the base64 sentinel in Mcp-Name is compared raw", MCP_PARSE,
        "    match header_name_value(header) {", "    match Some(header.to_owned()) {")
 mutate("mcp-modern-ping-served", "ping is served under 2026-07-28", MCP_PARSE,
