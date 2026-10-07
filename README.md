@@ -17,10 +17,24 @@ Gateway
 `752395a` (re-pinned 2026-10-01). It covers Otto's contract only, and not all of it; the
 gaps are listed in [docs/otto-baseline.md](docs/otto-baseline.md). The Rust gateway's policy
 core exists (`crates/gateway-core`: the decision function, its table of cases and the audit
-record type), but nothing serves requests yet.
+record type). The gateway serves MCP over HTTP in both revisions (`crates/gateway`), but only
+on test fakes: it has no durable audit store and no real connectors yet.
 
 Run the baseline with `python3 conformance/run.py --otto-source /path/to/otto`.
 See [conformance setup and coverage](conformance/README.md).
+
+## Running the gateway on fixtures
+
+```sh
+cargo run -p gateway-dev --bin switchboard-dev -- --once
+```
+
+This serves the gateway on `127.0.0.1:8471` over the test fakes, with real signed tokens from
+in-process issuers, and runs a scripted client against it in both MCP revisions. It prints
+every request, answer and audit row: team A reads its own document and is denied the other
+team's with a sentence naming it. Leave out `--once` to keep it serving, then use
+`switchboard-client` or point an MCP client at it. See
+[CONTRIBUTING.md](CONTRIBUTING.md#running-the-gateway-on-fixtures).
 
 ## Documents
 
