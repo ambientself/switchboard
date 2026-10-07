@@ -209,13 +209,14 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    an object in the schema lists its properties, any other property is refused, at any depth.
    The gateway forwards its own serialization of the arguments, never the caller's bytes. A
    call that fails is completed with outcome `error`, and nothing is forwarded. A built-in
-   connector parses the arguments into its own types instead.
+   connector parses the arguments into its own types instead. Either way, a side effect whose
+   arguments are refused has its receipt settled as `not_performed` with the row.
 8. **Run the tool** if allowed, with a brokered credential. The connector, the credential
    layer and the custodian may still refuse, never allow. A connector may refuse because of
    what the call names, such as a repository outside the team's scope. The gateway bounds the
    result's size and duration above any bound of the connector's own. A result over the bound
-   is never cut short silently: for a `read` tool it is outcome `error`, and for a `propose`
-   tool it is an outcome not known (`unknown`, decision 0009).
+   is never cut short silently: for a `read` tool it is outcome `error`, and for any other tool
+   it is `unknown` (decision 0009).
 9. **Complete the audit row** with the outcome (`ok`, `error`, `refused`, `unknown` or
    `duplicate`) and latency. The answer waits for this for at most the answer budget, and
    finish keeps retrying until its deadline.
@@ -574,12 +575,22 @@ written complete, has no finish, and is never open.
   the result.
 - **A call runs on a task of its own,** started before begin, not on the request's future
   (section 6).
-- **Five outcomes:** `ok`, `error` and `refused`, the last for a connector's scope refusal or a
-  `propose` tool's refusal (section 8); `unknown`, for a side effect sent with no definite
-  answer; and `duplicate`, when nothing ran because the same request was already completed. A
-  read never reports `unknown`. A side-effecting connector reports `error` only when it knows
-  the vendor did nothing. A proxied tool's error is `unknown` unless its approval says its
-  errors are safe.
+- **Five outcomes,** as decision 0009 states them:
+  - `ok`: the call completed.
+  - `error`: the call failed, with a kind: invalid arguments, an oversized or late result from
+    a `read` tool, a custodian refusal, a vendor refusal, or another failure. How a vendor
+    refusal is recognized is defined per connector. A side-effecting connector reports `error`
+    only when it knows the vendor did nothing.
+  - `refused`: a refusal after the decision that can never allow: a connector's scope refusal,
+    a `propose` tool's refusal (section 8), or the credential layer's refusal, such as an
+    employee with no grant. Nothing was sent.
+  - `unknown`: a side effect sent with no definite answer, including a result over the
+    gateway's bound from a tool not classified `read`. A read never reports it. A proxied
+    tool's error is `unknown` unless its approval says its errors are safe.
+  - `duplicate`: nothing ran because the same request was already completed.
+
+  For a side effect, `ok` settles the receipt as `completed`, `error` and `refused` as
+  `not_performed`, and `unknown` as `unknown`.
 - **The caller's tool-use identifier is recorded,** so a caller's control plane can look up
   the decision for a call it already knows about. Otto's does. The MCP specification defines
   no such identifier: Claude Code sends `claudecode/toolUseId` in `_meta`, and other clients
@@ -599,10 +610,6 @@ written complete, has no finish, and is never open.
   revision says exactly what it was.
 - **The credential identity used is recorded:** the mode and the vendor-side principal, never
   the secret.
-- **An `error` outcome has a kind:** invalid arguments, an oversized or late result, a
-  custodian refusal, or a vendor refusal. How a vendor refusal is recognized is defined per
-  connector. `refused` also covers the credential layer's refusal, such as an employee with no
-  grant.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as

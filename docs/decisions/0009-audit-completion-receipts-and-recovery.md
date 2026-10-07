@@ -168,13 +168,26 @@ test it on both.
 
 ### Outcomes
 
-`ok`, `error` and `refused` keep their meanings. Two are new. `unknown` applies to side effects
-only. It means the connector sent the request and got no definite answer: a timeout, a dropped
-connection, or a server error after the request was sent. A side-effecting connector reports
-`error` only when it knows the vendor did nothing, because the request failed before it was
-sent or the vendor definitely rejected it. A proxied tool's error is `unknown` unless its
-approval says its errors are safe. A read never reports `unknown`. `duplicate` belongs to
-part 2: nothing ran, because the same request was already completed.
+There are five outcomes. This is the one statement of them; design section 11 repeats it.
+
+- `ok`: the call completed.
+- `error`: the call failed, with an error kind from [decision
+  0011](0011-resource-authorization-and-tool-assurance.md): invalid arguments, an oversized or
+  late result from a `read` tool, a custodian refusal, a vendor refusal, or another failure. A
+  side-effecting connector reports `error` only when it knows the vendor did nothing, because
+  the request failed before it was sent or the vendor definitely rejected it.
+- `refused`: a refusal made after the decision that can never allow: a connector's scope
+  refusal, a `propose` tool's refusal (decision 0006), or the credential layer's refusal, such
+  as an employee with no grant (decision 0011). Nothing was sent.
+- `unknown`, new, for side effects only: the connector sent the request and got no definite
+  answer. That covers a timeout, a dropped connection, a server error after the request was
+  sent, and a result over the gateway's size or duration bound from a tool not classified
+  `read`. A proxied tool's error is `unknown` unless its approval says its errors are safe. A
+  read never reports `unknown`.
+- `duplicate`, new, part 2: nothing ran, because the same request was already completed.
+
+For a side effect, the outcome settles the receipt (part 2): `ok` as `completed`, `error` and
+`refused` as `not_performed`, and `unknown` as `unknown`.
 
 ### Open rows
 
@@ -257,7 +270,7 @@ it moves in the same transaction as the finish.
 | --- | --- |
 | `pending` | Reserved; no outcome yet. A receipt still `pending` after its row's deadline is treated as `unknown` wherever it is read. |
 | `completed` | The vendor confirmed the effect. Its reference is recorded. |
-| `not_performed` | Established, not assumed, that nothing took effect: the connector refused, the request was never sent, the vendor definitely rejected it, or an authoritative lookup found nothing. |
+| `not_performed` | Established, not assumed, that nothing took effect: the argument check, the credential layer, the custodian or the connector refused, the request was never sent, the vendor definitely rejected it, or an authoritative lookup found nothing. |
 | `unknown` | The request may have reached the vendor and the result is not known. |
 
 A receipt leaves `pending` once, for any of the other three. It leaves `unknown`, or a
@@ -273,9 +286,14 @@ fields and the tool, and reconciliation needs the resources. Whether receipts ne
 protection than this is part of Still open 7.
 
 When the instance making a call knows nothing was sent, it settles the receipt as
-`not_performed` itself and completes the row as `error`. That happens when the caller
-disconnected before the connector was called, and when begin was never confirmed; in the
-second case it keeps trying on the finish pool until the finish deadline. A late finish that
+`not_performed` itself, in the same transaction as the row's completion. The row is completed
+as `error` when the caller disconnected before the connector was called, when begin was never
+confirmed, and when the arguments were refused before anything was sent: by the gateway's
+argument check for a proxied tool ([decision
+0011](0011-resource-authorization-and-tool-assurance.md)), which runs after begin, or by a
+built-in connector's own parsing. In the second case it keeps trying on the finish pool until
+the finish deadline. A refusal by the credential layer or the connector is completed as `refused`, and a
+custodian refusal as `error`, with the receipt `not_performed` in each case. A late finish that
 disagrees with a receipt reconciliation has already settled is written to the row. The
 receipt is left as it is, and the disagreement is logged and counted; alerting waits for Still
 open 9.

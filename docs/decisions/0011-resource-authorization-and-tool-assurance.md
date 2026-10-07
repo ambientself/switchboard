@@ -127,8 +127,9 @@ result cut short with an explicit flag, as Otto's GitHub tools do: ten search re
 comments, files up to 256 KiB, each marked as truncated. The gateway's bounds are set above
 every connector's, so the caller sees the connector's flagged truncation and Otto's behavior
 holds. A result that exceeds the gateway's bound is never cut short silently. For a `read`
-tool it is outcome `error`. For a `propose` tool the vendor may already have acted, so an
-oversized or late result is recorded as an outcome not known (Q10) and is never presented as
+tool it is outcome `error`. For any other tool the vendor may already have acted, so an
+oversized or late result is recorded as `unknown`
+([decision 0009](0009-audit-completion-receipts-and-recovery.md)) and is never presented as
 safe to retry. The values, and whether a server may have a longer deadline than the default
 (a Sumo Logic search may take two minutes), are set with the other limits in milestone 3
 (Q12).
@@ -242,11 +243,11 @@ sits with a maximum snapshot age, are Q11's.
 | Whether the approvals fit together | The snapshot loader, with the rules above. | When a snapshot loads. | No. A snapshot that breaks a rule is never served. | Policy revision. |
 | Which resources the call names, or the reach | The tool's resource adapter, gateway code. | Before the decision. | No. Finding none denies a `declared` tool. | Resources, or the connector entry marked as a reach. |
 | Profile, surface, tool, delegation, classification, resource limit | The decision function. | Before the row is begun. | Yes. The only place that can. | Decision, reason, sentence. |
-| Arguments against the approved schema | The gateway, for proxied tools; the connector's own types, for built-in ones. | After the row is begun, before the vendor. | No. | Outcome `error`, invalid arguments; nothing is forwarded. |
+| Arguments against the approved schema | The gateway, for proxied tools; the connector's own types, for built-in ones. | After the row is begun, before the vendor. | No. | Outcome `error`, invalid arguments; nothing is forwarded, and a side effect's receipt is `not_performed`. |
 | Scope known only when running | A built-in connector, for `checks_own_scope` tools. | While running. | No. | Outcome `refused`, with its sentence. |
 | Which credential, narrowed how | The credential layer and the custodian, in the approved mode. | While running. | No. | `refused` when no grant exists; `error`, a custodian refusal, when the custodian refuses; the credential identity used. |
 | What the credential may do | The vendor. | While running. | No. | Outcome `error`; a vendor refusal where the connector can tell. |
-| Result size and duration | The gateway, above any bound of the connector's own. | While and after the tool runs. | No. | `error` for a `read` tool; an outcome not known for a `propose` tool (Q10). |
+| Result size and duration | The gateway, above any bound of the connector's own. | While and after the tool runs. | No. | `error` for a `read` tool; `unknown` for any other tool (decision 0009). |
 | Whether a reach still holds | The registry's scheduled check, run as gateway calls. | Outside the calls it protects. | No. It withdraws. | Its own rows, and the withdrawal. |
 
 The design no longer claims that one function decides everything. It claims that one function
@@ -544,8 +545,9 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
 - The audit row gains: whether its resources were named by the call or are a reach, recorded
   by reference to the entry; the credential identity used (the mode and the vendor-side
   principal, never the secret); and an error kind: invalid arguments, an oversized or late
-  result, a custodian refusal or a vendor refusal. `refused` now covers the credential
-  layer's refusal as well as the connector's. Otto's `gateway_audit` table has none of these
+  result from a `read` tool, a custodian refusal or a vendor refusal. `refused` now covers the
+  credential layer's refusal as well as the connector's. An oversized or late result from any
+  other tool is `unknown`. The five outcomes are stated once, in decision 0009. Otto's `gateway_audit` table has none of these
   columns, so they stay in this gateway's own record unless Otto adds them. Whether it gains
   them is part of the question pull request 30 puts in Q12, whether that table gains a general
   column and who adds it. That is its one home.
