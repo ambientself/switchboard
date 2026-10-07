@@ -25,9 +25,11 @@ profiles initially.
    identity: an API key, service account, app installation or OAuth client credentials. A
    vendor MCP server that works only with a per-user login cannot serve them as it stands.
    Employees' own agents may use per-user OAuth grants held by the gateway.
-2. **No production mutation.** A tool that changes production is destructive, whichever way
-   the system is connected. So the first question is read access, and whether a credential or
-   a server can be limited to reads.
+2. **No production mutation.** A tool that changes production is `write` or `destructive`,
+   according to its effect, whichever way the system is connected. Both are denied in every
+   profile (the 2026-10-04 amendment to
+   [decision 0006](decisions/0006-what-the-decision-function-sees.md)). So the first question
+   is read access, and whether a credential or a server can be limited to reads.
 3. **Brokering for API-shaped systems, minting for CLI-shaped ones.**
 4. **A proxied server is exposed only if the gateway can limit it.** Either the gateway
    understands the tool's arguments, or the server's credential and route limit it to exactly
