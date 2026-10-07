@@ -555,6 +555,40 @@ fn a_credential_source_told_to_refuse_refuses_and_still_records_the_request() {
     );
 }
 
+#[test]
+fn a_credential_source_told_to_be_unavailable_says_so_and_still_records_the_request() {
+    let (fixture, source) = (fixture(), FakeCredentialSource::new());
+    let caller = principal(&fixture, Caller::TeamA);
+    let ask = || ask(&source, &caller);
+
+    source.unavailable_next();
+    assert_eq!(
+        ask(),
+        Err(CredentialError::Unavailable(
+            "the fake credential source was told to be unavailable".into()
+        ))
+    );
+    assert_eq!(
+        ask().unwrap().label(),
+        "fake-credential-for-fixture-team-a-1",
+        "only the next request failed, and it issued nothing"
+    );
+
+    source.unavailable_all();
+    assert!(matches!(ask(), Err(CredentialError::Unavailable(_))));
+    assert!(matches!(ask(), Err(CredentialError::Unavailable(_))));
+    // Refusing replaces being unavailable, and stopping ends either.
+    source.refuse_all();
+    assert!(matches!(ask(), Err(CredentialError::Refused(_))));
+    source.stop_refusing();
+    assert!(ask().is_ok());
+    assert_eq!(
+        source.requests().len(),
+        6,
+        "failed requests are recorded too"
+    );
+}
+
 // --- The fixture connector ------------------------------------------------------------------
 
 struct Rig {

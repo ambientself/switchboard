@@ -865,11 +865,12 @@ mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "  
 mutate("fake-audit-row-ids-not-positions", "every row has the same identifier", A, "            Ok(AuditRowId::new(position.to_string()))", '            Ok(AuditRowId::new("0"))')
 
 C = TESTKIT_SRC + "credentials.rs"
-mutate("fake-credentials-refuse-next-ignored", "a request told to be refused is issued", C,
-       "            Refusing::Next => {\n                state.refusing = Refusing::Never;\n                true\n            }", "            Refusing::Next => false,")
-mutate("fake-credentials-refuse-next-is-refuse-all", "a refusal meant for the next request is never cleared", C,
-       "            Refusing::Next => {\n                state.refusing = Refusing::Never;\n                true\n            }", "            Refusing::Next => true,")
-mutate("fake-credentials-refuse-all-ignored", "requests told to be refused are issued", C, "            Refusing::Always => true,", "            Refusing::Always => false,")
+NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
+mutate("fake-credentials-refuse-next-ignored", "a request told to fail is issued", C, NEXT_FAILURE, "            Refusing::Next(_) => None,")
+mutate("fake-credentials-refuse-next-is-refuse-all", "a failure meant for the next request is never cleared", C, NEXT_FAILURE, "            Refusing::Next(failure) => Some(failure),")
+mutate("fake-credentials-refuse-all-ignored", "requests told to fail are issued", C, "            Refusing::Always(failure) => Some(failure),", "            Refusing::Always(_) => None,")
+mutate("fake-credentials-unavailable-is-refused", "a source told to be unavailable refuses instead", C,
+       "            Some(Failure::Unavailable) => Err(CredentialError::Unavailable(", "            Some(Failure::Unavailable) => Err(CredentialError::Refused(")
 mutate("fake-credentials-count-not-kept", "every credential has the same number", C, "            state.issued += 1;\n", "")
 mutate("fake-credentials-label-ignores-team", "every team's credential is labelled alike", C,
        "                Some(team) => team.to_string(),", '                Some(_) => "team".to_owned(),')

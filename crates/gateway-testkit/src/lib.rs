@@ -6,7 +6,7 @@
 //!
 //! - [`InMemoryAuditStore`] keeps rows in order, can fail or hold `begin` and `finish`.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
-//!   can refuse.
+//!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a write tool and a scope-checking tool, records
 //!   every call, and can fail or hang.
 //! - [`LocalIssuer`] generates a key pair when built and signs tokens a test can break in any
