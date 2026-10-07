@@ -1,8 +1,7 @@
 //! The gateway: the crate that puts the policy core, the identity verifier and the connectors
 //! together and decides whether a deployment may start.
 //!
-//! This is design section 5's `gateway` crate. The HTTP server and the `switchboard` binary
-//! come later; what is here needs no socket:
+//! This is design section 5's `gateway` crate:
 //!
 //! - [`Config`] is the deployment's configuration as data: identity, audit, the policy
 //!   snapshot, tool definitions and the rules that select a profile.
@@ -20,6 +19,14 @@
 //! - [`RequestPath`] is design section 6's request path over the [`Gates`]: identity, the MCP
 //!   adapter, profile selection, the decision, the audit row and the connector, from a
 //!   request's method, headers and body to its HTTP response.
+//! - [`serve`] is the HTTP endpoint, `POST /mcp/{surface}`, over a listener and the [`Gates`]:
+//!   the host and origin checks, the body limit, and a task per answer, so a client that
+//!   disconnects cannot cut a tool call off from its audit row.
+//! - [`telemetry::init`] sends logs to standard output as JSON lines.
+//!
+//! The `switchboard` binary reads a configuration file, runs the boot gates and serves. It has
+//! no durable audit store and no connectors yet, so it starts only with audit explicitly
+//! disabled, and serves no tool.
 
 #![forbid(unsafe_code)]
 
@@ -30,6 +37,8 @@ mod config;
 pub mod path;
 mod resources;
 mod selector;
+pub mod server;
+pub mod telemetry;
 
 pub use audit::{DISABLED_ROW, DisabledAuditStore};
 pub use boot::{BootError, GateState, Gates, Wiring};
@@ -45,3 +54,4 @@ pub use resources::ResourceAdapter;
 pub use selector::{
     NO_PROFILE, ProfileSelector, SelectorError, SelectorRules, UserRule, WorkloadRule,
 };
+pub use server::{DISABLED_GATE_REMINDER, MAX_BODY_BYTES, serve, serve_with_shutdown};

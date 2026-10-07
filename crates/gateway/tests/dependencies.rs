@@ -9,15 +9,19 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-const ALLOWED: [&str; 8] = [
+const ALLOWED: [&str; 12] = [
+    "axum",
     "gateway-core",
     "gateway-identity",
     "gateway-mcp",
     "http",
+    "http-body-util",
     "serde",
     "serde_json",
     "thiserror",
+    "tokio",
     "tracing",
+    "tracing-subscriber",
 ];
 
 /// Never in a running gateway, whatever else the allowlist comes to hold.
