@@ -261,6 +261,53 @@ async fn begin_counts_waiting_for_a_connection_in_its_budget() {
     ));
 }
 
+/// Begin has one budget for the wait for a connection and the insert together, so an insert
+/// that starts late has only what is left of it.
+#[tokio::test]
+async fn begin_has_one_budget_for_the_connection_and_the_insert() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_secs(2),
+        ..Budgets::default()
+    };
+    let store = db
+        .store(PoolSizes {
+            begin: 1,
+            finish: 1,
+        })
+        .with_budgets(budgets);
+    // The one begin connection is busy for most of the budget, and once it is free the table
+    // is still locked.
+    let held = store.begin.get().await.unwrap();
+    let lock = lock_table(&db).await;
+    let busy_for = Duration::from_millis(1500);
+
+    let started = Instant::now();
+    let (failure, ()) = tokio::join!(
+        within(budgets.begin + SLACK, begin_read(&store, &fixture)),
+        async {
+            sleep(busy_for).await;
+            drop(held);
+        }
+    );
+    let elapsed = started.elapsed();
+    let failure = failure.unwrap_err();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    // With a budget of its own, the insert would have run to busy_for + budget.
+    assert!(elapsed >= budgets.begin, "{elapsed:?}");
+    assert!(
+        elapsed < budgets.begin + Duration::from_millis(750),
+        "{elapsed:?}"
+    );
+    release(&lock).await;
+}
+
 #[tokio::test]
 async fn finish_answers_at_its_budget_and_completes_the_rows_later() {
     let Some(db) = TestDatabase::create().await else {
