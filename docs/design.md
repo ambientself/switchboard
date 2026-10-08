@@ -816,10 +816,12 @@ unconfigured one is absent from every surface.
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
 Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the audit
-table or a partition of it unlogged, with the trigger that sets the times or a write-once
-trigger missing or disabled, with grants beyond decision 0009's on the audit or receipt table,
-with a role that owns the database, with a session that logged in as another role than the one
-it runs as, with a session that a role or database default puts in
+table or a partition of it unlogged, with an audit table that does not stand alone (one that is
+partitioned, that another table inherits from, or that inherits from one, since each partition
+or child has triggers, an owner and grants of its own), with the trigger that sets the times
+or a write-once trigger missing or disabled, with grants beyond decision 0009's on the audit or
+receipt table, with a role that owns the database, with a session that logged in as another
+role than the one it runs as, with a session that a role or database default puts in
 `session_replication_role = replica`, where neither trigger fires, or with a database whose
 encoding is not UTF8. It also refuses a role that can set a setting only a superuser may set,
 or change any setting with `ALTER SYSTEM`, since a change made that way reaches the store's
@@ -1061,6 +1063,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - The boot check covers all three triggers. Today it covers the two on the audit table, the
   one that sets the times and the one that completes a row once; the third is the receipt
   table's (part 2).
+- If retention needs it, a partitioned audit table, with the boot check reading the triggers,
+  owner and grants of every partition, in whatever schema. Today the boot check refuses a
+  partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
   giving up a guard without running completes its row as `error`. Today a guard can only be
   consumed by running it.

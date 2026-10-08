@@ -162,6 +162,21 @@ pub enum Problem {
     },
     /// `switchboard_audit.call_rows` is not there.
     TableMissing,
+    /// `switchboard_audit.call_rows` is partitioned. Each partition has its own triggers,
+    /// each enabled or disabled on its own, its own owner and its own grants, and may be in
+    /// another schema, so the store refuses a partitioned table rather than trust what the
+    /// partitioned table alone shows.
+    Partitioned,
+    /// A table inherits from `switchboard_audit.call_rows` or is a partition of it, or
+    /// `call_rows` inherits from a table or is a partition of one. An update or delete through
+    /// the parent reaches the child's rows, under the child's own triggers and the parent's
+    /// grants, so the store requires `call_rows` to stand alone.
+    Inheritance {
+        /// The table that inherits.
+        child: String,
+        /// The table it inherits from.
+        parent: String,
+    },
     /// `switchboard_audit.call_rows`, or a partition of it, is unlogged. Crash recovery empties
     /// an unlogged table, committed rows included, and a standby never receives its rows.
     Unlogged {
@@ -276,6 +291,16 @@ impl fmt::Display for Problem {
                  pooler, may have dropped them"
             ),
             Self::TableMissing => write!(f, "the table switchboard_audit.call_rows does not exist"),
+            Self::Partitioned => write!(
+                f,
+                "the table switchboard_audit.call_rows is partitioned, and each partition has \
+                 triggers, an owner and grants of its own, which the store does not check"
+            ),
+            Self::Inheritance { child, parent } => write!(
+                f,
+                "the table {child} inherits from {parent} or is a partition of it, and the \
+                 store requires switchboard_audit.call_rows to stand alone"
+            ),
             Self::Unlogged { table } => write!(
                 f,
                 "the table {table} is unlogged, so a crash empties it, committed rows and all, \
@@ -383,7 +408,10 @@ impl PgAuditStore {
     /// - The database's encoding is UTF8, so it holds every character a row may carry.
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
     ///   two triggers, enabled: the one that sets both times at insert, and the one that
-    ///   completes a row at most once. Neither it nor any partition of it is unlogged.
+    ///   completes a row at most once. It is not unlogged. It stands alone: it is not
+    ///   partitioned, no table inherits from it or is a partition of it, and it inherits from
+    ///   none. A partition or child has triggers, an owner and grants of its own, which this
+    ///   check does not read.
     /// - The session's `session_replication_role` is not `replica`, which a role or database
     ///   default can set, and under which neither trigger fires.
     /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
@@ -475,17 +503,26 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     // rather than an error.
     let table = client
         .query_opt(
-            "SELECT c.oid FROM pg_catalog.pg_class c
+            "SELECT c.oid, c.relkind = 'p' FROM pg_catalog.pg_class c
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = 'switchboard_audit' AND c.relname = 'call_rows'
                  AND c.relkind IN ('r', 'p')",
             &[],
         )
         .await?
-        .map(|row| row.get::<_, tokio_postgres::types::Oid>(0));
+        .map(|row| {
+            (
+                row.get::<_, tokio_postgres::types::Oid>(0),
+                row.get::<_, bool>(1),
+            )
+        });
     match table {
         None => problems.push(Problem::TableMissing),
-        Some(table) => {
+        Some((table, partitioned)) => {
+            if partitioned {
+                problems.push(Problem::Partitioned);
+            }
+            inheritance(client, table, &mut problems).await?;
             unlogged(client, table, &mut problems).await?;
             columns(client, table, &mut problems).await?;
             triggers(client, table, &mut problems).await?;
@@ -613,13 +650,43 @@ async fn ownership(
     Ok(())
 }
 
+/// Every table that inherits from `table` or is a partition of it, and every table `table`
+/// inherits from or is a partition of, in any schema. Only direct links are listed: one is
+/// enough to refuse.
+async fn inheritance(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query(
+            "SELECT cn.nspname || '.' || c.relname, pn.nspname || '.' || p.relname
+             FROM pg_catalog.pg_inherits i
+                 JOIN pg_catalog.pg_class c ON c.oid = i.inhrelid
+                 JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace
+                 JOIN pg_catalog.pg_class p ON p.oid = i.inhparent
+                 JOIN pg_catalog.pg_namespace pn ON pn.oid = p.relnamespace
+             WHERE i.inhparent = $1::oid OR i.inhrelid = $1::oid
+             ORDER BY 1, 2",
+            &[&table],
+        )
+        .await?;
+    problems.extend(found.into_iter().map(|row| Problem::Inheritance {
+        child: row.get(0),
+        parent: row.get(1),
+    }));
+    Ok(())
+}
+
 async fn unlogged(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
-    // A partition can be unlogged when the partitioned table is not, and the rows are in the
-    // partitions. The tree of a table that is not partitioned is empty.
+    // A partitioned table is refused on its own, and an unlogged partition is named as well,
+    // so one refusal lists everything wrong. A partition can be unlogged when the partitioned
+    // table is not, and the rows are in the partitions. The tree of a table that is not
+    // partitioned is empty.
     let found = client
         .query(
             "SELECT n.nspname || '.' || c.relname

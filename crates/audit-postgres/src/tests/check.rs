@@ -840,6 +840,122 @@ async fn an_unlogged_table_or_partition_is_refused() {
     assert_eq!(found, vec![unlogged("switchboard_audit.unlogged_rows")]);
 }
 
+fn inheritance(child: &str, parent: &str) -> Problem {
+    Problem::Inheritance {
+        child: child.into(),
+        parent: parent.into(),
+    }
+}
+
+/// Each partition has its own triggers, each enabled or not on its own, its own owner and its
+/// own grants, and may be in another schema. An update through the partitioned table fires the
+/// partition's copy of complete_once, so one disabled there lets a completed row be completed
+/// again, and a grant on a partition reaches its rows directly. So a partitioned table is
+/// refused, whatever its partitions hold, even when the table itself has the migration's
+/// triggers and grants.
+#[tokio::test]
+async fn a_partitioned_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "ALTER TABLE switchboard_audit.call_rows RENAME TO old_rows;
+             CREATE TABLE switchboard_audit.call_rows
+                 (LIKE switchboard_audit.old_rows INCLUDING DEFAULTS INCLUDING CONSTRAINTS)
+                 PARTITION BY LIST (decision);
+             DROP TABLE switchboard_audit.old_rows;
+             ALTER TABLE switchboard_audit.call_rows OWNER TO {OWNER_ROLE};
+             CREATE TRIGGER complete_once BEFORE UPDATE ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();
+             CREATE TRIGGER set_times BEFORE INSERT ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION switchboard_audit.set_times();
+             GRANT INSERT ({inserted}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
+             GRANT UPDATE ({updated}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
+             GRANT SELECT ({selected}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};",
+            inserted = INSERTED.join(", "),
+            updated = UPDATED.join(", "),
+            selected = SELECTED.join(", "),
+        ))
+        .await
+        .unwrap();
+    let store = db.store(PoolSizes::default());
+    // With no partition yet, the table can hold no row, and is refused all the same.
+    assert_eq!(problems(&store).await, vec![Problem::Partitioned]);
+
+    // A partition in the schema with complete_once disabled on it alone, and one in another
+    // schema that the gateway may delete from.
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE switchboard_audit.allow_rows PARTITION OF switchboard_audit.call_rows
+                 FOR VALUES IN ('allow');
+             ALTER TABLE switchboard_audit.allow_rows DISABLE TRIGGER complete_once;
+             CREATE SCHEMA elsewhere;
+             CREATE TABLE elsewhere.deny_rows PARTITION OF switchboard_audit.call_rows
+                 FOR VALUES IN ('deny');
+             GRANT USAGE ON SCHEMA elsewhere TO {GATEWAY_ROLE};
+             GRANT DELETE ON elsewhere.deny_rows TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![
+            Problem::Partitioned,
+            inheritance("elsewhere.deny_rows", "switchboard_audit.call_rows"),
+            inheritance(
+                "switchboard_audit.allow_rows",
+                "switchboard_audit.call_rows"
+            ),
+        ]
+    );
+}
+
+/// An update or delete through a parent reaches its children's rows, under each child's own
+/// triggers and the parent's grants. So `call_rows` may have no child, in any schema, and may
+/// be the child of no table.
+#[tokio::test]
+async fn a_table_that_inherits_or_is_inherited_from_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default());
+
+    admin
+        .batch_execute("CREATE TABLE public.more_rows () INHERITS (switchboard_audit.call_rows)")
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![inheritance(
+            "public.more_rows",
+            "switchboard_audit.call_rows"
+        )]
+    );
+    admin
+        .batch_execute("DROP TABLE public.more_rows")
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+
+    admin
+        .batch_execute(
+            "CREATE TABLE public.base_rows (id uuid);
+             ALTER TABLE switchboard_audit.call_rows INHERIT public.base_rows",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![inheritance(
+            "switchboard_audit.call_rows",
+            "public.base_rows"
+        )]
+    );
+}
+
 #[tokio::test]
 async fn a_disabled_or_missing_trigger_is_refused() {
     let Some(db) = TestDatabase::create().await else {

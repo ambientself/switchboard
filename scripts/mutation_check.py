@@ -1358,6 +1358,12 @@ mutate("pg-check-unlogged-table-ignored", "an unlogged table that is not partiti
        "             WHERE (c.oid = $1::oid\n", "             WHERE (false\n")
 mutate("pg-check-unlogged-partition-ignored", "an unlogged partition passes the check", PG_CHECK,
        "OR c.oid IN (SELECT relid", "OR false AND c.oid IN (SELECT relid")
+mutate("pg-check-partitioned-ignored", "a partitioned table passes the check", PG_CHECK,
+       "            if partitioned {", "            if false {")
+mutate("pg-check-children-ignored", "a table that inherits from call_rows, or a partition of it, passes the check", PG_CHECK,
+       "WHERE i.inhparent = $1::oid OR i.inhrelid = $1::oid", "WHERE i.inhrelid = $1::oid")
+mutate("pg-check-parents-ignored", "call_rows inheriting from a table passes the check", PG_CHECK,
+       "WHERE i.inhparent = $1::oid OR i.inhrelid = $1::oid", "WHERE i.inhparent = $1::oid")
 mutate("pg-check-parameter-grants-ignored", "a role holding a grant on a setting passes the check", PG_CHECK,
        "    if version >= 150_000 {", "    if false {")
 mutate("pg-check-alter-system-ignored", "a role that may change a setting with ALTER SYSTEM passes the check", PG_CHECK,
