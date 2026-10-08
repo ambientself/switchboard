@@ -217,6 +217,66 @@ async fn rows_read_back_exactly_as_the_core_wrote_them() {
     assert_eq!(outcomes.iter().filter(|o| o.is_none()).count(), 3);
 }
 
+/// The testkit's callers carry no delegation, so the calls above leave the delegation and
+/// acting-person columns empty. A record with every optional value set, each to a value no
+/// other column holds, reads back exactly, so a value written to another column's place is
+/// caught, proved and claimed ones included.
+#[tokio::test]
+async fn a_record_with_every_value_set_reads_back_exactly() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let record = |value: Value| -> AuditRecord { serde_json::from_value(value).unwrap() };
+    let common = |decision: &str| {
+        json!({
+            "tool_use_id": format!("toolu-{decision}"),
+            "deployment": format!("deployment-{decision}"),
+            "surface": format!("surface-{decision}"),
+            "profile": format!("profile-{decision}"),
+            "tool": format!("tool-{decision}"),
+            "connector": format!("connector-{decision}"),
+            "classification": "write",
+            "resources": {"named": [
+                {"system": "system-1", "kind": "kind-1", "identifier": "identifier-1"},
+                {"system": "system-2", "kind": "kind-2", "identifier": "identifier-2"}
+            ]},
+            "resources_omitted": 3,
+            "policy_revision": format!("revision-{decision}"),
+            "proved_delegation_team": format!("delegation-team-{decision}"),
+            "claimed_acting_person": format!("acting-person-{decision}"),
+            "claimed_team": format!("claimed-team-{decision}"),
+            "completion": null
+        })
+    };
+    // An allowed call by a workload, which has a team.
+    let mut allowed = common("allow");
+    allowed["decision"] = json!("allow");
+    allowed["reason"] = json!(null);
+    allowed["sentence"] = json!(null);
+    allowed["proved_principal"] = json!({
+        "id": {"issuer": "issuer-allow", "subject": "subject-allow"},
+        "kind": "workload",
+        "team": "proved-team-allow"
+    });
+    // A denied call by a user, who has groups.
+    let mut denied = common("deny");
+    denied["decision"] = json!("deny");
+    denied["reason"] = json!("classification_not_permitted");
+    denied["sentence"] = json!("sentence-deny");
+    denied["proved_principal"] = json!({
+        "id": {"issuer": "issuer-deny", "subject": "subject-deny"},
+        "kind": "user",
+        "groups": ["group-1", "group-2"]
+    });
+
+    for written in [record(allowed), record(denied)] {
+        let row = store.begin(&written).await.unwrap();
+        assert_eq!(read_back(&admin, &row).await, written);
+    }
+}
+
 #[tokio::test]
 async fn a_call_naming_more_resources_than_a_row_holds_records_how_many_were_left_out() {
     let Some(db) = TestDatabase::create().await else {
@@ -245,6 +305,82 @@ async fn a_call_naming_more_resources_than_a_row_holds_records_how_many_were_lef
 
     let row = through_core(&store, &fixture, &call).await;
     assert_eq!(read_back(&admin, &row).await, expected);
+}
+
+/// Postgres text cannot hold U+0000, and a caller chooses its tool-use identifier and the team
+/// it states. A record carrying one is refused, so the call is refused and no row is written,
+/// rather than a row that is not the record. The same holds for a refusal's sentence at finish,
+/// which gives up and is reported.
+#[tokio::test]
+async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let given_up = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&given_up);
+    let store = db
+        .store(PoolSizes::default())
+        .on_given_up(move |report| kept.lock().unwrap().push(report.error.to_string()));
+    let admin = db.admin().await;
+
+    for metadata in [
+        RequestMetadata {
+            tool_use_id: Some(ToolUseId::new("toolu_\u{0}x")),
+            claimed_team: None,
+        },
+        RequestMetadata {
+            tool_use_id: None,
+            claimed_team: Some(Claimed::new(TeamId::new("team\u{0}x"))),
+        },
+    ] {
+        // A denial, whose row would otherwise be written at begin.
+        let call = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
+        let context = CallContext {
+            resources: FixtureConnector::resources_of(call.tool, &call.arguments),
+            caller: fixture.caller_context(call.caller, call.surface).unwrap(),
+            tool: RequestedTool::new(call.tool),
+        };
+        let decision = decide(&fixture.policy, &context);
+        let failure = audit::begin(&store, decision, call.arguments, metadata)
+            .await
+            .unwrap_err();
+        let cause = std::error::Error::source(&failure)
+            .and_then(|source| source.downcast_ref::<PgAuditError>())
+            .unwrap();
+        assert!(matches!(cause, PgAuditError::Nul { .. }), "{cause}");
+    }
+    let rows: i64 = admin
+        .query_one("SELECT count(*) FROM switchboard_audit.call_rows", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0);
+
+    let row = begun_row(&store, &fixture).await;
+    let refused = completion(
+        Outcome::Refused {
+            sentence: "Not that one.\u{0}".into(),
+        },
+        3,
+    );
+    let error = store
+        .finish_within_budget(&row, &refused)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            PgAuditError::Nul {
+                column: "outcome_sentence"
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(read_back(&admin, &row).await.completion, None);
+    assert_eq!(store.finishes().given_up, 1);
+    assert_eq!(store.finishes().in_flight, 0);
+    assert_eq!(given_up.lock().unwrap().clone(), vec![error.to_string()]);
 }
 
 #[tokio::test]
@@ -387,14 +523,11 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
-    let admin = db.admin().await;
-    admin
-        .batch_execute(&format!(
-            "ALTER ROLE {GATEWAY_ROLE} IN DATABASE {} SET synchronous_commit = off",
-            db.name()
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "ALTER ROLE {GATEWAY_ROLE} IN DATABASE {} SET synchronous_commit = off",
+        db.name()
+    ))
+    .await;
     async fn show(client: &Client) -> String {
         client
             .query_one("SHOW synchronous_commit", &[])
@@ -408,18 +541,31 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
     assert_eq!(show(&store.begin.get().await.unwrap()).await, "on");
     assert_eq!(show(&store.finish.get().await.unwrap()).await, "on");
 
-    // Options the caller set are kept beside it.
+    // Options the caller set are kept beside the store's, and come before them, so where both
+    // set one setting the store's value is the one that holds: the last wins.
     let mut config = db.config_as(GATEWAY_ROLE);
-    config.options("-c statement_timeout=4321");
+    config.options(
+        "-c statement_timeout=4321 -c synchronous_commit=off -c search_path=public,pg_catalog",
+    );
     let store = PgAuditStore::connect(config, NoTls, PoolSizes::default()).unwrap();
-    let client = store.begin.get().await.unwrap();
-    assert_eq!(show(&client).await, "on");
-    let timeout: String = client
-        .query_one("SHOW statement_timeout", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(timeout, "4321ms");
+    for client in [
+        store.begin.get().await.unwrap(),
+        store.finish.get().await.unwrap(),
+    ] {
+        assert_eq!(show(&client).await, "on");
+        for (setting, expected) in [
+            ("statement_timeout", "4321ms"),
+            ("search_path", "pg_catalog,pg_temp"),
+        ] {
+            let found: String = client
+                .query_one(&format!("SHOW {setting}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(found, expected, "{setting}");
+        }
+    }
+    store.check_at_boot().await.unwrap();
 }
 
 #[tokio::test]

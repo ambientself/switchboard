@@ -27,8 +27,9 @@ const URL_VARIABLE: &str = "SWITCHBOARD_TEST_DATABASE_URL";
 /// value for tests only, never a credential.
 const DUMMY_PASSWORD: &str = "dummy-password-for-tests-only";
 
-/// Tests run in parallel. Creating databases and changing the cluster-wide roles is done one
-/// test at a time, because two sessions updating one role at once fail.
+/// Tests run in parallel. Creating databases, and changing the roles, memberships and grants on
+/// settings that the whole server shares, is done one test at a time, because two sessions
+/// updating one row of a shared catalog at once fail ("tuple concurrently updated").
 static SETUP: Mutex<()> = Mutex::const_new(());
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -45,6 +46,11 @@ pub(crate) struct TestDatabase {
 impl TestDatabase {
     /// `None`, after saying so, when no test server is configured.
     pub(crate) async fn create() -> Option<Self> {
+        Self::create_with("").await
+    }
+
+    /// The same, with `options` after `CREATE DATABASE` and its name, such as an encoding.
+    pub(crate) async fn create_with(options: &str) -> Option<Self> {
         let Ok(url) = std::env::var(URL_VARIABLE) else {
             eprintln!("skipped: {URL_VARIABLE} is not set");
             return None;
@@ -73,7 +79,7 @@ impl TestDatabase {
                 .await
                 .unwrap();
             server
-                .batch_execute(&format!("CREATE DATABASE {}", database.name))
+                .batch_execute(&format!("CREATE DATABASE {} {options}", database.name))
                 .await
                 .unwrap();
             let admin = database.admin().await;
@@ -117,6 +123,16 @@ impl TestDatabase {
     /// A session as `role`.
     pub(crate) async fn connect_as(&self, role: &str) -> Client {
         connect(&self.config_as(role)).await
+    }
+
+    /// Runs `sql` in this database as the server's superuser, one test at a time. For
+    /// statements that change what the whole server shares: roles, memberships, role defaults
+    /// and grants on settings. Two sessions changing one row of a shared catalog at once fail,
+    /// as two tests granting on one setting do, or one granting while another's teardown
+    /// revokes.
+    pub(crate) async fn cluster_wide(&self, sql: &str) {
+        let _one_at_a_time = SETUP.lock().await;
+        self.admin().await.batch_execute(sql).await.unwrap();
     }
 
     /// A store connected as the gateway's role.

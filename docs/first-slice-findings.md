@@ -140,7 +140,9 @@ warnings. No restart of the gateway was needed in either case.
 
 - **Paused, allowed read.** The insert committed after Postgres was unpaused, after the call
   had been refused. The store completed the row as `allow | error | 0 ms`, as decision 0009
-  requires: a row may overstate what ran, never understate it.
+  requires: a row may overstate what ran, never understate it. *Changed after these runs:* the
+  branch now carries the Postgres store as PR #39 has it, which does not complete such a row.
+  It stays open, with no outcome, until that recovery is built (design section 17).
 - **Paused, denied read.** No row appeared. The call was refused, so nothing ran, but the
   denial itself is recorded only in the gateway's log. This was seen once.
 - **Stopped.** No row for any refused call. Nothing was sent, so nothing was written.
@@ -265,8 +267,10 @@ From the run of 2026-10-07 (93/93):
    reports the count only at shutdown. Decision 0009 asks for a telemetry event naming the
    row when it happens. Without one, the open row is found only by querying for it. That query
    is not built either (decision 0009's open-row work). *Fixed after these runs:* the store
-   now logs `audit_row_given_up` at `ERROR` when it gives up, naming the row and the outcome it
-   could not write. The open-row query is still not built.
+   reports each finish it gives up, and the gateway logs each report as `audit_row_given_up` at
+   `ERROR`, naming the row, the outcome it could not write, and why. An insert that commits
+   after its begin failed is not a finish, so its row stays open with no event. The open-row
+   query is still not built.
 2. **The gateway's termination grace period is the default.** In kind it is 30 s, and Compose
    uses its default of 10 s. Decision 0009 says it must be longer than the readiness-removal
    delay plus the begin budget, the call deadline and the finish deadline: 2 s + 5 s + 30 s

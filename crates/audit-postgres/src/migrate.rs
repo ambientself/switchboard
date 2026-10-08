@@ -15,7 +15,8 @@ pub const SCHEMA: &str = "switchboard_audit";
 
 /// Creates [`OWNER_ROLE`] and [`GATEWAY_ROLE`] if they do not exist, and lets them connect to
 /// the current database, the owner also to create a schema in it. Run by an administrator,
-/// connected to the audit database, before [`migrate`]. Safe to run again. Sets no password.
+/// connected to the audit database, before [`migrate`]. Safe to run again, and in several
+/// sessions at once. Sets no password.
 pub const ROLES: &str = include_str!("../sql/roles.sql");
 
 /// One schema change, applied once, in order.

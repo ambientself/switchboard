@@ -1,8 +1,8 @@
 -- The two roles the audit schema needs, and what each may do with the database.
 --
 -- Run by an administrator, connected to the database that will hold the audit schema, before
--- the first migration. Roles belong to the whole server, so this can be run again, and by two
--- sessions at once, without failing.
+-- the first migration. It can be run again, and in several sessions at once, without failing:
+-- each run takes a lock first, so runs take turns, and a role another run created is kept.
 --
 -- switchboard_owner owns the schema, its tables and its trigger, and runs the migrations.
 -- switchboard_gateway is the role the gateway connects as. It gets nothing here beyond
@@ -13,6 +13,10 @@
 
 DO $roles$
 BEGIN
+    -- Two runs granting on one database at once update the same catalog row, and the second
+    -- fails. The number is any number, the same in every copy of this script, and not the
+    -- migrations' lock.
+    PERFORM pg_advisory_xact_lock(6005341489043162114);
     BEGIN
         CREATE ROLE switchboard_owner
             LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;

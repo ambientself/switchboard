@@ -1,11 +1,14 @@
 //! The roles, grants, trigger and constraints, exercised with plain SQL.
 
+use std::time::Duration;
+
+use tokio::time::{Instant, sleep};
 use tokio_postgres::Client;
 
 use super::{
-    CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, TestDatabase, code, message,
+    CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, SETUP, TestDatabase, code, message,
 };
-use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, migrate};
+use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, ROLES, migrate};
 
 /// The begin columns of an allowed call by a workload, as `(column, value)` in SQL.
 const ALLOWED: &[(&str, &str)] = &[
@@ -104,6 +107,72 @@ async fn only_the_owner_may_migrate() {
         migrate(&mut admin).await,
         Err(MigrateError::NotOwner { .. })
     ));
+}
+
+/// Two migrators on one database take turns: one applies the migration, and the other then
+/// finds it applied. Without the lock, both create the schema at once and one fails.
+#[tokio::test]
+async fn two_migrators_at_once_take_turns() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    for _ in 0..5 {
+        admin
+            .batch_execute("DROP SCHEMA switchboard_audit CASCADE")
+            .await
+            .unwrap();
+        let mut first = db.connect_as(OWNER_ROLE).await;
+        let mut second = db.connect_as(OWNER_ROLE).await;
+        let (first, second) = tokio::join!(migrate(&mut first), migrate(&mut second));
+        let mut applied = vec![first.unwrap(), second.unwrap()];
+        applied.sort_unstable();
+        assert_eq!(applied, vec![vec![], vec![1]]);
+    }
+}
+
+/// Several administrators running the roles script on one database at once take turns.
+/// Without the lock, their grants update the database's catalog row at once and all but one
+/// fail.
+#[tokio::test]
+async fn the_roles_script_runs_in_several_sessions_at_once() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    // The runs are held at their first CREATE ROLE until all four are waiting, so they then go
+    // on together rather than one after another as they arrive.
+    let _one_at_a_time = SETUP.lock().await;
+    let gate = db.admin().await;
+    let waiting = format!(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = '{}' AND wait_event_type = 'Lock'",
+        db.name()
+    );
+    for _ in 0..5 {
+        gate.batch_execute("BEGIN; LOCK TABLE pg_catalog.pg_authid IN SHARE MODE")
+            .await
+            .unwrap();
+        let mut runs = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let admin = db.admin().await;
+            runs.spawn(async move { admin.batch_execute(ROLES).await });
+        }
+        let give_up = Instant::now() + Duration::from_secs(30);
+        while gate
+            .query_one(&waiting, &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+            < 4
+        {
+            assert!(Instant::now() < give_up, "the runs did not all wait");
+            sleep(Duration::from_millis(10)).await;
+        }
+        gate.batch_execute("COMMIT").await.unwrap();
+        while let Some(run) = runs.join_next().await {
+            run.unwrap().unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -457,6 +526,60 @@ async fn an_insert_cannot_choose_its_times_whoever_writes() {
     assert_eq!(code(&error), Some(NOT_NULL_VIOLATION), "{error}");
 }
 
+/// Both trigger functions look names up in `pg_catalog` alone. Otherwise a role that can write
+/// the table, and puts a schema holding functions of its own before `pg_catalog`, would change
+/// what the triggers do: here a `-` that makes every two rows look alike, so a completion may
+/// write any column, and a clock that says it is 2000.
+#[tokio::test]
+async fn the_triggers_use_the_catalogs_own_functions_whatever_the_search_path() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(
+            "CREATE FUNCTION public.all_alike(jsonb, text[]) RETURNS jsonb
+                 LANGUAGE sql AS $$SELECT '{}'::jsonb$$;
+             CREATE OPERATOR public.- (
+                 LEFTARG = jsonb, RIGHTARG = text[], FUNCTION = public.all_alike);
+             CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz
+                 LANGUAGE sql AS $$SELECT '2000-01-01T00:00:00Z'::timestamptz$$;",
+        )
+        .await
+        .unwrap();
+    let owner = db.connect_as(OWNER_ROLE).await;
+    owner
+        .batch_execute("SET search_path = public, pg_catalog")
+        .await
+        .unwrap();
+    // A plain statement in this session finds the stand-ins.
+    let shadowed: bool = owner
+        .query_one(
+            "SELECT '{\"a\": 1}'::jsonb - ARRAY['b'] = '{}'::jsonb
+                 AND clock_timestamp() < '2001-01-01T00:00:00Z'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(shadowed);
+
+    // The triggers do not.
+    let id = insert_row(&owner, &insert(&[])).await;
+    assert_eq!(times(&owner, &id).await, (true, None));
+    let error = owner
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows SET outcome = 'ok', latency_ms = 1,
+                 tool = 'fixture__other' WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(message(&error).contains("only the completion"), "{error}");
+}
+
 #[tokio::test]
 async fn the_database_sets_both_times() {
     let Some(db) = TestDatabase::create().await else {
@@ -517,6 +640,14 @@ async fn a_row_the_core_could_not_make_is_refused() {
         (
             "an allowed call with a reason",
             with(&[("reason", "'unknown_tool'")]),
+        ),
+        (
+            "an allowed call with a sentence",
+            with(&[("sentence", "'Denied.'")]),
+        ),
+        (
+            "a principal of neither kind",
+            with(&[("proved_kind", "'service'"), ("proved_team", "")]),
         ),
         (
             "an allowed call with no connector",
@@ -636,4 +767,29 @@ async fn a_row_the_core_could_not_make_is_refused() {
     ] {
         insert_row(&owner, &insert(&changes)).await;
     }
+
+    // The trigger sets the completion time together with the outcome. With it disabled, which
+    // only the owner can do, the constraint still keeps the two together.
+    let set_times = |change: &str| {
+        format!("ALTER TABLE switchboard_audit.call_rows {change} TRIGGER set_times")
+    };
+    owner.batch_execute(&set_times("DISABLE")).await.unwrap();
+    for (case, changes) in [
+        (
+            "an outcome without its time",
+            with(&[
+                ("begun_at", "now()"),
+                ("outcome", "'ok'"),
+                ("latency_ms", "1"),
+            ]),
+        ),
+        (
+            "a time without an outcome",
+            with(&[("begun_at", "now()"), ("finished_at", "now()")]),
+        ),
+    ] {
+        let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
+    }
+    owner.batch_execute(&set_times("ENABLE")).await.unwrap();
 }

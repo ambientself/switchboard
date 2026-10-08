@@ -7,8 +7,7 @@
 //!   with proved and claimed values in separate columns.
 //! - [`PgAuditStore`] is the core's [`AuditStore`](gateway_core::AuditStore) on that table.
 //!   Begin and finish each keep a time budget ([`Budgets`]). Finish keeps trying, on a task of
-//!   its own, after its answer budget has passed, until a deadline. Each row it stops trying
-//!   to write is counted and logged as [`GIVEN_UP_EVENT`].
+//!   its own, after its answer budget has passed, until a deadline.
 //! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
 //!   is as the store expects and the role it connects as can do no more than the store needs.
 //!
@@ -19,6 +18,11 @@
 //! - It updates only the completion columns: outcome, its sentence, and latency.
 //! - It selects only the identifier, the decision and the completion. It cannot read who
 //!   called what, and it cannot delete.
+//!
+//! Those are the migration's grants on the table. Other objects can give a role more: a grant
+//! on a view over the table, a rule, a `SECURITY DEFINER` function, or a function that reaches
+//! the server's files. [`PgAuditStore::check_at_boot`] refuses the ones it knows of, and its
+//! documentation lists those it does not look for.
 //!
 //! And for every role, through two triggers: both times come from the database's clock,
 //! whatever an insert or a completion carries; a row is completed at most once, a denial is
@@ -50,4 +54,4 @@ pub use check::{BootCheckError, Problem};
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
-pub use store::{Budgets, FinishCounts, GIVEN_UP_EVENT, PgAuditError, PgAuditStore, PoolSizes};
+pub use store::{Budgets, FinishCounts, GivenUp, PgAuditError, PgAuditStore, PoolSizes};

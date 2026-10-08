@@ -1897,7 +1897,10 @@ mutate("registry-links-testkit", "the registry, and so the gateway, links the te
 # Most of these are caught only by the tests against Postgres, which run when
 # SWITCHBOARD_TEST_DATABASE_URL names a superuser on a throwaway server (see the crate's
 # documentation). Without it they survive. The `pg-columns-*` ones need no server, nor do
-# pg-check-durability-ignored, pg-check-delete-ignored and pg-retry-slow-attempt-final.
+# pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
+# pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
+# pg-retry-socket-failure-final, pg-finish-dropped-task-not-reported,
+# pg-finish-pause-past-deadline and pg-finish-pause-uncapped.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 PG_STORE = PG + "src/store.rs"
@@ -1915,6 +1918,10 @@ mutate("pg-trigger-finished-at-not-set", "the database does not set the completi
 mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_SQL,
        "CREATE TRIGGER complete_once\n    BEFORE UPDATE ON switchboard_audit.call_rows\n"
        "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
+mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_SQL,
+       "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $complete_once$", "    LANGUAGE plpgsql\nAS $complete_once$")
+mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_SQL,
+       "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $set_times$", "    LANGUAGE plpgsql\nAS $set_times$")
 mutate("pg-grant-insert-begun-at", "the gateway may write the begin time", PG_SQL,
        "    tool_use_id, deployment, surface, profile, tool, connector, classification,\n",
        "    begun_at, tool_use_id, deployment, surface, profile, tool, connector, classification,\n")
@@ -1929,6 +1936,8 @@ mutate("pg-grant-delete", "the gateway may delete rows", PG_SQL,
        "GRANT DELETE ON switchboard_audit.call_rows TO switchboard_gateway;\n")
 mutate("pg-grant-gateway-creates", "the gateway may create objects in the database", PG + "sql/roles.sql",
        "'GRANT CONNECT ON DATABASE %I TO switchboard_gateway'", "'GRANT CONNECT, CREATE ON DATABASE %I TO switchboard_gateway'")
+mutate("pg-roles-unlocked", "two runs of the roles script grant at once", PG + "sql/roles.sql",
+       "    PERFORM pg_advisory_xact_lock(6005341489043162114);\n", "")
 mutate("pg-check-denial-sentence", "a denial may lack its sentence", PG_SQL,
        "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
        "WHEN 'deny' THEN reason IS NOT NULL AND outcome IS NULL")
@@ -1940,12 +1949,47 @@ mutate("pg-check-refusal-sentence", "only a refusal carrying a sentence is not c
        "        AND coalesce(outcome = 'refused', false) = (outcome_sentence IS NOT NULL)\n", "")
 mutate("pg-check-resources-shape", "resources may be any JSON", PG_SQL,
        "        CHECK (jsonb_typeof(resources) = 'array' OR resources = '\"unknown\"'::jsonb),", "        CHECK (true),")
+mutate("pg-check-denial-reason", "a denial may lack its reason", PG_SQL,
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
+       "WHEN 'deny' THEN sentence IS NOT NULL AND outcome IS NULL")
+mutate("pg-check-denial-outcome", "a denial may have an outcome", PG_SQL,
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
+       "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL")
+mutate("pg-check-allowed-reason", "an allowed call may have a reason", PG_SQL,
+       "            ELSE reason IS NULL AND sentence IS NULL\n", "            ELSE sentence IS NULL\n")
+mutate("pg-check-allowed-sentence", "an allowed call may have a sentence", PG_SQL,
+       "            ELSE reason IS NULL AND sentence IS NULL\n", "            ELSE reason IS NULL\n")
+mutate("pg-check-allowed-connector-only", "an allowed call may lack its connector", PG_SQL,
+       "AND connector IS NOT NULL AND classification IS NOT NULL", "AND classification IS NOT NULL")
+mutate("pg-check-allowed-classification-only", "an allowed call may lack its classification", PG_SQL,
+       "AND connector IS NOT NULL AND classification IS NOT NULL", "AND connector IS NOT NULL")
+mutate("pg-check-user-groups", "a user may lack its groups, and a workload have some", PG_SQL,
+       "        AND (proved_kind = 'user') = (proved_groups IS NOT NULL)\n", "")
+mutate("pg-check-completion-latency", "an outcome may lack its latency", PG_SQL,
+       "        (outcome IS NULL) = (latency_ms IS NULL)\n", "        true\n")
+mutate("pg-check-completion-time", "an outcome may lack its time", PG_SQL,
+       "        AND (outcome IS NULL) = (finished_at IS NULL)\n", "")
+for column, values in [
+    ("classification", "'read', 'propose', 'write', 'destructive'"),
+    ("decision", "'allow', 'deny'"),
+    ("proved_kind", "'workload', 'user'"),
+    ("outcome", "'ok', 'error', 'refused'"),
+]:
+    mutate(f"pg-check-{column.replace('_', '-')}-any", f"the {column} column takes any text", PG_SQL,
+           f"CHECK ({column} IN ({values}))", "CHECK (true)")
+for column in ["resources_omitted", "latency_ms"]:
+    mutate(f"pg-check-{column.replace('_', '-')}-negative", f"the {column} column takes a negative number", PG_SQL,
+           f"CHECK ({column} >= 0)", "CHECK (true)")
 mutate("pg-migrate-any-role", "any role may run the migrations", PG + "src/migrate.rs",
        "    if current_user != OWNER_ROLE {", "    if false {")
 mutate("pg-session-not-synchronous", "sessions keep the role's synchronous_commit", PG_STORE,
        "        config.options(options);\n", "        let _ = options;\n")
 mutate("pg-session-options-replaced", "the caller's session options are dropped", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', "SESSION_OPTIONS.to_owned()")
+mutate("pg-session-search-path-kept", "sessions look names up in the schemas a default puts first", PG_STORE,
+       '"-c synchronous_commit=on -c search_path=pg_catalog,pg_temp"', '"-c synchronous_commit=on"')
+mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
+       'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
        "            pool: self.finish.clone(),", "            pool: self.begin.clone(),")
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
@@ -1962,22 +2006,39 @@ mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succ
 mutate("pg-columns-complete-record-begun", "begin drops a completion it was handed", PG_COLUMNS,
        "        if record.completion.is_some() {", "        if false {")
 mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
-       "            claimed_team: record\n                .claimed_team", "            claimed_team: record\n                .proved_delegation_team")
+       "record.claimed_team.as_ref().map(|team| team.get().as_str()),", "record.proved_delegation_team.as_ref().map(|team| team.get().as_str()),")
+mutate("pg-insert-delegation-and-acting-person-swapped", "the INSERT writes the proved delegation team and the claimed acting person in each other's columns", PG_COLUMNS,
+       "            &self.proved_delegation_team,\n            &self.claimed_acting_person,\n",
+       "            &self.claimed_acting_person,\n            &self.proved_delegation_team,\n")
 mutate("pg-columns-workload-team-as-group", "a workload's team is written as a group", PG_COLUMNS,
-       '            PrincipalKind::Workload { team } => ("workload", Some(team.to_string()), None),',
-       '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![team.to_string()])),')
+       '                "workload",\n                Some(stored("proved_team", team.as_str())?),\n                None,',
+       '                "workload",\n                None,\n                Some(vec![stored("proved_team", team.as_str())?]),')
 mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
        "            && Some(self.latency_ms) == latency_ms\n", "")
 mutate("pg-columns-unknown-as-none", "resources nobody could name are written as none named", PG_COLUMNS,
        '        RecordedResources::Unknown => Value::String("unknown".to_owned()),',
        "        RecordedResources::Unknown => Value::Array(vec![]),")
 mutate("pg-columns-resource-kind-as-system", "a resource's kind is written as its system", PG_COLUMNS,
-       '                        "system": resource.system,', '                        "system": resource.kind,')
+       '"system": stored("resources", &resource.system)?,', '"system": stored("resources", &resource.kind)?,')
 mutate("pg-columns-omitted-saturates", "a count of resources left out past the column is cut short", PG_COLUMNS,
        "    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {\n"
        "        PgAuditError::Column(\"a count of resources left out past the column's range\")\n"
        "    })?;",
        "    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);")
+mutate("pg-columns-nul-kept", "a NUL in a text value is passed on to the database", PG_COLUMNS,
+       "    if text.contains('\\0') {\n        return Err(PgAuditError::Nul { column });\n    }\n", "")
+mutate("pg-columns-nul-replaced", "a NUL in a text value is written as another character", PG_COLUMNS,
+       "    if text.contains('\\0') {\n        return Err(PgAuditError::Nul { column });\n    }\n    Ok(text.to_owned())",
+       "    let _ = column;\n    Ok(text.replace('\\0', \"\\u{FFFD}\"))")
+mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is passed on to the database", PG_COLUMNS,
+       '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
+       "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
+mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
+       'Outcome::Refused { sentence } => Some(stored("outcome_sentence", sentence)?),',
+       "Outcome::Refused { sentence } => Some(sentence.clone()),")
+mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
+       """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
+       """            .unwrap_or(i64::MAX);""")
 mutate("pg-sql-resources-nullable", "a row may record no resources at all", PG_SQL,
        "    resources              jsonb       NOT NULL\n", "    resources              jsonb\n")
 mutate("pg-sql-omitted-nullable", "a row may leave out the count of resources left out", PG_SQL,
@@ -1999,22 +2060,40 @@ mutate("pg-times-begun-at-default", "the begin time falls back to a default the 
 PG_CHECK = PG + "src/check.rs"
 mutate("pg-begin-pool-wait-unbounded", "begin waits for a connection past its budget", PG_STORE,
        "timeout_at(deadline, self.begin.get())", "timeout_at(deadline + Duration::from_secs(3600), self.begin.get())")
+mutate("pg-finish-pool-wait-unbounded", "a finish attempt waits for a connection past its time", PG_STORE,
+       "timeout_at(by, self.pool.get())", "timeout_at(by + Duration::from_secs(3600), self.pool.get())")
 mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget", PG_STORE,
-       "timeout_at(deadline, &mut receiver)", "timeout_at(deadline + Duration::from_secs(3600), &mut receiver)")
+       "timeout_at(deadline, insert_on(&client, &row))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, &row))")
+mutate("pg-begin-insert-budget-restarts", "begin's insert has a budget of its own after the wait for a connection", PG_STORE,
+       "match timeout_at(deadline, insert_on(&client, &row)).await {",
+       "match timeout_at(Instant::now() + budget, insert_on(&client, &row)).await {")
 mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
        "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
 mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
-       "    drop(Object::take(client));", "    drop(client);")
+       "    drop(Object::take(client));\n}\n", "    drop(client);\n}\n")
+# The same two, at finish's call alone: begin's tests do not reach it.
+mutate("pg-finish-timeout-not-cancelled", "a finish attempt that ran out of time is left running", PG_STORE,
+       "                abandon(client, &self.cancel);\n                Err(PgAuditError::AttemptTimedOut)",
+       "                drop(Object::take(client));\n                Err(PgAuditError::AttemptTimedOut)")
+mutate("pg-finish-timeout-connection-kept", "a finish connection that ran out of time goes back to its pool", PG_STORE,
+       "                abandon(client, &self.cancel);\n                Err(PgAuditError::AttemptTimedOut)",
+       "                drop(client);\n                Err(PgAuditError::AttemptTimedOut)")
 mutate("pg-finish-waits-past-answer-budget", "finish holds the answer until its deadline", PG_STORE,
        "let answer_by = started + self.budgets.answer;", "let answer_by = started + self.budgets.finish_deadline;")
 mutate("pg-finish-stops-at-answer-budget", "finish stops trying when the answer goes out", PG_STORE,
        "            deadline: started + self.budgets.finish_deadline,", "            deadline: started + self.budgets.answer,")
+mutate("pg-finish-attempt-unbounded-by-answer", "a finish attempt is limited only by the deadline, not the answer budget", PG_STORE,
+       "            attempt: self.budgets.answer,", "            attempt: self.budgets.finish_deadline,")
 mutate("pg-finish-no-retry", "finish gives up after one failed attempt", PG_STORE,
        "                Err(error) => error,", "                Err(error) => return Err(error),")
 mutate("pg-finish-retries-final-errors", "finish retries a failure that trying again cannot fix", PG_STORE,
        "                Err(error) if !error.is_transient() => return Err(error),", "                Err(error) if false => return Err(error),")
 mutate("pg-finish-no-deadline", "finish keeps trying past its deadline", PG_STORE,
        "            if now >= self.deadline {", "            if false {")
+mutate("pg-finish-pause-past-deadline", "a pause between finish attempts may run past the deadline", PG_STORE,
+       "sleep_until((now + pause).min(self.deadline)).await;", "sleep_until(now + pause).await;")
+mutate("pg-finish-pause-uncapped", "the pause between finish attempts doubles without a cap", PG_STORE,
+       "pause = (pause * 2).min(LONGEST_PAUSE);", "pause = pause * 2;")
 mutate("pg-retry-connect-failure-final", "a connection that could not be made is not retried", PG_STORE,
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
        "            Self::Pool(PoolError::Timeout(_)) | Self::AttemptTimedOut => {")
@@ -2022,12 +2101,51 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) => {")
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
-       "            in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+       "        self.in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported", PG_STORE,
+       "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n            error,\n        });\n",
+       "        let _ = error;\n")
+mutate("pg-finish-dropped-task-not-reported", "a finish dropped with its runtime is not counted or reported", PG_STORE,
+       "        if !self.settled {", "        if false {")
+mutate("pg-finish-unstorable-not-settled", "a completion the row cannot hold is not counted or reported", PG_STORE,
+       "                let result = Err(error);\n                settle.settle(&result);\n",
+       "                let result = Err(error);\n                std::mem::forget(settle);\n")
+# One retried SQLSTATE class at a time.
+RETRIED_CLASSES = ["08", "40", "53", "57", "58"]
+for retried in RETRIED_CLASSES:
+    kept = " | ".join(f'"{other}"' for other in RETRIED_CLASSES if other != retried)
+    mutate(f"pg-retry-class-{retried}-final", f"a failure of SQLSTATE class {retried} is not retried", PG_STORE,
+           'Some("08" | "40" | "53" | "57" | "58")', f"Some({kept})")
+mutate("pg-retry-read-only-final", "a server that has become read-only is not retried", PG_STORE,
+       '|| matches!(code.code(), "25006" | "55P03")', '|| matches!(code.code(), "55P03")')
+mutate("pg-retry-lock-timeout-final", "a lock not had within lock_timeout is not retried", PG_STORE,
+       '|| matches!(code.code(), "25006" | "55P03")', '|| matches!(code.code(), "25006")')
+mutate("pg-retry-failed-connection-kept", "a connection whose attempt failed is used again", PG_STORE,
+       "every attempt on it would find.\n                drop(Object::take(client));",
+       "every attempt on it would find.\n                drop(client);")
+mutate("pg-begin-failed-connection-kept", "a begin connection that found the server read-only goes back to its pool", PG_STORE,
+       "rather than fail on this one.\n                drop(Object::take(client));",
+       "rather than fail on this one.\n                drop(client);")
+mutate("pg-retry-closed-connection-final", "a connection found closed is not retried", PG_STORE,
+       "                    error.is_closed()\n", "                    false\n")
+mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not retried", PG_STORE,
+       "                        || std::error::Error::source(error)\n"
+       "                            .is_some_and(|source| source.is::<std::io::Error>())\n", "")
+mutate("pg-retry-attempt-past-deadline", "one attempt may run past the finish deadline", PG_STORE,
+       "let by = (Instant::now() + self.attempt).min(self.deadline);", "let by = Instant::now() + self.attempt;")
+mutate("pg-cancel-unbounded", "a cancel the server does not answer is waited for without end", PG_STORE,
+       "let _ = tokio::time::timeout(CANCEL_WAIT, token.cancel_query(tls)).await;",
+       "let _ = CANCEL_WAIT;\n                let _ = token.cancel_query(tls).await;")
+mutate("pg-migrate-unlocked", "two migrators run at once", PG + "src/migrate.rs",
+       'SELECT pg_advisory_xact_lock($1)', 'SELECT $1::bigint')
 mutate("pg-check-durability-ignored", "a server without fsync passes the check", PG_CHECK,
        "    (found != expected).then_some(", "    false.then_some(")
 mutate("pg-check-superuser-ignored", "a superuser passes the check", PG_CHECK,
        '            (1, "SUPERUSER"),\n', "")
-mutate("pg-check-bypassrls-ignored", "a role that bypasses row security passes the check", PG_CHECK,
+for index, attribute in [(2, "CREATEROLE"), (3, "CREATEDB"), (4, "REPLICATION")]:
+    mutate(f"pg-check-{attribute.lower()}-attribute-ignored", f"a role with {attribute} passes the check", PG_CHECK,
+           f'            ({index}, "{attribute}"),\n', "")
+mutate("pg-check-bypassrls-ignored","a role that bypasses row security passes the check", PG_CHECK,
        '            (5, "BYPASSRLS"),\n', "")
 mutate("pg-check-attributes-own-role-only", "a role the session can become is not checked for attributes", PG_CHECK,
        "             WHERE pg_has_role(current_user, oid, 'MEMBER')", "             WHERE rolname = current_user")
@@ -2056,7 +2174,10 @@ mutate("pg-check-set-times-unchecked", "the trigger that sets the times is not c
        '    Trigger {\n        name: "set_times",\n        purpose: "sets both times from the database\'s clock",\n'
        '        fires: "before each insert",\n        tgtype: 1 | 2 | 4,\n    },\n', "")
 mutate("pg-check-extra-column-ignored", "a column grant beyond the gateway's passes the check", PG_CHECK,
-       "    for (privilege, column) in held.difference(&expected) {", "    for (privilege, column) in held.difference(&held) {")
+       "    for (privilege, column) in reachable.difference(&expected) {",
+       "    for (privilege, column) in reachable.difference(&reachable) {")
+mutate("pg-check-needed-grant-reachable-only", "a column grant the store needs passes when only SET ROLE reaches it", PG_CHECK,
+       "    for (privilege, column) in expected.difference(&held) {", "    for (privilege, column) in expected.difference(&reachable) {")
 mutate("pg-check-missing-column-grant-ignored", "a column grant the store needs may be missing", PG_CHECK,
        "    for (privilege, column) in expected.difference(&held) {", "    for (privilege, column) in expected.difference(&expected) {")
 mutate("pg-check-whole-table-per-column", "a privilege on the whole table is also reported for every column", PG_CHECK,
@@ -2071,8 +2192,148 @@ mutate("pg-check-schema-create-ignored", "CREATE on the schema passes the check"
        "        if schema.get::<_, bool>(1) {", "        if false {")
 mutate("pg-check-database-create-ignored", "CREATE on the database passes the check", PG_CHECK,
        "    if database.get::<_, bool>(1) {", "    if false {")
-mutate("pg-check-replication-role-ignored", "a role that may set session_replication_role passes the check", PG_CHECK,
-       "        if can_set {", "        if false {")
+mutate("pg-check-session-settings-ignored", "a session without the store's settings passes the check", PG_CHECK,
+       "        if found != *expected {\n            problems.push(Problem::SessionSetting {",
+       "        if false {\n            problems.push(Problem::SessionSetting {")
+mutate("pg-check-unlogged-ignored", "an unlogged table passes the check", PG_CHECK,
+       "                 AND c.relpersistence <> 'p'", "                 AND false")
+mutate("pg-check-unlogged-table-ignored", "an unlogged table that is not partitioned passes the check", PG_CHECK,
+       "             WHERE (c.oid = $1::oid\n", "             WHERE (false\n")
+mutate("pg-check-unlogged-partition-ignored", "an unlogged partition passes the check", PG_CHECK,
+       "OR c.oid IN (SELECT relid", "OR false AND c.oid IN (SELECT relid")
+mutate("pg-check-partitioned-ignored", "a partitioned table passes the check", PG_CHECK,
+       "            if partitioned {", "            if false {")
+mutate("pg-check-children-ignored", "a table that inherits from call_rows, or a partition of it, passes the check", PG_CHECK,
+       "WHERE i.inhparent = $1::oid OR i.inhrelid = $1::oid", "WHERE i.inhrelid = $1::oid")
+mutate("pg-check-parents-ignored", "call_rows inheriting from a table passes the check", PG_CHECK,
+       "WHERE i.inhparent = $1::oid OR i.inhrelid = $1::oid", "WHERE i.inhparent = $1::oid")
+mutate("pg-check-parameter-grants-ignored", "a role holding a grant on a setting passes the check", PG_CHECK,
+       "    if version >= 150_000 {", "    if false {")
+mutate("pg-check-alter-system-ignored", "a role that may change a setting with ALTER SYSTEM passes the check", PG_CHECK,
+       "unnest(ARRAY['ALTER SYSTEM', 'SET']) AS p", "unnest(ARRAY['SET']) AS p")
+mutate("pg-check-setting-set-ignored", "a role that may set a setting only a superuser may set passes the check", PG_CHECK,
+       "OR NOT EXISTS (SELECT FROM pg_catalog.pg_settings s", "OR false AND NOT EXISTS (SELECT FROM pg_catalog.pg_settings s")
+mutate("pg-check-replication-role-only", "SET is refused on session_replication_role alone", PG_CHECK,
+       "OR NOT EXISTS (SELECT FROM pg_catalog.pg_settings s",
+       "OR a.parname = 'session_replication_role' AND NOT EXISTS (SELECT FROM pg_catalog.pg_settings s")
+mutate("pg-check-user-setting-set-refused", "SET on a setting any role may set is refused", PG_CHECK,
+       "AND s.context = 'user'", "AND false")
+for relkind, kind in [("v", "view"), ("m", "materialized-view"), ("f", "foreign-table")]:
+    kinds = ", ".join(f"'{k}'" for k in ["r", "p", "v", "m", "f"] if k != relkind)
+    mutate(f"pg-check-{kind}-ignored", f"a grant on a {kind.replace('-', ' ')} in the schema passes the check", PG_CHECK,
+           "c.relkind IN ('r', 'p', 'v', 'm', 'f')", f"c.relkind IN ({kinds})")
+for privilege in ["SELECT", "INSERT", "UPDATE", "TRUNCATE", "REFERENCES", "TRIGGER"]:
+    mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
+           f'        "{privilege}",\n', "")
+mutate("pg-check-maintain-ignored", "MAINTAIN on the table passes the check", PG_CHECK,
+       '        privileges.push("MAINTAIN");', "")
+mutate("pg-check-trigger-function-any-schema", "a trigger calling a function of the same name in another schema passes the check", PG_CHECK,
+       "AND n.nspname = 'switchboard_audit' AND p.proname = $2", "AND p.proname = $2")
+mutate("pg-check-trigger-function-any-name", "a trigger calling another of the schema's functions passes the check", PG_CHECK,
+       "AND n.nspname = 'switchboard_audit' AND p.proname = $2", "AND n.nspname = 'switchboard_audit' AND $2::text IS NOT NULL")
+mutate("pg-check-column-references-ignored", "REFERENCES on a column passes the check", PG_CHECK,
+       '    "REFERENCES",\n    "SELECT WITH GRANT OPTION",', '    "SELECT WITH GRANT OPTION",')
+mutate("pg-check-sequence-select-ignored", "SELECT on a sequence in the schema passes the check", PG_CHECK,
+       "unnest(ARRAY['USAGE', 'SELECT', 'UPDATE'])", "unnest(ARRAY['USAGE', 'UPDATE'])")
+mutate("pg-check-sequence-update-ignored", "UPDATE on a sequence in the schema, which allows setval, passes the check", PG_CHECK,
+       "unnest(ARRAY['USAGE', 'SELECT', 'UPDATE'])", "unnest(ARRAY['USAGE', 'SELECT'])")
+mutate("pg-check-table-any-relkind", "a relation named call_rows that is not a table is taken for the table", PG_CHECK,
+       "                 AND c.relkind IN ('r', 'p')\",", "                 AND true\",")
+mutate("pg-check-schema-owner-membership-ignored", "a member of the schema's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, n.nspowner, 'MEMBER')",
+       "                 AND n.nspowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-function-owner-membership-ignored", "a member of the trigger functions' owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, p.proowner, 'MEMBER')",
+       "                 AND p.proowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-database-owner-ignored", "the database's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, d.datdba, 'MEMBER')", "                 AND false")
+mutate("pg-check-database-owner-membership-ignored", "a role that can become the database's owner passes the check", PG_CHECK,
+       "                 AND pg_has_role(current_user, d.datdba, 'MEMBER')",
+       "                 AND d.datdba = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-replica-session-ignored", "a session in replica mode, where the triggers do not fire, passes the check", PG_CHECK,
+       '    if replication_role == "replica" {', "    if false {")
+mutate("pg-check-encoding-ignored", "a database that is not UTF8 passes the check", PG_CHECK,
+       '    if encoding != "UTF8" {', "    if false {")
+mutate("pg-check-logged-in-as-ignored", "a session that logged in as another role passes the check", PG_CHECK,
+       "    if logged_in != role {", "    if false {")
+mutate("pg-check-privileges-own-role-only", "a role the session can become is not checked for privileges", PG_CHECK,
+       "                 WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND {test})",
+       "                 WHERE r.rolname = current_user AND {test})")
+# Each privilege check asked of the session's role alone, one at a time.
+for site, test in [
+    ("column", "has_column_privilege(r.oid, $1::oid, a.attnum, p)"),
+    ("whole-table", "has_table_privilege(r.oid, $1::oid, p)"),
+    ("table", "has_table_privilege(r.oid, c.oid, p)"),
+    ("other-table-column", "has_any_column_privilege(r.oid, c.oid, p)"),
+    ("sequence", "has_sequence_privilege(r.oid, c.oid, p)"),
+    ("schema-create", "has_schema_privilege(r.oid, n.oid, 'CREATE')"),
+    ("schema-grant-option", "has_schema_privilege(r.oid, n.oid, 'USAGE WITH GRANT OPTION')"),
+    ("database-create", "has_database_privilege(r.oid, current_database(), 'CREATE')"),
+    ("parameter", "has_parameter_privilege(r.oid, a.parname, p)"),
+    ("reaching-table", "has_table_privilege(r.oid, v.oid, p)"),
+    ("reaching-column", "has_any_column_privilege(r.oid, v.oid, p)"),
+    ("definer-execute", "has_function_privilege(r.oid, d.oid, 'EXECUTE')"),
+    ("server-function", "has_function_privilege(r.oid, p.oid, 'EXECUTE')"),
+]:
+    mutate(f"pg-check-{site}-own-role-only", f"the {site} privilege check asks only of the session's role", PG_CHECK,
+           f'"{test}"', f'"r.rolname = current_user AND {test}"')
+mutate("pg-check-grant-option-ignored", "the gateway's own column privileges with grant option pass the check", PG_CHECK,
+       '    "SELECT WITH GRANT OPTION",\n    "INSERT WITH GRANT OPTION",\n    "UPDATE WITH GRANT OPTION",\n', "")
+mutate("pg-check-schema-grant-option-ignored", "USAGE on the schema with grant option passes the check", PG_CHECK,
+       "        if schema.get::<_, bool>(2) {", "        if false {")
+mutate("pg-check-server-roles-ignored", "a role that reaches the server's files or programs passes the check", PG_CHECK,
+       "            problems.push(Problem::ServerAccess { role, reach });", "            let _ = (role, reach);")
+mutate("pg-check-server-roles-inherited-only", "a server role reached without inheriting it passes the check", PG_CHECK,
+       "WHERE rolname = $1 AND pg_has_role(current_user, oid, 'MEMBER'))",
+       "WHERE rolname = $1 AND pg_has_role(current_user, oid, 'USAGE'))")
+for server_role in ["pg_execute_server_program", "pg_read_server_files", "pg_write_server_files"]:
+    mutate(f"pg-check-{server_role.replace('_', '-')}-ignored", f"a member of {server_role} passes the check", PG_CHECK,
+           f'        "{server_role}",\n', '        "pg_monitor",\n')
+
+mutate("pg-check-rule-ignored", "a rule on the table passes the check", PG_CHECK,
+       "            .map(|row| Problem::Rule { rule: row.get(0) }),",
+       "            .filter(|_| false)\n            .map(|row| Problem::Rule { rule: row.get(0) }),")
+mutate("pg-check-reaching-ignored", "a grant on a view or rule outside the schema that reaches the table passes the check", PG_CHECK,
+       "                 WHERE n.nspname <> 'switchboard_audit'\n                     AND ({}",
+       "                 WHERE false\n                     AND ({}")
+mutate("pg-check-reaching-direct-only", "a view over a view over the table is not followed", PG_CHECK,
+       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid\n",
+       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid AND x.oid = $1::oid\n")
+mutate("pg-check-reaching-views-only", "a rule on another table that writes the table is not followed", PG_CHECK,
+       "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid\n",
+       "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid AND rw.rulename = '_RETURN'\n")
+mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that reaches the table passes the check", PG_CHECK,
+       "OR (p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND {}))", "OR (false AND {}))")
+mutate("pg-check-definers-ignored", "a SECURITY DEFINER function that can reach the table passes the check", PG_CHECK,
+       "                     WHERE p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x",
+       "                     WHERE false AND p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x")
+mutate("pg-check-definer-trigger-ignored", "a write to a table whose trigger runs such a function passes the check", PG_CHECK,
+       "unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS w", "unnest(ARRAY[]::text[]) AS w")
+mutate("pg-check-definer-trigger-own-role-only", "the trigger route asks only of the session's role, for a privilege on the whole table", PG_CHECK,
+       "has_table_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_table_privilege(r.oid, c.oid, w)")
+mutate("pg-check-definer-trigger-column-own-role-only", "the trigger route asks only of the session's role, for a column privilege", PG_CHECK,
+       "has_any_column_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_any_column_privilege(r.oid, c.oid, w)")
+mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner holds only column privileges passes the check", PG_CHECK,
+       "OR has_any_column_privilege(p.proowner, x.oid,", "OR false AND has_any_column_privilege(p.proowner, x.oid,")
+mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
+       "SELECT FROM reaching x\n", "SELECT FROM (SELECT $1::oid AS oid) x\n")
+mutate("pg-check-definer-schema-owner-ignored", "a definer function of the schema's owner passes the check", PG_CHECK,
+       "OR EXISTS (SELECT FROM pg_catalog.pg_namespace s", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_namespace s")
+mutate("pg-check-definer-chain-not-followed", "a definer function that reaches the table through another passes the check", PG_CHECK,
+       "                         JOIN pg_catalog.pg_proc p ON p.prosecdef\n",
+       "                         JOIN pg_catalog.pg_proc p ON false AND p.prosecdef\n")
+mutate("pg-check-definer-chain-execute-not-followed", "a definer function that runs another passes the check", PG_CHECK,
+       "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
+mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
+       "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
+mutate("pg-check-server-functions-ignored", "a role that can run a function reaching the server's files passes the check", PG_CHECK,
+       "    problems.extend(found.into_iter().map(|row| Problem::ServerFunction {",
+       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::ServerFunction {")
+# The pg_file_* functions are adminpack's, which PostgreSQL 17, the version the tests run on,
+# no longer has, so nothing can catch their removal.
+for server_function in ["lo_export", "lo_import", "pg_ls_dir", "pg_read_binary_file", "pg_read_file", "pg_stat_file"]:
+    mutate(f"pg-check-{server_function.replace('_', '-')}-ignored", f"a role that can run {server_function} passes the check", PG_CHECK,
+           f'    "{server_function}",\n', "")
 
 
 # --- demo-checks ---------------------------------------------------------------------------
@@ -2242,19 +2503,10 @@ mutate("demo-compose-dev-issuer-published", "the development issuer is published
        "      - issuer-keys:/shared/issuer\n    ports:\n      - \"127.0.0.1:18090:8090\"\n    healthcheck:")
 
 
-# --- first slice: resources on rows, late begins, naming what goes down ---------------------
+# --- first slice: resources on rows, naming what goes down ------------------------------------
 
-# The pg-late-* and pg-begin-not-cancelled ones are caught only against Postgres
-# (SWITCHBOARD_TEST_DATABASE_URL); the pg-columns-resources-* ones need no server. The audit
-# store's own section has the mutation that writes unknown resources as none named.
-mutate("pg-late-row-left-open", "an allowed row that commits after its begin failed is left open", PG_STORE,
-       "                Ok(committed) if allowed => {", "                Ok(committed) if false => {")
-mutate("pg-late-denial-completed", "a denied row that commits late is given an outcome", PG_STORE,
-       "                Ok(committed) if allowed => {", "                Ok(committed) if true => {")
-mutate("pg-late-connection-kept", "a connection whose insert answered late goes back to its pool", PG_STORE,
-       "            std::mem::drop(Object::take(client));", "            std::mem::drop(client);")
-mutate("pg-begin-not-cancelled", "an insert past the begin budget is left running", PG_STORE,
-       "                tokio::spawn(self.cancel.as_ref()(token));", "                let _ = token;")
+# The pg-columns-resources-* ones need no server. The audit store's own section has the
+# mutation that writes unknown resources as none named.
 mutate("pg-columns-resources-dropped", "a row records no resources", PG_COLUMNS,
        "    Ok((resources, omitted))", "    Ok((json!([]), omitted))")
 mutate("pg-columns-resources-omitted-dropped", "a row counts no resources as left out", PG_COLUMNS,
@@ -2281,9 +2533,8 @@ mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's
 # --- first slice: the demo's honesty review ----------------------------------------------------
 # Unknown resources for a tool the gateway does not know, the row check that tests what it
 # claims, the operator checks for both teams and the API server's routes, team-b's own
-# pre-policy probe, proxied results passed on as the server sent them, the given-up event and
-# the grace periods. pg-given-up-insert-not-logged is caught only against Postgres
-# (SWITCHBOARD_TEST_DATABASE_URL); the other pg-given-up-* ones need no server.
+# pre-policy probe, proxied results passed on as the server sent them, and the grace periods.
+# The given-up event is the gateway's now; its mutations are in the last section.
 
 mutate("gw-unknown-tool-resources-none", "a call to a tool the gateway does not know records no resources", GW + "path.rs",
        "            return Resources::Unknown;\n", "            return Resources::Named(Vec::new());\n")
@@ -2293,12 +2544,6 @@ mutate("gw-proxied-structured-content-dropped", "a proxied server's structured c
        '            structured_content: result.get("structuredContent").cloned(),', "            structured_content: None,")
 mutate("mcp-tool-result-legacy-structured-non-object", "a legacy pass-through result carries structuredContent that is not an object", MCP_REPLY,
        "structured_content.filter(|value| era == Era::Modern || value.is_object());", "structured_content.filter(|_| true);")
-mutate("pg-given-up-finish-not-logged", "a finish given up at its deadline is only counted", PG_STORE,
-       '                event = GIVEN_UP_EVENT,\n                stage = "finish",', '                event = "not_the_event",\n                stage = "finish",')
-mutate("pg-given-up-finish-row-unnamed", "the given-up event does not name its row", PG_STORE,
-       '                stage = "finish",\n                row = row.as_str(),\n', '                stage = "finish",\n')
-mutate("pg-given-up-insert-not-logged", "an insert given up at the deadline is only counted", PG_STORE,
-       '                    event = GIVEN_UP_EVENT,\n                    stage = "begin",', '                    event = "not_the_event",\n                    stage = "begin",')
 mutate("demo-driver-unknown-row-as-none", "the row check takes none for the resources of a tool the gateway does not know", DRIVER,
        '        elif .reason == "unknown_tool" then "unknown"\n', '        elif .reason == "unknown_tool" then []\n')
 mutate("demo-driver-row-check-counts-nothing", "the row check passes whatever rows were wrong", DRIVER,
@@ -2321,6 +2566,30 @@ mutate("demo-kind-slow-readiness-removal", "readiness removal takes longer than 
        "            failureThreshold: 3\n", "            failureThreshold: 10\n")
 mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
        "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
+
+# --- first slice: the Postgres store as PR #39 has it -----------------------------------------
+# The gateway logs each finish the store reports given up, and the demo's database, set up by
+# deploy/demo's scripts for both Compose and kind, passes the store's boot checks. Each is
+# caught only against Postgres (SWITCHBOARD_TEST_DATABASE_URL).
+
+mutate("gw-given-up-not-logged", "a finish the store gives up is not logged", GW + "start.rs",
+       "        .on_given_up(log_given_up);\n", ";\n")
+mutate("gw-given-up-wrong-event", "a finish given up is logged under another event", GW + "start.rs",
+       'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";', 'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up_";')
+mutate("gw-given-up-row-unnamed", "the given-up event does not name its row", GW + "start.rs",
+       "        row = given_up.row.as_str(),\n", "")
+mutate("gw-given-up-outcome-unnamed", "the given-up event does not name the outcome not written", GW + "start.rs",
+       "        outcome = given_up.outcome,\n", "")
+mutate("gw-given-up-not-error", "the given-up event is logged below ERROR", GW + "start.rs",
+       "fn log_given_up(given_up: GivenUp<'_>) {\n    tracing::error!(", "fn log_given_up(given_up: GivenUp<'_>) {\n    tracing::warn!(")
+mutate("demo-roles-gateway-owns-database", "the demo's gateway role owns its database", "deploy/demo/roles.sql",
+       "CREATE DATABASE switchboard OWNER switchboard_owner", "CREATE DATABASE switchboard OWNER switchboard_gateway")
+mutate("demo-roles-gateway-can-create", "the demo's gateway role may create in its database", "deploy/demo/roles.sql",
+       "GRANT CONNECT ON DATABASE switchboard TO switchboard_gateway, switchboard_reader;",
+       "GRANT CONNECT, CREATE ON DATABASE switchboard TO switchboard_gateway, switchboard_reader;")
+mutate("demo-migrate-gateway-reads-everything", "the demo grants the gateway role every column", "deploy/demo/migrate.sh",
+       'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader;',
+       'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader, switchboard_gateway;')
 
 # --- Running -------------------------------------------------------------------------------
 

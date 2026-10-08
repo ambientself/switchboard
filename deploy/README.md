@@ -97,7 +97,7 @@ check that the deployment files load.
 | --- | --- |
 | Binaries | `switchboard` (crates/gateway), `switchboard-dev` (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server), built by `cargo build --release --workspace --bins`. `switchboard` links nothing from the testkit. |
 | Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with its keys file and team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server. Missing, partial or unknown fields refuse to start, except `listen`, which is `127.0.0.1:8080` (loopback only) if left out. |
-| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. |
+| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. One `"event":"audit_row_given_up"` line at `ERROR` for each audit row whose completion the store stopped trying to write, with the `row`, the `outcome` not written and the `cause`. |
 | Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-1`; `compose/config/registry-withdrawn.toml` is revision `demo-2` without `docs__read_document`. A new version that changes a server or a tool's route is refused until a restart. |
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
@@ -107,13 +107,13 @@ check that the deployment files load.
 
 ## What a run shows that is not settled
 
-- **A refused call can still leave a row, completed as `error`.** In the database outage
+- **A refused call can still leave a row, and nothing completes it.** In the database outage
   step the gateway refuses the call after its 2 s begin budget, and nothing runs. The store
   asks Postgres to cancel the insert, but a paused server cannot act on that; once it is
-  unpaused the insert commits. The store is still waiting for the insert's answer, so it
-  completes that row as `error` with latency 0, as decision 0009 says: a row may overstate
-  what ran, never understate it. The listing shows it as an `allow` row with outcome `error`
-  inside the outage, and the driver checks that no allowed row is left without an outcome.
+  unpaused the insert commits. Decision 0009 allows this: a begin reported as failed may still
+  have written its row. Completing such a row as `error` is not built (design section 17), so
+  the listing may show an `allow` row with no outcome inside the outage. The driver checks that
+  the outage left at most that one row open, and that every other allowed row has an outcome.
   The rest of decision 0009's row work (gateway-assigned identifiers, a deadline column, the
   open-row query, `tools/list` rows) is not built.
 - **It runs from an unmerged branch.** `agent/first-slice` stacks #25 (the harness's latest

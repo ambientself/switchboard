@@ -16,6 +16,9 @@ connector-proxy = { path = "../connector-proxy" }
 gateway-core = { path = "../gateway-core" }
 serde_json = "1"
 sha2 = "0.10"
+# Sets up the demo's database from its scripts on a throwaway server, when one is given.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
 
 [lints]
 workspace = true

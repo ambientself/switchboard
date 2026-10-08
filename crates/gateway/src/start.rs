@@ -11,13 +11,17 @@
 //! how the gateway was started: identity enforced or disabled, with how many issuers and
 //! subjects; audit in Postgres, with the role and its check, or disabled; and the registry's
 //! revision.
+//!
+//! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
+//! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
+//! left open and not only by querying for it (decision 0009).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use audit_postgres::{BootCheckError, PgAuditError, PgAuditStore, PoolSizes};
+use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
 use connector_proxy::{
     CredentialFileError, FileCredentials, ProxyConnector, Upstream, UpstreamError,
 };
@@ -30,6 +34,12 @@ use crate::boot::{self, BootError, Gates, Settings, Wiring};
 use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment};
 use crate::reload::Reloader;
+
+/// The `event` field of the error logged for each audit row the Postgres store stops trying to
+/// complete: the finish deadline passed, or the database refused the completion. It names the
+/// `row`, the `outcome` that was not written (`ok`, `error` or `refused`), and the `cause`.
+/// The row keeps an empty outcome.
+pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";
 
 /// How long the audit store's boot checks may take, connecting included.
 pub const AUDIT_CHECK_BUDGET: Duration = Duration::from_secs(15);
@@ -251,12 +261,24 @@ async fn audit_store(url: &str) -> Result<Arc<PgAuditStore>, StartError> {
     let config: tokio_postgres::Config = url
         .parse()
         .map_err(|error: tokio_postgres::Error| StartError::DatabaseUrl(error.to_string()))?;
-    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?;
+    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?
+        .on_given_up(log_given_up);
     match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {
         Err(_elapsed) => Err(StartError::AuditCheckTimedOut),
         Ok(Err(refused)) => Err(StartError::AuditCheck(refused)),
         Ok(Ok(())) => Ok(Arc::new(store)),
     }
+}
+
+/// Logs one finish the store gave up as [`GIVEN_UP_EVENT`]. Called on the finish's own task.
+fn log_given_up(given_up: GivenUp<'_>) {
+    tracing::error!(
+        event = GIVEN_UP_EVENT,
+        row = given_up.row.as_str(),
+        outcome = given_up.outcome,
+        cause = %given_up.error,
+        "an audit row's completion was not written, and the store has stopped trying"
+    );
 }
 
 /// The role the store connects as, for the boot line. Never the password.

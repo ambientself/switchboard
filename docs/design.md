@@ -640,6 +640,12 @@ written complete, has no finish, and is never open.
   before the tool runs. The size limits and audit latency targets in Q12 must cover a row this
   large, counted as the store counts it.
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
+- **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
+  the record rather than store another value in its place, and the call is refused. Postgres
+  text and jsonb cannot hold U+0000, and a caller chooses its tool-use identifier and the
+  values it claims, so the Postgres store refuses a record with U+0000 in any text value,
+  naming the column, and a refusal sentence with one at finish. It refuses a latency or a
+  count past its `bigint` column the same way.
 - **Proved and claimed are separate columns.**
 - **No foreign key to anything a caller owns,** so a caller's data retention cannot delete its
   audit trail.
@@ -817,9 +823,44 @@ later is held to the same rule.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
-Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the trigger
-that sets the times or a write-once trigger missing or disabled, or with grants beyond
-decision 0009's on the audit or receipt table.
+Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the audit
+table or a partition of it unlogged, with an audit table that does not stand alone (one that is
+partitioned, that another table inherits from, or that inherits from one, since each partition
+or child has triggers, an owner and grants of its own), with the trigger that sets the times
+or a write-once trigger missing or disabled, with grants beyond decision 0009's on the audit or
+receipt table, with a role that owns the database, with a session that logged in as another
+role than the one it runs as, with a session that a role or database default puts in
+`session_replication_role = replica`, where neither trigger fires, or with a database whose
+encoding is not UTF8. It also refuses a role that can set a setting only a superuser may set,
+or change any setting with `ALTER SYSTEM`, since a change made that way reaches the store's
+running sessions at the next reload. Its sessions commit synchronously and look names up in
+`pg_catalog` alone, so a function another role makes in a schema a default puts first cannot
+change what its checks or its writes do. Both settings travel in the startup options, which a
+pooler may drop, so the check reads them back and refuses a session without them.
+
+The grants on the audit table are not the only way to it, so the Postgres check also refuses,
+for the gateway's role and every role it can become, PUBLIC included: an audit table that is a
+view or foreign table, or has a rule; any privilege on a view, materialized view or table with
+a rule, in any schema, that reaches the audit table directly or through other views and rules;
+being able to run a `SECURITY DEFINER` function, in any schema, whose owner can read or change
+the audit table, by EXECUTE or by writing to a table whose trigger runs it; and EXECUTE on the
+catalog's functions that read or write the server's files (`lo_export`, `lo_import`,
+`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's
+`pg_file_*`).
+
+What the Postgres check does not look for, which an administrator must keep from the gateway's
+role without its help:
+
+- **Changes after boot.** It reads the catalog once. A grant, view, rule or function made
+  later is not seen until the next boot.
+- **Event triggers.** One fires on statements the gateway's role may be able to run, such as
+  `CREATE TEMP TABLE`, and its function may be `SECURITY DEFINER`.
+- **Other functions that leave the database.** Only the catalog's file functions above are
+  refused by name. A function in an untrusted language such as `plpython3u`, or in C from an
+  extension, runs with the access of the server's operating-system user.
+- **Other connections back in.** `postgres_fdw` or `dblink` can log in again as another role,
+  through a user mapping or a function holding that role's password. A foreign table in the
+  audit schema is refused; one elsewhere is not followed to where it connects.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
@@ -1054,9 +1095,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - The boot check covers all three triggers. Today it covers the two on the audit table, the
   one that sets the times and the one that completes a row once; the third is the receipt
   table's (part 2).
+- If retention needs it, a partitioned audit table, with the boot check reading the triggers,
+  owner and grants of every partition, in whatever schema. Today the boot check refuses a
+  partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
   giving up a guard without running completes its row as `error`. Today a guard can only be
-  consumed by running it.
+  consumed by running it, and a row whose insert commits after its begin failed stays open.
 - In the core: `begin` takes the identifier; `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
@@ -1066,9 +1110,13 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   row is never finished twice, and so does the harness's in-memory store. With #25, the
   in-memory store can also write and then report failure, lose the process between run and
   finish, and keep the answer budget, so the contract suite runs on it.
+- A finish given up names, for a side effect, the vendor's reference (part 2). Today the
+  Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
+  stopped, but no outcome carries a vendor reference yet.
 - Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
   finish pool of its own, finish waiting at most the answer budget and then retrying on its
-  own task until the deadline, an identical repeat finish accepted, and column grants.
+  own task until the deadline, an identical repeat finish accepted, column grants, and the
+  report of each finish given up.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1097,6 +1145,12 @@ off only in a development build, with CI's check of the release artifact; and th
 - Telemetry events that carry the surface and the source address, counters, and a bounded
   queue, with events for `initialize`, `ping`, `server/discover` and bodies that cannot be
   parsed. Today an identity failure is logged with the deployment and the cause only.
+- The telemetry event for each finish given up, made from the audit store's report of it,
+  naming the row and the outcome's kind, with a different second completion logged and counted
+  apart from a finish that ran out of time (decision 0009). Today the Postgres store reports
+  each one through `on_given_up`, and the gateway logs each report as `audit_row_given_up` at
+  `ERROR`, with the row, the outcome's kind and the cause. A different second completion is
+  told apart only by its cause, and is not counted apart.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled.
   Today the spawned task always runs to completion.
 - The row's identifier in the result's `_meta`, or in `error.data`.
@@ -1232,7 +1286,9 @@ run against each. The fake runs it in the per-change loop and Postgres in the sl
 that can do what Postgres cannot tests nothing.
 
 1. `begin` returns `Ok` only once the row is stored, and is idempotent by identifier.
-2. The stored row is exactly the record given, including the resources.
+2. The stored row is exactly the record given, including the resources. A record the store
+   cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
+   leaves no row. The fake must refuse the same records, which it does not yet.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the

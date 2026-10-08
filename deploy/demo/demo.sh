@@ -55,6 +55,9 @@ CURRENT_STEP="start"
 MODE=""
 PAUSED=""
 SINCE=""
+# The database outage step's span, in the database's clock (epoch seconds); 0 to 0 if there was none.
+OUTAGE_FROM=0
+OUTAGE_TO=0
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
@@ -74,6 +77,13 @@ check_at_least() {
   case "$1" in
     '' | *[!0-9]*) fail "$3 (got '$1', want a number of at least $2)" ;;
     *) if [ "$1" -ge "$2" ]; then pass "$3 ($1)"; else fail "$3 (got $1, want at least $2)"; fi ;;
+  esac
+}
+# check_at_most GOT MAX NAME
+check_at_most() {
+  case "$1" in
+    '' | *[!0-9]*) fail "$3 (got '$1', want a number of at most $2)" ;;
+    *) if [ "$1" -le "$2" ]; then pass "$3 ($1)"; else fail "$3 (got $1, want at most $2)"; fi ;;
   esac
 }
 # count_lines PATTERN TEXT: how many lines of TEXT match the extended regex PATTERN.
@@ -219,9 +229,15 @@ audit_rows() {
       "audit: $team's call that named no project records none"
   done
   check_row_resources "$(row_resources_json)"
-  # A begin that ran past its budget may still commit; the store then completes the row as
-  # error, because the call was refused and nothing ran (decision 0009).
-  check "$(audit_count "decision = 'allow' and outcome is null")" 0 "audit: no allowed row is left without an outcome"
+  # A begin that ran past its budget may still commit: the store asks the server to cancel the
+  # insert, but a paused server cannot act on that before it commits. Nothing completes such a
+  # row yet (decision 0009), so the outage step's one refused call may leave its row open. No
+  # other allowed row may.
+  local outage="begun_at between to_timestamp($OUTAGE_FROM) and to_timestamp($OUTAGE_TO)"
+  check "$(audit_count "decision = 'allow' and outcome is null and not ($outage)")" 0 \
+    "audit: no allowed row outside the database outage is left without an outcome"
+  check_at_most "$(audit_count "decision = 'allow' and outcome is null and $outage")" 1 \
+    "audit: the database outage left at most its refused call's row without an outcome"
   check "$(audit_count "proved_subject like '%stranger%'")" 0 "audit: no row for the ServiceAccount outside the manifest"
 }
 
@@ -311,6 +327,7 @@ compose_run() {
   step "database unavailable: the call is refused and nothing runs"
   local before after
   before=$(mock_docs_requests)
+  OUTAGE_FROM=$(psql_superuser -Atc "select extract(epoch from now())")
   PAUSED=1
   dc pause postgres
   compose_workload "read while the database is paused" audit-down team-a
@@ -318,6 +335,8 @@ compose_run() {
   PAUSED=""
   after=$(mock_docs_requests)
   check "$after" "$before" "mock-docs received nothing while the database was down"
+  # An insert the pause held commits as soon as the server runs again, well within 2 s.
+  OUTAGE_TO=$(psql_superuser -Atc "select extract(epoch from now() + interval '2 seconds')")
 
   step "withdraw $READ_TOOL from the registry (the gateway polls every 2 s)"
   swap_registry "$ROOT/deploy/compose/config/registry-withdrawn.toml"

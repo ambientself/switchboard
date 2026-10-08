@@ -1,6 +1,12 @@
 //! What each column of `switchboard_audit.call_rows` holds, taken from the core's record.
 //!
 //! No I/O here, so the mapping is tested without a database.
+//!
+//! A row is exactly its record, or it is not written. Postgres text, text arrays and jsonb
+//! cannot hold U+0000, and callers choose some values, such as their tool-use identifier. A
+//! record with U+0000 in any text value is refused with [`PgAuditError::Nul`], naming the
+//! column, rather than written with another character in its place: begin fails, so the core
+//! refuses the call. A latency or a count past its column's range is refused the same way.
 
 use gateway_core::PrincipalKind;
 use gateway_core::audit::{AuditRecord, Completion, DecisionKind, Outcome, RecordedResources};
@@ -55,45 +61,63 @@ impl BeginRow {
         }
         let principal = record.proved_principal.get();
         let (proved_kind, proved_team, proved_groups) = match &principal.kind {
-            PrincipalKind::Workload { team } => ("workload", Some(team.to_string()), None),
+            PrincipalKind::Workload { team } => (
+                "workload",
+                Some(stored("proved_team", team.as_str())?),
+                None,
+            ),
             PrincipalKind::User { groups } => (
                 "user",
                 None,
-                Some(groups.iter().map(ToString::to_string).collect()),
+                Some(
+                    groups
+                        .iter()
+                        .map(|group| stored("proved_groups", group.as_str()))
+                        .collect::<Result<_, _>>()?,
+                ),
             ),
         };
         let (resources, resources_omitted) = resources(record)?;
         Ok(Self {
-            tool_use_id: record.tool_use_id.as_ref().map(ToString::to_string),
-            deployment: record.deployment.to_string(),
-            surface: record.surface.to_string(),
-            profile: record.profile.to_string(),
-            tool: record.tool.clone(),
-            connector: record.connector.as_ref().map(ToString::to_string),
+            tool_use_id: optional(
+                "tool_use_id",
+                record.tool_use_id.as_ref().map(|id| id.as_str()),
+            )?,
+            deployment: stored("deployment", record.deployment.as_str())?,
+            surface: stored("surface", record.surface.as_str())?,
+            profile: stored("profile", record.profile.as_str())?,
+            tool: stored("tool", &record.tool)?,
+            connector: optional("connector", record.connector.as_ref().map(|c| c.as_str()))?,
             classification: record.classification.map(|c| c.as_str()),
             resources,
             resources_omitted,
             decision: decision(record.decision),
             reason: record.reason.map(|kind| name_of(&kind)).transpose()?,
-            sentence: record.sentence.clone(),
-            policy_revision: record.policy_revision.to_string(),
-            proved_issuer: principal.id.issuer.to_string(),
-            proved_subject: principal.id.subject.to_string(),
+            sentence: optional("sentence", record.sentence.as_deref())?,
+            policy_revision: stored("policy_revision", record.policy_revision.as_str())?,
+            proved_issuer: stored("proved_issuer", principal.id.issuer.as_str())?,
+            proved_subject: stored("proved_subject", principal.id.subject.as_str())?,
             proved_kind,
             proved_team,
             proved_groups,
-            proved_delegation_team: record
-                .proved_delegation_team
-                .as_ref()
-                .map(|team| team.get().to_string()),
-            claimed_acting_person: record
-                .claimed_acting_person
-                .as_ref()
-                .map(|person| person.get().to_string()),
-            claimed_team: record
-                .claimed_team
-                .as_ref()
-                .map(|team| team.get().to_string()),
+            proved_delegation_team: optional(
+                "proved_delegation_team",
+                record
+                    .proved_delegation_team
+                    .as_ref()
+                    .map(|team| team.get().as_str()),
+            )?,
+            claimed_acting_person: optional(
+                "claimed_acting_person",
+                record
+                    .claimed_acting_person
+                    .as_ref()
+                    .map(|person| person.get().as_str()),
+            )?,
+            claimed_team: optional(
+                "claimed_team",
+                record.claimed_team.as_ref().map(|team| team.get().as_str()),
+            )?,
         })
     }
 
@@ -134,13 +158,13 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
             named
                 .iter()
                 .map(|resource| {
-                    json!({
-                        "system": resource.system,
-                        "kind": resource.kind,
-                        "identifier": resource.identifier,
-                    })
+                    Ok(json!({
+                        "system": stored("resources", &resource.system)?,
+                        "kind": stored("resources", &resource.kind)?,
+                        "identifier": stored("resources", &resource.identifier)?,
+                    }))
                 })
-                .collect(),
+                .collect::<Result<_, PgAuditError>>()?,
         ),
         RecordedResources::Unknown => Value::String("unknown".to_owned()),
     };
@@ -148,6 +172,18 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
         PgAuditError::Column("a count of resources left out past the column's range")
     })?;
     Ok((resources, omitted))
+}
+
+/// `text`, for `column`, which cannot hold U+0000.
+fn stored(column: &'static str, text: &str) -> Result<String, PgAuditError> {
+    if text.contains('\0') {
+        return Err(PgAuditError::Nul { column });
+    }
+    Ok(text.to_owned())
+}
+
+fn optional(column: &'static str, text: Option<&str>) -> Result<Option<String>, PgAuditError> {
+    text.map(|text| stored(column, text)).transpose()
 }
 
 fn decision(kind: DecisionKind) -> &'static str {
@@ -186,18 +222,28 @@ impl FinishRow {
     pub const SELECT: &'static str = "SELECT outcome, outcome_sentence, latency_ms
         FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
 
-    pub fn from_completion(completion: &Completion) -> Self {
-        let (outcome, outcome_sentence) = match &completion.outcome {
-            Outcome::Ok => ("ok", None),
-            Outcome::Error => ("error", None),
-            Outcome::Refused { sentence } => ("refused", Some(sentence.clone())),
+    /// The columns for `completion`. Refuses a sentence holding U+0000, and a latency past the
+    /// column's range, rather than write another value than the completion's.
+    pub fn from_completion(completion: &Completion) -> Result<Self, PgAuditError> {
+        let outcome_sentence = match &completion.outcome {
+            Outcome::Refused { sentence } => Some(stored("outcome_sentence", sentence)?),
+            Outcome::Ok | Outcome::Error => None,
         };
-        Self {
-            outcome,
+        let latency_ms = i64::try_from(completion.latency_ms)
+            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;
+        Ok(Self {
+            outcome: Self::outcome_of(completion),
             outcome_sentence,
-            // No call takes 292 million years; a latency past the column's range is recorded
-            // as the most it can hold rather than refused.
-            latency_ms: i64::try_from(completion.latency_ms).unwrap_or(i64::MAX),
+            latency_ms,
+        })
+    }
+
+    /// The name the row gives `completion`'s outcome.
+    pub fn outcome_of(completion: &Completion) -> &'static str {
+        match completion.outcome {
+            Outcome::Ok => "ok",
+            Outcome::Error => "error",
+            Outcome::Refused { .. } => "refused",
         }
     }
 
@@ -314,6 +360,75 @@ mod tests {
         );
     }
 
+    /// A NUL in any text value refuses the record, naming the column, rather than write the
+    /// row with something else in its place.
+    #[test]
+    fn a_nul_in_any_text_value_refuses_the_record() {
+        let nul = |text: &str| json!(format!("{text}\u{0}x"));
+        let refused = |value: serde_json::Value| match BeginRow::from_record(&record(value)) {
+            Err(PgAuditError::Nul { column }) => column,
+            other => panic!("{other:?}"),
+        };
+        let user = serde_json::to_value(denied_user_with_delegation()).unwrap();
+        for field in [
+            "tool_use_id",
+            "deployment",
+            "surface",
+            "profile",
+            "tool",
+            "connector",
+            "sentence",
+            "policy_revision",
+            "proved_delegation_team",
+            "claimed_acting_person",
+            "claimed_team",
+        ] {
+            let mut value = user.clone();
+            value[field] = nul(field);
+            assert_eq!(refused(value), field);
+        }
+        for (field, column) in [("issuer", "proved_issuer"), ("subject", "proved_subject")] {
+            let mut value = user.clone();
+            value["proved_principal"]["id"][field] = nul(field);
+            assert_eq!(refused(value), column);
+        }
+        let mut value = user.clone();
+        value["proved_principal"]["groups"] = json!(["group-g", nul("group")]);
+        assert_eq!(refused(value), "proved_groups");
+        for field in ["system", "kind", "identifier"] {
+            let mut value = user.clone();
+            value["resources"]["named"][1][field] = nul(field);
+            assert_eq!(refused(value), "resources");
+        }
+        let mut value = serde_json::to_value(allowed_workload()).unwrap();
+        value["proved_principal"]["team"] = nul("team");
+        assert_eq!(refused(value), "proved_team");
+
+        let refused = FinishRow::from_completion(&Completion {
+            outcome: Outcome::Refused {
+                sentence: "No.\u{0}".into(),
+            },
+            latency_ms: 1,
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(PgAuditError::Nul {
+                    column: "outcome_sentence"
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            PgAuditError::Nul {
+                column: "tool_use_id"
+            }
+            .to_string(),
+            "the audit column tool_use_id would hold U+0000, which Postgres cannot store, so the \
+             row is not written"
+        );
+    }
+
     #[test]
     fn a_workload_has_a_team_and_no_groups() {
         let row = BeginRow::from_record(&allowed_workload()).unwrap();
@@ -402,6 +517,7 @@ mod tests {
                 outcome,
                 latency_ms: 7,
             })
+            .unwrap()
         };
         assert_eq!(
             finish(Outcome::Ok),
@@ -425,12 +541,23 @@ mod tests {
     }
 
     #[test]
-    fn a_latency_past_the_column_is_held_at_its_most() {
-        let row = FinishRow::from_completion(&Completion {
-            outcome: Outcome::Ok,
-            latency_ms: u64::MAX,
-        });
-        assert_eq!(row.latency_ms, i64::MAX);
+    fn a_latency_past_the_column_is_refused() {
+        let latency = |latency_ms| {
+            FinishRow::from_completion(&Completion {
+                outcome: Outcome::Ok,
+                latency_ms,
+            })
+        };
+        assert_eq!(
+            latency(i64::MAX.unsigned_abs()).unwrap().latency_ms,
+            i64::MAX
+        );
+        for past in [i64::MAX.unsigned_abs() + 1, u64::MAX] {
+            assert!(
+                matches!(latency(past), Err(PgAuditError::Column(_))),
+                "{past}"
+            );
+        }
     }
 
     #[test]

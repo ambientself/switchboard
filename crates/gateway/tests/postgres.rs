@@ -1,6 +1,7 @@
 //! The gateway built from files with its audit rows in Postgres, as the demo runs it: the store
 //! passes its boot checks as the gateway's role, an allowed call, a denial and a refusal each
-//! leave their row, and a connection as a superuser refuses to start.
+//! leave their row, a completion the database refuses is logged as given up, naming its row,
+//! and a connection as a superuser refuses to start.
 //!
 //! Runs only when `SWITCHBOARD_TEST_DATABASE_URL` names a superuser on a throwaway server, as
 //! the audit store's own database tests do; otherwise it says it was skipped and passes. It
@@ -11,6 +12,7 @@
 mod files;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use audit_postgres::{GATEWAY_ROLE, OWNER_ROLE, ROLES, migrate};
 use files::{
@@ -20,13 +22,40 @@ use gateway::path::RequestPath;
 use gateway::start::prepare;
 use gateway_identity::SystemClock;
 use mock_docs_server::{AcceptedCredential, Config};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
 const URL_VARIABLE: &str = "SWITCHBOARD_TEST_DATABASE_URL";
 
 /// Given to both audit roles on the throwaway test server. A dummy value for tests only.
 const DUMMY_PASSWORD: &str = "dummy-password-for-tests-only";
+
+/// A log writer the test reads back.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// Every event logged with `event` as its `event` field, as JSON.
+    fn events(&self, event: &str) -> Vec<Value> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|logged| logged["fields"]["event"] == json!(event))
+            .collect()
+    }
+}
 
 async fn connect(config: &tokio_postgres::Config) -> Client {
     let (client, connection) = config.connect(NoTls).await.unwrap();
@@ -50,6 +79,17 @@ async fn the_gateway_writes_its_rows_to_postgres_as_its_own_role_and_no_other() 
         eprintln!("skipped: {URL_VARIABLE} is not set");
         return;
     };
+    // The store reports a finish it gives up on that finish's own task, on any of the
+    // runtime's threads, so the subscriber is global. This binary has no other test.
+    let captured = Captured::default();
+    let writer = captured.clone();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .unwrap();
     let server: tokio_postgres::Config = server_url.parse().unwrap();
     let database = format!("switchboard_gateway_test_{}", std::process::id());
     let admin = connect(&server).await;
@@ -77,7 +117,7 @@ async fn the_gateway_writes_its_rows_to_postgres_as_its_own_role_and_no_other() 
     owner.user(OWNER_ROLE).password(DUMMY_PASSWORD);
     migrate(&mut connect(&owner).await).await.unwrap();
 
-    let outcome = run(&server, &database, &setup).await;
+    let outcome = run(&server, &database, &setup, &captured).await;
     drop(setup);
     admin
         .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
@@ -90,6 +130,7 @@ async fn run(
     server: &tokio_postgres::Config,
     database: &str,
     setup: &Client,
+    captured: &Captured,
 ) -> Result<(), String> {
     let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
         .await
@@ -234,5 +275,52 @@ async fn run(
         assert_eq!(row[8], "demo-1");
         assert_eq!([&row[9], &row[10]], [resources, "0"], "{row:?}");
     }
+
+    // A completion the database refuses is given up at once, and logged naming its row and
+    // the outcome that was not written.
+    setup
+        .batch_execute(&format!(
+            "REVOKE UPDATE (outcome, outcome_sentence, latency_ms) \
+               ON switchboard_audit.call_rows FROM {GATEWAY_ROLE}"
+        ))
+        .await
+        .unwrap();
+    call(
+        &path,
+        &token,
+        READ_TOOL,
+        json!({"project": "atlas", "document": "plan"}),
+    )
+    .await;
+    let open: String = setup
+        .query_one(
+            "SELECT id::text FROM switchboard_audit.call_rows
+              WHERE outcome IS NULL AND decision = 'allow'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let mut waited = Duration::ZERO;
+    let logged = loop {
+        // The name operators and deploy/README.md know it by.
+        let logged = captured.events("audit_row_given_up");
+        if !logged.is_empty() || waited >= Duration::from_secs(10) {
+            break logged;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += Duration::from_millis(50);
+    };
+    assert_eq!(logged.len(), 1, "{logged:#?}");
+    let fields = &logged[0]["fields"];
+    assert_eq!(logged[0]["level"], json!("ERROR"), "{logged:#?}");
+    assert_eq!(fields["row"], json!(open), "{logged:#?}");
+    assert_eq!(fields["outcome"], json!("ok"), "{logged:#?}");
+    assert!(
+        fields["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("permission denied")),
+        "{logged:#?}"
+    );
     Ok(())
 }
