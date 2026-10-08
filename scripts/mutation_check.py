@@ -1201,7 +1201,18 @@ mutate("mcp-params-not-object-accepted", "params that are not an object are read
 mutate("mcp-call-name-optional", "a tools/call with no name is served with an empty name", MCP_PARSE,
        '    let Some(Value::String(name)) = params.remove("name") else {',
        '    let Some(Value::String(name)) = params.remove("name").or(Some(Value::String(String::new()))) else {')
-mutate("mcp-call-arguments-array-accepted", "a tools/call whose arguments are an array is served with none", MCP_PARSE,
+mutate("mcp-method-not-string-accepted", "a method that is not a string is read as its JSON text", MCP_PARSE,
+       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: method must be a string",\n            ));\n        }\n',
+       "        Some(method) => method.to_string(),\n")
+mutate("mcp-no-method-accepted", "a request with no method is read as one with an empty method", MCP_PARSE,
+       '        None => return Err(Rejection::invalid_request("Invalid request: no method")),',
+       "        None => String::new(),")
+mutate("mcp-structured-id-accepted", "an id that is an object or an array is dropped, making the request a notification", MCP_PARSE,
+       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: id must be a string or an integer",\n            ));\n        }\n    };\n',
+       "        Some(_) => None,\n    };\n")
+mutate("mcp-call-arguments-array-accepted","a tools/call whose arguments are an array is served with none", MCP_PARSE,
        "        None | Some(Value::Null) => Map::new(),", "        None | Some(Value::Null | Value::Array(_)) => Map::new(),")
 # The adapter's dependency fence. It has no dev-dependency to move, so the mutation adds a crate
 # the workspace already locks and edits Cargo.lock to match, which `--locked` accepts.
@@ -1257,6 +1268,24 @@ mutate("gw-catalog-duplicate-accepted", "a second definition for a tool replaces
 mutate("gw-catalog-schema-not-checked", "an input schema that is not an object schema is accepted", CATALOG,
        '    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")',
        "    let _ = schema;\n    true")
+
+# Every struct the configuration nests refuses a key it does not know.
+for path, struct in [
+    (GW + "config.rs", "Config"),
+    (GW + "config.rs", "IdentitySection"),
+    (GW + "config.rs", "AuditSection"),
+    (GW + "config.rs", "HttpSection"),
+    (GW + "config.rs", "IssuerEntry"),
+    (CATALOG, "ToolDefinition"),
+    (SELECTOR, "SelectorRules"),
+    (SELECTOR, "WorkloadRule"),
+    (SELECTOR, "UserRule"),
+]:
+    mutate(f"gw-unknown-fields-{struct}", f"{struct} accepts unknown fields", path,
+           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
+mutate("gw-unknown-fields-IssuerKindEntry", "an issuer's kind accepts unknown fields", GW + "config.rs",
+       '#[serde(rename_all = "snake_case", deny_unknown_fields)]\npub enum IssuerKindEntry {',
+       '#[serde(rename_all = "snake_case")]\npub enum IssuerKindEntry {')
 
 # Connectors.
 mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
@@ -1329,6 +1358,10 @@ BIN_BIND = (
     '        Err(error) => return refuse(&format!("cannot listen on {}: {error}", arguments.listen)),\n'
     "    };\n"
 )
+mutate("gw-bin-default-listen-every-interface", "switchboard listens on every interface unless told otherwise", GW_BIN,
+       'const DEFAULT_LISTEN: &str = "127.0.0.1:8080";', 'const DEFAULT_LISTEN: &str = "0.0.0.0:8080";')
+mutate("gw-bin-default-listen-ipv6-every-interface", "switchboard listens on every IPv6 interface unless told otherwise", GW_BIN,
+       'const DEFAULT_LISTEN: &str = "127.0.0.1:8080";', 'const DEFAULT_LISTEN: &str = "[::]:8080";')
 mutate("gw-bin-binds-before-boot-gates", "switchboard binds its socket before the boot gates run", GW_BIN,
        BIN_GATES + "\n" + BIN_BIND, BIN_BIND + BIN_GATES)
 mutate_all(

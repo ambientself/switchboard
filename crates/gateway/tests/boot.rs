@@ -138,14 +138,18 @@ impl World {
     }
 }
 
-/// Sets `path` (dotted, objects only) in `config` to `value`, or removes it if `value` is
-/// `None`.
+/// Sets `path` (dotted; a number steps into an array) in `config` to `value`, or removes it if
+/// `value` is `None`. The last step names a key of an object.
 fn set(config: &mut Value, path: &str, value: Option<Value>) {
     let mut keys: Vec<&str> = path.split('.').collect();
     let last = keys.pop().unwrap();
     let mut target = config;
     for key in keys {
-        target = target.get_mut(key).unwrap();
+        target = match key.parse::<usize>() {
+            Ok(index) => target.get_mut(index),
+            Err(_) => target.get_mut(key),
+        }
+        .unwrap();
     }
     let object = target.as_object_mut().unwrap();
     match value {
@@ -310,11 +314,22 @@ fn an_issuer_whose_keys_are_not_a_jwk_set_is_refused() {
 #[test]
 fn configuration_with_an_unknown_field_is_not_read() {
     let world = World::new();
+    // The configuration as written is read, so each refusal below is for the added key.
+    assert!(serde_json::from_value::<Config>(world.config()).is_ok());
     for path in [
         "audit.disable",
         "identity.enabled",
         "http.allowed_host",
         "policy_revision",
+        // One per struct the configuration nests, down to each issuer and each rule.
+        "identity.enforce.0.audience",
+        "identity.enforce.1.max_lifetime",
+        "identity.enforce.0.kind.workload.subject",
+        "identity.enforce.1.kind.user.groups",
+        "catalog.0.schema",
+        "profiles.default",
+        "profiles.workloads.0.group",
+        "profiles.users.0.team",
     ] {
         let mut config = world.config();
         set(&mut config, path, Some(json!(true)));

@@ -39,10 +39,10 @@ struct Arguments {
     listen: SocketAddr,
 }
 
-fn arguments() -> Result<Arguments, String> {
+/// Reads the command line, without the program's name. An empty error asks for the usage.
+fn arguments(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
     let mut config = None;
     let mut listen = DEFAULT_LISTEN.to_owned();
-    let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--listen" => {
@@ -73,7 +73,7 @@ fn refuse(reason: &str) -> ExitCode {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let arguments = match arguments() {
+    let arguments = match arguments(std::env::args().skip(1)) {
         Ok(arguments) => arguments,
         Err(problem) => {
             if problem.is_empty() {
@@ -150,5 +150,33 @@ async fn shutdown() {
     tokio::select! {
         () = interrupt => tracing::info!("interrupted; shutting down"),
         () = terminate => tracing::info!("terminated; shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    fn parse(command_line: &[&str]) -> Result<Arguments, String> {
+        arguments(command_line.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    /// With no `--listen`, the gateway is reachable from this machine only: it binds the IPv4
+    /// loopback address, never every interface.
+    #[test]
+    fn the_default_listen_address_is_loopback_only() {
+        let parsed = parse(&["config.json"]).unwrap();
+        assert_eq!(parsed.config, PathBuf::from("config.json"));
+        assert_eq!(parsed.listen.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(!parsed.listen.ip().is_unspecified());
+        assert_eq!(parsed.listen.port(), 8080);
+    }
+
+    #[test]
+    fn listen_replaces_the_default() {
+        let parsed = parse(&["--listen", "0.0.0.0:9000", "config.json"]).unwrap();
+        assert_eq!(parsed.listen, "0.0.0.0:9000".parse::<SocketAddr>().unwrap());
     }
 }
