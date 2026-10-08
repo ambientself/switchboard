@@ -35,3 +35,43 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # The audit store's tests that need a database run only when SWITCHBOARD_TEST_DATABASE_URL is
+  # set, and the job above does not set it. This one does, against a throwaway Postgres that
+  # lives only for the job. Each test makes its own database and roles and drops them.
+  postgres:
+    name: Audit store against Postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # A dummy password for this throwaway service container only. Not a credential.
+          POSTGRES_PASSWORD: dummy-ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      SWITCHBOARD_TEST_DATABASE_URL: postgres://postgres:dummy-ci-password@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      # A test with no server says "skipped" and passes. Here that would mean the job checked
+      # nothing, so the job fails if any test says it. --nocapture also puts the latency test's
+      # p50 and p95 in the log; they measure a CI runner, not production.
+      - name: Test the audit store against Postgres
+        run: |
+          set -o pipefail
+          cargo test -p audit-postgres --locked -- --nocapture 2>&1 | tee test-output.txt
+          if grep -q 'skipped: SWITCHBOARD_TEST_DATABASE_URL is not set' test-output.txt; then
+            echo "a Postgres test was skipped, so SWITCHBOARD_TEST_DATABASE_URL did not reach it"
+            exit 1
+          fi
