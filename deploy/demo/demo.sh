@@ -16,9 +16,9 @@
 # status is non-zero if any check failed or any step could not run. Nothing is retried and no
 # failure is ignored.
 #
-# It never touches the cluster otto-dev or ~/.kube/config. It refuses a cluster named otto-dev,
-# drops KUBECONFIG from its environment, and names its own kubeconfig file, .demo/kubeconfig,
-# in every kubectl and kind call.
+# It never touches any cluster but switchboard-demo, and never ~/.kube/config. It refuses any
+# other cluster name (otto-dev included), drops KUBECONFIG from its environment, and names its
+# own kubeconfig file, .demo/kubeconfig, in every kubectl and kind call.
 #
 # Needs docker (with compose), kind, kubectl, jq and awk on the host.
 #
@@ -34,9 +34,11 @@ set -euo pipefail
 unset KUBECONFIG
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-CLUSTER=${SWITCHBOARD_DEMO_CLUSTER:-switchboard-demo}
-if [ "$CLUSTER" = "otto-dev" ]; then
-  echo "demo.sh: refusing to touch the cluster otto-dev; the demo uses its own cluster" >&2
+# The demo's own cluster, and the only one it touches. SWITCHBOARD_DEMO_CLUSTER may name it
+# again, but any other name is refused before any kind or kubectl call.
+CLUSTER=switchboard-demo
+if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then
+  echo "demo.sh: refusing to touch the cluster ${SWITCHBOARD_DEMO_CLUSTER}; the demo uses only its own cluster, $CLUSTER" >&2
   exit 2
 fi
 DEMO_DIR=$ROOT/.demo

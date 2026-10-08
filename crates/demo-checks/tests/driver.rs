@@ -1,6 +1,6 @@
 //! `deploy/demo/demo.sh` with fake `docker`, `kind` and `kubectl` that record every call. The
-//! driver must refuse the cluster `otto-dev` before calling anything, name its own kubeconfig
-//! in every call, never pass on the caller's KUBECONFIG, and count every failure.
+//! driver must refuse any cluster but `switchboard-demo` before calling anything, name its own
+//! kubeconfig in every call, never pass on the caller's KUBECONFIG, and count every failure.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -81,25 +81,42 @@ fn own_kubeconfig() -> String {
 }
 
 #[test]
-fn it_refuses_otto_dev_before_calling_anything() {
-    for mode in ["kind", "compose", "down"] {
-        let (run, calls) = demo(
-            "otto-dev",
-            &[mode],
-            &[("SWITCHBOARD_DEMO_CLUSTER", "otto-dev")],
-        );
-        assert_eq!(run.status, Some(2), "{}", run.transcript());
-        assert!(
-            run.stderr
-                .contains("refusing to touch the cluster otto-dev"),
-            "{}",
-            run.transcript()
-        );
-        assert!(
-            calls.is_empty(),
-            "demo.sh {mode} called tools for otto-dev: {calls:?}"
-        );
+fn it_refuses_any_cluster_but_its_own_before_calling_anything() {
+    for cluster in ["otto-dev", "other-cluster"] {
+        for args in [
+            &["kind"][..],
+            &["compose"][..],
+            &["down", "kind"][..],
+            &["down", "all"][..],
+        ] {
+            let (run, calls) = demo(cluster, args, &[("SWITCHBOARD_DEMO_CLUSTER", cluster)]);
+            assert_eq!(run.status, Some(2), "{args:?}: {}", run.transcript());
+            assert!(
+                run.stderr
+                    .contains(&format!("refusing to touch the cluster {cluster}")),
+                "{}",
+                run.transcript()
+            );
+            assert!(
+                calls.is_empty(),
+                "demo.sh {args:?} called tools for {cluster}: {calls:?}"
+            );
+        }
     }
+    // Naming its own cluster is the same as naming none.
+    let (run, calls) = demo(
+        "own-cluster",
+        &["down", "kind"],
+        &[("SWITCHBOARD_DEMO_CLUSTER", "switchboard-demo")],
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        calls,
+        [format!(
+            "kind KUBECONFIG= delete cluster --name switchboard-demo --kubeconfig {}",
+            own_kubeconfig()
+        )]
+    );
 }
 
 #[test]

@@ -2359,8 +2359,12 @@ mutate("demo-workload-direct-any-failure", "any failed direct call passes, not o
        """    check "$?" 28 "direct""", """    check "$([ $? -ne 0 ] && echo 28)" 28 "direct""")
 mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
        """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
-mutate("demo-driver-otto-dev-allowed", "the driver runs against otto-dev", DRIVER,
-       """if [ "$CLUSTER" = "otto-dev" ]; then""", """if false; then""")
+CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
+mutate("demo-driver-otto-dev-allowed", "the driver runs whatever cluster it is given", DRIVER,
+       CLUSTER_CHECK, "if false; then")
+mutate_all("demo-driver-other-cluster-allowed", "the driver refuses only otto-dev, and runs any other cluster it is given",
+           (DRIVER, "\nCLUSTER=switchboard-demo\n", "\nCLUSTER=${SWITCHBOARD_DEMO_CLUSTER:-switchboard-demo}\n"),
+           (DRIVER, CLUSTER_CHECK, 'if [ "$CLUSTER" = "otto-dev" ]; then'))
 mutate("demo-driver-keeps-kubeconfig-env", "the caller's KUBECONFIG reaches kubectl and kind", DRIVER,
        "\nunset KUBECONFIG\n", "\n: unset KUBECONFIG\n")
 mutate("demo-driver-default-kubeconfig", "kubectl uses whatever kubeconfig is the default", DRIVER,
