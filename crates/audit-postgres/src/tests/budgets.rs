@@ -429,6 +429,38 @@ async fn finish_tries_again_on_a_new_connection_while_the_server_is_read_only() 
     assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
 }
 
+/// A begin that finds the server read-only fails, so the core refuses the call. The connection
+/// that found it read-only stays read-only, so it does not go back to the pool: once the server
+/// is writable again, the next begin makes a new connection and writes its row.
+#[tokio::test]
+async fn begin_makes_a_new_connection_after_the_server_was_read_only() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    // One begin connection, so a read-only one kept in the pool would serve every later begin.
+    let store = db.store(PoolSizes {
+        begin: 1,
+        finish: 1,
+    });
+    let read_only = "default_transaction_read_only";
+    set_for_new_sessions(&db.server, db.name(), read_only, Some("on")).await;
+    let failure = begin_read(&store, &fixture).await.unwrap_err();
+    match cause(&failure) {
+        PgAuditError::Database(error) => assert_eq!(super::code(error), Some("25006")),
+        other => panic!("{other}"),
+    }
+    assert_eq!(store.begin.status().size, 0);
+
+    set_for_new_sessions(&db.server, db.name(), read_only, None).await;
+    for _ in 0..3 {
+        assert!(matches!(
+            begin_read(&store, &fixture).await.unwrap(),
+            Begun::Allowed(_)
+        ));
+    }
+}
+
 /// A lock not had within `lock_timeout`, which a database or role may set, is tried again.
 #[tokio::test]
 async fn finish_tries_again_when_a_lock_times_out() {

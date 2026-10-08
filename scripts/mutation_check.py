@@ -1281,8 +1281,11 @@ mutate("pg-retry-read-only-final", "a server that has become read-only is not re
 mutate("pg-retry-lock-timeout-final", "a lock not had within lock_timeout is not retried", PG_STORE,
        '|| matches!(code.code(), "25006" | "55P03")', '|| matches!(code.code(), "25006")')
 mutate("pg-retry-failed-connection-kept", "a connection whose attempt failed is used again", PG_STORE,
-       "                drop(Object::take(client));\n                Err(error)",
-       "                drop(client);\n                Err(error)")
+       "every attempt on it would find.\n                drop(Object::take(client));",
+       "every attempt on it would find.\n                drop(client);")
+mutate("pg-begin-failed-connection-kept", "a begin connection that found the server read-only goes back to its pool", PG_STORE,
+       "rather than fail on this one.\n                drop(Object::take(client));",
+       "rather than fail on this one.\n                drop(client);")
 mutate("pg-retry-closed-connection-final", "a connection found closed is not retried", PG_STORE,
        "                    error.is_closed()\n", "                    false\n")
 mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not retried", PG_STORE,

@@ -313,7 +313,9 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   cancel the insert, which stops one still waiting, for example on a lock. One that has
 ///   already committed, or commits before the cancel arrives, stays: a begin reported as
 ///   failed may still have written its row (decision 0009). Until that row is completed as
-///   `error` (design section 17), it keeps an empty outcome.
+///   `error` (design section 17), it keeps an empty outcome. A begin whose insert fails in a
+///   way trying again could fix, such as a server that has become read-only, also discards its
+///   connection, so the next begin makes a new one rather than fail on it too.
 /// - Finish writes the completion columns of a row that has none, on a task of its own. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
@@ -434,6 +436,13 @@ impl PgAuditStore {
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
         match timeout_at(deadline, insert_on(&client, &row)).await {
+            Ok(Err(error)) if error.is_transient() => {
+                // A failure trying again could fix may be the connection's own: one that found
+                // the server read-only, as the old primary is after a failover, stays so. The
+                // next begin makes a new connection rather than fail on this one.
+                drop(Object::take(client));
+                Err(error)
+            }
             Ok(inserted) => inserted,
             Err(_) => {
                 abandon(client, &self.cancel);
