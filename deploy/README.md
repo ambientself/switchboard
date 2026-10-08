@@ -63,15 +63,21 @@ gateway, whose call to the server succeeds; after it, a new pod's direct call mu
 (curl exit 28), and the same pod must still reach the gateway and get an allowed read through
 it.
 
-Network policy does not see what reaches a pod through the API server: exec, port-forward,
-and the pod, Service and node proxy routes. The operator checks ask `kubectl auth can-i` for
-each of these, with `create` and `get`, in `mock-docs` and `switchboard` (the node proxy is
-cluster-wide), for each team's workload, and require `no`. They also check that neither
-workload can get, list or watch the two namespaces' secrets or the gateway's configuration
-(list and watch return a Secret's data too), start pods in its own namespace, or mint the
-gateway's tokens. That is 29 checks per team. Decision 0010's other controls (attach, ephemeral
-containers, impersonation, bind and escalate on roles, and controllers that create pods) are
-not checked yet.
+Network policy does not see what reaches a pod through the API server: exec, attach,
+port-forward, ephemeral containers, and the pod, Service and node proxy routes. The operator
+checks ask `kubectl auth can-i` about each team's workload and require `no` (decision 0010,
+control 1). In `mock-docs`, `switchboard` and the team's own namespace, they ask about each
+route (`create` and `get` on exec, attach, port-forward and the pod and Service proxies;
+`patch` and `update` on ephemeral containers), creating pods, minting a ServiceAccount's token,
+impersonating a ServiceAccount, `bind` and `escalate` on roles, creating role bindings, and
+`create`, `update` and `patch` on Deployments, ReplicaSets, StatefulSets, DaemonSets, Jobs and
+CronJobs: 36 checks each. Across the cluster they ask about the node proxy (`create` and
+`get`), impersonating users, groups, UIDs and extras (`userextras/scopes`), `bind` and
+`escalate` on cluster roles, and creating cluster role bindings: 9 checks. can-i cannot name
+UIDs and extras, which the API server checks in `authentication.k8s.io` though it serves no
+such resource, so those two are asked as SubjectAccessReviews. Last, neither workload may get,
+list or watch the two namespaces' secrets or the gateway's configuration (list and watch return a
+Secret's data too): 9 checks. That is 126 checks per team.
 
 ## Stopping the gateway
 

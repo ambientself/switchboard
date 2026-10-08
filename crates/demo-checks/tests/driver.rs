@@ -679,54 +679,113 @@ fn each_row_must_record_what_its_call_named() {
     }
 }
 
-/// Runs `body` with `k` answering every call with `answer`. Returns the run and each call made.
-fn with_can_i(name: &str, answer: &str, body: &str) -> (Run, Vec<String>) {
-    let calls = scratch(name).join("calls.log");
+/// Runs `body` with `k` answering every `auth can-i` with `answer` and every SubjectAccessReview
+/// with `allowed`. Returns the run, each can-i asked and each review's body.
+fn with_can_i(
+    name: &str,
+    answer: &str,
+    allowed: &str,
+    body: &str,
+) -> (Run, Vec<String>, Vec<Value>) {
+    let log = scratch(name).join("calls.log");
     let run = sourced(&format!(
-        "k() {{ echo \"k $*\" >> '{}'; echo {answer}; }}\n{body}\nFINISHED=1\nresult 0",
-        calls.display()
+        "k() {{ case \"$1\" in\n  \
+           create) printf 'review %s\\n' \"$(cat)\" >> '{log}'; echo {allowed} ;;\n  \
+           *) echo \"k $*\" >> '{log}'; echo {answer} ;;\n\
+         esac; }}\n{body}\nFINISHED=1\nresult 0",
+        log = log.display()
     ));
-    let calls = std::fs::read_to_string(&calls)
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    (run, calls)
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let mut asks = Vec::new();
+    let mut reviews = Vec::new();
+    for line in text.lines() {
+        match line.strip_prefix("review ") {
+            Some(review) => reviews.push(serde_json::from_str(review).unwrap()),
+            None => asks.push(line.to_owned()),
+        }
+    }
+    (run, asks, reviews)
+}
+
+/// What a team's workload must not be able to do, as `kubectl auth can-i` arguments.
+fn operator_asks(team: &str) -> Vec<String> {
+    let mut asks = Vec::new();
+    // Reading a secret or the gateway's configuration: list and watch return the data too.
+    for verb in ["get", "list", "watch"] {
+        asks.push(format!("{verb} secrets -n switchboard"));
+        asks.push(format!("{verb} secrets -n mock-docs"));
+        asks.push(format!("{verb} configmaps -n switchboard"));
+    }
+    // Across the cluster: the node proxy, impersonating a user or a group, and the cluster's
+    // roles and bindings.
+    for verb in ["create", "get"] {
+        asks.push(format!("{verb} nodes --subresource=proxy"));
+    }
+    for resource in ["users", "groups"] {
+        asks.push(format!("impersonate {resource}"));
+    }
+    for verb in ["bind", "escalate"] {
+        asks.push(format!("{verb} clusterroles.rbac.authorization.k8s.io"));
+    }
+    asks.push("create clusterrolebindings.rbac.authorization.k8s.io".to_owned());
+    // In mock-docs, the gateway's namespace and the team's own.
+    for ns in ["mock-docs", "switchboard", team] {
+        asks.push(format!("create pods -n {ns}"));
+        asks.push(format!(
+            "create serviceaccounts --subresource=token -n {ns}"
+        ));
+        asks.push(format!("impersonate serviceaccounts -n {ns}"));
+        // The API server's routes, whose traffic network policy does not see.
+        for verb in ["create", "get"] {
+            for route in [
+                "pods --subresource=exec",
+                "pods --subresource=attach",
+                "pods --subresource=portforward",
+                "pods --subresource=proxy",
+                "services --subresource=proxy",
+            ] {
+                asks.push(format!("{verb} {route} -n {ns}"));
+            }
+        }
+        for verb in ["patch", "update"] {
+            asks.push(format!(
+                "{verb} pods --subresource=ephemeralcontainers -n {ns}"
+            ));
+        }
+        for verb in ["bind", "escalate"] {
+            asks.push(format!("{verb} roles.rbac.authorization.k8s.io -n {ns}"));
+        }
+        asks.push(format!(
+            "create rolebindings.rbac.authorization.k8s.io -n {ns}"
+        ));
+        // The controllers that start pods.
+        for resource in [
+            "deployments.apps",
+            "replicasets.apps",
+            "statefulsets.apps",
+            "daemonsets.apps",
+            "jobs.batch",
+            "cronjobs.batch",
+        ] {
+            for verb in ["create", "update", "patch"] {
+                asks.push(format!("{verb} {resource} -n {ns}"));
+            }
+        }
+    }
+    asks
 }
 
 #[test]
 fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy() {
-    let (run, calls) = with_can_i("can-i-no", "no", "operator_checks");
+    let (run, asks, reviews) = with_can_i("can-i-no", "no", "false", "operator_checks");
     assert_eq!(run.status, Some(0), "{}", run.transcript());
     let mut expected = Vec::new();
+    let mut expected_reviews = Vec::new();
     for team in ["team-a", "team-b"] {
-        let mut asks = Vec::new();
-        // Reading a secret or the gateway's configuration: list and watch return the data too.
-        for verb in ["get", "list", "watch"] {
-            asks.push(format!("{verb} secrets -n switchboard"));
-            asks.push(format!("{verb} secrets -n mock-docs"));
-            asks.push(format!("{verb} configmaps -n switchboard"));
-        }
-        asks.push(format!("create pods -n {team}"));
-        asks.push("create serviceaccounts --subresource=token -n switchboard".to_owned());
-        // The API server's routes, whose traffic network policy does not see.
-        for verb in ["create", "get"] {
-            asks.push(format!("{verb} nodes --subresource=proxy"));
-        }
-        for ns in ["mock-docs", "switchboard"] {
-            for verb in ["create", "get"] {
-                for route in [
-                    "pods --subresource=exec",
-                    "pods --subresource=portforward",
-                    "pods --subresource=proxy",
-                    "services --subresource=proxy",
-                ] {
-                    asks.push(format!("{verb} {route} -n {ns}"));
-                }
-            }
-        }
-        assert_eq!(asks.len(), 29);
-        for ask in asks {
+        let team_asks = operator_asks(team);
+        // 9 reads, 7 across the cluster, and 36 in each of three namespaces.
+        assert_eq!(team_asks.len(), 9 + 7 + 3 * 36);
+        for ask in team_asks {
             let check = format!("PASS {team}'s workload may not: {ask}");
             assert!(
                 run.stdout.lines().any(|line| line == check),
@@ -737,26 +796,85 @@ fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy(
                 "k auth can-i {ask} --as=system:serviceaccount:{team}:mock-workload"
             ));
         }
+        // Impersonating a UID or an extra, which can-i cannot name, by SubjectAccessReview: the
+        // group, resource and subresource the API server checks, for the user and groups `--as`
+        // gives the team's ServiceAccount.
+        for (resource, subresource) in [("uids", ""), ("userextras", "scopes")] {
+            let named = [resource, subresource]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("/");
+            let check = format!(
+                "PASS {team}'s workload may not: impersonate authentication.k8s.io/{named}"
+            );
+            assert!(
+                run.stdout.lines().any(|line| line == check),
+                "{check}\n{}",
+                run.transcript()
+            );
+            expected_reviews.push(json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SubjectAccessReview",
+                "spec": {
+                    "user": format!("system:serviceaccount:{team}:mock-workload"),
+                    "groups": [
+                        "system:serviceaccounts",
+                        format!("system:serviceaccounts:{team}"),
+                        "system:authenticated",
+                    ],
+                    "resourceAttributes": {
+                        "verb": "impersonate",
+                        "group": "authentication.k8s.io",
+                        "resource": resource,
+                        "subresource": subresource,
+                    },
+                },
+            }));
+        }
     }
-    // Exactly these, and each once: 29 per team, 58 in all.
-    let mut called = calls.clone();
+    // Exactly these, and each once: 124 asks and 2 reviews per team.
+    let mut called = asks.clone();
     called.sort();
     expected.sort();
     assert_eq!(called, expected, "{}", run.transcript());
-    assert_eq!(called.len(), 58);
+    assert_eq!(called.len(), 248);
+    assert_eq!(reviews, expected_reviews, "{}", run.transcript());
 
     // A yes, or no answer at all, fails the check.
-    for answer in ["yes", "''"] {
-        let (run, _) = with_can_i("can-i-answer", answer, "operator_checks");
+    for (answer, allowed) in [("yes", "true"), ("''", "''")] {
+        let (run, _, _) = with_can_i("can-i-answer", answer, allowed, "operator_checks");
         assert_eq!(run.status, Some(1), "{answer}: {}", run.transcript());
-        assert!(
-            run.failed(
-                "team-b's workload may not: create services --subresource=proxy -n mock-docs"
-            ),
-            "{answer}: {}",
-            run.transcript()
-        );
+        for check in [
+            "team-b's workload may not: create services --subresource=proxy -n mock-docs",
+            "team-b's workload may not: create cronjobs.batch -n team-b",
+            "team-b's workload may not: impersonate authentication.k8s.io/userextras/scopes",
+        ] {
+            assert!(run.failed(check), "{answer}: {check}\n{}", run.transcript());
+        }
     }
+}
+
+#[test]
+fn a_can_i_about_a_resource_the_api_does_not_serve_fails() {
+    // can-i still answers no, about a core resource of the whole name: a no that means nothing.
+    let run = sourced(
+        "k() { echo \"Warning: the server doesn't have a resource type 'uids'\" >&2; echo no; }\n\
+         can_i_no team-a impersonate uids\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    assert!(
+        run.failed("team-a's workload may not: impersonate uids (got 'a resource the API does not serve: Warning:"),
+        "{}",
+        run.transcript()
+    );
+    // Its warning about a cluster-wide resource asked in a namespace changes nothing.
+    let run = sourced(
+        "k() { echo \"Warning: resource 'nodes' is not namespace scoped\" >&2; echo no; }\n\
+         can_i_no team-a get nodes --subresource=proxy\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
 }
 
 #[test]

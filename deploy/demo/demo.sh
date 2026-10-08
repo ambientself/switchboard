@@ -429,42 +429,100 @@ kind_workload() { # LABEL NAMESPACE CRONJOB MODE
 can_i_no() {
   local team=$1 answer
   shift
-  # can-i exits 1 when the answer is no; the answer itself is what is checked.
-  if answer=$(k auth can-i "$@" --as="system:serviceaccount:$team:mock-workload" 2>/dev/null); then :; fi
+  # can-i exits 1 when the answer is no; the answer itself, its last line, is what is checked.
+  # can-i looks the resource up in the API's discovery. One it cannot find is still asked, as a
+  # core resource of the whole name that nothing grants, so the answer is no whatever the
+  # workload may do. Its warning fails the check.
+  if answer=$(k auth can-i "$@" --as="system:serviceaccount:$team:mock-workload" 2>&1); then :; fi
+  case "$answer" in
+    *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\n'*}" ;;
+    *) answer=${answer##*$'\n'} ;;
+  esac
   check "$answer" no "$team's workload may not: $*"
 }
 
-# operator_checks: what each team's workload may not do through the cluster API. Reading the
-# gateway's or the server's secrets, or the gateway's configuration, starting pods, and minting
-# the gateway's tokens would each reach the server without the gateway. So would the API
-# server's own routes to a pod, a Service or a node: exec, port-forward and the proxy. Their
-# traffic comes from the API server, not the workload's pod, so the network policy does not stop
-# it. Reading is checked as get, list and watch, since list and watch return a Secret's data
-# too. Each pod and Service route is checked for mock-docs and for the gateway, and the node
-# proxy for the cluster, with both verbs a request through it can use.
+# sar_no TEAM VERB GROUP RESOURCE [SUBRESOURCE]: as can_i_no, across the cluster, for what can-i
+# cannot name. The API server checks impersonating a UID as `uids` and an extra as
+# `userextras/<key>`, both in authentication.k8s.io, which serves neither as a resource. can-i
+# would warn and ask about a core resource of the whole name instead (see can_i_no). A
+# SubjectAccessReview names the group, resource and subresource as the API server asks them,
+# for the user and groups `--as` gives a ServiceAccount.
+sar_no() {
+  local team=$1 verb=$2 group=$3 resource=$4 subresource=${5:-} allowed answer
+  # shellcheck disable=SC2016 # jq's own variables
+  allowed=$(jq -cn --arg team "$team" --arg verb "$verb" --arg group "$group" \
+      --arg resource "$resource" --arg subresource "$subresource" '{
+        apiVersion: "authorization.k8s.io/v1", kind: "SubjectAccessReview",
+        spec: {user: "system:serviceaccount:\($team):mock-workload",
+               groups: ["system:serviceaccounts", "system:serviceaccounts:\($team)", "system:authenticated"],
+               resourceAttributes: {verb: $verb, group: $group, resource: $resource, subresource: $subresource}}}' \
+    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)
+  case "$allowed" in
+    false) answer=no ;;
+    true) answer=yes ;;
+    *) answer="no answer: $allowed" ;;
+  esac
+  check "$answer" no "$team's workload may not: $verb $group/$resource${subresource:+/$subresource}"
+}
+
+# operator_checks: what each team's workload may not do through the cluster API (decision 0010,
+# control 1). Reading the gateway's or the server's secrets, or the gateway's configuration,
+# would reach the server without the gateway. So would anything that yields a pod or a token
+# that holds a credential: starting pods, or a controller that starts them (Deployments,
+# ReplicaSets, StatefulSets, DaemonSets, Jobs and CronJobs); minting a ServiceAccount's token;
+# impersonating a user, group, ServiceAccount, UID or extra; and binding or escalating a role,
+# or creating a binding. So would the API server's own routes to a pod, a Service or a node:
+# exec, attach, port-forward, the proxies, and ephemeral containers. Their traffic comes from
+# the API server, not the workload's pod, so the network policy does not stop it.
 #
-# Not checked here (decision 0010's other controls, left to a follow-up issue): attach,
-# ephemeral containers, impersonation, bind and escalate on roles, and controllers that create
-# pods (Deployments, Jobs and the like).
+# Reading is checked as get, list and watch, since list and watch return a Secret's data too.
+# Each route is checked with both verbs a request through it can use, and an ephemeral
+# container with both that add one. What is namespaced is checked in mock-docs, in the
+# gateway's namespace and in the team's own; the rest across the cluster. Asked about a
+# cluster-wide resource, can-i asks in the kubeconfig's namespace, `default`, and warns; RBAC
+# then counts that namespace's RoleBindings as well as ClusterRoleBindings, so a no there holds
+# across the cluster too.
 operator_checks() {
-  local team ns verb subresource
+  local team ns verb subresource resource
   for team in team-a team-b; do
     for verb in get list watch; do
       can_i_no "$team" "$verb" secrets -n switchboard
       can_i_no "$team" "$verb" secrets -n mock-docs
       can_i_no "$team" "$verb" configmaps -n switchboard
     done
-    can_i_no "$team" create pods -n "$team"
-    can_i_no "$team" create serviceaccounts --subresource=token -n switchboard
     for verb in create get; do
       can_i_no "$team" "$verb" nodes --subresource=proxy
     done
-    for ns in mock-docs switchboard; do
+    for resource in users groups; do
+      can_i_no "$team" impersonate "$resource"
+    done
+    sar_no "$team" impersonate authentication.k8s.io uids
+    sar_no "$team" impersonate authentication.k8s.io userextras scopes
+    for verb in bind escalate; do
+      can_i_no "$team" "$verb" clusterroles.rbac.authorization.k8s.io
+    done
+    can_i_no "$team" create clusterrolebindings.rbac.authorization.k8s.io
+    for ns in mock-docs switchboard "$team"; do
+      can_i_no "$team" create pods -n "$ns"
+      can_i_no "$team" create serviceaccounts --subresource=token -n "$ns"
+      can_i_no "$team" impersonate serviceaccounts -n "$ns"
       for verb in create get; do
-        for subresource in exec portforward proxy; do
+        for subresource in exec attach portforward proxy; do
           can_i_no "$team" "$verb" pods --subresource="$subresource" -n "$ns"
         done
         can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"
+      done
+      for verb in patch update; do
+        can_i_no "$team" "$verb" pods --subresource=ephemeralcontainers -n "$ns"
+      done
+      for verb in bind escalate; do
+        can_i_no "$team" "$verb" roles.rbac.authorization.k8s.io -n "$ns"
+      done
+      can_i_no "$team" create rolebindings.rbac.authorization.k8s.io -n "$ns"
+      for resource in deployments.apps replicasets.apps statefulsets.apps daemonsets.apps jobs.batch cronjobs.batch; do
+        for verb in create update patch; do
+          can_i_no "$team" "$verb" "$resource" -n "$ns"
+        done
       done
     done
   done
@@ -578,7 +636,7 @@ kind_run() {
   step "identity: a ServiceAccount not in the team manifest"
   kind_workload "stranger" team-a stranger-workload refused
 
-  step "operator checks: neither team's workload may get, list or watch the gateway's or mock-docs' secrets or the gateway's configuration, start pods in its namespace, mint the gateway's tokens, exec, port-forward or proxy to either, or proxy to a node"
+  step "operator checks: in mock-docs, the gateway's namespace or its own, neither team's workload may start pods or the controllers that start them, mint tokens, impersonate a ServiceAccount, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create a binding; nor get, list or watch the gateway's or mock-docs' secrets or the gateway's configuration; nor, across the cluster, proxy to a node, impersonate a user, group, UID or extra, bind or escalate a cluster role, or create a cluster binding"
   operator_checks
 
   step "the server never saw a workload token through the gateway, and no denied call reached it"
