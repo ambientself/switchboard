@@ -1,8 +1,6 @@
 //! Identity end to end: every caller who cannot be verified gets the same 401, byte for byte,
 //! before the body is read; a request from another host or origin is refused before that; and
 //! a gateway with identity disabled says so and refuses every call.
-//!
-//! Plan #26's tests 10, 11 and 16.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;

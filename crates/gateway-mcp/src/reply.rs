@@ -78,7 +78,8 @@ pub enum Reply {
     Initialized,
     /// The answer to `ping`: an empty result.
     Pong,
-    /// The answer to `server/discover`: [`MODERN`] is the one version listed (owner answer Q3).
+    /// The answer to `server/discover`: [`MODERN`] is the one version listed (decision 0007's
+    /// 2026-10-07 amendment).
     Discovered,
     /// The answer to `tools/list`: the tools the caller may call, in the order given. Under
     /// 2026-07-28 it is marked private to the caller, because it varies by authorization.
@@ -97,8 +98,8 @@ pub enum Reply {
         /// The server's `structuredContent`, if it gave one.
         structured_content: Option<Value>,
     },
-    /// A tool ran and failed: a result with `isError: true` and the message as text (owner
-    /// answer Q5).
+    /// A tool ran and failed: a result with `isError: true` and the message as text
+    /// (decision 0007's 2026-10-07 amendment).
     ToolError(String),
     /// The call was refused: by policy, by the connector's scope check, by a failed audit, or
     /// because identity is turned off. A JSON-RPC error with [`DENIAL_CODE`] and the sentence

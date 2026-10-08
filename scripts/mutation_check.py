@@ -966,6 +966,12 @@ mutate_all(
     (IDENTITY + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
 )
+mutate_all(
+    "identity-dependency-added-under-spaced-target",
+    "the identity crate gains a dependency outside the allowlist, under a target table spelled with spaces",
+    (IDENTITY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\nproptest = "1"\n', '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    (IDENTITY + "Cargo.toml", "\n[lints]\n", "\n[ target.'cfg(all())'.dependencies ]\nproptest = \"1\"\n\n[lints]\n"),
+)
 # Enabling `aws_lc_rs` itself would add crates to Cargo.lock, which `--locked` refuses before any
 # test runs, so that mutation could never give a verdict. Any second entry in the feature list
 # fails the same assertion a second backend would, and leaves the lock as it is.
@@ -1067,6 +1073,13 @@ mutate_all(
     (CRATE + "Cargo.toml", 'thiserror = "2"\n', 'thiserror = "2"\nproptest = "1"\n'),
     (CRATE + "Cargo.toml", '[dev-dependencies]\nproptest = "1"\n', "[dev-dependencies]\n"),
 )
+# A table header with spaces is still a table to Cargo, and one under a target is still built.
+mutate_all(
+    "dependency-added-under-spaced-target",
+    "the core gains a dependency outside the allowlist, under a target table spelled with spaces",
+    (CRATE + "Cargo.toml", '[dev-dependencies]\nproptest = "1"\n', "[dev-dependencies]\n"),
+    (CRATE + "Cargo.toml", "\n[lints]\n", "\n[ target.'cfg(all())'.dependencies ]\nproptest = \"1\"\n\n[lints]\n"),
+)
 
 
 # --- gateway-mcp ---------------------------------------------------------------------------
@@ -1085,13 +1098,20 @@ mutate("mcp-content-type-ignored", "a body not declared as JSON is served", MCP_
 mutate("mcp-accept-ignored", "an Accept excluding JSON is served", MCP_PARSE,
        "    if !accept_admits_json(headers) {", "    if false && !accept_admits_json(headers) {")
 mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON", MCP + "headers.rs",
-       "is_ok_and(|q| q <= 0.0)", "is_ok_and(|q| q < 0.0)")
+       ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
+mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
+       ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
+mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
+       ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
 mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
        '                response\n                    .headers\n                    .insert(ALLOW, HeaderValue::from_static("POST"));\n',
        "")
 mutate("mcp-challenge-dropped", "a 401 carries no WWW-Authenticate challenge", MCP_REJECTION,
        "                response\n                    .headers\n                    .insert(WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));\n",
        "")
+mutate("mcp-request-timeout-keeps-connection", "a 408 leaves the connection open for the rest of the late body", MCP_REJECTION,
+       '                    .insert(CONNECTION, HeaderValue::from_static("close"));',
+       '                    .insert(CONNECTION, HeaderValue::from_static("keep-alive"));')
 mutate("mcp-batch-accepted", "the first request of a JSON array is processed", MCP_PARSE,
        '        Value::Array(_) => {\n            return Err(Rejection::invalid_request(\n'
        '                "Invalid request: batches are not supported",\n            ));\n        }\n',
@@ -1128,11 +1148,24 @@ mutate("mcp-method-header-not-compared", "Mcp-Method is not compared with the bo
        "        Single::One(header) if header == method => {}", "        Single::One(header) if !header.is_empty() => {}")
 mutate("mcp-name-header-not-compared", "Mcp-Name is not compared with the body", MCP_PARSE,
        "        Some(decoded) if decoded == name => Ok(()),", "        Some(_) => Ok(()),")
+mutate("mcp-method-header-optional", "a modern request with no Mcp-Method header is served", MCP_PARSE,
+       '        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n'
+       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n',
+       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n')
+mutate("mcp-name-header-optional", "a modern tools/call with no Mcp-Name header is served", MCP_PARSE,
+       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n",
+       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n"
+       "    if matches!(single(headers, NAME_HEADER), Single::Absent) {\n        return Ok(());\n    }\n")
+mutate("mcp-duplicate-header-first-used", "the first of two copies of a single-valued MCP header is used", MCP + "headers.rs",
+       "    if values.next().is_some() {\n        return Single::Malformed;\n    }\n", "")
 mutate("mcp-name-sentinel-not-decoded", "the base64 sentinel in Mcp-Name is compared raw", MCP_PARSE,
        "    match header_name_value(header) {", "    match Some(header.to_owned()) {")
 mutate("mcp-modern-ping-served", "ping is served under 2026-07-28", MCP_PARSE,
        '        "server/discover" => Ok(Call::Discover),\n',
        '        "server/discover" => Ok(Call::Discover),\n        "ping" => Ok(Call::Ping),\n')
+mutate("mcp-legacy-ping-unknown", "ping is not served under 2025-06-18", MCP_PARSE,
+       '        "ping" => Ok(Call::Ping),\n', "")
 mutate("mcp-modern-unknown-method-200", "an unknown modern method is answered 200, not 404", MCP_REJECTION,
        "            Era::Modern => StatusCode::NOT_FOUND,", "            Era::Modern => StatusCode::OK,")
 mutate("mcp-legacy-any-header-version", "a legacy request accepts any MCP-Protocol-Version", MCP_PARSE,
@@ -1145,6 +1178,51 @@ mutate("mcp-legacy-structured-non-object", "a legacy result carries structuredCo
        "            if era == Era::Modern || value.is_object() {", "            if true {")
 mutate("mcp-denial-code-changed", "the denial code becomes -32602", MCP + "constants.rs",
        "pub const DENIAL_CODE: i64 = -32001;", "pub const DENIAL_CODE: i64 = -32602;")
+mutate("mcp-era-header-ignored", "a request with the modern version header and no _meta is served as legacy", MCP_PARSE,
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() {")
+mutate("mcp-era-meta-ignored", "a request whose _meta names its version, with no version header, is served as legacy", MCP_PARSE,
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
+       "    if header_is_modern {")
+mutate("mcp-content-type-any-charset", "a JSON content type with a charset other than UTF-8 is served", MCP + "headers.rs",
+       '            || value.trim().trim_matches(\'"\').eq_ignore_ascii_case("utf-8")',
+       '            || !value.is_empty()')
+mutate("mcp-jsonrpc-version-unchecked", "a request that does not say jsonrpc 2.0 is served", MCP_PARSE,
+       '    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {',
+       '    if false && object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {')
+mutate("mcp-response-refused-as-methodless", "a posted response is refused only for having no method", MCP_PARSE,
+       '        None if object.contains_key("result") || object.contains_key("error") => {',
+       '        None if false => {')
+mutate("mcp-fractional-id-accepted", "a fractional or out-of-range id is read as an integer", MCP_PARSE,
+       "        Some(Value::Number(id)) => match id.as_i64() {",
+       "        Some(Value::Number(id)) => match id.as_i64().or_else(|| id.as_f64().map(|id| id as i64)) {")
+mutate("mcp-params-not-object-accepted", "params that are not an object are read as empty", MCP_PARSE,
+       "        Some(_) => Params::Malformed,", "        Some(_) => Params::Object(Map::new()),")
+mutate("mcp-call-name-optional", "a tools/call with no name is served with an empty name", MCP_PARSE,
+       '    let Some(Value::String(name)) = params.remove("name") else {',
+       '    let Some(Value::String(name)) = params.remove("name").or(Some(Value::String(String::new()))) else {')
+mutate("mcp-method-not-string-accepted", "a method that is not a string is read as its JSON text", MCP_PARSE,
+       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: method must be a string",\n            ));\n        }\n',
+       "        Some(method) => method.to_string(),\n")
+mutate("mcp-no-method-accepted", "a request with no method is read as one with an empty method", MCP_PARSE,
+       '        None => return Err(Rejection::invalid_request("Invalid request: no method")),',
+       "        None => String::new(),")
+mutate("mcp-structured-id-accepted", "an id that is an object or an array is dropped, making the request a notification", MCP_PARSE,
+       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: id must be a string or an integer",\n            ));\n        }\n    };\n',
+       "        Some(_) => None,\n    };\n")
+mutate("mcp-call-arguments-array-accepted","a tools/call whose arguments are an array is served with none", MCP_PARSE,
+       "        None | Some(Value::Null) => Map::new(),", "        None | Some(Value::Null | Value::Array(_)) => Map::new(),")
+# The adapter's dependency fence. It has no dev-dependency to move, so the mutation adds a crate
+# the workspace already locks and edits Cargo.lock to match, which `--locked` accepts.
+mutate_all(
+    "mcp-dependency-thiserror",
+    "the adapter depends on a crate outside its allowlist",
+    ("crates/gateway-mcp/Cargo.toml", 'serde_json = "1"\n\n[lints]\n', 'serde_json = "1"\nthiserror = "2"\n\n[lints]\n'),
+    ("Cargo.lock", 'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n]\n',
+     'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n "thiserror",\n]\n'),
+)
 
 
 # --- gateway -------------------------------------------------------------------------------
@@ -1190,6 +1268,25 @@ mutate("gw-catalog-duplicate-accepted", "a second definition for a tool replaces
 mutate("gw-catalog-schema-not-checked", "an input schema that is not an object schema is accepted", CATALOG,
        '    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")',
        "    let _ = schema;\n    true")
+
+# Every struct the gateway's own configuration sections nest refuses a key it does not know. The
+# policy section is gateway-core's snapshot; its structs are not covered here yet (#41).
+for path, struct in [
+    (GW + "config.rs", "Config"),
+    (GW + "config.rs", "IdentitySection"),
+    (GW + "config.rs", "AuditSection"),
+    (GW + "config.rs", "HttpSection"),
+    (GW + "config.rs", "IssuerEntry"),
+    (CATALOG, "ToolDefinition"),
+    (SELECTOR, "SelectorRules"),
+    (SELECTOR, "WorkloadRule"),
+    (SELECTOR, "UserRule"),
+]:
+    mutate(f"gw-unknown-fields-{struct}", f"{struct} accepts unknown fields", path,
+           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
+mutate("gw-unknown-fields-IssuerKindEntry", "an issuer's kind accepts unknown fields", GW + "config.rs",
+       '#[serde(rename_all = "snake_case", deny_unknown_fields)]\npub enum IssuerKindEntry {',
+       '#[serde(rename_all = "snake_case")]\npub enum IssuerKindEntry {')
 
 # Connectors.
 mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
@@ -1240,6 +1337,42 @@ mutate_all(
     ("crates/gateway/Cargo.toml", 'tracing = "0.1"\n', 'tracing = "0.1"\ngateway-testkit = { path = "../gateway-testkit" }\n'),
     ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
 )
+mutate_all(
+    "gw-dependency-testkit-under-spaced-target",
+    "the gateway depends on the testkit, under a target table spelled with spaces",
+    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+    ("crates/gateway/Cargo.toml", "\n[lints]\n",
+     "\n[ target.'cfg(all())'.dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n"),
+)
+# A dependency renamed to an allowed name cannot be shown here: every allowed name is already a
+# dependency, and Cargo refuses one name for two packages. The fences compare the package each
+# entry resolves to, which is what a rename would change.
+mutate("gw-dependency-testkit-as-build-dependency", "the gateway builds with the testkit, under a build-dependencies table spelled with spaces",
+       "crates/gateway/Cargo.toml",
+       "\n[lints]\n", "\n[ build-dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n")
+
+
+# The binary loads its deployment, starts the audit store and runs the boot gates before it
+# binds a socket. Where it listens when the deployment file does not say is loopback only.
+GW_BIN = GW + "bin/switchboard.rs"
+GW_DEPLOY = GW + "deployment.rs"
+BIN_PREPARE = (
+    "    let prepared = match start::prepare(deployment, Arc::new(SystemClock)).await {\n"
+    "        Ok(prepared) => prepared,\n        Err(error) => return refuse(&error.to_string()),\n    };\n"
+)
+BIN_BIND = (
+    "    let listener = match TcpListener::bind(listen).await {\n"
+    "        Ok(listener) => listener,\n"
+    '        Err(error) => return refuse(&format!("cannot listen on {listen}: {error}")),\n'
+    "    };\n"
+)
+DEFAULT_LISTEN = "SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);"
+mutate("gw-bin-default-listen-every-interface", "switchboard listens on every interface unless told otherwise", GW_DEPLOY,
+       DEFAULT_LISTEN, "SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);")
+mutate("gw-bin-default-listen-ipv6-every-interface", "switchboard listens on every IPv6 interface unless told otherwise", GW_DEPLOY,
+       DEFAULT_LISTEN, "SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 8080);")
+mutate("gw-bin-binds-before-boot-gates", "switchboard binds its socket before the audit store and the boot gates are ready", GW_BIN,
+       BIN_PREPARE + BIN_BIND, BIN_BIND + BIN_PREPARE)
 
 
 # --- gateway path --------------------------------------------------------------------------
@@ -1312,6 +1445,17 @@ mutate("gw-audit-failed-as-tool-error", "an unrecorded scope refusal is answered
 mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a result", GW_PATH,
        "Answer::Error(message) => Reply::ToolError(message),",
        "Answer::Error(message) => Reply::Denied(message),")
+mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
+       "                return Reply::Denied(failure.sentence().to_owned());",
+       "                return Reply::ToolError(failure.sentence().to_owned());")
+mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
+       "                return Reply::Denied(refusal.sentence().to_owned());",
+       "                return Reply::ToolError(refusal.sentence().to_owned());")
+mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
+       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
+       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
+mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
+       "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
 mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
        "        if let Some(failure) = finished.failure() {\n",
        "        if let Some(failure) = finished.failure() {\n"
@@ -1341,8 +1485,15 @@ mutate_all(
 )
 mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
        "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
+mutate("gw-host-bracket-suffix-ignored", "whatever follows a bracketed host is dropped unchecked", GW_SERVER,
+       "            Some(close) => host.split_at(close + 1),", "            Some(close) => return &host[..=close],")
+mutate("gw-host-empty-port-accepted", "a Host ending in a colon with no port is allowed", GW_SERVER,
+       "let is_port = |port: &str| !port.is_empty() && port.bytes()", "let is_port = |port: &str| port.bytes()")
 mutate("gw-host-first-of-two", "the first of two Host headers is checked", GW_SERVER,
        "        (Some(_), Some(_)) => None,", "        (Some(value), Some(_)) => value.to_str().ok(),")
+mutate("gw-host-absent-allowed", "a request with no Host and no authority is taken as for localhost", GW_SERVER,
+       "        (None, _) => parts.uri.authority().map(|authority| authority.as_str()),",
+       '        (None, _) => Some("localhost"),')
 mutate("gw-host-prefix-match", "a Host that starts with an allowed one is allowed", GW_SERVER,
        ".any(|allowed| allowed.eq_ignore_ascii_case(host))", ".any(|allowed| host.starts_with(allowed.as_str()))")
 mutate("gw-origin-check-skipped", "a request from any Origin is served", GW_SERVER,
@@ -1362,9 +1513,24 @@ mutate("gw-body-unlimited", "a body with no declared length is read whatever its
 mutate("gw-body-read-before-identity", "the body is read before identity is checked", GW_SERVER, ADMIT,
        "    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {\n"
        "        Ok(body) => Body::from(body),\n        Err(_) => return unreadable(),\n    };\n" + ADMIT)
+mutate("gw-head-timeout-unset", "a request's head may take hyper's default 30 seconds, not the configured time", GW_SERVER,
+       "    http.timer(TokioTimer::new())\n        .header_read_timeout(timeouts.header_read);\n",
+       "    http.timer(TokioTimer::new());\n")
+mutate("gw-head-timeout-no-timer", "the head's deadline is configured with no timer to run it", GW_SERVER,
+       "    http.timer(TokioTimer::new())\n        .header_read_timeout(", "    http.header_read_timeout(")
+mutate("gw-body-read-untimed", "a body may take an hour to arrive", GW_SERVER,
+       "tokio::time::timeout(endpoint.body_read, reading)", "tokio::time::timeout(Duration::from_secs(3600), reading)")
+mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour for a connection that stopped part way", GW_SERVER,
+       "tokio::time::timeout(timeouts.shutdown_grace, connections.shutdown())",
+       "tokio::time::timeout(Duration::from_secs(3600), connections.shutdown())")
+mutate("gw-shutdown-leaves-connections-open", "a connection still open after the grace keeps serving after the server returns", GW_SERVER,
+       "        tasks.spawn(async move {", "        tokio::spawn(async move {")
 mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
        "    match tokio::spawn(answering.instrument(span)).await {",
        "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
+mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
+       "        return refused(&Rejection::request_timeout());",
+       "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
 
 
 # --- gateway-dev ---------------------------------------------------------------------------
@@ -1435,6 +1601,19 @@ mutate("dev-client-bin-era-ignored", "switchboard-client runs both eras whatever
        "    for era in arguments.eras {", "    for era in [Era::Legacy, Era::Modern] {")
 mutate("dev-client-bin-unexpected-exits-0", "switchboard-client exits 0 when an answer was not as expected", DEV_CLIENT_BIN,
        "    } else {\n        ExitCode::from(1)\n    }", "    } else {\n        ExitCode::SUCCESS\n    }")
+
+
+# --- gateway-dev: switchboard-dev ----------------------------------------------------------
+
+DEV_BIN = DEV + "bin/switchboard-dev.rs"
+
+mutate("dev-bin-unexpected-answer-ignored", "switchboard-dev's script passes whatever the answers were", DEV_BIN,
+       "            as_expected = false;\n", "")
+mutate("dev-bin-once-unexpected-exits-0", "switchboard-dev --once exits 0 when an answer was not as expected", DEV_BIN,
+       '    if !as_expected {\n        return Err("an answer was not as expected".to_owned());\n    }\n',
+       "    let _ = as_expected;\n")
+mutate("dev-bin-once-unclean-stop-exits-0", "switchboard-dev --once exits 0 when the gateway did not stop cleanly", DEV_BIN,
+       "    if let Err(error) = stopped {", "    if let (Err(error), false) = (stopped, true) {")
 
 
 # --- mock-docs-server ------------------------------------------------------------------------
@@ -2142,7 +2321,6 @@ mutate("demo-kind-slow-readiness-removal", "readiness removal takes longer than 
        "            failureThreshold: 3\n", "            failureThreshold: 10\n")
 mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
        "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
-
 
 # --- Running -------------------------------------------------------------------------------
 

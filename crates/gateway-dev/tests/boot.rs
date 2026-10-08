@@ -1,12 +1,11 @@
 //! The boot gates on the fixture world: the configuration `switchboard-dev` starts from passes
-//! only with identity and audit each configured or explicitly disabled, and a refused
-//! configuration never gets as far as a listener.
+//! only with identity and audit each configured or explicitly disabled.
 //!
-//! Plan #26's test 17, on the fixture's configuration. The gates' own table is in the gateway
-//! crate's `tests/boot.rs`.
+//! The gates' own table is in the gateway crate's `tests/boot.rs`. That a refused configuration
+//! never binds its port is tested on the `switchboard` binary, in that crate's
+//! `tests/binary.rs`; serving takes the gates, which a refused configuration does not have.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use gateway::{BootError, Config, GateState, Gates, Wiring, boot};
@@ -109,19 +108,4 @@ fn the_fixture_starts_only_with_each_gate_configured_or_explicitly_disabled() {
             }
         }
     }
-}
-
-#[tokio::test]
-async fn a_refused_configuration_never_binds_its_port() {
-    // A free port, chosen and released.
-    let port = {
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        probe.local_addr().unwrap().port()
-    };
-    let world = World::new();
-    assert!(world.boot(Stated::Unstated, Stated::On).is_err());
-    assert!(world.boot(Stated::On, Stated::Unstated).is_err());
-    // Serving needs the gates, which a refused configuration does not have; nothing listens.
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    assert!(tokio::net::TcpStream::connect(address).await.is_err());
 }

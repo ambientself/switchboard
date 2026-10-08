@@ -274,7 +274,9 @@ impl FixtureGateway {
         &self.credentials
     }
 
-    /// Stops taking connections, and returns once the requests in flight are answered.
+    /// Stops taking connections, and returns once every tool call started has completed its
+    /// row. A connection still open after the shutdown grace is closed, and a request on it
+    /// that had not started its answer is not answered.
     pub async fn shutdown(mut self) -> io::Result<()> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());

@@ -668,6 +668,8 @@ dependencies = [
  "gateway-testkit",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "mock-docs-server",
  "serde",
  "serde_json",

@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! deployment = "compose-demo"
-//! listen = "0.0.0.0:8080"
+//! listen = "0.0.0.0:8080"     # 127.0.0.1:8080 if left out
 //!
 //! [http]
 //! allowed_hosts = ["gateway", "127.0.0.1", "localhost"]
@@ -53,12 +53,13 @@
 //! - **Credentials** map each registry server's credential reference to the file holding it.
 //!   Every server's reference must be here, and nothing else may be.
 //!
-//! Every table refuses fields it does not know. Nothing has a default: a missing field is an
-//! error, and so is a field that does not belong to the chosen mode or kind, such as
-//! `subjects_file` on a user issuer.
+//! Every table refuses fields it does not know. Only `listen` has a default, [`DEFAULT_LISTEN`],
+//! so a gateway not told where to listen is reachable from its own machine only. Any other
+//! missing field is an error, and so is a field that does not belong to the chosen mode or kind,
+//! such as `subjects_file` on a user issuer.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -70,13 +71,18 @@ use crate::config::{
     Algorithm, AuditSection, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
 
+/// Where the gateway listens when the deployment file does not say: loopback only, never every
+/// interface.
+pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+
 /// The deployment file as written.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentFile {
     /// The deployment's name, recorded on every audit row.
     pub deployment: DeploymentName,
-    /// The address the gateway listens on.
+    /// The address the gateway listens on, [`DEFAULT_LISTEN`] if it is not given.
+    #[serde(default = "default_listen")]
     pub listen: SocketAddr,
     /// What the HTTP endpoint accepts.
     pub http: HttpSection,
@@ -88,6 +94,10 @@ pub struct DeploymentFile {
     pub audit: AuditFile,
     /// Each credential reference the registry's servers name, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
+}
+
+fn default_listen() -> SocketAddr {
+    DEFAULT_LISTEN
 }
 
 /// The registry file, and how often it is read again.

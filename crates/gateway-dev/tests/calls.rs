@@ -3,8 +3,8 @@
 //!
 //! Issue #26's list: a denied call never reaches the connector, an audit begin that fails
 //! refuses the call, an audit finish that fails does not undo a success, and a scope refusal is
-//! recorded as refused. Then plan #26's tests 12 to 15: a client that goes away, the tool-use
-//! identifier, the two teams' documents, and a tool that fails.
+//! recorded as refused. Then a client that goes away, the tool-use identifier, the two teams'
+//! documents, and a tool that fails.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;

@@ -46,33 +46,38 @@ pub(crate) fn content_type_is_json(headers: &HeaderMap) -> bool {
     })
 }
 
-/// True when there is no `Accept` header, or one of its media ranges admits
-/// `application/json` with a quality above zero.
+/// True when there is no `Accept` header, or the most specific of its media ranges that
+/// matches `application/json` gives it a quality above zero. `application/json` is more specific
+/// than `application/*`, which is more specific than `*/*` (RFC 9110, section 12.5.1), so
+/// `application/json;q=0, */*` excludes JSON. Among equally specific ranges the highest quality
+/// counts. A quality that does not read as a number counts as 1.
 pub(crate) fn accept_admits_json(headers: &HeaderMap) -> bool {
     let mut values = headers.get_all(ACCEPT).iter().peekable();
     if values.peek().is_none() {
         return true;
     }
-    values.any(|value| {
-        value
-            .to_str()
-            .is_ok_and(|value| value.split(',').any(range_admits_json))
-    })
+    values
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(json_range)
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+        .is_some_and(|(_, quality)| quality > 0.0)
 }
 
-fn range_admits_json(range: &str) -> bool {
+/// How specifically `range` matches `application/json`, from 2 for `application/json` down to
+/// 0 for `*/*`, and the quality it gives; `None` when it does not match.
+fn json_range(range: &str) -> Option<(usize, f32)> {
     let mut parts = range.split(';');
     let media_range = parts.next().unwrap_or_default().trim();
-    let matches = ["application/json", "application/*", "*/*"]
+    let specificity = ["*/*", "application/*", "application/json"]
         .iter()
-        .any(|accepted| media_range.eq_ignore_ascii_case(accepted));
-    let refused = parts.any(|parameter| {
-        parameter.split_once('=').is_some_and(|(name, quality)| {
-            name.trim().eq_ignore_ascii_case("q")
-                && quality.trim().parse::<f32>().is_ok_and(|q| q <= 0.0)
-        })
-    });
-    matches && !refused
+        .position(|matching| media_range.eq_ignore_ascii_case(matching))?;
+    let quality = parts
+        .filter_map(|parameter| parameter.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+        .and_then(|(_, quality)| quality.trim().parse::<f32>().ok())
+        .unwrap_or(1.0);
+    Some((specificity, quality))
 }
 
 const SENTINEL_PREFIX: &str = "=?base64?";
@@ -154,6 +159,29 @@ mod tests {
         assert!(!admits("application/json; q=0.0, text/html"));
         assert!(!admits("application/jsonl"));
         assert!(accept_admits_json(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn the_most_specific_range_that_matches_json_decides() {
+        let admits = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT, value.parse().unwrap());
+            accept_admits_json(&headers)
+        };
+        assert!(!admits("application/json;q=0, */*;q=1"));
+        assert!(!admits("application/json;q=0, application/*"));
+        assert!(!admits("*/*, application/*;q=0"));
+        assert!(!admits("application/json; charset=utf-8; q=0, */*"));
+        assert!(admits("application/*;q=0, application/json;q=0.5"));
+        assert!(admits("*/*;q=0, application/json"));
+        assert!(admits("application/json;q=0, application/json;q=0.1"));
+        assert!(admits("application/json;q=high"));
+
+        // The ranges may come in more than one header.
+        let mut headers = HeaderMap::new();
+        headers.append(ACCEPT, "*/*".parse().unwrap());
+        headers.append(ACCEPT, "application/json;q=0".parse().unwrap());
+        assert!(!accept_admits_json(&headers));
     }
 
     #[test]

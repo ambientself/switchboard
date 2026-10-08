@@ -49,6 +49,7 @@ team's with a sentence naming it. Leave out `--once` to keep it serving, then us
 | [docs/design.md](docs/design.md) | The design: scope, architecture, data model, invariants and delivery milestones. Authoritative once the open questions are settled. |
 | [docs/systems.md](docs/systems.md) | The systems the gateway must reach, how each is likely to be connected, and what is still unverified. |
 | [docs/otto-baseline.md](docs/otto-baseline.md) | Behavior verified against the pinned Go gateway, including gaps and differences from the draft. |
+| [docs/claude-code-trial.md](docs/claude-code-trial.md) | Claude Code pointed at the local gateway in both negotiation modes: what worked and what did not. |
 | [docs/feedback-loops.md](docs/feedback-loops.md) | Proposal for fast feedback once building starts: what runs in seconds, before a commit, and in CI. |
 | [docs/open-questions.md](docs/open-questions.md) | Settled questions and proposed refinements, each open item with a recommendation and what it blocks. |
 | [docs/decisions/](docs/decisions/) | Decision records, one per file, for choices that are settled. |

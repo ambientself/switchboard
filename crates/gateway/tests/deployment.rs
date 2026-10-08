@@ -4,6 +4,7 @@
 
 mod files;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -116,11 +117,32 @@ fn identity_and_audit_can_each_be_disabled_explicitly() {
     assert!(loaded.audit.section().disabled);
 }
 
+/// With no `listen`, the gateway is reachable from its own machine only: it binds the IPv4
+/// loopback address, never every interface.
+#[test]
+fn the_default_listen_address_is_loopback_only() {
+    let loaded = load_edited("default-listen", "listen = \"127.0.0.1:0\"\n", "").unwrap();
+    assert_eq!(loaded.listen, gateway::deployment::DEFAULT_LISTEN);
+    assert_eq!(loaded.listen.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert!(!loaded.listen.ip().is_unspecified());
+    assert_eq!(loaded.listen.port(), 8080);
+}
+
+#[test]
+fn listen_replaces_the_default() {
+    let loaded = load_edited(
+        "given-listen",
+        "listen = \"127.0.0.1:0\"\n",
+        "listen = \"0.0.0.0:9000\"\n",
+    )
+    .unwrap();
+    assert_eq!(loaded.listen, "0.0.0.0:9000".parse::<SocketAddr>().unwrap());
+}
+
 #[test]
 fn a_missing_field_is_refused() {
     for (field, line) in [
         ("deployment", "deployment = \"files-test\"\n"),
-        ("listen", "listen = \"127.0.0.1:0\"\n"),
         ("poll_seconds", "poll_seconds = 1\n"),
         ("file", "file = \"registry/registry.toml\"\n"),
         ("mode", "mode = \"enforce\"\n"),

@@ -3,19 +3,20 @@
 //!
 //! The request path's own behaviour is tested in `path.rs`. These tests cover what the HTTP
 //! layer adds: the host and origin checks, the body limit, identity before the body is read, a
-//! task per answer that a disconnect cannot cancel, and shutting down.
+//! task per answer that a disconnect cannot cancel, the time limits on a request's head and
+//! body, and shutting down.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
 
 use std::time::Duration;
 
-use gateway::MAX_BODY_BYTES;
+use gateway::{MAX_BODY_BYTES, Timeouts};
 use gateway_core::audit::{Completion, DecisionKind, Outcome};
-use gateway_mcp::{LEGACY, MODERN, PARSE_ERROR};
+use gateway_mcp::{INVALID_REQUEST, LEGACY, MODERN, PARSE_ERROR};
 use gateway_testkit::{Caller, READ_TOOL, SURFACE_READ, TEAM_B_DOCUMENT};
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use support::{ALLOWED_ORIGIN, Http, PATIENCE, Server, eventually, exchange, legacy, read_answer};
@@ -155,6 +156,9 @@ async fn a_host_that_is_not_allowed_is_refused_before_identity() {
         format!("evil.example:{port}"),
         format!("localhost.evil.example:{port}"),
         format!("127.0.0.2:{port}"),
+        "localhost:".to_owned(),
+        format!("localhost:{port}x"),
+        format!("127.0.0.1:{port}:{port}"),
     ] {
         let answer = ping().header("host", &host).send(&server).await;
         answer.assert_forbidden(FORBIDDEN_HOST);
@@ -388,4 +392,172 @@ async fn the_server_stops_when_told_to() {
         TcpStream::connect(server.address).await.is_err(),
         "still listening"
     );
+}
+
+/// Timeouts short enough for a test, but for the ones it names.
+fn short() -> Timeouts {
+    Timeouts {
+        header_read: Duration::from_millis(300),
+        body_read: Duration::from_millis(300),
+        shutdown_grace: Duration::from_millis(300),
+    }
+}
+
+/// A request line and the start of a header, and nothing after.
+const HALF_A_HEAD: &[u8] = b"POST /mcp/fixture-read HTTP/1.1\r\nHost: local";
+
+/// Reads until the server closes `stream`, and says whether it did within [`PATIENCE`].
+async fn closed_by_the_server(stream: &mut TcpStream) -> bool {
+    let mut buffer = [0; 1024];
+    loop {
+        match tokio::time::timeout(PATIENCE, stream.read(&mut buffer)).await {
+            Err(_) => return false,
+            Ok(Ok(0) | Err(_)) => return true,
+            Ok(Ok(_)) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_does_not_finish_its_head_in_time_is_closed() {
+    let server = Server::start_with(Timeouts {
+        shutdown_grace: Duration::from_secs(60),
+        ..short()
+    })
+    .await;
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(HALF_A_HEAD).await.unwrap();
+    let started = std::time::Instant::now();
+    assert!(
+        closed_by_the_server(&mut stream).await,
+        "still open after {PATIENCE:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn a_body_that_does_not_arrive_in_time_is_408() {
+    let server = Server::start_with(short()).await;
+    let request = server
+        .post(SURFACE_READ, &legacy("tools/list", json!({})))
+        .bearer(&server.token(Caller::TeamA))
+        .without("connection")
+        .header("content-length", "100");
+    let mut bytes = request.head();
+    bytes.extend_from_slice(b"{\"jsonrpc\":");
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    let answer = read_answer(&mut stream).await;
+    assert_eq!(answer.status, 408);
+    assert_eq!(answer.header("connection"), Some("close"));
+    assert_eq!(
+        answer.json(),
+        json!({"jsonrpc": "2.0", "id": null, "error": {
+            "code": INVALID_REQUEST,
+            "message": "Request timeout: the body did not arrive in time, so nothing ran",
+        }})
+    );
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn shutting_down_stops_waiting_for_a_half_sent_request_after_the_grace() {
+    let mut server = Server::start_with(Timeouts {
+        header_read: Duration::from_secs(60),
+        body_read: Duration::from_secs(60),
+        ..short()
+    })
+    .await;
+    // One connection stopped part way through its head, another part way through its body.
+    let mut head = TcpStream::connect(server.address).await.unwrap();
+    head.write_all(HALF_A_HEAD).await.unwrap();
+    let request = server
+        .post(SURFACE_READ, &legacy("tools/list", json!({})))
+        .bearer(&server.token(Caller::TeamA))
+        .header("content-length", "100");
+    let mut body = TcpStream::connect(server.address).await.unwrap();
+    body.write_all(&request.head()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.stop.take().unwrap().send(()).unwrap();
+    let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    stopped.expect("the server stopped").unwrap().unwrap();
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn a_call_whose_body_arrives_after_shutting_down_never_starts() {
+    let mut server = Server::start_with(Timeouts {
+        header_read: Duration::from_secs(60),
+        body_read: Duration::from_secs(60),
+        ..short()
+    })
+    .await;
+    let request = server.call(
+        Caller::TeamA,
+        SURFACE_READ,
+        READ_TOOL,
+        json!({"document": Caller::TeamA.own_document()}),
+    );
+    let length = request.body.len().to_string();
+    let request = request.header("content-length", &length);
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&request.head()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.stop.take().unwrap().send(()).unwrap();
+    let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    stopped.expect("the server stopped").unwrap().unwrap();
+    server.assert_nothing_ran();
+
+    // The body arrives once the server has returned. The connection is closed, so nothing
+    // answers it and no call starts.
+    let _ = stream.write_all(&request.body).await;
+    let mut received = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        match tokio::time::timeout(PATIENCE, stream.read(&mut buffer)).await {
+            Err(_) => panic!("the connection is still open after {PATIENCE:?}"),
+            Ok(Ok(0) | Err(_)) => break,
+            Ok(Ok(read)) => received.extend_from_slice(&buffer[..read]),
+        }
+    }
+    assert!(
+        received.is_empty(),
+        "answered after shutting down: {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn shutting_down_waits_past_the_grace_for_a_call_that_is_running() {
+    let mut server = Server::start_with(short()).await;
+    let gate = server.connector.hang_next();
+    let request = server.call(
+        Caller::TeamA,
+        SURFACE_READ,
+        READ_TOOL,
+        json!({"document": Caller::TeamA.own_document()}),
+    );
+    let length = request.body.len().to_string();
+    let request = request.header("content-length", &length);
+    let mut bytes = request.head();
+    bytes.extend_from_slice(&request.body);
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    eventually("the call reaching the connector", || gate.waiting() == 1).await;
+
+    server.stop.take().unwrap().send(()).unwrap();
+    // Well past the grace, the call is still running and the server still waits for it.
+    let waited = tokio::time::timeout(Duration::from_secs(1), &mut server.serving).await;
+    assert!(waited.is_err(), "the server returned with a call running");
+    assert_eq!(server.store.row(0).unwrap().completion, None);
+
+    gate.open();
+    let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    stopped.expect("the server stopped").unwrap().unwrap();
+    assert!(server.store.row(0).unwrap().completion.is_some());
 }

@@ -198,6 +198,66 @@ fn migrate_needs_the_owners_database_url() {
     );
 }
 
+/// The deployment is checked, and the audit store and boot gates run, before a socket is bound.
+/// With the address already taken, a deployment the binary refuses is refused for its own
+/// reason, not for the address.
+#[test]
+fn a_refused_deployment_is_refused_before_the_address_is_bound() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = held.local_addr().unwrap().to_string();
+    let files = Files::new(
+        "binary-held",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    let config = format!("--config={}", files.path("gateway.toml").display());
+    let listen_line = "listen = \"127.0.0.1:0\"\n";
+    let held_at = |audit: &str| {
+        let text = files::deployment_file(audit);
+        assert_eq!(text.matches(listen_line).count(), 1);
+        text.replace(listen_line, &format!("listen = \"{address}\"\n"))
+    };
+
+    // The address really is taken: a deployment that passes cannot listen on it.
+    files.write("gateway.toml", &held_at("[audit]\nmode = \"disabled\"\n"));
+    let started = run(&[&config]);
+    assert_eq!(started.status.code(), Some(1));
+    assert!(
+        stderr(&started).contains("cannot listen on"),
+        "{}",
+        stderr(&started)
+    );
+
+    let unused_credential = held_at("[audit]\nmode = \"disabled\"\n").replace(
+        "[credentials]\n",
+        "[credentials]\nunused-credential = \"docs-credential\"\n",
+    );
+    let unreachable_store =
+        held_at("[audit]\nmode = \"postgres\"\nurl_env = \"SWITCHBOARD_BINARY_TEST_URL\"\n");
+    for (name, deployment, reason) in [
+        ("unused-credential", unused_credential, "no server uses it"),
+        (
+            "unreachable-store",
+            unreachable_store,
+            "the audit store will not start",
+        ),
+    ] {
+        files.write("gateway.toml", &deployment);
+        let output = run_with(
+            &[&config],
+            &[(
+                "SWITCHBOARD_BINARY_TEST_URL",
+                "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
+            )],
+        );
+        let said = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{name}: {said}");
+        assert!(said.contains(reason), "{name}: {said}");
+        assert!(!said.contains("cannot listen on"), "{name}: {said}");
+    }
+    drop(held);
+}
+
 /// The binary running, with each line of its standard output parsed as JSON.
 struct Running {
     child: Child,

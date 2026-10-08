@@ -20,8 +20,9 @@
 //!   adapter, profile selection, the decision, the audit row and the connector, from a
 //!   request's method, headers and body to its HTTP response.
 //! - [`serve`] is the HTTP endpoint, `POST /mcp/{surface}`, over a listener and the [`Gates`]:
-//!   the host and origin checks, the body limit, and a task per answer, so a client that
-//!   disconnects cannot cut a tool call off from its audit row.
+//!   the host and origin checks, the body limit, time limits on a request's head and body, and
+//!   a task per answer, so a client that disconnects cannot cut a tool call off from its audit
+//!   row.
 //! - [`telemetry::init`] sends logs to standard output as JSON lines.
 //!
 //! The first slice (decision 0008) runs from files:
@@ -76,4 +77,7 @@ pub use resources::ResourceAdapter;
 pub use selector::{
     NO_PROFILE, ProfileSelector, SelectorError, SelectorRules, UserRule, WorkloadRule,
 };
-pub use server::{DISABLED_GATE_REMINDER, MAX_BODY_BYTES, serve, serve_with_shutdown};
+pub use server::{
+    BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES, SHUTDOWN_GRACE,
+    Timeouts, serve, serve_with_shutdown, serve_with_timeouts,
+};
