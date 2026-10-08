@@ -1435,6 +1435,8 @@ mutate("gw-body-read-untimed", "a body may take an hour to arrive", GW_SERVER,
 mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour for a connection that stopped part way", GW_SERVER,
        "tokio::time::timeout(timeouts.shutdown_grace, connections.shutdown())",
        "tokio::time::timeout(Duration::from_secs(3600), connections.shutdown())")
+mutate("gw-shutdown-leaves-connections-open", "a connection still open after the grace keeps serving after the server returns", GW_SERVER,
+       "        tasks.spawn(async move {", "        tokio::spawn(async move {")
 mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
        "    match tokio::spawn(answering.instrument(span)).await {",
        "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")

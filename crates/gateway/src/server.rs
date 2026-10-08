@@ -23,9 +23,10 @@
 //!    started still completes its audit row.
 //!
 //! Shutting down stops taking connections, and waits up to [`SHUTDOWN_GRACE`] for those still
-//! open, such as one whose client stopped part way through a request. It then waits for the
-//! answer tasks, however long they take: a call whose client has gone is still running, and a
-//! process that exited under it would leave its row open.
+//! open, such as one whose client stopped part way through a request. It then closes any still
+//! open, so a request on them that has not started its answer never will. Last, it waits for
+//! the answer tasks, however long they take: a call whose client has gone is still running, and
+//! a process that exited under it would leave its row open.
 //!
 //! Every request is logged once it is answered, with its status and how long it took. A
 //! disabled gate is logged at boot, and again every [`DISABLED_GATE_REMINDER`] while the
@@ -53,6 +54,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::boot::{GateState, Gates};
@@ -70,7 +72,7 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a request's body may take to arrive once identity has passed. Longer is 408.
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long shutting down waits for connections still open before it stops waiting for them.
+/// How long shutting down waits for connections still open before it closes them.
 /// Answer tasks already running are waited for however long they take.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
@@ -82,7 +84,7 @@ pub struct Timeouts {
     pub header_read: Duration,
     /// How long a request's body may take to arrive once identity has passed.
     pub body_read: Duration,
-    /// How long shutting down waits for connections still open.
+    /// How long shutting down waits for connections still open before it closes them.
     pub shutdown_grace: Duration,
 }
 
@@ -115,9 +117,9 @@ where
 }
 
 /// Serves `gates` on `listener` until `shutdown` completes, then stops taking connections. It
-/// returns once the connections still open have closed, or `timeouts.shutdown_grace` has
-/// passed, and every tool call started has completed its audit row, including calls whose
-/// clients have gone.
+/// waits for the connections still open to close, up to `timeouts.shutdown_grace`, and then
+/// closes those that have not, so no tool call starts after it returns. It returns once every
+/// tool call started has completed its audit row, including calls whose clients have gone.
 pub async fn serve_with_timeouts<F>(
     listener: TcpListener,
     gates: Gates,
@@ -148,8 +150,12 @@ where
     http.timer(TokioTimer::new())
         .header_read_timeout(timeouts.header_read);
     let connections = GracefulShutdown::new();
+    // Every connection's task, so that those still open after the grace can be closed.
+    let mut tasks: JoinSet<()> = JoinSet::new();
     let mut shutdown = pin!(shutdown);
     loop {
+        // Forget the connections that have closed, so the set holds only those still open.
+        while tasks.try_join_next().is_some() {}
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => stream,
@@ -162,7 +168,7 @@ where
         };
         let connection =
             connections.watch(http.serve_connection(TokioIo::new(stream), service.clone()));
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!(%error, "a connection ended with an error");
             }
@@ -178,9 +184,12 @@ where
         tracing::warn!(
             %address,
             grace_ms = u64::try_from(timeouts.shutdown_grace.as_millis()).unwrap_or(u64::MAX),
-            "stopped waiting for connections still open after the grace period"
+            "closing the connections still open after the grace period"
         );
     }
+    // A handler that has not started its answer is dropped with its connection. One that has
+    // started it holds a counted task, which goes on without the handler.
+    tasks.shutdown().await;
     let running = answers.running();
     if running > 0 {
         tracing::info!(
@@ -354,7 +363,9 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
     let answering = path.respond(admitted, &surface, &parts.headers, &body);
     let span = tracing::info_span!("answer", %surface);
     // Its own task, so a client that goes away cannot stop a call between running the tool
-    // and completing its row; counted, so that shutting down waits for it.
+    // and completing its row; counted, so that shutting down waits for it. Nothing awaits
+    // between counting it and spawning it, so a handler dropped at shutdown has done both or
+    // neither.
     let running = endpoint.answers.start();
     let answering = async move {
         let _running = running;

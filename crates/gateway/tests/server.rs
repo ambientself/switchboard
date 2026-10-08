@@ -478,6 +478,52 @@ async fn shutting_down_stops_waiting_for_a_half_sent_request_after_the_grace() {
 }
 
 #[tokio::test]
+async fn a_call_whose_body_arrives_after_shutting_down_never_starts() {
+    let mut server = Server::start_with(Timeouts {
+        header_read: Duration::from_secs(60),
+        body_read: Duration::from_secs(60),
+        ..short()
+    })
+    .await;
+    let request = server.call(
+        Caller::TeamA,
+        SURFACE_READ,
+        READ_TOOL,
+        json!({"document": Caller::TeamA.own_document()}),
+    );
+    let length = request.body.len().to_string();
+    let request = request.header("content-length", &length);
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&request.head()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.stop.take().unwrap().send(()).unwrap();
+    let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    stopped.expect("the server stopped").unwrap().unwrap();
+    server.assert_nothing_ran();
+
+    // The body arrives once the server has returned. The connection is closed, so nothing
+    // answers it and no call starts.
+    let _ = stream.write_all(&request.body).await;
+    let mut received = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        match tokio::time::timeout(PATIENCE, stream.read(&mut buffer)).await {
+            Err(_) => panic!("the connection is still open after {PATIENCE:?}"),
+            Ok(Ok(0) | Err(_)) => break,
+            Ok(Ok(read)) => received.extend_from_slice(&buffer[..read]),
+        }
+    }
+    assert!(
+        received.is_empty(),
+        "answered after shutting down: {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
 async fn shutting_down_waits_past_the_grace_for_a_call_that_is_running() {
     let mut server = Server::start_with(short()).await;
     let gate = server.connector.hang_next();
