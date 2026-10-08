@@ -57,8 +57,10 @@ claude mcp add --transport http switchboard-a http://127.0.0.1:8471/mcp/fixture-
   --header "Authorization: Bearer $(jq -r .team_a target/switchboard-dev/tokens.json)"
 ```
 
-The header is read once, when the server is added, so it stops working when that token
-expires an hour later. Add it again with a fresh token.
+The shell puts the token into the command once, and Claude Code keeps that value, so the
+server stops working when the token expires an hour later. Add it again with a fresh token.
+What Claude Code sent and got back in each of its negotiation modes is recorded in
+[docs/claude-code-trial.md](docs/claude-code-trial.md).
 
 The endpoints are `/mcp/fixture-read` and `/mcp/fixture-all`. `fixture-read` serves the two
 read tools to both teams and the user. `fixture-all` serves the teams only, and adds
