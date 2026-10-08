@@ -1,9 +1,14 @@
-//! Why a token was refused: in detail for logs, and in one opaque form for the caller.
+//! Why a token was refused: in detail for logs, and in one opaque form for the caller. Beside
+//! both, what the token claimed, for the identity-failure event.
 
 use std::fmt;
 
-use gateway_core::IDENTITY_FAILURE;
+use gateway_core::{Claimed, IDENTITY_FAILURE, escape};
 use thiserror::Error;
+
+/// The longest a claimed issuer or subject is kept, in characters after escaping, before it is
+/// cut short and marked with `…`.
+pub const MAX_CLAIMED: usize = 256;
 
 /// A claim a check names. Displays as a noun phrase that ends in "claim", so a message reads
 /// the same whether the claim has a fixed name or, like the groups claim, a configured one.
@@ -43,8 +48,9 @@ impl fmt::Display for Claim {
 /// reads [`IDENTITY_FAILURE`] whatever happened.
 ///
 /// No variant carries a value taken from the token, so a refusal cannot put attacker-chosen
-/// text into a log line. What it gives up is the offending issuer or `kid` by name; the token
-/// is still in the request's own log.
+/// text into a log line. What it gives up is the offending issuer or `kid` by name. The issuer
+/// and subject the token claimed are kept beside it instead, escaped and capped, in
+/// [`ClaimedCaller`], and the token is still in the request's own log.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum VerifyError {
     /// The caller presented no token, with checking on.
@@ -113,19 +119,28 @@ pub enum VerifyError {
 }
 
 /// A refusal of a caller's identity. Displays as the one opaque sentence, whatever the cause;
-/// the cause is [`detail`](IdentityFailure::detail).
+/// the cause is [`detail`](IdentityFailure::detail), and what the token claimed is
+/// [`claimed`](IdentityFailure::claimed).
 ///
 /// Its `Debug` output includes the detail, because logs are what that is for: never put a
-/// `{:?}` of this into a response. The caller's text is [`outward`](IdentityFailure::outward),
-/// or this value's `Display`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `{:?}` of this into a response. It leaves out what the token claimed, which is for the
+/// identity-failure event only. The caller's text is [`outward`](IdentityFailure::outward), or
+/// this value's `Display`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityFailure {
     detail: VerifyError,
+    claimed: ClaimedCaller,
 }
 
 impl IdentityFailure {
+    /// A refusal with nothing claimed: there was no token.
     pub(crate) fn new(detail: VerifyError) -> Self {
-        Self { detail }
+        Self::claiming(detail, ClaimedCaller::default())
+    }
+
+    /// A refusal of a token that claimed `claimed`.
+    pub(crate) fn claiming(detail: VerifyError, claimed: ClaimedCaller) -> Self {
+        Self { detail, claimed }
     }
 
     /// Which check refused, for the log.
@@ -133,9 +148,23 @@ impl IdentityFailure {
         &self.detail
     }
 
+    /// The issuer and subject the token claimed, for the identity-failure event (decision
+    /// 0009). Nothing in them was verified.
+    pub fn claimed(&self) -> &ClaimedCaller {
+        &self.claimed
+    }
+
     /// The one sentence a caller reads for every identity failure.
     pub fn outward(&self) -> &'static str {
         IDENTITY_FAILURE
+    }
+}
+
+impl fmt::Debug for IdentityFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdentityFailure")
+            .field("detail", &self.detail)
+            .finish_non_exhaustive()
     }
 }
 
@@ -146,3 +175,42 @@ impl fmt::Display for IdentityFailure {
 }
 
 impl std::error::Error for IdentityFailure {}
+
+/// The issuer and subject a refused token claimed, read from its payload whatever check refused
+/// it. Nothing in them was verified.
+///
+/// Decision 0009: the identity-failure event records them, escaped and capped, and never the
+/// token. [`VerifyError`] still carries nothing from the token, so these are the only values
+/// from it a refusal gives out. Each is escaped as sentences and audit rows are, by
+/// [`gateway_core::escape`], and cut at [`MAX_CLAIMED`] characters before it is kept, so the
+/// text the token held is never stored here as it was.
+///
+/// Each is `None` when the token had no such claim or one that is not a string, and both are
+/// `None` when there was no token, it was too large to read, or its payload is not a JSON
+/// object.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaimedCaller {
+    issuer: Option<Claimed<String>>,
+    subject: Option<Claimed<String>>,
+}
+
+impl ClaimedCaller {
+    /// Escapes and caps what a token claimed.
+    pub(crate) fn new(issuer: Option<&str>, subject: Option<&str>) -> Self {
+        let kept = |text: &str| Claimed::new(escape(text, MAX_CLAIMED));
+        Self {
+            issuer: issuer.map(kept),
+            subject: subject.map(kept),
+        }
+    }
+
+    /// The `iss` claim, escaped and capped.
+    pub fn issuer(&self) -> Option<&Claimed<String>> {
+        self.issuer.as_ref()
+    }
+
+    /// The `sub` claim, escaped and capped.
+    pub fn subject(&self) -> Option<&Claimed<String>> {
+        self.subject.as_ref()
+    }
+}

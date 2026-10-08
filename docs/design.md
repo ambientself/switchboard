@@ -1064,9 +1064,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 
 - The principal carries a Kubernetes workload's pod UID, read from its projected token
   (decision 0012). Today neither the verifier nor the principal has it.
-- The claimed issuer and subject are available beside a verification error, escaped and
-  capped, for the identity-failure telemetry event (decision 0009). The error itself still
-  carries nothing from the token, as today.
+- Already built: the claimed issuer and subject are available beside a verification error,
+  escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
+  itself still carries nothing from the token. The event does not record them yet (#26).
 - With #10 and #26: a principal state for identity checking turned off, which a row can record
   as `disabled`.
 
