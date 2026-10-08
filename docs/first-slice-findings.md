@@ -28,6 +28,9 @@ cannot show that, and these numbers do not change it.
   run was not measured.
 - **After the review's fixes** (section 8). Both runs pass again from `a509ec9`: Compose
   89/89 and kind 139/139. Nothing needed fixing.
+- **With PR #39's stricter boot check** (section 9). Both runs pass from `ef621ef`: Compose
+  90/90 and kind 140/140. The boot check accepted the demo's database in both. Nothing needed
+  fixing.
 
 ## Where and how
 
@@ -352,3 +355,35 @@ cluster's API port. `docker` and `kubectl` on the host were refused. The runs re
 through a separate SSH tunnel into the VM for each: the Docker socket at `.demo/d.sock`, with
 `DOCKER_HOST` pointing at it, and the cluster's API port at its usual address. Restarting Colima
 would restore its own forwards.
+
+## 9. The runs with PR #39's audit store
+
+Both demos ran again on 2026-10-08 from `ef621ef`, on the same laptop. That commit carries the
+Postgres audit store as PR #39 has it at `9ac12c8`. Its boot check refuses more than before:
+views and rules that reach the table, `SECURITY DEFINER` functions, functions that read or
+write server files, partitions, replica sessions and databases not in UTF8. Compose ran first,
+on a new database, and was taken down. kind then ran on the existing cluster
+`switchboard-demo`, against the database the earlier runs left, and was left deployed. Both
+passed on the first attempt. Nothing in the repository had to change.
+
+| | result | wall clock | notes |
+| --- | --- | --- | --- |
+| `demo.sh compose` | PASS (90/90), exit 0 | 34 s | 14 s of it compiled the workspace's own crates in the image; dependencies were cached |
+| `demo.sh kind` | PASS (140/140), exit 0 | 48 s | the image was fully cached from the Compose run; existing cluster |
+
+What changed from section 8:
+
+- **The boot check accepted the demo's setup.** The gateway logged `"role_check":"passed"` in
+  both runs, so `deploy/demo/roles.sql`, the migrations and `migrate.sh`'s reader grants give
+  the gateway's role nothing the stricter check refuses.
+- **One check became two,** so each count rose by one. "No allowed row is left without an
+  outcome" is now "no allowed row outside the database outage is left without an outcome" and
+  "the database outage left at most its refused call's row without an outcome". In Compose the
+  outage left that one row open, as an `allow` row with no outcome; this store does not
+  complete it (design section 17). kind has no outage step and left none.
+
+The rest matched section 8: 10 rows in each run, each matched to the call that made it and
+none wrong; 42 `kubectl auth can-i` checks answered `no`; mock-docs accepted 4 requests in
+Compose and 6 in kind, all with the gateway credential's hash, and refused only the two
+pre-policy probes in kind; 7 `identity_failed` lines and no row for the stranger. Docker and the
+cluster's API were reached through Colima's own forwards; no tunnel was needed.
