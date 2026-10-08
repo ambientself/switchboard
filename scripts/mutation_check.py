@@ -1075,8 +1075,8 @@ mutate_all(
 # SWITCHBOARD_TEST_DATABASE_URL names a superuser on a throwaway server (see the crate's
 # documentation). Without it they survive. The `pg-columns-*` ones need no server, nor do
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
-# pg-retry-slow-attempt-final, pg-retry-closed-connection-final and
-# pg-retry-socket-failure-final.
+# pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
+# pg-retry-socket-failure-final and pg-finish-dropped-task-not-reported.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 PG_STORE = PG + "src/store.rs"
@@ -1251,10 +1251,12 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) => {")
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
-       "                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+       "        self.in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
 mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported", PG_STORE,
-       "                report(GivenUp {\n                    row: &named,\n                    outcome,\n                    error,\n                });\n",
-       "                let _ = (&report, &named, outcome);\n")
+       "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n            error,\n        });\n",
+       "        let _ = error;\n")
+mutate("pg-finish-dropped-task-not-reported", "a finish dropped with its runtime is not counted or reported", PG_STORE,
+       "        if !self.settled {", "        if false {")
 mutate("pg-retry-broken-connection-final", "a connection the server broke off is not retried", PG_STORE,
        'Some("08" | "40" | "53" | "57" | "58")', 'Some("ZZ")')
 mutate("pg-retry-read-only-final", "a server that has become read-only is not retried", PG_STORE,

@@ -178,8 +178,8 @@ impl Default for Budgets {
 pub struct FinishCounts {
     /// Still trying to complete their row.
     pub in_flight: usize,
-    /// Stopped without completing their row: the deadline passed, or the database refused.
-    /// Each such row keeps an empty outcome.
+    /// Stopped without completing their row: the deadline passed, the database refused, or the
+    /// task was dropped before it ended. Each such row keeps an empty outcome.
     pub given_up: u64,
 }
 
@@ -199,8 +199,9 @@ pub struct GivenUp<'a> {
     pub outcome: &'static str,
     /// Why it stopped: [`PgAuditError::Deadline`] when the deadline passed,
     /// [`PgAuditError::CompletedDifferently`] when the row already had another completion,
-    /// [`PgAuditError::NoSuchRow`] when the row is not there, or another refusal by the
-    /// database.
+    /// [`PgAuditError::NoSuchRow`] when the row is not there,
+    /// [`PgAuditError::FinishTaskLost`] when its task was dropped before it ended, as when the
+    /// runtime shuts down, or another refusal by the database.
     pub error: &'a PgAuditError,
 }
 
@@ -220,6 +221,45 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Settles one finish: counts it in flight until dropped, and counts and reports it if it gives
+/// up. A finish dropped before it was settled, because its task was dropped with the runtime,
+/// gives up too, so no finish ends without a trace.
+struct Settle {
+    in_flight: InFlight,
+    report: Report,
+    row: AuditRowId,
+    outcome: &'static str,
+    settled: bool,
+}
+
+impl Settle {
+    fn settle(mut self, result: &Result<(), PgAuditError>) {
+        self.settled = true;
+        if let Err(error) = result {
+            self.give_up(error);
+        }
+    }
+
+    fn give_up(&self, error: &PgAuditError) {
+        self.in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
+        (self.report)(GivenUp {
+            row: &self.row,
+            outcome: self.outcome,
+            error,
+        });
+    }
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.give_up(&PgAuditError::FinishTaskLost {
+                row: self.row.as_str().to_owned(),
+            });
+        }
     }
 }
 
@@ -263,7 +303,8 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   different one is an error, so the first completion stands and retrying is safe. The
 ///   table's trigger holds the same rule for every role.
 ///
-/// If the caller stops waiting for finish, its task still completes the row.
+/// If the caller stops waiting for finish, its task still completes the row. If the runtime
+/// drops the task first, the finish is counted and reported as given up.
 ///
 /// Must be used inside a Tokio runtime: finish spawns its task there.
 pub struct PgAuditStore {
@@ -400,30 +441,26 @@ impl PgAuditStore {
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
         let started = Instant::now();
+        let finish = FinishRow::from_completion(completion);
+        let settle = Settle {
+            in_flight: InFlight::start(&self.counters),
+            report: Arc::clone(&self.given_up),
+            row: row.clone(),
+            outcome: finish.outcome,
+            settled: false,
+        };
         let task = Retry {
             pool: self.finish.clone(),
             cancel: Arc::clone(&self.cancel),
             row: row.as_str().to_owned(),
-            finish: FinishRow::from_completion(completion),
+            finish,
             attempt: self.budgets.answer,
             deadline: started + self.budgets.finish_deadline,
         };
         let (sender, receiver) = oneshot::channel();
-        let in_flight = InFlight::start(&self.counters);
-        let report = Arc::clone(&self.given_up);
-        let named = row.clone();
-        let outcome = task.finish.outcome;
         tokio::spawn(async move {
             let result = task.run().await;
-            if let Err(error) = &result {
-                in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
-                report(GivenUp {
-                    row: &named,
-                    outcome,
-                    error,
-                });
-            }
-            drop(in_flight);
+            settle.settle(&result);
             // The caller may have stopped waiting, after the answer budget.
             let _ = sender.send(result);
         });
@@ -653,5 +690,69 @@ mod unit {
             "{refused}"
         );
         assert!(PgAuditError::Database(refused).is_transient());
+    }
+
+    /// A finish whose task is dropped with its runtime, before it ends, is counted and
+    /// reported as given up, as the gateway's telemetry needs. Needs no server: the store
+    /// keeps trying a port nothing listens on.
+    #[test]
+    fn a_finish_dropped_with_its_runtime_is_reported() {
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(closed_port()).user("nobody");
+        let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&reports);
+        let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())
+            .unwrap()
+            .with_budgets(Budgets {
+                answer: Duration::from_millis(100),
+                finish_deadline: Duration::from_secs(600),
+                ..Budgets::default()
+            })
+            .on_given_up(move |given_up| {
+                kept.lock().unwrap().push((
+                    given_up.row.as_str().to_owned(),
+                    given_up.outcome,
+                    given_up.error.to_string(),
+                ));
+            });
+        let row = AuditRowId::new("00000000-0000-4000-8000-000000000000");
+        let completion = Completion {
+            outcome: gateway_core::audit::Outcome::Error,
+            latency_ms: 1,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(store.finish_within_budget(&row, &completion))
+            .unwrap_err();
+        assert!(
+            matches!(error, PgAuditError::AnswerBudget { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            store.finishes(),
+            FinishCounts {
+                in_flight: 1,
+                given_up: 0
+            }
+        );
+
+        drop(runtime);
+        assert_eq!(
+            store.finishes(),
+            FinishCounts {
+                in_flight: 0,
+                given_up: 1
+            }
+        );
+        let lost = PgAuditError::FinishTaskLost {
+            row: row.as_str().to_owned(),
+        };
+        assert_eq!(
+            reports.lock().unwrap().clone(),
+            vec![(row.as_str().to_owned(), "error", lost.to_string())]
+        );
     }
 }
