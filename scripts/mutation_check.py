@@ -1268,8 +1268,12 @@ mutate("pg-finish-dropped-task-not-reported", "a finish dropped with its runtime
 mutate("pg-finish-unstorable-not-settled", "a completion the row cannot hold is not counted or reported", PG_STORE,
        "                let result = Err(error);\n                settle.settle(&result);\n",
        "                let result = Err(error);\n                std::mem::forget(settle);\n")
-mutate("pg-retry-broken-connection-final", "a connection the server broke off is not retried", PG_STORE,
-       'Some("08" | "40" | "53" | "57" | "58")', 'Some("ZZ")')
+# One retried SQLSTATE class at a time.
+RETRIED_CLASSES = ["08", "40", "53", "57", "58"]
+for retried in RETRIED_CLASSES:
+    kept = " | ".join(f'"{other}"' for other in RETRIED_CLASSES if other != retried)
+    mutate(f"pg-retry-class-{retried}-final", f"a failure of SQLSTATE class {retried} is not retried", PG_STORE,
+           'Some("08" | "40" | "53" | "57" | "58")', f"Some({kept})")
 mutate("pg-retry-read-only-final", "a server that has become read-only is not retried", PG_STORE,
        '|| matches!(code.code(), "25006" | "55P03")', '|| matches!(code.code(), "55P03")')
 mutate("pg-retry-lock-timeout-final", "a lock not had within lock_timeout is not retried", PG_STORE,

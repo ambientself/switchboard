@@ -777,6 +777,103 @@ async fn finish_counts_waiting_for_a_connection_in_each_attempt() {
     assert_eq!(outcome_of(&db.admin().await, &row).await, None);
 }
 
+/// Makes the first update of `call_rows` fail with SQLSTATE `code`, through a trigger that
+/// fires before the table's own, and lets every later one through. Each update is counted in
+/// the sequence `public.update_attempts`.
+async fn fail_the_first_update_with(db: &TestDatabase, code: &str) {
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SEQUENCE public.update_attempts;
+             CREATE FUNCTION public.fail_the_first_update() RETURNS trigger
+                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+             AS $$
+             BEGIN
+                 IF nextval('public.update_attempts') = 1 THEN
+                     RAISE EXCEPTION 'the first update fails' USING ERRCODE = '{code}';
+                 END IF;
+                 RETURN NEW;
+             END
+             $$;
+             CREATE TRIGGER a_fail_the_first_update
+                 BEFORE UPDATE ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION public.fail_the_first_update();"
+        ))
+        .await
+        .unwrap();
+}
+
+/// A finish whose first update fails with SQLSTATE `code` tries again and completes its row.
+async fn finish_tries_again_after(code: &str) {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    fail_the_first_update_with(&db, code).await;
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        answer: Duration::from_secs(5),
+        ..Budgets::default()
+    };
+    let store = db.store(PoolSizes::default()).with_budgets(budgets);
+    let admin = db.admin().await;
+    let (row, ok) = ran(
+        &store,
+        &fixture,
+        Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT),
+    )
+    .await;
+
+    let finished = within(budgets.answer + SLACK, audit::finish(&store, ok, 7)).await;
+    assert!(
+        finished.failure().is_none(),
+        "{code}: {:?}",
+        finished.failure()
+    );
+    assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
+    assert_eq!(
+        count(&admin, "SELECT last_value FROM public.update_attempts").await,
+        2,
+        "{code}"
+    );
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 0
+        }
+    );
+}
+
+/// Class 08, a connection exception.
+#[tokio::test]
+async fn finish_tries_again_after_a_connection_exception() {
+    finish_tries_again_after("08006").await;
+}
+
+/// Class 40, a transaction rolled back, as by a serialization failure or a deadlock.
+#[tokio::test]
+async fn finish_tries_again_after_a_serialization_failure() {
+    finish_tries_again_after("40001").await;
+}
+
+/// Class 53, insufficient resources, such as a full disk.
+#[tokio::test]
+async fn finish_tries_again_after_the_server_runs_short() {
+    finish_tries_again_after("53100").await;
+}
+
+/// Class 57, operator intervention, such as a server shutting down.
+#[tokio::test]
+async fn finish_tries_again_after_an_operator_intervenes() {
+    finish_tries_again_after("57P01").await;
+}
+
+/// Class 58, a system error outside Postgres, such as a failed read or write.
+#[tokio::test]
+async fn finish_tries_again_after_a_system_error() {
+    finish_tries_again_after("58030").await;
+}
+
 /// The code a request for TLS starts with, where a startup has its protocol version.
 const TLS_REQUEST_CODE: u32 = 80_877_103;
 
