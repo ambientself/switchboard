@@ -2,9 +2,7 @@
 
 use std::time::Duration;
 
-use gateway_core::audit::{
-    self, AuditRowId, Begun, Completion, DecisionKind, Outcome, RequestMetadata,
-};
+use gateway_core::audit::{self, AuditRowId, Begun, Completion, Outcome, RequestMetadata};
 use gateway_core::audit::{MAX_RECORDED_RESOURCES, RecordedResources};
 use gateway_core::{
     AuditRecord, AuditStore, CallContext, Claimed, RequestedTool, Resources, TeamId, ToolUseId,
@@ -250,33 +248,54 @@ async fn a_call_naming_more_resources_than_a_row_holds_records_how_many_were_lef
 }
 
 /// Postgres text cannot hold U+0000, and a caller chooses its tool-use identifier and the team
-/// it states. A denial carrying one is still recorded, with U+FFFD in its place, and so is a
-/// connector's refusal whose sentence carries one.
+/// it states. A record carrying one is refused, so the call is refused and no row is written,
+/// rather than a row that is not the record. The same holds for a refusal's sentence at finish,
+/// which gives up and is reported.
 #[tokio::test]
-async fn a_nul_in_a_value_does_not_stop_its_row_being_written() {
+async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
     let fixture = Fixture::new().unwrap();
-    let store = db.store(PoolSizes::default());
+    let given_up = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&given_up);
+    let store = db
+        .store(PoolSizes::default())
+        .on_given_up(move |report| kept.lock().unwrap().push(report.error.to_string()));
     let admin = db.admin().await;
 
-    let mut call = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
-    call.metadata = RequestMetadata {
-        tool_use_id: Some(ToolUseId::new("toolu_\u{0}x")),
-        claimed_team: Some(Claimed::new(TeamId::new("team\u{0}x"))),
-    };
-    let row = through_core(&store, &fixture, &call).await;
-    let recorded = read_back(&admin, &row).await;
-    assert_eq!(recorded.decision, DecisionKind::Deny);
-    assert_eq!(
-        recorded.tool_use_id,
-        Some(ToolUseId::new("toolu_\u{FFFD}x"))
-    );
-    assert_eq!(
-        recorded.claimed_team,
-        Some(Claimed::new(TeamId::new("team\u{FFFD}x")))
-    );
+    for metadata in [
+        RequestMetadata {
+            tool_use_id: Some(ToolUseId::new("toolu_\u{0}x")),
+            claimed_team: None,
+        },
+        RequestMetadata {
+            tool_use_id: None,
+            claimed_team: Some(Claimed::new(TeamId::new("team\u{0}x"))),
+        },
+    ] {
+        // A denial, whose row would otherwise be written at begin.
+        let call = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
+        let context = CallContext {
+            resources: FixtureConnector::resources_of(call.tool, &call.arguments),
+            caller: fixture.caller_context(call.caller, call.surface).unwrap(),
+            tool: RequestedTool::new(call.tool),
+        };
+        let decision = decide(&fixture.policy, &context);
+        let failure = audit::begin(&store, decision, call.arguments, metadata)
+            .await
+            .unwrap_err();
+        let cause = std::error::Error::source(&failure)
+            .and_then(|source| source.downcast_ref::<PgAuditError>())
+            .unwrap();
+        assert!(matches!(cause, PgAuditError::Nul { .. }), "{cause}");
+    }
+    let rows: i64 = admin
+        .query_one("SELECT count(*) FROM switchboard_audit.call_rows", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0);
 
     let row = begun_row(&store, &fixture).await;
     let refused = completion(
@@ -285,19 +304,23 @@ async fn a_nul_in_a_value_does_not_stop_its_row_being_written() {
         },
         3,
     );
-    store.finish_within_budget(&row, &refused).await.unwrap();
-    let sentence: Option<String> = admin
-        .query_one(
-            "SELECT outcome_sentence FROM switchboard_audit.call_rows
-             WHERE id = ($1::text)::uuid",
-            &[&row.as_str()],
-        )
+    let error = store
+        .finish_within_budget(&row, &refused)
         .await
-        .unwrap()
-        .get(0);
-    assert_eq!(sentence.as_deref(), Some("Not that one.\u{FFFD}"));
-    // The same completion again is found to be the one written.
-    store.finish_within_budget(&row, &refused).await.unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            PgAuditError::Nul {
+                column: "outcome_sentence"
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(read_back(&admin, &row).await.completion, None);
+    assert_eq!(store.finishes().given_up, 1);
+    assert_eq!(store.finishes().in_flight, 0);
+    assert_eq!(given_up.lock().unwrap().clone(), vec![error.to_string()]);
 }
 
 #[tokio::test]

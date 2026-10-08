@@ -27,6 +27,16 @@ pub enum PgAuditError {
     /// A value could not be put in its column.
     #[error("an audit column could not be written: {0}")]
     Column(&'static str),
+    /// A text value holds U+0000, which Postgres text and jsonb cannot store. The record is
+    /// refused rather than written with another character in its place, so a row written is
+    /// always exactly its record.
+    #[error(
+        "the audit column {column} would hold U+0000, which Postgres cannot store, so the row is not written"
+    )]
+    Nul {
+        /// The column.
+        column: &'static str,
+    },
     /// No connection could be had.
     #[error("no connection to the audit database: {0}")]
     Pool(#[from] PoolError),
@@ -178,8 +188,8 @@ impl Default for Budgets {
 pub struct FinishCounts {
     /// Still trying to complete their row.
     pub in_flight: usize,
-    /// Stopped without completing their row: the deadline passed, the database refused, or the
-    /// task was dropped before it ended. Each such row keeps an empty outcome.
+    /// Stopped without completing their row: the deadline passed, the database or the store
+    /// refused, or the task was dropped before it ended. Each such row keeps an empty outcome.
     pub given_up: u64,
 }
 
@@ -201,7 +211,8 @@ pub struct GivenUp<'a> {
     /// [`PgAuditError::CompletedDifferently`] when the row already had another completion,
     /// [`PgAuditError::NoSuchRow`] when the row is not there,
     /// [`PgAuditError::FinishTaskLost`] when its task was dropped before it ended, as when the
-    /// runtime shuts down, or another refusal by the database.
+    /// runtime shuts down, a completion the row cannot hold, or another refusal by the
+    /// database.
     pub error: &'a PgAuditError,
 }
 
@@ -302,6 +313,10 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   that has become read-only. An identical completion written again is accepted, and a
 ///   different one is an error, so the first completion stands and retrying is safe. The
 ///   table's trigger holds the same rule for every role.
+/// - A row is exactly its record, or it is not written. Begin refuses a record with U+0000 in
+///   any text value, which Postgres cannot store, with [`PgAuditError::Nul`], so the core
+///   refuses the call; finish refuses a refusal sentence with one, or a latency past its
+///   column's range, and gives up.
 ///
 /// If the caller stops waiting for finish, its task still completes the row. If the runtime
 /// drops the task first, the finish is counted and reported as given up.
@@ -430,7 +445,7 @@ impl PgAuditStore {
         complete_on(
             &client,
             row.as_str(),
-            &FinishRow::from_completion(completion),
+            &FinishRow::from_completion(completion)?,
         )
         .await
     }
@@ -441,13 +456,20 @@ impl PgAuditStore {
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
         let started = Instant::now();
-        let finish = FinishRow::from_completion(completion);
         let settle = Settle {
             in_flight: InFlight::start(&self.counters),
             report: Arc::clone(&self.given_up),
             row: row.clone(),
-            outcome: finish.outcome,
+            outcome: FinishRow::outcome_of(completion),
             settled: false,
+        };
+        let finish = match FinishRow::from_completion(completion) {
+            Ok(finish) => finish,
+            Err(error) => {
+                let result = Err(error);
+                settle.settle(&result);
+                return result;
+            }
         };
         let task = Retry {
             pool: self.finish.clone(),

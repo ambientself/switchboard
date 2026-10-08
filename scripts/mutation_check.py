@@ -1176,30 +1176,36 @@ mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succ
 mutate("pg-columns-complete-record-begun", "begin drops a completion it was handed", PG_COLUMNS,
        "        if record.completion.is_some() {", "        if false {")
 mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
-       "            claimed_team: record\n                .claimed_team", "            claimed_team: record\n                .proved_delegation_team")
+       "record.claimed_team.as_ref().map(|team| team.get().as_str()),", "record.proved_delegation_team.as_ref().map(|team| team.get().as_str()),")
 mutate("pg-columns-workload-team-as-group", "a workload's team is written as a group", PG_COLUMNS,
-       '            PrincipalKind::Workload { team } => ("workload", Some(storable(team.as_str())), None),',
-       '            PrincipalKind::Workload { team } => ("workload", None, Some(vec![storable(team.as_str())])),')
+       '                "workload",\n                Some(stored("proved_team", team.as_str())?),\n                None,',
+       '                "workload",\n                None,\n                Some(vec![stored("proved_team", team.as_str())?]),')
 mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
        "            && Some(self.latency_ms) == latency_ms\n", "")
 mutate("pg-columns-unknown-as-none", "resources nobody could name are written as none named", PG_COLUMNS,
        '        RecordedResources::Unknown => Value::String("unknown".to_owned()),',
        "        RecordedResources::Unknown => Value::Array(vec![]),")
 mutate("pg-columns-resource-kind-as-system", "a resource's kind is written as its system", PG_COLUMNS,
-       '                        "system": storable(&resource.system),', '                        "system": storable(&resource.kind),')
+       '"system": stored("resources", &resource.system)?,', '"system": stored("resources", &resource.kind)?,')
 mutate("pg-columns-omitted-saturates", "a count of resources left out past the column is cut short", PG_COLUMNS,
        "    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {\n"
        "        PgAuditError::Column(\"a count of resources left out past the column's range\")\n"
        "    })?;",
        "    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);")
-mutate("pg-columns-nul-kept", "a NUL in a text value is written as it is", PG_COLUMNS,
-       """    text.replace('\\0', "\\u{FFFD}")""", "    text.to_owned()")
-mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is written as it is", PG_COLUMNS,
-       "tool_use_id: record.tool_use_id.as_ref().map(|id| storable(id.as_str())),",
-       "tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
-mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is written as it is", PG_COLUMNS,
-       'Outcome::Refused { sentence } => ("refused", Some(storable(sentence))),',
-       'Outcome::Refused { sentence } => ("refused", Some(sentence.clone())),')
+mutate("pg-columns-nul-kept", "a NUL in a text value is passed on to the database", PG_COLUMNS,
+       "    if text.contains('\\0') {\n        return Err(PgAuditError::Nul { column });\n    }\n", "")
+mutate("pg-columns-nul-replaced", "a NUL in a text value is written as another character", PG_COLUMNS,
+       "    if text.contains('\\0') {\n        return Err(PgAuditError::Nul { column });\n    }\n    Ok(text.to_owned())",
+       "    let _ = column;\n    Ok(text.replace('\\0', \"\\u{FFFD}\"))")
+mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is passed on to the database", PG_COLUMNS,
+       '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
+       "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
+mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
+       'Outcome::Refused { sentence } => Some(stored("outcome_sentence", sentence)?),',
+       "Outcome::Refused { sentence } => Some(sentence.clone()),")
+mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
+       """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
+       """            .unwrap_or(i64::MAX);""")
 mutate("pg-sql-resources-nullable", "a row may record no resources at all", PG_SQL,
        "    resources              jsonb       NOT NULL\n", "    resources              jsonb\n")
 mutate("pg-sql-omitted-nullable", "a row may leave out the count of resources left out", PG_SQL,
@@ -1257,6 +1263,9 @@ mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported
        "        let _ = error;\n")
 mutate("pg-finish-dropped-task-not-reported", "a finish dropped with its runtime is not counted or reported", PG_STORE,
        "        if !self.settled {", "        if false {")
+mutate("pg-finish-unstorable-not-settled", "a completion the row cannot hold is not counted or reported", PG_STORE,
+       "                let result = Err(error);\n                settle.settle(&result);\n",
+       "                let result = Err(error);\n                std::mem::forget(settle);\n")
 mutate("pg-retry-broken-connection-final", "a connection the server broke off is not retried", PG_STORE,
        'Some("08" | "40" | "53" | "57" | "58")', 'Some("ZZ")')
 mutate("pg-retry-read-only-final", "a server that has become read-only is not retried", PG_STORE,

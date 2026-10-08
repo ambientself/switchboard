@@ -635,6 +635,12 @@ written complete, has no finish, and is never open.
   before the tool runs. The size limits and audit latency targets in Q12 must cover a row this
   large, counted as the store counts it.
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
+- **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
+  the record rather than store another value in its place, and the call is refused. Postgres
+  text and jsonb cannot hold U+0000, and a caller chooses its tool-use identifier and the
+  values it claims, so the Postgres store refuses a record with U+0000 in any text value,
+  naming the column, and a refusal sentence with one at finish. It refuses a latency or a
+  count past its `bigint` column the same way.
 - **Proved and claimed are separate columns.**
 - **No foreign key to anything a caller owns,** so a caller's data retention cannot delete its
   audit trail.
@@ -1237,7 +1243,9 @@ run against each. The fake runs it in the per-change loop and Postgres in the sl
 that can do what Postgres cannot tests nothing.
 
 1. `begin` returns `Ok` only once the row is stored, and is idempotent by identifier.
-2. The stored row is exactly the record given, including the resources.
+2. The stored row is exactly the record given, including the resources. A record the store
+   cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
+   leaves no row. The fake must refuse the same records, which it does not yet.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the
