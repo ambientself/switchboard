@@ -32,6 +32,9 @@ cannot show that, and these numbers do not change it.
 - **With PR #39's stricter boot check** (section 9). Both runs pass from `ef621ef`: Compose
   90/90 and kind 140/140. The boot check accepted the demo's database in both. Nothing needed
   fixing.
+- **After the review's triage** (section 10). Both runs pass from `eaccbab`: Compose 90/90
+  and kind 156/156. mock-docs accepted exactly the calls the gateway allowed, and the operator
+  checks are now 58, 29 per team.
 
 ## Where and how
 
@@ -388,3 +391,41 @@ none wrong; 42 `kubectl auth can-i` checks answered `no`; mock-docs accepted 4 r
 Compose and 6 in kind, all with the gateway credential's hash, and refused only the two
 pre-policy probes in kind; 7 `identity_failed` lines and no row for the stranger. Docker and the
 cluster's API were reached through Colima's own forwards; no tunnel was needed.
+
+## 10. The runs after the review's triage
+
+Both demos ran again on 2026-10-08 from `eaccbab`, on the same laptop. That commit carries PR
+#42 with main merged in (PR #39's audit store and the pinned CI actions) and the fixes from the
+review's triage. Compose ran first, on a new database, and was taken down. kind then ran on the
+existing cluster `switchboard-demo` and was left deployed. Both passed on the first attempt.
+
+| | result | wall clock | notes |
+| --- | --- | --- | --- |
+| `demo.sh compose` | PASS (90/90), exit 0 | 36 s | the image's build context was 24 kB; dependencies were cached |
+| `demo.sh kind` | PASS (156/156), exit 0 | 53 s | the image was cached from the Compose run; existing cluster |
+
+What changed from section 9:
+
+- **The server check counts exactly.** It used to ask for at least 4 requests accepted with
+  the gateway's credential, so a denied call that reached mock-docs would still have passed.
+  It now asks for exactly the calls the gateway allowed: 4 in Compose, each team's list and
+  read, and 6 in kind, which adds each pod's read after its direct call timed out. Both runs
+  got exactly that. These are the same numbers section 9 saw; only the check is stricter.
+- **The operator checks ask more.** 58 `kubectl auth can-i` checks answered `no`, 29 per team,
+  up from 42. Secrets in `switchboard` and `mock-docs` and ConfigMaps in `switchboard` are now
+  asked about with `get`, `list` and `watch`, since `list` and `watch` return a Secret's data
+  too. The node proxy is asked about with `create` and `get`. That is why kind's count rose
+  by 16. Decision 0010's other controls (attach, ephemeral containers, impersonation, bind
+  and escalate, and controllers that create pods) are still not checked.
+- **The driver touches only `switchboard-demo`.** `SWITCHBOARD_DEMO_CLUSTER` set to any other
+  name now stops the script before any `kind` or `kubectl` call.
+
+Two gateway changes from the same triage are not exercised by these runs, and are covered by
+tests in `crates/gateway`. A proxied call's arguments are checked against the policy version
+its decision was made from, not one loaded while its audit row was being begun. A registry
+reload that changes the policy but keeps its `revision` is refused. The demo's withdrawal step
+changes the revision to `demo-2`, so it still loads.
+
+The rest matched section 9: 10 rows in each run, each matched to the call that made it and
+none wrong; the boot check passed for the demo's database in both runs; mock-docs refused only
+the two pre-policy probes in kind; 7 `identity_failed` lines and no row for the stranger.
