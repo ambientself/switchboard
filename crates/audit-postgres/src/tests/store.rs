@@ -484,18 +484,31 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
     assert_eq!(show(&store.begin.get().await.unwrap()).await, "on");
     assert_eq!(show(&store.finish.get().await.unwrap()).await, "on");
 
-    // Options the caller set are kept beside it.
+    // Options the caller set are kept beside the store's, and come before them, so where both
+    // set one setting the store's value is the one that holds: the last wins.
     let mut config = db.config_as(GATEWAY_ROLE);
-    config.options("-c statement_timeout=4321");
+    config.options(
+        "-c statement_timeout=4321 -c synchronous_commit=off -c search_path=public,pg_catalog",
+    );
     let store = PgAuditStore::connect(config, NoTls, PoolSizes::default()).unwrap();
-    let client = store.begin.get().await.unwrap();
-    assert_eq!(show(&client).await, "on");
-    let timeout: String = client
-        .query_one("SHOW statement_timeout", &[])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(timeout, "4321ms");
+    for client in [
+        store.begin.get().await.unwrap(),
+        store.finish.get().await.unwrap(),
+    ] {
+        assert_eq!(show(&client).await, "on");
+        for (setting, expected) in [
+            ("statement_timeout", "4321ms"),
+            ("search_path", "pg_catalog,pg_temp"),
+        ] {
+            let found: String = client
+                .query_one(&format!("SHOW {setting}"), &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(found, expected, "{setting}");
+        }
+    }
+    store.check_at_boot().await.unwrap();
 }
 
 #[tokio::test]

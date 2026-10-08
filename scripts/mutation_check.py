@@ -1160,6 +1160,8 @@ mutate("pg-session-options-replaced", "the caller's session options are dropped"
        'format!("{existing} {SESSION_OPTIONS}")', "SESSION_OPTIONS.to_owned()")
 mutate("pg-session-search-path-kept", "sessions look names up in the schemas a default puts first", PG_STORE,
        '"-c synchronous_commit=on -c search_path=pg_catalog,pg_temp"', '"-c synchronous_commit=on"')
+mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
+       'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
        "            pool: self.finish.clone(),", "            pool: self.begin.clone(),")
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
