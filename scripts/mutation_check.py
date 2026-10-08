@@ -1350,6 +1350,8 @@ mutate("pg-check-database-owner-ignored", "the database's owner passes the check
 mutate("pg-check-database-owner-membership-ignored", "a role that can become the database's owner passes the check", PG_CHECK,
        "                 AND pg_has_role(current_user, d.datdba, 'MEMBER')",
        "                 AND d.datdba = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
+mutate("pg-check-replica-session-ignored", "a session in replica mode, where the triggers do not fire, passes the check", PG_CHECK,
+       '    if replication_role == "replica" {', "    if false {")
 mutate("pg-check-logged-in-as-ignored", "a session that logged in as another role passes the check", PG_CHECK,
        "    if logged_in != role {", "    if false {")
 mutate("pg-check-privileges-own-role-only", "a role the session can become is not checked for privileges", PG_CHECK,

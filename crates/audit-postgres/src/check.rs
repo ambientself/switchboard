@@ -181,6 +181,10 @@ pub enum Problem {
         /// The trigger.
         trigger: &'static str,
     },
+    /// The session runs with `session_replication_role` set to `replica`, as a role or
+    /// database default can set it, so a trigger enabled for ordinary sessions, as both of the
+    /// table's are, does not fire.
+    ReplicaSession,
     /// The session's role, or a role it can become, has an attribute that lets it around the
     /// grants or the trigger.
     RoleAttribute {
@@ -262,6 +266,12 @@ impl fmt::Display for Problem {
             Self::TriggerDisabled { trigger } => {
                 write!(f, "the trigger {trigger} on call_rows is disabled")
             }
+            Self::ReplicaSession => write!(
+                f,
+                "this session has session_replication_role = replica, under which a trigger \
+                 enabled as the migration enables both does not fire; a role or database \
+                 default may set it"
+            ),
             Self::RoleAttribute { role, attribute } => write!(
                 f,
                 "the role {role}, which this session is or can become, has {attribute}"
@@ -328,6 +338,8 @@ impl PgAuditStore {
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
     ///   two triggers, enabled: the one that sets both times at insert, and the one that
     ///   completes a row at most once.
+    /// - The session's `session_replication_role` is not `replica`, which a role or database
+    ///   default can set, and under which neither trigger fires.
     /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
     ///   to another role.
     /// - The role is not a superuser, and cannot create roles or databases, replicate, or
@@ -358,13 +370,15 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     let session = client
         .query_one(
             "SELECT current_user::text, session_user::text,
-                    current_setting('server_version_num')::int",
+                    current_setting('server_version_num')::int,
+                    current_setting('session_replication_role')",
             &[],
         )
         .await?;
     let role: String = session.get(0);
     let logged_in: String = session.get(1);
     let version: i32 = session.get(2);
+    let replication_role: String = session.get(3);
 
     // Every check below asks about the current role. A session can return to the role it
     // logged in as, so the two must be the same.
@@ -378,6 +392,12 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
             .await?
             .get(0);
         problems.extend(setting_problem(name, found, expected));
+    }
+
+    // The value in effect, after any role or database default. The role cannot change it
+    // itself: being able to set it is refused below.
+    if replication_role == "replica" {
+        problems.push(Problem::ReplicaSession);
     }
 
     role_attributes(client, &mut problems).await?;
@@ -586,7 +606,8 @@ async fn triggers(
 }
 
 /// The problem with `trigger`, given how it is enabled, or that it was not found. 'O' fires in
-/// a normal session and 'A' always; 'D' never and 'R' only for replication.
+/// a session whose `session_replication_role` is not `replica`, which [`check`] requires, and
+/// 'A' always; 'D' never and 'R' only for replication.
 fn trigger_problem(trigger: &Trigger, enabled: Option<&str>) -> Option<Problem> {
     match enabled {
         None => Some(Problem::TriggerMissing {

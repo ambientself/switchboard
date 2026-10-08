@@ -905,3 +905,58 @@ async fn a_function_put_before_the_catalogs_own_does_not_change_what_the_check_f
         .get(0);
     assert_eq!(path, "pg_catalog,pg_temp");
 }
+
+/// What a session of `store` has `session_replication_role` set to.
+async fn replication_role(store: &PgAuditStore) -> String {
+    store
+        .begin
+        .get()
+        .await
+        .unwrap()
+        .query_one("SHOW session_replication_role", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A role or database default can set `session_replication_role` to `replica` for a role that
+/// cannot set it itself. Neither trigger fires then.
+#[tokio::test]
+async fn a_session_a_default_puts_in_replica_mode_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+
+    // A default for the role in this database.
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    admin
+        .batch_execute(&format!(
+            "ALTER ROLE {role} IN DATABASE {} SET session_replication_role = replica",
+            db.name()
+        ))
+        .await
+        .unwrap();
+    let store = db.store_as(&role);
+    assert_eq!(replication_role(&store).await, "replica");
+    assert_eq!(problems(&store).await, vec![Problem::ReplicaSession]);
+
+    // A default for every session in the database.
+    let other = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.store_as(&other).check_at_boot().await.unwrap();
+    admin
+        .batch_execute(&format!(
+            "ALTER DATABASE {} SET session_replication_role = replica",
+            db.name()
+        ))
+        .await
+        .unwrap();
+    let store = db.store_as(&other);
+    assert_eq!(replication_role(&store).await, "replica");
+    assert_eq!(problems(&store).await, vec![Problem::ReplicaSession]);
+    assert!(
+        Problem::ReplicaSession
+            .to_string()
+            .contains("session_replication_role = replica")
+    );
+}
