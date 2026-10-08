@@ -15,7 +15,9 @@
 //!   is `proved`, `disabled` or `failed`, and `disabled` is only reachable from
 //!   [`IdentityConfig::Disabled`].
 //! - [`VerifyError`] says which check refused, for logs. [`IdentityFailure`] is what the
-//!   verifier returns, and displays as the one sentence a caller may read.
+//!   verifier returns, and displays as the one sentence a caller may read. Beside the cause it
+//!   holds a [`ClaimedCaller`]: the issuer and subject the token claimed, escaped and capped,
+//!   for the identity-failure event.
 
 #![forbid(unsafe_code)]
 
@@ -30,6 +32,6 @@ pub use config::{
     ConfigError, DEFAULT_GROUPS_CLAIM, IdentityConfig, IssuerConfig, IssuerKind, MAX_LEEWAY,
     MIN_RSA_BITS, SigningAlgorithm,
 };
-pub use error::{Claim, IdentityFailure, VerifyError};
+pub use error::{Claim, ClaimedCaller, IdentityFailure, MAX_CLAIMED, VerifyError};
 pub use identity::{Identity, Verification, VerificationState};
 pub use verifier::{MAX_TOKEN_BYTES, TokenVerifier};

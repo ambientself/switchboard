@@ -17,7 +17,7 @@ use crate::clock::{Clock, unix_seconds};
 use crate::config::{
     ConfigError, IssuerConfig, IssuerKind, MAX_LEEWAY, MIN_RSA_BITS, SigningAlgorithm,
 };
-use crate::error::{Claim, IdentityFailure, VerifyError};
+use crate::error::{Claim, ClaimedCaller, IdentityFailure, VerifyError};
 
 /// The largest token accepted, in bytes. Larger than any token an identity provider issues for
 /// a user with many groups, and small enough that parsing one is not a way to spend the
@@ -171,8 +171,26 @@ impl Verifier for TokenVerifier {
     type Error = IdentityFailure;
 
     fn verify(&self, token: &str) -> Result<Principal, IdentityFailure> {
-        self.verify_token(token).map_err(IdentityFailure::new)
+        self.verify_token(token)
+            .map_err(|detail| IdentityFailure::claiming(detail, claimed_by(token)))
     }
+}
+
+/// The issuer and subject a refused token claims, for the identity-failure event.
+///
+/// Read the same way whichever check refused, by decoding the payload once without checking
+/// anything, as the issuer lookup does. A claim is kept only if it is a string. A token over
+/// [`MAX_TOKEN_BYTES`] is not read at all, and a payload that does not decode to a JSON object
+/// gives nothing.
+fn claimed_by(token: &str) -> ClaimedCaller {
+    if token.len() > MAX_TOKEN_BYTES {
+        return ClaimedCaller::default();
+    }
+    let Ok(unverified) = jsonwebtoken::dangerous::insecure_decode_claims::<Claims>(token) else {
+        return ClaimedCaller::default();
+    };
+    let text = |name: &str| unverified.get(name).and_then(Value::as_str);
+    ClaimedCaller::new(text("iss"), text("sub"))
 }
 
 impl Entry {

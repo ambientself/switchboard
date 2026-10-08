@@ -463,11 +463,20 @@ mutate("snapshot-duplicate-profile", "a profile defined twice is accepted", SRC 
        "return Err(SnapshotError::DuplicateProfile(previous.name));", "let _ = previous;")
 mutate("snapshot-unapproved-tool", "a surface may serve an unapproved tool", SRC + "policy.rs",
        "find(|tool| !tools.contains_key(*tool))", "find(|tool| false && !tools.contains_key(*tool))")
-for struct in ("Surface", "ApprovedTool"):
-    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "policy.rs",
-           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
-for struct in ("AuditRecord", "RecordedResource"):
-    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "audit.rs",
+# The policy structs are the gateway configuration's policy section too: the gateway's boot test
+# probes the ones the core's own tests do not.
+for path, struct in [
+    (SRC + "policy.rs", "Surface"),
+    (SRC + "policy.rs", "ApprovedTool"),
+    (SRC + "policy.rs", "SnapshotData"),
+    (SRC + "policy.rs", "Profile"),
+    (SRC + "policy.rs", "ResourceLimits"),
+    (SRC + "policy.rs", "Resource"),
+    (SRC + "principal.rs", "PrincipalId"),
+    (SRC + "audit.rs", "AuditRecord"),
+    (SRC + "audit.rs", "RecordedResource"),
+]:
+    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", path,
            f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
 mutate_all(
     "surface-restriction-default",
@@ -487,8 +496,8 @@ mutate_all(
 mutate_all(
     "principal-id-ignores-issuer",
     "principal identifiers compare, order and hash by subject alone",
-    (SRC + "principal.rs", "#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]\npub struct PrincipalId {",
-     "#[derive(Clone, Debug, Serialize, Deserialize)]\npub struct PrincipalId {"),
+    (SRC + "principal.rs", "#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct PrincipalId {",
+     "#[derive(Clone, Debug, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct PrincipalId {"),
     (SRC + "principal.rs", "/// What kind of caller a principal is, and the facts that come with that kind.",
      "impl PartialEq for PrincipalId {\n    fn eq(&self, o: &Self) -> bool {\n        self.subject == o.subject\n    }\n}\nimpl Eq for PrincipalId {}\n"
      "impl PartialOrd for PrincipalId {\n    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {\n        Some(self.cmp(o))\n    }\n}\n"
@@ -598,10 +607,10 @@ for field, old, new in [
     ("revision", "        policy_revision,\n        proved_principal", '        policy_revision: { let _ = policy_revision; PolicyRevision::new("x") },\n        proved_principal'),
     ("delegation-team", "            .map(|delegation| delegation.team().into()),", "            .map(|_| None).flatten(),"),
     ("acting-person", "            .map(|delegation| delegation.acting_person()),", "            .map(|_| None).flatten(),"),
-    ("tool-unescaped", "        tool: sentences::safe(call.tool.as_str(), sentences::MAX_RENDERED),", "        tool: call.tool.as_str().to_owned(),"),
-    ("surface-unescaped", "        surface: SurfaceName::new(sentences::safe(\n            call.caller.surface.as_str(),\n            sentences::MAX_RENDERED,\n        )),",
+    ("tool-unescaped", "        tool: sentences::escape(call.tool.as_str(), sentences::MAX_RENDERED),", "        tool: call.tool.as_str().to_owned(),"),
+    ("surface-unescaped", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),\n            sentences::MAX_RENDERED,\n        )),",
      "        surface: call.caller.surface.clone(),"),
-    ("surface-constant", "        surface: SurfaceName::new(sentences::safe(\n            call.caller.surface.as_str(),", '        surface: SurfaceName::new(sentences::safe(\n            "x",'),
+    ("surface-constant", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),", '        surface: SurfaceName::new(sentences::escape(\n            "x",'),
 ]:
     mutate(f"record-{field}", f"the row's {field} is wrong", SRC + "audit.rs", old, new)
 for variant, renamed in [("Ok", "success"), ("Error", "failed")]:
@@ -649,19 +658,19 @@ mutate("record-resources-denied-appended", "a resource denial past the cap makes
 mutate("record-resources-denied-first", "a resource denial past the cap is recorded first, not in the order named", SRC + "audit.rs",
        "        kept.push(denied);\n", "        kept.insert(0, denied);\n")
 for field, cap in (("system", "sentences::MAX_RENDERED"), ("kind", "sentences::MAX_RENDERED"), ("identifier", "MAX_RECORDED_IDENTIFIER")):
-    line = f"            {field}: sentences::safe(&resource.{field}, {cap}),"
+    line = f"            {field}: sentences::escape(&resource.{field}, {cap}),"
     mutate(f"record-resource-{field}-unescaped", f"a recorded resource's {field} is not made safe", SRC + "audit.rs",
            line, f"            {field}: resource.{field}.clone(),")
     mutate(f"record-resource-{field}-uncapped", f"a recorded resource's {field} is not cut short", SRC + "audit.rs",
-           line, f"            {field}: sentences::safe(&resource.{field}, usize::MAX),")
+           line, f"            {field}: sentences::escape(&resource.{field}, usize::MAX),")
 mutate("record-resource-identifier-cap-128", "a recorded identifier is cut at 128 characters, like the tool name", SRC + "audit.rs",
-       "            identifier: sentences::safe(&resource.identifier, MAX_RECORDED_IDENTIFIER),",
-       "            identifier: sentences::safe(&resource.identifier, sentences::MAX_RENDERED),")
+       "            identifier: sentences::escape(&resource.identifier, MAX_RECORDED_IDENTIFIER),",
+       "            identifier: sentences::escape(&resource.identifier, sentences::MAX_RENDERED),")
 mutate("record-resource-identifier-cap-short", "a recorded identifier is cut one character early", SRC + "audit.rs",
        "pub const MAX_RECORDED_IDENTIFIER: usize = 2048;", "pub const MAX_RECORDED_IDENTIFIER: usize = 2047;")
 mutate("record-resource-system-kind-swapped", "a recorded resource's system and kind are swapped", SRC + "audit.rs",
-       "            system: sentences::safe(&resource.system, sentences::MAX_RENDERED),\n            kind: sentences::safe(&resource.kind, sentences::MAX_RENDERED),",
-       "            system: sentences::safe(&resource.kind, sentences::MAX_RENDERED),\n            kind: sentences::safe(&resource.system, sentences::MAX_RENDERED),")
+       "            system: sentences::escape(&resource.system, sentences::MAX_RENDERED),\n            kind: sentences::escape(&resource.kind, sentences::MAX_RENDERED),",
+       "            system: sentences::escape(&resource.kind, sentences::MAX_RENDERED),\n            kind: sentences::escape(&resource.system, sentences::MAX_RENDERED),")
 mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: { let _ = recorded; Outcome::Ok },\n            latency_ms,")
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",
@@ -714,7 +723,7 @@ mutate("sentence-system-kind-swapped", "the resource sentence swaps system and k
        '("system", Text(&resource.system)),\n                    ("kind", Text(&resource.kind)),',
        '("system", Text(&resource.kind)),\n                    ("kind", Text(&resource.system)),')
 mutate("sentence-fill-rescans", "a value is scanned for placeholders", SRC + "sentences.rs",
-       "            Some((_, Piece::Text(value))) => sentence.push_str(&safe(value, MAX_RENDERED)),",
+       "            Some((_, Piece::Text(value))) => sentence.push_str(&escape(value, MAX_RENDERED)),",
        "            Some((_, Piece::Text(value))) => sentence.push_str(&fill(value, values).0),")
 mutate("sentence-invalid-name-raw", "an invalid tool name is echoed as it was sent", SRC + "sentences.rs",
        '                &[("tool", Piece::Capped(tool.as_str(), MAX_TOOL_NAME))],', '                &[("tool", Piece::Rendered(&Rendered(tool.as_str().to_owned())))],')
@@ -859,7 +868,7 @@ mutate("identity-crit-null-ignored", "a crit of null is read as no crit", V, CRI
 mutate("identity-crit-empty-allowed", "a crit that lists nothing is accepted", V, CRIT,
        '        .is_none_or(|header| header.get("crit").is_some_and(|crit| crit.as_array().is_none_or(|names| !names.is_empty())))')
 mutate("identity-token-size-unbounded", "a token of any size is parsed", V,
-       "    if token.len() > MAX_TOKEN_BYTES {", "    if false && token.len() > MAX_TOKEN_BYTES {")
+       "        if token.len() > MAX_TOKEN_BYTES {", "        if false && token.len() > MAX_TOKEN_BYTES {")
 mutate("identity-clock-is-the-system-clock", "verification reads the system time, not the injected clock", V,
        "        let now = unix_seconds(self.clock.as_ref());", "        let now = jsonwebtoken::get_current_timestamp();")
 mutate("identity-unknown-alg-reads-as-malformed", "a header with an algorithm nobody supports is reported as malformed", V,
@@ -960,6 +969,36 @@ mutate("identity-groups-claim-sentence", "the log names the groups claim as `the
        '            Claim::Groups => "groups claim",', '            Claim::Groups => "the groups claim claim",')
 mutate("identity-state-names","the proved state is recorded under another name", IDENTITY_SRC + "identity.rs",
        '            VerificationState::Proved => "proved",', '            VerificationState::Proved => "ok",')
+# What a refused token claimed: kept beside the failure, escaped and capped, for the
+# identity-failure event, and never in the cause, the caller's sentence or the failure's Debug.
+# The cause has no field a claimed value could go in, so no mutation puts one there; giving it
+# one breaks the token table's exhaustive match before any test runs.
+CLAIMED_KEPT = "        let kept = |text: &str| Claimed::new(escape(text, MAX_CLAIMED));\n"
+mutate("identity-claimed-not-escaped", "a claimed issuer or subject is kept as the token wrote it, only cut short", IDENTITY_SRC + "error.rs",
+       CLAIMED_KEPT, "        let kept = |text: &str| Claimed::new(text.chars().take(MAX_CLAIMED).collect::<String>());\n")
+mutate("identity-claimed-not-capped", "a claimed issuer or subject is kept at any length", IDENTITY_SRC + "error.rs",
+       CLAIMED_KEPT, "        let kept = |text: &str| Claimed::new(escape(text, usize::MAX));\n")
+mutate("identity-claimed-in-outward", "the outward sentence names the claimed subject", IDENTITY_SRC + "error.rs",
+       "    pub fn outward(&self) -> &'static str {\n        IDENTITY_FAILURE",
+       "    pub fn outward(&self) -> &'static str {\n        Box::leak(format!(\"{IDENTITY_FAILURE} {:?}\", self.claimed.subject()).into_boxed_str())")
+mutate("identity-claimed-in-display", "the failure displays the claimed issuer", IDENTITY_SRC + "error.rs",
+       "        f.write_str(IDENTITY_FAILURE)\n    }\n}\n\nimpl std::error::Error",
+       "        write!(f, \"{IDENTITY_FAILURE} {:?}\", self.claimed.issuer())\n    }\n}\n\nimpl std::error::Error")
+mutate("identity-claimed-in-debug", "the failure's Debug includes what the token claimed", IDENTITY_SRC + "error.rs",
+       '            .field("detail", &self.detail)\n            .finish_non_exhaustive()',
+       '            .field("detail", &self.detail)\n            .field("claimed", &self.claimed)\n            .finish()')
+CLAIMED_READ = '    ClaimedCaller::new(text("iss"), text("sub"))\n'
+mutate("identity-claimed-issuer-dropped", "a refusal keeps no claimed issuer", V, CLAIMED_READ, '    ClaimedCaller::new(None, text("sub"))\n')
+mutate("identity-claimed-subject-dropped", "a refusal keeps no claimed subject", V, CLAIMED_READ, '    ClaimedCaller::new(text("iss"), None)\n')
+mutate("identity-claimed-non-string-kept", "a claim that is not a string is kept as empty text", V,
+       "    let text = |name: &str| unverified.get(name).and_then(Value::as_str);",
+       "    let text = |name: &str| unverified.get(name).map(|value| value.as_str().unwrap_or_default());")
+mutate("identity-claimed-from-oversize-token", "a token too large to verify is read for what it claims", V,
+       "    if token.len() > MAX_TOKEN_BYTES {\n        return ClaimedCaller::default();",
+       "    if false {\n        return ClaimedCaller::default();")
+mutate("identity-claimed-only-for-unknown-issuer", "only a token from an unlisted issuer keeps what it claimed", V,
+       "            .map_err(|detail| IdentityFailure::claiming(detail, claimed_by(token)))",
+       "            .map_err(|detail| if detail == VerifyError::UnknownIssuer { IdentityFailure::claiming(detail, claimed_by(token)) } else { IdentityFailure::new(detail) })")
 mutate_all(
     "identity-dependency-added",
     "the identity crate gains a dependency outside the allowlist",
@@ -995,6 +1034,12 @@ mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "  
 mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A,
        "            state.rows.push(record.clone());",
        "            state.rows.push(AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() });")
+mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A,
+       "            state.rows.push(record.clone());",
+       "            state.rows.push(AuditRecord { resources_omitted: 0, ..record.clone() });")
+mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A,
+       "            row.completion = Some(completion.completion().clone());",
+       "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted = 0;")
 mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A,
        "            row.completion = Some(completion.completion().clone());",
        "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted += 1;")
@@ -1270,7 +1315,8 @@ mutate("gw-catalog-schema-not-checked", "an input schema that is not an object s
        "    let _ = schema;\n    true")
 
 # Every struct the gateway's own configuration sections nest refuses a key it does not know. The
-# policy section is gateway-core's snapshot; its structs are not covered here yet (#41).
+# policy section is gateway-core's snapshot; its structs are mutated with the core's, under "The
+# snapshot".
 for path, struct in [
     (GW + "config.rs", "Config"),
     (GW + "config.rs", "IdentitySection"),

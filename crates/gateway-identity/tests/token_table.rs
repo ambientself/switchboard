@@ -10,6 +10,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gateway_core::{IDENTITY_FAILURE, Principal, PrincipalKind, Proved};
 use gateway_identity::{
@@ -316,6 +317,14 @@ fn cases() -> Vec<Case> {
         refused("no exp", MissingClaim(ExpiresAt), |t, _| {
             t.without_claim("exp")
         }),
+        // Under the default ceiling a token with no exp would also be too long, if it were read
+        // as never expiring. Under a ceiling no lifetime exceeds, only the missing exp refuses it.
+        refused(
+            "no exp, under a ceiling no lifetime exceeds",
+            MissingClaim(ExpiresAt),
+            |t, _| t.without_claim("exp"),
+        )
+        .adjust(|config| config.max_lifetime = Duration::from_secs(u64::MAX)),
         refused("exp as a string", MalformedClaim(ExpiresAt), |t, _| {
             t.claim("exp", json!((NOW + 100).to_string()))
         }),

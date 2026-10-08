@@ -378,12 +378,12 @@ pub async fn begin(
     let record = AuditRecord {
         tool_use_id: metadata.tool_use_id,
         deployment: call.caller.deployment.clone(),
-        surface: SurfaceName::new(sentences::safe(
+        surface: SurfaceName::new(sentences::escape(
             call.caller.surface.as_str(),
             sentences::MAX_RENDERED,
         )),
         profile: call.caller.profile.clone(),
-        tool: sentences::safe(call.tool.as_str(), sentences::MAX_RENDERED),
+        tool: sentences::escape(call.tool.as_str(), sentences::MAX_RENDERED),
         connector: tool.map(|tool| tool.connector.clone()),
         classification: tool.map(|tool| tool.classification),
         resources,
@@ -453,9 +453,9 @@ fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResour
     let recorded = kept
         .into_iter()
         .map(|resource| RecordedResource {
-            system: sentences::safe(&resource.system, sentences::MAX_RENDERED),
-            kind: sentences::safe(&resource.kind, sentences::MAX_RENDERED),
-            identifier: sentences::safe(&resource.identifier, MAX_RECORDED_IDENTIFIER),
+            system: sentences::escape(&resource.system, sentences::MAX_RENDERED),
+            kind: sentences::escape(&resource.kind, sentences::MAX_RENDERED),
+            identifier: sentences::escape(&resource.identifier, MAX_RECORDED_IDENTIFIER),
         })
         .collect();
     (RecordedResources::Named(recorded), omitted)

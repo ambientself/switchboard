@@ -314,15 +314,20 @@ fn an_issuer_whose_keys_are_not_a_jwk_set_is_refused() {
 #[test]
 fn configuration_with_an_unknown_field_is_not_read() {
     let world = World::new();
+    // One surface is restricted to a named principal, so the policy section nests a
+    // principal's identifier to probe.
+    let mut written = world.config();
+    written["policy"]["surfaces"][0]["principals"] =
+        json!({"only": [{"issuer": WORKLOAD_ISSUER, "subject": TEAM_A_SUBJECT}]});
     // The configuration as written is read, so each refusal below is for the added key.
-    assert!(serde_json::from_value::<Config>(world.config()).is_ok());
+    assert!(serde_json::from_value::<Config>(written.clone()).is_ok());
+    let resource = format!("policy.limits.teams.{TEAM_A}.0.access");
     for path in [
         "audit.disable",
         "identity.enabled",
         "http.allowed_host",
         "policy_revision",
-        // One per struct the gateway's own sections nest, down to each issuer and each rule. The
-        // policy section is gateway-core's snapshot and is not probed here yet (#41).
+        // One per struct the gateway's own sections nest, down to each issuer and each rule.
         "identity.enforce.0.audience",
         "identity.enforce.1.max_lifetime",
         "identity.enforce.0.kind.workload.subject",
@@ -331,8 +336,16 @@ fn configuration_with_an_unknown_field_is_not_read() {
         "profiles.default",
         "profiles.workloads.0.group",
         "profiles.users.0.team",
+        // And one per struct the policy section, gateway-core's snapshot, nests that the core's
+        // own tests do not probe: the snapshot itself, a profile, the limits, a resource and a
+        // principal's identifier. The core probes a surface and an approved tool.
+        "policy.limit",
+        "policy.profiles.0.surfaces",
+        "policy.limits.users",
+        resource.as_str(),
+        "policy.surfaces.0.principals.only.0.groups",
     ] {
-        let mut config = world.config();
+        let mut config = written.clone();
         set(&mut config, path, Some(json!(true)));
         assert!(
             serde_json::from_value::<Config>(config).is_err(),
