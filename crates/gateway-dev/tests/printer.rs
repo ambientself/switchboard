@@ -10,6 +10,18 @@ use gateway_testkit::{Caller, READ_TOOL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_D
 use serde_json::{Value, json};
 use support::{Lines, legacy, post};
 
+/// Whether `id` is a UUIDv7 as the gateway writes one: lowercase and hyphenated, with version
+/// 7 and the RFC 9562 variant.
+fn is_uuid_v7(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
+        && groups[2].starts_with('7')
+        && groups[3].starts_with(['8', '9', 'a', 'b'])
+}
+
 fn read(document: &str) -> Value {
     legacy(
         "tools/call",
@@ -33,17 +45,24 @@ async fn each_row_is_printed_as_it_is_begun_and_finished() {
     let printed = lines.json();
     assert_eq!(printed.len(), 3, "{printed:?}");
     assert_eq!(printed[0]["audit"], json!("begun"));
-    assert_eq!(printed[0]["row"], json!("0"));
+    let first = printed[0]["row"].as_str().unwrap();
+    assert!(is_uuid_v7(first), "{first}");
     assert_eq!(
         printed[0]["record"]["decision"],
         json!("allow"),
         "{printed:?}"
     );
     assert_eq!(printed[1]["audit"], json!("finished"));
-    assert_eq!(printed[1]["row"], json!("0"));
+    assert_eq!(
+        printed[1]["row"],
+        json!(first),
+        "finish names the row begin wrote"
+    );
     assert_eq!(printed[1]["completion"]["outcome"], json!("ok"));
     assert_eq!(printed[2]["audit"], json!("begun"));
-    assert_eq!(printed[2]["row"], json!("1"));
+    let second = printed[2]["row"].as_str().unwrap();
+    assert!(is_uuid_v7(second), "{second}");
+    assert_ne!(first, second, "each call has a row of its own");
     // A denied row is printed as the store holds it, sentence and all, and is never finished.
     assert_eq!(
         printed[2]["record"],
@@ -83,6 +102,11 @@ async fn a_begin_that_fails_still_refuses_the_call() {
     let printed = lines.json();
     assert_eq!(printed.len(), 1, "{printed:?}");
     assert_eq!(printed[0]["audit"], json!("begin_failed"));
+    let row = printed[0]["row"].as_str().unwrap();
+    assert!(
+        is_uuid_v7(row),
+        "a failed begin names the row it was for: {row}"
+    );
 }
 
 #[tokio::test]
@@ -107,5 +131,8 @@ async fn a_finish_that_fails_is_printed_and_the_answer_stands() {
     let printed = lines.json();
     let events: Vec<&Value> = printed.iter().map(|line| &line["audit"]).collect();
     assert_eq!(events, [&json!("begun"), &json!("finish_failed")]);
-    assert_eq!(printed[1]["row"], json!("0"));
+    assert_eq!(
+        printed[1]["row"], printed[0]["row"],
+        "the failed finish names the row begin wrote"
+    );
 }

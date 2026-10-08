@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use gateway::{
-    BootError, CatalogError, Config, DISABLED_ROW, GateState, Gates, NO_PROFILE, ResourceAdapter,
-    SelectorError, Wiring, boot,
+    BootError, CatalogError, Config, GateState, Gates, NO_PROFILE, ResourceAdapter, SelectorError,
+    Wiring, boot,
 };
 use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
 use gateway_core::{
@@ -20,7 +20,7 @@ use gateway_testkit::{
     FakeCredentialSource, Fixture, FixtureConnector, GROUP_G, InMemoryAuditStore, LocalIssuer,
     PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, SURFACE_READ,
     SteppableClock, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, USER_ISSUER,
-    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, policy_data,
+    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, policy_data, row_start,
 };
 use serde_json::{Value, json};
 
@@ -442,8 +442,10 @@ fn with_audit_disabled_an_allowed_call_runs_and_nothing_is_recorded() {
     };
     let decision = decide(&gates.snapshot(), &call);
     let store = gates.audit_store().as_ref();
+    let start = row_start();
     let begun = block_on(audit::begin(
         store,
+        start.clone(),
         decision,
         arguments,
         RequestMetadata::default(),
@@ -451,7 +453,11 @@ fn with_audit_disabled_an_allowed_call_runs_and_nothing_is_recorded() {
     let Ok(Begun::Allowed(guard)) = begun else {
         panic!("{begun:?}");
     };
-    assert_eq!(guard.row().as_str(), DISABLED_ROW);
+    assert_eq!(
+        guard.row(),
+        &start.row,
+        "the guard carries the identifier it was given"
+    );
     let connector = gates.connector(&guard.tool().connector).unwrap().clone();
     let ran = block_on(audit::run(connector.as_ref(), guard));
     let finished = block_on(audit::finish(store, ran, 0));

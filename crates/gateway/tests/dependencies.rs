@@ -14,7 +14,7 @@
 
 use serde_json::{Value, json};
 
-const ALLOWED: [&str; 19] = [
+const ALLOWED: [&str; 20] = [
     "audit-postgres",
     "axum",
     "connector-proxy",
@@ -34,6 +34,7 @@ const ALLOWED: [&str; 19] = [
     "toml",
     "tracing",
     "tracing-subscriber",
+    "uuid",
 ];
 
 /// Never in a running gateway, whatever else the allowlist comes to hold. The mock server plays

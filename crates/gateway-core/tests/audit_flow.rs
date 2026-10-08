@@ -8,9 +8,8 @@ use std::future::ready;
 use std::sync::{Arc, Mutex};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind,
-    MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, Outcome, RecordedResource, RecordedResources,
-    RequestMetadata,
+    self, Answer, AuditFailure, Begun, Completion, DecisionKind, MAX_RECORDED_IDENTIFIER,
+    MAX_RECORDED_RESOURCES, Outcome, RecordedResource, RecordedResources, RequestMetadata,
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
@@ -172,6 +171,7 @@ fn metadata() -> RequestMetadata {
 fn begin(store: &dyn AuditStore, decision: Decision) -> Begun {
     common::ready(audit::begin(
         store,
+        common::start(),
         decision,
         json!({"path": "README.md"}),
         metadata(),
@@ -213,7 +213,7 @@ fn an_allowed_call_runs_its_own_arguments_once_and_completes_its_row() {
         "the outcome is empty until finish"
     );
     assert_eq!(guard.tool().name.as_str(), "fixture__read");
-    assert_eq!(guard.row(), &AuditRowId::new("0"));
+    assert_eq!(store.ids(), vec![guard.row().clone()]);
 
     let ran = common::ready(audit::run(&connector, guard));
     assert_eq!(
@@ -273,7 +273,7 @@ fn a_denial_returns_exactly_the_sentence_its_row_holds_and_is_never_completed() 
         "Tool `fixture__propose` is classified `propose`, which profile `readers` does not permit. Choose a tool whose classification this profile permits."
     );
     assert_eq!(rows[0].completion, None);
-    assert_eq!(refusal.row(), &AuditRowId::new("0"));
+    assert_eq!(store.ids(), vec![refusal.row().clone()]);
 }
 
 #[test]
@@ -312,9 +312,14 @@ fn a_store_that_cannot_begin_refuses_an_allowed_call() {
     };
     let decision = decide(&snapshot(), &call("fixture__read"));
     assert!(decision.is_allowed());
-    let failure: AuditFailure =
-        common::ready(audit::begin(&store, decision, json!({}), metadata()))
-            .expect_err("a store that cannot write must refuse the call");
+    let failure: AuditFailure = common::ready(audit::begin(
+        &store,
+        common::start(),
+        decision,
+        json!({}),
+        metadata(),
+    ))
+    .expect_err("a store that cannot write must refuse the call");
     assert_eq!(failure.sentence(), AUDIT_FAILURE);
     assert_ne!(failure.sentence(), gateway_core::IDENTITY_FAILURE);
     assert!(store.rows().is_empty());
@@ -328,8 +333,14 @@ fn a_store_that_cannot_begin_withholds_a_denial_too() {
     };
     let decision = decide(&snapshot(), &call("fixture__propose"));
     assert!(!decision.is_allowed());
-    let failure = common::ready(audit::begin(&store, decision, json!({}), metadata()))
-        .expect_err("a denial with no row must not be answered with its sentence");
+    let failure = common::ready(audit::begin(
+        &store,
+        common::start(),
+        decision,
+        json!({}),
+        metadata(),
+    ))
+    .expect_err("a denial with no row must not be answered with its sentence");
     assert_eq!(failure.sentence(), AUDIT_FAILURE);
 }
 
@@ -375,6 +386,87 @@ fn a_connector_refusal_reaches_the_caller_only_as_its_row_records_it() {
             },
             latency_ms: 3,
         })
+    );
+}
+
+#[test]
+fn begin_writes_the_row_under_the_identifier_it_is_given_once() {
+    let store = MemoryStore::default();
+    let start = common::start();
+    let begin_again = |decision| {
+        common::ready(audit::begin(
+            &store,
+            start.clone(),
+            decision,
+            json!({}),
+            metadata(),
+        ))
+    };
+    let Ok(Begun::Allowed(guard)) = begin_again(decide(&snapshot(), &call("fixture__read"))) else {
+        panic!("expected a guard");
+    };
+    assert_eq!(guard.row(), &start.row);
+    let Ok(Begun::Allowed(retried)) = begin_again(decide(&snapshot(), &call("fixture__read")))
+    else {
+        panic!("a retried begin with the same decision must succeed");
+    };
+    assert_eq!(retried.row(), &start.row);
+    assert_eq!(store.ids(), vec![start.row.clone()], "one row, not two");
+
+    let refused = begin_again(decide(&snapshot(), &call("fixture__propose")));
+    assert!(
+        matches!(refused, Err(ref failure) if failure.sentence() == AUDIT_FAILURE),
+        "a begin with a known identifier and another decision must fail"
+    );
+    assert_eq!(store.rows().len(), 1);
+    assert_eq!(
+        store.last().decision,
+        DecisionKind::Allow,
+        "the first row stands"
+    );
+}
+
+#[test]
+fn the_test_store_accepts_an_identical_second_completion_and_refuses_a_different_one() {
+    let store = MemoryStore::default();
+    let start = common::start();
+    // Each pass begins the same row, which a retried begin may, runs and finishes it.
+    let finish_again = |latency_ms| {
+        let connector = RecordingConnector::answering(ToolOutcome::Ok(json!(1)));
+        let decision = decide(&snapshot(), &call("fixture__read"));
+        let Ok(Begun::Allowed(guard)) = common::ready(audit::begin(
+            &store,
+            start.clone(),
+            decision,
+            json!({}),
+            metadata(),
+        )) else {
+            panic!("a begin of an allowed row must give a guard");
+        };
+        let ran = common::ready(audit::run(&connector, guard));
+        common::ready(audit::finish(&store, ran, latency_ms))
+    };
+    assert!(finish_again(5).failure().is_none());
+    assert_eq!(
+        store.last().completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 5,
+        })
+    );
+    assert!(
+        finish_again(5).failure().is_none(),
+        "an identical second completion is accepted"
+    );
+    assert!(
+        finish_again(6).failure().is_some(),
+        "a different second completion is refused"
+    );
+    assert_eq!(store.rows().len(), 1);
+    assert_eq!(
+        store.last().completion.map(|done| done.latency_ms),
+        Some(5),
+        "the first completion stands"
     );
 }
 

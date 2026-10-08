@@ -188,13 +188,17 @@ pub struct RequestMetadata {
     pub claimed_team: Option<Claimed<TeamId>>,
 }
 
-/// The store's identifier for an audit row.
+/// An audit row's identifier. The gateway chooses it before begin, a UUIDv7 (decision 0009),
+/// and gives it to the store with the record, so that begin can be retried without writing a
+/// second row. The core reads no clock and makes no identifier: it carries the one it is
+/// given. A store may refuse an identifier it cannot hold, as the Postgres store refuses one
+/// that is not a UUID.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AuditRowId(String);
 
 impl AuditRowId {
-    /// Wraps the identifier a store assigned.
+    /// Wraps an identifier the gateway chose.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -212,18 +216,40 @@ pub type StoreError = Box<dyn Error + Send + Sync + 'static>;
 /// crates; this crate only states the interface. Usable as `dyn AuditStore`, so one store can
 /// sit in shared server state.
 pub trait AuditStore: Send + Sync {
-    /// Writes the row before any tool runs or any denial is returned, and returns its
-    /// identifier. Must not return `Ok` unless the row is durable.
+    /// Writes `record` as the row `row`, before any tool runs or any denial is returned.
+    ///
+    /// - The row is durable when begin returns `Ok`, and not before.
+    /// - A second begin with an identifier already stored, whose stored decision (allow or
+    ///   deny) is the same as `record`'s, returns `Ok` and writes no second row. So begin can
+    ///   be retried by identifier.
+    /// - A second begin with an identifier already stored, whose stored decision differs,
+    ///   returns `Err`, and the stored row stands.
+    ///
+    /// The comparison stops at the decision on purpose. The Postgres store's role cannot read
+    /// who called what, so it cannot compare more, and a store for tests must not check more
+    /// than Postgres can: a test would then rely on a check the real store does not make.
     fn begin<'a>(
         &'a self,
+        row: &'a AuditRowId,
         record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>>;
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Fills in the outcome and latency of a row that [`begin`](AuditStore::begin) wrote.
     /// Takes a [`RowCompletion`], which only [`finish`] can make, from a
     /// call that ran.
+    ///
+    /// A repeat of the completion a row already has, the same outcome and latency, returns
+    /// `Ok`, so finish can be retried. A different completion of a row already complete
+    /// returns `Err`, and the first completion stands.
     fn finish<'a>(&'a self, completion: &'a RowCompletion)
     -> BoxFuture<'a, Result<(), StoreError>>;
+}
+
+/// What the gateway supplies for a row before [`begin`], besides the decision and the request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowStart {
+    /// The row's identifier, chosen once per call. A retry of begin reuses it.
+    pub row: AuditRowId,
 }
 
 /// The completion of one allowed row, for [`AuditStore::finish`]. Made only by [`finish`].
@@ -331,8 +357,8 @@ impl AuditFailure {
     }
 }
 
-/// Writes the audit row for `decision`, before anything runs and before any denial is
-/// returned.
+/// Writes the audit row for `decision`, as the row `start` names, before anything runs and
+/// before any denial is returned.
 ///
 /// Returns [`Begun::Allowed`] with the guard that running the tool requires, which owns
 /// `arguments`, or [`Begun::Denied`] with the sentence for the caller. The arguments are not
@@ -340,6 +366,7 @@ impl AuditFailure {
 /// written, returns [`AuditFailure`] and the call must be refused, whatever the decision was.
 pub async fn begin(
     store: &dyn AuditStore,
+    start: RowStart,
     decision: Decision,
     arguments: serde_json::Value,
     metadata: RequestMetadata,
@@ -406,8 +433,9 @@ pub async fn begin(
         claimed_team: metadata.claimed_team,
         completion: None,
     };
-    let row = store
-        .begin(&record)
+    let RowStart { row } = start;
+    store
+        .begin(&row, &record)
         .await
         .map_err(AuditFailure::from_store)?;
     Ok(match decided {

@@ -23,7 +23,7 @@ use gateway_testkit::{
     Caller, DRAFT_REFUSAL, DRAFT_TOOL, FOREIGN_DRAFT, FakeCredentialSource, Fixture,
     FixtureConnector, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND,
     RESOURCE_SYSTEM, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock,
-    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, block_on, policy_data, poll_once,
+    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, block_on, policy_data, poll_once, row_start,
 };
 use serde_json::{Value, json};
 
@@ -103,8 +103,14 @@ impl Gateway {
             tool: RequestedTool::new(tool),
         };
         let decision = decide(&self.fixture.policy, &call);
-        let begun = match audit::begin(&self.store, decision, arguments, RequestMetadata::default())
-            .await
+        let begun = match audit::begin(
+            &self.store,
+            row_start(),
+            decision,
+            arguments,
+            RequestMetadata::default(),
+        )
+        .await
         {
             Ok(begun) => begun,
             Err(failure) => return Response::AuditFailed(failure.sentence()),

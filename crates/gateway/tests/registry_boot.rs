@@ -202,11 +202,12 @@ impl HeldStore {
 impl AuditStore for HeldStore {
     fn begin<'a>(
         &'a self,
+        row: &'a AuditRowId,
         record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             self.gate.wait().await;
-            self.inner.begin(record).await
+            self.inner.begin(row, record).await
         })
     }
 

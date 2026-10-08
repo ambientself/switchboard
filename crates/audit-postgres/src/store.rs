@@ -46,6 +46,13 @@ pub enum PgAuditError {
     /// The database refused or failed the statement.
     #[error("the audit database did not write the row: {}", describe(.0))]
     Database(#[from] tokio_postgres::Error),
+    /// Begin named a row the table already holds, with another decision. The stored row
+    /// stands. Only the decision is compared, because the gateway's role can read no more.
+    #[error("audit row {row} was already begun, with another decision")]
+    BegunDifferently {
+        /// The row begin named.
+        row: String,
+    },
     /// Finish named a row the table does not hold.
     #[error("audit row {row} does not exist")]
     NoSuchRow {
@@ -428,8 +435,8 @@ impl PgAuditStore {
         }
     }
 
-    async fn insert(&self, record: &AuditRecord) -> Result<AuditRowId, PgAuditError> {
-        let row = BeginRow::from_record(record)?;
+    async fn insert(&self, id: &AuditRowId, record: &AuditRecord) -> Result<(), PgAuditError> {
+        let row = BeginRow::from_record(id, record)?;
         let budget = self.budgets.begin;
         let deadline = Instant::now() + budget;
         let client = timeout_at(deadline, self.begin.get())
@@ -518,11 +525,31 @@ impl PgAuditStore {
     }
 }
 
-/// Inserts the first half of a row and returns the identifier the database assigned.
-async fn insert_on(client: &ClientWrapper, row: &BeginRow) -> Result<AuditRowId, PgAuditError> {
+/// Inserts the first half of a row under its identifier, unless that row is already stored.
+/// A row already stored with the same decision is this begin's own, written by an earlier
+/// attempt, which is success; one with another decision is not.
+async fn insert_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditError> {
     let statement = client.prepare_cached(BeginRow::INSERT).await?;
-    let inserted = client.query_one(&statement, &row.parameters()).await?;
-    Ok(AuditRowId::new(inserted.try_get::<_, String>(0)?))
+    let inserted = client.execute(&statement, &row.parameters()).await?;
+    if inserted == 1 {
+        return Ok(());
+    }
+    let statement = client.prepare_cached(BeginRow::DECISION).await?;
+    let Some(stored) = client.query_opt(&statement, &[&row.id]).await? else {
+        // Nothing was inserted and nothing is stored: the gateway's role cannot delete, so
+        // only another role could have removed it in between.
+        return Err(PgAuditError::NoSuchRow {
+            row: row.id.clone(),
+        });
+    };
+    let decision: String = stored.try_get(0)?;
+    if decision == row.decision {
+        Ok(())
+    } else {
+        Err(PgAuditError::BegunDifferently {
+            row: row.id.clone(),
+        })
+    }
 }
 
 /// Writes the completion of `row` if it has none, and otherwise checks the one it has.
@@ -630,9 +657,10 @@ impl Retry {
 impl AuditStore for PgAuditStore {
     fn begin<'a>(
         &'a self,
+        row: &'a AuditRowId,
         record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
-        Box::pin(async move { self.insert(record).await.map_err(StoreError::from) })
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move { self.insert(row, record).await.map_err(StoreError::from) })
     }
 
     fn finish<'a>(
@@ -678,6 +706,7 @@ mod unit {
         for final_error in [
             PgAuditError::NoSuchRow { row: "r".into() },
             PgAuditError::CompletedDifferently { row: "r".into() },
+            PgAuditError::BegunDifferently { row: "r".into() },
             PgAuditError::Pool(PoolError::Closed),
             PgAuditError::Column("x"),
         ] {

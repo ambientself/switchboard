@@ -6,9 +6,10 @@ use std::future::{Future, ready as now};
 use std::marker::PhantomData;
 use std::pin::pin;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use gateway_core::audit::{AuditRowId, RowCompletion, StoreError};
+use gateway_core::audit::{AuditRowId, RowCompletion, RowStart, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, Provable, Proved, ToolName, Verifier};
 
 /// A stand-in verifier that accepts its fixture as given.
@@ -51,18 +52,42 @@ pub fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// An audit store in memory. Row identifiers are positions, so a test can see which row a
-/// write reached. Either half can be told to fail.
+/// A row identifier no other call in this test process has: the gateway chooses one per call,
+/// and the core only carries it.
+pub fn start() -> RowStart {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    RowStart {
+        row: AuditRowId::new(format!("row-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
+    }
+}
+
+/// An audit store in memory, keeping rows by identifier in the order they were begun. Begin is
+/// idempotent on the identifier as the interface says, comparing only the decision. Finish
+/// accepts an identical repeat and refuses a different one. Either half can be told to fail.
 #[derive(Default)]
 pub struct MemoryStore {
     pub fail_begin: bool,
     pub fail_finish: bool,
-    pub rows: Mutex<Vec<AuditRecord>>,
+    pub rows: Mutex<Vec<(AuditRowId, AuditRecord)>>,
 }
 
 impl MemoryStore {
     pub fn rows(&self) -> Vec<AuditRecord> {
-        self.rows.lock().unwrap().clone()
+        self.rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+
+    pub fn ids(&self) -> Vec<AuditRowId> {
+        self.rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub fn last(&self) -> AuditRecord {
@@ -73,14 +98,23 @@ impl MemoryStore {
 impl AuditStore for MemoryStore {
     fn begin<'a>(
         &'a self,
+        row: &'a AuditRowId,
         record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         let result = if self.fail_begin {
             Err("the store is down".into())
         } else {
             let mut rows = self.rows.lock().unwrap();
-            rows.push(record.clone());
-            Ok(AuditRowId::new((rows.len() - 1).to_string()))
+            match rows.iter().find(|(id, _)| id == row) {
+                Some((_, stored)) if stored.decision == record.decision => Ok(()),
+                Some(_) => {
+                    Err(format!("row {} was begun with another decision", row.as_str()).into())
+                }
+                None => {
+                    rows.push((row.clone(), record.clone()));
+                    Ok(())
+                }
+            }
         };
         Box::pin(now(result))
     }
@@ -92,12 +126,18 @@ impl AuditStore for MemoryStore {
         let result = if self.fail_finish {
             Err("the store is down".into())
         } else {
-            let index: usize = completion.row().as_str().parse().unwrap();
             let mut rows = self.rows.lock().unwrap();
-            let row = &mut rows[index];
-            assert!(row.completion.is_none(), "row {index} finished twice");
-            row.completion = Some(completion.completion().clone());
-            Ok(())
+            match rows.iter_mut().find(|(id, _)| id == completion.row()) {
+                None => Err("no such row".into()),
+                Some((_, row)) => match &row.completion {
+                    None => {
+                        row.completion = Some(completion.completion().clone());
+                        Ok(())
+                    }
+                    Some(done) if done == completion.completion() => Ok(()),
+                    Some(_) => Err("the row was already finished differently".into()),
+                },
+            }
         };
         Box::pin(now(result))
     }
