@@ -185,6 +185,20 @@ struct HeldStore {
     gate: Gate,
 }
 
+impl HeldStore {
+    /// Returns once a call waits at the gate. Bounded, so a call that never reaches this store
+    /// fails the test instead of hanging it.
+    async fn held(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while self.gate.waiting() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the call never reached the audit store it was given");
+    }
+}
+
 impl AuditStore for HeldStore {
     fn begin<'a>(
         &'a self,
@@ -236,9 +250,7 @@ async fn a_tool_withdrawn_while_a_call_waits_is_not_sent() {
             .await
         }
     });
-    while store.gate.waiting() == 0 {
-        tokio::task::yield_now().await;
-    }
+    store.held().await;
     // Withdrawn meanwhile.
     let original = files::registry(&mock.url());
     let start = original
@@ -357,9 +369,7 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
             .await
         }
     });
-    while store.gate.waiting() == 0 {
-        tokio::task::yield_now().await;
-    }
+    store.held().await;
     // Meanwhile demo-2 declares other_project and reads it as a resource.
     let revision = reloader
         .apply(&Registry::from_toml_str(&widened(&files::registry(&mock.url()), "demo-2")).unwrap())
