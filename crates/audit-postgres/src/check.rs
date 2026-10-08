@@ -517,6 +517,35 @@ impl PgAuditStore {
     ///   none can set a setting only a superuser may set, such as `session_replication_role`,
     ///   which would silence both triggers; and none can change any setting with
     ///   `ALTER SYSTEM`, which reaches every session at the next reload.
+    /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule. A
+    ///   rule's statements run as the table's owner whenever the gateway writes.
+    /// - Neither the role nor any role it can become, PUBLIC included, holds anything on a
+    ///   view, materialized view or table with a rule, in any schema, that reaches `call_rows`
+    ///   directly or through other views and rules. A view runs with its owner's privileges,
+    ///   and a rule with its table's owner's.
+    /// - Neither can run a `SECURITY DEFINER` function, in any schema, whose owner can read or
+    ///   change `call_rows`: one that holds a privilege on it, or on a view or rule that
+    ///   reaches it, or can act as the schema's owner, or can run another such function. Running
+    ///   it means EXECUTE, which PUBLIC holds on every new function unless it is revoked, or a
+    ///   write to a table whose trigger runs it, since a trigger does not ask for EXECUTE.
+    /// - Neither can run the catalog's functions that read or write the server's own files:
+    ///   `lo_export`, `lo_import`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
+    ///   `pg_stat_file`, and adminpack's `pg_file_*` where the server has them.
+    ///
+    /// # What it does not look for
+    ///
+    /// The check reads the catalog of one database, once. It does not see:
+    ///
+    /// - anything changed after it passes, until the next boot;
+    /// - an event trigger, which fires on statements the role may be able to run, such as
+    ///   `CREATE TEMP TABLE`, and whose function may be `SECURITY DEFINER`;
+    /// - functions that reach outside the database other than the catalog's file functions
+    ///   named above: one in an untrusted language such as `plpython3u`, or in C from an
+    ///   extension, runs with the server's operating-system user's access to its files;
+    /// - a way back in through another connection: `postgres_fdw` or `dblink`, through a user
+    ///   mapping or a function that holds another role's password, can reach `call_rows` as
+    ///   that role. A foreign table in `switchboard_audit` is refused; one elsewhere is not
+    ///   followed to where it connects.
     ///
     /// Has no time limit: wrap it in one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {

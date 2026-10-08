@@ -830,6 +830,30 @@ running sessions at the next reload. Its sessions commit synchronously and look 
 change what its checks or its writes do. Both settings travel in the startup options, which a
 pooler may drop, so the check reads them back and refuses a session without them.
 
+The grants on the audit table are not the only way to it, so the Postgres check also refuses,
+for the gateway's role and every role it can become, PUBLIC included: an audit table that is a
+view or foreign table, or has a rule; any privilege on a view, materialized view or table with
+a rule, in any schema, that reaches the audit table directly or through other views and rules;
+being able to run a `SECURITY DEFINER` function, in any schema, whose owner can read or change
+the audit table, by EXECUTE or by writing to a table whose trigger runs it; and EXECUTE on the
+catalog's functions that read or write the server's files (`lo_export`, `lo_import`,
+`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's
+`pg_file_*`).
+
+What the Postgres check does not look for, which an administrator must keep from the gateway's
+role without its help:
+
+- **Changes after boot.** It reads the catalog once. A grant, view, rule or function made
+  later is not seen until the next boot.
+- **Event triggers.** One fires on statements the gateway's role may be able to run, such as
+  `CREATE TEMP TABLE`, and its function may be `SECURITY DEFINER`.
+- **Other functions that leave the database.** Only the catalog's file functions above are
+  refused by name. A function in an untrusted language such as `plpython3u`, or in C from an
+  extension, runs with the access of the server's operating-system user.
+- **Other connections back in.** `postgres_fdw` or `dblink` can log in again as another role,
+  through a user mapping or a function holding that role's password. A foreign table in the
+  audit schema is refused; one elsewhere is not followed to where it connects.
+
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
 swap, whatever the snapshot's source. The check is in the binary, not in policy data, so no

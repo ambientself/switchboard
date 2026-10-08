@@ -19,6 +19,11 @@
 //! - It selects only the identifier, the decision and the completion. It cannot read who
 //!   called what, and it cannot delete.
 //!
+//! Those are the migration's grants on the table. Other objects can give a role more: a grant
+//! on a view over the table, a rule, a `SECURITY DEFINER` function, or a function that reaches
+//! the server's files. [`PgAuditStore::check_at_boot`] refuses the ones it knows of, and its
+//! documentation lists those it does not look for.
+//!
 //! And for every role, through two triggers: both times come from the database's clock,
 //! whatever an insert or a completion carries; a row is completed at most once, a denial is
 //! never completed, and a completion writes nothing else.
