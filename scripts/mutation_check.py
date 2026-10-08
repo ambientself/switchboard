@@ -1178,6 +1178,40 @@ mutate("mcp-legacy-structured-non-object", "a legacy result carries structuredCo
        "            if era == Era::Modern || value.is_object() {", "            if true {")
 mutate("mcp-denial-code-changed", "the denial code becomes -32602", MCP + "constants.rs",
        "pub const DENIAL_CODE: i64 = -32001;", "pub const DENIAL_CODE: i64 = -32602;")
+mutate("mcp-era-header-ignored", "a request with the modern version header and no _meta is served as legacy", MCP_PARSE,
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() {")
+mutate("mcp-era-meta-ignored", "a request whose _meta names its version, with no version header, is served as legacy", MCP_PARSE,
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
+       "    if header_is_modern {")
+mutate("mcp-content-type-any-charset", "a JSON content type with a charset other than UTF-8 is served", MCP + "headers.rs",
+       '            || value.trim().trim_matches(\'"\').eq_ignore_ascii_case("utf-8")',
+       '            || !value.is_empty()')
+mutate("mcp-jsonrpc-version-unchecked", "a request that does not say jsonrpc 2.0 is served", MCP_PARSE,
+       '    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {',
+       '    if false && object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {')
+mutate("mcp-response-refused-as-methodless", "a posted response is refused only for having no method", MCP_PARSE,
+       '        None if object.contains_key("result") || object.contains_key("error") => {',
+       '        None if false => {')
+mutate("mcp-fractional-id-accepted", "a fractional or out-of-range id is read as an integer", MCP_PARSE,
+       "        Some(Value::Number(id)) => match id.as_i64() {",
+       "        Some(Value::Number(id)) => match id.as_i64().or_else(|| id.as_f64().map(|id| id as i64)) {")
+mutate("mcp-params-not-object-accepted", "params that are not an object are read as empty", MCP_PARSE,
+       "        Some(_) => Params::Malformed,", "        Some(_) => Params::Object(Map::new()),")
+mutate("mcp-call-name-optional", "a tools/call with no name is served with an empty name", MCP_PARSE,
+       '    let Some(Value::String(name)) = params.remove("name") else {',
+       '    let Some(Value::String(name)) = params.remove("name").or(Some(Value::String(String::new()))) else {')
+mutate("mcp-call-arguments-array-accepted", "a tools/call whose arguments are an array is served with none", MCP_PARSE,
+       "        None | Some(Value::Null) => Map::new(),", "        None | Some(Value::Null | Value::Array(_)) => Map::new(),")
+# The adapter's dependency fence. It has no dev-dependency to move, so the mutation adds a crate
+# the workspace already locks and edits Cargo.lock to match, which `--locked` accepts.
+mutate_all(
+    "mcp-dependency-thiserror",
+    "the adapter depends on a crate outside its allowlist",
+    ("crates/gateway-mcp/Cargo.toml", 'serde_json = "1"\n\n[lints]\n', 'serde_json = "1"\nthiserror = "2"\n\n[lints]\n'),
+    ("Cargo.lock", 'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n]\n',
+     'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n "thiserror",\n]\n'),
+)
 
 
 # --- gateway -------------------------------------------------------------------------------
@@ -1374,6 +1408,17 @@ mutate("gw-audit-failed-as-tool-error", "an unrecorded scope refusal is answered
 mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a result", GW_PATH,
        "Answer::Error(message) => Reply::ToolError(message),",
        "Answer::Error(message) => Reply::Denied(message),")
+mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
+       "                return Reply::Denied(failure.sentence().to_owned());",
+       "                return Reply::ToolError(failure.sentence().to_owned());")
+mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
+       "                return Reply::Denied(refusal.sentence().to_owned());",
+       "                return Reply::ToolError(refusal.sentence().to_owned());")
+mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
+       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
+       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
+mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
+       "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
 mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
        "        if let Some(failure) = finished.failure() {\n",
        "        if let Some(failure) = finished.failure() {\n"
@@ -1409,6 +1454,9 @@ mutate("gw-host-empty-port-accepted", "a Host ending in a colon with no port is 
        "let is_port = |port: &str| !port.is_empty() && port.bytes()", "let is_port = |port: &str| port.bytes()")
 mutate("gw-host-first-of-two", "the first of two Host headers is checked", GW_SERVER,
        "        (Some(_), Some(_)) => None,", "        (Some(value), Some(_)) => value.to_str().ok(),")
+mutate("gw-host-absent-allowed", "a request with no Host and no authority is taken as for localhost", GW_SERVER,
+       "        (None, _) => parts.uri.authority().map(|authority| authority.as_str()),",
+       '        (None, _) => Some("localhost"),')
 mutate("gw-host-prefix-match", "a Host that starts with an allowed one is allowed", GW_SERVER,
        ".any(|allowed| allowed.eq_ignore_ascii_case(host))", ".any(|allowed| host.starts_with(allowed.as_str()))")
 mutate("gw-origin-check-skipped", "a request from any Origin is served", GW_SERVER,
