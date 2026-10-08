@@ -2515,6 +2515,10 @@ mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs p
        '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
 mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
        'docs-credential.sha256")" 6 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
+mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
+       "\n.claude\n", "\n")
+mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
+       "\n**/target\n", "\n")
 mutate("demo-driver-health-checks-counted", "the outage step counts health checks as requests", DRIVER,
        "select(.accepted == true)' | awk 'END { print NR }'", "select(.event == \"request\")' | awk 'END { print NR }'")
 mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,

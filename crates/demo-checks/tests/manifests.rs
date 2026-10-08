@@ -332,3 +332,27 @@ fn the_dev_issuer_signs_for_every_subject_the_compose_demo_asks_for() {
             .any(|line| line.starts_with("\"workload:") && line.contains("stranger"))
     );
 }
+
+/// The image is built with the repository root as its context and `COPY . .`, so the context
+/// must leave out the worktrees under `.claude` (each with its own target directory, plus
+/// session files), every target directory, and the demo transcripts.
+#[test]
+fn the_image_build_context_leaves_out_worktrees_targets_and_transcripts() {
+    let dockerfile = read("deploy/Dockerfile");
+    assert!(dockerfile.contains("\nCOPY . .\n"), "{dockerfile}");
+    let ignored = read(".dockerignore");
+    let lines: Vec<&str> = ignored.lines().map(str::trim).collect();
+    for pattern in [
+        ".git",
+        ".demo",
+        "target",
+        "**/target",
+        ".claude",
+        "demo-runs",
+    ] {
+        assert!(
+            lines.contains(&pattern),
+            "{pattern} is not in .dockerignore"
+        );
+    }
+}
