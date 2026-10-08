@@ -35,6 +35,8 @@ cannot show that, and these numbers do not change it.
 - **After the review's triage** (section 10). Both runs pass from `eaccbab`: Compose 90/90
   and kind 156/156. mock-docs accepted exactly the calls the gateway allowed, and the operator
   checks are now 58, 29 per team.
+- **Run twice in a row** (section 11). From `eb58476`, each demo ran twice without `down` in
+  between, and all four runs passed: Compose 90/90 both times and kind 156/156 both times.
 
 ## Where and how
 
@@ -429,3 +431,40 @@ changes the revision to `demo-2`, so it still loads.
 The rest matched section 9: 10 rows in each run, each matched to the call that made it and
 none wrong; the boot check passed for the demo's database in both runs; mock-docs refused only
 the two pre-policy probes in kind; 7 `identity_failed` lines and no row for the stranger.
+
+## 11. Each demo run twice in a row
+
+Both demos ran on 2026-10-08 from `eb58476`, on the same laptop. That commit carries PR #42 with
+main merged in (PRs #44, #45 and #46 as well as #39) and the second round of review fixes. Each
+demo ran twice in a row without `demo.sh down` in between: Compose twice, then kind twice on the
+existing cluster `switchboard-demo`. All four passed on the first attempt. Compose was then taken
+down, and kind was left deployed.
+
+| | result | wall clock | notes |
+| --- | --- | --- | --- |
+| `demo.sh compose` | PASS (90/90), exit 0 | 44 s | new containers and database |
+| `demo.sh compose`, again | PASS (90/90), exit 0 | 16 s | the gateway, mock-docs, the dev issuer and Postgres kept running from the first run |
+| `demo.sh kind` | PASS (156/156), exit 0 | 55 s | existing cluster |
+| `demo.sh kind`, again | PASS (156/156), exit 0 | 57 s | existing cluster |
+
+What changed from section 10:
+
+- **A rerun counts only its own requests.** The server check asks for exactly the calls the
+  gateway allowed, but it read mock-docs' whole log, so a second run against the same mock-docs
+  saw the first run's requests too and failed. It now reads the log from the run's start mark,
+  taken from Postgres' clock with the audit rows' mark. The second Compose run reused the
+  first run's mock-docs and saw exactly its own 4 accepted requests.
+- **A rerun keeps the registry directory.** The Compose run used to delete its copy of the
+  registry and copy it again, but a gateway container kept from the first run still had the
+  deleted directory mounted, so the withdrawal step's change never reached it. The run now
+  keeps the directory and replaces only `registry.toml`. The second Compose run reused the
+  gateway, and its withdrawal step passed.
+- **kind did not exercise the reused server.** Each kind run built an image with a new ID, so
+  mock-docs and the gateway got new pods both times. The image's layers were all cached; the ID
+  still changes because the build exports a new attestation manifest each time. The second kind
+  run read mock-docs' log from its start mark all the same.
+
+The rest matched section 10: 10 rows in each run, each matched to the call that made it and
+none wrong; mock-docs accepted 4 requests in Compose and 6 in kind, all with the gateway
+credential's hash, and refused only the two pre-policy probes in kind; 58 `kubectl auth can-i`
+checks answered `no`; 7 `identity_failed` lines and no row for the stranger.
