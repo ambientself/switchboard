@@ -93,11 +93,8 @@ async fn a_role_that_can_become_the_owner_is_refused() {
     };
     // NOINHERIT membership still lets the role SET ROLE to the owner.
     let role = db.new_role("NOLOGIN", &[]).await;
-    db.admin()
-        .await
-        .batch_execute(&format!("GRANT {OWNER_ROLE} TO {role} WITH INHERIT FALSE"))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!("GRANT {OWNER_ROLE} TO {role} WITH INHERIT FALSE"))
+        .await;
     let store = db.store_like_gateway("", &[&role]).await;
     let found = problems(&store).await;
     for object in [
@@ -136,13 +133,11 @@ async fn a_role_that_owns_the_database_or_can_become_its_owner_is_refused() {
     // NOINHERIT membership still lets the role SET ROLE to the owner.
     let owner = db.new_role("NOLOGIN", &[]).await;
     let member = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
-    admin
-        .batch_execute(&format!(
-            "{} GRANT {owner} TO {member} WITH INHERIT FALSE;",
-            give_the_database_to(owner.clone())
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "{} GRANT {owner} TO {member} WITH INHERIT FALSE;",
+        give_the_database_to(owner.clone())
+    ))
+    .await;
     assert_eq!(problems(&db.store_as(&member)).await, owns);
 
     let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
@@ -474,13 +469,10 @@ async fn a_role_that_can_set_a_setting_only_a_superuser_may_is_refused() {
         return;
     };
     let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
-    db.admin()
-        .await
-        .batch_execute(&format!(
-            "GRANT SET ON PARAMETER session_replication_role, log_statement, work_mem TO {role}"
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "GRANT SET ON PARAMETER session_replication_role, log_statement, work_mem TO {role}"
+    ))
+    .await;
     assert_eq!(
         problems(&db.store_as(&role)).await,
         vec![
@@ -508,15 +500,12 @@ async fn a_role_that_can_change_a_setting_with_alter_system_is_refused() {
     // NOINHERIT membership still lets the role SET ROLE to the other.
     let other = db.new_role("NOLOGIN", &[]).await;
     let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
-    db.admin()
-        .await
-        .batch_execute(&format!(
-            "GRANT ALTER SYSTEM ON PARAMETER session_replication_role, fsync TO {role};
-             GRANT ALTER SYSTEM ON PARAMETER archive_command TO {other};
-             GRANT {other} TO {role} WITH INHERIT FALSE;"
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "GRANT ALTER SYSTEM ON PARAMETER session_replication_role, fsync TO {role};
+         GRANT ALTER SYSTEM ON PARAMETER archive_command TO {other};
+         GRANT {other} TO {role} WITH INHERIT FALSE;"
+    ))
+    .await;
     assert_eq!(
         problems(&db.store_as(&role)).await,
         vec![
@@ -569,12 +558,15 @@ async fn wide_role(db: &TestDatabase) -> String {
              GRANT SELECT (version) ON switchboard_audit.migrations TO {wide};
              CREATE SEQUENCE switchboard_audit.extra;
              GRANT USAGE ON SEQUENCE switchboard_audit.extra TO {wide};
-             GRANT CREATE ON DATABASE {} TO {wide};
-             GRANT SET ON PARAMETER session_replication_role TO {wide};",
+             GRANT CREATE ON DATABASE {} TO {wide};",
             db.name()
         ))
         .await
         .unwrap();
+    db.cluster_wide(&format!(
+        "GRANT SET ON PARAMETER session_replication_role TO {wide}"
+    ))
+    .await;
     wide
 }
 
@@ -603,13 +595,10 @@ async fn a_role_that_can_set_role_to_a_wide_role_without_inheriting_it_is_refuse
     };
     let wide = wide_role(&db).await;
     let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
-    db.admin()
-        .await
-        .batch_execute(&format!(
-            "GRANT {wide} TO {role} WITH INHERIT FALSE, SET TRUE"
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "GRANT {wide} TO {role} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .await;
     assert_eq!(
         problems(&db.store_as(&role)).await,
         what_the_wide_role_holds(&db)
@@ -636,11 +625,7 @@ async fn a_noinherit_role_that_can_become_a_wide_role_is_refused() {
     grant_the_gateways_own(&db, &role, "").await;
     // With its own privileges given to it directly, it passes.
     db.store_as(&role).check_at_boot().await.unwrap();
-    db.admin()
-        .await
-        .batch_execute(&format!("GRANT {wide} TO {role}"))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!("GRANT {wide} TO {role}")).await;
     assert_eq!(
         problems(&db.store_as(&role)).await,
         what_the_wide_role_holds(&db)
@@ -716,11 +701,8 @@ async fn a_role_that_can_reach_the_servers_files_or_programs_is_refused() {
             ],
         )
         .await;
-    db.admin()
-        .await
-        .batch_execute(&format!("GRANT {writer} TO {role} WITH INHERIT FALSE"))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!("GRANT {writer} TO {role} WITH INHERIT FALSE"))
+        .await;
     let found = problems(&db.store_as(&role)).await;
     let roles: Vec<&str> = found
         .iter()
@@ -1177,13 +1159,11 @@ async fn a_session_a_default_puts_in_replica_mode_is_refused() {
 
     // A default for the role in this database.
     let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
-    admin
-        .batch_execute(&format!(
-            "ALTER ROLE {role} IN DATABASE {} SET session_replication_role = replica",
-            db.name()
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "ALTER ROLE {role} IN DATABASE {} SET session_replication_role = replica",
+        db.name()
+    ))
+    .await;
     let store = db.store_as(&role);
     assert_eq!(replication_role(&store).await, "replica");
     assert_eq!(problems(&store).await, vec![Problem::ReplicaSession]);
@@ -1247,11 +1227,8 @@ async fn a_session_without_the_stores_settings_is_refused() {
         return;
     };
     let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
-    db.admin()
-        .await
-        .batch_execute(&format!("ALTER ROLE {role} SET synchronous_commit = off"))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!("ALTER ROLE {role} SET synchronous_commit = off"))
+        .await;
     // The store's own sessions override the role's default.
     let mut store = db.store_as(&role);
     store.check_at_boot().await.unwrap();

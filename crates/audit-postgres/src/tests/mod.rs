@@ -27,8 +27,9 @@ const URL_VARIABLE: &str = "SWITCHBOARD_TEST_DATABASE_URL";
 /// value for tests only, never a credential.
 const DUMMY_PASSWORD: &str = "dummy-password-for-tests-only";
 
-/// Tests run in parallel. Creating databases and changing the cluster-wide roles is done one
-/// test at a time, because two sessions updating one role at once fail.
+/// Tests run in parallel. Creating databases, and changing the roles, memberships and grants on
+/// settings that the whole server shares, is done one test at a time, because two sessions
+/// updating one row of a shared catalog at once fail ("tuple concurrently updated").
 static SETUP: Mutex<()> = Mutex::const_new(());
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -122,6 +123,16 @@ impl TestDatabase {
     /// A session as `role`.
     pub(crate) async fn connect_as(&self, role: &str) -> Client {
         connect(&self.config_as(role)).await
+    }
+
+    /// Runs `sql` in this database as the server's superuser, one test at a time. For
+    /// statements that change what the whole server shares: roles, memberships, role defaults
+    /// and grants on settings. Two sessions changing one row of a shared catalog at once fail,
+    /// as two tests granting on one setting do, or one granting while another's teardown
+    /// revokes.
+    pub(crate) async fn cluster_wide(&self, sql: &str) {
+        let _one_at_a_time = SETUP.lock().await;
+        self.admin().await.batch_execute(sql).await.unwrap();
     }
 
     /// A store connected as the gateway's role.

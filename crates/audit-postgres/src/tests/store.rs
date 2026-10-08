@@ -523,14 +523,11 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
-    let admin = db.admin().await;
-    admin
-        .batch_execute(&format!(
-            "ALTER ROLE {GATEWAY_ROLE} IN DATABASE {} SET synchronous_commit = off",
-            db.name()
-        ))
-        .await
-        .unwrap();
+    db.cluster_wide(&format!(
+        "ALTER ROLE {GATEWAY_ROLE} IN DATABASE {} SET synchronous_commit = off",
+        db.name()
+    ))
+    .await;
     async fn show(client: &Client) -> String {
         client
             .query_one("SHOW synchronous_commit", &[])
