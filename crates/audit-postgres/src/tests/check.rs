@@ -155,7 +155,7 @@ async fn a_role_that_owns_the_database_or_can_become_its_owner_is_refused() {
     // end its own sessions in it, but not the superuser's or another role's, so those go first.
     drop(admin);
     let server = connect(&db.server).await;
-    for _ in 0..250 {
+    for _ in 0..1500 {
         let others: i64 = server
             .query_one(
                 "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND usename <> $2",

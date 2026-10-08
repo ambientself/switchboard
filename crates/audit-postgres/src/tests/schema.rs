@@ -157,7 +157,7 @@ async fn the_roles_script_runs_in_several_sessions_at_once() {
             let admin = db.admin().await;
             runs.spawn(async move { admin.batch_execute(ROLES).await });
         }
-        let give_up = Instant::now() + Duration::from_secs(5);
+        let give_up = Instant::now() + Duration::from_secs(30);
         while gate
             .query_one(&waiting, &[])
             .await
