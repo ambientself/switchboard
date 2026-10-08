@@ -1699,3 +1699,88 @@ async fn a_definer_function_that_reaches_the_table_through_another_is_refused() 
         assert_eq!(rows(&db).await, 0, "{purge}");
     }
 }
+
+/// EXECUTE on `lo_export` writes any file the server's operating-system user can write, and
+/// `pg_read_file` and the others read or list them, as membership in `pg_write_server_files`
+/// or `pg_read_server_files` would. Each is refused, for every argument list, whether the role
+/// holds it or can SET ROLE to one that does.
+#[tokio::test]
+async fn a_role_that_can_run_a_function_that_reaches_the_servers_files_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let other = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.cluster_wide(&format!("GRANT {other} TO {role} WITH INHERIT FALSE"))
+        .await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "GRANT EXECUTE ON FUNCTION pg_catalog.lo_export(oid, text) TO {role};
+             GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO {other};"
+        ))
+        .await
+        .unwrap();
+    let store = db.store_as(&role);
+    assert_eq!(
+        problems(&store).await,
+        vec![
+            Problem::ServerFunction {
+                function: "pg_catalog.lo_export(oid, text)".into()
+            },
+            Problem::ServerFunction {
+                function: "pg_catalog.pg_read_file(text)".into()
+            },
+        ]
+    );
+    // What the check refuses is real: the role reads a file of the server's own.
+    let session = db.connect_as(&role).await;
+    session
+        .batch_execute(&format!("SET ROLE {other}"))
+        .await
+        .unwrap();
+    let version: String = session
+        .query_one("SELECT pg_read_file('PG_VERSION')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(version.trim().parse::<u32>().is_ok(), "{version}");
+
+    // Every function the check names that this server has, with each of its argument lists.
+    let names = [
+        "lo_export",
+        "lo_import",
+        "pg_ls_dir",
+        "pg_read_binary_file",
+        "pg_read_file",
+        "pg_stat_file",
+    ];
+    let all: Vec<String> = admin
+        .query(
+            "SELECT 'pg_catalog.' || proname || '(' || pg_get_function_identity_arguments(oid)
+                    || ')'
+             FROM pg_catalog.pg_proc
+             WHERE pronamespace = 'pg_catalog'::regnamespace AND proname::text = ANY($1)
+             ORDER BY 1",
+            &[&names.as_slice()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(all.len() > names.len(), "{all:?}");
+    for function in &all {
+        admin
+            .batch_execute(&format!("GRANT EXECUTE ON FUNCTION {function} TO {other}"))
+            .await
+            .unwrap();
+    }
+    let expected: Vec<Problem> = all
+        .iter()
+        .map(|function| Problem::ServerFunction {
+            function: function.clone(),
+        })
+        .collect();
+    assert_eq!(problems(&store).await, expected);
+}

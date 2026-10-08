@@ -126,6 +126,24 @@ const SERVER_ROLES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The catalog's functions that read or write the server's own files, as the roles in
+/// [`SERVER_ROLES`] do. Each is revoked from PUBLIC when the server is created, and an
+/// administrator can grant it. `lo_export` writes any file the server's operating-system user
+/// can write, `postgresql.auto.conf` among them, which reaches every session at the next
+/// reload. The `pg_file_*` functions are adminpack's, which PostgreSQL 17 no longer has.
+const SERVER_FUNCTIONS: &[&str] = &[
+    "lo_export",
+    "lo_import",
+    "pg_ls_dir",
+    "pg_read_binary_file",
+    "pg_read_file",
+    "pg_stat_file",
+    "pg_file_rename",
+    "pg_file_sync",
+    "pg_file_unlink",
+    "pg_file_write",
+];
+
 /// Every relation whose rules read or write `call_rows`, given as `$1`, directly or through
 /// another such relation, in any schema, `call_rows` included: a view or materialized view
 /// over it, and a table or view with a rule whose action reaches it. A view's query is a rule,
@@ -292,6 +310,13 @@ pub enum Problem {
         /// How the session can run it.
         by: String,
     },
+    /// The session's role, or a role it can become, can run a catalog function that reads or
+    /// writes the server's own files, such as `lo_export`, which writes any file the server's
+    /// operating-system user can write.
+    ServerFunction {
+        /// The function, with its schema and argument types.
+        function: String,
+    },
     /// The session's role lacks a privilege the store needs.
     Missing {
         /// The privilege.
@@ -409,6 +434,11 @@ impl fmt::Display for Problem {
                 "the SECURITY DEFINER function {function} runs as {owner}, which can read or \
                  change switchboard_audit.call_rows, and this session's role, or a role it can \
                  become, holds {by}"
+            ),
+            Self::ServerFunction { function } => write!(
+                f,
+                "this session's role, or a role it can become, can run {function}, which \
+                 reaches the database server's own files"
             ),
             Self::Missing { privilege, object } => write!(
                 f,
@@ -589,6 +619,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
         reaching_privileges(client, table, version, &mut problems).await?;
         definers(client, table, version, &mut problems).await?;
     }
+    server_functions(client, &mut problems).await?;
 
     if problems.is_empty() {
         Ok(())
@@ -1196,6 +1227,31 @@ async fn definers(
         function: row.get(0),
         owner: row.get(1),
         by: row.get(2),
+    }));
+    Ok(())
+}
+
+/// None of [`SERVER_FUNCTIONS`] may be run by the session's role or a role it can become.
+async fn server_functions(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}
+                 FROM pg_catalog.pg_proc p
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                 WHERE fn.nspname = 'pg_catalog' AND p.proname::text = ANY($1::text[])
+                     AND {}
+                 ORDER BY 1",
+                by_any_role("has_function_privilege(r.oid, p.oid, 'EXECUTE')"),
+            ),
+            &[&SERVER_FUNCTIONS],
+        )
+        .await?;
+    problems.extend(found.into_iter().map(|row| Problem::ServerFunction {
+        function: row.get(0),
     }));
     Ok(())
 }

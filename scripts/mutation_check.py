@@ -1450,6 +1450,7 @@ for site, test in [
     ("reaching-table", "has_table_privilege(r.oid, v.oid, p)"),
     ("reaching-column", "has_any_column_privilege(r.oid, v.oid, p)"),
     ("definer-execute", "has_function_privilege(r.oid, d.oid, 'EXECUTE')"),
+    ("server-function", "has_function_privilege(r.oid, p.oid, 'EXECUTE')"),
 ]:
     mutate(f"pg-check-{site}-own-role-only", f"the {site} privilege check asks only of the session's role", PG_CHECK,
            f'"{test}"', f'"r.rolname = current_user AND {test}"')
@@ -1502,6 +1503,14 @@ mutate("pg-check-definer-chain-execute-not-followed", "a definer function that r
        "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
 mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
+mutate("pg-check-server-functions-ignored", "a role that can run a function reaching the server's files passes the check", PG_CHECK,
+       "    problems.extend(found.into_iter().map(|row| Problem::ServerFunction {",
+       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::ServerFunction {")
+# The pg_file_* functions are adminpack's, which PostgreSQL 17, the version the tests run on,
+# no longer has, so nothing can catch their removal.
+for server_function in ["lo_export", "lo_import", "pg_ls_dir", "pg_read_binary_file", "pg_read_file", "pg_stat_file"]:
+    mutate(f"pg-check-{server_function.replace('_', '-')}-ignored", f"a role that can run {server_function} passes the check", PG_CHECK,
+           f'    "{server_function}",\n', "")
 
 
 # --- Running -------------------------------------------------------------------------------
