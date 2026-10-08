@@ -164,7 +164,9 @@ lines only once the interfaces between them have settled.
 | `connector-github` | GitHub tools, and the client for the key custodian. |
 | `otto-adapter` | Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
-| `gateway` | The proxy binary: HTTP handler, boot gates, wiring. |
+| `gateway-mcp` | The MCP protocol adapter: JSON-RPC envelopes, the two revisions, header checks, rendering. No policy types. |
+| `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, wiring. |
+| `gateway-dev` | The gateway on the test fakes (`switchboard-dev`), a scripted client, and the end-to-end tests. |
 | `registry` | The control-plane binary, once it exists. |
 | `conformance` | The black-box suite, a fake vendor API and a fake MCP server. |
 
@@ -810,8 +812,11 @@ Checked before a socket is bound. Identity and audit each have four states:
 | Identity | Starts; callers must prove themselves. | Starts with a loud warning. | Refuses to start. | Refuses, as a contradiction. |
 | Audit | Starts; every call recorded. | Starts with a loud warning. | Refuses to start. | Refuses, as a contradiction. |
 
-A partly configured gate is refused. A connector that is partly configured refuses to start; an
-unconfigured one is absent from every surface.
+A partly configured gate is refused. A connector that is partly configured refuses to start. A
+connector that is not configured must be absent from every surface: a snapshot that puts one of
+its tools on a surface refuses to start, rather than starting with that tool dropped, so a tool
+the policy serves is either served or loudly refused, never silently missing. A snapshot loaded
+later is held to the same rule.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The

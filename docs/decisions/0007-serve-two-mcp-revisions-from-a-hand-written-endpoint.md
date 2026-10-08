@@ -1,8 +1,8 @@
 # 0007: Serve two MCP revisions from a hand-written endpoint
 
-Date: 2026-10-01. Status: accepted. Settles the part of Q13 that milestone 1 needs: the MCP
-revision and the first client. Changes one consequence of
-[decision 0001](0001-build-on-axum-not-pingora.md).
+Date: 2026-10-01, amended 2026-10-07 (the amendment is at the end). Status: accepted. Settles
+the part of Q13 that milestone 1 needs: the MCP revision and the first client. Changes one
+consequence of [decision 0001](0001-build-on-axum-not-pingora.md).
 
 ## Context
 
@@ -70,3 +70,25 @@ Facts checked against the specification, the Rust SDK and Claude Code's document
   varies by the caller's authorization, which that revision allows, and never by connection.
 - Host and origin checks are this project's to implement, and are configured explicitly.
 - Open in Q13 and unaffected: employees' clients, sign-in, token audience and private access.
+
+## Amended 2026-10-07: choices made for the HTTP path
+
+The owner made these choices when the HTTP path (#26) was planned. They were first recorded
+only in code comments, numbered after that plan's own questions, which clash with the numbers
+in [open-questions.md](../open-questions.md). They are recorded here instead.
+
+1. **One code for every refusal, for now.** A policy denial, a connector's scope refusal, an
+   audit failure and an identity failure all use `-32001`, in both eras. The sentence tells
+   them apart, and an identity failure is also a 401. Giving each kind its own code is a
+   change to this decision.
+2. **`server/discover` lists only `2026-07-28`.** A client that wants `2025-06-18` starts with
+   `initialize`, as that era requires.
+3. **A tool that ran and failed is answered with a result, not an error:** `isError: true`,
+   with the tool's message as text, so the model sees what went wrong. Its row records the
+   outcome `error`. JSON-RPC errors are kept for refusals and for requests the gateway could
+   not take.
+4. **No client may cache a tool list.** `tools/list` and `server/discover` are answered with a
+   `ttlMs` of zero, so a withdrawn tool is gone from the next list.
+5. **With identity disabled, nothing is listed and every `tools/call` is refused,** with a
+   sentence that says why, and no row is written. Design section 17, under #26, names what
+   replaces this: reads served, with rows whose identity is `disabled`.

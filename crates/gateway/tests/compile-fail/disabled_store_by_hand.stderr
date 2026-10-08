@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+ --> tests/compile-fail/disabled_store_by_hand.rs:7:38
+  |
+7 |     let _store = DisabledAuditStore::new();
+  |                                      ^^^ private associated function
+  |
+ ::: src/audit.rs
+  |
+  |     pub(crate) fn new() -> Self {
+  |     --------------------------- private associated function defined here

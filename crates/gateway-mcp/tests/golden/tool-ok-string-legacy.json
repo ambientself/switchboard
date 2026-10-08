@@ -1,0 +1,19 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "content": [
+        {
+          "text": "\"plain\"",
+          "type": "text"
+        }
+      ],
+      "isError": false
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

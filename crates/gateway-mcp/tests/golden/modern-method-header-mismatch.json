@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32020,
+      "message": "Header mismatch: Mcp-Method header value 'tools/call' does not match body value 'tools/list'"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 400
+}

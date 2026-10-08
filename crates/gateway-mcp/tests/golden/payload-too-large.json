@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32600,
+      "message": "Payload too large"
+    },
+    "id": null,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 413
+}

@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32601,
+      "message": "Method not found: resources/list is not served under 2025-06-18"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

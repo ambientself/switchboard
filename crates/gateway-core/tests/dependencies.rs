@@ -3,30 +3,65 @@
 //! An allowlist rather than a denylist of HTTP, MCP, database and async-runtime crates: a
 //! denylist only names the crates someone thought of. Adding a dependency to the core means
 //! adding it here, in the same change, where a reviewer sees it.
+//!
+//! The manifest is read as Cargo reads it, through `cargo metadata`, so every dependency that
+//! is not a dev-dependency is checked: normal and build dependencies, those under a
+//! `[target.…]` table however its header is spelled, and each under the package it resolves to,
+//! not the name the manifest gives it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-const MANIFEST: &str = include_str!("../Cargo.toml");
+use serde_json::{Value, json};
 
 const ALLOWED: [&str; 3] = ["serde", "serde_json", "thiserror"];
 
-/// The crate names in one `[section]` of the manifest.
-fn section(name: &str) -> Vec<String> {
-    let header = format!("[{name}]");
-    MANIFEST
-        .lines()
-        .skip_while(|line| line.trim() != header)
-        .skip(1)
-        .take_while(|line| !line.trim_start().starts_with('['))
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.split(['=', '.']).next().unwrap().trim().to_owned())
+/// Every dependency of this crate that is not a dev-dependency, as `cargo metadata` gives it.
+fn built_with() -> Vec<Value> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+            "--manifest-path",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == json!(env!("CARGO_PKG_NAME")))
+        .unwrap();
+    package["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|dependency| dependency["kind"] != json!("dev"))
+        .cloned()
+        .collect()
+}
+
+/// The packages this crate is built with, by the names they are published under.
+fn packages() -> Vec<String> {
+    built_with()
+        .iter()
+        .map(|dependency| dependency["name"].as_str().unwrap().to_owned())
         .collect()
 }
 
 #[test]
 fn the_core_depends_only_on_allowed_crates() {
-    let dependencies = section("dependencies");
-    assert!(!dependencies.is_empty(), "found no [dependencies] section");
+    let dependencies = packages();
+    assert!(!dependencies.is_empty(), "found no dependencies");
     let unexpected: Vec<&String> = dependencies
         .iter()
         .filter(|name| !ALLOWED.contains(&name.as_str()))
@@ -35,14 +70,4 @@ fn the_core_depends_only_on_allowed_crates() {
         unexpected.is_empty(),
         "gateway-core must not depend on {unexpected:?}; the core performs no I/O"
     );
-}
-
-#[test]
-fn the_core_has_no_other_kind_of_dependency() {
-    for kind in ["build-dependencies", "target", "dependencies."] {
-        assert!(
-            !MANIFEST.contains(&format!("[{kind}")),
-            "gateway-core has a [{kind}] section, which this test does not check"
-        );
-    }
 }

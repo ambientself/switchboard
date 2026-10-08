@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32020,
+      "message": "Header mismatch: Mcp-Name header value does not match body value params.name"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 400
+}

@@ -1,0 +1,28 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "_meta": {
+        "io.modelcontextprotocol/serverInfo": {
+          "name": "switchboard",
+          "version": "0.1.0"
+        }
+      },
+      "cacheScope": "public",
+      "capabilities": {
+        "tools": {}
+      },
+      "instructions": "Dummy instructions for the golden files.",
+      "resultType": "complete",
+      "supportedVersions": [
+        "2026-07-28"
+      ],
+      "ttlMs": 0
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32601,
+      "message": "Method not found: ping is not served under 2026-07-28"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 404
+}
