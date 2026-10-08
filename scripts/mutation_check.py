@@ -1349,8 +1349,6 @@ mutate("pg-check-schema-create-ignored", "CREATE on the schema passes the check"
        "        if schema.get::<_, bool>(1) {", "        if false {")
 mutate("pg-check-database-create-ignored", "CREATE on the database passes the check", PG_CHECK,
        "    if database.get::<_, bool>(1) {", "    if false {")
-mutate("pg-check-replication-role-ignored", "a role that may set session_replication_role passes the check", PG_CHECK,
-       "        if can_set {", "        if false {")
 mutate("pg-check-session-settings-ignored", "a session without the store's settings passes the check", PG_CHECK,
        "        if found != *expected {\n            problems.push(Problem::SessionSetting {",
        "        if false {\n            problems.push(Problem::SessionSetting {")
@@ -1360,6 +1358,17 @@ mutate("pg-check-unlogged-table-ignored", "an unlogged table that is not partiti
        "             WHERE (c.oid = $1::oid\n", "             WHERE (false\n")
 mutate("pg-check-unlogged-partition-ignored", "an unlogged partition passes the check", PG_CHECK,
        "OR c.oid IN (SELECT relid", "OR false AND c.oid IN (SELECT relid")
+mutate("pg-check-parameter-grants-ignored", "a role holding a grant on a setting passes the check", PG_CHECK,
+       "    if version >= 150_000 {", "    if false {")
+mutate("pg-check-alter-system-ignored", "a role that may change a setting with ALTER SYSTEM passes the check", PG_CHECK,
+       "unnest(ARRAY['ALTER SYSTEM', 'SET']) AS p", "unnest(ARRAY['SET']) AS p")
+mutate("pg-check-setting-set-ignored", "a role that may set a setting only a superuser may set passes the check", PG_CHECK,
+       "OR NOT EXISTS (SELECT FROM pg_catalog.pg_settings s", "OR false AND NOT EXISTS (SELECT FROM pg_catalog.pg_settings s")
+mutate("pg-check-replication-role-only", "SET is refused on session_replication_role alone", PG_CHECK,
+       "OR NOT EXISTS (SELECT FROM pg_catalog.pg_settings s",
+       "OR a.parname = 'session_replication_role' AND NOT EXISTS (SELECT FROM pg_catalog.pg_settings s")
+mutate("pg-check-user-setting-set-refused", "SET on a setting any role may set is refused", PG_CHECK,
+       "AND s.context = 'user'", "AND false")
 for privilege in ["TRUNCATE", "REFERENCES", "TRIGGER"]:
     mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
            f'        "{privilege}",\n', "")
@@ -1397,7 +1406,7 @@ for site, test in [
     ("schema-create", "has_schema_privilege(r.oid, n.oid, 'CREATE')"),
     ("schema-grant-option", "has_schema_privilege(r.oid, n.oid, 'USAGE WITH GRANT OPTION')"),
     ("database-create", "has_database_privilege(r.oid, current_database(), 'CREATE')"),
-    ("replication-role", "has_parameter_privilege(r.oid, 'session_replication_role', 'SET')"),
+    ("parameter", "has_parameter_privilege(r.oid, a.parname, p)"),
 ]:
     mutate(f"pg-check-{site}-own-role-only", f"the {site} privilege check asks only of the session's role", PG_CHECK,
            f'"{test}"', f'"r.rolname = current_user AND {test}"')

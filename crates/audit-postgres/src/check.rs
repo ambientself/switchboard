@@ -401,8 +401,10 @@ impl PgAuditStore {
     ///   whether or not it is inherited, since `SET ROLE` reaches a role that is not. So none
     ///   holds the store's privileges with grant option; none holds anything on the table as a
     ///   whole, so none can DELETE, TRUNCATE or add a trigger; none can CREATE in the schema or
-    ///   the database; none holds anything on any other table or sequence in the schema; and
-    ///   none can set `session_replication_role`, which would silence the trigger.
+    ///   the database; none holds anything on any other table or sequence in the schema; none
+    ///   can set a setting only a superuser may set, such as `session_replication_role`, which
+    ///   would silence both triggers; and none can change any setting with `ALTER SYSTEM`,
+    ///   which reaches every session at the next reload.
     ///
     /// Has no time limit: wrap it in one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {
@@ -897,24 +899,34 @@ async fn other_privileges(
         });
     }
 
-    // From version 15 a role can be granted the right to set a superuser setting.
+    // From version 15 a role can be granted the right to set a setting only a superuser may
+    // set, such as session_replication_role, which silences both triggers, and the right to
+    // change any setting with ALTER SYSTEM. A setting changed that way reaches every session,
+    // the store's own already checked among them, at the next reload: fsync off, or
+    // session_replication_role = replica, or archive_command, which runs a program on the
+    // server. Every such grant is in pg_parameter_acl. SET on a setting any role may set adds
+    // nothing.
     if version >= 150_000 {
-        let can_set: bool = client
-            .query_one(
+        let held = client
+            .query(
                 &format!(
-                    "SELECT {}",
-                    by_any_role(
-                        "has_parameter_privilege(r.oid, 'session_replication_role', 'SET')"
-                    )
+                    "SELECT a.parname, p
+                     FROM pg_catalog.pg_parameter_acl a,
+                         unnest(ARRAY['ALTER SYSTEM', 'SET']) AS p
+                     WHERE (p = 'ALTER SYSTEM'
+                            OR NOT EXISTS (SELECT FROM pg_catalog.pg_settings s
+                                           WHERE s.name = a.parname AND s.context = 'user'))
+                         AND {}
+                     ORDER BY 1, 2",
+                    by_any_role("has_parameter_privilege(r.oid, a.parname, p)")
                 ),
                 &[],
             )
-            .await?
-            .get(0);
-        if can_set {
+            .await?;
+        for row in held {
             problems.push(Problem::Extra {
-                privilege: "SET".into(),
-                object: "the setting session_replication_role".into(),
+                privilege: row.get(1),
+                object: format!("the setting {}", row.get::<_, String>(0)),
             });
         }
     }

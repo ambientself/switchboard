@@ -437,8 +437,11 @@ async fn any_privilege_on_another_table_in_the_schema_is_refused() {
     );
 }
 
+/// SET on `session_replication_role` silences both triggers, and SET on any other setting only
+/// a superuser may set is as far from what the gateway needs. SET on a setting any role may set
+/// adds nothing.
 #[tokio::test]
-async fn a_role_that_can_silence_the_trigger_is_refused() {
+async fn a_role_that_can_set_a_setting_only_a_superuser_may_is_refused() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
@@ -446,14 +449,65 @@ async fn a_role_that_can_silence_the_trigger_is_refused() {
     db.admin()
         .await
         .batch_execute(&format!(
-            "GRANT SET ON PARAMETER session_replication_role TO {role}"
+            "GRANT SET ON PARAMETER session_replication_role, log_statement, work_mem TO {role}"
         ))
         .await
         .unwrap();
     assert_eq!(
         problems(&db.store_as(&role)).await,
-        vec![extra("SET", "the setting session_replication_role")]
+        vec![
+            extra("SET", "the setting log_statement"),
+            extra("SET", "the setting session_replication_role"),
+        ]
     );
+    // What the check refuses is real: the role turns both triggers off for its session.
+    db.connect_as(&role)
+        .await
+        .batch_execute("SET session_replication_role = replica")
+        .await
+        .unwrap();
+}
+
+/// A setting changed with ALTER SYSTEM reaches every session at the next reload, whoever
+/// reloads, including the store's own sessions that already passed the check:
+/// `session_replication_role = replica` silences both triggers, `fsync = off` loses committed
+/// rows, and `archive_command` runs a program on the server.
+#[tokio::test]
+async fn a_role_that_can_change_a_setting_with_alter_system_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    // NOINHERIT membership still lets the role SET ROLE to the other.
+    let other = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "GRANT ALTER SYSTEM ON PARAMETER session_replication_role, fsync TO {role};
+             GRANT ALTER SYSTEM ON PARAMETER archive_command TO {other};
+             GRANT {other} TO {role} WITH INHERIT FALSE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&db.store_as(&role)).await,
+        vec![
+            extra("ALTER SYSTEM", "the setting archive_command"),
+            extra("ALTER SYSTEM", "the setting fsync"),
+            extra("ALTER SYSTEM", "the setting session_replication_role"),
+        ]
+    );
+    // What the check refuses is real: the role writes the server's configuration. It writes the
+    // value fsync already has, and takes it out again, so the server is as it was.
+    let session = db.connect_as(&role).await;
+    session
+        .batch_execute("ALTER SYSTEM SET fsync = on")
+        .await
+        .unwrap();
+    session
+        .batch_execute("ALTER SYSTEM RESET fsync")
+        .await
+        .unwrap();
 }
 
 /// Grants `role` the gateway's own privileges directly, as the migration grants them to the
