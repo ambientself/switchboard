@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway::{Config, ResourceAdapter, Wiring, boot, serve_with_shutdown};
+use gateway::{Config, ResourceAdapter, Timeouts, Wiring, boot, serve_with_timeouts};
 use gateway_core::{ApprovedTool, IDENTITY_FAILURE, Resources};
 use gateway_mcp::{CHALLENGE, DENIAL_CODE};
 use gateway_testkit::{
@@ -49,6 +49,10 @@ pub struct Server {
 
 impl Server {
     pub async fn start() -> Self {
+        Self::start_with(Timeouts::default()).await
+    }
+
+    pub async fn start_with(timeouts: Timeouts) -> Self {
         let fixture = Fixture::new().unwrap();
         let credentials = Arc::new(FakeCredentialSource::new());
         let connector = Arc::new(FixtureConnector::new(credentials.clone()));
@@ -62,9 +66,14 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
-        let serving = tokio::spawn(serve_with_shutdown(listener, gates, async {
-            let _ = stopped.await;
-        }));
+        let serving = tokio::spawn(serve_with_timeouts(
+            listener,
+            gates,
+            async {
+                let _ = stopped.await;
+            },
+            timeouts,
+        ));
         Self {
             fixture,
             store,

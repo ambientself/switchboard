@@ -1,8 +1,10 @@
 //! The HTTP endpoint: `POST /mcp/{surface}` over the [`RequestPath`].
 //!
 //! [`serve`] takes a bound listener and the [`Gates`], so nothing is served for a configuration
-//! that did not pass the boot gates. Each request goes through these steps, and each step
-//! answers before the next one runs:
+//! that did not pass the boot gates. A connection has [`HEADER_READ_TIMEOUT`] to send each
+//! request's line and headers, or it is closed: nothing below runs until they have arrived, so
+//! this is what bounds a client that has proved nothing. Each request then goes through these
+//! steps, and each step answers before the next one runs:
 //!
 //! 1. **Host**: the one `Host` header, without its port, must be in `http.allowed_hosts`.
 //!    Otherwise 403. This and the next check stop a web page from reaching the gateway through
@@ -14,14 +16,16 @@
 //!    that excludes JSON is 406.
 //! 4. **Declared size**: a `Content-Length` over [`MAX_BODY_BYTES`] is 413.
 //! 5. **Identity**, from the headers alone ([`RequestPath::admit`]). The body has not been read.
-//! 6. **The body** is read, up to [`MAX_BODY_BYTES`]; a body that grows past it is 413.
+//! 6. **The body** is read, up to [`MAX_BODY_BYTES`]; a body that grows past it is 413, and one
+//!    that has not arrived within [`BODY_READ_TIMEOUT`] is 408.
 //! 7. **The answer** ([`RequestPath::respond`]) runs on its own task, which the handler waits
 //!    for. A client that disconnects drops the handler, but not that task, so a tool call that
 //!    started still completes its audit row.
 //!
-//! Shutting down waits for those tasks too, not only for the connections still open: a call
-//! whose client has gone is still running, and a process that exited under it would leave its
-//! row open.
+//! Shutting down stops taking connections, and waits up to [`SHUTDOWN_GRACE`] for those still
+//! open, such as one whose client stopped part way through a request. It then waits for the
+//! answer tasks, however long they take: a call whose client has gone is still running, and a
+//! process that exited under it would leave its row open.
 //!
 //! Every request is logged once it is answered, with its status and how long it took. A
 //! disabled gate is logged at boot, and again every [`DISABLED_GATE_REMINDER`] while the
@@ -29,6 +33,7 @@
 
 use std::future::Future;
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,10 +43,14 @@ use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::response::Response;
 use axum::routing::any;
 use gateway_mcp::{HttpResponse, INTERNAL_ERROR, Rejection};
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
+use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
 use http::request::Parts;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -55,18 +64,65 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// How often a disabled gate is logged again while the gateway serves.
 pub const DISABLED_GATE_REMINDER: Duration = Duration::from_secs(60);
 
-/// Serves `gates` on `listener` until the listener fails.
+/// How long a connection may take to send a request's line and headers before it is closed.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a request's body may take to arrive once identity has passed. Longer is 408.
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long shutting down waits for connections still open before it stops waiting for them.
+/// Answer tasks already running are waited for however long they take.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// The time limits the server applies. [`Timeouts::default`] is [`HEADER_READ_TIMEOUT`],
+/// [`BODY_READ_TIMEOUT`] and [`SHUTDOWN_GRACE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeouts {
+    /// How long a connection may take to send a request's line and headers.
+    pub header_read: Duration,
+    /// How long a request's body may take to arrive once identity has passed.
+    pub body_read: Duration,
+    /// How long shutting down waits for connections still open.
+    pub shutdown_grace: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            header_read: HEADER_READ_TIMEOUT,
+            body_read: BODY_READ_TIMEOUT,
+            shutdown_grace: SHUTDOWN_GRACE,
+        }
+    }
+}
+
+/// Serves `gates` on `listener`, with the default [`Timeouts`], until the process ends.
 pub async fn serve(listener: TcpListener, gates: Gates) -> io::Result<()> {
     serve_with_shutdown(listener, gates, std::future::pending()).await
 }
 
-/// Serves `gates` on `listener` until `shutdown` completes, then stops taking connections and
-/// returns once the requests in flight are answered and every tool call started has completed
-/// its audit row, including calls whose clients have gone.
+/// Serves `gates` on `listener`, with the default [`Timeouts`], until `shutdown` completes. See
+/// [`serve_with_timeouts`].
 pub async fn serve_with_shutdown<F>(
     listener: TcpListener,
     gates: Gates,
     shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_with_timeouts(listener, gates, shutdown, Timeouts::default()).await
+}
+
+/// Serves `gates` on `listener` until `shutdown` completes, then stops taking connections. It
+/// returns once the connections still open have closed, or `timeouts.shutdown_grace` has
+/// passed, and every tool call started has completed its audit row, including calls whose
+/// clients have gone.
+pub async fn serve_with_timeouts<F>(
+    listener: TcpListener,
+    gates: Gates,
+    shutdown: F,
+    timeouts: Timeouts,
 ) -> io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -83,17 +139,48 @@ where
     let path = RequestPath::new(gates);
     let reminder = tokio::spawn(remind(path.clone()));
     let answers = Answers::default();
-    let served = axum::serve(
-        listener,
-        router(Endpoint {
-            path,
-            answers: answers.clone(),
-        }),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await;
+    let service = TowerToHyperService::new(router(Endpoint {
+        path,
+        answers: answers.clone(),
+        body_read: timeouts.body_read,
+    }));
+    let mut http = http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(timeouts.header_read);
+    let connections = GracefulShutdown::new();
+    let mut shutdown = pin!(shutdown);
+    loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(error) => {
+                    accept_failed(&error).await;
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+        let connection =
+            connections.watch(http.serve_connection(TokioIo::new(stream), service.clone()));
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "a connection ended with an error");
+            }
+        });
+    }
+    drop(listener);
     reminder.abort();
     tracing::info!(%address, "stopped listening");
+    if tokio::time::timeout(timeouts.shutdown_grace, connections.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            %address,
+            grace_ms = u64::try_from(timeouts.shutdown_grace.as_millis()).unwrap_or(u64::MAX),
+            "stopped waiting for connections still open after the grace period"
+        );
+    }
     let running = answers.running();
     if running > 0 {
         tracing::info!(
@@ -103,14 +190,32 @@ where
         );
     }
     answers.finished().await;
-    served
+    Ok(())
 }
 
-/// What the endpoint's handler holds: the request path, and the answers it has started.
+/// A connection that could not be accepted. One the client reset or aborted is its own
+/// problem; anything else, such as running out of file descriptors, is logged and waited out
+/// for a second, so the loop does not spin.
+async fn accept_failed(error: &io::Error) {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    ) {
+        return;
+    }
+    tracing::error!(%error, "cannot accept a connection");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// What the endpoint's handler holds: the request path, the answers it has started, and how
+/// long a body may take.
 #[derive(Clone)]
 struct Endpoint {
     path: RequestPath,
     answers: Answers,
+    body_read: Duration,
 }
 
 /// Counts the answer tasks that are running, whether or not anyone is still waiting for them.
@@ -230,7 +335,12 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
         // The surface in the URL does not decode to text, so it names no surface.
         return not_found();
     };
-    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+    let reading = axum::body::to_bytes(body, MAX_BODY_BYTES);
+    let Ok(read) = tokio::time::timeout(endpoint.body_read, reading).await else {
+        tracing::debug!("the request body did not arrive in time");
+        return request_timeout();
+    };
+    let body = match read {
         Ok(body) => body,
         Err(error) => {
             let error = error.into_inner();
@@ -357,6 +467,17 @@ fn unreadable() -> HttpResponse {
     HttpResponse {
         status: StatusCode::BAD_REQUEST,
         headers: HeaderMap::new(),
+        body: Vec::new(),
+    }
+}
+
+/// The body did not arrive within [`Timeouts::body_read`].
+fn request_timeout() -> HttpResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    HttpResponse {
+        status: StatusCode::REQUEST_TIMEOUT,
+        headers,
         body: Vec::new(),
     }
 }

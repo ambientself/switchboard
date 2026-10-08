@@ -14,13 +14,15 @@
 
 use serde_json::{Value, json};
 
-const ALLOWED: [&str; 12] = [
+const ALLOWED: [&str; 14] = [
     "axum",
     "gateway-core",
     "gateway-identity",
     "gateway-mcp",
     "http",
     "http-body-util",
+    "hyper",
+    "hyper-util",
     "serde",
     "serde_json",
     "thiserror",

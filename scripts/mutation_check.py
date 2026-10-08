@@ -1421,6 +1421,16 @@ mutate("gw-body-unlimited", "a body with no declared length is read whatever its
 mutate("gw-body-read-before-identity", "the body is read before identity is checked", GW_SERVER, ADMIT,
        "    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {\n"
        "        Ok(body) => Body::from(body),\n        Err(_) => return unreadable(),\n    };\n" + ADMIT)
+mutate("gw-head-timeout-unset", "a request's head may take hyper's default 30 seconds, not the configured time", GW_SERVER,
+       "    http.timer(TokioTimer::new())\n        .header_read_timeout(timeouts.header_read);\n",
+       "    http.timer(TokioTimer::new());\n")
+mutate("gw-head-timeout-no-timer", "the head's deadline is configured with no timer to run it", GW_SERVER,
+       "    http.timer(TokioTimer::new())\n        .header_read_timeout(", "    http.header_read_timeout(")
+mutate("gw-body-read-untimed", "a body may take an hour to arrive", GW_SERVER,
+       "tokio::time::timeout(endpoint.body_read, reading)", "tokio::time::timeout(Duration::from_secs(3600), reading)")
+mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour for a connection that stopped part way", GW_SERVER,
+       "tokio::time::timeout(timeouts.shutdown_grace, connections.shutdown())",
+       "tokio::time::timeout(Duration::from_secs(3600), connections.shutdown())")
 mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
        "    match tokio::spawn(answering.instrument(span)).await {",
        "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")

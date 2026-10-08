@@ -20,6 +20,11 @@ gateway-mcp = { path = "../gateway-mcp" }
 http = "1"
 # Tells a body over the size limit apart from one that could not be read.
 http-body-util = "0.1"
+# The connection loop. axum's own sets no deadline for a request's head, so a client that sends
+# half of one holds its connection, and shutting down, for as long as it likes. Both are
+# already in the build through axum.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
