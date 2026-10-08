@@ -2570,7 +2570,12 @@ mutate("demo-driver-row-check-counts-nothing", "the row check passes whatever ro
 mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
        '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
 mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
-       "  for team in team-a team-b; do\n    can_i_no", "  for team in team-a; do\n    can_i_no")
+       "  for team in team-a team-b; do\n    for verb in get list watch; do\n",
+       "  for team in team-a; do\n    for verb in get list watch; do\n")
+mutate("demo-driver-secrets-get-only", "only get is checked on secrets and configuration, not list or watch", DRIVER,
+       "    for verb in get list watch; do\n", "    for verb in get; do\n")
+mutate("demo-driver-no-node-proxy", "the node proxy is not checked", DRIVER,
+       '      can_i_no "$team" "$verb" nodes --subresource=proxy\n', "      :\n")
 mutate("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked", DRIVER,
        "        for subresource in exec portforward proxy; do\n", "        for subresource in exec; do\n")
 mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", DRIVER,

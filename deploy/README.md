@@ -63,10 +63,14 @@ must connect and get 401 from the server; after it, a new pod's direct call must
 it.
 
 Network policy does not see what reaches a pod through the API server: exec, port-forward,
-and the pod and Service proxy routes. The operator checks ask `kubectl auth can-i` for each of
-these, with `create` and `get`, in `mock-docs` and `switchboard`, for each team's workload, and
-require `no`. They also check that neither workload can read the two namespaces' secrets or the
-gateway's configuration, start pods, or mint the gateway's tokens.
+and the pod, Service and node proxy routes. The operator checks ask `kubectl auth can-i` for
+each of these, with `create` and `get`, in `mock-docs` and `switchboard` (the node proxy is
+cluster-wide), for each team's workload, and require `no`. They also check that neither
+workload can get, list or watch the two namespaces' secrets or the gateway's configuration
+(list and watch return a Secret's data too), start pods in its own namespace, or mint the
+gateway's tokens. That is 29 checks per team. Decision 0010's other controls (attach, ephemeral
+containers, impersonation, bind and escalate on roles, and controllers that create pods) are
+not checked yet.
 
 ## Stopping the gateway
 

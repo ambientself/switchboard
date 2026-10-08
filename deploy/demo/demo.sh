@@ -411,19 +411,30 @@ can_i_no() {
 }
 
 # operator_checks: what each team's workload may not do through the cluster API. Reading the
-# gateway's or the server's secrets and configuration, starting pods, and minting the
-# gateway's tokens would each reach the server without the gateway. So would the API server's
-# own routes to a pod or Service: exec, port-forward and the proxy. Their traffic comes from the
-# API server, not the workload's pod, so the network policy does not stop it. Each route is
-# checked for mock-docs and for the gateway, with both verbs a request through it can use.
+# gateway's or the server's secrets, or the gateway's configuration, starting pods, and minting
+# the gateway's tokens would each reach the server without the gateway. So would the API
+# server's own routes to a pod, a Service or a node: exec, port-forward and the proxy. Their
+# traffic comes from the API server, not the workload's pod, so the network policy does not stop
+# it. Reading is checked as get, list and watch, since list and watch return a Secret's data
+# too. Each pod and Service route is checked for mock-docs and for the gateway, and the node
+# proxy for the cluster, with both verbs a request through it can use.
+#
+# Not checked here (decision 0010's other controls, left to a follow-up issue): attach,
+# ephemeral containers, impersonation, bind and escalate on roles, and controllers that create
+# pods (Deployments, Jobs and the like).
 operator_checks() {
   local team ns verb subresource
   for team in team-a team-b; do
-    can_i_no "$team" get secrets -n switchboard
-    can_i_no "$team" get secrets -n mock-docs
-    can_i_no "$team" get configmaps -n switchboard
+    for verb in get list watch; do
+      can_i_no "$team" "$verb" secrets -n switchboard
+      can_i_no "$team" "$verb" secrets -n mock-docs
+      can_i_no "$team" "$verb" configmaps -n switchboard
+    done
     can_i_no "$team" create pods -n "$team"
     can_i_no "$team" create serviceaccounts --subresource=token -n switchboard
+    for verb in create get; do
+      can_i_no "$team" "$verb" nodes --subresource=proxy
+    done
     for ns in mock-docs switchboard; do
       for verb in create get; do
         for subresource in exec portforward proxy; do
@@ -540,7 +551,7 @@ kind_run() {
   step "identity: a ServiceAccount not in the team manifest"
   kind_workload "stranger" team-a stranger-workload refused
 
-  step "operator checks: neither team's workload may read the gateway's or mock-docs' secrets, start pods, mint the gateway's tokens, or exec, port-forward or proxy to either"
+  step "operator checks: neither team's workload may get, list or watch the gateway's or mock-docs' secrets or the gateway's configuration, start pods in its namespace, mint the gateway's tokens, exec, port-forward or proxy to either, or proxy to a node"
   operator_checks
 
   step "the server never saw a workload token through the gateway, and no denied call reached it"

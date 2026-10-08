@@ -610,10 +610,21 @@ fn with_can_i(name: &str, answer: &str, body: &str) -> (Run, Vec<String>) {
 fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy() {
     let (run, calls) = with_can_i("can-i-no", "no", "operator_checks");
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    let called = |call: &str| calls.iter().any(|line| line == call);
-    let passed = |check: &str| run.stdout.lines().any(|line| line == check);
+    let mut expected = Vec::new();
     for team in ["team-a", "team-b"] {
-        let account = format!("--as=system:serviceaccount:{team}:mock-workload");
+        let mut asks = Vec::new();
+        // Reading a secret or the gateway's configuration: list and watch return the data too.
+        for verb in ["get", "list", "watch"] {
+            asks.push(format!("{verb} secrets -n switchboard"));
+            asks.push(format!("{verb} secrets -n mock-docs"));
+            asks.push(format!("{verb} configmaps -n switchboard"));
+        }
+        asks.push(format!("create pods -n {team}"));
+        asks.push("create serviceaccounts --subresource=token -n switchboard".to_owned());
+        // The API server's routes, whose traffic network policy does not see.
+        for verb in ["create", "get"] {
+            asks.push(format!("{verb} nodes --subresource=proxy"));
+        }
         for ns in ["mock-docs", "switchboard"] {
             for verb in ["create", "get"] {
                 for route in [
@@ -622,24 +633,29 @@ fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy(
                     "pods --subresource=proxy",
                     "services --subresource=proxy",
                 ] {
-                    let call = format!("k auth can-i {verb} {route} -n {ns} {account}");
-                    assert!(called(&call), "{call}\n{}", run.transcript());
-                    let check = format!("PASS {team}'s workload may not: {verb} {route} -n {ns}");
-                    assert!(passed(&check), "{check}\n{}", run.transcript());
+                    asks.push(format!("{verb} {route} -n {ns}"));
                 }
             }
         }
-        for rest in [
-            "get secrets -n switchboard".to_owned(),
-            "get secrets -n mock-docs".to_owned(),
-            "get configmaps -n switchboard".to_owned(),
-            format!("create pods -n {team}"),
-            "create serviceaccounts --subresource=token -n switchboard".to_owned(),
-        ] {
-            let call = format!("k auth can-i {rest} {account}");
-            assert!(called(&call), "{call}\n{}", run.transcript());
+        assert_eq!(asks.len(), 29);
+        for ask in asks {
+            let check = format!("PASS {team}'s workload may not: {ask}");
+            assert!(
+                run.stdout.lines().any(|line| line == check),
+                "{check}\n{}",
+                run.transcript()
+            );
+            expected.push(format!(
+                "k auth can-i {ask} --as=system:serviceaccount:{team}:mock-workload"
+            ));
         }
     }
+    // Exactly these, and each once: 29 per team, 58 in all.
+    let mut called = calls.clone();
+    called.sort();
+    expected.sort();
+    assert_eq!(called, expected, "{}", run.transcript());
+    assert_eq!(called.len(), 58);
 
     // A yes, or no answer at all, fails the check.
     for answer in ["yes", "''"] {
