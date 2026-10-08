@@ -11,10 +11,12 @@
 //! failure sentence, which no decision produces, is re-exported as
 //! [`IDENTITY_FAILURE`](crate::IDENTITY_FAILURE).
 //!
-//! Every value put into a sentence passes through [`safe`]: control characters, non-ASCII,
+//! Every value put into a sentence passes through [`escape`]: control characters, non-ASCII,
 //! backticks and backslashes are escaped and the length is capped, because some of these
 //! values (the tool and surface a request names, a resource identifier) are chosen by the
-//! caller.
+//! caller. It is public, as [`gateway_core::escape`](crate::escape), so a value that never
+//! reaches a sentence or a row, such as the issuer a refused token claims, is escaped the same
+//! way.
 
 use crate::classification::Classification;
 use crate::decision::{DelegationProblem, Reason, ResourceProblem};
@@ -252,13 +254,13 @@ enum Piece<'a> {
     Rendered(&'a Rendered),
 }
 
-/// `text` made safe to put inside a sentence or an audit column: printable ASCII stays as it
-/// is, a backtick becomes `` \` `` so it cannot close a code span, a backslash becomes `\\`,
-/// and anything else (newlines, other control characters, non-ASCII) is written as an escape:
-/// `\n`, `\r`, `\t` or `\u{...}`. Because the backslash is escaped too, two different texts
-/// never give the same result unless they were cut. The result is cut at `cap` characters and
-/// marked with `…`, which cannot otherwise appear, since non-ASCII is escaped.
-pub(crate) fn safe(text: &str, cap: usize) -> String {
+/// `text` made safe to put inside a sentence, an audit column or a log line: printable ASCII
+/// stays as it is, a backtick becomes `` \` `` so it cannot close a code span, a backslash
+/// becomes `\\`, and anything else (newlines, other control characters, non-ASCII) is written
+/// as an escape: `\n`, `\r`, `\t` or `\u{...}`. Because the backslash is escaped too, two
+/// different texts never give the same result unless they were cut. The result is cut at `cap`
+/// characters and marked with `…`, which cannot otherwise appear, since non-ASCII is escaped.
+pub fn escape(text: &str, cap: usize) -> String {
     let mut out = String::new();
     let mut length = 0;
     for character in text.chars() {
@@ -297,8 +299,8 @@ fn fill(template: &str, values: &[(&str, Piece<'_>)]) -> Rendered {
         };
         let name = &after[..close];
         match values.iter().find(|(key, _)| *key == name) {
-            Some((_, Piece::Text(value))) => sentence.push_str(&safe(value, MAX_RENDERED)),
-            Some((_, Piece::Capped(value, cap))) => sentence.push_str(&safe(value, *cap)),
+            Some((_, Piece::Text(value))) => sentence.push_str(&escape(value, MAX_RENDERED)),
+            Some((_, Piece::Capped(value, cap))) => sentence.push_str(&escape(value, *cap)),
             Some((_, Piece::Rendered(value))) => sentence.push_str(&value.0),
             None => sentence.push_str(&rest[open..open + close + 2]),
         }
@@ -378,37 +380,37 @@ mod tests {
     }
 
     #[test]
-    fn safe_escapes_what_is_not_printable_ascii() {
-        assert_eq!(safe("org/repo-1_A.b", 64), "org/repo-1_A.b");
-        assert_eq!(safe("a b", 64), "a b");
-        assert_eq!(safe("a\nb", 64), "a\\nb");
-        assert_eq!(safe("a\rb\tc\u{0}", 64), "a\\rb\\tc\\u{0}");
-        assert_eq!(safe("a`b", 64), "a\\`b");
-        assert_eq!(safe("caf\u{e9}", 64), "caf\\u{e9}");
-        assert_eq!(safe("\u{202e}", 64), "\\u{202e}");
-        assert_eq!(safe("a\\b", 64), "a\\\\b");
+    fn escape_handles_what_is_not_printable_ascii() {
+        assert_eq!(escape("org/repo-1_A.b", 64), "org/repo-1_A.b");
+        assert_eq!(escape("a b", 64), "a b");
+        assert_eq!(escape("a\nb", 64), "a\\nb");
+        assert_eq!(escape("a\rb\tc\u{0}", 64), "a\\rb\\tc\\u{0}");
+        assert_eq!(escape("a`b", 64), "a\\`b");
+        assert_eq!(escape("caf\u{e9}", 64), "caf\\u{e9}");
+        assert_eq!(escape("\u{202e}", 64), "\\u{202e}");
+        assert_eq!(escape("a\\b", 64), "a\\\\b");
     }
 
     /// Texts that differ before escaping differ after it: a backslash is escaped, so a
     /// literal `\n` and a newline are told apart.
     #[test]
-    fn safe_keeps_different_texts_different() {
+    fn escape_keeps_different_texts_different() {
         for (one, other) in [
             ("a\nb", "a\\nb"),
             ("a`b", "a\\`b"),
             ("\u{e9}", "\\u{e9}"),
             ("\\", "\\\\"),
         ] {
-            assert_ne!(safe(one, 64), safe(other, 64), "{one:?} and {other:?}");
+            assert_ne!(escape(one, 64), escape(other, 64), "{one:?} and {other:?}");
         }
     }
 
     #[test]
-    fn safe_caps_the_length() {
-        assert_eq!(safe("abcdef", 4), "abcd…");
-        assert_eq!(safe("abcd", 4), "abcd");
-        assert_eq!(safe("ab\ncd", 3), "ab…");
-        let long = safe(&"x".repeat(10_000), MAX_RENDERED);
+    fn escape_caps_the_length() {
+        assert_eq!(escape("abcdef", 4), "abcd…");
+        assert_eq!(escape("abcd", 4), "abcd");
+        assert_eq!(escape("ab\ncd", 3), "ab…");
+        let long = escape(&"x".repeat(10_000), MAX_RENDERED);
         assert_eq!(long.chars().count(), MAX_RENDERED + 1);
     }
 
