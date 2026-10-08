@@ -1272,8 +1272,12 @@ mutate_all(
     ("crates/gateway/Cargo.toml", "\n[lints]\n",
      "\n[ target.'cfg(all())'.dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n"),
 )
-mutate("gw-dependency-testkit-renamed", "the gateway builds with the testkit under an allowed name", "crates/gateway/Cargo.toml",
-       "\n[lints]\n", "\n[ build-dependencies ]\nserde = { package = \"gateway-testkit\", path = \"../gateway-testkit\" }\n\n[lints]\n")
+# A dependency renamed to an allowed name cannot be shown here: every allowed name is already a
+# dependency, and Cargo refuses one name for two packages. The fences compare the package each
+# entry resolves to, which is what a rename would change.
+mutate("gw-dependency-testkit-as-build-dependency", "the gateway builds with the testkit, under a build-dependencies table spelled with spaces",
+       "crates/gateway/Cargo.toml",
+       "\n[lints]\n", "\n[ build-dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n")
 
 
 # The binary checks its configuration before it binds a socket.
