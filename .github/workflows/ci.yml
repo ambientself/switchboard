@@ -8,23 +8,31 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's run in progress. A push to main gets
+# a group of its own, keyed by its commit, so every commit that lands on main gets a finished
+# result.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Actions are pinned to full commit SHAs, with the release tag in a trailing comment.
+# Dependabot (.github/dependabot.yml) opens pull requests that move both together.
 jobs:
   rust:
     name: Format, lint and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The toolchain is the exact version in rust-toolchain.toml, with its components; the
       # compile-fail tests' expected output is tied to it.
       - name: Install the pinned toolchain
         run: |
           rustup toolchain install
           rustc --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
@@ -41,10 +49,14 @@ jobs:
   # lives only for the job. Each test makes its own database and roles and drops them.
   postgres:
     name: Audit store against Postgres
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       postgres:
-        image: postgres:17
+        # Pinned by the digest of the multi-arch index for this tag. Dependabot does not update
+        # images in workflow files, so bump the tag and the digest together by hand; the digest
+        # comes from `docker buildx imagetools inspect postgres:<tag>`.
+        image: postgres:17.11@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
         env:
           # A dummy password for this throwaway service container only. Not a credential.
           POSTGRES_PASSWORD: dummy-ci-password
@@ -58,12 +70,14 @@ jobs:
     env:
       SWITCHBOARD_TEST_DATABASE_URL: postgres://postgres:dummy-ci-password@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install the pinned toolchain
         run: |
           rustup toolchain install
           rustc --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # A test with no server says "skipped" and passes. Here that would mean the job checked
       # nothing, so the job fails if any test says it. --nocapture also puts the latency test's
       # p50 and p95 in the log; they measure a CI runner, not production.
