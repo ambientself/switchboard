@@ -1,6 +1,6 @@
 //! The gateway on the testkit's fakes, for development and for tests.
 //!
-//! Plan #26 section 7: the demo and the end-to-end tests start the gateway the same way.
+//! The demo and the end-to-end tests start the gateway the same way.
 //!
 //! - [`start_fixture_gateway`] runs the real `gateway` (boot gates, request path, HTTP server)
 //!   on `127.0.0.1`, wired to the testkit's world: two [`LocalIssuer`]s on the system clock,

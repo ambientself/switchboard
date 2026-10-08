@@ -1,4 +1,5 @@
-//! The MCP SDK as a client of the fixture gateway (plan #26 section 6, test 6).
+//! The MCP SDK as a client of the fixture gateway (decision 0007: each method served has a
+//! test against the SDK's client).
 //!
 //! `rmcp` 3.5.1 connects in each of its three lifecycle modes:
 //!

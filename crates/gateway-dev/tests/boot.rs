@@ -2,8 +2,7 @@
 //! only with identity and audit each configured or explicitly disabled, and a refused
 //! configuration never gets as far as a listener.
 //!
-//! Plan #26's test 17, on the fixture's configuration. The gates' own table is in the gateway
-//! crate's `tests/boot.rs`.
+//! The gates' own table is in the gateway crate's `tests/boot.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::{Ipv4Addr, SocketAddr};

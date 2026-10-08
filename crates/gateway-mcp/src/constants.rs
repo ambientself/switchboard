@@ -7,7 +7,7 @@ pub const MODERN: &str = "2026-07-28";
 pub const LEGACY: &str = "2025-06-18";
 
 /// The JSON-RPC code for a policy denial, a scope refusal, an audit failure and an identity
-/// failure, in both eras (decision 0007, owner answer Q1 for now).
+/// failure, in both eras (decision 0007 and its 2026-10-07 amendment).
 pub const DENIAL_CODE: i64 = -32001;
 
 /// `HeaderMismatch` (2026-07-28): a mirrored header is missing, malformed, or disagrees with
@@ -33,8 +33,8 @@ pub const INVALID_PARAMS: i64 = -32602;
 /// JSON-RPC: the gateway failed in a way that is not the caller's doing.
 pub const INTERNAL_ERROR: i64 = -32603;
 
-/// How long a client may cache `tools/list` and `server/discover`, in milliseconds. Zero for
-/// now (owner answer Q8): a withdrawn tool must disappear at once.
+/// How long a client may cache `tools/list` and `server/discover`, in milliseconds. Zero
+/// (decision 0007's 2026-10-07 amendment): a withdrawn tool must disappear at once.
 pub const LIST_TTL_MS: u64 = 0;
 
 /// The `WWW-Authenticate` challenge sent with every 401.

@@ -1097,7 +1097,7 @@ fn what_is_not_a_json_post_is_refused_before_identity() {
     assert!(world.store.rows().is_empty());
 }
 
-// --- Identity disabled (owner answer Q4) and audit disabled ----------------------------------
+// --- Identity disabled (decision 0007's 2026-10-07 amendment) and audit disabled ------------
 
 #[test]
 fn with_identity_disabled_nothing_is_listed_every_call_is_refused_and_it_says_so() {

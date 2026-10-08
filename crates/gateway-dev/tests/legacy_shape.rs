@@ -1,6 +1,6 @@
-//! The legacy era as Otto's harness speaks it (plan #26 section 6, test 7): no
-//! `MCP-Protocol-Version` header, no `Accept`, only a content type and a token. Every request
-//! is served, and no answer ever carries an `Mcp-Session-Id`, even to a client that sends one.
+//! The legacy era as Otto's harness speaks it: no `MCP-Protocol-Version` header, no `Accept`,
+//! only a content type and a token. Every request is served, and no answer ever carries an
+//! `Mcp-Session-Id`, even to a client that sends one.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use gateway_core::audit::DecisionKind;

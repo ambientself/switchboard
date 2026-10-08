@@ -1,7 +1,7 @@
 //! The protocol end to end: the 2026-07-28 header checks and the transport's refusals, sent by
 //! a caller with a valid token. None of them reaches the connector or writes a row.
 //!
-//! Plan #26's tests 8 and 9, and test 7's 2025-06-18 shape with no version header.
+//! Also the 2025-06-18 shape with no version header.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
