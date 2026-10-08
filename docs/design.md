@@ -1076,8 +1076,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 **#10, audit and receipts** (the core, the Postgres store built for #10, and the test stores).
 
 - The gateway assigns each row a UUIDv7 and begin takes it, retrying by identifier within its
-  budget. Today the store assigns the identifier with a column default and gives up at the
-  budget.
+  budget. The identifier and begin are built: the gateway makes one UUIDv7 per call before
+  begin, and every store's begin takes it and is idempotent on it, comparing only the
+  decision. The audit table has no default for it, and the gateway's role may insert it. The
+  retry is not built yet: the Postgres store still gives up at the budget.
 - A `BEFORE INSERT` trigger sets the time at begin and the deadline from the database's clock
   and the allowance the gateway supplies, and the deadline is `NOT NULL`. Today the trigger,
   `set_times`, sets the time at begin (and, for a row inserted complete, the completion time)
@@ -1101,15 +1103,16 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
   giving up a guard without running completes its row as `error`. Today a guard can only be
   consumed by running it, and a row whose insert commits after its begin failed stays open.
-- In the core: `begin` takes the identifier; `Begun` gains the answers to a reused key;
+- In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
   `tools_list_is_decide_run_once_per_tool` and `an_opened_world_is_allowed` are restated for
   it (decision 0006, amended 2026-10-07).
-- The core's test store accepts an identical second completion, where today it asserts that a
-  row is never finished twice, and so does the harness's in-memory store. With #25, the
-  in-memory store can also write and then report failure, lose the process between run and
-  finish, and keep the answer budget, so the contract suite runs on it.
+- With #25, the harness's in-memory store can also write and then report failure, lose the
+  process between run and finish, and keep the answer budget, so the contract suite runs on
+  it. Already built for both test stores, the core's and the harness's: an identical second
+  completion is accepted, and a different one is refused with the first standing. The fault
+  modes are not built.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped, but no outcome carries a vendor reference yet.
