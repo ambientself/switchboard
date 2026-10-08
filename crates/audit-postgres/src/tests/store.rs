@@ -217,6 +217,66 @@ async fn rows_read_back_exactly_as_the_core_wrote_them() {
     assert_eq!(outcomes.iter().filter(|o| o.is_none()).count(), 3);
 }
 
+/// The testkit's callers carry no delegation, so the calls above leave the delegation and
+/// acting-person columns empty. A record with every optional value set, each to a value no
+/// other column holds, reads back exactly, so a value written to another column's place is
+/// caught, proved and claimed ones included.
+#[tokio::test]
+async fn a_record_with_every_value_set_reads_back_exactly() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let record = |value: Value| -> AuditRecord { serde_json::from_value(value).unwrap() };
+    let common = |decision: &str| {
+        json!({
+            "tool_use_id": format!("toolu-{decision}"),
+            "deployment": format!("deployment-{decision}"),
+            "surface": format!("surface-{decision}"),
+            "profile": format!("profile-{decision}"),
+            "tool": format!("tool-{decision}"),
+            "connector": format!("connector-{decision}"),
+            "classification": "write",
+            "resources": {"named": [
+                {"system": "system-1", "kind": "kind-1", "identifier": "identifier-1"},
+                {"system": "system-2", "kind": "kind-2", "identifier": "identifier-2"}
+            ]},
+            "resources_omitted": 3,
+            "policy_revision": format!("revision-{decision}"),
+            "proved_delegation_team": format!("delegation-team-{decision}"),
+            "claimed_acting_person": format!("acting-person-{decision}"),
+            "claimed_team": format!("claimed-team-{decision}"),
+            "completion": null
+        })
+    };
+    // An allowed call by a workload, which has a team.
+    let mut allowed = common("allow");
+    allowed["decision"] = json!("allow");
+    allowed["reason"] = json!(null);
+    allowed["sentence"] = json!(null);
+    allowed["proved_principal"] = json!({
+        "id": {"issuer": "issuer-allow", "subject": "subject-allow"},
+        "kind": "workload",
+        "team": "proved-team-allow"
+    });
+    // A denied call by a user, who has groups.
+    let mut denied = common("deny");
+    denied["decision"] = json!("deny");
+    denied["reason"] = json!("classification_not_permitted");
+    denied["sentence"] = json!("sentence-deny");
+    denied["proved_principal"] = json!({
+        "id": {"issuer": "issuer-deny", "subject": "subject-deny"},
+        "kind": "user",
+        "groups": ["group-1", "group-2"]
+    });
+
+    for written in [record(allowed), record(denied)] {
+        let row = store.begin(&written).await.unwrap();
+        assert_eq!(read_back(&admin, &row).await, written);
+    }
+}
+
 #[tokio::test]
 async fn a_call_naming_more_resources_than_a_row_holds_records_how_many_were_left_out() {
     let Some(db) = TestDatabase::create().await else {

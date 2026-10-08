@@ -1179,6 +1179,9 @@ mutate("pg-columns-complete-record-begun", "begin drops a completion it was hand
        "        if record.completion.is_some() {", "        if false {")
 mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
        "record.claimed_team.as_ref().map(|team| team.get().as_str()),", "record.proved_delegation_team.as_ref().map(|team| team.get().as_str()),")
+mutate("pg-insert-delegation-and-acting-person-swapped", "the INSERT writes the proved delegation team and the claimed acting person in each other's columns", PG_COLUMNS,
+       "            &self.proved_delegation_team,\n            &self.claimed_acting_person,\n",
+       "            &self.claimed_acting_person,\n            &self.proved_delegation_team,\n")
 mutate("pg-columns-workload-team-as-group", "a workload's team is written as a group", PG_COLUMNS,
        '                "workload",\n                Some(stored("proved_team", team.as_str())?),\n                None,',
        '                "workload",\n                None,\n                Some(vec![stored("proved_team", team.as_str())?]),')
