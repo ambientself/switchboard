@@ -302,9 +302,10 @@ From the run of 2026-10-07 (93/93):
    and 8.3. Each number is reported as the range over three rounds, not one figure.
 7. **Not measured.** A cold run. A database outage in kind. Sustained load and an exhausted
    begin pool. A gateway restart with calls in flight. Rows that name many resources.
-8. **Unmerged.** Everything here runs from `agent/first-slice`, which stacks unmerged work
-   (#25's harness, #26, #10, #14 and #9) on main. Milestone 2 is not done until those merge
-   and the owner rules on what remains of decisions 0009 and 0010.
+8. **Run before the work merged.** These runs were made from `agent/first-slice`, which then
+   stacked unmerged work (#25's harness, #26, #10, #14 and #9). That work has since merged
+   (#35, #38, #39 and #42), and the later runs in section 11 are from #42's tree. Milestone 2
+   is not done until decisions 0009 and 0010's remaining criteria for the slice land (#47).
 9. **The runs claimed more than some checks tested.** A review of the demo after these runs
    found four. A call to a tool the gateway does not know, such as the withdrawn one, recorded
    `resources` as `[]`, which reads as a call that named nothing, though it named a project.

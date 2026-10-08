@@ -120,9 +120,10 @@ check that the deployment files load.
   the outage left at most that one row open, and that every other allowed row has an outcome.
   The rest of decision 0009's row work (gateway-assigned identifiers, a deadline column, the
   open-row query, `tools/list` rows) is not built.
-- **It runs from an unmerged branch.** `agent/first-slice` stacks #25 (the harness's latest
-  head, PR #35), #26, #10, #14 and #9 work that has not been merged, on top of main with #29
-  and #30.
+- **Decisions 0009 and 0010 ask more of the slice than it has.** The gateway does not yet
+  present its own projected identity to mock-docs, and there is no route-check program and no
+  section 11 signals. Until those land (#47), mock-docs recognises the gateway only by a
+  static dummy credential checked into this repository, compared by its SHA-256.
 
 ## Findings
 
