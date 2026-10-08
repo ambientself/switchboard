@@ -11,6 +11,12 @@
 //! routes a tool to an upstream tool the gateway did not start with. Withdrawing a tool is
 //! always possible.
 //!
+//! A new file that changes the policy must also change its `revision`. Audit rows explain a
+//! decision only by the revision they record, so two different policies served under one
+//! revision would make those rows ambiguous. Such a file is refused and the policy served now
+//! stays. A file whose policy is the same as the one served (a comment edited, say) is fine
+//! with the same revision.
+//!
 //! The file is read by path every time, never through a handle kept open, so an edit that
 //! replaces the file (`sed -i`, a rename, a ConfigMap update swapping a symlink) is seen. Mount
 //! the directory that holds the file, not the file itself: a bind mount of a single file keeps
@@ -42,6 +48,12 @@ pub enum ReloadError {
          serve it"
     )]
     RouteChanged(ToolName),
+    /// The file changes the policy but keeps the revision of the policy served now.
+    #[error(
+        "the registry's policy changed but its revision is still `{0}`; change the revision \
+         with every edit to the policy"
+    )]
+    RevisionUnchanged(PolicyRevision),
     /// The policy fails a boot gate.
     #[error(transparent)]
     Boot(#[from] BootError),
@@ -80,6 +92,10 @@ impl Reloader {
         }
         let policy = ServedPolicy::from_registry(registry).map_err(BootError::from)?;
         check_registry_policy(registry, &policy, &self.basis)?;
+        let served = self.live.current();
+        if policy.revision() == served.revision() && policy != *served {
+            return Err(ReloadError::RevisionUnchanged(policy.revision().clone()));
+        }
         let revision = policy.revision().clone();
         self.live.replace(policy);
         Ok(revision)

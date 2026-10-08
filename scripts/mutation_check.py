@@ -2467,6 +2467,11 @@ mutate("gw-reload-servers-unchecked", "a reload may change a server the connecto
        "        if registry.servers() != started.servers() {", "        if false {")
 mutate("gw-reload-routes-unchecked", "a reload may route a tool somewhere new", RELOAD,
        "            if started.routes().get(tool) != Some(route) {", "            if false {")
+mutate("gw-reload-same-revision-served", "a reload that changes the policy but not its revision is served", RELOAD,
+       "        if policy.revision() == served.revision() && policy != *served {", "        if false {")
+mutate("gw-reload-same-revision-any-change", "a reload under the same revision is refused even if the policy is the same", RELOAD,
+       "        if policy.revision() == served.revision() && policy != *served {",
+       "        if policy.revision() == served.revision() {")
 mutate("gw-reload-gates-skipped", "a reload skips the boot gates", RELOAD,
        "        check_registry_policy(registry, &policy, &self.basis)?;\n", "")
 mutate("gw-reload-never-reads-again", "the watcher never serves a new file", RELOAD,

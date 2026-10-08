@@ -382,6 +382,64 @@ async fn a_new_registry_file_is_served_once_it_passes_and_refused_otherwise() {
 }
 
 #[tokio::test]
+async fn a_new_registry_file_that_changes_the_policy_but_not_its_revision_is_refused() {
+    let world = World::new("same-revision").await;
+    let prepared = world.prepare().await.unwrap();
+    let path = RequestPath::new(prepared.gates);
+    let reloader = prepared.watch.reloader;
+    let team_a = token(TEAM_A_SA);
+    let original = registry(&world.mock.url());
+
+    // The read tool withdrawn and a limit narrowed, both still as demo-1.
+    let withdrawn =
+        withdraw_read_tool(&original).replace("revision = \"demo-2\"", "revision = \"demo-1\"");
+    let narrowed = original.replace(
+        "team-b = [{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
+        "team-b = []",
+    );
+    assert_ne!(narrowed, original);
+    for changed in [withdrawn, narrowed] {
+        let refused = reloader
+            .apply(&Registry::from_toml_str(&changed).unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(&refused, ReloadError::RevisionUnchanged(revision) if revision.as_str() == "demo-1"),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("`demo-1`"), "{refused}");
+    }
+    // The policy served before stays.
+    assert_eq!(listed(&path, &team_a).await, [LIST_TOOL, READ_TOOL]);
+    let team_b = token(TEAM_B_SA);
+    let read = call(
+        &path,
+        &team_b,
+        READ_TOOL,
+        json!({"project": "borealis", "document": "plan"}),
+    )
+    .await;
+    assert!(read.body["result"].is_object(), "{}", read.body);
+
+    // The same policy under the same revision, with only a comment changed, is fine.
+    let commented = original.replace(
+        "# Recorded with every decision made from this file.",
+        "# Recorded with every decision made from this file, as the row's policy_revision.",
+    );
+    assert_ne!(commented, original);
+    let revision = reloader
+        .apply(&Registry::from_toml_str(&commented).unwrap())
+        .unwrap();
+    assert_eq!(revision.as_str(), "demo-1");
+
+    // And a changed policy under a new revision is served.
+    let revision = reloader
+        .apply(&Registry::from_toml_str(&withdraw_read_tool(&original)).unwrap())
+        .unwrap();
+    assert_eq!(revision.as_str(), "demo-2");
+    assert_eq!(listed(&path, &team_a).await, [LIST_TOOL]);
+}
+
+#[tokio::test]
 async fn the_watcher_serves_a_replaced_file_and_keeps_the_old_policy_on_a_broken_one() {
     let world = World::new("watch").await;
     let prepared = world.prepare().await.unwrap();

@@ -15,7 +15,7 @@ use crate::selector::{NO_PROFILE, ProfileSelector};
 
 /// One version of the policy: everything a request reads from it, taken together, so one
 /// request never mixes two versions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedPolicy {
     snapshot: Arc<PolicySnapshot>,
     catalog: ToolCatalog,
@@ -24,7 +24,7 @@ pub struct ServedPolicy {
 }
 
 /// Where profile rules come from.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Selection {
     /// The rules in the JSON configuration: issuer and team, issuer and group.
     Rules(ProfileSelector),
