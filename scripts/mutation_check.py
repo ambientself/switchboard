@@ -1004,6 +1004,12 @@ mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "  
 mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A,
        "            state.rows.push(record.clone());",
        "            state.rows.push(AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() });")
+mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A,
+       "            state.rows.push(record.clone());",
+       "            state.rows.push(AuditRecord { resources_omitted: 0, ..record.clone() });")
+mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A,
+       "            row.completion = Some(completion.completion().clone());",
+       "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted = 0;")
 mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A,
        "            row.completion = Some(completion.completion().clone());",
        "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted += 1;")
