@@ -463,11 +463,20 @@ mutate("snapshot-duplicate-profile", "a profile defined twice is accepted", SRC 
        "return Err(SnapshotError::DuplicateProfile(previous.name));", "let _ = previous;")
 mutate("snapshot-unapproved-tool", "a surface may serve an unapproved tool", SRC + "policy.rs",
        "find(|tool| !tools.contains_key(*tool))", "find(|tool| false && !tools.contains_key(*tool))")
-for struct in ("Surface", "ApprovedTool"):
-    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "policy.rs",
-           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
-for struct in ("AuditRecord", "RecordedResource"):
-    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", SRC + "audit.rs",
+# The policy structs are the gateway configuration's policy section too: the gateway's boot test
+# probes the ones the core's own tests do not.
+for path, struct in [
+    (SRC + "policy.rs", "Surface"),
+    (SRC + "policy.rs", "ApprovedTool"),
+    (SRC + "policy.rs", "SnapshotData"),
+    (SRC + "policy.rs", "Profile"),
+    (SRC + "policy.rs", "ResourceLimits"),
+    (SRC + "policy.rs", "Resource"),
+    (SRC + "principal.rs", "PrincipalId"),
+    (SRC + "audit.rs", "AuditRecord"),
+    (SRC + "audit.rs", "RecordedResource"),
+]:
+    mutate(f"unknown-fields-{struct}", f"{struct} accepts unknown fields", path,
            f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
 mutate_all(
     "surface-restriction-default",
@@ -487,8 +496,8 @@ mutate_all(
 mutate_all(
     "principal-id-ignores-issuer",
     "principal identifiers compare, order and hash by subject alone",
-    (SRC + "principal.rs", "#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]\npub struct PrincipalId {",
-     "#[derive(Clone, Debug, Serialize, Deserialize)]\npub struct PrincipalId {"),
+    (SRC + "principal.rs", "#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct PrincipalId {",
+     "#[derive(Clone, Debug, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct PrincipalId {"),
     (SRC + "principal.rs", "/// What kind of caller a principal is, and the facts that come with that kind.",
      "impl PartialEq for PrincipalId {\n    fn eq(&self, o: &Self) -> bool {\n        self.subject == o.subject\n    }\n}\nimpl Eq for PrincipalId {}\n"
      "impl PartialOrd for PrincipalId {\n    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {\n        Some(self.cmp(o))\n    }\n}\n"
@@ -1714,7 +1723,8 @@ mutate("gw-catalog-schema-not-checked", "an input schema that is not an object s
        "    let _ = schema;\n    true")
 
 # Every struct the gateway's own configuration sections nest refuses a key it does not know. The
-# policy section is gateway-core's snapshot; its structs are not covered here yet (#41).
+# policy section is gateway-core's snapshot; its structs are mutated with the core's, under "The
+# snapshot".
 for path, struct in [
     (GW + "config.rs", "Config"),
     (GW + "config.rs", "IdentitySection"),

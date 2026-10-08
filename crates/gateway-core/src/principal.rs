@@ -13,6 +13,7 @@ use crate::proof::Claimed;
 /// different callers. Equality, ordering and hashing all include the issuer, so a principal
 /// from one cluster can never be mistaken for one from another.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalId {
     /// The issuer that vouched for the subject.
     pub issuer: Issuer,
