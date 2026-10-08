@@ -1369,6 +1369,10 @@ mutate("pg-check-replication-role-only", "SET is refused on session_replication_
        "OR a.parname = 'session_replication_role' AND NOT EXISTS (SELECT FROM pg_catalog.pg_settings s")
 mutate("pg-check-user-setting-set-refused", "SET on a setting any role may set is refused", PG_CHECK,
        "AND s.context = 'user'", "AND false")
+for relkind, kind in [("v", "view"), ("m", "materialized-view"), ("f", "foreign-table")]:
+    kinds = ", ".join(f"'{k}'" for k in ["r", "p", "v", "m", "f"] if k != relkind)
+    mutate(f"pg-check-{kind}-ignored", f"a grant on a {kind.replace('-', ' ')} in the schema passes the check", PG_CHECK,
+           "c.relkind IN ('r', 'p', 'v', 'm', 'f')", f"c.relkind IN ({kinds})")
 for privilege in ["TRUNCATE", "REFERENCES", "TRIGGER"]:
     mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
            f'        "{privilege}",\n', "")

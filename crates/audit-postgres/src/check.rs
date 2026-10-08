@@ -401,10 +401,10 @@ impl PgAuditStore {
     ///   whether or not it is inherited, since `SET ROLE` reaches a role that is not. So none
     ///   holds the store's privileges with grant option; none holds anything on the table as a
     ///   whole, so none can DELETE, TRUNCATE or add a trigger; none can CREATE in the schema or
-    ///   the database; none holds anything on any other table or sequence in the schema; none
-    ///   can set a setting only a superuser may set, such as `session_replication_role`, which
-    ///   would silence both triggers; and none can change any setting with `ALTER SYSTEM`,
-    ///   which reaches every session at the next reload.
+    ///   the database; none holds anything on any other table, view or sequence in the schema;
+    ///   none can set a setting only a superuser may set, such as `session_replication_role`,
+    ///   which would silence both triggers; and none can change any setting with
+    ///   `ALTER SYSTEM`, which reaches every session at the next reload.
     ///
     /// Has no time limit: wrap it in one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {

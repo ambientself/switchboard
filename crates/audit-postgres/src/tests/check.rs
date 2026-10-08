@@ -414,6 +414,8 @@ async fn a_role_that_cannot_use_the_schema_is_refused() {
     );
 }
 
+/// A view over call_rows would show the gateway the columns its own grants withhold, such as
+/// who called; so would a materialized view; and a foreign table may reach anywhere.
 #[tokio::test]
 async fn any_privilege_on_another_table_in_the_schema_is_refused() {
     let Some(db) = TestDatabase::create().await else {
@@ -424,15 +426,31 @@ async fn any_privilege_on_another_table_in_the_schema_is_refused() {
         .batch_execute(&format!(
             "GRANT SELECT (version) ON switchboard_audit.migrations TO {GATEWAY_ROLE};
              CREATE SEQUENCE switchboard_audit.extra;
-             GRANT USAGE ON SEQUENCE switchboard_audit.extra TO {GATEWAY_ROLE};"
+             GRANT USAGE ON SEQUENCE switchboard_audit.extra TO {GATEWAY_ROLE};
+             SET ROLE {OWNER_ROLE};
+             CREATE VIEW switchboard_audit.who AS
+                 SELECT id, proved_subject FROM switchboard_audit.call_rows;
+             CREATE MATERIALIZED VIEW switchboard_audit.who_then AS
+                 SELECT id, proved_subject FROM switchboard_audit.call_rows;
+             GRANT SELECT ON switchboard_audit.who, switchboard_audit.who_then
+                 TO {GATEWAY_ROLE};
+             RESET ROLE;
+             CREATE FOREIGN DATA WRAPPER switchboard_test_wrapper;
+             CREATE SERVER switchboard_test_server FOREIGN DATA WRAPPER switchboard_test_wrapper;
+             CREATE FOREIGN TABLE switchboard_audit.elsewhere (id uuid)
+                 SERVER switchboard_test_server;
+             GRANT SELECT (id) ON switchboard_audit.elsewhere TO {GATEWAY_ROLE};"
         ))
         .await
         .unwrap();
     assert_eq!(
         problems(&db.store(PoolSizes::default())).await,
         vec![
+            extra("SELECT", "switchboard_audit.elsewhere"),
             extra("USAGE", "switchboard_audit.extra"),
             extra("SELECT", "switchboard_audit.migrations"),
+            extra("SELECT", "switchboard_audit.who"),
+            extra("SELECT", "switchboard_audit.who_then"),
         ]
     );
 }
