@@ -1095,6 +1095,10 @@ mutate("pg-trigger-finished-at-not-set", "the database does not set the completi
 mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_SQL,
        "CREATE TRIGGER complete_once\n    BEFORE UPDATE ON switchboard_audit.call_rows\n"
        "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
+mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_SQL,
+       "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $complete_once$", "    LANGUAGE plpgsql\nAS $complete_once$")
+mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_SQL,
+       "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $set_times$", "    LANGUAGE plpgsql\nAS $set_times$")
 mutate("pg-grant-insert-begun-at", "the gateway may write the begin time", PG_SQL,
        "    tool_use_id, deployment, surface, profile, tool, connector, classification,\n",
        "    begun_at, tool_use_id, deployment, surface, profile, tool, connector, classification,\n")

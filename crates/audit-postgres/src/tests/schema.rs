@@ -526,6 +526,60 @@ async fn an_insert_cannot_choose_its_times_whoever_writes() {
     assert_eq!(code(&error), Some(NOT_NULL_VIOLATION), "{error}");
 }
 
+/// Both trigger functions look names up in `pg_catalog` alone. Otherwise a role that can write
+/// the table, and puts a schema holding functions of its own before `pg_catalog`, would change
+/// what the triggers do: here a `-` that makes every two rows look alike, so a completion may
+/// write any column, and a clock that says it is 2000.
+#[tokio::test]
+async fn the_triggers_use_the_catalogs_own_functions_whatever_the_search_path() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(
+            "CREATE FUNCTION public.all_alike(jsonb, text[]) RETURNS jsonb
+                 LANGUAGE sql AS $$SELECT '{}'::jsonb$$;
+             CREATE OPERATOR public.- (
+                 LEFTARG = jsonb, RIGHTARG = text[], FUNCTION = public.all_alike);
+             CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz
+                 LANGUAGE sql AS $$SELECT '2000-01-01T00:00:00Z'::timestamptz$$;",
+        )
+        .await
+        .unwrap();
+    let owner = db.connect_as(OWNER_ROLE).await;
+    owner
+        .batch_execute("SET search_path = public, pg_catalog")
+        .await
+        .unwrap();
+    // A plain statement in this session finds the stand-ins.
+    let shadowed: bool = owner
+        .query_one(
+            "SELECT '{\"a\": 1}'::jsonb - ARRAY['b'] = '{}'::jsonb
+                 AND clock_timestamp() < '2001-01-01T00:00:00Z'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(shadowed);
+
+    // The triggers do not.
+    let id = insert_row(&owner, &insert(&[])).await;
+    assert_eq!(times(&owner, &id).await, (true, None));
+    let error = owner
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows SET outcome = 'ok', latency_ms = 1,
+                 tool = 'fixture__other' WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(message(&error).contains("only the completion"), "{error}");
+}
+
 #[tokio::test]
 async fn the_database_sets_both_times() {
     let Some(db) = TestDatabase::create().await else {
