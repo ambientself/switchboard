@@ -960,3 +960,33 @@ async fn a_session_a_default_puts_in_replica_mode_is_refused() {
             .contains("session_replication_role = replica")
     );
 }
+
+/// In a database that is not UTF8, a character the encoding cannot hold fails the whole
+/// insert, and the core ends every shortened value with one.
+#[tokio::test]
+async fn a_database_that_is_not_utf8_is_refused() {
+    let Some(db) = TestDatabase::create_with(
+        "ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0",
+    )
+    .await
+    else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    assert_eq!(
+        problems(&store).await,
+        vec![Problem::Encoding {
+            found: "LATIN1".into()
+        }]
+    );
+    // What the check refuses is real.
+    let error = store
+        .begin
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT $1::text", &[&"shortened\u{2026}"])
+        .await
+        .unwrap_err();
+    assert_eq!(super::code(&error), Some("22P05"), "{error}");
+}

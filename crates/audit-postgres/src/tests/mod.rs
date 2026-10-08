@@ -45,6 +45,11 @@ pub(crate) struct TestDatabase {
 impl TestDatabase {
     /// `None`, after saying so, when no test server is configured.
     pub(crate) async fn create() -> Option<Self> {
+        Self::create_with("").await
+    }
+
+    /// The same, with `options` after `CREATE DATABASE` and its name, such as an encoding.
+    pub(crate) async fn create_with(options: &str) -> Option<Self> {
         let Ok(url) = std::env::var(URL_VARIABLE) else {
             eprintln!("skipped: {URL_VARIABLE} is not set");
             return None;
@@ -73,7 +78,7 @@ impl TestDatabase {
                 .await
                 .unwrap();
             server
-                .batch_execute(&format!("CREATE DATABASE {}", database.name))
+                .batch_execute(&format!("CREATE DATABASE {} {options}", database.name))
                 .await
                 .unwrap();
             let admin = database.admin().await;

@@ -185,6 +185,12 @@ pub enum Problem {
     /// database default can set it, so a trigger enabled for ordinary sessions, as both of the
     /// table's are, does not fire.
     ReplicaSession,
+    /// The database's encoding is not UTF8, so a row carrying a character the encoding cannot
+    /// hold, such as the `…` the core ends a shortened value with, would not be written.
+    Encoding {
+        /// The encoding the database has.
+        found: String,
+    },
     /// The session's role, or a role it can become, has an attribute that lets it around the
     /// grants or the trigger.
     RoleAttribute {
@@ -272,6 +278,11 @@ impl fmt::Display for Problem {
                  enabled as the migration enables both does not fire; a role or database \
                  default may set it"
             ),
+            Self::Encoding { found } => write!(
+                f,
+                "the database's encoding is {found}, not UTF8, so a row with a character \
+                 {found} cannot hold would not be written"
+            ),
             Self::RoleAttribute { role, attribute } => write!(
                 f,
                 "the role {role}, which this session is or can become, has {attribute}"
@@ -335,6 +346,7 @@ impl PgAuditStore {
     /// and do not serve if it fails.
     ///
     /// - The server syncs commits to disk: `fsync` and `full_page_writes` are on.
+    /// - The database's encoding is UTF8, so it holds every character a row may carry.
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
     ///   two triggers, enabled: the one that sets both times at insert, and the one that
     ///   completes a row at most once.
@@ -371,7 +383,8 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
         .query_one(
             "SELECT current_user::text, session_user::text,
                     current_setting('server_version_num')::int,
-                    current_setting('session_replication_role')",
+                    current_setting('session_replication_role'),
+                    current_setting('server_encoding')",
             &[],
         )
         .await?;
@@ -379,6 +392,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     let logged_in: String = session.get(1);
     let version: i32 = session.get(2);
     let replication_role: String = session.get(3);
+    let encoding: String = session.get(4);
 
     // Every check below asks about the current role. A session can return to the role it
     // logged in as, so the two must be the same.
@@ -398,6 +412,9 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     // itself: being able to set it is refused below.
     if replication_role == "replica" {
         problems.push(Problem::ReplicaSession);
+    }
+    if encoding != "UTF8" {
+        problems.push(Problem::Encoding { found: encoding });
     }
 
     role_attributes(client, &mut problems).await?;
