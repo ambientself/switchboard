@@ -20,8 +20,9 @@
 //!   adapter, profile selection, the decision, the audit row and the connector, from a
 //!   request's method, headers and body to its HTTP response.
 //! - [`serve`] is the HTTP endpoint, `POST /mcp/{surface}`, over a listener and the [`Gates`]:
-//!   the host and origin checks, the body limit, and a task per answer, so a client that
-//!   disconnects cannot cut a tool call off from its audit row.
+//!   the host and origin checks, the body limit, time limits on a request's head and body, and
+//!   a task per answer, so a client that disconnects cannot cut a tool call off from its audit
+//!   row.
 //! - [`telemetry::init`] sends logs to standard output as JSON lines.
 //!
 //! The `switchboard` binary reads a configuration file, runs the boot gates and serves. It has
