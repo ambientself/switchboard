@@ -26,6 +26,8 @@ cannot show that, and these numbers do not change it.
   (6 changes), because kubelet takes that long to update a mounted ConfigMap.
 - **Run time.** `demo.sh compose` took 21 s and `demo.sh kind` took 44 s, both warm. A cold
   run was not measured.
+- **After the review's fixes** (section 8). Both runs pass again from `a509ec9`: Compose
+  89/89 and kind 139/139. Nothing needed fixing.
 
 ## Where and how
 
@@ -300,4 +302,49 @@ From the run of 2026-10-07 (93/93):
    after these runs:* such a row records `"unknown"`; the driver matches every row to the call
    that made it and checks its resources; the operator checks cover both teams and those
    routes, in `mock-docs` and `switchboard`; and each team makes its own pre-policy call.
-   Sections 1 to 6 describe the runs as they were, before these fixes.
+   Sections 1 to 6 describe the runs as they were, before these fixes. Section 8 has the runs
+   after them.
+
+## 8. The runs after the fixes
+
+Both demos ran again on 2026-10-07 from `a509ec9`, which carries the fixes of gaps 1, 2, 3 and
+9, on the same laptop. Compose ran first and was taken down. kind then ran on the existing
+cluster `switchboard-demo` and was left deployed. Both passed on the first attempt. Nothing in
+the repository had to change.
+
+| | result | wall clock | notes |
+| --- | --- | --- | --- |
+| `demo.sh compose` | PASS (89/89), exit 0 | 85 s | 47 s of it compiled the workspace's own crates in the image; dependencies were cached |
+| `demo.sh kind` | PASS (139/139), exit 0 | 81 s | the image was fully cached from the Compose run; existing cluster |
+
+The counts rose from 83 and 93 because the checks of gap 9 now run. What they showed:
+
+- **Each row records what its call named.** Every row of each run was matched to the call
+  that made it: 10 rows in Compose and 10 in kind, none wrong. Each team's call that named no
+  project recorded `[]`. In Compose, the call to the withdrawn tool recorded `"unknown"` under
+  revision `demo-2`, not `[]`.
+- **The operator checks cover both teams and the API server's routes.** 42 `kubectl auth
+  can-i` checks answered `no`, 21 per team. Besides secrets, ConfigMaps, pods and gateway
+  tokens, they cover exec, port-forward and the pod proxy, each with `create` and `get`, and the
+  Service proxy, in both `mock-docs` and `switchboard`.
+- **Each team has its own control for the network policy.** Before the policy, each team's new
+  pod reached mock-docs directly and got 401. After it, each team's new pod timed out (curl
+  exit 28) and still read through the gateway.
+- **The server saw only the gateway's credential through the gateway.** mock-docs accepted 6
+  requests, all with the gateway credential's hash, and refused the two pre-policy probes,
+  each with that team's own token.
+- **Results are not wrapped twice** (gap 3). Each list and read through the gateway, in both
+  runs, returned the server's own content, and the workload checks that the text is not a whole
+  tool result.
+- **The gateway's grace period is 50 s** in the deployed kind manifest (gap 2).
+
+The rest matched sections 4 and 5: the cluster's own issuer, 7 `identity_failed` lines and no
+row for the stranger, and in Compose the paused database refused the call with nothing reaching
+mock-docs.
+
+**One thing on the host, not in the repository.** The Colima VM's SSH control connection had
+been restarted earlier that evening, which dropped its forwards of the Docker socket and of the
+cluster's API port. `docker` and `kubectl` on the host were refused. The runs reached them
+through a separate SSH tunnel into the VM for each: the Docker socket at `.demo/d.sock`, with
+`DOCKER_HOST` pointing at it, and the cluster's API port at its usual address. Restarting Colima
+would restore its own forwards.
