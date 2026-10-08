@@ -815,14 +815,18 @@ unconfigured one is absent from every surface.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
-Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the trigger
-that sets the times or a write-once trigger missing or disabled, with grants beyond decision
-0009's on the audit or receipt table, with a role that owns the database, with a session that
-logged in as another role than the one it runs as, with a session that a role or database
-default puts in `session_replication_role = replica`, where neither trigger fires, or with a
-database whose encoding is not UTF8. Its sessions look names up in `pg_catalog` alone, so a
-function another role makes in a schema a default puts first cannot change what its checks or
-its writes do.
+Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the audit
+table or a partition of it unlogged, with the trigger that sets the times or a write-once
+trigger missing or disabled, with grants beyond decision 0009's on the audit or receipt table,
+with a role that owns the database, with a session that logged in as another role than the one
+it runs as, with a session that a role or database default puts in
+`session_replication_role = replica`, where neither trigger fires, or with a database whose
+encoding is not UTF8. It also refuses a role that can set a setting only a superuser may set,
+or change any setting with `ALTER SYSTEM`, since a change made that way reaches the store's
+running sessions at the next reload. Its sessions commit synchronously and look names up in
+`pg_catalog` alone, so a function another role makes in a schema a default puts first cannot
+change what its checks or its writes do. Both settings travel in the startup options, which a
+pooler may drop, so the check reads them back and refuses a session without them.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
