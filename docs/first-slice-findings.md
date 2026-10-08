@@ -20,8 +20,9 @@ cannot show that, and these numbers do not change it.
   starts again succeeds.
 - **Database lost between begin and finish.** The caller gets the call's result after the call
   plus the 2 s answer budget. The row is completed if Postgres comes back within the 30 s
-  finish deadline. If it does not, the row stays open, and nothing is logged when the store
-  gives up.
+  finish deadline. If it does not, the row stays open. In these runs nothing was logged when the
+  store gave up; that was fixed after them, and the gateway now logs each one as
+  `audit_row_given_up` at `ERROR` (section 7, gap 1).
 - **Time to see a policy change.** Compose: 0.15 s to 2.03 s (30 changes). kind: 33 s to 88 s
   (6 changes), because kubelet takes that long to update a mounted ConfigMap.
 - **Run time.** `demo.sh compose` took 21 s and `demo.sh kind` took 44 s, both warm. A cold
