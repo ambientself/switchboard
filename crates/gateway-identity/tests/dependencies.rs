@@ -103,3 +103,34 @@ fn the_identity_crate_selects_exactly_one_crypto_backend() {
         "two backends make jsonwebtoken panic on first use"
     );
 }
+
+/// The workspace's lock file: which version of each package the build uses.
+const LOCK: &str = include_str!("../../../Cargo.lock");
+
+/// The lock file's entries for the package `name`, one per version.
+fn locked(name: &str) -> Vec<&'static str> {
+    let line = format!("name = \"{name}\"");
+    LOCK.split("[[package]]")
+        .filter(|entry| entry.lines().any(|l| l == line))
+        .collect()
+}
+
+/// The configuration check refuses an RSA key the crypto backend would refuse at verify by
+/// calling the same constructor, `rsa::RsaPublicKey::new`. That holds only while this crate and
+/// `jsonwebtoken` use the same `rsa`. Were `jsonwebtoken` to move to a newer one while this
+/// crate stayed on its own, the lock file would hold two, and the check could pass a key verify
+/// refuses on every token.
+#[test]
+fn the_identity_crate_checks_rsa_keys_with_the_rsa_jsonwebtoken_verifies_with() {
+    let rsa = locked("rsa");
+    assert_eq!(rsa.len(), 1, "the build has more than one rsa: {rsa:#?}");
+    for dependent in [env!("CARGO_PKG_NAME"), "jsonwebtoken"] {
+        let entries = locked(dependent);
+        assert_eq!(entries.len(), 1, "{entries:#?}");
+        assert!(
+            entries[0].lines().any(|line| line == r#" "rsa","#),
+            "{dependent} does not depend on rsa: {}",
+            entries[0]
+        );
+    }
+}

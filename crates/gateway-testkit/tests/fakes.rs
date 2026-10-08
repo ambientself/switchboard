@@ -13,15 +13,16 @@ use gateway_core::audit::{
 };
 use gateway_core::{
     AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, ConnectorName, CredentialError,
-    CredentialHandle, CredentialSource, Principal, Proved, RequestedTool, Resources, decide,
+    CredentialHandle, CredentialSource, Principal, Proved, RequestedTool, Resource, Resources,
+    decide,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
     Caller, DRAFT_REFUSAL, DRAFT_TOOL, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FOREIGN_DRAFT,
     FakeCredentialSource, FixedClock, Fixture, FixtureConnector, GROUP_G_DOCUMENT, Gate,
     InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM, SCOPE_REFUSAL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    WRITE_TOOL, WriteRecord, block_on, policy_data, poll_once,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A, TEAM_A_DOCUMENT,
+    TEAM_B_DOCUMENT, WRITE_TOOL, WriteRecord, block_on, document, policy_data, poll_once,
 };
 use serde_json::{Value, json};
 
@@ -210,6 +211,43 @@ fn rows_come_back_in_the_order_they_were_begun_with_completions_filled_in() {
         Some(6)
     );
     assert_eq!((store.begin_attempts(), store.finish_attempts()), (2, 2));
+}
+
+/// Every other row here omits no resources, so a store that dropped the count would pass them.
+/// Team A may reach three more documents than a row records, and the call names them all.
+#[test]
+fn a_row_keeps_its_count_of_omitted_resources_through_begin_and_finish() {
+    let (mut fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let named: Vec<Resource> = (0..audit::MAX_RECORDED_RESOURCES + 3)
+        .map(|n| document(&format!("team-a-{n}")))
+        .collect();
+    let mut data = policy_data();
+    data["limits"]["teams"][TEAM_A] = serde_json::to_value(&named).unwrap();
+    fixture.policy = serde_json::from_value(data).unwrap();
+    let call = CallContext {
+        caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
+        tool: RequestedTool::new(READ_TOOL),
+        resources: Resources::Named(named),
+    };
+    let decision = decide(&fixture.policy, &call);
+    assert!(decision.is_allowed(), "{decision:?}");
+    let begun = block_on(audit::begin(
+        &store,
+        decision,
+        json!({"document": "team-a-0"}),
+        RequestMetadata::default(),
+    ));
+    let Ok(Begun::Allowed(guard)) = begun else {
+        panic!("{begun:?}")
+    };
+    assert_eq!(store.rows()[0].resources_omitted, 3, "begin kept the count");
+
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let ran = block_on(audit::run(&connector, guard));
+    block_on(audit::finish(&store, ran, 5));
+    let row = store.row(0).unwrap();
+    assert!(row.completion.is_some(), "{row:?}");
+    assert_eq!(row.resources_omitted, 3, "finish kept the count");
 }
 
 #[test]
