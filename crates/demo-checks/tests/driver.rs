@@ -366,6 +366,44 @@ fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
     ] {
         assert_eq!(driver.matches(call).count(), 1, "{call}");
     }
+    assert_eq!(
+        driver
+            .matches("  check_server_bearers \"$(mock_docs_log)\" \\\n")
+            .count(),
+        2,
+        "both bearer checks read only this run's mock-docs log"
+    );
+}
+
+#[test]
+fn the_server_bearer_checks_count_only_this_runs_requests() {
+    // A second run without `down` reuses mock-docs, whose whole log still holds the first run's
+    // two accepted calls. The fakes print the whole log unless asked for lines from the mark.
+    let sha = "35078c7e636169b1ad9e5a04af03cb483f59535baaf71232f48d8a6181a93bd4";
+    let good = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#;
+    let mark = "2026-10-08T10:00:00.123456Z";
+    let this_run = [good, good].join("\n");
+    let whole = [good, good, good, good].join("\n");
+    for (mode, flag, fake) in [("compose", "--since", "dc"), ("kind", "--since-time", "k")] {
+        let run = sourced(&format!(
+            "{fake}() {{ case \" $* \" in *' {flag} {mark} '*) printf '%s\\n' '{this_run}' ;; *) printf '%s\\n' '{whole}' ;; esac; }}\n\
+             MODE={mode}\nLOG_SINCE={mark}\n\
+             check_server_bearers \"$(mock_docs_log)\" {sha} 2 accepted\nFINISHED=1\nresult 0"
+        ));
+        assert_eq!(run.status, Some(0), "{mode}: {}", run.transcript());
+    }
+
+    // The mark is the run's start, read once from Postgres with the audit rows' mark.
+    let run = sourced(
+        "psql_superuser() { echo '1791451200.123456 2026-10-08T10:00:00.123456Z'; }\nmark_start\necho \"since=$SINCE log=$LOG_SINCE\"",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout
+            .contains("since=1791451200.123456 log=2026-10-08T10:00:00.123456Z"),
+        "{}",
+        run.transcript()
+    );
 }
 
 #[test]

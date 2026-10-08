@@ -57,6 +57,8 @@ CURRENT_STEP="start"
 MODE=""
 PAUSED=""
 SINCE=""
+# The same moment as SINCE, as an RFC 3339 time for `logs --since` and `logs --since-time`.
+LOG_SINCE=""
 # The database outage step's span, in the database's clock (epoch seconds); 0 to 0 if there was none.
 OUTAGE_FROM=0
 OUTAGE_TO=0
@@ -151,8 +153,23 @@ psql_superuser() {
 audit_count() { psql_reader -Atc "select count(*) from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE) and $1"; }
 
 mark_start() {
-  SINCE=$(psql_superuser -Atc "select extract(epoch from now())")
-  echo "audit rows from this run start at epoch $SINCE"
+  local mark
+  mark=$(psql_superuser -AtF ' ' -c "select extract(epoch from now()),
+    to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
+  SINCE=${mark% *}
+  LOG_SINCE=${mark#* }
+  echo "audit rows and mock-docs requests from this run start at epoch $SINCE ($LOG_SINCE)"
+}
+
+# mock_docs_log: mock-docs' log lines from this run's start. A run that follows another without
+# `down` can reuse the same server, whose whole log holds the earlier run's requests too. The
+# mark is Postgres' clock, which is the clock Docker and the kubelet stamp log lines with: all
+# run on the same Docker host.
+mock_docs_log() {
+  case "$MODE" in
+    compose) dc logs --no-log-prefix --since "$LOG_SINCE" mock-docs ;;
+    kind) k -n mock-docs logs --since-time "$LOG_SINCE" deploy/mock-docs ;;
+  esac
 }
 
 # project_json NAME: the `resources` column of a call that named only the docs project NAME.
@@ -251,7 +268,7 @@ check_boot() {
   check "$(count_lines '"identity":"disabled"|"audit":"disabled"' "$1")" 0 "the gateway disabled neither identity nor audit"
 }
 
-# check_server_bearers LOGS SHA256 CALLS SCOPE: what mock-docs received. Every request it
+# check_server_bearers LOGS SHA256 CALLS SCOPE: what mock-docs received this run. Every request it
 # accepted carried the gateway's credential, which is SHA256; with SCOPE=all, so did every request
 # carrying any bearer. CALLS is exactly how many calls the gateway allowed so far: one more means
 # a call it denied reached the server, one fewer that an allowed call did not, or that the log is
@@ -325,7 +342,7 @@ compose_run() {
 
   step "the server never saw a workload token, and no denied call reached it"
   # Each team's full run is allowed two calls, its list and its read; its other calls are denied.
-  check_server_bearers "$(dc logs --no-log-prefix mock-docs)" \
+  check_server_bearers "$(mock_docs_log)" \
     "$(cat "$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256")" 4 all
 
   step "database unavailable: the call is refused and nothing runs"
@@ -559,7 +576,7 @@ kind_run() {
   # were refused (401); every request the server accepted carried the gateway's credential.
   # Each team's full run is allowed three calls: its list, its read, and the same pod's read
   # after its direct call times out. Its other calls are denied, and the stranger is refused.
-  check_server_bearers "$(k -n mock-docs logs deploy/mock-docs)" \
+  check_server_bearers "$(mock_docs_log)" \
     "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 6 accepted
 
   step "the gateway's view of identity failures (operators only; no audit rows)"

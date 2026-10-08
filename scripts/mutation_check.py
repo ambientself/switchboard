@@ -2423,6 +2423,12 @@ mutate("demo-driver-result-ignores-failures", "the RESULT passes with FAILs coun
        """  if [ "$FAILS" -eq 0 ] && [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""", """  if [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""")
 mutate("demo-driver-any-bearer-is-the-gateways", "mock-docs' accepted bearers are not compared with the gateway's", DRIVER,
        """'$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ }""", """'$1 == "accepted" && 0 { n++ }""")
+mutate("demo-driver-compose-bearers-whole-log", "the Compose bearer check counts earlier runs' requests too", DRIVER,
+       """    compose) dc logs --no-log-prefix --since "$LOG_SINCE" mock-docs ;;""", """    compose) dc logs --no-log-prefix mock-docs ;;""")
+mutate("demo-driver-kind-bearers-whole-log", "the kind bearer check counts earlier runs' requests too", DRIVER,
+       """    kind) k -n mock-docs logs --since-time "$LOG_SINCE" deploy/mock-docs ;;""", """    kind) k -n mock-docs logs deploy/mock-docs ;;""")
+mutate("demo-driver-log-mark-is-epoch", "the log mark is the epoch number, not a time logs accept", DRIVER,
+       "  LOG_SINCE=${mark#* }\n", "  LOG_SINCE=${mark% *}\n")
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
        '"127.0.0.1:18080:8080"', '"18080:8080"')
 mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
