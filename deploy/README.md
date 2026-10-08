@@ -58,7 +58,8 @@ and a new pod with it still connected. Kubelet's readiness probes still pass und
 ingress policy. No Calico was needed.
 
 The demo still checks this every run, for each team: before the policy, a new pod's direct call
-must connect and get 401 from the server; after it, a new pod's direct call must time out
+must connect and get 401 from the server, and the same pod must get an allowed read through the
+gateway, whose call to the server succeeds; after it, a new pod's direct call must time out
 (curl exit 28), and the same pod must still reach the gateway and get an allowed read through
 it.
 

@@ -357,14 +357,44 @@ fn the_server_bearer_check_admits_only_the_gateways_credential() {
     }
 }
 
+/// The calls a function of workload.sh expects the gateway to allow, before and inside its
+/// `DIRECT_URL` block: one per `expect_allowed` of a call.
+fn allowed_calls(script: &str, function: &str) -> (usize, usize) {
+    let start = script
+        .find(&format!("\n{function}() {{\n"))
+        .unwrap_or_else(|| panic!("workload.sh has no {function}()"));
+    let body = &script[start..];
+    let body = &body[..body.find("\n}\n").expect("the function ends")];
+    let (before, inside) = body
+        .split_once("  if [ -n \"${DIRECT_URL:-}\" ]; then\n")
+        .unwrap_or((body, ""));
+    let count = |text: &str| text.matches("expect_allowed \"$(call ").count();
+    (count(before), count(inside))
+}
+
 #[test]
 fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
+    // Each allowed call is one request mock-docs accepts. Both runs have two teams. Compose
+    // runs `full` without DIRECT_URL. kind runs `before-policy`, then `full` with DIRECT_URL,
+    // which adds the same pod's read after its direct call.
+    let workload = common::read("deploy/demo/workload.sh");
+    let (full, full_direct) = allowed_calls(&workload, "full");
+    let (before_policy, _) = allowed_calls(&workload, "before_policy");
+    assert_eq!((full, full_direct, before_policy), (2, 1, 1));
+    let compose = 2 * full;
+    let kind = 2 * (before_policy + full + full_direct);
+    assert_eq!((compose, kind), (4, 8));
+
     let driver = common::read("deploy/demo/demo.sh");
     for call in [
-        "\"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" 4 all\n",
-        "\"$(cat \"$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256\")\" 6 accepted\n",
+        format!(
+            "\"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
+        ),
+        format!(
+            "\"$(cat \"$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256\")\" {kind} accepted\n"
+        ),
     ] {
-        assert_eq!(driver.matches(call).count(), 1, "{call}");
+        assert_eq!(driver.matches(&call).count(), 1, "{call}");
     }
     assert_eq!(
         driver
@@ -753,4 +783,39 @@ fn each_team_has_its_own_direct_call_before_the_policy() {
         .find("\n  k apply -k \"$ROOT/deploy/kind/policy\"\n")
         .expect("kind_run applies the policy");
     assert!(probes < policy);
+}
+
+#[test]
+fn a_new_job_keeps_its_templates_environment_and_takes_the_mode() {
+    // The before-policy Job reads its team's project through the gateway, so it needs the
+    // template's OWN_PROJECT.
+    require(&["jq"]);
+    let cronjob = json!({
+        "metadata": {"namespace": "team-a"},
+        "spec": {"jobTemplate": {
+            "metadata": {"labels": {"app": "mock-workload"}},
+            "spec": {"backoffLimit": 0, "template": {"spec": {"containers": [{
+                "name": "workload",
+                "args": ["full"],
+                "env": [{"name": "OWN_PROJECT", "value": "atlas"}],
+            }]}}},
+        }},
+    });
+    // start_job discards what apply prints, so the fake shows what it was given on stderr.
+    let run = sourced(&format!(
+        "k() {{ case \"$*\" in '-n team-a get cronjob mock-workload -o json') echo '{cronjob}' ;; 'apply -f -') cat >&2 ;; esac; }}\n\
+         start_job team-a mock-workload before-policy"
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let applied: Value = serde_json::from_str(&run.stderr)
+        .unwrap_or_else(|error| panic!("{error}\n{}", run.transcript()));
+    assert_eq!(applied["kind"], "Job", "{applied}");
+    assert_eq!(applied["metadata"]["namespace"], "team-a", "{applied}");
+    let container = &applied["spec"]["template"]["spec"]["containers"][0];
+    assert_eq!(container["args"], json!(["before-policy"]), "{applied}");
+    assert_eq!(
+        container["env"],
+        json!([{"name": "OWN_PROJECT", "value": "atlas"}]),
+        "{applied}"
+    );
 }

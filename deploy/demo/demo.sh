@@ -471,8 +471,11 @@ operator_checks() {
 }
 
 # before_policy_probes: before the network policy, a new pod of each team calls mock-docs
-# directly. The call must connect and the server must refuse the workload's own token. Each
-# team's later check that its direct call is dropped then has its own control in the same run.
+# directly. The call must connect and the server must refuse the workload's own token. The same
+# pod then reads its team's project through the gateway, and the gateway's call to the same
+# server must succeed. Each team's later check that its direct call is dropped then has its own
+# control in the same run. The Job is the team's CronJob template with only the argument
+# changed (start_job), so it has the template's OWN_PROJECT (deploy/kind/base/workloads.yaml).
 before_policy_probes() {
   kind_workload "team-a before policy" team-a mock-workload before-policy
   kind_workload "team-b before policy" team-b mock-workload before-policy
@@ -561,7 +564,7 @@ kind_run() {
   step "the gateway's boot lines"
   check_boot "$(k -n switchboard logs deploy/gateway)"
 
-  step "before the policy: each team's direct call to mock-docs connects, and the server refuses the workload's own token"
+  step "before the policy: each team's direct call to mock-docs connects, the server refuses the workload's own token, and the gateway's call to mock-docs succeeds"
   before_policy_probes
 
   step "apply the network policy; new pods from here on; settle 10 s"
@@ -581,10 +584,12 @@ kind_run() {
   step "the server never saw a workload token through the gateway, and no denied call reached it"
   # The two direct calls before the policy, one per team, carried the workloads' own tokens and
   # were refused (401); every request the server accepted carried the gateway's credential.
-  # Each team's full run is allowed three calls: its list, its read, and the same pod's read
-  # after its direct call times out. Its other calls are denied, and the stranger is refused.
+  # Each team is allowed four calls, so 2 x 4 = 8: before the policy, the read through the
+  # gateway after its direct call; after it, its full run's list and read, and the same pod's
+  # read after its direct call times out. Its other calls are denied, and the stranger is
+  # refused.
   check_server_bearers "$(mock_docs_log)" \
-    "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 6 accepted
+    "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 8 accepted
 
   step "the gateway's view of identity failures (operators only; no audit rows)"
   local gateway_logs
