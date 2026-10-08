@@ -20,9 +20,10 @@
 //!
 //! [`check_registry`] runs the same gates for a deployment whose policy comes from the registry
 //! file (`gateway-registry`), which has already checked its own tools, definitions, adapters
-//! and rules. Its connectors are registered with [`Wiring::proxied`]: each one is wrapped in
-//! the registry's argument check, and its resource adapter is the one the registry approved
-//! for each tool. Every approved tool's server must have a connector.
+//! and rules. Its connectors are registered with [`Wiring::proxied`]: each call to one runs
+//! behind the registry's argument check, and its resources are read with the adapter the
+//! registry approved for its tool, both from the policy version the call's request took.
+//! Every approved tool's server must have a connector.
 //!
 //! A disabled gate starts with a warning logged here; the HTTP layer repeats it while the
 //! gateway runs.
@@ -43,7 +44,6 @@ use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection};
 use crate::policy::{LivePolicy, ServedPolicy};
-use crate::proxied::{CheckedArguments, RegistryResources};
 use crate::reload::Reloader;
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
@@ -207,7 +207,7 @@ impl Wiring {
             name.into(),
             Registered {
                 connector,
-                resources,
+                reads: Reads::Adapter(resources),
                 results: Results::Values,
             },
         ));
@@ -228,10 +228,20 @@ impl fmt::Debug for Wiring {
     }
 }
 
-struct Registered {
-    connector: Arc<dyn Connector>,
-    resources: Arc<dyn ResourceAdapter>,
-    results: Results,
+pub(crate) struct Registered {
+    pub(crate) connector: Arc<dyn Connector>,
+    pub(crate) reads: Reads,
+    pub(crate) results: Results,
+}
+
+/// How a connector's calls are read.
+pub(crate) enum Reads {
+    /// With the resource adapter registered beside the connector.
+    Adapter(Arc<dyn ResourceAdapter>),
+    /// With the registry's argument adapters, from the policy version each request took: its
+    /// resources for the decision, and its argument check around the run
+    /// ([`crate::proxied::CheckedArguments`]). The connector never runs without that check.
+    Registry,
 }
 
 /// What a connector's successful result is, which decides how it reaches the caller.
@@ -333,25 +343,34 @@ impl Gates {
         self.policy.current().snapshot().clone()
     }
 
-    /// The connector registered as `name`.
+    /// The connector registered as `name` with its own resource adapter. A proxied server's
+    /// connector is not handed out: it runs only behind the argument check of the policy
+    /// version a request took.
     pub fn connector(&self, name: &ConnectorName) -> Option<&Arc<dyn Connector>> {
         self.connectors
             .get(name)
+            .filter(|registered| matches!(registered.reads, Reads::Adapter(_)))
             .map(|registered| &registered.connector)
     }
 
-    /// The resource adapter registered with the connector `name`.
+    /// The resource adapter registered with the connector `name`. A proxied server's tools
+    /// are read with the registry's adapters instead.
     pub fn resource_adapter(&self, name: &ConnectorName) -> Option<&Arc<dyn ResourceAdapter>> {
-        self.connectors
-            .get(name)
-            .map(|registered| &registered.resources)
+        match &self.connectors.get(name)?.reads {
+            Reads::Adapter(adapter) => Some(adapter),
+            Reads::Registry => None,
+        }
     }
 
-    /// What the connector `name`'s successful results are.
-    pub(crate) fn results(&self, name: &ConnectorName) -> Option<Results> {
-        self.connectors
-            .get(name)
-            .map(|registered| registered.results)
+    /// What is registered as `name`: the connector, how its calls are read, and its results.
+    pub(crate) fn registered(&self, name: &ConnectorName) -> Option<&Registered> {
+        self.connectors.get(name)
+    }
+
+    /// The policy served now, which the argument check reads to see whether a tool was
+    /// withdrawn while a call was being decided.
+    pub(crate) fn live_policy(&self) -> &LivePolicy {
+        &self.policy
     }
 }
 
@@ -465,8 +484,8 @@ pub fn check_registry(
     let mut connectors = BTreeMap::new();
     for (name, connector) in proxied {
         let registered = Registered {
-            connector: Arc::new(CheckedArguments::new(connector, live.clone())),
-            resources: Arc::new(RegistryResources::new(live.clone())),
+            connector,
+            reads: Reads::Registry,
             results: Results::ToolResults,
         };
         if connectors.insert(name.clone(), registered).is_some() {

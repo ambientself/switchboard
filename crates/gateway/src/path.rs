@@ -56,7 +56,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, IDENTITY_FAILURE, PolicySnapshot,
+    ApprovedTool, CallContext, CallerContext, Classification, Connector, IDENTITY_FAILURE,
     Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
@@ -67,9 +67,10 @@ use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
 
-use crate::boot::{GateState, Gates, Results};
+use crate::boot::{GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
 use crate::policy::ServedPolicy;
+use crate::proxied::{CheckedArguments, registry_resources};
 
 /// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
 pub const MAX_TOOL_USE_ID: usize = 128;
@@ -308,7 +309,7 @@ impl RequestPath {
         } = call;
         let arguments = Value::Object(arguments);
         let requested = RequestedTool::new(name);
-        let resources = self.resources(snapshot, &requested, &arguments);
+        let resources = self.resources(policy, &requested, &arguments);
         let context = CallContext {
             caller: self.caller_context(policy, principal, surface),
             tool: requested,
@@ -350,7 +351,7 @@ impl RequestPath {
         };
         let row = guard.row().clone();
         let tool = guard.tool().name.clone();
-        let Some(connector) = gates.connector(&guard.tool().connector) else {
+        let Some(registered) = gates.registered(&guard.tool().connector) else {
             // The boot gates refuse a tool on a surface whose connector is not registered.
             tracing::error!(
                 row = guard.row().as_str(),
@@ -361,11 +362,25 @@ impl RequestPath {
                 "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
             );
         };
-        let results = gates.results(&guard.tool().connector);
+        let results = Some(registered.results);
+        // A proxied server's call is checked against the schema of the policy this request
+        // took, the one its decision was made from, never a version served since.
+        let checked;
+        let connector: &dyn Connector = match &registered.reads {
+            Reads::Adapter(_) => registered.connector.as_ref(),
+            Reads::Registry => {
+                checked = CheckedArguments::new(
+                    registered.connector.as_ref(),
+                    policy,
+                    gates.live_policy(),
+                );
+                &checked
+            }
+        };
 
         let started = gates.clock().now();
         let running = Instant::now();
-        let ran = audit::run(connector.as_ref(), guard).await;
+        let ran = audit::run(connector, guard).await;
         let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
         // No answer budget: the core gives out the answer when the store's finish returns.
@@ -401,18 +416,29 @@ impl RequestPath {
     /// For a name that is not an approved tool there is no adapter, so nobody can say what the
     /// call names: [`Resources::Unknown`], which its row records as `unknown`. Recording none
     /// would read as a call that named nothing. The decision denies the call before it looks.
+    ///
+    /// A proxied server's tools are read with the adapter the request's own policy version
+    /// approved, the version the decision is made from.
     fn resources(
         &self,
-        snapshot: &PolicySnapshot,
+        policy: &ServedPolicy,
         requested: &RequestedTool,
         arguments: &Value,
     ) -> Resources {
         let gates = &self.inner.gates;
-        let Some(approved) = requested.name().ok().and_then(|name| snapshot.tool(&name)) else {
+        let Some(approved) = requested
+            .name()
+            .ok()
+            .and_then(|name| policy.snapshot().tool(&name))
+        else {
             return Resources::Unknown;
         };
-        match gates.resource_adapter(&approved.connector) {
-            Some(adapter) => adapter.resources(approved, arguments),
+        match gates
+            .registered(&approved.connector)
+            .map(|registered| &registered.reads)
+        {
+            Some(Reads::Adapter(adapter)) => adapter.resources(approved, arguments),
+            Some(Reads::Registry) => registry_resources(policy, approved, arguments),
             // Every connector is registered with an adapter, and the boot gates refuse an
             // approved tool whose connector is not registered.
             None => Resources::Named(Vec::new()),

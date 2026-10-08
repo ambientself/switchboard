@@ -1416,12 +1416,12 @@ mutate("gw-tool-use-id-dropped", "the tool-use identifier never reaches the row"
        "tool_use_id: bounded_tool_use_id(tool_use_id),",
        "tool_use_id: bounded_tool_use_id(tool_use_id).filter(|_| false),")
 mutate("gw-resources-always-empty", "the resource adapter is ignored", GW_PATH,
-       "            Some(adapter) => adapter.resources(approved, arguments),",
-       "            Some(_) => Resources::Named(Vec::new()),")
+       "            Some(Reads::Adapter(adapter)) => adapter.resources(approved, arguments),",
+       "            Some(Reads::Adapter(_)) => Resources::Named(Vec::new()),")
 mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the requested name", GW_PATH,
-       "match gates.resource_adapter(&approved.connector) {",
-       "match gates.resource_adapter(&gateway_core::ConnectorName::new(requested.as_str()))"
-       ".or(gates.resource_adapter(&approved.connector)) {")
+       "            .registered(&approved.connector)\n",
+       "            .registered(&gateway_core::ConnectorName::new(requested.as_str()))\n"
+       "            .or(gates.registered(&approved.connector))\n")
 mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
        "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
        "        let Caller::Proved(principal) = caller else {\n"
@@ -2444,13 +2444,19 @@ mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is
        "            Err(sentence) => Box::pin(std::future::ready(ToolOutcome::Refused(sentence))),",
        "            Err(_sentence) => self.inner.run(call),")
 mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
-       "            None => Err(withdrawn_while_deciding(tool.as_str())),", "            None => Ok(()),")
+       "            Some(adapter) if !withdrawn => {", "            Some(adapter) => {")
+mutate("gw-proxied-checks-live-schema", "a call's arguments are checked against the policy served now, not the one it was decided under", PROXIED,
+       "        let adapter = self.policy.arguments(&tool);\n",
+       "        let live = self.live.current();\n        let adapter = live.arguments(&tool);\n")
 mutate("gw-proxied-resources-never-named", "the registry's adapter is not asked for resources", PROXIED,
-       "            (Some(adapter), Some(arguments)) => adapter.resources(arguments),",
-       "            (Some(_adapter), Some(_arguments)) => Resources::Named(Vec::new()),")
+       "        (Some(adapter), Some(arguments)) => adapter.resources(arguments),",
+       "        (Some(_adapter), Some(_arguments)) => Resources::Named(Vec::new()),")
 
-mutate("gw-boot-registry-connector-unwrapped", "a proxied connector runs without the argument check", BOOT,
-       "            connector: Arc::new(CheckedArguments::new(connector, live.clone())),", "            connector,")
+mutate("gw-path-proxied-unchecked", "a proxied connector runs without the argument check", GW_PATH,
+       "            Reads::Adapter(_) => registered.connector.as_ref(),\n",
+       "            Reads::Adapter(_) | Reads::Registry => registered.connector.as_ref(),\n")
+mutate("gw-boot-proxied-connector-handed-out", "a proxied server's connector is handed out to run unchecked", BOOT,
+       "            .filter(|registered| matches!(registered.reads, Reads::Adapter(_)))\n", "")
 mutate("gw-boot-registry-server-unconnected", "a registry server with no connector starts", BOOT,
        "        if !basis.connectors.contains(&route.server) {", "        if false {")
 mutate("gw-boot-registry-rule-issuer-unchecked", "a registry rule may name an untrusted issuer", BOOT,
