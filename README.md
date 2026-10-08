@@ -24,7 +24,7 @@ file (`crates/gateway-registry`, reloaded when it changes), audit rows in Postgr
 (`crates/audit-postgres`), and calls forwarded by the proxy connector
 (`crates/connector-proxy`) with the gateway's own credential. The demo's deployment, against a
 mock document server, is in [deploy/](deploy/README.md): `deploy/demo/demo.sh compose` and
-`deploy/demo/demo.sh kind` run it. It runs from an unmerged branch; see the deploy README.
+`deploy/demo/demo.sh kind` run it from `main`.
 
 Run the baseline with `python3 conformance/run.py --otto-source /path/to/otto`.
 See [conformance setup and coverage](conformance/README.md).

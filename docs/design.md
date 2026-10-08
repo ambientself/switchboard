@@ -1125,7 +1125,7 @@ decision-table case for each comment tool, a case showing them denied in every o
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
 
-**#14, the first slice.** The mock server's own refusal of anything but the gateway's projected
+**#47, what the first slice (#14) still lacks.** The mock server's own refusal of anything but the gateway's projected
 token; the route-check program, its operator step and its probe (decision 0010); the
 signals of section 11 exported; and the open-row query. Decision 0009's shutdown order, in which
 an instance first fails its readiness check and then stops accepting calls, is not built either:
