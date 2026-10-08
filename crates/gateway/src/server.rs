@@ -17,7 +17,8 @@
 //! 4. **Declared size**: a `Content-Length` over [`MAX_BODY_BYTES`] is 413.
 //! 5. **Identity**, from the headers alone ([`RequestPath::admit`]). The body has not been read.
 //! 6. **The body** is read, up to [`MAX_BODY_BYTES`]; a body that grows past it is 413, and one
-//!    that has not arrived within [`BODY_READ_TIMEOUT`] is 408.
+//!    that has not arrived within [`BODY_READ_TIMEOUT`] is 408, with a sentence saying nothing
+//!    ran, and the connection is closed.
 //! 7. **The answer** ([`RequestPath::respond`]) runs on its own task, which the handler waits
 //!    for. A client that disconnects drops the handler, but not that task, so a tool call that
 //!    started still completes its audit row.
@@ -44,7 +45,7 @@ use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::response::Response;
 use axum::routing::any;
 use gateway_mcp::{HttpResponse, INTERNAL_ERROR, Rejection};
-use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
 use http::request::Parts;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
@@ -346,8 +347,7 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
     };
     let reading = axum::body::to_bytes(body, MAX_BODY_BYTES);
     let Ok(read) = tokio::time::timeout(endpoint.body_read, reading).await else {
-        tracing::debug!("the request body did not arrive in time");
-        return request_timeout();
+        return refused(&Rejection::request_timeout());
     };
     let body = match read {
         Ok(body) => body,
@@ -478,17 +478,6 @@ fn unreadable() -> HttpResponse {
     HttpResponse {
         status: StatusCode::BAD_REQUEST,
         headers: HeaderMap::new(),
-        body: Vec::new(),
-    }
-}
-
-/// The body did not arrive within [`Timeouts::body_read`].
-fn request_timeout() -> HttpResponse {
-    let mut headers = HeaderMap::new();
-    headers.insert(CONNECTION, HeaderValue::from_static("close"));
-    HttpResponse {
-        status: StatusCode::REQUEST_TIMEOUT,
-        headers,
         body: Vec::new(),
     }
 }

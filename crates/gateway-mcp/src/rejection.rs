@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use http::header::{ALLOW, WWW_AUTHENTICATE};
+use http::header::{ALLOW, CONNECTION, WWW_AUTHENTICATE};
 use http::{HeaderValue, StatusCode};
 use serde_json::{Value, json};
 
@@ -25,6 +25,8 @@ pub enum RejectionKind {
     NotAcceptable,
     /// 413: the body is larger than the gateway reads. Built by the HTTP layer.
     PayloadTooLarge,
+    /// 408: the body did not arrive in time. Built by the HTTP layer.
+    RequestTimeout,
     /// 403: a `Host` the gateway is not configured to answer for. Built by the HTTP layer.
     ForbiddenHost,
     /// 403: an `Origin` the gateway is not configured to accept. Built by the HTTP layer.
@@ -184,6 +186,17 @@ impl Rejection {
         )
     }
 
+    /// 408, for a body that did not arrive in time. The connection is closed after it, since
+    /// what is left of the body would be read as the next request.
+    pub fn request_timeout() -> Self {
+        Rejection::new(
+            RejectionKind::RequestTimeout,
+            StatusCode::REQUEST_TIMEOUT,
+            INVALID_REQUEST,
+            "Request timeout: the body did not arrive in time, so nothing ran",
+        )
+    }
+
     /// 403, for a `Host` header the gateway does not answer for.
     pub fn forbidden_host() -> Self {
         Rejection::new(
@@ -266,6 +279,11 @@ impl Rejection {
                 response
                     .headers
                     .insert(WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));
+            }
+            RejectionKind::RequestTimeout => {
+                response
+                    .headers
+                    .insert(CONNECTION, HeaderValue::from_static("close"));
             }
             _ => {}
         }

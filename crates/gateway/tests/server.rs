@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use gateway::{MAX_BODY_BYTES, Timeouts};
 use gateway_core::audit::{Completion, DecisionKind, Outcome};
-use gateway_mcp::{LEGACY, MODERN, PARSE_ERROR};
+use gateway_mcp::{INVALID_REQUEST, LEGACY, MODERN, PARSE_ERROR};
 use gateway_testkit::{Caller, READ_TOOL, SURFACE_READ, TEAM_B_DOCUMENT};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -442,6 +442,7 @@ async fn a_body_that_does_not_arrive_in_time_is_408() {
     let request = server
         .post(SURFACE_READ, &legacy("tools/list", json!({})))
         .bearer(&server.token(Caller::TeamA))
+        .without("connection")
         .header("content-length", "100");
     let mut bytes = request.head();
     bytes.extend_from_slice(b"{\"jsonrpc\":");
@@ -449,6 +450,14 @@ async fn a_body_that_does_not_arrive_in_time_is_408() {
     stream.write_all(&bytes).await.unwrap();
     let answer = read_answer(&mut stream).await;
     assert_eq!(answer.status, 408);
+    assert_eq!(answer.header("connection"), Some("close"));
+    assert_eq!(
+        answer.json(),
+        json!({"jsonrpc": "2.0", "id": null, "error": {
+            "code": INVALID_REQUEST,
+            "message": "Request timeout: the body did not arrive in time, so nothing ran",
+        }})
+    );
     server.assert_nothing_ran();
 }
 

@@ -1109,6 +1109,9 @@ mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJ
 mutate("mcp-challenge-dropped", "a 401 carries no WWW-Authenticate challenge", MCP_REJECTION,
        "                response\n                    .headers\n                    .insert(WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));\n",
        "")
+mutate("mcp-request-timeout-keeps-connection", "a 408 leaves the connection open for the rest of the late body", MCP_REJECTION,
+       '                    .insert(CONNECTION, HeaderValue::from_static("close"));',
+       '                    .insert(CONNECTION, HeaderValue::from_static("keep-alive"));')
 mutate("mcp-batch-accepted", "the first request of a JSON array is processed", MCP_PARSE,
        '        Value::Array(_) => {\n            return Err(Rejection::invalid_request(\n'
        '                "Invalid request: batches are not supported",\n            ));\n        }\n',
@@ -1440,6 +1443,9 @@ mutate("gw-shutdown-leaves-connections-open", "a connection still open after the
 mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
        "    match tokio::spawn(answering.instrument(span)).await {",
        "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
+mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
+       "        return refused(&Rejection::request_timeout());",
+       "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
 
 
 # --- gateway-dev ---------------------------------------------------------------------------
