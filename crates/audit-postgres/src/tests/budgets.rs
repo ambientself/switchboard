@@ -215,7 +215,9 @@ async fn begin_gives_up_at_its_budget_and_cancels_an_insert_still_waiting() {
         0
     );
 
-    // And the next begin, with the table free, writes its row.
+    // And the next begin, with the table free, writes its row. It must make a new connection,
+    // which on a loaded machine can take longer than the short budget, so it has the default.
+    let store = store.with_budgets(Budgets::default());
     assert!(matches!(
         begin_read(&store, &fixture).await.unwrap(),
         Begun::Allowed(_)
@@ -249,8 +251,14 @@ async fn begin_counts_waiting_for_a_connection_in_its_budget() {
         matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
         "{failure}"
     );
+    // Once the connection is free, the next begin has it. On a loaded machine its insert can
+    // take longer than the short budget, so it has the default.
     drop(held);
-    assert!(begin_read(&store, &fixture).await.is_ok());
+    let store = store.with_budgets(Budgets::default());
+    assert!(matches!(
+        begin_read(&store, &fixture).await.unwrap(),
+        Begun::Allowed(_)
+    ));
 }
 
 #[tokio::test]
