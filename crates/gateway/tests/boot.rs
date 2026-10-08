@@ -321,7 +321,8 @@ fn configuration_with_an_unknown_field_is_not_read() {
         "identity.enabled",
         "http.allowed_host",
         "policy_revision",
-        // One per struct the configuration nests, down to each issuer and each rule.
+        // One per struct the gateway's own sections nest, down to each issuer and each rule. The
+        // policy section is gateway-core's snapshot and is not probed here yet (#41).
         "identity.enforce.0.audience",
         "identity.enforce.1.max_lifetime",
         "identity.enforce.0.kind.workload.subject",

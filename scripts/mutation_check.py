@@ -1269,7 +1269,8 @@ mutate("gw-catalog-schema-not-checked", "an input schema that is not an object s
        '    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")',
        "    let _ = schema;\n    true")
 
-# Every struct the configuration nests refuses a key it does not know.
+# Every struct the gateway's own configuration sections nest refuses a key it does not know. The
+# policy section is gateway-core's snapshot; its structs are not covered here yet (#41).
 for path, struct in [
     (GW + "config.rs", "Config"),
     (GW + "config.rs", "IdentitySection"),
