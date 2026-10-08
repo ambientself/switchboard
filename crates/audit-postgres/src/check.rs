@@ -143,6 +143,10 @@ const REACHING: &str = "reaching(oid) AS (
             JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
     )";
 
+/// A function's name as reports give it: schema, name and argument types.
+const FUNCTION_NAME: &str =
+    "fn.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')'";
+
 /// The privileges a role may hold on a column. One held with grant option can be passed on to
 /// any other role, so it is checked as a privilege of its own.
 const COLUMN_PRIVILEGES: &[&str] = &[
@@ -277,6 +281,17 @@ pub enum Problem {
         /// The rule.
         rule: String,
     },
+    /// A `SECURITY DEFINER` function runs as a role that can read or change `call_rows`, itself
+    /// or through another such function, and the session's role, or a role it can become, can
+    /// run it: with EXECUTE, or by writing to a table whose trigger runs it.
+    Definer {
+        /// The function, with its schema and argument types.
+        function: String,
+        /// The role it runs as.
+        owner: String,
+        /// How the session can run it.
+        by: String,
+    },
     /// The session's role lacks a privilege the store needs.
     Missing {
         /// The privilege.
@@ -384,6 +399,16 @@ impl fmt::Display for Problem {
                 f,
                 "the table switchboard_audit.call_rows has the rule {rule}, whose statements run \
                  as the table's owner when the gateway writes"
+            ),
+            Self::Definer {
+                function,
+                owner,
+                by,
+            } => write!(
+                f,
+                "the SECURITY DEFINER function {function} runs as {owner}, which can read or \
+                 change switchboard_audit.call_rows, and this session's role, or a role it can \
+                 become, holds {by}"
             ),
             Self::Missing { privilege, object } => write!(
                 f,
@@ -562,6 +587,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     other_privileges(client, version, &mut problems).await?;
     if let Some((table, _)) = table {
         reaching_privileges(client, table, version, &mut problems).await?;
+        definers(client, table, version, &mut problems).await?;
     }
 
     if problems.is_empty() {
@@ -1088,6 +1114,89 @@ async fn reaching_privileges(
             object: row.get(0),
         });
     }
+    Ok(())
+}
+
+/// No `SECURITY DEFINER` function, in any schema, that runs as a role able to read or change
+/// `call_rows` may be run by the session's role or a role it can become, PUBLIC included,
+/// which holds EXECUTE on every new function unless it is revoked. A function's owner is able
+/// when it holds a privilege on `call_rows` or on anything [`REACHING`] finds, superusers among
+/// them since they hold every privilege; when it can act as the owner of the schema, which may
+/// drop the table; or when it can run another such function, itself or through a trigger on a
+/// table it can write. A trigger runs its function without asking for EXECUTE, so a write to a
+/// table with such a trigger counts as running it. A function owned by a role the session can
+/// become is left out: what that role holds is checked as the session's own.
+async fn definers(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    version: i32,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let privileges = table_privileges(version).join(", ");
+    let found = client
+        .query(
+            &format!(
+                "WITH RECURSIVE {REACHING},
+                 definers(oid) AS (
+                     SELECT p.oid FROM pg_catalog.pg_proc p
+                     WHERE p.prosecdef
+                         AND (EXISTS (SELECT FROM reaching x
+                                      WHERE has_table_privilege(p.proowner, x.oid, $2)
+                                          OR has_any_column_privilege(p.proowner, x.oid,
+                                                                      'SELECT, INSERT, UPDATE'))
+                              OR EXISTS (SELECT FROM pg_catalog.pg_namespace s
+                                         WHERE s.nspname = 'switchboard_audit'
+                                             AND pg_has_role(p.proowner, s.nspowner, 'USAGE')))
+                     UNION
+                     SELECT p.oid
+                     FROM definers d
+                         JOIN pg_catalog.pg_proc p ON p.prosecdef
+                             AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')
+                                  OR EXISTS (SELECT FROM pg_catalog.pg_trigger t
+                                             WHERE t.tgfoid = d.oid
+                                                 AND (has_any_column_privilege(
+                                                          p.proowner, t.tgrelid,
+                                                          'INSERT, UPDATE')
+                                                      OR has_table_privilege(
+                                                          p.proowner, t.tgrelid,
+                                                          'DELETE, TRUNCATE'))))
+                 )
+                 SELECT {FUNCTION_NAME}, o.rolname::text, 'EXECUTE on it'
+                 FROM definers d
+                     JOIN pg_catalog.pg_proc p ON p.oid = d.oid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
+                 WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')
+                     AND {}
+                 UNION ALL
+                 SELECT {FUNCTION_NAME}, o.rolname::text,
+                        w || ' on ' || n.nspname || '.' || c.relname || ', whose trigger '
+                            || t.tgname || ' runs it'
+                 FROM definers d
+                     JOIN pg_catalog.pg_proc p ON p.oid = d.oid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
+                     JOIN pg_catalog.pg_trigger t ON t.tgfoid = p.oid
+                     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
+                     unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS w
+                 WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')
+                     AND {}
+                 ORDER BY 1, 3",
+                by_any_role("has_function_privilege(r.oid, d.oid, 'EXECUTE')"),
+                by_any_role(
+                    "(has_table_privilege(r.oid, c.oid, w)
+                      OR w IN ('INSERT', 'UPDATE') AND has_any_column_privilege(r.oid, c.oid, w))"
+                ),
+            ),
+            &[&table, &privileges],
+        )
+        .await?;
+    problems.extend(found.into_iter().map(|row| Problem::Definer {
+        function: row.get(0),
+        owner: row.get(1),
+        by: row.get(2),
+    }));
     Ok(())
 }
 

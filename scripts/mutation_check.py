@@ -1449,6 +1449,7 @@ for site, test in [
     ("parameter", "has_parameter_privilege(r.oid, a.parname, p)"),
     ("reaching-table", "has_table_privilege(r.oid, v.oid, p)"),
     ("reaching-column", "has_any_column_privilege(r.oid, v.oid, p)"),
+    ("definer-execute", "has_function_privilege(r.oid, d.oid, 'EXECUTE')"),
 ]:
     mutate(f"pg-check-{site}-own-role-only", f"the {site} privilege check asks only of the session's role", PG_CHECK,
            f'"{test}"', f'"r.rolname = current_user AND {test}"')
@@ -1479,6 +1480,28 @@ mutate("pg-check-reaching-views-only", "a rule on another table that writes the 
        "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid AND rw.rulename = '_RETURN'\n")
 mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that reaches the table passes the check", PG_CHECK,
        "OR (p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND {}))", "OR (false AND {}))")
+mutate("pg-check-definers-ignored", "a SECURITY DEFINER function that can reach the table passes the check", PG_CHECK,
+       "                     WHERE p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x",
+       "                     WHERE false AND p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x")
+mutate("pg-check-definer-trigger-ignored", "a write to a table whose trigger runs such a function passes the check", PG_CHECK,
+       "unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS w", "unnest(ARRAY[]::text[]) AS w")
+mutate("pg-check-definer-trigger-own-role-only", "the trigger route asks only of the session's role, for a privilege on the whole table", PG_CHECK,
+       "has_table_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_table_privilege(r.oid, c.oid, w)")
+mutate("pg-check-definer-trigger-column-own-role-only", "the trigger route asks only of the session's role, for a column privilege", PG_CHECK,
+       "has_any_column_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_any_column_privilege(r.oid, c.oid, w)")
+mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner holds only column privileges passes the check", PG_CHECK,
+       "OR has_any_column_privilege(p.proowner, x.oid,", "OR false AND has_any_column_privilege(p.proowner, x.oid,")
+mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
+       "SELECT FROM reaching x\n", "SELECT FROM (SELECT $1::oid AS oid) x\n")
+mutate("pg-check-definer-schema-owner-ignored", "a definer function of the schema's owner passes the check", PG_CHECK,
+       "OR EXISTS (SELECT FROM pg_catalog.pg_namespace s", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_namespace s")
+mutate("pg-check-definer-chain-not-followed", "a definer function that reaches the table through another passes the check", PG_CHECK,
+       "                         JOIN pg_catalog.pg_proc p ON p.prosecdef\n",
+       "                         JOIN pg_catalog.pg_proc p ON false AND p.prosecdef\n")
+mutate("pg-check-definer-chain-execute-not-followed", "a definer function that runs another passes the check", PG_CHECK,
+       "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
+mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
+       "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
 
 
 # --- Running -------------------------------------------------------------------------------
