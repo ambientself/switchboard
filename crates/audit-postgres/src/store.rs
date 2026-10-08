@@ -227,8 +227,11 @@ impl Drop for InFlight {
 type Canceller = Arc<dyn Fn(CancelToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Every session the store opens commits synchronously, whatever the server, database or role
-/// sets as its default: begin must not return before its row is durable.
-const SESSION_OPTIONS: &str = "-c synchronous_commit=on";
+/// sets as its default: begin must not return before its row is durable. And it looks names up
+/// in `pg_catalog` alone, then its own temporary schema, so a function, operator or type
+/// another role made in a schema a database or role default puts first cannot stand in for
+/// the catalog's own, in the store's statements or in the boot checks.
+const SESSION_OPTIONS: &str = "-c synchronous_commit=on -c search_path=pg_catalog,pg_temp";
 
 /// The first pause between attempts to complete a row; each pause after doubles, up to
 /// [`LONGEST_PAUSE`].
@@ -277,7 +280,8 @@ impl PgAuditStore {
     /// needed, with the default [`Budgets`]. Nothing connects here, so a database that is down
     /// is found by the first call, or by [`check_at_boot`](Self::check_at_boot).
     ///
-    /// Each session sets `synchronous_commit` to `on`, after any options `config` carries.
+    /// Each session sets `synchronous_commit` to `on` and `search_path` to
+    /// `pg_catalog, pg_temp`, after any options `config` carries.
     pub fn connect<T>(
         config: tokio_postgres::Config,
         tls: T,

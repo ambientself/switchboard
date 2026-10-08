@@ -853,3 +853,55 @@ async fn a_trigger_that_fires_at_another_time_or_on_some_rows_is_refused() {
         .unwrap();
     assert_eq!(problems(&store).await, vec![missing("complete_once")]);
 }
+
+/// A function another role made, in a schema that a database or role default puts before
+/// `pg_catalog`, cannot stand in for the catalog's own: the store's sessions look names up in
+/// `pg_catalog` alone.
+#[tokio::test]
+async fn a_function_put_before_the_catalogs_own_does_not_change_what_the_check_finds() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    // The stand-in says no role is a member of any other, so every check that asks about the
+    // roles the session can become would find nothing.
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE FUNCTION public.pg_has_role(name, oid, text) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT false';
+             ALTER DATABASE {} SET search_path = public, pg_catalog;
+             GRANT DELETE ON switchboard_audit.call_rows TO {GATEWAY_ROLE};",
+            db.name()
+        ))
+        .await
+        .unwrap();
+    // A plain session finds the stand-in.
+    let member: bool = db
+        .connect_as(GATEWAY_ROLE)
+        .await
+        .query_one(
+            "SELECT pg_has_role(current_user, oid, 'MEMBER')
+             FROM pg_catalog.pg_roles WHERE rolname = current_user",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!member);
+
+    let store = db.store(PoolSizes::default());
+    assert_eq!(
+        problems(&store).await,
+        vec![extra("DELETE", "switchboard_audit.call_rows")]
+    );
+    let path: String = store
+        .begin
+        .get()
+        .await
+        .unwrap()
+        .query_one("SHOW search_path", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(path, "pg_catalog,pg_temp");
+}

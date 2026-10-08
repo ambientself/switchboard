@@ -812,7 +812,9 @@ audit table lacks a column it writes, and if its database role can do more than 
 Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the trigger
 that sets the times or a write-once trigger missing or disabled, with grants beyond decision
 0009's on the audit or receipt table, with a role that owns the database, or with a session that
-logged in as another role than the one it runs as.
+logged in as another role than the one it runs as. Its sessions look names up in `pg_catalog`
+alone, so a function another role makes in a schema a default puts first cannot change what its
+checks or its writes do.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
