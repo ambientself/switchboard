@@ -126,6 +126,23 @@ const SERVER_ROLES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every relation whose rules read or write `call_rows`, given as `$1`, directly or through
+/// another such relation, in any schema, `call_rows` included: a view or materialized view
+/// over it, and a table or view with a rule whose action reaches it. A view's query is a rule,
+/// so one walk over the rules' dependencies finds them all. A view runs with its owner's
+/// privileges, and a rule with those of its table's owner, so a grant on any of them can give
+/// what the grants on `call_rows` withhold.
+const REACHING: &str = "reaching(oid) AS (
+        SELECT $1::oid
+        UNION
+        SELECT rw.ev_class
+        FROM reaching x
+            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid
+                AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
+            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
+    )";
+
 /// The privileges a role may hold on a column. One held with grant option can be passed on to
 /// any other role, so it is checked as a privilege of its own.
 const COLUMN_PRIVILEGES: &[&str] = &[
@@ -253,6 +270,13 @@ pub enum Problem {
         /// What it is held on.
         object: String,
     },
+    /// `switchboard_audit.call_rows` has a rule. A rule's statements run, as the table's owner,
+    /// in place of or beside a write the gateway makes, so one could delete a row whenever the
+    /// gateway completes one. The migration makes none.
+    Rule {
+        /// The rule.
+        rule: String,
+    },
     /// The session's role lacks a privilege the store needs.
     Missing {
         /// The privilege.
@@ -355,6 +379,11 @@ impl fmt::Display for Problem {
                 f,
                 "this session's role, or a role it can become, holds {privilege} on {object}, \
                  which the gateway must not have"
+            ),
+            Self::Rule { rule } => write!(
+                f,
+                "the table switchboard_audit.call_rows has the rule {rule}, whose statements run \
+                 as the table's owner when the gateway writes"
             ),
             Self::Missing { privilege, object } => write!(
                 f,
@@ -526,10 +555,14 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
             unlogged(client, table, &mut problems).await?;
             columns(client, table, &mut problems).await?;
             triggers(client, table, &mut problems).await?;
+            rules(client, table, &mut problems).await?;
             column_privileges(client, table, &mut problems).await?;
         }
     }
     other_privileges(client, version, &mut problems).await?;
+    if let Some((table, _)) = table {
+        reaching_privileges(client, table, version, &mut problems).await?;
+    }
 
     if problems.is_empty() {
         Ok(())
@@ -785,6 +818,26 @@ fn trigger_problem(trigger: &Trigger, enabled: Option<&str>) -> Option<Problem> 
     }
 }
 
+async fn rules(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query(
+            "SELECT rulename::text FROM pg_catalog.pg_rewrite WHERE ev_class = $1::oid
+             ORDER BY 1",
+            &[&table],
+        )
+        .await?;
+    problems.extend(
+        found
+            .into_iter()
+            .map(|row| Problem::Rule { rule: row.get(0) }),
+    );
+    Ok(())
+}
+
 /// The table-level privileges a role may hold, by server version.
 fn table_privileges(version: i32) -> Vec<&'static str> {
     let mut privileges = vec![
@@ -996,6 +1049,44 @@ async fn other_privileges(
                 object: format!("the setting {}", row.get::<_, String>(0)),
             });
         }
+    }
+    Ok(())
+}
+
+/// Nothing, for the session's role or any role it can become, PUBLIC included, on any view,
+/// materialized view or table with a rule, in another schema, that reaches `call_rows`
+/// ([`REACHING`]). Those in the schema are refused with everything else there.
+async fn reaching_privileges(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    version: i32,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let privileges = table_privileges(version);
+    let held = client
+        .query(
+            &format!(
+                "WITH RECURSIVE {REACHING}
+                 SELECT n.nspname || '.' || v.relname, p
+                 FROM reaching x
+                     JOIN pg_catalog.pg_class v ON v.oid = x.oid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = v.relnamespace,
+                     unnest($2::text[]) AS p
+                 WHERE n.nspname <> 'switchboard_audit'
+                     AND ({}
+                         OR (p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND {}))
+                 ORDER BY 1, 2",
+                by_any_role("has_table_privilege(r.oid, v.oid, p)"),
+                by_any_role("has_any_column_privilege(r.oid, v.oid, p)"),
+            ),
+            &[&table, &privileges],
+        )
+        .await?;
+    for row in held {
+        problems.push(Problem::Extra {
+            privilege: row.get(1),
+            object: row.get(0),
+        });
     }
     Ok(())
 }

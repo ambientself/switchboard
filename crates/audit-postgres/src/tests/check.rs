@@ -1317,3 +1317,160 @@ async fn a_session_without_the_stores_settings_is_refused() {
         ]
     );
 }
+
+/// Begins an allowed row as the owner, and returns its identifier.
+async fn a_row(db: &TestDatabase) -> String {
+    db.connect_as(OWNER_ROLE)
+        .await
+        .query_one(
+            "INSERT INTO switchboard_audit.call_rows (
+                 deployment, surface, profile, tool, connector, classification, resources,
+                 resources_omitted, decision, policy_revision, proved_issuer, proved_subject,
+                 proved_kind, proved_team)
+             VALUES ('fixture', 'fixture-all', 'workload-rw', 'fixture__read', 'fixture', 'read',
+                     '[]', 0, 'allow', 'fixture-1', 'https://issuer.fixture.test',
+                     'secret-subject', 'workload', 'team-a')
+             RETURNING id::text",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// How many rows `call_rows` has, as the superuser counts them.
+async fn rows(db: &TestDatabase) -> i64 {
+    db.admin()
+        .await
+        .query_one("SELECT count(*) FROM switchboard_audit.call_rows", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A view runs with its owner's privileges, and a rule's statements with those of its table's
+/// owner. So a grant on a view over `call_rows`, on a view over that view, on a materialized
+/// view, or on a table with a rule that writes `call_rows`, gives what the grants on
+/// `call_rows` withhold, in whatever schema it is, to PUBLIC or to a role the gateway's can
+/// SET ROLE to without inheriting it. A grant on a table that does not reach `call_rows` is no
+/// concern here.
+#[tokio::test]
+async fn a_grant_on_a_view_or_rule_in_another_schema_that_reaches_the_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let reader = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.cluster_wide(&format!("GRANT {reader} TO {role} WITH INHERIT FALSE"))
+        .await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE SCHEMA reports;
+             CREATE VIEW reports.calls AS SELECT * FROM switchboard_audit.call_rows;
+             CREATE VIEW reports.subjects AS SELECT id, proved_subject FROM reports.calls;
+             CREATE MATERIALIZED VIEW reports.calls_then AS
+                 SELECT id, proved_subject FROM switchboard_audit.call_rows;
+             CREATE TABLE reports.inbox (id uuid);
+             CREATE RULE purge AS ON INSERT TO reports.inbox
+                 DO ALSO DELETE FROM switchboard_audit.call_rows WHERE id = NEW.id;
+             CREATE TABLE reports.unrelated (id uuid);
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT SELECT ON reports.calls TO PUBLIC;
+             GRANT DELETE ON reports.calls TO {reader};
+             GRANT SELECT (id, proved_subject) ON reports.subjects TO {reader};
+             GRANT SELECT ON reports.calls_then TO {reader};
+             GRANT INSERT (id) ON reports.inbox TO {GATEWAY_ROLE};
+             GRANT SELECT, INSERT ON reports.unrelated TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&db.store_as(&role)).await,
+        vec![
+            extra("DELETE", "reports.calls"),
+            extra("SELECT", "reports.calls"),
+            extra("SELECT", "reports.calls_then"),
+            extra("INSERT", "reports.inbox"),
+            extra("SELECT", "reports.subjects"),
+        ]
+    );
+
+    // What the check refuses is real: the role reads who called, through a view over a view,
+    // and deletes rows, through a view as the role it can become and through a rule as
+    // itself.
+    let first = a_row(&db).await;
+    let second = a_row(&db).await;
+    let session = db.connect_as(&role).await;
+    session
+        .batch_execute(&format!("SET ROLE {reader}"))
+        .await
+        .unwrap();
+    let subject: String = session
+        .query_one(
+            &format!("SELECT proved_subject FROM reports.subjects WHERE id = '{first}'"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(subject, "secret-subject");
+    session
+        .batch_execute(&format!(
+            "DELETE FROM reports.calls WHERE id = '{first}';
+             RESET ROLE;
+             INSERT INTO reports.inbox (id) VALUES ('{second}');"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+}
+
+/// A rule on `call_rows` itself runs its statements as the table's owner whenever the gateway
+/// writes: here completing a row deletes it.
+#[tokio::test]
+async fn a_rule_on_the_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE RULE also_purge AS ON UPDATE TO switchboard_audit.call_rows
+                 DO ALSO DELETE FROM switchboard_audit.call_rows WHERE id = OLD.id;"
+        ))
+        .await
+        .unwrap();
+    let error = db
+        .store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap_err();
+    let BootCheckError::Unfit { problems, .. } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(
+        problems,
+        &vec![Problem::Rule {
+            rule: "also_purge".into()
+        }]
+    );
+    assert!(
+        error.to_string().contains("has the rule also_purge"),
+        "{error}"
+    );
+
+    // What the check refuses is real.
+    let row = a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute(&format!(
+            "UPDATE switchboard_audit.call_rows SET outcome = 'ok', latency_ms = 1
+             WHERE id = '{row}'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+}

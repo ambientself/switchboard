@@ -1447,6 +1447,8 @@ for site, test in [
     ("schema-grant-option", "has_schema_privilege(r.oid, n.oid, 'USAGE WITH GRANT OPTION')"),
     ("database-create", "has_database_privilege(r.oid, current_database(), 'CREATE')"),
     ("parameter", "has_parameter_privilege(r.oid, a.parname, p)"),
+    ("reaching-table", "has_table_privilege(r.oid, v.oid, p)"),
+    ("reaching-column", "has_any_column_privilege(r.oid, v.oid, p)"),
 ]:
     mutate(f"pg-check-{site}-own-role-only", f"the {site} privilege check asks only of the session's role", PG_CHECK,
            f'"{test}"', f'"r.rolname = current_user AND {test}"')
@@ -1462,6 +1464,21 @@ mutate("pg-check-server-roles-inherited-only", "a server role reached without in
 for server_role in ["pg_execute_server_program", "pg_read_server_files", "pg_write_server_files"]:
     mutate(f"pg-check-{server_role.replace('_', '-')}-ignored", f"a member of {server_role} passes the check", PG_CHECK,
            f'        "{server_role}",\n', '        "pg_monitor",\n')
+
+mutate("pg-check-rule-ignored", "a rule on the table passes the check", PG_CHECK,
+       "            .map(|row| Problem::Rule { rule: row.get(0) }),",
+       "            .filter(|_| false)\n            .map(|row| Problem::Rule { rule: row.get(0) }),")
+mutate("pg-check-reaching-ignored", "a grant on a view or rule outside the schema that reaches the table passes the check", PG_CHECK,
+       "                 WHERE n.nspname <> 'switchboard_audit'\n                     AND ({}",
+       "                 WHERE false\n                     AND ({}")
+mutate("pg-check-reaching-direct-only", "a view over a view over the table is not followed", PG_CHECK,
+       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid\n",
+       "            JOIN pg_catalog.pg_depend d ON d.refobjid = x.oid AND x.oid = $1::oid\n")
+mutate("pg-check-reaching-views-only", "a rule on another table that writes the table is not followed", PG_CHECK,
+       "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid\n",
+       "            JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid AND rw.rulename = '_RETURN'\n")
+mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that reaches the table passes the check", PG_CHECK,
+       "OR (p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND {}))", "OR (false AND {}))")
 
 
 # --- Running -------------------------------------------------------------------------------
