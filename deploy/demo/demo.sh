@@ -251,12 +251,13 @@ check_boot() {
   check "$(count_lines '"identity":"disabled"|"audit":"disabled"' "$1")" 0 "the gateway disabled neither identity nor audit"
 }
 
-# check_server_bearers LOGS SHA256 MIN SCOPE: what mock-docs received. Every request it accepted
-# carried the gateway's credential, which is SHA256; with SCOPE=all, so did every request carrying
-# any bearer. MIN is the fewest accepted requests the run must have made. Requests with no bearer
-# (the health checks) are not counted.
+# check_server_bearers LOGS SHA256 CALLS SCOPE: what mock-docs received. Every request it
+# accepted carried the gateway's credential, which is SHA256; with SCOPE=all, so did every request
+# carrying any bearer. CALLS is exactly how many calls the gateway allowed so far: one more means
+# a call it denied reached the server, one fewer that an allowed call did not, or that the log is
+# short. Requests with no bearer (the health checks) are not counted.
 check_server_bearers() {
-  local logs=$1 sha=$2 min=$3 scope=$4 lines
+  local logs=$1 sha=$2 calls=$3 scope=$4 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.bearer_sha256 != null)
     | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256)"')
   echo "    requests seen by mock-docs, by answer and bearer sha256 prefix (the gateway's is ${sha:0:12}...):"
@@ -265,7 +266,7 @@ check_server_bearers() {
   good=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "accepted" && length($2) >= 8 && index(sha, $2) == 1 { n++ } END { print n + 0 }')
   bad=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
   stray=$(printf '%s\n' "$lines" | awk -v sha="$sha" 'NF == 2 && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
-  check_at_least "$good" "$min" "mock-docs accepted the gateway's credential"
+  check "$good" "$calls" "mock-docs accepted the gateway's credential on exactly the $calls calls the gateway allowed"
   check "$bad" 0 "mock-docs accepted no other bearer"
   if [ "$scope" = all ]; then
     check "$stray" 0 "mock-docs never received any bearer but the gateway's"
@@ -322,7 +323,8 @@ compose_run() {
   compose_workload "team-a workload" full team-a
   compose_workload "team-b workload" full team-b
 
-  step "the server never saw a workload token"
+  step "the server never saw a workload token, and no denied call reached it"
+  # Each team's full run is allowed two calls, its list and its read; its other calls are denied.
   check_server_bearers "$(dc logs --no-log-prefix mock-docs)" \
     "$(cat "$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256")" 4 all
 
@@ -541,11 +543,13 @@ kind_run() {
   step "operator checks: neither team's workload may read the gateway's or mock-docs' secrets, start pods, mint the gateway's tokens, or exec, port-forward or proxy to either"
   operator_checks
 
-  step "the server never saw a workload token through the gateway"
+  step "the server never saw a workload token through the gateway, and no denied call reached it"
   # The two direct calls before the policy, one per team, carried the workloads' own tokens and
   # were refused (401); every request the server accepted carried the gateway's credential.
+  # Each team's full run is allowed three calls: its list, its read, and the same pod's read
+  # after its direct call times out. Its other calls are denied, and the stranger is refused.
   check_server_bearers "$(k -n mock-docs logs deploy/mock-docs)" \
-    "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 4 accepted
+    "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 6 accepted
 
   step "the gateway's view of identity failures (operators only; no audit rows)"
   local gateway_logs

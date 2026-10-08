@@ -2511,6 +2511,10 @@ mutate("dev-issuer-empty-values", "an empty subject or audience is signed", DEV_
 mutate("dev-issuer-no-subject", "the development issuer starts with no subjects", DEV_BIN,
        "        subjects: (!subjects.is_empty())", "        subjects: (true)")
 
+mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
+       '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
+mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
+       'docs-credential.sha256")" 6 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
 mutate("demo-driver-health-checks-counted", "the outage step counts health checks as requests", DRIVER,
        "select(.accepted == true)' | awk 'END { print NR }'", "select(.event == \"request\")' | awk 'END { print NR }'")
 mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,

@@ -342,15 +342,30 @@ fn the_server_bearer_check_admits_only_the_gateways_credential() {
         run.transcript()
     );
 
-    let run = sourced(&format!(
-        "check_server_bearers '{}' {sha} 2 accepted\nFINISHED=1\nresult 0",
-        logs(&[good])
-    ));
-    assert!(
-        run.failed("mock-docs accepted the gateway's credential"),
-        "{}",
-        run.transcript()
-    );
+    // One fewer than the calls the gateway allowed, or one more: a denied call reached the
+    // server, or the log is short.
+    for lines in [&[good][..], &[good, good, good][..]] {
+        let run = sourced(&format!(
+            "check_server_bearers '{}' {sha} 2 accepted\nFINISHED=1\nresult 0",
+            logs(lines)
+        ));
+        assert!(
+            run.failed("mock-docs accepted the gateway's credential on exactly the 2 calls"),
+            "{}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
+    let driver = common::read("deploy/demo/demo.sh");
+    for call in [
+        "\"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" 4 all\n",
+        "\"$(cat \"$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256\")\" 6 accepted\n",
+    ] {
+        assert_eq!(driver.matches(call).count(), 1, "{call}");
+    }
 }
 
 #[test]
