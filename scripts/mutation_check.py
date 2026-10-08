@@ -1076,7 +1076,8 @@ mutate_all(
 # documentation). Without it they survive. The `pg-columns-*` ones need no server, nor do
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
 # pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
-# pg-retry-socket-failure-final and pg-finish-dropped-task-not-reported.
+# pg-retry-socket-failure-final, pg-finish-dropped-task-not-reported,
+# pg-finish-pause-past-deadline and pg-finish-pause-uncapped.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 PG_STORE = PG + "src/store.rs"
@@ -1260,6 +1261,10 @@ mutate("pg-finish-retries-final-errors", "finish retries a failure that trying a
        "                Err(error) if !error.is_transient() => return Err(error),", "                Err(error) if false => return Err(error),")
 mutate("pg-finish-no-deadline", "finish keeps trying past its deadline", PG_STORE,
        "            if now >= self.deadline {", "            if false {")
+mutate("pg-finish-pause-past-deadline", "a pause between finish attempts may run past the deadline", PG_STORE,
+       "sleep_until((now + pause).min(self.deadline)).await;", "sleep_until(now + pause).await;")
+mutate("pg-finish-pause-uncapped", "the pause between finish attempts doubles without a cap", PG_STORE,
+       "pause = (pause * 2).min(LONGEST_PAUSE);", "pause = pause * 2;")
 mutate("pg-retry-connect-failure-final", "a connection that could not be made is not retried", PG_STORE,
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
        "            Self::Pool(PoolError::Timeout(_)) | Self::AttemptTimedOut => {")

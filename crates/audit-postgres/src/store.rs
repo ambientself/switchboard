@@ -741,6 +741,81 @@ mod unit {
         assert!(PgAuditError::Database(refused).is_transient());
     }
 
+    /// A server that takes each connection and closes it at once, keeping when it took each.
+    async fn server_that_closes_every_connection() -> (u16, Arc<std::sync::Mutex<Vec<Instant>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                kept.lock().unwrap().push(Instant::now());
+                drop(socket);
+            }
+        });
+        (port, accepted)
+    }
+
+    /// While every attempt fails at once, finish pauses between attempts for twice as long each
+    /// time, but never longer than [`LONGEST_PAUSE`], so a database back near the deadline is
+    /// still tried; and no pause runs past the deadline, so finish gives up at it. Needs no
+    /// server: the one here closes every connection it takes.
+    #[tokio::test]
+    async fn finish_pauses_at_most_the_longest_pause_and_gives_up_at_its_deadline() {
+        let (port, accepted) = server_that_closes_every_connection().await;
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(port).user("nobody");
+        // The last attempt before the deadline comes about 4.55 s in, after pauses of 50, 100,
+        // 200, 400 and 800 ms and then 1 s each. A pause after it that ran its full second
+        // would end 0.75 s past the deadline.
+        let deadline = Duration::from_millis(4800);
+        let given_up_at = Arc::new(std::sync::Mutex::new(None));
+        let kept = Arc::clone(&given_up_at);
+        let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())
+            .unwrap()
+            .with_budgets(Budgets {
+                answer: Duration::from_millis(500),
+                finish_deadline: deadline,
+                ..Budgets::default()
+            })
+            .on_given_up(move |_| *kept.lock().unwrap() = Some(Instant::now()));
+        let row = AuditRowId::new("00000000-0000-4000-8000-000000000000");
+        let completion = Completion {
+            outcome: gateway_core::audit::Outcome::Ok,
+            latency_ms: 1,
+        };
+
+        let started = Instant::now();
+        let error = store
+            .finish_within_budget(&row, &completion)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, PgAuditError::AnswerBudget { .. }),
+            "{error}"
+        );
+        while store.finishes().in_flight > 0 {
+            assert!(started.elapsed() < deadline + Duration::from_secs(3));
+            sleep_until(Instant::now() + Duration::from_millis(10)).await;
+        }
+        let given_up = given_up_at.lock().unwrap().unwrap() - started;
+        assert!(given_up >= deadline, "{given_up:?}");
+        assert!(
+            given_up < deadline + Duration::from_millis(350),
+            "gave up {given_up:?} after it began"
+        );
+
+        let accepted = accepted.lock().unwrap().clone();
+        assert!(accepted.len() >= 9, "{} attempts", accepted.len());
+        for pair in accepted.windows(2) {
+            let pause = pair[1] - pair[0];
+            assert!(
+                pause < LONGEST_PAUSE + Duration::from_millis(300),
+                "a pause of {pause:?} between attempts"
+            );
+        }
+    }
+
     /// A finish whose task is dropped with its runtime, before it ends, is counted and
     /// reported as given up, as the gateway's telemetry needs. Needs no server: the store
     /// keeps trying a port nothing listens on.
