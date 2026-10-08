@@ -722,6 +722,61 @@ async fn a_finish_the_caller_stops_waiting_for_still_completes_its_row() {
     );
 }
 
+/// Each attempt counts waiting for a connection from the finish pool, so a finish whose pool is
+/// held, by a burst of other finishes or a connect that hangs, still gives up at its deadline.
+#[tokio::test]
+async fn finish_counts_waiting_for_a_connection_in_each_attempt() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        answer: Duration::from_secs(4),
+        finish_deadline: Duration::from_secs(1),
+        ..Budgets::default()
+    };
+    let (store, reports) = reporting(
+        db.store(PoolSizes {
+            begin: 1,
+            finish: 1,
+        })
+        .with_budgets(budgets),
+    );
+    let (row, ok) = ran(
+        &store,
+        &fixture,
+        Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT),
+    )
+    .await;
+    // Every finish connection is in use.
+    let held = store.finish.get().await.unwrap();
+
+    let started = Instant::now();
+    let finished = within(
+        budgets.finish_deadline + SLACK,
+        audit::finish(&store, ok, 7),
+    )
+    .await;
+    assert!(started.elapsed() >= budgets.finish_deadline - Duration::from_millis(100));
+    let PgAuditError::Deadline { last, .. } = cause(finished.failure().unwrap()) else {
+        panic!("{:?}", finished.failure());
+    };
+    assert!(matches!(**last, PgAuditError::AttemptTimedOut), "{last}");
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 1
+        }
+    );
+    assert_eq!(
+        reports_of(&reports),
+        vec![(row.clone(), "ok", "deadline".to_owned())]
+    );
+    drop(held);
+    assert_eq!(outcome_of(&db.admin().await, &row).await, None);
+}
+
 /// The code a request for TLS starts with, where a startup has its protocol version.
 const TLS_REQUEST_CODE: u32 = 80_877_103;
 

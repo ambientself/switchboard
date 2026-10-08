@@ -1227,6 +1227,8 @@ mutate("pg-times-begun-at-default", "the begin time falls back to a default the 
 PG_CHECK = PG + "src/check.rs"
 mutate("pg-begin-pool-wait-unbounded", "begin waits for a connection past its budget", PG_STORE,
        "timeout_at(deadline, self.begin.get())", "timeout_at(deadline + Duration::from_secs(3600), self.begin.get())")
+mutate("pg-finish-pool-wait-unbounded", "a finish attempt waits for a connection past its time", PG_STORE,
+       "timeout_at(by, self.pool.get())", "timeout_at(by + Duration::from_secs(3600), self.pool.get())")
 mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget", PG_STORE,
        "timeout_at(deadline, insert_on(&client, &row))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, &row))")
 mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
