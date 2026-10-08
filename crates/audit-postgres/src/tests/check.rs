@@ -710,6 +710,54 @@ async fn a_missing_table_is_refused() {
     );
 }
 
+/// Crash recovery empties an unlogged table, and a standby never receives its rows, so rows
+/// begin reported as committed would be lost.
+#[tokio::test]
+async fn an_unlogged_table_or_partition_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default());
+    let unlogged = |table: &str| Problem::Unlogged {
+        table: table.into(),
+    };
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.call_rows SET UNLOGGED")
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![unlogged("switchboard_audit.call_rows")]
+    );
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.call_rows SET LOGGED")
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+
+    // A partitioned table holds no rows itself: they are in its partitions, which may be
+    // unlogged when it is not.
+    admin
+        .batch_execute(
+            "ALTER TABLE switchboard_audit.call_rows RENAME TO old_rows;
+             CREATE TABLE switchboard_audit.call_rows (LIKE switchboard_audit.old_rows)
+                 PARTITION BY RANGE (begun_at);
+             CREATE TABLE switchboard_audit.logged_rows PARTITION OF switchboard_audit.call_rows
+                 FOR VALUES FROM (MINVALUE) TO ('2000-01-01');
+             CREATE UNLOGGED TABLE switchboard_audit.unlogged_rows
+                 PARTITION OF switchboard_audit.call_rows DEFAULT;",
+        )
+        .await
+        .unwrap();
+    let found: Vec<Problem> = problems(&store)
+        .await
+        .into_iter()
+        .filter(|problem| matches!(problem, Problem::Unlogged { .. }))
+        .collect();
+    assert_eq!(found, vec![unlogged("switchboard_audit.unlogged_rows")]);
+}
+
 #[tokio::test]
 async fn a_disabled_or_missing_trigger_is_refused() {
     let Some(db) = TestDatabase::create().await else {

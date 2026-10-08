@@ -162,6 +162,12 @@ pub enum Problem {
     },
     /// `switchboard_audit.call_rows` is not there.
     TableMissing,
+    /// `switchboard_audit.call_rows`, or a partition of it, is unlogged. Crash recovery empties
+    /// an unlogged table, committed rows included, and a standby never receives its rows.
+    Unlogged {
+        /// The table or partition.
+        table: String,
+    },
     /// A column the store writes or reads is not there.
     ColumnMissing {
         /// The column.
@@ -270,6 +276,11 @@ impl fmt::Display for Problem {
                  pooler, may have dropped them"
             ),
             Self::TableMissing => write!(f, "the table switchboard_audit.call_rows does not exist"),
+            Self::Unlogged { table } => write!(
+                f,
+                "the table {table} is unlogged, so a crash empties it, committed rows and all, \
+                 and a standby never receives its rows"
+            ),
             Self::ColumnMissing { column } => {
                 write!(f, "the column call_rows.{column} does not exist")
             }
@@ -372,7 +383,7 @@ impl PgAuditStore {
     /// - The database's encoding is UTF8, so it holds every character a row may carry.
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
     ///   two triggers, enabled: the one that sets both times at insert, and the one that
-    ///   completes a row at most once.
+    ///   completes a row at most once. Neither it nor any partition of it is unlogged.
     /// - The session's `session_replication_role` is not `replica`, which a role or database
     ///   default can set, and under which neither trigger fires.
     /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
@@ -473,6 +484,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     match table {
         None => problems.push(Problem::TableMissing),
         Some(table) => {
+            unlogged(client, table, &mut problems).await?;
             columns(client, table, &mut problems).await?;
             triggers(client, table, &mut problems).await?;
             column_privileges(client, table, &mut problems).await?;
@@ -595,6 +607,34 @@ async fn ownership(
         owned
             .into_iter()
             .map(|row| Problem::Owns { object: row.get(0) }),
+    );
+    Ok(())
+}
+
+async fn unlogged(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    // A partition can be unlogged when the partitioned table is not, and the rows are in the
+    // partitions. The tree of a table that is not partitioned is empty.
+    let found = client
+        .query(
+            "SELECT n.nspname || '.' || c.relname
+             FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE (c.oid = $1::oid
+                    OR c.oid IN (SELECT relid
+                                 FROM pg_catalog.pg_partition_tree(($1::oid)::pg_catalog.regclass)))
+                 AND c.relpersistence <> 'p'
+             ORDER BY 1",
+            &[&table],
+        )
+        .await?;
+    problems.extend(
+        found
+            .into_iter()
+            .map(|row| Problem::Unlogged { table: row.get(0) }),
     );
     Ok(())
 }

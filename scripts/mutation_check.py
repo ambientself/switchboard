@@ -1354,6 +1354,12 @@ mutate("pg-check-replication-role-ignored", "a role that may set session_replica
 mutate("pg-check-session-settings-ignored", "a session without the store's settings passes the check", PG_CHECK,
        "        if found != *expected {\n            problems.push(Problem::SessionSetting {",
        "        if false {\n            problems.push(Problem::SessionSetting {")
+mutate("pg-check-unlogged-ignored", "an unlogged table passes the check", PG_CHECK,
+       "                 AND c.relpersistence <> 'p'", "                 AND false")
+mutate("pg-check-unlogged-table-ignored", "an unlogged table that is not partitioned passes the check", PG_CHECK,
+       "             WHERE (c.oid = $1::oid\n", "             WHERE (false\n")
+mutate("pg-check-unlogged-partition-ignored", "an unlogged partition passes the check", PG_CHECK,
+       "OR c.oid IN (SELECT relid", "OR false AND c.oid IN (SELECT relid")
 for privilege in ["TRUNCATE", "REFERENCES", "TRIGGER"]:
     mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
            f'        "{privilege}",\n', "")
