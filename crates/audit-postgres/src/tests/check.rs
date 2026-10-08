@@ -363,7 +363,7 @@ async fn a_column_grant_beyond_its_own_is_refused() {
     db.admin()
         .await
         .batch_execute(&format!(
-            "GRANT SELECT (proved_subject), UPDATE (tool)
+            "GRANT SELECT (proved_subject), UPDATE (tool), REFERENCES (id)
                  ON switchboard_audit.call_rows TO {GATEWAY_ROLE}"
         ))
         .await
@@ -371,6 +371,7 @@ async fn a_column_grant_beyond_its_own_is_refused() {
     assert_eq!(
         problems(&db.store(PoolSizes::default())).await,
         vec![
+            extra("REFERENCES", "switchboard_audit.call_rows.id"),
             extra("SELECT", "switchboard_audit.call_rows.proved_subject"),
             extra("UPDATE", "switchboard_audit.call_rows.tool"),
         ]
@@ -420,7 +421,8 @@ async fn a_role_that_cannot_use_the_schema_is_refused() {
 }
 
 /// A view over call_rows would show the gateway the columns its own grants withhold, such as
-/// who called; so would a materialized view; and a foreign table may reach anywhere.
+/// who called; so would a materialized view; and a foreign table may reach anywhere. On a
+/// sequence, SELECT reads it and UPDATE sets it with setval.
 #[tokio::test]
 async fn any_privilege_on_another_table_in_the_schema_is_refused() {
     let Some(db) = TestDatabase::create().await else {
@@ -432,6 +434,10 @@ async fn any_privilege_on_another_table_in_the_schema_is_refused() {
             "GRANT SELECT (version) ON switchboard_audit.migrations TO {GATEWAY_ROLE};
              CREATE SEQUENCE switchboard_audit.extra;
              GRANT USAGE ON SEQUENCE switchboard_audit.extra TO {GATEWAY_ROLE};
+             CREATE SEQUENCE switchboard_audit.extra_read;
+             GRANT SELECT ON SEQUENCE switchboard_audit.extra_read TO {GATEWAY_ROLE};
+             CREATE SEQUENCE switchboard_audit.extra_set;
+             GRANT UPDATE ON SEQUENCE switchboard_audit.extra_set TO {GATEWAY_ROLE};
              SET ROLE {OWNER_ROLE};
              CREATE VIEW switchboard_audit.who AS
                  SELECT id, proved_subject FROM switchboard_audit.call_rows;
@@ -453,6 +459,8 @@ async fn any_privilege_on_another_table_in_the_schema_is_refused() {
         vec![
             extra("SELECT", "switchboard_audit.elsewhere"),
             extra("USAGE", "switchboard_audit.extra"),
+            extra("SELECT", "switchboard_audit.extra_read"),
+            extra("UPDATE", "switchboard_audit.extra_set"),
             extra("SELECT", "switchboard_audit.migrations"),
             extra("SELECT", "switchboard_audit.who"),
             extra("SELECT", "switchboard_audit.who_then"),
@@ -774,6 +782,46 @@ async fn a_missing_table_is_refused() {
     );
 }
 
+/// Only a table is the table. A foreign table named `call_rows`, with the columns, the grants
+/// and the triggers the store expects, may send its rows anywhere, so it is refused as missing.
+#[tokio::test]
+async fn a_relation_named_call_rows_that_is_not_a_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let columns: Vec<String> = crate::check::COLUMNS
+        .iter()
+        .map(|(name, kind)| format!("{name} {kind}"))
+        .collect();
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "DROP TABLE switchboard_audit.call_rows;
+             CREATE FOREIGN DATA WRAPPER switchboard_test_wrapper;
+             CREATE SERVER switchboard_test_server FOREIGN DATA WRAPPER switchboard_test_wrapper;
+             CREATE FOREIGN TABLE switchboard_audit.call_rows ({columns})
+                 SERVER switchboard_test_server;
+             ALTER FOREIGN TABLE switchboard_audit.call_rows OWNER TO {OWNER_ROLE};
+             CREATE TRIGGER set_times BEFORE INSERT ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION switchboard_audit.set_times();
+             CREATE TRIGGER complete_once BEFORE UPDATE ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();
+             GRANT INSERT ({inserted}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
+             GRANT UPDATE ({updated}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
+             GRANT SELECT ({selected}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};",
+            columns = columns.join(", "),
+            inserted = INSERTED.join(", "),
+            updated = UPDATED.join(", "),
+            selected = SELECTED.join(", "),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&db.store(PoolSizes::default())).await,
+        vec![Problem::TableMissing]
+    );
+}
+
 /// Crash recovery empties an unlogged table, and a standby never receives its rows, so rows
 /// begin reported as committed would be lost.
 #[tokio::test]
@@ -1070,6 +1118,18 @@ async fn a_trigger_that_fires_at_another_time_or_on_some_rows_is_refused() {
             .unwrap();
         store.check_at_boot().await.unwrap();
     }
+    // A trigger of the right name, at the right time, that calls the schema's other function:
+    // complete_once running set_times would fire before every update and hold nothing to
+    // being written once.
+    admin
+        .batch_execute(
+            "DROP TRIGGER complete_once ON switchboard_audit.call_rows;
+             CREATE TRIGGER complete_once BEFORE UPDATE ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION switchboard_audit.set_times();",
+        )
+        .await
+        .unwrap();
+    assert_eq!(problems(&store).await, vec![missing("complete_once")]);
     // A condition makes a trigger fire on some rows only.
     admin
         .batch_execute(

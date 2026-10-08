@@ -1406,6 +1406,16 @@ mutate("pg-check-maintain-ignored", "MAINTAIN on the table passes the check", PG
        '        privileges.push("MAINTAIN");', "")
 mutate("pg-check-trigger-function-any-schema", "a trigger calling a function of the same name in another schema passes the check", PG_CHECK,
        "AND n.nspname = 'switchboard_audit' AND p.proname = $2", "AND p.proname = $2")
+mutate("pg-check-trigger-function-any-name", "a trigger calling another of the schema's functions passes the check", PG_CHECK,
+       "AND n.nspname = 'switchboard_audit' AND p.proname = $2", "AND n.nspname = 'switchboard_audit' AND $2::text IS NOT NULL")
+mutate("pg-check-column-references-ignored", "REFERENCES on a column passes the check", PG_CHECK,
+       '    "REFERENCES",\n    "SELECT WITH GRANT OPTION",', '    "SELECT WITH GRANT OPTION",')
+mutate("pg-check-sequence-select-ignored", "SELECT on a sequence in the schema passes the check", PG_CHECK,
+       "unnest(ARRAY['USAGE', 'SELECT', 'UPDATE'])", "unnest(ARRAY['USAGE', 'UPDATE'])")
+mutate("pg-check-sequence-update-ignored", "UPDATE on a sequence in the schema, which allows setval, passes the check", PG_CHECK,
+       "unnest(ARRAY['USAGE', 'SELECT', 'UPDATE'])", "unnest(ARRAY['USAGE', 'SELECT'])")
+mutate("pg-check-table-any-relkind", "a relation named call_rows that is not a table is taken for the table", PG_CHECK,
+       "                 AND c.relkind IN ('r', 'p')\",", "                 AND true\",")
 mutate("pg-check-schema-owner-membership-ignored", "a member of the schema's owner passes the check", PG_CHECK,
        "                 AND pg_has_role(current_user, n.nspowner, 'MEMBER')",
        "                 AND n.nspowner = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)")
