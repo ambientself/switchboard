@@ -25,9 +25,22 @@
 //!   row.
 //! - [`telemetry::init`] sends logs to standard output as JSON lines.
 //!
-//! The `switchboard` binary reads a configuration file, runs the boot gates and serves. It has
-//! no durable audit store and no connectors yet, so it starts only with audit explicitly
-//! disabled, and serves no tool.
+//! The first slice (decision 0008) runs from files:
+//!
+//! - [`Deployment`] reads the deployment file and every file it names: each issuer's keys and
+//!   team manifest, the registry file, the audit database's URL from the environment, and each
+//!   proxied server's credential file.
+//! - [`ServedPolicy`] is one version of the policy, from the JSON configuration or from the
+//!   registry file (`gateway-registry`): snapshot, approved definitions, profile rules and
+//!   argument adapters. The [`Gates`] serve the current version, and [`boot::check_registry`]
+//!   hands back a [`Reloader`] that replaces it when the registry file changes.
+//! - [`start::prepare`] builds the gateway: a `ProxyConnector` per registry server, behind the
+//!   registry's argument check; the Postgres audit store after its boot checks, or audit
+//!   explicitly disabled; and the boot gates.
+//!
+//! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves, and
+//! `switchboard migrate` brings the audit schema up to date. Nothing in it comes from the
+//! testkit; `tests/dependencies.rs` holds the crate's dependencies to an allowlist.
 
 #![forbid(unsafe_code)]
 
@@ -35,22 +48,31 @@ mod audit;
 pub mod boot;
 mod catalog;
 mod config;
+pub mod deployment;
 pub mod path;
+mod policy;
+mod proxied;
+pub mod reload;
 mod resources;
 mod selector;
 pub mod server;
+pub mod start;
 pub mod telemetry;
 
 pub use audit::{DISABLED_ROW, DisabledAuditStore};
-pub use boot::{BootError, GateState, Gates, Wiring};
+pub use boot::{BootError, GateState, Gates, Settings, Wiring};
 pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
+pub use deployment::{AuditChoice, Deployment, DeploymentError};
 pub use path::{
     AUDIT_DISABLED_NOTE, Admitted, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
     RequestPath, SERVER_NAME,
 };
+pub use policy::{LivePolicy, ServedPolicy};
+pub use proxied::{undeclared_argument, withdrawn_while_deciding};
+pub use reload::{ReloadError, Reloader};
 pub use resources::ResourceAdapter;
 pub use selector::{
     NO_PROFILE, ProfileSelector, SelectorError, SelectorRules, UserRule, WorkloadRule,

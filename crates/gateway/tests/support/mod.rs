@@ -157,11 +157,11 @@ pub fn config(fixture: &Fixture) -> Value {
         },
         "policy": gateway_testkit::policy_data(),
         "catalog": [
-                definition(READ_TOOL),
-                definition(DRAFT_TOOL),
-                definition(WRITE_TOOL),
-                definition(SCOPED_READ_TOOL),
-            ],
+            definition(READ_TOOL),
+            definition(DRAFT_TOOL),
+            definition(WRITE_TOOL),
+            definition(SCOPED_READ_TOOL),
+        ],
         "profiles": {
             "workloads": [
                 {"issuer": WORKLOAD_ISSUER, "team": TEAM_A, "profile": PROFILE_TEAM_A},

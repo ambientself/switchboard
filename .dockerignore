@@ -1,0 +1,10 @@
+.git
+.demo
+target
+conformance/.cache
+**/__pycache__
+# A worktree checkout lives under .claude, with its own target directory; the main checkout
+# can hold many. None of it belongs in the image, nor do session files or demo transcripts.
+.claude
+**/target
+demo-runs

@@ -1,0 +1,6 @@
+# The team manifest for the cluster's ServiceAccount issuer: subject to team. team-a's
+# `stranger` ServiceAccount is deliberately absent; its real, correctly scoped token is refused.
+
+[subjects]
+"system:serviceaccount:team-a:mock-workload" = "team-a"
+"system:serviceaccount:team-b:mock-workload" = "team-b"

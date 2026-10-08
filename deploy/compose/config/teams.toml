@@ -1,0 +1,7 @@
+# The team manifest for the Compose dev issuer: subject to team. `workload:team-a:stranger` and
+# `workload:team-b:stranger` are deliberately absent; the dev issuer signs tokens for them, and
+# the gateway refuses them.
+
+[subjects]
+"workload:team-a:mock-workload" = "team-a"
+"workload:team-b:mock-workload" = "team-b"

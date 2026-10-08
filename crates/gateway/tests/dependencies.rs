@@ -14,11 +14,14 @@
 
 use serde_json::{Value, json};
 
-const ALLOWED: [&str; 14] = [
+const ALLOWED: [&str; 19] = [
+    "audit-postgres",
     "axum",
+    "connector-proxy",
     "gateway-core",
     "gateway-identity",
     "gateway-mcp",
+    "gateway-registry",
     "http",
     "http-body-util",
     "hyper",
@@ -27,12 +30,16 @@ const ALLOWED: [&str; 14] = [
     "serde_json",
     "thiserror",
     "tokio",
+    "tokio-postgres",
+    "toml",
     "tracing",
     "tracing-subscriber",
 ];
 
-/// Never in a running gateway, whatever else the allowlist comes to hold.
-const TEST_ONLY: [&str; 2] = ["gateway-testkit", "rmcp"];
+/// Never in a running gateway, whatever else the allowlist comes to hold. The mock server plays
+/// a third party in tests and the demo; the gateway dev crate holds the fixture wiring and the
+/// development issuer, built on the testkit.
+const TEST_ONLY: [&str; 4] = ["gateway-testkit", "rmcp", "mock-docs-server", "gateway-dev"];
 
 /// Every dependency of this crate that is not a dev-dependency, as `cargo metadata` gives it.
 fn built_with() -> Vec<Value> {

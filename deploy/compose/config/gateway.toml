@@ -1,0 +1,43 @@
+# The gateway's deployment file for the Compose demo: `switchboard --config=<this file>`.
+# The format is in crates/gateway/src/deployment.rs. Relative paths are read from this file's
+# directory. Keep it in step with deploy/kind/base/config/gateway.toml; only the issuer, its
+# keys, the team manifest, the hosts and the credential's path differ.
+
+deployment = "compose-demo"
+listen = "0.0.0.0:8080"
+
+[http]
+# Host is matched without the port. `gateway` is the Compose service name; the other two are
+# how the host reaches the published port.
+allowed_hosts = ["gateway", "127.0.0.1", "localhost"]
+allowed_origins = []
+
+[registry]
+# Inside a mounted directory, not a mounted file, so replacing the file is seen (planDemo 14e).
+file = "/etc/switchboard/registry/registry.toml"
+poll_seconds = 2
+
+[identity]
+mode = "enforce"
+
+# The Compose dev issuer. Development only: it signs tokens for the subjects it is started with,
+# and it is reachable only on the Compose network.
+[[identity.issuers]]
+issuer = "https://dev-issuer.switchboard.test"
+kind = "workload"
+audiences = ["switchboard"]
+algorithm = "RS256"
+# Written by the dev issuer at start-up to the shared volume. Read once, at boot.
+keys_file = "/shared/issuer/jwks.json"
+subjects_file = "teams.toml"
+max_lifetime_seconds = 3600
+leeway_seconds = 30
+
+[audit]
+mode = "postgres"
+# The URL, which holds the dummy password, is read from this environment variable.
+url_env = "SWITCHBOARD_DATABASE_URL"
+
+[credentials]
+# A Compose secret holding a dummy value. The proxy sends it upstream; the workload never sees it.
+docs-credential = "/run/secrets/docs-credential"

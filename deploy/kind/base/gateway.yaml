@@ -1,0 +1,108 @@
+# The gateway. It verifies projected ServiceAccount tokens against the cluster's own issuer
+# keys (ConfigMap cluster-issuer-keys, which demo.sh creates), writes audit rows to Postgres as
+# switchboard_gateway, and forwards allowed calls to mock-docs with its own dummy credential.
+# Its deployment file (ConfigMap gateway-config) names everything else it reads.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: switchboard
+  labels:
+    app: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      serviceAccountName: gateway
+      # Decision 0009, Shutdown: the grace period must outlast the readiness-removal delay plus
+      # the 2 s begin budget, the 5 s call deadline and the 30 s finish deadline. Otherwise a
+      # stop can kill the gateway while it is still completing rows, and they stay open. The
+      # readiness probe below takes up to 6 s to notice (3 failures, 2 s apart), so that is
+      # 43 s. Kubernetes' default of 30 s is too short; 50 s leaves a margin.
+      # crates/demo-checks holds this to the code's values.
+      terminationGracePeriodSeconds: 50
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # The gateway refuses to start until the audit table exists; wait for the migration so it
+        # does not crash-loop meanwhile. Bounded: it fails after three minutes.
+        - name: wait-for-audit-schema
+          image: switchboard-demo:dev
+          imagePullPolicy: Never
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              until psql "$SWITCHBOARD_DATABASE_URL" -Atqc 'select 1 from switchboard_audit.call_rows limit 0' >/dev/null 2>&1; do
+                i=$((i + 1))
+                if [ "$i" -ge 90 ]; then echo "the audit schema did not appear within 180s" >&2; exit 1; fi
+                sleep 2
+              done
+          env:
+            - name: SWITCHBOARD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: database, key: gateway-url}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      containers:
+        - name: gateway
+          image: switchboard-demo:dev
+          imagePullPolicy: Never
+          command: ["switchboard", "--config=/etc/switchboard/config/gateway.toml"]
+          env:
+            - name: SWITCHBOARD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: database, key: gateway-url}}
+            - name: RUST_LOG
+              value: info
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/switchboard/config, readOnly: true}
+            # No subPath, so ConfigMap edits reach the running gateway.
+            - {name: registry, mountPath: /etc/switchboard/registry, readOnly: true}
+            - {name: issuer-keys, mountPath: /etc/switchboard/issuer, readOnly: true}
+            - {name: docs-credential, mountPath: /var/run/secrets/switchboard, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: gateway-config}
+        - name: registry
+          configMap: {name: registry}
+        - name: issuer-keys
+          configMap: {name: cluster-issuer-keys}
+        - name: docs-credential
+          secret: {secretName: docs-credential}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: switchboard
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

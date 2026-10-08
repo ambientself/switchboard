@@ -1,0 +1,161 @@
+# The Compose demo: Postgres, the migration, the dev issuer, the mock docs server and the
+# gateway. `deploy/demo/demo.sh compose` drives it; the `workload` service runs only under the
+# `demo` profile. Compose proves the mechanics and makes no claim about network routes
+# (draft 0010): every service here shares one network.
+#
+# Only the gateway is published, on 127.0.0.1:18080. Postgres is not published at all, and
+# neither is the dev issuer, which signs for anyone who can reach it.
+# Every password and credential below is a dummy value for this demo.
+#
+# The commands are the image's binaries: `switchboard` (crates/gateway), `switchboard-dev issuer`
+# (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server).
+
+name: switchboard-demo
+
+x-demo-image: &demo-image
+  image: switchboard-demo:dev
+  # Built once, by the gateway service below.
+  pull_policy: never
+
+x-database: &database
+  PGHOST: postgres
+  PGPORT: "5432"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: dummy-superuser-password
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  migrate:
+    <<: *demo-image
+    command: ["migrate.sh"]
+    environment:
+      <<: *database
+      POSTGRES_PASSWORD: dummy-superuser-password
+      OWNER_PASSWORD: dummy-owner-password
+      GATEWAY_PASSWORD: dummy-gateway-password
+      READER_PASSWORD: dummy-reader-password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  dev-issuer:
+    <<: *demo-image
+    # Development only. It makes a key pair at start, writes the public half to the shared
+    # volume, and answers GET /token?subject=...&audience=... on the Compose network for the
+    # subjects below; it is not published. The two strangers are signed so the demo can show
+    # the gateway refusing a real token whose subject is not in the team manifest.
+    command:
+      - switchboard-dev
+      - issuer
+      - --listen=0.0.0.0:8090
+      - --issuer=https://dev-issuer.switchboard.test
+      - --keys-out=/shared/issuer/jwks.json
+      - --subject=workload:team-a:mock-workload
+      - --subject=workload:team-b:mock-workload
+      - --subject=workload:team-a:stranger
+      - --subject=workload:team-b:stranger
+    volumes:
+      - issuer-keys:/shared/issuer
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /shared/issuer/jwks.json && curl -fso /dev/null http://127.0.0.1:8090/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mock-docs:
+    <<: *demo-image
+    # Accepts only the gateway's credential: it is given the credential's sha256, never the
+    # credential. It logs the sha256 prefix of every bearer it receives.
+    command: ["mock-docs-server"]
+    environment:
+      MOCK_DOCS_LISTEN: 0.0.0.0:8080
+      MOCK_DOCS_TOKEN_SHA256_FILE: /run/secrets/docs-credential-sha256
+    secrets:
+      - docs-credential-sha256
+    healthcheck:
+      test: ["CMD", "curl", "-so", "/dev/null", "http://127.0.0.1:8080/mcp"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  gateway:
+    <<: *demo-image
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        REQUIRE_ALL_BINS: "true"
+    # The deployment file names everything else: the registry, the dev issuer's keys, the team
+    # manifest, the audit database's URL variable and the credential file.
+    command: ["switchboard", "--config=/etc/switchboard/gateway.toml"]
+    # Decision 0009, Shutdown: on `docker compose stop` or `down`, the gateway must be given
+    # longer than the 2 s begin budget, the 5 s call deadline and the 30 s finish deadline,
+    # 37 s, before it is killed. Otherwise it can be killed while it is still completing rows,
+    # and they stay open. Compose has no readiness removal to add. Its default of 10 s is too
+    # short; 50 s is the kind manifest's value. crates/demo-checks holds this to the code's
+    # values.
+    stop_grace_period: 50s
+    ports:
+      - "127.0.0.1:18080:8080"
+    environment:
+      SWITCHBOARD_DATABASE_URL: postgres://switchboard_gateway:dummy-gateway-password@postgres:5432/switchboard
+      RUST_LOG: info
+    volumes:
+      - ./config/gateway.toml:/etc/switchboard/gateway.toml:ro
+      - ./config/teams.toml:/etc/switchboard/teams.toml:ro
+      # demo.sh mounts a copy under .demo/, so withdrawing a tool never edits the repository.
+      - ${SWITCHBOARD_REGISTRY_DIR:-./config/registry}:/etc/switchboard/registry:ro
+      - issuer-keys:/shared/issuer:ro
+    secrets:
+      - docs-credential
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      dev-issuer:
+        condition: service_healthy
+      mock-docs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-so", "/dev/null", "http://127.0.0.1:8080/mcp/docs"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  workload:
+    <<: *demo-image
+    profiles: [demo]
+    command: ["workload.sh", "full"]
+    # Team A by default; demo.sh sets these per run.
+    environment:
+      GATEWAY_URL: http://gateway:8080/mcp/docs
+      TOKEN_URL: http://dev-issuer:8090/token?subject=workload:team-a:mock-workload&audience=switchboard
+      OWN_PROJECT: atlas
+      OTHER_PROJECT: borealis
+      # Real tokens from the dev issuer that the gateway must refuse: a subject not in the team
+      # manifest, and the right subject for another audience.
+      BAD_TOKEN_URLS: >-
+        http://dev-issuer:8090/token?subject=workload:team-a:stranger&audience=switchboard
+        http://dev-issuer:8090/token?subject=workload:team-a:mock-workload&audience=not-switchboard
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+secrets:
+  docs-credential:
+    file: ./dummy-credentials/docs-credential
+  docs-credential-sha256:
+    file: ./dummy-credentials/docs-credential.sha256
+
+volumes:
+  pgdata:
+  issuer-keys:

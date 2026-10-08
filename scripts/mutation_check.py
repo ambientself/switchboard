@@ -1127,6 +1127,817 @@ mutate_all(
 )
 
 
+# --- gateway-mcp ---------------------------------------------------------------------------
+
+MCP = "crates/gateway-mcp/src/"
+MCP_PARSE = MCP + "parse.rs"
+MCP_REPLY = MCP + "reply.rs"
+MCP_REJECTION = MCP + "rejection.rs"
+
+mutate("mcp-get-served", "GET is answered", MCP_PARSE,
+       "    if method != Method::POST {", "    if method != Method::POST && method != Method::GET {")
+mutate("mcp-delete-served", "DELETE is answered", MCP_PARSE,
+       "    if method != Method::POST {", "    if method != Method::POST && method != Method::DELETE {")
+mutate("mcp-content-type-ignored", "a body not declared as JSON is served", MCP_PARSE,
+       "    if !content_type_is_json(headers) {", "    if false && !content_type_is_json(headers) {")
+mutate("mcp-accept-ignored", "an Accept excluding JSON is served", MCP_PARSE,
+       "    if !accept_admits_json(headers) {", "    if false && !accept_admits_json(headers) {")
+mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON", MCP + "headers.rs",
+       ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
+mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
+       ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
+mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
+       ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
+mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
+       '                response\n                    .headers\n                    .insert(ALLOW, HeaderValue::from_static("POST"));\n',
+       "")
+mutate("mcp-challenge-dropped", "a 401 carries no WWW-Authenticate challenge", MCP_REJECTION,
+       "                response\n                    .headers\n                    .insert(WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));\n",
+       "")
+mutate("mcp-request-timeout-keeps-connection", "a 408 leaves the connection open for the rest of the late body", MCP_REJECTION,
+       '                    .insert(CONNECTION, HeaderValue::from_static("close"));',
+       '                    .insert(CONNECTION, HeaderValue::from_static("keep-alive"));')
+mutate("mcp-batch-accepted", "the first request of a JSON array is processed", MCP_PARSE,
+       '        Value::Array(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: batches are not supported",\n            ));\n        }\n',
+       "        Value::Array(mut batch) if !batch.is_empty() => match batch.remove(0) {\n"
+       "            Value::Object(object) => object,\n"
+       '            _ => return Err(Rejection::invalid_request("not an object")),\n        },\n')
+mutate("mcp-null-id-accepted", "id: null is accepted", MCP_PARSE,
+       '        Some(Value::Null) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: id must not be null",\n            ));\n        }\n',
+       "        Some(Value::Null) => Some(RequestId::Number(0)),\n")
+mutate("mcp-notification-gets-body", "a notification is answered 200", MCP_REPLY,
+       "            status: StatusCode::ACCEPTED,", "            status: StatusCode::OK,")
+mutate("mcp-initialize-era-from-meta", "an initialize carrying a modern _meta version is served as modern", MCP_PARSE,
+       '    if method == "initialize" {\n        return Era::Legacy;\n    }\n', "")
+mutate("mcp-session-id-issued", "initialize gains Mcp-Session-Id", MCP_REPLY,
+       "            return result_response(id, result);\n",
+       "            let mut response = result_response(id, result);\n"
+       '            response.headers.insert(http::HeaderName::from_static("mcp-session-id"), HeaderValue::from_static("dummy-session"));\n'
+       "            return response;\n")
+mutate("mcp-initialize-echoes-version", "initialize answers a version other than 2025-06-18", MCP_REPLY,
+       '"protocolVersion": LEGACY,', '"protocolVersion": MODERN,')
+mutate("mcp-protocol-header-optional-modern", "the modern MCP-Protocol-Version header is not required", MCP_PARSE,
+       "        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one MCP-Protocol-Version header is required",\n',
+       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one MCP-Protocol-Version header is required",\n')
+mutate("mcp-protocol-header-mismatch-accepted", "an MCP-Protocol-Version header that disagrees with _meta is accepted", MCP_PARSE,
+       "        Single::One(header) if header == version => {}", "        Single::One(header) if !header.is_empty() => {}")
+mutate("mcp-unsupported-version-served", "an unsupported version is served", MCP_PARSE,
+       "    if version != MODERN {", "    if version.is_empty() {")
+mutate("mcp-capabilities-not-required", "clientCapabilities is optional", MCP_PARSE,
+       ".is_some_and(Value::is_object)", ".is_none_or(Value::is_object)")
+mutate("mcp-method-header-not-compared", "Mcp-Method is not compared with the body", MCP_PARSE,
+       "        Single::One(header) if header == method => {}", "        Single::One(header) if !header.is_empty() => {}")
+mutate("mcp-name-header-not-compared", "Mcp-Name is not compared with the body", MCP_PARSE,
+       "        Some(decoded) if decoded == name => Ok(()),", "        Some(_) => Ok(()),")
+mutate("mcp-method-header-optional", "a modern request with no Mcp-Method header is served", MCP_PARSE,
+       '        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n'
+       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n',
+       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
+       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n')
+mutate("mcp-name-header-optional", "a modern tools/call with no Mcp-Name header is served", MCP_PARSE,
+       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n",
+       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n"
+       "    if matches!(single(headers, NAME_HEADER), Single::Absent) {\n        return Ok(());\n    }\n")
+mutate("mcp-duplicate-header-first-used", "the first of two copies of a single-valued MCP header is used", MCP + "headers.rs",
+       "    if values.next().is_some() {\n        return Single::Malformed;\n    }\n", "")
+mutate("mcp-name-sentinel-not-decoded", "the base64 sentinel in Mcp-Name is compared raw", MCP_PARSE,
+       "    match header_name_value(header) {", "    match Some(header.to_owned()) {")
+mutate("mcp-modern-ping-served", "ping is served under 2026-07-28", MCP_PARSE,
+       '        "server/discover" => Ok(Call::Discover),\n',
+       '        "server/discover" => Ok(Call::Discover),\n        "ping" => Ok(Call::Ping),\n')
+mutate("mcp-legacy-ping-unknown", "ping is not served under 2025-06-18", MCP_PARSE,
+       '        "ping" => Ok(Call::Ping),\n', "")
+mutate("mcp-modern-unknown-method-200", "an unknown modern method is answered 200, not 404", MCP_REJECTION,
+       "            Era::Modern => StatusCode::NOT_FOUND,", "            Era::Modern => StatusCode::OK,")
+mutate("mcp-legacy-any-header-version", "a legacy request accepts any MCP-Protocol-Version", MCP_PARSE,
+       "        Single::One(header) if header == LEGACY => {}", "        Single::One(_) => {}")
+mutate("mcp-cursor-accepted", "a cursor the server never issued is accepted", MCP_PARSE,
+       "        None | Some(Value::Null) => Ok(Call::ToolsList),", "        _ => Ok(Call::ToolsList),")
+mutate("mcp-list-cache-public", "a modern tools/list is marked public", MCP_REPLY,
+       '"cacheScope": "private",', '"cacheScope": "public",')
+mutate("mcp-legacy-structured-non-object", "a legacy result carries structuredContent that is not an object", MCP_REPLY,
+       "            if era == Era::Modern || value.is_object() {", "            if true {")
+mutate("mcp-denial-code-changed", "the denial code becomes -32602", MCP + "constants.rs",
+       "pub const DENIAL_CODE: i64 = -32001;", "pub const DENIAL_CODE: i64 = -32602;")
+mutate("mcp-era-header-ignored", "a request with the modern version header and no _meta is served as legacy", MCP_PARSE,
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() {")
+mutate("mcp-era-meta-ignored", "a request whose _meta names its version, with no version header, is served as legacy", MCP_PARSE,
+       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
+       "    if header_is_modern {")
+mutate("mcp-content-type-any-charset", "a JSON content type with a charset other than UTF-8 is served", MCP + "headers.rs",
+       '            || value.trim().trim_matches(\'"\').eq_ignore_ascii_case("utf-8")',
+       '            || !value.is_empty()')
+mutate("mcp-jsonrpc-version-unchecked", "a request that does not say jsonrpc 2.0 is served", MCP_PARSE,
+       '    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {',
+       '    if false && object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {')
+mutate("mcp-response-refused-as-methodless", "a posted response is refused only for having no method", MCP_PARSE,
+       '        None if object.contains_key("result") || object.contains_key("error") => {',
+       '        None if false => {')
+mutate("mcp-fractional-id-accepted", "a fractional or out-of-range id is read as an integer", MCP_PARSE,
+       "        Some(Value::Number(id)) => match id.as_i64() {",
+       "        Some(Value::Number(id)) => match id.as_i64().or_else(|| id.as_f64().map(|id| id as i64)) {")
+mutate("mcp-params-not-object-accepted", "params that are not an object are read as empty", MCP_PARSE,
+       "        Some(_) => Params::Malformed,", "        Some(_) => Params::Object(Map::new()),")
+mutate("mcp-call-name-optional", "a tools/call with no name is served with an empty name", MCP_PARSE,
+       '    let Some(Value::String(name)) = params.remove("name") else {',
+       '    let Some(Value::String(name)) = params.remove("name").or(Some(Value::String(String::new()))) else {')
+mutate("mcp-method-not-string-accepted", "a method that is not a string is read as its JSON text", MCP_PARSE,
+       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: method must be a string",\n            ));\n        }\n',
+       "        Some(method) => method.to_string(),\n")
+mutate("mcp-no-method-accepted", "a request with no method is read as one with an empty method", MCP_PARSE,
+       '        None => return Err(Rejection::invalid_request("Invalid request: no method")),',
+       "        None => String::new(),")
+mutate("mcp-structured-id-accepted", "an id that is an object or an array is dropped, making the request a notification", MCP_PARSE,
+       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
+       '                "Invalid request: id must be a string or an integer",\n            ));\n        }\n    };\n',
+       "        Some(_) => None,\n    };\n")
+mutate("mcp-call-arguments-array-accepted","a tools/call whose arguments are an array is served with none", MCP_PARSE,
+       "        None | Some(Value::Null) => Map::new(),", "        None | Some(Value::Null | Value::Array(_)) => Map::new(),")
+# The adapter's dependency fence. It has no dev-dependency to move, so the mutation adds a crate
+# the workspace already locks and edits Cargo.lock to match, which `--locked` accepts.
+mutate_all(
+    "mcp-dependency-thiserror",
+    "the adapter depends on a crate outside its allowlist",
+    ("crates/gateway-mcp/Cargo.toml", 'serde_json = "1"\n\n[lints]\n', 'serde_json = "1"\nthiserror = "2"\n\n[lints]\n'),
+    ("Cargo.lock", 'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n]\n',
+     'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n "thiserror",\n]\n'),
+)
+
+
+# --- gateway -------------------------------------------------------------------------------
+
+GW = "crates/gateway/src/"
+BOOT = GW + "boot.rs"
+SELECTOR = GW + "selector.rs"
+CATALOG = GW + "catalog.rs"
+
+# The identity and audit gates: configured, explicitly disabled, neither, both.
+mutate("gw-boot-identity-neither-starts", "identity neither enforced nor disabled starts, unchecked", BOOT,
+       "        (None, false) => return Err(BootError::IdentityUnconfigured),\n",
+       "        (None, false) => (IdentityConfig::Disabled, GateState::Disabled),\n")
+mutate("gw-boot-identity-both-starts", "identity both enforced and disabled starts, unchecked", BOOT,
+       "        (Some(_), true) => return Err(BootError::IdentityContradiction),\n",
+       "        (Some(_), true) => (IdentityConfig::Disabled, GateState::Disabled),\n")
+mutate("gw-boot-audit-neither-starts", "audit with no store and no opt-out starts, recording nothing", BOOT,
+       "        (None, false) => Err(BootError::AuditUnconfigured),\n",
+       "        (None, false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled)),\n")
+mutate("gw-boot-audit-both-starts", "audit with a store and an opt-out starts", BOOT,
+       "        (Some(_), true) => Err(BootError::AuditContradiction),\n",
+       "        (Some(store), true) => Ok((store, GateState::On)),\n")
+mutate("gw-noop-store-when-enforced", "the no-op store is used although a store was supplied", BOOT,
+       "        (Some(store), false) => Ok((store, GateState::On)),\n",
+       "        (Some(_), false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::On)),\n")
+mutate("gw-disabled-store-constructible", "anyone can make the no-op audit store", GW + "audit.rs",
+       "    pub(crate) fn new() -> Self {", "    pub fn new() -> Self {")
+mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Host starts", BOOT,
+       "    if config.http.allowed_hosts.is_empty() {\n        return Err(BootError::NoAllowedHosts);\n    }\n", "")
+
+# Tool definitions.
+mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
+       "            if !self.definitions.contains_key(name) {\n                return Err(CatalogError::Missing(name.clone()));\n            }\n",
+       "")
+mutate("gw-boot-catalog-not-checked", "boot does not check the catalog against the snapshot", BOOT,
+       "    catalog.check(&approved)?;\n", "    let _ = &approved;\n")
+mutate("gw-catalog-unapproved-accepted", "a definition for a tool nobody approved is kept", CATALOG,
+       "            Some(name) => Err(CatalogError::NotApproved(name.clone())),", "            Some(_) => Ok(()),")
+mutate("gw-catalog-duplicate-accepted", "a second definition for a tool replaces the first", CATALOG,
+       "            if let Some(previous) = catalog.insert(definition.name.clone(), definition) {\n"
+       "                return Err(CatalogError::Duplicate(previous.name));\n            }\n",
+       "            catalog.insert(definition.name.clone(), definition);\n")
+mutate("gw-catalog-schema-not-checked", "an input schema that is not an object schema is accepted", CATALOG,
+       '    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")',
+       "    let _ = schema;\n    true")
+
+# Every struct the gateway's own configuration sections nest refuses a key it does not know. The
+# policy section is gateway-core's snapshot; its structs are mutated with the core's, under "The
+# snapshot".
+for path, struct in [
+    (GW + "config.rs", "Config"),
+    (GW + "config.rs", "IdentitySection"),
+    (GW + "config.rs", "AuditSection"),
+    (GW + "config.rs", "HttpSection"),
+    (GW + "config.rs", "IssuerEntry"),
+    (CATALOG, "ToolDefinition"),
+    (SELECTOR, "SelectorRules"),
+    (SELECTOR, "WorkloadRule"),
+    (SELECTOR, "UserRule"),
+]:
+    mutate(f"gw-unknown-fields-{struct}", f"{struct} accepts unknown fields", path,
+           f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
+mutate("gw-unknown-fields-IssuerKindEntry", "an issuer's kind accepts unknown fields", GW + "config.rs",
+       '#[serde(rename_all = "snake_case", deny_unknown_fields)]\npub enum IssuerKindEntry {',
+       '#[serde(rename_all = "snake_case")]\npub enum IssuerKindEntry {')
+
+# Connectors.
+mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
+       "        if !connectors.contains_key(&tool.connector) {", "        if false && !connectors.contains_key(&tool.connector) {")
+mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice keeps the last one", BOOT,
+       "    for (name, registered) in registrations {\n"
+       "        if connectors.insert(name.clone(), registered).is_some() {\n"
+       "            return Err(BootError::DuplicateConnector(name));\n        }\n",
+       "    for (name, registered) in registrations {\n        connectors.insert(name, registered);\n")
+mutate("gw-boot-registry-duplicate-connector-accepted", "a proxied connector registered twice keeps the last one", BOOT,
+       "        };\n        if connectors.insert(name.clone(), registered).is_some() {\n"
+       "            return Err(BootError::DuplicateConnector(name));\n        }\n",
+       "        };\n        connectors.insert(name, registered);\n")
+
+# Profile selection: the rules, and the checks on them at boot.
+mutate("gw-selector-first-group-only", "only the user's first group selects a profile", SELECTOR,
+       "                    .iter()\n                    .filter_map(|group| rules.and_then(|rules| rules.get(group)))",
+       "                    .iter()\n                    .take(1)\n                    .filter_map(|group| rules.and_then(|rules| rules.get(group)))")
+mutate("gw-selector-ignores-issuer", "a user's groups select through another issuer's rules", SELECTOR,
+       "                let rules = self.users.get(issuer);", "                let rules = self.users.values().next();")
+mutate("gw-selector-workload-ignores-issuer", "a workload's team selects through another issuer's rules", SELECTOR,
+       "                .get(issuer)\n                .and_then(|teams| teams.get(team))",
+       "                .values()\n                .find_map(|teams| teams.get(team))")
+mutate("gw-selector-ambiguous-picks-first", "a user whose groups select two profiles gets the first", SELECTOR,
+       "        (Some(profile), None) => Some(profile),", "        (Some(profile), _) => Some(profile),")
+mutate("gw-selector-duplicate-workload-rule", "a second rule for one workload key replaces the first", SELECTOR,
+       "            if teams.insert(rule.team.clone(), rule.profile).is_some() {",
+       "            if teams.insert(rule.team.clone(), rule.profile).is_some() && false {")
+mutate("gw-selector-duplicate-user-rule", "a second rule for one user key replaces the first", SELECTOR,
+       "            if groups.insert(rule.group.clone(), rule.profile).is_some() {",
+       "            if groups.insert(rule.group.clone(), rule.profile).is_some() && false {")
+mutate("gw-boot-reserved-profile-accepted", "a policy may define the profile given to unselected callers", BOOT,
+       "    if snapshot.profile(&ProfileName::new(NO_PROFILE)).is_some() {",
+       "    if false && snapshot.profile(&ProfileName::new(NO_PROFILE)).is_some() {")
+mutate("gw-boot-unknown-profile-accepted", "a rule may select a profile the policy lacks", BOOT,
+       "        .find(|profile| snapshot.profile(profile).is_none())", "        .find(|_| false)")
+mutate("gw-boot-rule-issuer-not-checked", "a rule may name an issuer that is not configured", BOOT,
+       "        rules_name_configured_issuers(&config.profiles, issuers)?;\n", "        let _ = issuers;\n")
+mutate("gw-boot-rule-issuer-any-kind", "a workload rule may name a user issuer", BOOT,
+       "        .find(|rule| !issuers.workloads.contains(&rule.issuer))",
+       "        .find(|rule| !issuers.workloads.contains(&rule.issuer) && !issuers.users.contains(&rule.issuer))")
+
+# The testkit is a test tool. Moving it from the gateway's dev-dependencies into its own leaves
+# Cargo.lock as it is, so `--locked` still builds and the allowlist test is what notices.
+mutate_all(
+    "gw-dependency-testkit",
+    "the gateway depends on the testkit",
+    ("crates/gateway/Cargo.toml", 'tracing = "0.1"\n', 'tracing = "0.1"\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+)
+mutate_all(
+    "gw-dependency-testkit-under-spaced-target",
+    "the gateway depends on the testkit, under a target table spelled with spaces",
+    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+    ("crates/gateway/Cargo.toml", "\n[lints]\n",
+     "\n[ target.'cfg(all())'.dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n"),
+)
+# A dependency renamed to an allowed name cannot be shown here: every allowed name is already a
+# dependency, and Cargo refuses one name for two packages. The fences compare the package each
+# entry resolves to, which is what a rename would change.
+mutate("gw-dependency-testkit-as-build-dependency", "the gateway builds with the testkit, under a build-dependencies table spelled with spaces",
+       "crates/gateway/Cargo.toml",
+       "\n[lints]\n", "\n[ build-dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n")
+
+
+# The binary loads its deployment, starts the audit store and runs the boot gates before it
+# binds a socket. Where it listens when the deployment file does not say is loopback only.
+GW_BIN = GW + "bin/switchboard.rs"
+GW_DEPLOY = GW + "deployment.rs"
+BIN_PREPARE = (
+    "    let prepared = match start::prepare(deployment, Arc::new(SystemClock)).await {\n"
+    "        Ok(prepared) => prepared,\n        Err(error) => return refuse(&error.to_string()),\n    };\n"
+)
+BIN_BIND = (
+    "    let listener = match TcpListener::bind(listen).await {\n"
+    "        Ok(listener) => listener,\n"
+    '        Err(error) => return refuse(&format!("cannot listen on {listen}: {error}")),\n'
+    "    };\n"
+)
+DEFAULT_LISTEN = "SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);"
+mutate("gw-bin-default-listen-every-interface", "switchboard listens on every interface unless told otherwise", GW_DEPLOY,
+       DEFAULT_LISTEN, "SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);")
+mutate("gw-bin-default-listen-ipv6-every-interface", "switchboard listens on every IPv6 interface unless told otherwise", GW_DEPLOY,
+       DEFAULT_LISTEN, "SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 8080);")
+mutate("gw-bin-binds-before-boot-gates", "switchboard binds its socket before the audit store and the boot gates are ready", GW_BIN,
+       BIN_PREPARE + BIN_BIND, BIN_BIND + BIN_PREPARE)
+
+
+# --- gateway path --------------------------------------------------------------------------
+
+GW_PATH = GW + "path.rs"
+LIST_SURFACE = (
+    "entries(&self.inner.gates.policy(), snapshot.surface(&surface).map(|surface| surface.tools.iter()"
+    ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
+)
+
+mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
+       "        let admitted = match self.admit(method, headers) {\n",
+       "        if let Err(rejection) = gateway_mcp::parse(method, headers, body) {\n"
+       "            return rejection.response();\n        }\n"
+       "        let admitted = match self.admit(method, headers) {\n")
+mutate("gw-transport-after-identity", "identity is checked before the transport checks", GW_PATH,
+       "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n"
+       "        let gates = &self.inner.gates;\n",
+       "        let gates = &self.inner.gates;\n"
+       "        if let Verification::Failed(_) = gates.identity().check(bearer_token(headers)) {\n"
+       "            return Err(Rejection::unauthorized(IDENTITY_FAILURE).response());\n        }\n"
+       "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n")
+mutate("gw-identity-detail-returned", "the identity failure's cause goes to the caller", GW_PATH,
+       "Err(Rejection::unauthorized(IDENTITY_FAILURE).response())",
+       "Err(Rejection::unauthorized(&failure.detail().to_string()).response())")
+mutate("gw-missing-token-distinct", "a caller with no token gets a different body", GW_PATH,
+       "Err(Rejection::unauthorized(IDENTITY_FAILURE).response())",
+       "Err(Rejection::unauthorized(if *failure.detail() == gateway_identity::VerifyError::MissingToken "
+       '{ "No token was presented." } else { IDENTITY_FAILURE }).response())')
+mutate("gw-bearer-duplicate-accepted", "the first of two Authorization headers is used", GW_PATH,
+       "    if values.next().is_some() {\n        return None;\n    }\n", "")
+mutate("gw-bearer-scheme-case-sensitive", "only `Bearer` spelled with one capital is accepted", GW_PATH,
+       '.eq_ignore_ascii_case("bearer")', '.eq("Bearer")')
+mutate("gw-bearer-any-scheme", "a token under any scheme is accepted", GW_PATH,
+       '.eq_ignore_ascii_case("bearer")', '.ne("")')
+mutate("gw-tool-use-id-unbounded", "a tool-use identifier of any length reaches the row", GW_PATH,
+       "        && value.len() <= MAX_TOOL_USE_ID\n", "")
+mutate("gw-tool-use-id-any-characters", "a tool-use identifier with control characters reaches the row", GW_PATH,
+       "\n        && value.bytes().all(|byte| byte.is_ascii_graphic());", ";")
+mutate("gw-tool-use-id-dropped", "the tool-use identifier never reaches the row", GW_PATH,
+       "tool_use_id: bounded_tool_use_id(tool_use_id),",
+       "tool_use_id: bounded_tool_use_id(tool_use_id).filter(|_| false),")
+mutate("gw-resources-always-empty", "the resource adapter is ignored", GW_PATH,
+       "            Some(Reads::Adapter(adapter)) => adapter.resources(approved, arguments),",
+       "            Some(Reads::Adapter(_)) => Resources::Named(Vec::new()),")
+mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the requested name", GW_PATH,
+       "            .registered(&approved.connector)\n",
+       "            .registered(&gateway_core::ConnectorName::new(requested.as_str()))\n"
+       "            .or(gates.registered(&approved.connector))\n")
+mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
+       "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
+       "        let Caller::Proved(principal) = caller else {\n"
+       "            let snapshot = self.inner.gates.snapshot();\n"
+       f"            return {LIST_SURFACE};\n        }};\n")
+mutate("gw-list-unfiltered", "tools/list returns every tool on the surface, undecided", GW_PATH,
+       "        let caller = self.caller_context(&policy, principal, surface);\n"
+       "        entries(&policy, list_tools(policy.snapshot(), &caller))\n",
+       "        let _ = principal;\n        let snapshot = self.inner.gates.snapshot();\n"
+       f"        {LIST_SURFACE}\n")
+mutate("gw-disabled-identity-unannounced", "initialize does not say identity is disabled", GW_PATH,
+       "        notes.push(IDENTITY_DISABLED_NOTE);\n", "")
+mutate("gw-disabled-audit-unannounced", "initialize does not say audit is disabled", GW_PATH,
+       "        notes.push(AUDIT_DISABLED_NOTE);\n", "")
+mutate("gw-refusal-answered-as-success", "a scope refusal is answered as a result with isError false", GW_PATH,
+       "Answer::Refused(sentence) => Reply::Denied(sentence),",
+       "Answer::Refused(sentence) => Reply::ToolOk(Value::from(sentence)),")
+mutate("gw-audit-failed-as-tool-error", "an unrecorded scope refusal is answered as a tool error", GW_PATH,
+       "Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),",
+       "Answer::AuditFailed { sentence } => Reply::ToolError(sentence.to_owned()),")
+mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a result", GW_PATH,
+       "Answer::Error(message) => Reply::ToolError(message),",
+       "Answer::Error(message) => Reply::Denied(message),")
+mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
+       "                return Reply::Denied(failure.sentence().to_owned());",
+       "                return Reply::ToolError(failure.sentence().to_owned());")
+mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
+       "                return Reply::Denied(refusal.sentence().to_owned());",
+       "                return Reply::ToolError(refusal.sentence().to_owned());")
+mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
+       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
+       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
+mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
+       "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
+mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
+       "        if let Some(failure) = finished.failure() {\n",
+       "        if let Some(failure) = finished.failure() {\n"
+       "            return Reply::Denied(failure.sentence().to_owned());\n")
+mutate("gw-latency-not-measured", "every call is recorded as taking no time", GW_PATH,
+       "let latency_ms = elapsed_millis(gates.clock().as_ref(), started);",
+       "let latency_ms = 0;")
+mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
+       "read_only: tool.classification == Classification::Read,", "read_only: true,")
+
+
+# --- gateway server ------------------------------------------------------------------------
+
+GW_SERVER = GW + "server.rs"
+HOST_CHECK = (
+    "    if let Err(rejection) = check_host(gates, parts) {\n"
+    "        return refused(&rejection);\n    }\n"
+)
+ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers) {\n"
+
+mutate("gw-host-check-skipped", "a request for any Host is served", GW_SERVER, HOST_CHECK, "")
+mutate_all(
+    "gw-host-after-identity",
+    "the Host is checked after identity",
+    (GW_SERVER, HOST_CHECK, ""),
+    (GW_SERVER, "    let Ok(Path(surface)) =", HOST_CHECK + "    let Ok(Path(surface)) ="),
+)
+mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
+       "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
+mutate("gw-host-bracket-suffix-ignored", "whatever follows a bracketed host is dropped unchecked", GW_SERVER,
+       "            Some(close) => host.split_at(close + 1),", "            Some(close) => return &host[..=close],")
+mutate("gw-host-empty-port-accepted", "a Host ending in a colon with no port is allowed", GW_SERVER,
+       "let is_port = |port: &str| !port.is_empty() && port.bytes()", "let is_port = |port: &str| port.bytes()")
+mutate("gw-host-first-of-two", "the first of two Host headers is checked", GW_SERVER,
+       "        (Some(_), Some(_)) => None,", "        (Some(value), Some(_)) => value.to_str().ok(),")
+mutate("gw-host-absent-allowed", "a request with no Host and no authority is taken as for localhost", GW_SERVER,
+       "        (None, _) => parts.uri.authority().map(|authority| authority.as_str()),",
+       '        (None, _) => Some("localhost"),')
+mutate("gw-host-prefix-match", "a Host that starts with an allowed one is allowed", GW_SERVER,
+       ".any(|allowed| allowed.eq_ignore_ascii_case(host))", ".any(|allowed| host.starts_with(allowed.as_str()))")
+mutate("gw-origin-check-skipped", "a request from any Origin is served", GW_SERVER,
+       "    if let Err(rejection) = check_origin(gates, &parts.headers) {\n        return refused(&rejection);\n    }\n", "")
+mutate("gw-origin-required", "a request with no Origin is refused, which shuts out command-line clients", GW_SERVER,
+       "    let Some(first) = values.next() else {\n        return Ok(());",
+       "    let Some(first) = values.next() else {\n        return Err(Rejection::forbidden_origin());")
+mutate("gw-origin-first-of-two", "the first of two Origin headers is checked", GW_SERVER,
+       "    let allowed = values.next().is_none()\n        && first", "    let allowed = first")
+mutate("gw-declared-length-not-checked", "a declared length over the limit reaches identity", GW_SERVER,
+       "    if declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {",
+       "    if false && declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {")
+mutate("gw-declared-length-limit-exclusive", "a body of exactly the limit is refused", GW_SERVER,
+       "|length| length > MAX_BODY_BYTES)", "|length| length >= MAX_BODY_BYTES)")
+mutate("gw-body-unlimited", "a body with no declared length is read whatever its size", GW_SERVER,
+       "axum::body::to_bytes(body, MAX_BODY_BYTES)", "axum::body::to_bytes(body, usize::MAX)")
+mutate("gw-body-read-before-identity", "the body is read before identity is checked", GW_SERVER, ADMIT,
+       "    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {\n"
+       "        Ok(body) => Body::from(body),\n        Err(_) => return unreadable(),\n    };\n" + ADMIT)
+mutate("gw-head-timeout-unset", "a request's head may take hyper's default 30 seconds, not the configured time", GW_SERVER,
+       "    http.timer(TokioTimer::new())\n        .header_read_timeout(timeouts.header_read);\n",
+       "    http.timer(TokioTimer::new());\n")
+mutate("gw-head-timeout-no-timer", "the head's deadline is configured with no timer to run it", GW_SERVER,
+       "    http.timer(TokioTimer::new())\n        .header_read_timeout(", "    http.header_read_timeout(")
+mutate("gw-body-read-untimed", "a body may take an hour to arrive", GW_SERVER,
+       "tokio::time::timeout(endpoint.body_read, reading)", "tokio::time::timeout(Duration::from_secs(3600), reading)")
+mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour for a connection that stopped part way", GW_SERVER,
+       "tokio::time::timeout(timeouts.shutdown_grace, connections.shutdown())",
+       "tokio::time::timeout(Duration::from_secs(3600), connections.shutdown())")
+mutate("gw-shutdown-leaves-connections-open", "a connection still open after the grace keeps serving after the server returns", GW_SERVER,
+       "        tasks.spawn(async move {", "        tokio::spawn(async move {")
+mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
+       "    match tokio::spawn(answering.instrument(span)).await {",
+       "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
+mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
+       "        return refused(&Rejection::request_timeout());",
+       "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
+
+
+# --- gateway-dev ---------------------------------------------------------------------------
+
+DEV = "crates/gateway-dev/src/"
+DEV_START = DEV + "start.rs"
+DEV_PRINTER = DEV + "printer.rs"
+DEV_TOKENS = DEV + "tokens.rs"
+DEV_CLIENT = DEV + "client.rs"
+
+mutate("dev-listens-on-every-interface", "the fixture gateway listens on every interface, not loopback", DEV_START,
+       "pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;", "pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::UNSPECIFIED;")
+mutate("dev-identity-off-by-default", "the fixture gateway starts with identity disabled unless told otherwise", DEV_START,
+       "            identity_disabled: false,", "            identity_disabled: true,")
+mutate("dev-identity-option-ignored", "asking for identity disabled starts it enforced", DEV_START,
+       '        config["identity"] = json!({"disabled": true});\n', "")
+mutate("dev-clock-option-ignored", "the gateway verifies on the system clock whatever clock it is given", DEV_START,
+       "    let mut wiring = Wiring::new(clock.clone()).connector(",
+       "    let mut wiring = Wiring::new(Arc::new(SystemClock)).connector(")
+mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
+       "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
+mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into a row id, so the call runs with no row", DEV_PRINTER,
+       "            begun\n        })", '            begun.or_else(|_| Ok(AuditRowId::new("printed")))\n        })')
+mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
+       "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
+mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
+       "pub const TOKEN_LIFETIME_SECS: u64 = DEFAULT_MAX_LIFETIME;", "pub const TOKEN_LIFETIME_SECS: u64 = DEFAULT_MAX_LIFETIME + 1;")
+mutate("dev-client-prints-token", "the scripted client prints the bearer token", DEV_CLIENT,
+       "\"> authorization: Bearer <{}'s token, not shown>\",\n                self.caller",
+       "\"> authorization: Bearer {}\",\n                self.token")
+mutate("dev-client-ignores-unexpected", "the scripted client passes whatever the answers were", DEV_CLIENT,
+       "            if !exchange.as_expected() {", "            if false && !exchange.as_expected() {")
+mutate("dev-client-any-error-is-a-denial", "the scripted client takes any JSON-RPC error for a denial", DEV_CLIENT,
+       'Expect::Denied => status == 200 && body["error"]["code"] == json!(DENIAL_CODE),',
+       'Expect::Denied => status == 200 && body.get("error").is_some(),')
+
+
+# --- gateway-dev end-to-end ----------------------------------------------------------------
+# Guards the end-to-end tests in crates/gateway-dev/tests/ watch: the server's wait for running
+# answers at shutdown, and the fixture world those tests and switchboard-dev share.
+
+DEV_WORLD = DEV + "world.rs"
+
+mutate("gw-shutdown-leaves-answers-running", "the server returns while a call whose client has gone is still running", GW_SERVER,
+       "    answers.finished().await;\n", "")
+mutate("gw-shutdown-answer-not-counted", "an answer stops being counted as soon as its task starts", GW_SERVER,
+       "        let _running = running;\n", "        drop(running);\n")
+mutate("dev-resources-ignore-tool", "the fixture's documents are read as if every tool declared them", DEV_WORLD,
+       "        FixtureConnector::resources_of(tool.name.as_str(), arguments)",
+       "        FixtureConnector::resources_of(gateway_testkit::READ_TOOL, arguments)")
+mutate("dev-fixture-allows-an-origin", "the fixture gateway accepts a browser page on localhost", DEV_WORLD,
+       '"allowed_origins": []}', '"allowed_origins": ["http://localhost:6274"]}')
+mutate("dev-team-b-selects-team-a-profile", "team B's workloads get team A's profile", DEV_WORLD,
+       '"team": TEAM_B, "profile": PROFILE_TEAM_B}', '"team": TEAM_B, "profile": PROFILE_TEAM_A}')
+mutate("dev-fixture-accepts-another-audience", "the fixture gateway accepts tokens meant for someone else", DEV_WORLD,
+       '"audiences": [AUDIENCE],', '"audiences": [AUDIENCE, "someone-else"],')
+mutate("dev-fixture-lifetime-unbounded", "the fixture gateway accepts tokens that live for days", DEV_WORLD,
+       '"max_lifetime_secs": DEFAULT_MAX_LIFETIME,', '"max_lifetime_secs": DEFAULT_MAX_LIFETIME * 48,')
+
+
+# --- gateway-dev: switchboard-client -------------------------------------------------------
+
+DEV_CLIENT_BIN = DEV + "bin/switchboard-client.rs"
+
+mutate("dev-client-bin-caller-ignored", "switchboard-client presents team A's token whatever caller it is asked for", DEV_CLIENT_BIN,
+       "read_token(&arguments.tokens, caller, SURFACE_READ)", "read_token(&arguments.tokens, Caller::TeamA, SURFACE_READ)")
+mutate("dev-client-bin-era-ignored", "switchboard-client runs both eras whatever era it is asked for", DEV_CLIENT_BIN,
+       "    for era in arguments.eras {", "    for era in [Era::Legacy, Era::Modern] {")
+mutate("dev-client-bin-unexpected-exits-0", "switchboard-client exits 0 when an answer was not as expected", DEV_CLIENT_BIN,
+       "    } else {\n        ExitCode::from(1)\n    }", "    } else {\n        ExitCode::SUCCESS\n    }")
+
+
+# --- gateway-dev: switchboard-dev ----------------------------------------------------------
+
+DEV_BIN = DEV + "bin/switchboard-dev.rs"
+
+mutate("dev-bin-unexpected-answer-ignored", "switchboard-dev's script passes whatever the answers were", DEV_BIN,
+       "            as_expected = false;\n", "")
+mutate("dev-bin-once-unexpected-exits-0", "switchboard-dev --once exits 0 when an answer was not as expected", DEV_BIN,
+       '    if !as_expected {\n        return Err("an answer was not as expected".to_owned());\n    }\n',
+       "    let _ = as_expected;\n")
+mutate("dev-bin-once-unclean-stop-exits-0", "switchboard-dev --once exits 0 when the gateway did not stop cleanly", DEV_BIN,
+       "    if let Err(error) = stopped {", "    if let (Err(error), false) = (stopped, true) {")
+
+
+# --- mock-docs-server ------------------------------------------------------------------------
+
+MOCK = "crates/mock-docs-server/"
+MS = MOCK + "src/server.rs"
+MC = MOCK + "src/config.rs"
+MD = MOCK + "src/documents.rs"
+mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
+       "                accepted: self.inner.accepted.accepts(token),", "                accepted: true,")
+mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
+       "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
+       "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
+mutate("mock-credential-compares-one-byte", "only the first byte of the digest is compared", MC,
+       "            .zip(self.digest.iter())\n", "            .zip(self.digest.iter())\n            .take(1)\n")
+mutate("mock-scheme-ignored", "any scheme carries the token", MS,
+       '    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())', "    (!scheme.is_empty() && !token.is_empty())")
+mutate("mock-post-refusal-skipped", "POST /mcp answers a caller it did not accept", MS,
+       '    let mut line = request_line("request", &method, &uri, &caller);\n    if !caller.accepted {',
+       '    let mut line = request_line("request", &method, &uri, &caller);\n    if false {')
+mutate("mock-other-refusal-skipped", "other methods and paths answer a caller they did not accept", MS,
+       '        .write(request_line("request", &method, &uri, &caller));\n    if !caller.accepted {',
+       '        .write(request_line("request", &method, &uri, &caller));\n    if false {')
+mutate("mock-admin-get-refusal-skipped", "the admin tool list answers a caller it did not accept", MS,
+       '        .write(request_line("admin", &method, &uri, &caller));\n    if !caller.accepted {',
+       '        .write(request_line("admin", &method, &uri, &caller));\n    if false {')
+mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools for a caller it did not accept", MS,
+       '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
+       '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
+mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
+       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(self.inner.accepted.logged_prefix()),")
+mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
+mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
+       "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
+mutate("mock-documents-keyed-by-name", "a document is found by its name alone, in any project", MD,
+       "        self.0.get(&(project.to_owned(), document.to_owned()))",
+       "        let _ = project;\n        self.0.iter().find(|((_, name), _)| name == document).map(|(_, content)| content)")
+mutate("mock-list-ignores-project", "listing a project lists every project's documents", MD,
+       "            .filter(|(owner, _)| owner == project)", "            .filter(|(owner, _)| !owner.is_empty() || project.is_empty())")
+mutate("mock-withdrawn-tool-callable", "a tool not offered can still be called", MS,
+       "            .filter(|tool| self.offers(*tool))\n", "")
+mutate("mock-extra-argument-accepted", "an argument the tool does not declare is accepted", MS,
+       "        .find(|key| !tool.arguments().contains(&key.as_str()))", "        .find(|key| key.is_empty())")
+mutate("mock-slow-doc-not-slow", "slow-doc answers at once", MS, "                tokio::time::sleep(self.inner.slow).await;\n", "")
+mutate("mock-hang-doc-answers", "hang-doc answers", MS,
+       "            Some(Content::Hang) => std::future::pending().await,", "            Some(Content::Hang) => Ok(text_result(String::new())),")
+mutate("mock-hang-doc-is-slow", "hang-doc answers after slow-doc's delay", MS,
+       "            Some(Content::Hang) => std::future::pending().await,",
+       "            Some(Content::Hang) => {\n                tokio::time::sleep(self.inner.slow).await;\n                Ok(text_result(String::new()))\n            }")
+mutate("mock-fail-doc-succeeds", "fail-doc answers with a result", MS,
+       "            Some(Content::Fail) => Err(RpcError::new(", "            Some(Content::Fail) => Ok(text_result(String::new())).map_err(|_: RpcError| RpcError::new(")
+mutate("mock-huge-doc-half-size", "huge-doc answers with half a mebibyte", MS, '"x".repeat(HUGE_BYTES)', '"x".repeat(HUGE_BYTES / 2)')
+mutate("mock-two-credentials-take-the-file", "with both credential variables set, the file wins", MC,
+       "            (Some(path), None, None) => read_token_file", "            (Some(path), _, _) => read_token_file")
+mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part of the token", MC,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
+       "        if tools.contains(&tool) {", "        if false {")
+mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
+       "                if tools.contains(&tool) {", "                if false {")
+# Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
+mutate_all(
+    "mock-dependency-added",
+    "the mock server gains a dependency outside the allowlist",
+    (MOCK + "Cargo.toml", 'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\n',
+     'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n'),
+    (MOCK + "Cargo.toml", '[dev-dependencies]\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n', "[dev-dependencies]\n"),
+)
+
+
+# --- connector-proxy -------------------------------------------------------------------------
+
+PROXY = "crates/connector-proxy/"
+PC = PROXY + "src/connector.rs"
+PO = PROXY + "src/outcome.rs"
+PK = PROXY + "src/credentials.rs"
+# The bounds.
+mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
+       "        match tokio::time::timeout(self.deadline, self.exchange(request)).await {",
+       "        match Ok::<_, ()>(self.exchange(request).await) {")
+mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
+       "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
+mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
+mutate("proxy-streamed-size-unchecked", "a body without a declared length is read whatever its size", PC,
+       "                if received.len() + data.len() > self.max_response_bytes {", "                if false {")
+mutate("proxy-streamed-size-off-by-one", "a streamed body of exactly the cap is discarded", PC,
+       "                if received.len() + data.len() > self.max_response_bytes {",
+       "                if received.len() + data.len() >= self.max_response_bytes {")
+mutate("proxy-declared-length-ignored", "a declared length over the cap is not refused before reading", PC,
+       "            .is_some_and(|length| length > self.max_response_bytes as u64)", "            .is_some_and(|_| false)")
+mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap is refused", PC,
+       "            .is_some_and(|length| length > self.max_response_bytes as u64)",
+       "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
+mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
+       "            let frame = frame.map_err(|_| ToolOutcome::Error(outcome::BROKEN_OFF.to_owned()))?;",
+       "            let Ok(frame) = frame else { break };")
+# What is sent, and to whom.
+mutate("proxy-credential-not-sent", "the request carries no credential", PC,
+       "            .header(AUTHORIZATION, authorization)\n", "")
+mutate("proxy-connector-unchecked", "a tool routed to another connector is forwarded", PC,
+       "        if tool.connector != self.connector {", "        if false {")
+mutate("proxy-unmapped-tool-sent-as-is", "a tool with no upstream name is sent under its exposed name", PC,
+       "        let Some(upstream_name) = self.tools.get(&tool.name) else {\n"
+       "            return ToolOutcome::Refused(outcome::NOT_SERVED.to_owned());\n        };",
+       "        let upstream_name = self.tools.get(&tool.name).map_or(tool.name.as_str(), String::as_str);")
+mutate("proxy-exposed-name-sent", "the exposed name is sent instead of the upstream name", PC,
+       "self.request(id, upstream_name, arguments, secret)", "self.request(id, tool.name.as_str(), arguments, secret)")
+mutate("proxy-arguments-unchecked", "arguments that are not an object are sent as an empty object", PC,
+       "        let Value::Object(arguments) = call.arguments() else {\n"
+       "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
+       "        let empty = Map::new();\n        let arguments = match call.arguments() {\n"
+       "            Value::Object(arguments) => arguments,\n            _ => &empty,\n        };")
+# Statuses.
+mutate("proxy-401-not-named", "a rejected credential is reported as a bare status", PC,
+       "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
+mutate("proxy-403-is-an-error", "the server's refusal is recorded as an error", PC,
+       "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));",
+       "            return Err(ToolOutcome::Error(outcome::UPSTREAM_REFUSED.to_owned()));")
+mutate("proxy-any-status-read", "a body is read whatever the status", PC,
+       "        if status != StatusCode::OK {", "        if false {")
+# Reading the answer.
+mutate("proxy-media-type-unchecked", "an answer of any media type is read as JSON", PO,
+       "    if !content_type.is_some_and(is_json) {", "    if false {")
+mutate("proxy-version-unchecked", "an answer without jsonrpc 2.0 is accepted", PO,
+       '    if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")\n',
+       '    if message.get("jsonrpc").and_then(Value::as_str) == Some("never")\n')
+mutate("proxy-id-unchecked", "an answer to another request is accepted", PO,
+       '        || message.get("id").and_then(Value::as_u64) != Some(id)\n', "")
+mutate("proxy-result-and-error-accepted", "an answer with a result and an error is read as a result", PO,
+       "        (Some(Value::Object(result)), None) => tool_result(result),",
+       "        (Some(Value::Object(result)), _) => tool_result(result),")
+mutate("proxy-content-unchecked", "a result without content is accepted", PO,
+       '    let Some(Value::Array(content)) = result.get("content") else {\n'
+       "        return ToolOutcome::Error(NOT_MCP.to_owned());\n    };",
+       "    let empty = Vec::new();\n"
+       '    let content = match result.get("content") {\n        Some(Value::Array(content)) => content,\n        _ => &empty,\n    };')
+mutate("proxy-tool-error-is-ok", "a tool result marked isError is passed on as success", PO,
+       '    if result.get("isError") != Some(&Value::Bool(true)) {', "    if true {")
+mutate("proxy-server-text-uncut", "the server's text reaches the caller at any length", PO,
+       "        .take(MAX_MESSAGE_CHARS)\n", "")
+mutate("proxy-server-control-characters-kept", "the server's control characters reach the caller", PO,
+       "        .map(|c| if c.is_control() { ' ' } else { c })\n", "")
+# Configuration.
+mutate("proxy-https-accepted", "a URL of any scheme is accepted", PC,
+       '    let acceptable = endpoint.scheme_str() == Some("http")\n', "    let acceptable = endpoint.scheme_str().is_some()\n")
+mutate("proxy-user-information-accepted", "a URL carrying a user name or password is accepted", PC,
+       "        && !authority.as_str().contains('@');", ";")
+mutate("proxy-no-tools-accepted", "a server exposing no tools is accepted", PC, "        if tools.is_empty() {", "        if false {")
+mutate("proxy-empty-upstream-name-accepted", "an empty upstream name is accepted", PC,
+       ".find(|(_, upstream)| upstream.is_empty())", ".find(|_| false)")
+mutate("proxy-zero-deadline-accepted", "a zero deadline is accepted", PC, "        if deadline.is_zero() {", "        if false {")
+mutate("proxy-zero-cap-accepted", "a zero cap is accepted", PC, "        if max_response_bytes == 0 {", "        if false {")
+mutate("proxy-missing-credential-accepted", "a connector with no credential is built", PC,
+       "        if !credentials.connectors().any(|held| *held == connector) {", "        if false {")
+# The credential source.
+mutate("proxy-credential-not-trimmed", "the credential file's trailing newline is part of the token", PK,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("proxy-empty-credential-accepted", "an empty credential file is accepted", PK, "    if token.is_empty() {", "    if false {")
+mutate("proxy-credential-any-bytes", "a credential with spaces or control characters is accepted", PK,
+       "    if !token.bytes().all(is_token_byte) {", "    if false {")
+mutate("proxy-credential-size-unbounded", "a credential file of any size is read", PK,
+       "    if length > MAX_CREDENTIAL_BYTES {", "    if false {")
+mutate("proxy-credential-size-off-by-one", "a credential file of exactly the limit is refused", PK,
+       "    if length > MAX_CREDENTIAL_BYTES {", "    if length >= MAX_CREDENTIAL_BYTES {")
+mutate("proxy-duplicate-credential-accepted", "two files for one connector are accepted", PK,
+       "            if entries.contains_key(&connector) {", "            if false {")
+mutate("proxy-credential-for-any-connector", "a credential is issued for a connector that has none", PK,
+       "        match self.entries.get(connector) {", "        match self.entries.values().next() {")
+mutate("proxy-debug-shows-secret", "the source's debug output shows the secret", PK,
+       "                    .map(|(connector, stored)| (connector, &stored.label)),",
+       "                    .map(|(connector, stored)| (connector, &stored.secret.0)),")
+# Moving a dev-dependency into the connector's own dependencies leaves Cargo.lock as it is.
+mutate_all(
+    "proxy-dependency-added",
+    "the connector links the test fakes",
+    (PROXY + "Cargo.toml", 'tokio = { version = "1", features = ["time"] }\n',
+     'tokio = { version = "1", features = ["time"] }\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    (PROXY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
+)
+
+
+# --- gateway-registry ----------------------------------------------------------------------
+
+REGISTRY = "crates/gateway-registry/"
+RF = REGISTRY + "src/file.rs"
+RR = REGISTRY + "src/registry.rs"
+RA = REGISTRY + "src/adapter.rs"
+RS = REGISTRY + "src/selection.rs"
+RD = REGISTRY + "src/definition.rs"
+
+for struct in ["RegistryFile", "ServerFile", "ToolFile", "SourceFile", "SurfaceFile", "PrincipalIdFile",
+               "ProfileFile", "RuleFile", "LimitsFile", "ResourceFile"]:
+    mutate(f"registry-unknown-field-{struct}", f"{struct} ignores fields it does not know", RF,
+           f"#[serde(deny_unknown_fields)]\npub(crate) struct {struct} {{", f"pub(crate) struct {struct} {{")
+mutate("registry-unknown-field-CredentialFile", "a credential ignores fields it does not know", RF,
+       '#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]', '#[serde(tag = "mode", rename_all = "snake_case")]')
+mutate("registry-empty-text-accepted", "required text may be empty", RR,
+       "    if value.is_empty() {\n        Err(RegistryError::EmptyField {", "    if false {\n        Err(RegistryError::EmptyField {")
+mutate("registry-limit-identifier-empty", "a limit may name the empty identifier", RR,
+       '            require(&resource.identifier, "identifier", place)?;\n', "")
+mutate("registry-credential-reference-empty", "a credential may have no reference", RR,
+       '                require(&reference, "credential.reference", place)?;\n', "")
+mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
+       "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
+mutate("registry-address-unchecked", "any address is accepted", RR, "        if !http {", "        if false {")
+mutate("registry-address-host-unchecked", "an address with no host is accepted", RR,
+       ".is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))", ".is_some()")
+mutate("registry-duplicate-tool-left-to-core", "a tool approved twice is not refused by the loader", RR,
+       "        if definitions.contains_key(&checked.definition.name) {", "        if false {")
+mutate("registry-duplicate-upstream", "one upstream tool may be approved under two names", RR,
+       "        if !upstream.insert((", "        if false && !upstream.insert((")
+mutate("registry-unknown-server", "a tool on an unregistered server takes the first server", RR,
+       "    let Some(server) = servers.get(&tool.server) else {", "    let Some(server) = servers.get(&tool.server).or(servers.values().next()) else {")
+mutate("registry-name-outside-system", "a tool may be named after any system", RR, "    if !under_system {", "    if false {")
+mutate("registry-name-nothing-after-system", "a tool may be named `{system}__` alone", RR,
+       "        .is_some_and(|rest| !rest.is_empty());", "        .is_some();")
+mutate("registry-approved-at-offset", "an approval time may have no offset", RR, "    if at.offset.is_none() {", "    if false {")
+mutate("registry-hash-unchecked", "a definition changed after approval loads", RR,
+       "    if computed != tool.definition_sha256 {", "    if false {")
+mutate("registry-hash-ignores-title", "the approval hash does not cover the title", RD,
+       '        definition.insert("title".into(), Value::String(title.into()));', "        let _ = title;")
+mutate("registry-schema-type-unchecked", "an input schema need not be an object schema", RR,
+       '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
+mutate("registry-schema-keywords-unchecked", "a schema may use keywords the argument check does not follow", RA,
+       ".find(|keyword| object.contains_key(**keyword))", ".find(|keyword| false && object.contains_key(**keyword))")
+mutate("registry-schema-properties-unwalked", "keywords inside a property are not looked for", RA,
+       "            followable(property, &at.child(name))?;", "            let _ = (property, name);")
+mutate("registry-schema-items-unwalked", "keywords inside items are not looked for", RA,
+       '        followable(items, &at.child("items"))?;', "        let _ = items;")
+mutate("registry-schema-properties-not-object", "`properties` may be something other than an object", RA,
+       "            return Err(SchemaProblem::Malformed { at });", "            return Ok(());")
+mutate("registry-schema-node-not-schema", "a property or items may be something other than a schema", RA,
+       "        _ => return Err(SchemaProblem::Malformed { at: at.clone() }),", "        _ => return Ok(()),")
+mutate("registry-adapter-without-sources", "a tool may read its resources from no argument", RR,
+       "            if sources.is_empty() {\n                return Err(RegistryError::AdapterWithoutSources(name));",
+       "            if false {\n                return Err(RegistryError::AdapterWithoutSources(name));")
+mutate("registry-adapter-argument-undeclared", "an adapter may read an argument the schema does not declare", RR,
+       "properties.and_then(|p| p.get(&source.from_argument)) else {",
+       'properties.and_then(|p| p.get(&source.from_argument)).or(tool.input_schema.get("type")) else {')
+mutate("registry-adapter-argument-not-string", "an adapter may read an argument not typed as a string", RR,
+       '                if property.get("type") != Some(&Value::String("string".into())) {', "                if false {")
+mutate("registry-read-only-not-derived", "every definition is shown as read-only", RR,
+       "            read_only: tool.classification == gateway_core::Classification::Read,", "            read_only: true,")
+mutate("registry-declaration-no-resources", "a tool with an adapter is approved as naming no resources", RA,
+       "        if self.sources.is_empty() {\n            ResourceDeclaration::NoResources", "        if true {\n            ResourceDeclaration::NoResources")
+mutate("registry-rule-unknown-profile", "a rule may name a profile that is not defined", RR,
+       "        if snapshot.profile(&rule.profile).is_none() {", "        if false {")
+mutate("registry-duplicate-rule", "two rules may cover the same principals", RR,
+       "        if !covered.insert((rule.issuer.clone(), principal.clone())) {",
+       "        if false && !covered.insert((rule.issuer.clone(), principal.clone())) {")
+mutate("adapter-missing-argument-skipped", "a missing argument drops its resource and keeps the others", RA,
+       "                _ => return Resources::Named(Vec::new()),", "                _ => continue,")
+mutate("adapter-empty-identifier-accepted", "the empty string names a resource", RA,
+       "Some(Value::String(identifier)) if !identifier.is_empty() => {", "Some(Value::String(identifier)) => {")
+mutate("adapter-not-an-object-accepted", "arguments that are not an object pass the check", RA,
+       "        if !arguments.is_object() {", "        if false {")
+mutate("adapter-undeclared-accepted", "an undeclared argument passes the check", RA,
+       "                    None => Some(at.child(key)),", "                    None => None,")
+mutate("adapter-undeclared-not-nested", "nested objects are not checked", RA,
+       "                    Some(property) => undeclared(property, value, &at.child(key)),", "                    Some(_) => None,")
+mutate("adapter-undeclared-not-in-items", "array elements are not checked", RA,
+       "        Value::Array(items) => {", "        Value::Array(items) if false => {")
+mutate("adapter-pointer-unescaped", "a pointer does not escape `~` and `/`", RA,
+       "            token.replace('~', \"~0\").replace('/', \"~1\")", "            token")
+mutate("selection-issuer-ignored", "a rule covers principals of any issuer", RS,
+       "        principal.id.issuer == self.issuer\n", "        true\n")
+mutate("selection-group-ignored", "a group rule covers users in any group", RS,
+       "groups.contains(group)", "!groups.is_empty() || groups.contains(group)")
+mutate("selection-kind-ignored", "a workload rule covers users and a group rule covers workloads", RS,
+       "                _ => false,", "                _ => true,")
+mutate("selection-first-rule-wins", "disagreeing rules resolve to one of them", RS,
+       "            (Some(_), Some(_)) => Err(NoProfile::Ambiguous(profiles)),", "            (Some(first), Some(_)) => Ok(first.clone()),")
+# Moving the dev-dependency leaves Cargo.lock as it is, so the build still runs under --locked.
+mutate("registry-links-testkit", "the registry, and so the gateway, links the testkit", REGISTRY + "Cargo.toml",
+       'toml = "1"\n\n[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n',
+       'toml = "1"\ngateway-testkit = { path = "../gateway-testkit" }\n\n[dev-dependencies]\n')
+
+
 # --- audit-postgres ------------------------------------------------------------------------
 
 # Most of these are caught only by the tests against Postgres, which run when
@@ -1571,537 +2382,297 @@ for server_function in ["lo_export", "lo_import", "pg_ls_dir", "pg_read_binary_f
            f'    "{server_function}",\n', "")
 
 
-# --- gateway-mcp ---------------------------------------------------------------------------
+# --- demo-checks ---------------------------------------------------------------------------
+# The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
 
-MCP = "crates/gateway-mcp/src/"
-MCP_PARSE = MCP + "parse.rs"
-MCP_REPLY = MCP + "reply.rs"
-MCP_REJECTION = MCP + "rejection.rs"
+WORKLOAD = "deploy/demo/workload.sh"
+DRIVER = "deploy/demo/demo.sh"
+COMPOSE = "deploy/compose/compose.yaml"
+POLICY = "deploy/kind/policy/networkpolicies.yaml"
 
-mutate("mcp-get-served", "GET is answered", MCP_PARSE,
-       "    if method != Method::POST {", "    if method != Method::POST && method != Method::GET {")
-mutate("mcp-delete-served", "DELETE is answered", MCP_PARSE,
-       "    if method != Method::POST {", "    if method != Method::POST && method != Method::DELETE {")
-mutate("mcp-content-type-ignored", "a body not declared as JSON is served", MCP_PARSE,
-       "    if !content_type_is_json(headers) {", "    if false && !content_type_is_json(headers) {")
-mutate("mcp-accept-ignored", "an Accept excluding JSON is served", MCP_PARSE,
-       "    if !accept_admits_json(headers) {", "    if false && !accept_admits_json(headers) {")
-mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON", MCP + "headers.rs",
-       ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
-mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
-       ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
-mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
-       ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
-mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
-       '                response\n                    .headers\n                    .insert(ALLOW, HeaderValue::from_static("POST"));\n',
-       "")
-mutate("mcp-challenge-dropped", "a 401 carries no WWW-Authenticate challenge", MCP_REJECTION,
-       "                response\n                    .headers\n                    .insert(WWW_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));\n",
-       "")
-mutate("mcp-request-timeout-keeps-connection", "a 408 leaves the connection open for the rest of the late body", MCP_REJECTION,
-       '                    .insert(CONNECTION, HeaderValue::from_static("close"));',
-       '                    .insert(CONNECTION, HeaderValue::from_static("keep-alive"));')
-mutate("mcp-batch-accepted", "the first request of a JSON array is processed", MCP_PARSE,
-       '        Value::Array(_) => {\n            return Err(Rejection::invalid_request(\n'
-       '                "Invalid request: batches are not supported",\n            ));\n        }\n',
-       "        Value::Array(mut batch) if !batch.is_empty() => match batch.remove(0) {\n"
-       "            Value::Object(object) => object,\n"
-       '            _ => return Err(Rejection::invalid_request("not an object")),\n        },\n')
-mutate("mcp-null-id-accepted", "id: null is accepted", MCP_PARSE,
-       '        Some(Value::Null) => {\n            return Err(Rejection::invalid_request(\n'
-       '                "Invalid request: id must not be null",\n            ));\n        }\n',
-       "        Some(Value::Null) => Some(RequestId::Number(0)),\n")
-mutate("mcp-notification-gets-body", "a notification is answered 200", MCP_REPLY,
-       "            status: StatusCode::ACCEPTED,", "            status: StatusCode::OK,")
-mutate("mcp-initialize-era-from-meta", "an initialize carrying a modern _meta version is served as modern", MCP_PARSE,
-       '    if method == "initialize" {\n        return Era::Legacy;\n    }\n', "")
-mutate("mcp-session-id-issued", "initialize gains Mcp-Session-Id", MCP_REPLY,
-       "            return result_response(id, result);\n",
-       "            let mut response = result_response(id, result);\n"
-       '            response.headers.insert(http::HeaderName::from_static("mcp-session-id"), HeaderValue::from_static("dummy-session"));\n'
-       "            return response;\n")
-mutate("mcp-initialize-echoes-version", "initialize answers a version other than 2025-06-18", MCP_REPLY,
-       '"protocolVersion": LEGACY,', '"protocolVersion": MODERN,')
-mutate("mcp-protocol-header-optional-modern", "the modern MCP-Protocol-Version header is not required", MCP_PARSE,
-       "        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
-       '                id,\n                "Header mismatch: one MCP-Protocol-Version header is required",\n',
-       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
-       '                id,\n                "Header mismatch: one MCP-Protocol-Version header is required",\n')
-mutate("mcp-protocol-header-mismatch-accepted", "an MCP-Protocol-Version header that disagrees with _meta is accepted", MCP_PARSE,
-       "        Single::One(header) if header == version => {}", "        Single::One(header) if !header.is_empty() => {}")
-mutate("mcp-unsupported-version-served", "an unsupported version is served", MCP_PARSE,
-       "    if version != MODERN {", "    if version.is_empty() {")
-mutate("mcp-capabilities-not-required", "clientCapabilities is optional", MCP_PARSE,
-       ".is_some_and(Value::is_object)", ".is_none_or(Value::is_object)")
-mutate("mcp-method-header-not-compared", "Mcp-Method is not compared with the body", MCP_PARSE,
-       "        Single::One(header) if header == method => {}", "        Single::One(header) if !header.is_empty() => {}")
-mutate("mcp-name-header-not-compared", "Mcp-Name is not compared with the body", MCP_PARSE,
-       "        Some(decoded) if decoded == name => Ok(()),", "        Some(_) => Ok(()),")
-mutate("mcp-method-header-optional", "a modern request with no Mcp-Method header is served", MCP_PARSE,
-       '        Single::Absent | Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n'
-       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n',
-       "        Single::Absent => {}\n        Single::Malformed => {\n            return Err(Rejection::header_mismatch(\n"
-       '                id,\n                "Header mismatch: one Mcp-Method header is required",\n')
-mutate("mcp-name-header-optional", "a modern tools/call with no Mcp-Name header is served", MCP_PARSE,
-       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n",
-       "fn check_name_header(headers: &HeaderMap, id: &RequestId, name: &str) -> Result<(), Rejection> {\n"
-       "    if matches!(single(headers, NAME_HEADER), Single::Absent) {\n        return Ok(());\n    }\n")
-mutate("mcp-duplicate-header-first-used", "the first of two copies of a single-valued MCP header is used", MCP + "headers.rs",
-       "    if values.next().is_some() {\n        return Single::Malformed;\n    }\n", "")
-mutate("mcp-name-sentinel-not-decoded", "the base64 sentinel in Mcp-Name is compared raw", MCP_PARSE,
-       "    match header_name_value(header) {", "    match Some(header.to_owned()) {")
-mutate("mcp-modern-ping-served", "ping is served under 2026-07-28", MCP_PARSE,
-       '        "server/discover" => Ok(Call::Discover),\n',
-       '        "server/discover" => Ok(Call::Discover),\n        "ping" => Ok(Call::Ping),\n')
-mutate("mcp-legacy-ping-unknown", "ping is not served under 2025-06-18", MCP_PARSE,
-       '        "ping" => Ok(Call::Ping),\n', "")
-mutate("mcp-modern-unknown-method-200", "an unknown modern method is answered 200, not 404", MCP_REJECTION,
-       "            Era::Modern => StatusCode::NOT_FOUND,", "            Era::Modern => StatusCode::OK,")
-mutate("mcp-legacy-any-header-version", "a legacy request accepts any MCP-Protocol-Version", MCP_PARSE,
-       "        Single::One(header) if header == LEGACY => {}", "        Single::One(_) => {}")
-mutate("mcp-cursor-accepted", "a cursor the server never issued is accepted", MCP_PARSE,
-       "        None | Some(Value::Null) => Ok(Call::ToolsList),", "        _ => Ok(Call::ToolsList),")
-mutate("mcp-list-cache-public", "a modern tools/list is marked public", MCP_REPLY,
-       '"cacheScope": "private",', '"cacheScope": "public",')
-mutate("mcp-legacy-structured-non-object", "a legacy result carries structuredContent that is not an object", MCP_REPLY,
-       "            if era == Era::Modern || value.is_object() {", "            if true {")
-mutate("mcp-denial-code-changed", "the denial code becomes -32602", MCP + "constants.rs",
-       "pub const DENIAL_CODE: i64 = -32001;", "pub const DENIAL_CODE: i64 = -32602;")
-mutate("mcp-era-header-ignored", "a request with the modern version header and no _meta is served as legacy", MCP_PARSE,
-       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
-       "    if params.meta(PROTOCOL_VERSION_META).is_some() {")
-mutate("mcp-era-meta-ignored", "a request whose _meta names its version, with no version header, is served as legacy", MCP_PARSE,
-       "    if params.meta(PROTOCOL_VERSION_META).is_some() || header_is_modern {",
-       "    if header_is_modern {")
-mutate("mcp-content-type-any-charset", "a JSON content type with a charset other than UTF-8 is served", MCP + "headers.rs",
-       '            || value.trim().trim_matches(\'"\').eq_ignore_ascii_case("utf-8")',
-       '            || !value.is_empty()')
-mutate("mcp-jsonrpc-version-unchecked", "a request that does not say jsonrpc 2.0 is served", MCP_PARSE,
-       '    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {',
-       '    if false && object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {')
-mutate("mcp-response-refused-as-methodless", "a posted response is refused only for having no method", MCP_PARSE,
-       '        None if object.contains_key("result") || object.contains_key("error") => {',
-       '        None if false => {')
-mutate("mcp-fractional-id-accepted", "a fractional or out-of-range id is read as an integer", MCP_PARSE,
-       "        Some(Value::Number(id)) => match id.as_i64() {",
-       "        Some(Value::Number(id)) => match id.as_i64().or_else(|| id.as_f64().map(|id| id as i64)) {")
-mutate("mcp-params-not-object-accepted", "params that are not an object are read as empty", MCP_PARSE,
-       "        Some(_) => Params::Malformed,", "        Some(_) => Params::Object(Map::new()),")
-mutate("mcp-call-name-optional", "a tools/call with no name is served with an empty name", MCP_PARSE,
-       '    let Some(Value::String(name)) = params.remove("name") else {',
-       '    let Some(Value::String(name)) = params.remove("name").or(Some(Value::String(String::new()))) else {')
-mutate("mcp-method-not-string-accepted", "a method that is not a string is read as its JSON text", MCP_PARSE,
-       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
-       '                "Invalid request: method must be a string",\n            ));\n        }\n',
-       "        Some(method) => method.to_string(),\n")
-mutate("mcp-no-method-accepted", "a request with no method is read as one with an empty method", MCP_PARSE,
-       '        None => return Err(Rejection::invalid_request("Invalid request: no method")),',
-       "        None => String::new(),")
-mutate("mcp-structured-id-accepted", "an id that is an object or an array is dropped, making the request a notification", MCP_PARSE,
-       '        Some(_) => {\n            return Err(Rejection::invalid_request(\n'
-       '                "Invalid request: id must be a string or an integer",\n            ));\n        }\n    };\n',
-       "        Some(_) => None,\n    };\n")
-mutate("mcp-call-arguments-array-accepted","a tools/call whose arguments are an array is served with none", MCP_PARSE,
-       "        None | Some(Value::Null) => Map::new(),", "        None | Some(Value::Null | Value::Array(_)) => Map::new(),")
-# The adapter's dependency fence. It has no dev-dependency to move, so the mutation adds a crate
-# the workspace already locks and edits Cargo.lock to match, which `--locked` accepts.
-mutate_all(
-    "mcp-dependency-thiserror",
-    "the adapter depends on a crate outside its allowlist",
-    ("crates/gateway-mcp/Cargo.toml", 'serde_json = "1"\n\n[lints]\n', 'serde_json = "1"\nthiserror = "2"\n\n[lints]\n'),
-    ("Cargo.lock", 'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n]\n',
-     'name = "gateway-mcp"\nversion = "0.1.0"\ndependencies = [\n "base64 0.22.1",\n "http",\n "serde_json",\n "thiserror",\n]\n'),
-)
+mutate("demo-workload-check-always-passes", "every workload check passes whatever it got", WORKLOAD,
+       """  if [ "$1" = "$2" ]; then pass "$3"; else fail""", """  if true; then pass "$3"; else fail""")
+mutate("demo-workload-exits-zero-on-failure", "the workload exits 0 after a FAIL", WORKLOAD,
+       """  echo "RESULT: FAIL ($FAILS of $total failed)"\n  exit 1\n""", """  echo "RESULT: FAIL ($FAILS of $total failed)"\n  exit 0\n""")
+mutate("demo-workload-iserror-defaults-false", "an answer with no result reads as isError false", WORKLOAD,
+       """body '.result.isError')""", """body '.result.isError // false')""")
+mutate("demo-workload-limit-sentence-unchecked", "any denial sentence passes as the resource-limit one", WORKLOAD,
+       """grep -c "^Tool \\`$READ_TOOL\\` names docs project \\`$OTHER_PROJECT\\`, which is outside what .*\\. Name only resources within that limit\\.$")" 1""",
+       """grep -c ".")" 1""")
+mutate("demo-workload-identity-sentence-unchecked", "an identity refusal's sentence is not checked", WORKLOAD,
+       """  check "$(body '.error.message')" "$IDENTITY_FAILURE" "$2: sentence"\n""", "")
+mutate("demo-workload-direct-any-failure", "any failed direct call passes, not only a timeout", WORKLOAD,
+       """    check "$?" 28 "direct""", """    check "$([ $? -ne 0 ] && echo 28)" 28 "direct""")
+mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
+       """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
+CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
+mutate("demo-driver-otto-dev-allowed", "the driver runs whatever cluster it is given", DRIVER,
+       CLUSTER_CHECK, "if false; then")
+mutate_all("demo-driver-other-cluster-allowed", "the driver refuses only otto-dev, and runs any other cluster it is given",
+           (DRIVER, "\nCLUSTER=switchboard-demo\n", "\nCLUSTER=${SWITCHBOARD_DEMO_CLUSTER:-switchboard-demo}\n"),
+           (DRIVER, CLUSTER_CHECK, 'if [ "$CLUSTER" = "otto-dev" ]; then'))
+mutate("demo-driver-keeps-kubeconfig-env", "the caller's KUBECONFIG reaches kubectl and kind", DRIVER,
+       "\nunset KUBECONFIG\n", "\n: unset KUBECONFIG\n")
+mutate("demo-driver-default-kubeconfig", "kubectl uses whatever kubeconfig is the default", DRIVER,
+       """k() { kubectl --kubeconfig "$KCFG" --context""", """k() { kubectl --context""")
+mutate("demo-driver-down-default-kubeconfig", "down deletes the cluster through the default kubeconfig", DRIVER,
+       """down_kind() { kind delete cluster --name "$CLUSTER" --kubeconfig "$KCFG"; }""", """down_kind() { kind delete cluster --name "$CLUSTER"; }""")
+mutate("demo-driver-workload-exit-ignored", "a workload's non-zero exit without a FAIL line is not counted", DRIVER,
+       """  elif [ "$status" -ne 0 ] && [ "$failed" -eq 0 ]; then""", """  elif false; then""")
+mutate("demo-driver-result-ignores-failures", "the RESULT passes with FAILs counted", DRIVER,
+       """  if [ "$FAILS" -eq 0 ] && [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""", """  if [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""")
+mutate("demo-driver-any-bearer-is-the-gateways", "mock-docs' accepted bearers are not compared with the gateway's", DRIVER,
+       """'$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ }""", """'$1 == "accepted" && 0 { n++ }""")
+mutate("demo-driver-compose-bearers-whole-log", "the Compose bearer check counts earlier runs' requests too", DRIVER,
+       """    compose) dc logs --no-log-prefix --since "$LOG_SINCE" mock-docs ;;""", """    compose) dc logs --no-log-prefix mock-docs ;;""")
+mutate("demo-driver-kind-bearers-whole-log", "the kind bearer check counts earlier runs' requests too", DRIVER,
+       """    kind) k -n mock-docs logs --since-time "$LOG_SINCE" deploy/mock-docs ;;""", """    kind) k -n mock-docs logs deploy/mock-docs ;;""")
+mutate("demo-driver-log-mark-is-epoch", "the log mark is the epoch number, not a time logs accept", DRIVER,
+       "  LOG_SINCE=${mark#* }\n", "  LOG_SINCE=${mark% *}\n")
+mutate("demo-driver-compose-registry-replaced", "a Compose run replaces the registry directory a reused gateway still mounts", DRIVER,
+       """  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""",
+       """  rm -rf "$DEMO_DIR/compose-registry"\n  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""")
+mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
+       '"127.0.0.1:18080:8080"', '"18080:8080"')
+mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
+       "    image: postgres:17-alpine\n", "    image: postgres:17-alpine\n    ports:\n      - \"127.0.0.1:15433:5432\"\n")
+mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switchboard namespace", POLICY,
+       "              kubernetes.io/metadata.name: switchboard\n          podSelector:\n            matchLabels:\n              app: gateway\n",
+       "              kubernetes.io/metadata.name: switchboard\n")
+mutate("demo-policy-in-base", "the base applies the network policy before the direct call is shown", "deploy/kind/base/kustomization.yaml",
+       "  - workloads.yaml\n", "  - workloads.yaml\n  - ../policy\n")
+mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
+       "35078c7e636169b1", "35078c7e636169b2")
 
 
-# --- gateway -------------------------------------------------------------------------------
+# --- gateway: the first slice from files ---------------------------------------------------
+# The deployment file, the wiring that builds the gateway from it, the registry-mode boot gates
+# and reload, the mock server's digest file, the development issuer and the demo driver's
+# request count.
 
-GW = "crates/gateway/src/"
-BOOT = GW + "boot.rs"
-SELECTOR = GW + "selector.rs"
-CATALOG = GW + "catalog.rs"
+DEPLOY = GW + "deployment.rs"
+START = GW + "start.rs"
+PROXIED = GW + "proxied.rs"
+RELOAD = GW + "reload.rs"
+POLICY_RS = GW + "policy.rs"
+DEV_ISSUER = "crates/gateway-dev/src/issuer.rs"
+DEV_BIN = "crates/gateway-dev/src/bin/switchboard-dev.rs"
+MOCK_CONFIG = "crates/mock-docs-server/src/config.rs"
 
-# The identity and audit gates: configured, explicitly disabled, neither, both.
-mutate("gw-boot-identity-neither-starts", "identity neither enforced nor disabled starts, unchecked", BOOT,
-       "        (None, false) => return Err(BootError::IdentityUnconfigured),\n",
-       "        (None, false) => (IdentityConfig::Disabled, GateState::Disabled),\n")
-mutate("gw-boot-identity-both-starts", "identity both enforced and disabled starts, unchecked", BOOT,
-       "        (Some(_), true) => return Err(BootError::IdentityContradiction),\n",
-       "        (Some(_), true) => (IdentityConfig::Disabled, GateState::Disabled),\n")
-mutate("gw-boot-audit-neither-starts", "audit with no store and no opt-out starts, recording nothing", BOOT,
-       "        (None, false) => Err(BootError::AuditUnconfigured),\n",
-       "        (None, false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled)),\n")
-mutate("gw-boot-audit-both-starts", "audit with a store and an opt-out starts", BOOT,
-       "        (Some(_), true) => Err(BootError::AuditContradiction),\n",
-       "        (Some(store), true) => Ok((store, GateState::On)),\n")
-mutate("gw-noop-store-when-enforced", "the no-op store is used although a store was supplied", BOOT,
-       "        (Some(store), false) => Ok((store, GateState::On)),\n",
-       "        (Some(_), false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::On)),\n")
-mutate("gw-disabled-store-constructible", "anyone can make the no-op audit store", GW + "audit.rs",
-       "    pub(crate) fn new() -> Self {", "    pub fn new() -> Self {")
-mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Host starts", BOOT,
-       "    if config.http.allowed_hosts.is_empty() {\n        return Err(BootError::NoAllowedHosts);\n    }\n", "")
-
-# Tool definitions.
-mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
-       "            if !self.definitions.contains_key(name) {\n                return Err(CatalogError::Missing(name.clone()));\n            }\n",
-       "")
-mutate("gw-boot-catalog-not-checked", "boot does not check the catalog against the snapshot", BOOT,
-       "    catalog.check(&approved)?;\n", "    let _ = &approved;\n")
-mutate("gw-catalog-unapproved-accepted", "a definition for a tool nobody approved is kept", CATALOG,
-       "            Some(name) => Err(CatalogError::NotApproved(name.clone())),", "            Some(_) => Ok(()),")
-mutate("gw-catalog-duplicate-accepted", "a second definition for a tool replaces the first", CATALOG,
-       "            if let Some(previous) = catalog.insert(definition.name.clone(), definition) {\n"
-       "                return Err(CatalogError::Duplicate(previous.name));\n            }\n",
-       "            catalog.insert(definition.name.clone(), definition);\n")
-mutate("gw-catalog-schema-not-checked", "an input schema that is not an object schema is accepted", CATALOG,
-       '    schema.get("type").and_then(serde_json::Value::as_str) == Some("object")',
-       "    let _ = schema;\n    true")
-
-# Every struct the gateway's own configuration sections nest refuses a key it does not know. The
-# policy section is gateway-core's snapshot; its structs are mutated with the core's, under "The
-# snapshot".
-for path, struct in [
-    (GW + "config.rs", "Config"),
-    (GW + "config.rs", "IdentitySection"),
-    (GW + "config.rs", "AuditSection"),
-    (GW + "config.rs", "HttpSection"),
-    (GW + "config.rs", "IssuerEntry"),
-    (CATALOG, "ToolDefinition"),
-    (SELECTOR, "SelectorRules"),
-    (SELECTOR, "WorkloadRule"),
-    (SELECTOR, "UserRule"),
-]:
-    mutate(f"gw-unknown-fields-{struct}", f"{struct} accepts unknown fields", path,
+for struct in ["DeploymentFile", "RegistrySection", "IssuerFile", "TeamManifest"]:
+    mutate(f"gw-deploy-unknown-field-{struct}", f"{struct} ignores fields it does not know", DEPLOY,
            f"#[serde(deny_unknown_fields)]\npub struct {struct} {{", f"pub struct {struct} {{")
-mutate("gw-unknown-fields-IssuerKindEntry", "an issuer's kind accepts unknown fields", GW + "config.rs",
-       '#[serde(rename_all = "snake_case", deny_unknown_fields)]\npub enum IssuerKindEntry {',
-       '#[serde(rename_all = "snake_case")]\npub enum IssuerKindEntry {')
+mutate_all("gw-deploy-disabled-identity-takes-anything", "identity disabled ignores issuers still listed",
+           (DEPLOY, "    /// names a unit variant, so `mode = \"disabled\"` with issuers still listed would load.\n    Disabled {},",
+            "    /// names a unit variant, so `mode = \"disabled\"` with issuers still listed would load.\n    Disabled,"),
+           (DEPLOY, "            IdentityFile::Disabled {} => IdentitySection {", "            IdentityFile::Disabled => IdentitySection {"))
+mutate_all("gw-deploy-disabled-audit-takes-anything", "audit disabled ignores a URL variable still given",
+           (DEPLOY, "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled {},",
+            "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled,"),
+           (DEPLOY, "            AuditFile::Disabled {} => AuditChoice::Disabled,", "            AuditFile::Disabled => AuditChoice::Disabled,"))
+mutate("gw-deploy-poll-zero", "the registry may be read again never", DEPLOY,
+       "        if file.registry.poll_seconds == 0 {", "        if false {")
+mutate("gw-deploy-workload-without-manifest", "a workload issuer with no team manifest gets an empty one", DEPLOY,
+       "        (IssuerKindName::Workload, None, _) => {\n            return Err(DeploymentError::NoManifest(issuer.issuer));\n        }",
+       "        (IssuerKindName::Workload, None, _) => IssuerKindEntry::Workload {\n            subjects: BTreeMap::new(),\n        },")
+mutate("gw-deploy-groups-on-workload", "a workload issuer may carry a groups claim", DEPLOY,
+       "        (IssuerKindName::Workload, Some(manifest), None) => IssuerKindEntry::Workload {",
+       "        (IssuerKindName::Workload, Some(manifest), _) => IssuerKindEntry::Workload {")
+mutate("gw-deploy-manifest-for-user", "a user issuer may carry a team manifest", DEPLOY,
+       "        (IssuerKindName::User, None, groups_claim) => IssuerKindEntry::User {",
+       "        (IssuerKindName::User, _, groups_claim) => IssuerKindEntry::User {")
+mutate("gw-deploy-empty-database-url", "an empty database URL is taken as one", DEPLOY,
+       "                Some(url) if !url.is_empty() => AuditChoice::Postgres { url },",
+       "                Some(url) => AuditChoice::Postgres { url },")
+mutate("gw-deploy-paths-not-relative-to-file", "the registry path is read from the working directory", DEPLOY,
+       "            registry_file: base.join(file.registry.file),", "            registry_file: file.registry.file,")
 
-# Connectors.
-mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
-       "        if !connectors.contains_key(&tool.connector) {", "        if false && !connectors.contains_key(&tool.connector) {")
-mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice keeps the last one", BOOT,
-       "        if connectors.insert(name.clone(), registered).is_some() {\n"
-       "            return Err(BootError::DuplicateConnector(name));\n        }\n",
-       "        connectors.insert(name, registered);\n")
+mutate("gw-start-credential-any-file", "a server whose reference has no file takes another", START,
+       "        let Some(path) = files.get(reference) else {", "        let Some(path) = files.get(reference).or(files.values().next()) else {")
+mutate("gw-start-credential-unused", "a credential file no server uses is accepted", START,
+       "    if let Some(unused) = files.keys().find(|reference| !used.contains(*reference)) {",
+       "    if let Some(unused) = files.keys().find(|reference| !used.contains(*reference)).filter(|_| false) {")
+mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
+       "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
+       "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
+mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
+       "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
+       "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
 
-# Profile selection: the rules, and the checks on them at boot.
-mutate("gw-selector-first-group-only", "only the user's first group selects a profile", SELECTOR,
-       "                    .iter()\n                    .filter_map(|group| rules.and_then(|rules| rules.get(group)))",
-       "                    .iter()\n                    .take(1)\n                    .filter_map(|group| rules.and_then(|rules| rules.get(group)))")
-mutate("gw-selector-ignores-issuer", "a user's groups select through another issuer's rules", SELECTOR,
-       "                let rules = self.users.get(issuer);", "                let rules = self.users.values().next();")
-mutate("gw-selector-workload-ignores-issuer", "a workload's team selects through another issuer's rules", SELECTOR,
-       "                .get(issuer)\n                .and_then(|teams| teams.get(team))",
-       "                .values()\n                .find_map(|teams| teams.get(team))")
-mutate("gw-selector-ambiguous-picks-first", "a user whose groups select two profiles gets the first", SELECTOR,
-       "        (Some(profile), None) => Some(profile),", "        (Some(profile), _) => Some(profile),")
-mutate("gw-selector-duplicate-workload-rule", "a second rule for one workload key replaces the first", SELECTOR,
-       "            if teams.insert(rule.team.clone(), rule.profile).is_some() {",
-       "            if teams.insert(rule.team.clone(), rule.profile).is_some() && false {")
-mutate("gw-selector-duplicate-user-rule", "a second rule for one user key replaces the first", SELECTOR,
-       "            if groups.insert(rule.group.clone(), rule.profile).is_some() {",
-       "            if groups.insert(rule.group.clone(), rule.profile).is_some() && false {")
-mutate("gw-boot-reserved-profile-accepted", "a policy may define the profile given to unselected callers", BOOT,
-       "    if snapshot.profile(&ProfileName::new(NO_PROFILE)).is_some() {",
-       "    if false && snapshot.profile(&ProfileName::new(NO_PROFILE)).is_some() {")
-mutate("gw-boot-unknown-profile-accepted", "a rule may select a profile the policy lacks", BOOT,
-       "        .find(|profile| snapshot.profile(profile).is_none())", "        .find(|_| false)")
-mutate("gw-boot-rule-issuer-not-checked", "a rule may name an issuer that is not configured", BOOT,
-       "        rules_name_configured_issuers(&config.profiles, issuers)?;\n", "        let _ = issuers;\n")
-mutate("gw-boot-rule-issuer-any-kind", "a workload rule may name a user issuer", BOOT,
-       "        .find(|rule| !issuers.workloads.contains(&rule.issuer))",
-       "        .find(|rule| !issuers.workloads.contains(&rule.issuer) && !issuers.users.contains(&rule.issuer))")
+mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
+       "            Err(sentence) => Box::pin(std::future::ready(ToolOutcome::Refused(sentence))),",
+       "            Err(_sentence) => self.inner.run(call),")
+mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
+       "            Some(adapter) if !withdrawn => {", "            Some(adapter) => {")
+mutate("gw-proxied-checks-live-schema", "a call's arguments are checked against the policy served now, not the one it was decided under", PROXIED,
+       "        let adapter = self.policy.arguments(&tool);\n",
+       "        let live = self.live.current();\n        let adapter = live.arguments(&tool);\n")
+mutate("gw-proxied-resources-never-named", "the registry's adapter is not asked for resources", PROXIED,
+       "        (Some(adapter), Some(arguments)) => adapter.resources(arguments),",
+       "        (Some(_adapter), Some(_arguments)) => Resources::Named(Vec::new()),")
 
-# The testkit is a test tool. Moving it from the gateway's dev-dependencies into its own leaves
-# Cargo.lock as it is, so `--locked` still builds and the allowlist test is what notices.
-mutate_all(
-    "gw-dependency-testkit",
-    "the gateway depends on the testkit",
-    ("crates/gateway/Cargo.toml", 'tracing = "0.1"\n', 'tracing = "0.1"\ngateway-testkit = { path = "../gateway-testkit" }\n'),
-    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
-)
-mutate_all(
-    "gw-dependency-testkit-under-spaced-target",
-    "the gateway depends on the testkit, under a target table spelled with spaces",
-    ("crates/gateway/Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
-    ("crates/gateway/Cargo.toml", "\n[lints]\n",
-     "\n[ target.'cfg(all())'.dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n"),
-)
-# A dependency renamed to an allowed name cannot be shown here: every allowed name is already a
-# dependency, and Cargo refuses one name for two packages. The fences compare the package each
-# entry resolves to, which is what a rename would change.
-mutate("gw-dependency-testkit-as-build-dependency", "the gateway builds with the testkit, under a build-dependencies table spelled with spaces",
-       "crates/gateway/Cargo.toml",
-       "\n[lints]\n", "\n[ build-dependencies ]\ngateway-testkit = { path = \"../gateway-testkit\" }\n\n[lints]\n")
+mutate("gw-path-proxied-unchecked", "a proxied connector runs without the argument check", GW_PATH,
+       "            Reads::Adapter(_) => registered.connector.as_ref(),\n",
+       "            Reads::Adapter(_) | Reads::Registry => registered.connector.as_ref(),\n")
+mutate("gw-boot-proxied-connector-handed-out", "a proxied server's connector is handed out to run unchecked", BOOT,
+       "            .filter(|registered| matches!(registered.reads, Reads::Adapter(_)))\n", "")
+mutate("gw-boot-registry-server-unconnected", "a registry server with no connector starts", BOOT,
+       "        if !basis.connectors.contains(&route.server) {", "        if false {")
+mutate("gw-boot-registry-rule-issuer-unchecked", "a registry rule may name an untrusted issuer", BOOT,
+       "            if !configured.contains(&rule.issuer) {", "            if false {")
+mutate("gw-boot-registry-reserved-profile", "a registry may define the reserved profile", BOOT,
+       "        .profile(&ProfileName::new(NO_PROFILE))\n        .is_some()\n    {",
+       "        .profile(&ProfileName::new(NO_PROFILE))\n        .is_some()\n        && false\n    {")
+mutate("gw-boot-proxied-without-registry", "a proxied connector starts with no registry to read its arguments", BOOT,
+       "        return Err(BootError::ProxiedWithoutRegistry(name));\n", "")
+mutate("gw-boot-adapter-beside-registry", "a connector's own adapter is taken beside the registry", BOOT,
+       "        return Err(BootError::AdapterBesideRegistry(name));\n", "")
 
+mutate("gw-reload-servers-unchecked", "a reload may change a server the connectors were built for", RELOAD,
+       "        if registry.servers() != started.servers() {", "        if false {")
+mutate("gw-reload-routes-unchecked", "a reload may route a tool somewhere new", RELOAD,
+       "            if started.routes().get(tool) != Some(route) {", "            if false {")
+mutate("gw-reload-same-revision-served", "a reload that changes the policy but not its revision is served", RELOAD,
+       "        if policy.revision() == served.revision() && policy != *served {", "        if false {")
+mutate("gw-reload-same-revision-any-change", "a reload under the same revision is refused even if the policy is the same", RELOAD,
+       "        if policy.revision() == served.revision() && policy != *served {",
+       "        if policy.revision() == served.revision() {")
+mutate("gw-reload-gates-skipped", "a reload skips the boot gates", RELOAD,
+       "        check_registry_policy(registry, &policy, &self.basis)?;\n", "")
+mutate("gw-reload-never-reads-again", "the watcher never serves a new file", RELOAD,
+       "            if bytes == seen {", "            if true {")
 
-# The binary checks its configuration before it binds a socket.
-GW_BIN = GW + "bin/switchboard.rs"
-BIN_GATES = (
-    "    let gates = match boot::check(config, Wiring::new(Arc::new(SystemClock))) {\n"
-    "        Ok(gates) => gates,\n        Err(error) => return refuse(&error.to_string()),\n    };\n"
-)
-BIN_BIND = (
-    "    let listener = match TcpListener::bind(arguments.listen).await {\n"
-    "        Ok(listener) => listener,\n"
-    '        Err(error) => return refuse(&format!("cannot listen on {}: {error}", arguments.listen)),\n'
-    "    };\n"
-)
-mutate("gw-bin-default-listen-every-interface", "switchboard listens on every interface unless told otherwise", GW_BIN,
-       'const DEFAULT_LISTEN: &str = "127.0.0.1:8080";', 'const DEFAULT_LISTEN: &str = "0.0.0.0:8080";')
-mutate("gw-bin-default-listen-ipv6-every-interface", "switchboard listens on every IPv6 interface unless told otherwise", GW_BIN,
-       'const DEFAULT_LISTEN: &str = "127.0.0.1:8080";', 'const DEFAULT_LISTEN: &str = "[::]:8080";')
-mutate("gw-bin-binds-before-boot-gates", "switchboard binds its socket before the boot gates run", GW_BIN,
-       BIN_GATES + "\n" + BIN_BIND, BIN_BIND + BIN_GATES)
-mutate_all(
-    "gw-bin-binds-before-audit-refusal",
-    "switchboard binds its socket before it refuses a configuration that keeps audit on",
-    (GW_BIN, "\n" + BIN_BIND, ""),
-    (GW_BIN, "    if !config.audit.disabled {\n", BIN_BIND + "    if !config.audit.disabled {\n"),
-)
+mutate("gw-policy-no-rule-gets-a-profile", "a caller no registry rule covers gets the demo's profile", POLICY_RS,
+       "                    ProfileName::new(NO_PROFILE)\n", "                    ProfileName::new(\"workload-read\")\n")
+mutate("gw-path-identity-failure-unnamed", "an identity failure's log line has no event name", GW + "path.rs",
+       "                    event = \"identity_failed\",\n", "")
 
-# --- gateway path --------------------------------------------------------------------------
+mutate("mock-digest-file-beside-token", "a digest file and a token file may both be set", MOCK_CONFIG,
+       "            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,",
+       "            (_, _, Some(path)) => read_digest_file(Path::new(&path))?,")
+mutate("mock-digest-file-read-as-token", "a digest file is read as the token itself", MOCK_CONFIG,
+       "            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,",
+       "            (None, None, Some(path)) => read_token_file(Path::new(&path))?,")
 
-GW_PATH = GW + "path.rs"
-LIST_SURFACE = (
-    "self.entries(snapshot.surface(&surface).map(|surface| surface.tools.iter()"
-    ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
-)
+mutate("dev-issuer-any-subject", "the development issuer signs for any subject", DEV_ISSUER,
+       "        self.subjects.contains(subject).then(|| {", "        true.then(|| {")
+mutate("dev-issuer-unknown-parameter", "the development issuer ignores parameters it does not know", DEV_ISSUER,
+       "            _ => return Err(format!(\"unknown parameter `{name}`\")),", "            _ => continue,")
+mutate("dev-issuer-repeated-parameter", "a parameter given twice takes the last value", DEV_ISSUER,
+       "        if slot.replace(value).is_some() {", "        if slot.replace(value).is_some() && false {")
+mutate("dev-issuer-empty-values", "an empty subject or audience is signed", DEV_ISSUER,
+       "        (Some(subject), Some(audience)) if !subject.is_empty() && !audience.is_empty() => {",
+       "        (Some(subject), Some(audience)) => {")
+mutate("dev-issuer-no-subject", "the development issuer starts with no subjects", DEV_BIN,
+       "        subjects: (!subjects.is_empty())", "        subjects: (true)")
 
-mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
-       "        let admitted = match self.admit(method, headers) {\n",
-       "        if let Err(rejection) = gateway_mcp::parse(method, headers, body) {\n"
-       "            return rejection.response();\n        }\n"
-       "        let admitted = match self.admit(method, headers) {\n")
-mutate("gw-transport-after-identity", "identity is checked before the transport checks", GW_PATH,
-       "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n"
-       "        let gates = &self.inner.gates;\n",
-       "        let gates = &self.inner.gates;\n"
-       "        if let Verification::Failed(_) = gates.identity().check(bearer_token(headers)) {\n"
-       "            return Err(Rejection::unauthorized(IDENTITY_FAILURE).response());\n        }\n"
-       "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n")
-mutate("gw-identity-detail-returned", "the identity failure's cause goes to the caller", GW_PATH,
-       "Err(Rejection::unauthorized(IDENTITY_FAILURE).response())",
-       "Err(Rejection::unauthorized(&failure.detail().to_string()).response())")
-mutate("gw-missing-token-distinct", "a caller with no token gets a different body", GW_PATH,
-       "Err(Rejection::unauthorized(IDENTITY_FAILURE).response())",
-       "Err(Rejection::unauthorized(if *failure.detail() == gateway_identity::VerifyError::MissingToken "
-       '{ "No token was presented." } else { IDENTITY_FAILURE }).response())')
-mutate("gw-bearer-duplicate-accepted", "the first of two Authorization headers is used", GW_PATH,
-       "    if values.next().is_some() {\n        return None;\n    }\n", "")
-mutate("gw-bearer-scheme-case-sensitive", "only `Bearer` spelled with one capital is accepted", GW_PATH,
-       '.eq_ignore_ascii_case("bearer")', '.eq("Bearer")')
-mutate("gw-bearer-any-scheme", "a token under any scheme is accepted", GW_PATH,
-       '.eq_ignore_ascii_case("bearer")', '.ne("")')
-mutate("gw-tool-use-id-unbounded", "a tool-use identifier of any length reaches the row", GW_PATH,
-       "        && value.len() <= MAX_TOOL_USE_ID\n", "")
-mutate("gw-tool-use-id-any-characters", "a tool-use identifier with control characters reaches the row", GW_PATH,
-       "\n        && value.bytes().all(|byte| byte.is_ascii_graphic());", ";")
-mutate("gw-tool-use-id-dropped", "the tool-use identifier never reaches the row", GW_PATH,
-       "tool_use_id: bounded_tool_use_id(tool_use_id),",
-       "tool_use_id: bounded_tool_use_id(tool_use_id).filter(|_| false),")
-mutate("gw-resources-always-empty", "the resource adapter is ignored", GW_PATH,
-       "            Some((tool, adapter)) => adapter.resources(tool, arguments),",
-       "            Some(_) => Resources::Named(Vec::new()),")
-mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the requested name", GW_PATH,
-       "gates.resource_adapter(&tool.connector)?",
-       "gates.resource_adapter(&gateway_core::ConnectorName::new(requested.as_str()))"
-       ".or(gates.resource_adapter(&tool.connector))?")
-mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
-       "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
-       "        let Caller::Proved(principal) = caller else {\n"
-       "            let snapshot = self.inner.gates.snapshot();\n"
-       f"            return {LIST_SURFACE};\n        }};\n")
-mutate("gw-list-unfiltered", "tools/list returns every tool on the surface, undecided", GW_PATH,
-       "        let caller = self.caller_context(principal, surface);\n"
-       "        self.entries(list_tools(self.inner.gates.snapshot(), &caller))\n",
-       "        let _ = principal;\n        let snapshot = self.inner.gates.snapshot();\n"
-       f"        {LIST_SURFACE}\n")
-mutate("gw-disabled-identity-unannounced", "initialize does not say identity is disabled", GW_PATH,
-       "        notes.push(IDENTITY_DISABLED_NOTE);\n", "")
-mutate("gw-disabled-audit-unannounced", "initialize does not say audit is disabled", GW_PATH,
-       "        notes.push(AUDIT_DISABLED_NOTE);\n", "")
-mutate("gw-refusal-answered-as-success", "a scope refusal is answered as a result with isError false", GW_PATH,
-       "Answer::Refused(sentence) => Reply::Denied(sentence),",
-       "Answer::Refused(sentence) => Reply::ToolOk(Value::from(sentence)),")
-mutate("gw-audit-failed-as-tool-error", "an unrecorded scope refusal is answered as a tool error", GW_PATH,
-       "Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),",
-       "Answer::AuditFailed { sentence } => Reply::ToolError(sentence.to_owned()),")
-mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a result", GW_PATH,
-       "Answer::Error(message) => Reply::ToolError(message),",
-       "Answer::Error(message) => Reply::Denied(message),")
-mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
-       "                return Reply::Denied(failure.sentence().to_owned());",
-       "                return Reply::ToolError(failure.sentence().to_owned());")
-mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
-       "                return Reply::Denied(refusal.sentence().to_owned());",
-       "                return Reply::ToolError(refusal.sentence().to_owned());")
-mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
-       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
-       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
-mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
-       "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
-mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
-       "        if let Some(failure) = finished.failure() {\n",
-       "        if let Some(failure) = finished.failure() {\n"
-       "            return Reply::Denied(failure.sentence().to_owned());\n")
-mutate("gw-latency-not-measured", "every call is recorded as taking no time", GW_PATH,
-       "let latency_ms = elapsed_millis(gates.clock().as_ref(), started);",
-       "let latency_ms = 0;")
-mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
-       "read_only: tool.classification == Classification::Read,", "read_only: true,")
+mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
+       '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
+mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
+       'docs-credential.sha256")" 6 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
+mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
+       "\n.claude\n", "\n")
+mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
+       "\n**/target\n", "\n")
+mutate("demo-driver-health-checks-counted", "the outage step counts health checks as requests", DRIVER,
+       "select(.accepted == true)' | awk 'END { print NR }'", "select(.event == \"request\")' | awk 'END { print NR }'")
+mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,
+       "      - issuer-keys:/shared/issuer\n    healthcheck:",
+       "      - issuer-keys:/shared/issuer\n    ports:\n      - \"127.0.0.1:18090:8090\"\n    healthcheck:")
 
 
-# --- gateway server ------------------------------------------------------------------------
+# --- first slice: resources on rows, naming what goes down ------------------------------------
 
-GW_SERVER = GW + "server.rs"
-HOST_CHECK = (
-    "    if let Err(rejection) = check_host(gates, parts) {\n"
-    "        return refused(&rejection);\n    }\n"
-)
-ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers) {\n"
-
-mutate("gw-host-check-skipped", "a request for any Host is served", GW_SERVER, HOST_CHECK, "")
-mutate_all(
-    "gw-host-after-identity",
-    "the Host is checked after identity",
-    (GW_SERVER, HOST_CHECK, ""),
-    (GW_SERVER, "    let Ok(Path(surface)) =", HOST_CHECK + "    let Ok(Path(surface)) ="),
-)
-mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
-       "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
-mutate("gw-host-bracket-suffix-ignored", "whatever follows a bracketed host is dropped unchecked", GW_SERVER,
-       "            Some(close) => host.split_at(close + 1),", "            Some(close) => return &host[..=close],")
-mutate("gw-host-empty-port-accepted", "a Host ending in a colon with no port is allowed", GW_SERVER,
-       "let is_port = |port: &str| !port.is_empty() && port.bytes()", "let is_port = |port: &str| port.bytes()")
-mutate("gw-host-first-of-two", "the first of two Host headers is checked", GW_SERVER,
-       "        (Some(_), Some(_)) => None,", "        (Some(value), Some(_)) => value.to_str().ok(),")
-mutate("gw-host-absent-allowed", "a request with no Host and no authority is taken as for localhost", GW_SERVER,
-       "        (None, _) => parts.uri.authority().map(|authority| authority.as_str()),",
-       '        (None, _) => Some("localhost"),')
-mutate("gw-host-prefix-match", "a Host that starts with an allowed one is allowed", GW_SERVER,
-       ".any(|allowed| allowed.eq_ignore_ascii_case(host))", ".any(|allowed| host.starts_with(allowed.as_str()))")
-mutate("gw-origin-check-skipped", "a request from any Origin is served", GW_SERVER,
-       "    if let Err(rejection) = check_origin(gates, &parts.headers) {\n        return refused(&rejection);\n    }\n", "")
-mutate("gw-origin-required", "a request with no Origin is refused, which shuts out command-line clients", GW_SERVER,
-       "    let Some(first) = values.next() else {\n        return Ok(());",
-       "    let Some(first) = values.next() else {\n        return Err(Rejection::forbidden_origin());")
-mutate("gw-origin-first-of-two", "the first of two Origin headers is checked", GW_SERVER,
-       "    let allowed = values.next().is_none()\n        && first", "    let allowed = first")
-mutate("gw-declared-length-not-checked", "a declared length over the limit reaches identity", GW_SERVER,
-       "    if declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {",
-       "    if false && declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {")
-mutate("gw-declared-length-limit-exclusive", "a body of exactly the limit is refused", GW_SERVER,
-       "|length| length > MAX_BODY_BYTES)", "|length| length >= MAX_BODY_BYTES)")
-mutate("gw-body-unlimited", "a body with no declared length is read whatever its size", GW_SERVER,
-       "axum::body::to_bytes(body, MAX_BODY_BYTES)", "axum::body::to_bytes(body, usize::MAX)")
-mutate("gw-body-read-before-identity", "the body is read before identity is checked", GW_SERVER, ADMIT,
-       "    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {\n"
-       "        Ok(body) => Body::from(body),\n        Err(_) => return unreadable(),\n    };\n" + ADMIT)
-mutate("gw-head-timeout-unset", "a request's head may take hyper's default 30 seconds, not the configured time", GW_SERVER,
-       "    http.timer(TokioTimer::new())\n        .header_read_timeout(timeouts.header_read);\n",
-       "    http.timer(TokioTimer::new());\n")
-mutate("gw-head-timeout-no-timer", "the head's deadline is configured with no timer to run it", GW_SERVER,
-       "    http.timer(TokioTimer::new())\n        .header_read_timeout(", "    http.header_read_timeout(")
-mutate("gw-body-read-untimed", "a body may take an hour to arrive", GW_SERVER,
-       "tokio::time::timeout(endpoint.body_read, reading)", "tokio::time::timeout(Duration::from_secs(3600), reading)")
-mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour for a connection that stopped part way", GW_SERVER,
-       "tokio::time::timeout(timeouts.shutdown_grace, connections.shutdown())",
-       "tokio::time::timeout(Duration::from_secs(3600), connections.shutdown())")
-mutate("gw-shutdown-leaves-connections-open", "a connection still open after the grace keeps serving after the server returns", GW_SERVER,
-       "        tasks.spawn(async move {", "        tokio::spawn(async move {")
-mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
-       "    match tokio::spawn(answering.instrument(span)).await {",
-       "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
-mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
-       "        return refused(&Rejection::request_timeout());",
-       "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
+# The pg-columns-resources-* ones need no server. The audit store's own section has the
+# mutation that writes unknown resources as none named.
+mutate("pg-columns-resources-dropped", "a row records no resources", PG_COLUMNS,
+       "    Ok((resources, omitted))", "    Ok((json!([]), omitted))")
+mutate("pg-columns-resources-omitted-dropped", "a row counts no resources as left out", PG_COLUMNS,
+       "    Ok((resources, omitted))", "    Ok((resources, 0))")
+mutate("demo-driver-down-unnamed-takes-all", "down with nothing named takes down Compose and the cluster", DRIVER,
+       "      all) down_compose && down_kind ;;", '      all | "") down_compose && down_kind ;;')
+mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes the cluster too", DRIVER,
+       "      compose) down_compose ;;", "      compose) down_compose && down_kind ;;")
 
 
-# --- gateway-dev ---------------------------------------------------------------------------
+# --- first slice: the kind run's image ---------------------------------------------------------
+# A kind run deploys its image under a tag taken from the image's ID, so a run on an existing
+# cluster replaces the previous build's pods.
 
-DEV = "crates/gateway-dev/src/"
-DEV_START = DEV + "start.rs"
-DEV_PRINTER = DEV + "printer.rs"
-DEV_TOKENS = DEV + "tokens.rs"
-DEV_CLIENT = DEV + "client.rs"
-
-mutate("dev-listens-on-every-interface", "the fixture gateway listens on every interface, not loopback", DEV_START,
-       "pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;", "pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::UNSPECIFIED;")
-mutate("dev-identity-off-by-default", "the fixture gateway starts with identity disabled unless told otherwise", DEV_START,
-       "            identity_disabled: false,", "            identity_disabled: true,")
-mutate("dev-identity-option-ignored", "asking for identity disabled starts it enforced", DEV_START,
-       '        config["identity"] = json!({"disabled": true});\n', "")
-mutate("dev-clock-option-ignored", "the gateway verifies on the system clock whatever clock it is given", DEV_START,
-       "    let mut wiring = Wiring::new(clock.clone()).connector(",
-       "    let mut wiring = Wiring::new(Arc::new(SystemClock)).connector(")
-mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
-       "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
-mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into a row id, so the call runs with no row", DEV_PRINTER,
-       "            begun\n        })", '            begun.or_else(|_| Ok(AuditRowId::new("printed")))\n        })')
-mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
-       "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
-mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
-       "pub const TOKEN_LIFETIME_SECS: u64 = DEFAULT_MAX_LIFETIME;", "pub const TOKEN_LIFETIME_SECS: u64 = DEFAULT_MAX_LIFETIME + 1;")
-mutate("dev-client-prints-token", "the scripted client prints the bearer token", DEV_CLIENT,
-       "\"> authorization: Bearer <{}'s token, not shown>\",\n                self.caller",
-       "\"> authorization: Bearer {}\",\n                self.token")
-mutate("dev-client-ignores-unexpected", "the scripted client passes whatever the answers were", DEV_CLIENT,
-       "            if !exchange.as_expected() {", "            if false && !exchange.as_expected() {")
-mutate("dev-client-any-error-is-a-denial", "the scripted client takes any JSON-RPC error for a denial", DEV_CLIENT,
-       'Expect::Denied => status == 200 && body["error"]["code"] == json!(DENIAL_CODE),',
-       'Expect::Denied => status == 200 && body.get("error").is_some(),')
+mutate("demo-driver-kind-fixed-tag", "a kind run deploys the manifests' fixed tag", DRIVER,
+       r'''  k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -''',
+       r'''  k kustomize "$ROOT/deploy/kind/base" | k apply -f -''')
+mutate("demo-driver-kind-tag-not-from-id", "the run's tag is not taken from the image's ID", DRIVER,
+       "  IMG_RUN=${IMG%:*}:${image_id:0:12}\n", "  IMG_RUN=$IMG\n")
+mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's ID", DRIVER,
+       "    '' | *[!0-9a-f]*)\n", "    __never__)\n")
 
 
-# --- gateway-dev end-to-end ----------------------------------------------------------------
-# Guards the end-to-end tests in crates/gateway-dev/tests/ watch: the server's wait for running
-# answers at shutdown, and the fixture world those tests and switchboard-dev share.
+# --- first slice: the demo's honesty review ----------------------------------------------------
+# Unknown resources for a tool the gateway does not know, the row check that tests what it
+# claims, the operator checks for both teams and the API server's routes, team-b's own
+# pre-policy probe, proxied results passed on as the server sent them, and the grace periods.
+# The given-up event is the gateway's now; its mutations are in the last section.
 
-DEV_WORLD = DEV + "world.rs"
+mutate("gw-unknown-tool-resources-none", "a call to a tool the gateway does not know records no resources", GW + "path.rs",
+       "            return Resources::Unknown;\n", "            return Resources::Named(Vec::new());\n")
+mutate("gw-proxied-result-wrapped", "a proxied server's result is wrapped again as one JSON text block", GW + "path.rs",
+       "            Answer::Ok(value) if results == Some(Results::ToolResults) => passed_on(value),\n", "")
+mutate("gw-proxied-structured-content-dropped", "a proxied server's structured content is not passed on", GW + "path.rs",
+       '            structured_content: result.get("structuredContent").cloned(),', "            structured_content: None,")
+mutate("mcp-tool-result-legacy-structured-non-object", "a legacy pass-through result carries structuredContent that is not an object", MCP_REPLY,
+       "structured_content.filter(|value| era == Era::Modern || value.is_object());", "structured_content.filter(|_| true);")
+mutate("demo-driver-unknown-row-as-none", "the row check takes none for the resources of a tool the gateway does not know", DRIVER,
+       '        elif .reason == "unknown_tool" then "unknown"\n', '        elif .reason == "unknown_tool" then []\n')
+mutate("demo-driver-row-check-counts-nothing", "the row check passes whatever rows were wrong", DRIVER,
+       '    check "$(count_lines . "$wrong")" 0 "audit: every row', '    check 0 0 "audit: every row')
+mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
+       '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
+mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
+       "  for team in team-a team-b; do\n    for verb in get list watch; do\n",
+       "  for team in team-a; do\n    for verb in get list watch; do\n")
+mutate("demo-driver-secrets-get-only", "only get is checked on secrets and configuration, not list or watch", DRIVER,
+       "    for verb in get list watch; do\n", "    for verb in get; do\n")
+mutate("demo-driver-no-node-proxy", "the node proxy is not checked", DRIVER,
+       '      can_i_no "$team" "$verb" nodes --subresource=proxy\n', "      :\n")
+mutate("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked", DRIVER,
+       "        for subresource in exec portforward proxy; do\n", "        for subresource in exec; do\n")
+mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", DRIVER,
+       '        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"\n', "")
+mutate("demo-driver-no-team-b-probe", "team-b has no pre-policy probe", DRIVER,
+       '  kind_workload "team-b before policy" team-b mock-workload before-policy\n', "")
+mutate("demo-workload-wrapped-result-passes", "a result wrapped again passes as the server's own", WORKLOAD,
+       '| objects | select(has("content"))]', '| objects | select(false)]')
+mutate("demo-kind-default-grace-period", "the kind gateway gets Kubernetes' default 30 s to stop", "deploy/kind/base/gateway.yaml",
+       "      terminationGracePeriodSeconds: 50\n", "      terminationGracePeriodSeconds: 30\n")
+mutate("demo-kind-slow-readiness-removal", "readiness removal takes longer than the grace period allows", "deploy/kind/base/gateway.yaml",
+       "            failureThreshold: 3\n", "            failureThreshold: 10\n")
+mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
+       "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
 
-mutate("gw-shutdown-leaves-answers-running", "the server returns while a call whose client has gone is still running", GW_SERVER,
-       "    answers.finished().await;\n", "")
-mutate("gw-shutdown-answer-not-counted", "an answer stops being counted as soon as its task starts", GW_SERVER,
-       "        let _running = running;\n", "        drop(running);\n")
-mutate("dev-resources-ignore-tool", "the fixture's documents are read as if every tool declared them", DEV_WORLD,
-       "        FixtureConnector::resources_of(tool.name.as_str(), arguments)",
-       "        FixtureConnector::resources_of(gateway_testkit::READ_TOOL, arguments)")
-mutate("dev-fixture-allows-an-origin", "the fixture gateway accepts a browser page on localhost", DEV_WORLD,
-       '"allowed_origins": []}', '"allowed_origins": ["http://localhost:6274"]}')
-mutate("dev-team-b-selects-team-a-profile", "team B's workloads get team A's profile", DEV_WORLD,
-       '"team": TEAM_B, "profile": PROFILE_TEAM_B}', '"team": TEAM_B, "profile": PROFILE_TEAM_A}')
-mutate("dev-fixture-accepts-another-audience", "the fixture gateway accepts tokens meant for someone else", DEV_WORLD,
-       '"audiences": [AUDIENCE],', '"audiences": [AUDIENCE, "someone-else"],')
-mutate("dev-fixture-lifetime-unbounded", "the fixture gateway accepts tokens that live for days", DEV_WORLD,
-       '"max_lifetime_secs": DEFAULT_MAX_LIFETIME,', '"max_lifetime_secs": DEFAULT_MAX_LIFETIME * 48,')
+# --- first slice: the Postgres store as PR #39 has it -----------------------------------------
+# The gateway logs each finish the store reports given up, and the demo's database, set up by
+# deploy/demo's scripts for both Compose and kind, passes the store's boot checks. Each is
+# caught only against Postgres (SWITCHBOARD_TEST_DATABASE_URL).
 
-
-# --- gateway-dev: switchboard-client -------------------------------------------------------
-
-DEV_CLIENT_BIN = DEV + "bin/switchboard-client.rs"
-
-mutate("dev-client-bin-caller-ignored", "switchboard-client presents team A's token whatever caller it is asked for", DEV_CLIENT_BIN,
-       "read_token(&arguments.tokens, caller, SURFACE_READ)", "read_token(&arguments.tokens, Caller::TeamA, SURFACE_READ)")
-mutate("dev-client-bin-era-ignored", "switchboard-client runs both eras whatever era it is asked for", DEV_CLIENT_BIN,
-       "    for era in arguments.eras {", "    for era in [Era::Legacy, Era::Modern] {")
-mutate("dev-client-bin-unexpected-exits-0", "switchboard-client exits 0 when an answer was not as expected", DEV_CLIENT_BIN,
-       "    } else {\n        ExitCode::from(1)\n    }", "    } else {\n        ExitCode::SUCCESS\n    }")
-
-
-
-# --- gateway-dev: switchboard-dev ----------------------------------------------------------
-
-DEV_BIN = DEV + "bin/switchboard-dev.rs"
-
-mutate("dev-bin-unexpected-answer-ignored", "switchboard-dev's script passes whatever the answers were", DEV_BIN,
-       "            as_expected = false;\n", "")
-mutate("dev-bin-once-unexpected-exits-0", "switchboard-dev --once exits 0 when an answer was not as expected", DEV_BIN,
-       '    if !as_expected {\n        return Err("an answer was not as expected".to_owned());\n    }\n',
-       "    let _ = as_expected;\n")
-mutate("dev-bin-once-unclean-stop-exits-0", "switchboard-dev --once exits 0 when the gateway did not stop cleanly", DEV_BIN,
-       "    if let Err(error) = stopped {", "    if let (Err(error), false) = (stopped, true) {")
+mutate("gw-given-up-not-logged", "a finish the store gives up is not logged", GW + "start.rs",
+       "        .on_given_up(log_given_up);\n", ";\n")
+mutate("gw-given-up-wrong-event", "a finish given up is logged under another event", GW + "start.rs",
+       'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";', 'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up_";')
+mutate("gw-given-up-row-unnamed", "the given-up event does not name its row", GW + "start.rs",
+       "        row = given_up.row.as_str(),\n", "")
+mutate("gw-given-up-outcome-unnamed", "the given-up event does not name the outcome not written", GW + "start.rs",
+       "        outcome = given_up.outcome,\n", "")
+mutate("gw-given-up-not-error", "the given-up event is logged below ERROR", GW + "start.rs",
+       "fn log_given_up(given_up: GivenUp<'_>) {\n    tracing::error!(", "fn log_given_up(given_up: GivenUp<'_>) {\n    tracing::warn!(")
+mutate("demo-roles-gateway-owns-database", "the demo's gateway role owns its database", "deploy/demo/roles.sql",
+       "CREATE DATABASE switchboard OWNER switchboard_owner", "CREATE DATABASE switchboard OWNER switchboard_gateway")
+mutate("demo-roles-gateway-can-create", "the demo's gateway role may create in its database", "deploy/demo/roles.sql",
+       "GRANT CONNECT ON DATABASE switchboard TO switchboard_gateway, switchboard_reader;",
+       "GRANT CONNECT, CREATE ON DATABASE switchboard TO switchboard_gateway, switchboard_reader;")
+mutate("demo-migrate-gateway-reads-everything", "the demo grants the gateway role every column", "deploy/demo/migrate.sh",
+       'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader;',
+       'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader, switchboard_gateway;')
 
 # --- Running -------------------------------------------------------------------------------
 

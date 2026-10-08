@@ -1,0 +1,185 @@
+# The scripted workloads (deploy/demo/workload.sh). Each CronJob is suspended and never runs on
+# its schedule: it holds the Job template that demo.sh starts a new Job from, with the mode as
+# the container's argument. A new Job is a new pod, which is what the network-policy check needs.
+#
+# Each pod projects a token for audience `switchboard`, valid for 600 s, signed by the cluster.
+# No token is made by hand. Jobs never retry (backoffLimit 0): a failure is reported, not hidden.
+# team-a's workload. BAD_TOKEN_FILES is the pod's default API token: real and cluster-signed, for
+# the wrong audience. DIRECT_URL is the server's own address: before the policy a call there
+# connects, and after it the call must time out.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mock-workload
+  namespace: team-a
+  labels:
+    app: mock-workload
+spec:
+  suspend: true
+  schedule: "0 0 1 1 *"
+  jobTemplate:
+    metadata:
+      labels:
+        app: mock-workload
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: mock-workload
+        spec:
+          serviceAccountName: mock-workload
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: workload
+              image: switchboard-demo:dev
+              imagePullPolicy: Never
+              command: ["workload.sh"]
+              args: ["full"]
+              env:
+                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs"}
+                - {name: TOKEN_FILE, value: /var/run/secrets/switchboard/token}
+                - {name: OWN_PROJECT, value: atlas}
+                - {name: OTHER_PROJECT, value: borealis}
+                - {name: BAD_TOKEN_FILES, value: /var/run/secrets/kubernetes.io/serviceaccount/token}
+                - {name: DIRECT_URL, value: "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: switchboard-token, mountPath: /var/run/secrets/switchboard, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: switchboard-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: switchboard
+                      expirationSeconds: 600
+                      path: token
+            - {name: tmp, emptyDir: {}}
+---
+# team-b's workload. BAD_TOKEN_FILES is the pod's default API token: real and cluster-signed, for
+# the wrong audience. DIRECT_URL is the server's own address: before the policy a call there
+# connects, and after it the call must time out.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mock-workload
+  namespace: team-b
+  labels:
+    app: mock-workload
+spec:
+  suspend: true
+  schedule: "0 0 1 1 *"
+  jobTemplate:
+    metadata:
+      labels:
+        app: mock-workload
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: mock-workload
+        spec:
+          serviceAccountName: mock-workload
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: workload
+              image: switchboard-demo:dev
+              imagePullPolicy: Never
+              command: ["workload.sh"]
+              args: ["full"]
+              env:
+                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs"}
+                - {name: TOKEN_FILE, value: /var/run/secrets/switchboard/token}
+                - {name: OWN_PROJECT, value: borealis}
+                - {name: OTHER_PROJECT, value: atlas}
+                - {name: BAD_TOKEN_FILES, value: /var/run/secrets/kubernetes.io/serviceaccount/token}
+                - {name: DIRECT_URL, value: "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: switchboard-token, mountPath: /var/run/secrets/switchboard, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: switchboard-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: switchboard
+                      expirationSeconds: 600
+                      path: token
+            - {name: tmp, emptyDir: {}}
+---
+# A ServiceAccount the team manifest does not list. Its real, correctly scoped token is refused.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: stranger-workload
+  namespace: team-a
+  labels:
+    app: stranger-workload
+spec:
+  suspend: true
+  schedule: "0 0 1 1 *"
+  jobTemplate:
+    metadata:
+      labels:
+        app: stranger-workload
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: stranger-workload
+        spec:
+          serviceAccountName: stranger
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: workload
+              image: switchboard-demo:dev
+              imagePullPolicy: Never
+              command: ["workload.sh"]
+              args: ["refused"]
+              env:
+                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs"}
+                - {name: TOKEN_FILE, value: /var/run/secrets/switchboard/token}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              volumeMounts:
+                - {name: switchboard-token, mountPath: /var/run/secrets/switchboard, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: switchboard-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: switchboard
+                      expirationSeconds: 600
+                      path: token
+            - {name: tmp, emptyDir: {}}

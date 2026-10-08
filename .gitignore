@@ -1,3 +1,4 @@
 conformance/.cache/
 __pycache__/
 target/
+.demo/

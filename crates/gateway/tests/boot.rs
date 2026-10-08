@@ -374,6 +374,7 @@ fn passed_gates_hold_what_the_configuration_and_wiring_gave() {
     let read = ToolName::parse(READ_TOOL).unwrap();
     assert_eq!(
         gates
+            .policy()
             .catalog()
             .definition(&read)
             .map(|d| d.description.as_str()),
@@ -382,7 +383,8 @@ fn passed_gates_hold_what_the_configuration_and_wiring_gave() {
     let fixture = CONNECTOR.into();
     let ours: Arc<dyn gateway_core::Connector> = world.connector.clone();
     assert!(Arc::ptr_eq(gates.connector(&fixture).unwrap(), &ours));
-    let tool = gates.snapshot().tool(&read).unwrap();
+    let snapshot = gates.snapshot();
+    let tool = snapshot.tool(&read).unwrap();
     let adapter = gates.resource_adapter(&tool.connector).unwrap();
     assert_eq!(
         adapter.resources(tool, &Fixture::arguments_naming(TEAM_A_DOCUMENT)),
@@ -398,7 +400,7 @@ fn passed_gates_select_profiles_for_callers_their_identity_gate_proves() {
     let gates = world.boot(world.config(), world.wiring()).unwrap();
     let profile_of = |token: &str| match gates.identity().check(Some(token)) {
         Verification::Proved(principal) => {
-            gates.selector().select(principal.get()).as_str().to_owned()
+            gates.policy().select(principal.get()).as_str().to_owned()
         }
         other => panic!("{other:?}"),
     };
@@ -429,7 +431,7 @@ fn with_audit_disabled_an_allowed_call_runs_and_nothing_is_recorded() {
     let arguments = Fixture::arguments_naming(TEAM_A_DOCUMENT);
     let call = CallContext {
         caller: CallerContext {
-            profile: gates.selector().select(principal.get()),
+            profile: gates.policy().select(principal.get()),
             principal,
             delegation: None,
             surface: SURFACE_READ.into(),
@@ -438,7 +440,7 @@ fn with_audit_disabled_an_allowed_call_runs_and_nothing_is_recorded() {
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
     };
-    let decision = decide(gates.snapshot(), &call);
+    let decision = decide(&gates.snapshot(), &call);
     let store = gates.audit_store().as_ref();
     let begun = block_on(audit::begin(
         store,
@@ -579,6 +581,18 @@ fn a_connector_registered_twice_is_refused() {
     let booted = world.boot(world.config(), wiring);
     assert!(
         matches!(&booted, Err(BootError::DuplicateConnector(name)) if name.as_str() == CONNECTOR),
+        "{booted:?}"
+    );
+}
+
+#[test]
+fn a_proxied_connector_needs_the_policy_to_come_from_the_registry() {
+    // Nothing in this configuration reads a proxied server's arguments, so it is refused.
+    let world = World::new();
+    let wiring = world.wiring().proxied("proxied", world.connector.clone());
+    let booted = world.boot(world.config(), wiring);
+    assert!(
+        matches!(&booted, Err(BootError::ProxiedWithoutRegistry(name)) if name.as_str() == "proxied"),
         "{booted:?}"
     );
 }

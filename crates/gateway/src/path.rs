@@ -26,6 +26,9 @@
 //!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
 //!   answers. A denial is answered with the sentence the row holds.
 //!
+//! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
+//! everything from it, so a registry reload never splits one request across two versions.
+//!
 //! What the path does not do yet, and why:
 //!
 //! - **Identity failures are logged, not audited**, as decision 0009 records: they are
@@ -53,7 +56,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, IDENTITY_FAILURE, PolicySnapshot,
+    ApprovedTool, CallContext, CallerContext, Classification, Connector, IDENTITY_FAILURE,
     Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
@@ -64,8 +67,10 @@ use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
 
-use crate::boot::{GateState, Gates};
+use crate::boot::{GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
+use crate::policy::ServedPolicy;
+use crate::proxied::{CheckedArguments, registry_resources};
 
 /// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
 pub const MAX_TOOL_USE_ID: usize = 128;
@@ -175,6 +180,7 @@ impl RequestPath {
             }),
             Verification::Failed(failure) => {
                 tracing::warn!(
+                    event = "identity_failed",
                     deployment = %gates.deployment(),
                     cause = %failure.detail(),
                     "refused a caller whose identity was not proved"
@@ -251,23 +257,9 @@ impl RequestPath {
         let Caller::Proved(principal) = caller else {
             return Vec::new();
         };
-        let caller = self.caller_context(principal, surface);
-        self.entries(list_tools(self.inner.gates.snapshot(), &caller))
-    }
-
-    fn entries(&self, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
-        let catalog = self.inner.gates.catalog();
-        tools
-            .into_iter()
-            .filter_map(|tool| match catalog.definition(&tool.name) {
-                Some(definition) => Some(entry(tool, definition)),
-                None => {
-                    // The boot gates refuse an approved tool without a definition.
-                    tracing::error!(tool = %tool.name, "an approved tool has no definition");
-                    None
-                }
-            })
-            .collect()
+        let policy = self.inner.gates.policy();
+        let caller = self.caller_context(&policy, principal, surface);
+        entries(&policy, list_tools(policy.snapshot(), &caller))
     }
 
     /// `tools/call`: design section 6's steps 1 to 9.
@@ -280,7 +272,36 @@ impl RequestPath {
             );
             return Reply::Denied(IDENTITY_DISABLED.to_owned());
         };
-        let snapshot = gates.snapshot().clone();
+        let policy = gates.policy();
+        self.decide_and_run(&policy, principal, surface, call).await
+    }
+}
+
+fn entries(policy: &ServedPolicy, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
+    let catalog = policy.catalog();
+    tools
+        .into_iter()
+        .filter_map(|tool| match catalog.definition(&tool.name) {
+            Some(definition) => Some(entry(tool, definition)),
+            None => {
+                // The boot gates refuse an approved tool without a definition.
+                tracing::error!(tool = %tool.name, "an approved tool has no definition");
+                None
+            }
+        })
+        .collect()
+}
+
+impl RequestPath {
+    async fn decide_and_run(
+        &self,
+        policy: &ServedPolicy,
+        principal: Proved<Principal>,
+        surface: SurfaceName,
+        call: ToolCall,
+    ) -> Reply {
+        let gates = &self.inner.gates;
+        let snapshot = policy.snapshot();
         let ToolCall {
             name,
             arguments,
@@ -288,14 +309,14 @@ impl RequestPath {
         } = call;
         let arguments = Value::Object(arguments);
         let requested = RequestedTool::new(name);
-        let resources = self.resources(&snapshot, &requested, &arguments);
+        let resources = self.resources(policy, &requested, &arguments);
         let context = CallContext {
-            caller: self.caller_context(principal, surface),
+            caller: self.caller_context(policy, principal, surface),
             tool: requested,
             resources,
         };
         let decided = Instant::now();
-        let decision = decide(&snapshot, &context);
+        let decision = decide(snapshot, &context);
         let decide_us = micros(decided.elapsed());
         let metadata = RequestMetadata {
             tool_use_id: bounded_tool_use_id(tool_use_id),
@@ -330,7 +351,7 @@ impl RequestPath {
         };
         let row = guard.row().clone();
         let tool = guard.tool().name.clone();
-        let Some(connector) = gates.connector(&guard.tool().connector) else {
+        let Some(registered) = gates.registered(&guard.tool().connector) else {
             // The boot gates refuse a tool on a surface whose connector is not registered.
             tracing::error!(
                 row = guard.row().as_str(),
@@ -341,10 +362,25 @@ impl RequestPath {
                 "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
             );
         };
+        let results = Some(registered.results);
+        // A proxied server's call is checked against the schema of the policy this request
+        // took, the one its decision was made from, never a version served since.
+        let checked;
+        let connector: &dyn Connector = match &registered.reads {
+            Reads::Adapter(_) => registered.connector.as_ref(),
+            Reads::Registry => {
+                checked = CheckedArguments::new(
+                    registered.connector.as_ref(),
+                    policy,
+                    gates.live_policy(),
+                );
+                &checked
+            }
+        };
 
         let started = gates.clock().now();
         let running = Instant::now();
-        let ran = audit::run(connector.as_ref(), guard).await;
+        let ran = audit::run(connector, guard).await;
         let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
         // No answer budget: the core gives out the answer when the store's finish returns.
@@ -366,6 +402,7 @@ impl RequestPath {
             "ran a tool call"
         );
         match finished.answer().clone() {
+            Answer::Ok(value) if results == Some(Results::ToolResults) => passed_on(value),
             Answer::Ok(value) => Reply::ToolOk(value),
             Answer::Error(message) => Reply::ToolError(message),
             Answer::Refused(sentence) => Reply::Denied(sentence),
@@ -374,30 +411,51 @@ impl RequestPath {
     }
 
     /// The resources the call names, from the adapter registered with the connector of the
-    /// approved tool the call names. Never chosen by anything else in the request. A name that
-    /// is not an approved tool names no resources; the decision denies it before it looks.
+    /// approved tool the call names. Never chosen by anything else in the request.
+    ///
+    /// For a name that is not an approved tool there is no adapter, so nobody can say what the
+    /// call names: [`Resources::Unknown`], which its row records as `unknown`. Recording none
+    /// would read as a call that named nothing. The decision denies the call before it looks.
+    ///
+    /// A proxied server's tools are read with the adapter the request's own policy version
+    /// approved, the version the decision is made from.
     fn resources(
         &self,
-        snapshot: &PolicySnapshot,
+        policy: &ServedPolicy,
         requested: &RequestedTool,
         arguments: &Value,
     ) -> Resources {
         let gates = &self.inner.gates;
-        let approved = requested.name().ok().and_then(|name| snapshot.tool(&name));
-        let adapter =
-            approved.and_then(|tool| Some((tool, gates.resource_adapter(&tool.connector)?)));
-        match adapter {
-            Some((tool, adapter)) => adapter.resources(tool, arguments),
+        let Some(approved) = requested
+            .name()
+            .ok()
+            .and_then(|name| policy.snapshot().tool(&name))
+        else {
+            return Resources::Unknown;
+        };
+        match gates
+            .registered(&approved.connector)
+            .map(|registered| &registered.reads)
+        {
+            Some(Reads::Adapter(adapter)) => adapter.resources(approved, arguments),
+            Some(Reads::Registry) => registry_resources(policy, approved, arguments),
+            // Every connector is registered with an adapter, and the boot gates refuse an
+            // approved tool whose connector is not registered.
             None => Resources::Named(Vec::new()),
         }
     }
 
     /// Design section 6's step 3: the profile, from the configured rules. There is no
     /// delegation verifier yet.
-    fn caller_context(&self, principal: Proved<Principal>, surface: SurfaceName) -> CallerContext {
+    fn caller_context(
+        &self,
+        policy: &ServedPolicy,
+        principal: Proved<Principal>,
+        surface: SurfaceName,
+    ) -> CallerContext {
         let gates = &self.inner.gates;
         CallerContext {
-            profile: gates.selector().select(principal.get()),
+            profile: policy.select(principal.get()),
             principal,
             delegation: None,
             surface,
@@ -447,6 +505,22 @@ fn entry(tool: &ApprovedTool, definition: &ToolDefinition) -> ToolEntry {
         input_schema: definition.input_schema.clone(),
         read_only: tool.classification == Classification::Read,
     }
+}
+
+/// A proxied server's tool result as the caller gets it: the server's content blocks and
+/// structured content, as it sent them, not wrapped in another text block. The connector hands
+/// on only a result with a content list; anything else is logged and sent as a value, wrapped.
+fn passed_on(value: Value) -> Reply {
+    if let Value::Object(result) = &value
+        && let Some(Value::Array(content)) = result.get("content")
+    {
+        return Reply::ToolResult {
+            content: content.clone(),
+            structured_content: result.get("structuredContent").cloned(),
+        };
+    }
+    tracing::error!("a proxied server's tool result has no content list; it is sent as a value");
+    Reply::ToolOk(value)
 }
 
 /// How an answer is named in the log.

@@ -1,0 +1,24 @@
+[package]
+name = "demo-checks"
+version = "0.1.0"
+description = "Tests for the demo's deployment in deploy/: the scripted workload, the driver script, the Compose file and the kind manifests."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Tests only. The scripts under test need sh, bash, curl, jq and awk on the machine.
+[dev-dependencies]
+# The audit store's budgets and the proxy's call deadline, which the gateway's grace period
+# must outlast.
+audit-postgres = { path = "../audit-postgres" }
+connector-proxy = { path = "../connector-proxy" }
+gateway-core = { path = "../gateway-core" }
+serde_json = "1"
+sha2 = "0.10"
+# Sets up the demo's database from its scripts on a throwaway server, when one is given.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+
+[lints]
+workspace = true

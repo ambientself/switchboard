@@ -160,13 +160,16 @@ lines only once the interfaces between them have settled.
 | --- | --- |
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
-| `gateway-audit` | The audit store over Postgres, and the explicit no-op store. |
+| `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
 | `connector-github` | GitHub tools, and the client for the key custodian. |
 | `otto-adapter` | Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
+| `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
 | `gateway-mcp` | The MCP protocol adapter: JSON-RPC envelopes, the two revisions, header checks, rendering. No policy types. |
-| `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, wiring. |
+| `gateway` | The proxy binary (`switchboard`): HTTP handler, boot gates, the deployment file, wiring, registry reload. |
 | `gateway-dev` | The gateway on the test fakes (`switchboard-dev`), a scripted client, and the end-to-end tests. |
+| `mock-docs-server` | A mock document server that plays a proxied MCP server in tests and the demo. Shares no code with the gateway. |
+| `demo-checks` | Tests for the demo's scripts and manifests in `deploy/`. No code of its own. |
 | `registry` | The control-plane binary, once it exists. |
 | `conformance` | The black-box suite, a fake vendor API and a fake MCP server. |
 
@@ -1097,7 +1100,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
   giving up a guard without running completes its row as `error`. Today a guard can only be
-  consumed by running it.
+  consumed by running it, and a row whose insert commits after its begin failed stays open.
 - In the core: `begin` takes the identifier; `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
@@ -1124,8 +1127,9 @@ that removes the exception-list check.
 
 **#14, the first slice.** The mock server's own refusal of anything but the gateway's projected
 token; the route-check program, its operator step and its probe (decision 0010); the
-termination grace period and readiness delay set explicitly in the manifests; the signals of
-section 11 exported; and the open-row query.
+signals of section 11 exported; and the open-row query. Decision 0009's shutdown order, in which
+an instance first fails its readiness check and then stops accepting calls, is not built either:
+the manifests set the grace period, but nothing fails readiness first (#40).
 
 **#22, the Otto adapter.** The Ed25519 turn-grant verifier with strict encoding; a delegation in
 the call context that is present and unverified, carrying the failure kind and an optional
@@ -1145,7 +1149,9 @@ off only in a development build, with CI's check of the release artifact; and th
 - The telemetry event for each finish given up, made from the audit store's report of it,
   naming the row and the outcome's kind, with a different second completion logged and counted
   apart from a finish that ran out of time (decision 0009). Today the Postgres store reports
-  each one through `on_given_up`, and nothing receives the report.
+  each one through `on_given_up`, and the gateway logs each report as `audit_row_given_up` at
+  `ERROR`, with the row, the outcome's kind and the cause. A different second completion is
+  told apart only by its cause, and is not counted apart.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled.
   Today the spawned task always runs to completion.
 - The row's identifier in the result's `_meta`, or in `error.data`.

@@ -1,0 +1,29 @@
+# Postgres runs as root before it drops privileges, so its namespace enforces `baseline`; every
+# other namespace enforces `restricted`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: switchboard
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mock-docs
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+  labels:
+    pod-security.kubernetes.io/enforce: restricted

@@ -18,7 +18,7 @@ use gateway::{
     AUDIT_DISABLED_NOTE, Config, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
     RequestPath, ResourceAdapter, Wiring, boot,
 };
-use gateway_core::audit::{Completion, DecisionKind, Outcome};
+use gateway_core::audit::{Completion, DecisionKind, Outcome, RecordedResources};
 use gateway_core::{
     ApprovedTool, AuditRecord, Classification, IDENTITY_FAILURE, ReasonKind, Resources,
 };
@@ -1283,6 +1283,30 @@ fn a_name_that_is_not_an_approved_tool_reaches_no_adapter() {
             .denial();
     }
     assert!(world.resources.asked().is_empty());
+}
+
+#[test]
+fn a_call_to_a_tool_the_gateway_does_not_know_records_its_resources_as_unknown() {
+    // The call names a document, but no adapter reads it. Recording none would say the call
+    // named nothing.
+    let world = World::new();
+    for (position, name) in ["fixture__no_such_tool", "not a tool name!"]
+        .into_iter()
+        .enumerate()
+    {
+        world
+            .call(Caller::TeamA, SURFACE_ALL, name, own(Caller::TeamA))
+            .denial();
+        let row = world.row(position);
+        assert_eq!(row.reason, Some(ReasonKind::UnknownTool), "{name}");
+        assert_eq!(row.resources, RecordedResources::Unknown, "{name}");
+        assert_eq!(row.resources_omitted, 0);
+    }
+    // A known tool's call that names nothing is recorded as naming nothing.
+    world
+        .call(Caller::TeamA, SURFACE_ALL, READ_TOOL, json!({}))
+        .denial();
+    assert_eq!(world.row(2).resources, RecordedResources::Named(Vec::new()));
 }
 
 // --- What writes no row ---------------------------------------------------------------------

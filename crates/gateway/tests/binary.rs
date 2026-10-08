@@ -1,21 +1,21 @@
-//! The `switchboard` binary, run as a process: its arguments, its refusals to start, and a
-//! request over loopback with its JSON logs read back.
+//! The `switchboard` binary, run as a process: its arguments, its refusals to start, its boot
+//! lines, and requests over loopback forwarded to the mock docs server, with its JSON logs read
+//! back.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod files;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use gateway::{AUDIT_DISABLED_NOTE, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE};
+use files::{AUDIENCE, Files, READ_TOOL, SURFACE, TEAM_A_SA, cluster_issuer, kubernetes_token};
 use gateway_core::IDENTITY_FAILURE;
-use gateway_testkit::{
-    AUDIENCE, DRAFT_TOOL, Fixture, GROUP_G, PROFILE_TEAM_A, PROFILE_USER, READ_TOOL,
-    SCOPED_READ_TOOL, SURFACE_READ, TEAM_A, TEAM_A_SUBJECT, USER_ISSUER, WORKLOAD_ISSUER,
-    WRITE_TOOL,
-};
+use gateway_testkit::LocalIssuer;
+use mock_docs_server::{AcceptedCredential, Config};
 use serde_json::{Value, json};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_switchboard");
@@ -27,70 +27,25 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// forever, so that a refused configuration that starts serving fails the test.
 const EXIT_PATIENCE: Duration = Duration::from_secs(120);
 
-/// A configuration this build can start: audit disabled, and no tool on any surface, because
-/// the binary registers no connector.
-fn startable(identity: Value) -> Value {
-    let mut policy = gateway_testkit::policy_data();
-    for surface in policy["surfaces"].as_array_mut().unwrap() {
-        surface["tools"] = json!([]);
-    }
-    let definition = |name: &str| json!({"name": name, "description": "A fixture tool.", "input_schema": {"type": "object"}});
-    json!({
-        "deployment": "binary-test",
-        "identity": identity,
-        "audit": {"disabled": true},
-        "http": {"allowed_hosts": ["127.0.0.1"]},
-        "policy": policy,
-        "catalog": [
-                definition(READ_TOOL),
-                definition(DRAFT_TOOL),
-                definition(WRITE_TOOL),
-                definition(SCOPED_READ_TOOL),
-            ],
-        "profiles": {
-            "workloads": [{"issuer": WORKLOAD_ISSUER, "team": TEAM_A, "profile": PROFILE_TEAM_A}],
-            "users": [{"issuer": USER_ISSUER, "group": GROUP_G, "profile": PROFILE_USER}],
-        },
-    })
+fn issuer() -> &'static LocalIssuer {
+    static ISSUER: OnceLock<LocalIssuer> = OnceLock::new();
+    ISSUER.get_or_init(cluster_issuer)
 }
 
-fn enforced(fixture: &Fixture) -> Value {
-    let issuer = |issuer: &gateway_testkit::LocalIssuer, kind: Value| {
-        json!({
-            "issuer": issuer.issuer(),
-            "audiences": [AUDIENCE],
-            "kind": kind,
-            "algorithm": "ES256",
-            "keys": serde_json::to_value(issuer.jwk_set()).unwrap(),
-            "max_lifetime_secs": gateway_testkit::DEFAULT_MAX_LIFETIME,
-            "leeway_secs": gateway_testkit::DEFAULT_LEEWAY,
-        })
-    };
-    json!({"enforce": [
-        issuer(&fixture.workload_issuer, json!({"workload": {"subjects": {TEAM_A_SUBJECT: TEAM_A}}})),
-        issuer(&fixture.user_issuer, json!({"user": {}})),
-    ]})
-}
-
-/// Writes `config` to a file of its own under the target directory.
-fn config_file(name: &str, config: &Value) -> PathBuf {
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("switchboard-binary-test");
-    std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join(format!("{name}.json"));
-    std::fs::write(&path, config.to_string()).unwrap();
-    path
-}
-
-/// Runs the binary to its exit. One that is still running after [`EXIT_PATIENCE`] is killed
-/// and fails the test, so a configuration that should be refused but starts a server fails the
-/// test rather than hanging it.
-fn run(arguments: &[&str]) -> Output {
-    let mut child = Command::new(BINARY)
+/// Runs the binary to its exit, with `env` added to its environment. One that is still running
+/// after [`EXIT_PATIENCE`] is killed and fails the test, so a configuration that should be
+/// refused but starts a server fails the test rather than hanging it.
+fn run_with(arguments: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(BINARY);
+    command
         .args(arguments)
+        .env_remove("SWITCHBOARD_MIGRATE_DATABASE_URL")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().unwrap();
     let drain = |mut pipe: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -119,18 +74,30 @@ fn run(arguments: &[&str]) -> Output {
     }
 }
 
+fn run(arguments: &[&str]) -> Output {
+    run_with(arguments, &[])
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
 fn usage_errors_exit_with_two() {
     for arguments in [
         &[][..],
-        &["--listen"],
-        &["--listen", "not-an-address", "config.json"],
-        &["--verbose", "config.json"],
-        &["one.json", "two.json"],
+        &["--config"],
+        &["--config="],
+        &["--listen", "127.0.0.1:0"],
+        &["--verbose", "--config=gateway.toml"],
+        &["gateway.toml"],
+        &["migrate", "--config=gateway.toml"],
+        &["--config=gateway.toml", "migrate"],
+        &["migrate", "migrate"],
     ] {
         let output = run(arguments);
         assert_eq!(output.status.code(), Some(2), "{arguments:?}");
@@ -141,65 +108,119 @@ fn usage_errors_exit_with_two() {
     }
     let help = run(&["--help"]);
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("usage: switchboard"));
+    assert!(stdout(&help).contains("usage: switchboard"));
 }
 
 #[test]
-fn it_refuses_to_start_without_the_audit_opt_out() {
-    let mut config = startable(json!({"disabled": true}));
-    config["audit"] = json!({});
-    let path = config_file("audit-not-disabled", &config);
-    let output = run(&["--listen", "127.0.0.1:0", path.to_str().unwrap()]);
-    assert_eq!(output.status.code(), Some(1));
-    let said = stderr(&output);
-    assert!(said.contains("no durable audit store"), "{said}");
-    assert!(said.contains("\"audit\": {\"disabled\": true}"), "{said}");
-}
-
-#[test]
-fn it_refuses_to_start_on_what_the_boot_gates_refuse() {
-    let missing = run(&["--listen", "127.0.0.1:0", "/nonexistent/switchboard.json"]);
+fn it_refuses_to_start_on_a_deployment_it_cannot_load() {
+    let missing = run(&["--config=/nonexistent/gateway.toml"]);
     assert_eq!(missing.status.code(), Some(1));
     assert!(
         stderr(&missing).contains("cannot read"),
         "{}",
         stderr(&missing)
     );
+    // The refusal is logged as a JSON line too.
+    let logged: Value = serde_json::from_str(stdout(&missing).lines().last().unwrap()).unwrap();
+    assert_eq!(logged["fields"]["event"], json!("boot_refused"));
 
-    let path = config_file("not-json", &json!("not a configuration"));
-    let invalid = run(&["--listen", "127.0.0.1:0", path.to_str().unwrap()]);
+    let files = Files::new(
+        "binary-refusals",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    let config = files.path("gateway.toml");
+    let config = format!("--config={}", config.display());
+
+    files.write("gateway.toml", "listen = 8080\n");
+    let invalid = run(&[&config]);
     assert_eq!(invalid.status.code(), Some(1));
-    assert!(stderr(&invalid).contains("is not a valid configuration"));
+    assert!(stderr(&invalid).contains("is not a valid deployment file"));
 
-    // Identity neither enforced nor disabled.
-    let path = config_file("identity-unconfigured", &startable(json!({})));
-    let unconfigured = run(&["--listen", "127.0.0.1:0", path.to_str().unwrap()]);
+    let deployment = files::deployment_file("[audit]\nmode = \"disabled\"\n");
+    files.write(
+        "gateway.toml",
+        &deployment.replace("mode = \"enforce\"", "mode = \"unchecked\""),
+    );
+    let unconfigured = run(&[&config]);
     assert_eq!(unconfigured.status.code(), Some(1));
-    assert!(stderr(&unconfigured).contains("identity is not configured"));
+    assert!(stderr(&unconfigured).contains("unknown variant `unchecked`"));
 
-    // A tool on a surface, whose connector this build cannot register.
-    let mut config = startable(json!({"disabled": true}));
-    config["policy"]["surfaces"][0]["tools"] = json!([READ_TOOL]);
-    let path = config_file("tool-served", &config);
-    let served = run(&["--listen", "127.0.0.1:0", path.to_str().unwrap()]);
-    assert_eq!(served.status.code(), Some(1));
+    files.write(
+        "gateway.toml",
+        &files::deployment_file(
+            "[audit]\nmode = \"postgres\"\nurl_env = \"SWITCHBOARD_BINARY_TEST_URL\"\n",
+        ),
+    );
+    let no_url = run(&[&config]);
+    assert_eq!(no_url.status.code(), Some(1));
     assert!(
-        stderr(&served).contains("is not registered"),
+        stderr(&no_url).contains("SWITCHBOARD_BINARY_TEST_URL"),
         "{}",
-        stderr(&served)
+        stderr(&no_url)
+    );
+    let unreachable = run_with(
+        &[&config],
+        &[(
+            "SWITCHBOARD_BINARY_TEST_URL",
+            "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
+        )],
+    );
+    assert_eq!(unreachable.status.code(), Some(1));
+    assert!(
+        stderr(&unreachable).contains("the audit store will not start"),
+        "{}",
+        stderr(&unreachable)
     );
 }
 
-/// The configuration is checked before a socket is bound. With the address already taken, a
-/// configuration the binary refuses is refused for its own reason, not for the address.
 #[test]
-fn a_refused_configuration_is_refused_before_the_address_is_bound() {
+fn migrate_needs_the_owners_database_url() {
+    let unset = run(&["migrate"]);
+    assert_eq!(unset.status.code(), Some(1));
+    assert!(
+        stderr(&unset).contains("SWITCHBOARD_MIGRATE_DATABASE_URL"),
+        "{}",
+        stderr(&unset)
+    );
+    let unreachable = run_with(
+        &["migrate"],
+        &[(
+            "SWITCHBOARD_MIGRATE_DATABASE_URL",
+            "postgres://switchboard_owner:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
+        )],
+    );
+    assert_eq!(unreachable.status.code(), Some(1));
+    assert!(
+        stderr(&unreachable).contains("cannot connect"),
+        "{}",
+        stderr(&unreachable)
+    );
+}
+
+/// The deployment is checked, and the audit store and boot gates run, before a socket is bound.
+/// With the address already taken, a deployment the binary refuses is refused for its own
+/// reason, not for the address.
+#[test]
+fn a_refused_deployment_is_refused_before_the_address_is_bound() {
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = held.local_addr().unwrap().to_string();
+    let files = Files::new(
+        "binary-held",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    let config = format!("--config={}", files.path("gateway.toml").display());
+    let listen_line = "listen = \"127.0.0.1:0\"\n";
+    let held_at = |audit: &str| {
+        let text = files::deployment_file(audit);
+        assert_eq!(text.matches(listen_line).count(), 1);
+        text.replace(listen_line, &format!("listen = \"{address}\"\n"))
+    };
 
-    // The address really is taken: a configuration that passes cannot listen on it.
-    let path = config_file("held-startable", &startable(json!({"disabled": true})));
-    let started = run(&["--listen", &address, path.to_str().unwrap()]);
+    // The address really is taken: a deployment that passes cannot listen on it.
+    files.write("gateway.toml", &held_at("[audit]\nmode = \"disabled\"\n"));
+    let started = run(&[&config]);
     assert_eq!(started.status.code(), Some(1));
     assert!(
         stderr(&started).contains("cannot listen on"),
@@ -207,22 +228,28 @@ fn a_refused_configuration_is_refused_before_the_address_is_bound() {
         stderr(&started)
     );
 
-    let mut audit_not_disabled = startable(json!({"disabled": true}));
-    audit_not_disabled["audit"] = json!({});
-    for (name, config, reason) in [
+    let unused_credential = held_at("[audit]\nmode = \"disabled\"\n").replace(
+        "[credentials]\n",
+        "[credentials]\nunused-credential = \"docs-credential\"\n",
+    );
+    let unreachable_store =
+        held_at("[audit]\nmode = \"postgres\"\nurl_env = \"SWITCHBOARD_BINARY_TEST_URL\"\n");
+    for (name, deployment, reason) in [
+        ("unused-credential", unused_credential, "no server uses it"),
         (
-            "held-identity-unconfigured",
-            startable(json!({})),
-            "identity is not configured",
-        ),
-        (
-            "held-audit-not-disabled",
-            audit_not_disabled,
-            "no durable audit store",
+            "unreachable-store",
+            unreachable_store,
+            "the audit store will not start",
         ),
     ] {
-        let path = config_file(name, &config);
-        let output = run(&["--listen", &address, path.to_str().unwrap()]);
+        files.write("gateway.toml", &deployment);
+        let output = run_with(
+            &[&config],
+            &[(
+                "SWITCHBOARD_BINARY_TEST_URL",
+                "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
+            )],
+        );
         let said = stderr(&output);
         assert_eq!(output.status.code(), Some(1), "{name}: {said}");
         assert!(said.contains(reason), "{name}: {said}");
@@ -235,16 +262,14 @@ fn a_refused_configuration_is_refused_before_the_address_is_bound() {
 struct Running {
     child: Child,
     lines: mpsc::Receiver<Value>,
+    seen: Vec<Value>,
     address: SocketAddr,
-    /// The event logged once the listener was bound.
-    listening: Value,
 }
 
 impl Running {
-    fn start(name: &str, config: &Value) -> Self {
-        let path = config_file(name, config);
+    fn start(files: &Files) -> Self {
         let mut child = Command::new(BINARY)
-            .args(["--listen", "127.0.0.1:0", path.to_str().unwrap()])
+            .arg(format!("--config={}", files.path("gateway.toml").display()))
             .env("RUST_LOG", "info")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -265,11 +290,11 @@ impl Running {
         let mut running = Self {
             child,
             lines,
+            seen: Vec::new(),
             address: "127.0.0.1:0".parse().unwrap(),
-            listening: Value::Null,
         };
-        running.listening = running.event("listening");
-        running.address = running.listening["fields"]["address"]
+        let listening = running.event("listening");
+        running.address = listening["fields"]["address"]
             .as_str()
             .unwrap()
             .parse()
@@ -277,27 +302,40 @@ impl Running {
         running
     }
 
-    /// The next log event whose message is `message`.
-    fn event(&self, message: &str) -> Value {
+    /// The next log event whose message is `message`. Every line read is kept in `seen`.
+    fn event(&mut self, message: &str) -> Value {
         loop {
             let line = self
                 .lines
                 .recv_timeout(PATIENCE)
-                .unwrap_or_else(|_| panic!("no `{message}` event was logged"));
+                .unwrap_or_else(|_| panic!("no `{message}` event was logged: {:#?}", self.seen));
             assert!(line["timestamp"].is_string(), "{line}");
             assert!(line["level"].is_string(), "{line}");
+            self.seen.push(line.clone());
             if line["fields"]["message"] == json!(message) {
                 return line;
             }
         }
     }
 
-    /// Posts `body` to the fixture's read surface, and returns the status and the body.
-    fn post(&self, body: &Value) -> (u16, Value) {
+    /// The `"event":"boot"` lines logged so far.
+    fn boot_lines(&self) -> Vec<&Value> {
+        self.seen
+            .iter()
+            .filter(|line| line["fields"]["event"] == json!("boot"))
+            .collect()
+    }
+
+    /// Posts `body` to the docs surface with `token`, and returns the status and the body.
+    fn post(&self, token: Option<&str>, body: &Value) -> (u16, Value) {
         let body = body.to_string();
+        let authorization = token
+            .map(|token| format!("authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
         let request = format!(
-            "POST /mcp/{SURFACE_READ} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\n\
-             content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "POST /mcp/{SURFACE} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\n{authorization}\
+             content-type: application/json\r\naccept: application/json, text/event-stream\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
             self.address.port(),
             body.len(),
         );
@@ -308,7 +346,7 @@ impl Running {
         stream.read_to_string(&mut received).unwrap();
         let (head, body) = received.split_once("\r\n\r\n").unwrap();
         let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-        (status, serde_json::from_str(body).unwrap())
+        (status, serde_json::from_str(body).unwrap_or(Value::Null))
     }
 }
 
@@ -319,48 +357,50 @@ impl Drop for Running {
     }
 }
 
-fn initialize() -> Value {
-    json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-           "params": {"protocolVersion": "2025-06-18", "capabilities": {}}})
-}
+#[tokio::test(flavor = "multi_thread")]
+async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential() {
+    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+        .await
+        .unwrap();
+    let files = Files::new("binary-serves", &issuer().jwks_document(), &mock.url());
+    let mut running = tokio::task::block_in_place(|| Running::start(&files));
 
-#[test]
-fn with_identity_enforced_a_caller_without_a_token_is_refused() {
-    let fixture = Fixture::new().unwrap();
-    let running = Running::start("enforced", &startable(enforced(&fixture)));
-    let started = &running.listening;
-    assert_eq!(started["fields"]["identity"], json!("On"));
-    assert_eq!(started["fields"]["audit"], json!("Disabled"));
+    // How it was started, from its boot lines.
+    let boot = running.boot_lines();
+    let field = |name: &str| -> Vec<Value> {
+        boot.iter()
+            .filter_map(|line| line["fields"].get(name).cloned())
+            .collect()
+    };
+    assert_eq!(field("identity"), [json!("enforce")], "{boot:#?}");
+    assert_eq!(field("issuers"), [json!(1)]);
+    assert_eq!(field("subjects"), [json!(2)]);
+    assert_eq!(field("audit"), [json!("disabled")]);
+    assert_eq!(field("revision"), [json!("demo-1")]);
 
-    let (status, body) = running.post(&initialize());
+    let team_a = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
+    let read = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": READ_TOOL, "arguments": {"project": "atlas", "document": "plan"}}});
+    let (status, body) = tokio::task::block_in_place(|| running.post(Some(&team_a), &read));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["isError"], json!(false), "{body}");
+    let ran = tokio::task::block_in_place(|| running.event("ran a tool call"));
+    assert_eq!(ran["fields"]["outcome"], json!("ok"));
+
+    let (status, body) = tokio::task::block_in_place(|| running.post(None, &read));
     assert_eq!(status, 401);
     assert_eq!(body["error"]["message"], json!(IDENTITY_FAILURE));
-    let refused = running.event("refused a caller whose identity was not proved");
+    let refused = tokio::task::block_in_place(|| {
+        running.event("refused a caller whose identity was not proved")
+    });
+    assert_eq!(refused["fields"]["event"], json!("identity_failed"));
     assert_eq!(refused["level"], json!("WARN"));
-    let answered = running.event("answered a request");
-    assert_eq!(answered["fields"]["status"], json!(401));
-    assert!(answered["fields"]["elapsed_us"].is_u64(), "{answered}");
-}
 
-#[test]
-fn with_identity_disabled_it_says_so_and_refuses_every_call() {
-    let running = Running::start("disabled", &startable(json!({"disabled": true})));
-
-    let (status, body) = running.post(&initialize());
-    assert_eq!(status, 200, "{body}");
-    let instructions = body["result"]["instructions"].as_str().unwrap();
-    assert!(
-        instructions.contains(IDENTITY_DISABLED_NOTE),
-        "{instructions}"
-    );
-    assert!(instructions.contains(AUDIT_DISABLED_NOTE), "{instructions}");
-
-    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                      "params": {"name": READ_TOOL, "arguments": {}}});
-    let (status, body) = running.post(&call);
-    assert_eq!(status, 200);
-    assert_eq!(body["error"]["message"], json!(IDENTITY_DISABLED));
-    let answered = running.event("answered a request");
-    assert_eq!(answered["fields"]["status"], json!(200));
-    assert_eq!(answered["spans"][0]["name"], json!("request"));
+    // One request reached the server, with the gateway's credential.
+    let bearers: Vec<Value> = mock
+        .log_lines()
+        .iter()
+        .filter_map(|line| line.get("bearer_sha256").cloned())
+        .collect();
+    assert_eq!(bearers.len(), 1, "{bearers:?}");
 }
