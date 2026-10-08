@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": -32600,
+      "message": "Invalid request: unsupported MCP-Protocol-Version header; this endpoint serves 2026-07-28 with per-request _meta, and 2025-06-18 after initialize"
+    },
+    "id": 1,
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 400
+}

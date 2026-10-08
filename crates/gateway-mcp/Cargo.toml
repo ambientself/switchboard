@@ -1,0 +1,21 @@
+[package]
+name = "gateway-mcp"
+version = "0.1.0"
+description = "The gateway's MCP protocol adapter: JSON-RPC envelopes, the two eras, header checks and rendering. Pure functions, no I/O."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The adapter is pure functions from a method, headers and bytes to values, and back
+# (decision 0007). Keep async runtimes, HTTP servers and the policy core out of this list: the
+# `gateway` crate maps between this crate's types and the core's, so neither names the other's.
+[dependencies]
+# Decodes the `=?base64?...?=` sentinel in the `Mcp-Name` header.
+base64 = "0.22"
+# The request and response vocabulary only: methods, header maps and status codes.
+http = "1"
+serde_json = "1"
+
+[lints]
+workspace = true

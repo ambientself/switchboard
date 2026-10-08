@@ -1,0 +1,39 @@
+[package]
+name = "gateway-dev"
+version = "0.1.0"
+description = "The gateway on the testkit's fakes, for development and tests: the fixture wiring, an audit store that prints its rows, the switchboard-dev binary and a scripted client."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Development only. This crate depends on the testkit, which nothing in a running gateway may,
+# so the switchboard-dev binary lives here and not in the gateway crate.
+[dependencies]
+gateway = { path = "../gateway" }
+gateway-core = { path = "../gateway-core" }
+gateway-identity = { path = "../gateway-identity" }
+gateway-mcp = { path = "../gateway-mcp" }
+gateway-testkit = { path = "../gateway-testkit" }
+# The scripted client: plain HTTP/1.1 to loopback, with no TLS, no HTTP/2 and no proxy.
+reqwest = { version = "0.12", default-features = false }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+# switchboard-dev's logs, as text on standard error.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Reads a token's claims back.
+base64 = "0.22"
+# The MCP SDK as a client, in its three lifecycle modes (decision 0007). A test tool only, pinned
+# so an SDK release cannot change what the tests show without a change here.
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+# The HTTP client rmcp's transport is built on. The tests make their own, with no proxy, and
+# wrap it to record what went over the wire.
+rmcp-reqwest = { package = "reqwest", version = "0.13", default-features = false }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

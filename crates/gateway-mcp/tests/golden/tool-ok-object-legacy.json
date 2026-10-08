@@ -1,0 +1,23 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "content": [
+        {
+          "text": "{\"document\":\"team-a-notes\",\"text\":\"Dummy notes.\"}",
+          "type": "text"
+        }
+      ],
+      "isError": false,
+      "structuredContent": {
+        "document": "team-a-notes",
+        "text": "Dummy notes."
+      }
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}
