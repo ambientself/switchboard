@@ -319,13 +319,20 @@ swap_registry() { # FILE: replaces the mounted registry file in one rename
   mv "$DEMO_DIR/compose-registry/.registry.toml.new" "$DEMO_DIR/compose-registry/registry.toml"
 }
 
+# compose_registry: the gateway reads a copy of the registry, so withdrawing a tool never edits
+# the repository. The directory is kept from run to run and only its file replaced: a rerun
+# without `down` can reuse the gateway's container, whose mount still names the directory it
+# started with, and would never see a new one.
+compose_registry() {
+  mkdir -p "$DEMO_DIR/compose-registry"
+  swap_registry "$ROOT/deploy/compose/config/registry/registry.toml"
+}
+
 compose_run() {
   MODE=compose
   step "build the image; start Postgres, the migration, the dev issuer, mock-docs and the gateway"
   mkdir -p "$DEMO_DIR"
-  # The gateway reads a copy of the registry, so withdrawing a tool never edits the repository.
-  rm -rf "$DEMO_DIR/compose-registry"
-  cp -R "$ROOT/deploy/compose/config/registry" "$DEMO_DIR/compose-registry"
+  compose_registry
   export SWITCHBOARD_REGISTRY_DIR=$DEMO_DIR/compose-registry
   # Naming the gateway starts everything it depends on; --wait then accepts the migration
   # having exited 0, which it does not when the migration is named itself.

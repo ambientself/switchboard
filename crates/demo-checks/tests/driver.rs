@@ -427,6 +427,26 @@ fn the_outage_step_counts_only_requests_mock_docs_accepted() {
 }
 
 #[test]
+fn a_compose_rerun_keeps_the_registry_directory_the_gateway_mounted() {
+    // A rerun without `down` can reuse the gateway's container, whose bind mount holds the
+    // directory it started with, as a shell holds its working directory: replacing the
+    // directory would hide every later swap from it. The subshell stands in for the mount.
+    let dir = scratch("compose-registry");
+    let run = sourced(&format!(
+        "DEMO_DIR='{}'\ncompose_registry\n\
+         (cd \"$DEMO_DIR/compose-registry\" && echo withdrawn > registry.toml && compose_registry \\\n  \
+         && cmp -s registry.toml \"$ROOT/deploy/compose/config/registry/registry.toml\" && echo seen-by-the-mount)",
+        dir.display()
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout.contains("seen-by-the-mount"),
+        "{}",
+        run.transcript()
+    );
+}
+
+#[test]
 fn a_kind_run_tags_the_image_with_its_own_id() {
     let run = sourced(
         "docker() { case \"$1 $2\" in 'image inspect') echo sha256:90d73467ace7aabbccdd ;; *) echo \"docker $*\" ;; esac; }\nrun_image\necho \"tag=$IMG_RUN\"",

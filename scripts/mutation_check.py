@@ -2429,6 +2429,9 @@ mutate("demo-driver-kind-bearers-whole-log", "the kind bearer check counts earli
        """    kind) k -n mock-docs logs --since-time "$LOG_SINCE" deploy/mock-docs ;;""", """    kind) k -n mock-docs logs deploy/mock-docs ;;""")
 mutate("demo-driver-log-mark-is-epoch", "the log mark is the epoch number, not a time logs accept", DRIVER,
        "  LOG_SINCE=${mark#* }\n", "  LOG_SINCE=${mark% *}\n")
+mutate("demo-driver-compose-registry-replaced", "a Compose run replaces the registry directory a reused gateway still mounts", DRIVER,
+       """  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""",
+       """  rm -rf "$DEMO_DIR/compose-registry"\n  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""")
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
        '"127.0.0.1:18080:8080"', '"18080:8080"')
 mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
