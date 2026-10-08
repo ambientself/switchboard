@@ -1,5 +1,6 @@
 //! The boot checks, against databases and roles set up right and wrong.
 
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::NoTls;
 
 use std::collections::BTreeSet;
@@ -989,4 +990,47 @@ async fn a_database_that_is_not_utf8_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(super::code(&error), Some("22P05"), "{error}");
+}
+
+/// The store gives each session its settings in the startup options. A session without them,
+/// as a pooler that drops the options would hand the store, keeps the database's and the role's
+/// defaults, so it is refused.
+#[tokio::test]
+async fn a_session_without_the_stores_settings_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.admin()
+        .await
+        .batch_execute(&format!("ALTER ROLE {role} SET synchronous_commit = off"))
+        .await
+        .unwrap();
+    // The store's own sessions override the role's default.
+    let mut store = db.store_as(&role);
+    store.check_at_boot().await.unwrap();
+
+    let manager = Manager::from_config(
+        db.config_as(&role),
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        },
+    );
+    store.begin = Pool::builder(manager).max_size(1).build().unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![
+            Problem::SessionSetting {
+                name: "synchronous_commit",
+                found: "off".into(),
+                expected: "on",
+            },
+            Problem::SessionSetting {
+                name: "search_path",
+                found: "\"$user\", public".into(),
+                expected: "pg_catalog,pg_temp",
+            },
+        ]
+    );
 }

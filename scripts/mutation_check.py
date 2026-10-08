@@ -1075,7 +1075,7 @@ mutate_all(
 # SWITCHBOARD_TEST_DATABASE_URL names a superuser on a throwaway server (see the crate's
 # documentation). Without it they survive. The `pg-columns-*` ones need no server, nor do
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
-# pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
+# pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
 # pg-retry-socket-failure-final and pg-finish-dropped-task-not-reported.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
@@ -1351,6 +1351,9 @@ mutate("pg-check-database-create-ignored", "CREATE on the database passes the ch
        "    if database.get::<_, bool>(1) {", "    if false {")
 mutate("pg-check-replication-role-ignored", "a role that may set session_replication_role passes the check", PG_CHECK,
        "        if can_set {", "        if false {")
+mutate("pg-check-session-settings-ignored", "a session without the store's settings passes the check", PG_CHECK,
+       "        if found != *expected {\n            problems.push(Problem::SessionSetting {",
+       "        if false {\n            problems.push(Problem::SessionSetting {")
 for privilege in ["TRUNCATE", "REFERENCES", "TRIGGER"]:
     mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
            f'        "{privilege}",\n', "")

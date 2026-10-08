@@ -7,7 +7,7 @@ use std::fmt;
 use deadpool_postgres::ClientWrapper;
 use thiserror::Error;
 
-use crate::store::{PgAuditStore, describe};
+use crate::store::{PgAuditStore, SESSION_SETTINGS, describe};
 
 /// Every column of `call_rows` the store writes or reads, with its type as Postgres's
 /// `format_type` names it.
@@ -150,6 +150,16 @@ pub enum Problem {
         /// What it must be.
         expected: &'static str,
     },
+    /// The session does not have a setting the store gives each of its sessions at connection,
+    /// as when a pooler drops the startup options that carry it.
+    SessionSetting {
+        /// The setting.
+        name: &'static str,
+        /// What it is.
+        found: String,
+        /// What the store sets it to.
+        expected: &'static str,
+    },
     /// `switchboard_audit.call_rows` is not there.
     TableMissing,
     /// A column the store writes or reads is not there.
@@ -249,6 +259,16 @@ impl fmt::Display for Problem {
                 f,
                 "the server has {name} = {found}, and committed rows are durable only with {expected}"
             ),
+            Self::SessionSetting {
+                name,
+                found,
+                expected,
+            } => write!(
+                f,
+                "this session has {name} = {found}, not the {expected} the store sets in its \
+                 startup options; something between the store and the server, such as a \
+                 pooler, may have dropped them"
+            ),
             Self::TableMissing => write!(f, "the table switchboard_audit.call_rows does not exist"),
             Self::ColumnMissing { column } => {
                 write!(f, "the column call_rows.{column} does not exist")
@@ -346,6 +366,9 @@ impl PgAuditStore {
     /// and do not serve if it fails.
     ///
     /// - The server syncs commits to disk: `fsync` and `full_page_writes` are on.
+    /// - The session has the settings the store sets in its startup options:
+    ///   `synchronous_commit` is `on` and `search_path` is `pg_catalog,pg_temp`. A pooler that
+    ///   drops the options would leave the database's or the role's defaults in force.
     /// - The database's encoding is UTF8, so it holds every character a row may carry.
     /// - `switchboard_audit.call_rows` has every column the store uses, with its type, and its
     ///   two triggers, enabled: the one that sets both times at insert, and the one that
@@ -379,12 +402,13 @@ impl PgAuditStore {
 
 async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     let mut problems = Vec::new();
+    // The search path is not yet known to be the store's, so this names the catalog's own.
     let session = client
         .query_one(
-            "SELECT current_user::text, session_user::text,
-                    current_setting('server_version_num')::int,
-                    current_setting('session_replication_role'),
-                    current_setting('server_encoding')",
+            "SELECT current_user::pg_catalog.text, session_user::pg_catalog.text,
+                    pg_catalog.current_setting('server_version_num')::pg_catalog.int4,
+                    pg_catalog.current_setting('session_replication_role'),
+                    pg_catalog.current_setting('server_encoding')",
             &[],
         )
         .await?;
@@ -402,10 +426,23 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
 
     for (name, expected) in DURABILITY {
         let found: String = client
-            .query_one("SELECT current_setting($1)", &[name])
+            .query_one("SELECT pg_catalog.current_setting($1)", &[name])
             .await?
             .get(0);
         problems.extend(setting_problem(name, found, expected));
+    }
+    for (name, expected) in SESSION_SETTINGS {
+        let found: String = client
+            .query_one("SELECT pg_catalog.current_setting($1)", &[name])
+            .await?
+            .get(0);
+        if found != *expected {
+            problems.push(Problem::SessionSetting {
+                name,
+                found,
+                expected,
+            });
+        }
     }
 
     // The value in effect, after any role or database default. The role cannot change it

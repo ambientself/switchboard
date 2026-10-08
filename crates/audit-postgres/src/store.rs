@@ -282,6 +282,15 @@ type Canceller = Arc<dyn Fn(CancelToken) -> BoxFuture<'static, ()> + Send + Sync
 /// in `pg_catalog` alone, then its own temporary schema, so a function, operator or type
 /// another role made in a schema a database or role default puts first cannot stand in for
 /// the catalog's own, in the store's statements or in the boot checks.
+///
+/// The settings travel in the startup packet's `options`, which a pooler may drop, so the boot
+/// check reads each back from the session.
+pub(crate) const SESSION_SETTINGS: &[(&str, &str)] = &[
+    ("synchronous_commit", "on"),
+    ("search_path", "pg_catalog,pg_temp"),
+];
+
+/// [`SESSION_SETTINGS`] as startup options.
 const SESSION_OPTIONS: &str = "-c synchronous_commit=on -c search_path=pg_catalog,pg_temp";
 
 /// The first pause between attempts to complete a row; each pause after doubles, up to
@@ -643,6 +652,15 @@ mod unit {
                 finish_deadline: Duration::from_secs(30),
             }
         );
+    }
+
+    #[test]
+    fn the_session_options_set_each_session_setting() {
+        let spelled: Vec<String> = SESSION_SETTINGS
+            .iter()
+            .map(|(name, value)| format!("-c {name}={value}"))
+            .collect();
+        assert_eq!(SESSION_OPTIONS, spelled.join(" "));
     }
 
     #[test]
