@@ -1373,7 +1373,7 @@ for relkind, kind in [("v", "view"), ("m", "materialized-view"), ("f", "foreign-
     kinds = ", ".join(f"'{k}'" for k in ["r", "p", "v", "m", "f"] if k != relkind)
     mutate(f"pg-check-{kind}-ignored", f"a grant on a {kind.replace('-', ' ')} in the schema passes the check", PG_CHECK,
            "c.relkind IN ('r', 'p', 'v', 'm', 'f')", f"c.relkind IN ({kinds})")
-for privilege in ["TRUNCATE", "REFERENCES", "TRIGGER"]:
+for privilege in ["SELECT", "INSERT", "UPDATE", "TRUNCATE", "REFERENCES", "TRIGGER"]:
     mutate(f"pg-check-{privilege.lower()}-ignored", f"{privilege} on the table passes the check", PG_CHECK,
            f'        "{privilege}",\n', "")
 mutate("pg-check-maintain-ignored", "MAINTAIN on the table passes the check", PG_CHECK,

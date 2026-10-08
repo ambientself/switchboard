@@ -276,9 +276,19 @@ async fn each_privilege_on_the_whole_table_is_refused() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
-    // TRIGGER would let the role add a trigger of its own that rewrites a row after
-    // complete_once has passed it.
-    let mut granted = vec!["DELETE", "REFERENCES", "TRIGGER", "TRUNCATE"];
+    // INSERT on the whole table would let the role write a row's identifier and completion
+    // itself, a row complete from the start. TRIGGER would let it add a trigger of its own
+    // that rewrites a row after complete_once has passed it. A privilege on the whole table
+    // shows on every column, so the column check does not report these.
+    let mut granted = vec![
+        "DELETE",
+        "INSERT",
+        "REFERENCES",
+        "SELECT",
+        "TRIGGER",
+        "TRUNCATE",
+        "UPDATE",
+    ];
     if version(&db).await >= 170_000 {
         granted.push("MAINTAIN");
     }
