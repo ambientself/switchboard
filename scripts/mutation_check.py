@@ -1255,6 +1255,8 @@ mutate("pg-finish-waits-past-answer-budget", "finish holds the answer until its 
        "let answer_by = started + self.budgets.answer;", "let answer_by = started + self.budgets.finish_deadline;")
 mutate("pg-finish-stops-at-answer-budget", "finish stops trying when the answer goes out", PG_STORE,
        "            deadline: started + self.budgets.finish_deadline,", "            deadline: started + self.budgets.answer,")
+mutate("pg-finish-attempt-unbounded-by-answer", "a finish attempt is limited only by the deadline, not the answer budget", PG_STORE,
+       "            attempt: self.budgets.answer,", "            attempt: self.budgets.finish_deadline,")
 mutate("pg-finish-no-retry", "finish gives up after one failed attempt", PG_STORE,
        "                Err(error) => error,", "                Err(error) => return Err(error),")
 mutate("pg-finish-retries-final-errors", "finish retries a failure that trying again cannot fix", PG_STORE,

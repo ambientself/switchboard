@@ -359,8 +359,33 @@ async fn finish_answers_at_its_budget_and_completes_the_rows_later() {
     assert!(finished.failure().is_some());
     assert_eq!(store.finishes().in_flight, 2);
 
-    // Several attempts run out of time while the lock is held, and are tried again.
-    sleep(budgets.answer * 3).await;
+    // Several attempts run out of time while the lock is held, and are tried again. An attempt
+    // is limited by the answer budget, not only by the deadline: one that runs out is cancelled
+    // and its connection given up, so the next waits on the lock in a session of its own. The
+    // two rows' first attempts are two sessions; more show that attempts ended and were tried
+    // again, long before the deadline.
+    let give_up = Instant::now() + budgets.answer * 10;
+    let mut sessions = std::collections::BTreeSet::new();
+    while sessions.len() < 4 {
+        assert!(
+            Instant::now() < give_up,
+            "only {} sessions waited to complete a row: {sessions:?}",
+            sessions.len()
+        );
+        for waiting in admin
+            .query(
+                "SELECT pid FROM pg_stat_activity
+                 WHERE datname = $1 AND usename = $2 AND wait_event_type = 'Lock'
+                     AND query LIKE 'UPDATE switchboard_audit.call_rows%'",
+                &[&db.name(), &GATEWAY_ROLE],
+            )
+            .await
+            .unwrap()
+        {
+            sessions.insert(waiting.get::<_, i32>(0));
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(outcome_of(&admin, &ok_row).await, None);
     release(&lock).await;
     until(Duration::from_secs(10), "both completions", || async {
