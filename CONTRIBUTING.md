@@ -83,9 +83,32 @@ python3 scripts/mutation_check.py
 It breaks each guard in the workspace's crates, one at a time, in a temporary copy of the
 workspace, and requires the test suite to fail. It needs Python 3.12 or later and nothing else (if your
 `python3` is older, `uv run --python 3.13 scripts/mutation_check.py`), never touches
-the working tree, and prints one line per mutation. It takes a long while (a full test run per
-mutation), so CI does not run it; run it after changing a guard or the tests that watch one,
+the working tree, and prints one line per mutation: the verdict, the packages it ran and the
+seconds it took. CI does not run it; run it after changing a guard or the tests that watch one,
 and add a mutation for every guard you add.
+
+Each mutation runs only the tests that can see it: those of the package that holds each edited
+file, of every workspace package that depends on that one, and of the packages whose tests read
+the file (a table in the script; `deploy/` is read by `demo-checks`, for example). A file outside
+every crate that the table does not name runs the whole workspace. The packages that hold or read
+an edited file run first, and their dependents only if those pass; each run stops at the first
+failing test binary. `--all-catchers` runs them together and to the end, and names every test
+that fails. A mutation whose scoped run passes runs again with `cargo test --workspace --locked --no-fail-fast` and is
+reported as surviving only if that passes too, so a gap in the table costs time, not a verdict.
+Each set of packages is first run once unmutated, and one that fails on its own is not used.
+When you add a test that reads a file of another crate or outside `crates/`, add it to the table.
+
+A full pass still takes hours. Split it with `--shard I/N`, which runs every N-th mutation from
+the I-th (0-based), one process per shard. Give each shard a Postgres of its own, started as
+below on ports 25430 to 25433:
+
+```sh
+for i in 0 1 2 3; do
+  SWITCHBOARD_TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:2543$i/postgres \
+    python3 scripts/mutation_check.py --shard $i/4 > mutation-$i.log 2>&1 &
+done
+wait
+```
 
 ## Tests against Postgres
 
