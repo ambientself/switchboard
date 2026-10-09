@@ -164,3 +164,73 @@ impl Reloader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::sync::Mutex;
+
+    use serde_json::Value;
+
+    use super::*;
+    use crate::boot::tests::{registry, registry_text, release_basis};
+
+    /// A log writer the test reads back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_reload_the_receipt_gate_refuses_keeps_the_served_policy_and_says_so() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        // A release build serving a read tool at r1.
+        let started = registry("read", true);
+        let live = Arc::new(LivePolicy::new(
+            ServedPolicy::from_registry(&started).unwrap(),
+        ));
+        let reloader = Reloader::new(live.clone(), release_basis(started));
+
+        // The same tool reclassified `propose`, at r2: same server, same route.
+        let proposed = registry_text("propose", true, "r2");
+        reloader.reload(Path::new("registry.toml"), proposed.as_bytes());
+
+        assert_eq!(live.current().revision().as_str(), "r1");
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let refused: Vec<Value> = logged
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "policy_reload_refused")
+            .collect();
+        assert_eq!(refused.len(), 1, "{logged}");
+        let fields = &refused[0]["fields"];
+        assert_eq!(fields["served"], "r1");
+        let reason = fields["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("no receipt store is configured"),
+            "{reason}"
+        );
+
+        // The read version at r2 is served: the refusal was the gate's, not the file's.
+        let read = registry_text("read", true, "r2");
+        reloader.reload(Path::new("registry.toml"), read.as_bytes());
+        assert_eq!(live.current().revision().as_str(), "r2");
+    }
+}

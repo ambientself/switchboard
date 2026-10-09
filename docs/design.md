@@ -1171,8 +1171,12 @@ off only in a development build, with CI's check of the release artifact; and th
   Today the spawned task always runs to completion.
 - The row's identifier in the result's `_meta`, or in `error.data`.
 - The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
-  harness enables and CI's check of the release artifact. Today boot accepts a tool not
-  classified `read` even with audit off, and the harness serves a `propose` fixture tool.
+  harness enables and CI's check of the release artifact: built (#40). Both boot paths and
+  every registry reload refuse a snapshot serving a tool not classified `read`, since no
+  receipt store can be configured yet; a tool approved but on no surface passes. The harness's
+  crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
+  and CI builds it with the same command and checks it refuses a `propose` tool. The receipt
+  store, audit and identity condition arrives with receipts (#10).
 - An allowed call whose connector is not registered completes its row as `error`, where today
   the row stays open.
 - The key read from its carriers, the tool-use identifier and the named `_meta` field.

@@ -45,8 +45,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Each audit row's identifier, a UUIDv7 the gateway makes before begin (decision 0009).
 uuid = { version = "1", features = ["v7"] }
 
+# `test-support` makes a development build (design section 12): it exempts the gateway from the
+# receipt-store gate (decision 0009), so the harness can serve its `propose` and `write` fixture
+# tools with no receipt store. The release build never enables it: deploy/Dockerfile builds
+# `switchboard` with `-p gateway` alone, and CI checks that binary refuses a `propose` tool.
+[features]
+test-support = []
+
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }
+# The crate's own tests are a development build, as the harness's are: the testkit's fixture
+# serves `propose` and `write` tools.
+gateway = { path = ".", features = ["test-support"] }
 # The proxied server the wiring tests forward to.
 mock-docs-server = { path = "../mock-docs-server" }
 # Reads the mock server's log of which bearers reached it.

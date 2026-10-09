@@ -8,7 +8,9 @@
 //! 2. **Audit** has a store supplied by the wiring, or is explicitly disabled. Neither, or
 //!    both, is refused.
 //! 3. **HTTP** names at least one allowed host.
-//! 4. **Policy** becomes a snapshot through the core's own checks.
+//! 4. **Policy** becomes a snapshot through the core's own checks, and passes the
+//!    receipt-store gate (decision 0009): until receipts exist, a tool not classified `read`
+//!    is served only by a development build, one with the `test-support` feature.
 //! 5. **Tool definitions**: every approved tool has exactly one, and every one is for an
 //!    approved tool.
 //! 6. **Connectors**: none is registered twice, and every tool on a surface has its connector
@@ -23,7 +25,8 @@
 //! and rules. Its connectors are registered with [`Wiring::proxied`]: each call to one runs
 //! behind the registry's argument check, and its resources are read with the adapter the
 //! registry approved for its tool, both from the policy version the call's request took.
-//! Every approved tool's server must have a connector.
+//! Every approved tool's server must have a connector. The receipt-store gate runs there too,
+//! at boot and on every reload.
 //!
 //! A disabled gate starts with a warning logged here; the HTTP layer repeats it while the
 //! gateway runs.
@@ -35,8 +38,8 @@ use std::time::Duration;
 
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
-    AuditStore, Connector, ConnectorName, DeploymentName, InstanceName, Issuer, PolicySnapshot,
-    ProfileName, SnapshotError, ToolName,
+    AuditStore, Classification, Connector, ConnectorName, DeploymentName, InstanceName, Issuer,
+    PolicySnapshot, ProfileName, SnapshotError, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_registry::{Registry, RulePrincipal};
@@ -155,6 +158,20 @@ pub enum BootError {
          tools read their resources as the registry says"
     )]
     AdapterBesideRegistry(ConnectorName),
+    /// A tool not classified `read` is on a surface, and there is no receipt store to make its
+    /// calls safe to answer after a lost outcome (decision 0009). Only a development build,
+    /// one with the `test-support` feature, serves such a tool.
+    #[error(
+        "tool `{tool}` is classified `{classification}` and served on a surface, but no receipt \
+         store is configured: until receipts exist only tools classified `read` may be served \
+         (decision 0009)"
+    )]
+    NoReceiptStore {
+        /// The tool.
+        tool: ToolName,
+        /// Its classification.
+        classification: Classification,
+    },
 }
 
 /// The parts of a deployment's configuration that are not its policy, for [`check_registry`].
@@ -311,11 +328,13 @@ pub struct Gates {
 
 /// What the gateway was started with that a policy reload cannot change: the issuers, which
 /// profile rules must name, and the registry's servers and routes, which the connectors were
-/// built for.
+/// built for. And whether this build is exempt from the receipt-store gate, which only a
+/// development build is.
 pub(crate) struct Basis {
     pub(crate) issuers: Option<Issuers>,
     pub(crate) registry: Registry,
     pub(crate) connectors: BTreeSet<ConnectorName>,
+    pub(crate) receipt_exempt: bool,
 }
 
 impl fmt::Debug for Gates {
@@ -420,6 +439,12 @@ impl Gates {
 
 /// Runs every boot gate, in the order the [module documentation](self) gives.
 pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
+    check_with(config, wiring, cfg!(feature = "test-support"))
+}
+
+/// [`check`], with the receipt-store gate's exemption given, so a test in a development build
+/// can run the gate as the release build does.
+fn check_with(config: Config, wiring: Wiring, receipt_exempt: bool) -> Result<Gates, BootError> {
     let Wiring {
         clock,
         instance,
@@ -451,6 +476,7 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
         .flat_map(|surface| surface.tools.iter().cloned())
         .collect();
     let snapshot = PolicySnapshot::new(config.policy)?;
+    receipt_gate(&snapshot, receipt_exempt)?;
 
     let catalog = ToolCatalog::new(config.catalog)?;
     catalog.check(&approved)?;
@@ -552,6 +578,7 @@ pub fn check_registry(
         issuers,
         registry,
         connectors: connectors.keys().cloned().collect(),
+        receipt_exempt: cfg!(feature = "test-support"),
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
 
@@ -572,14 +599,16 @@ pub fn check_registry(
     Ok((gates, reloader))
 }
 
-/// The gates a registry's policy must pass, at boot and on every reload: every approved tool's
-/// server has a connector; with identity enforced, every rule names a configured issuer of its
-/// kind; the snapshot does not define [`NO_PROFILE`]; and every profile a rule names exists.
+/// The gates a registry's policy must pass, at boot and on every reload: the
+/// [receipt-store gate](receipt_gate); every approved tool's server has a connector; with
+/// identity enforced, every rule names a configured issuer of its kind; the snapshot does not
+/// define [`NO_PROFILE`]; and every profile a rule names exists.
 pub(crate) fn check_registry_policy(
     registry: &Registry,
     policy: &ServedPolicy,
     basis: &Basis,
 ) -> Result<(), BootError> {
+    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;
     for (tool, route) in registry.routes() {
         if !basis.connectors.contains(&route.server) {
             return Err(BootError::UnregisteredConnector {
@@ -617,6 +646,38 @@ pub(crate) fn check_registry_policy(
         return Err(BootError::UnknownProfile(unknown));
     }
     Ok(())
+}
+
+/// The receipt-store gate (decision 0009, "Until receipts exist"; design section 12). A
+/// snapshot that serves a tool not classified `read` (on any surface) is refused unless a
+/// receipt store is configured, which none can be yet. A tool approved but on no surface is
+/// not served, and passes. It runs at boot and at every snapshot swap, whatever the snapshot's
+/// source, and no policy setting changes it.
+///
+/// `exempt` is true only in a development build, one with the `test-support` feature, which
+/// the release build never enables: the callers pass `cfg!(feature = "test-support")`.
+pub(crate) fn receipt_gate(snapshot: &PolicySnapshot, exempt: bool) -> Result<(), BootError> {
+    if exempt || receipt_store_configured() {
+        return Ok(());
+    }
+    for surface in snapshot.surfaces() {
+        for tool in surface.tools.iter().filter_map(|name| snapshot.tool(name)) {
+            if tool.classification != Classification::Read {
+                return Err(BootError::NoReceiptStore {
+                    tool: tool.name.clone(),
+                    classification: tool.classification,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a receipt store is configured. None exists yet: receipts are #10 stage 2. That
+/// change makes this true only when a receipt store is configured, audit is on and identity is
+/// on, as decision 0009 requires, and passes it what it needs to tell.
+fn receipt_store_configured() -> bool {
+    false
 }
 
 /// Logs a warning for each gate that is turned off.
@@ -717,4 +778,201 @@ fn rules_name_configured_issuers(
         return Err(unconfigured("user", &rule.issuer));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    //! The receipt-store gate as a release build runs it. These tests are in a development
+    //! build, which is exempt, so each passes the exemption itself.
+    #![allow(clippy::unwrap_used)]
+
+    use gateway_identity::SystemClock;
+    use serde_json::json;
+
+    use super::*;
+
+    /// A registry file with one server and one tool of `classification`, on the `docs` surface
+    /// when `on_surface`, at `revision`.
+    pub(crate) fn registry_text(classification: &str, on_surface: bool, revision: &str) -> String {
+        let sha = gateway_registry::definition_sha256(
+            "list_documents",
+            None,
+            "Lists the documents.",
+            &json!({"type": "object"}),
+        );
+        let served = if on_surface {
+            "\"docs__list_documents\""
+        } else {
+            ""
+        };
+        format!(
+            r#"revision = "{revision}"
+profiles = []
+profile_rules = []
+
+[[servers]]
+name = "mock-docs"
+system = "docs"
+owner = "platform"
+identity = "mock-docs"
+address = "http://127.0.0.1:9/mcp"
+credential = {{ mode = "bearer", reference = "docs-credential" }}
+
+[[tools]]
+name = "docs__list_documents"
+server = "mock-docs"
+upstream_name = "list_documents"
+classification = "{classification}"
+description = "Lists the documents."
+approved_by = "approver@example.test"
+approved_at = 2026-10-06T00:00:00Z
+definition_sha256 = "{sha}"
+resources = "no_resources"
+
+[tools.input_schema]
+type = "object"
+
+[[surfaces]]
+name = "docs"
+tools = [{served}]
+teams = ["team-a"]
+principals = "any_in_teams_and_groups"
+
+[limits]
+"#
+        )
+    }
+
+    pub(crate) fn registry(classification: &str, on_surface: bool) -> Registry {
+        Registry::from_toml_str(&registry_text(classification, on_surface, "r1")).unwrap()
+    }
+
+    /// What a release build of `registry` starts with: no issuers, its one server connected,
+    /// and no exemption from the receipt-store gate.
+    pub(crate) fn release_basis(registry: Registry) -> Basis {
+        Basis {
+            issuers: None,
+            connectors: registry.servers().keys().cloned().collect(),
+            registry,
+            receipt_exempt: false,
+        }
+    }
+
+    fn refused_as(result: Result<(), BootError>, classification: Classification) {
+        match result {
+            Err(BootError::NoReceiptStore {
+                tool,
+                classification: refused,
+            }) => {
+                assert_eq!(tool.as_str(), "docs__list_documents");
+                assert_eq!(refused, classification);
+            }
+            other => panic!("expected the receipt-store refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_only_snapshot_passes_the_receipt_gate() {
+        assert!(receipt_gate(registry("read", true).snapshot(), false).is_ok());
+    }
+
+    #[test]
+    fn a_served_propose_tool_is_refused_without_a_receipt_store() {
+        refused_as(
+            receipt_gate(registry("propose", true).snapshot(), false),
+            Classification::Propose,
+        );
+    }
+
+    #[test]
+    fn a_served_write_tool_is_refused_without_a_receipt_store() {
+        refused_as(
+            receipt_gate(registry("write", true).snapshot(), false),
+            Classification::Write,
+        );
+    }
+
+    #[test]
+    fn a_tool_not_classified_read_but_on_no_surface_is_not_served_and_passes() {
+        for classification in ["propose", "write", "destructive"] {
+            let registry = registry(classification, false);
+            assert!(
+                receipt_gate(registry.snapshot(), false).is_ok(),
+                "{classification}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_development_build_is_exempt() {
+        assert!(receipt_gate(registry("propose", true).snapshot(), true).is_ok());
+    }
+
+    #[test]
+    fn the_refusal_names_the_tool_its_classification_and_the_reason() {
+        let error = receipt_gate(registry("propose", true).snapshot(), false).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("`docs__list_documents`"), "{message}");
+        assert!(message.contains("classified `propose`"), "{message}");
+        assert!(
+            message.contains("no receipt store is configured"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_json_configuration_path_runs_the_receipt_gate() {
+        let config = Config::from_json(
+            &json!({
+                "deployment": "receipt-gate",
+                "identity": {"disabled": true},
+                "audit": {"disabled": true},
+                "http": {"allowed_hosts": ["localhost"]},
+                "policy": {
+                    "revision": "r1",
+                    "tools": [{
+                        "name": "docs__list_documents",
+                        "classification": "propose",
+                        "connector": "mock-docs",
+                        "resources": "no_resources"
+                    }],
+                    "surfaces": [{
+                        "name": "docs",
+                        "tools": ["docs__list_documents"],
+                        "teams": ["team-a"],
+                        "principals": "any_in_teams_and_groups"
+                    }],
+                    "profiles": []
+                },
+                "catalog": [{
+                    "name": "docs__list_documents",
+                    "description": "Lists the documents.",
+                    "input_schema": {"type": "object"}
+                }],
+                "profiles": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let refused = check_with(config, Wiring::new(Arc::new(SystemClock)), false);
+        assert!(
+            matches!(refused, Err(BootError::NoReceiptStore { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn the_registry_path_runs_the_receipt_gate_at_boot_and_on_every_reload() {
+        for (classification, refused) in [("read", false), ("propose", true), ("write", true)] {
+            let registry = registry(classification, true);
+            let policy = ServedPolicy::from_registry(&registry).unwrap();
+            let checked =
+                check_registry_policy(&registry, &policy, &release_basis(registry.clone()));
+            assert_eq!(
+                matches!(checked, Err(BootError::NoReceiptStore { .. })),
+                refused,
+                "{classification}: {checked:?}"
+            );
+        }
+    }
 }

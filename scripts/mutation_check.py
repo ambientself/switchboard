@@ -1325,6 +1325,28 @@ mutate("gw-disabled-store-constructible", "anyone can make the no-op audit store
 mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Host starts", BOOT,
        "    if config.http.allowed_hosts.is_empty() {\n        return Err(BootError::NoAllowedHosts);\n    }\n", "")
 
+# The receipt-store gate (decision 0009): a tool not classified `read` on a surface is refused
+# outside a development build, at boot on both paths and on every registry reload. The tests
+# are in a development build, so the unit tests in boot.rs and reload.rs pass the exemption.
+RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, receipt_exempt)?;\n"
+RECEIPT_REGISTRY_PATH = "    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;\n"
+REGISTRY_BOOT_POLICY = "    check_registry_policy(&basis.registry, &live.current(), &basis)?;\n"
+mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate",
+           (BOOT, RECEIPT_CONFIG_PATH, ""), (BOOT, RECEIPT_REGISTRY_PATH, ""))
+mutate("gw-receipt-gate-config-path-skipped", "the JSON configuration's boot does not run the receipt-store gate", BOOT,
+       RECEIPT_CONFIG_PATH, "")
+mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
+           (BOOT, RECEIPT_REGISTRY_PATH, ""),
+           (BOOT, REGISTRY_BOOT_POLICY,
+            REGISTRY_BOOT_POLICY + "    receipt_gate(live.current().snapshot(), basis.receipt_exempt)?;\n"))
+mutate("gw-receipt-gate-exempt-always", "every build is exempt from the receipt-store gate", BOOT,
+       "    if exempt || receipt_store_configured() {", "    if true || exempt || receipt_store_configured() {")
+mutate("gw-receipt-store-always-configured", "a receipt store counts as configured when there is none", BOOT,
+       "fn receipt_store_configured() -> bool {\n    false\n}", "fn receipt_store_configured() -> bool {\n    true\n}")
+mutate("gw-receipt-gate-propose-passes", "the receipt-store gate refuses `write` but lets `propose` through", BOOT,
+       "            if tool.classification != Classification::Read {",
+       "            if !matches!(tool.classification, Classification::Read | Classification::Propose) {")
+
 # Tool definitions.
 mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
        "            if !self.definitions.contains_key(name) {\n                return Err(CatalogError::Missing(name.clone()));\n            }\n",
@@ -2878,6 +2900,17 @@ mutate("demo-driver-kind-tag-not-from-id", "the run's tag is not taken from the 
        "  IMG_RUN=${IMG%:*}:${image_id:0:12}\n", "  IMG_RUN=$IMG\n")
 mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's ID", DRIVER,
        "    '' | *[!0-9a-f]*)\n", "    __never__)\n")
+
+# The image's switchboard is the release build: `-p gateway` alone, no features, copied out
+# before the development binaries are built with `test-support` (decision 0009).
+DOCKERFILE = "deploy/Dockerfile"
+RELEASE_BUILD_LINE = "    cargo build --release --locked -p gateway --bin switchboard; \\\n"
+mutate("release-build-test-support", "the image's switchboard is built with test-support", DOCKERFILE,
+       RELEASE_BUILD_LINE, "    cargo build --release --locked -p gateway --bin switchboard --features gateway/test-support; \\\n")
+mutate("release-build-test-support-default", "test-support is a default feature of the gateway", "crates/gateway/Cargo.toml",
+       "[features]\ntest-support = []\n", '[features]\ndefault = ["test-support"]\ntest-support = []\n')
+mutate("release-build-workspace", "the image's switchboard is built with the workspace, taking its features", DOCKERFILE,
+       RELEASE_BUILD_LINE, "    cargo build --release --locked --workspace --bins; \\\n")
 
 
 # --- first slice: the demo's honesty review ----------------------------------------------------

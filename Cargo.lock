@@ -665,6 +665,7 @@ dependencies = [
  "audit-postgres",
  "axum",
  "connector-proxy",
+ "gateway",
  "gateway-core",
  "gateway-identity",
  "gateway-mcp",

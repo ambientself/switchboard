@@ -1,0 +1,48 @@
+# CI's check of the release artifact (decision 0009, design section 12): one `propose` tool on a
+# surface, and no receipt store, which the release `switchboard` must refuse to serve. Nothing
+# is reached: the gate refuses before a socket is bound. Every value here is a dummy.
+
+revision = "receipt-gate-1"
+
+# No profiles or rules: the gate refuses before any caller could be given one.
+profiles = []
+profile_rules = []
+
+[[servers]]
+name = "mock-docs"
+system = "docs"
+owner = "platform"
+identity = "mock-docs"
+# Port 9 (discard) on loopback. Never connected to.
+address = "http://127.0.0.1:9/mcp"
+credential = { mode = "bearer", reference = "docs-credential" }
+
+[[tools]]
+name = "docs__propose_document"
+server = "mock-docs"
+upstream_name = "propose_document"
+classification = "propose"
+title = "Propose a document"
+description = "Opens a draft document in one project for a person to review."
+approved_by = "ci-approver@example.test"
+approved_at = 2026-10-09T00:00:00Z
+definition_sha256 = "9b55679f29a51538416c9ef29344343ce59c87690cfe9fa34c46e0f11c252489"
+resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+
+[tools.input_schema]
+type = "object"
+required = ["project"]
+additionalProperties = false
+
+[tools.input_schema.properties.project]
+type = "string"
+description = "The project, such as `atlas`."
+
+[[surfaces]]
+name = "docs"
+tools = ["docs__propose_document"]
+teams = ["team-a"]
+principals = "any_in_teams_and_groups"
+
+[limits.teams]
+team-a = [{ system = "docs", kind = "project", identifier = "atlas" }]

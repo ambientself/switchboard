@@ -44,6 +44,46 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The release artifact itself (decision 0009, design section 12). A `test-support` build is
+  # exempt from the receipt-store gate, and a feature can be turned on in any build, so this
+  # builds `switchboard` with exactly deploy/Dockerfile's command and checks that it refuses a
+  # `propose` tool with no receipt store. crates/demo-checks/tests/release.rs holds the two
+  # commands to each other.
+  release:
+    name: Release build refuses unreceipted tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build switchboard as deploy/Dockerfile does
+        run: cargo build --release --locked -p gateway --bin switchboard
+      # deploy/ci/receipt-gate/ serves one `propose` tool, with identity and audit disabled so no
+      # issuer or database is needed. The binary must exit 1 and name the receipt-store gate,
+      # not any other refusal. If it started instead, the timeout stops it with status 124.
+      - name: The release switchboard refuses a propose tool with no receipt store
+        run: |
+          set +e
+          SWITCHBOARD_INSTANCE=ci timeout 60 target/release/switchboard \
+            --config=deploy/ci/receipt-gate/gateway.toml 2> receipt-gate-stderr.txt
+          status=$?
+          set -e
+          cat receipt-gate-stderr.txt
+          if [ "$status" -ne 1 ]; then
+            echo "expected switchboard to refuse to start with exit status 1, got $status"
+            exit 1
+          fi
+          if ! grep -qF 'refused to start: tool `docs__propose_document` is classified `propose` and served on a surface, but no receipt store is configured' receipt-gate-stderr.txt; then
+            echo "switchboard refused to start, but not for the receipt-store gate"
+            exit 1
+          fi
+
   # The audit store's tests that need a database run only when SWITCHBOARD_TEST_DATABASE_URL is
   # set, and the job above does not set it. This one does, against a throwaway Postgres that
   # lives only for the job. Each test makes its own database and roles and drops them.
