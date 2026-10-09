@@ -3,9 +3,11 @@
 //! `Mcp-Session-Id`, even to a client that sends one.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use gateway_core::audit::DecisionKind;
+use gateway_core::audit::{AuditRowId, DecisionKind};
 use gateway_dev::start_fixture_gateway;
-use gateway_mcp::{DENIAL_CODE, LEGACY, PROTOCOL_VERSION_HEADER, SESSION_ID_HEADER};
+use gateway_mcp::{
+    AUDIT_ROW_DATA, AUDIT_ROW_META, DENIAL_CODE, LEGACY, PROTOCOL_VERSION_HEADER, SESSION_ID_HEADER,
+};
 use gateway_testkit::{
     Caller, DOCUMENT_ARGUMENT, READ_TOOL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
 };
@@ -116,12 +118,20 @@ async fn a_legacy_client_with_no_version_header_is_served_throughout() {
     let answer = post(&url, &token, read(4, TEAM_A_DOCUMENT), &[]).await;
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!(answer.body["result"]["isError"], json!(false));
+    let read_row = answer.body["result"]["_meta"][AUDIT_ROW_META]
+        .as_str()
+        .expect("the result names its row")
+        .to_owned();
     answers.push(answer);
     let answer = post(&url, &token, read(5, TEAM_B_DOCUMENT), &[]).await;
     assert_eq!(answer.status, 200, "{}", answer.body);
     assert_eq!(answer.body["error"]["code"], json!(DENIAL_CODE));
     let sentence = answer.body["error"]["message"].as_str().unwrap().to_owned();
     assert!(sentence.contains(TEAM_B_DOCUMENT), "{sentence}");
+    let denied_row = answer.body["error"]["data"][AUDIT_ROW_DATA]
+        .as_str()
+        .expect("the denial names its row")
+        .to_owned();
     answers.push(answer);
 
     // The same list with the 2025-06-18 header, and with a session the gateway never issued:
@@ -169,5 +179,15 @@ async fn a_legacy_client_with_no_version_header_is_served_throughout() {
     assert!(rows[0].completion.is_some());
     assert_eq!(rows[1].decision, DecisionKind::Deny);
     assert_eq!(rows[1].sentence.as_deref(), Some(sentence.as_str()));
+    // Each answer named its own row.
+    let store = gateway.store();
+    assert_eq!(
+        store.row_with_id(&AuditRowId::new(read_row)),
+        Some(rows[0].clone())
+    );
+    assert_eq!(
+        store.row_with_id(&AuditRowId::new(denied_row)),
+        Some(rows[1].clone())
+    );
     assert_eq!(gateway.connector().received().len(), 1);
 }

@@ -24,7 +24,10 @@
 //!   asks for a row of kind `list`, which needs the core's list record (#10).
 //! - `tools/call` reads the call's resources through the adapter registered for the approved
 //!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
-//!   answers. A denial is answered with the sentence the row holds.
+//!   answers. A denial is answered with the sentence the row holds. The answer names the row
+//!   it wrote, in the result's `_meta` or in `error.data` (decision 0009), so a person can
+//!   quote it; see [`gateway_mcp::render_with_row`]. It names none when begin failed or audit
+//!   is disabled, because then no row was written under that identifier.
 //!
 //! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
 //! everything from it, so a registry reload never splits one request across two versions.
@@ -243,14 +246,16 @@ impl RequestPath {
 
     async fn answer(self, caller: Caller, surface: SurfaceName, request: Request) -> HttpResponse {
         let Request { id, era, call } = request;
-        let reply = match call {
-            Call::Initialize => Reply::Initialized,
-            Call::Ping => Reply::Pong,
-            Call::Discover => Reply::Discovered,
-            Call::ToolsList => Reply::Tools(self.list(caller, surface)),
+        // tools/list writes no row yet, so it names none.
+        let (reply, row) = match call {
+            Call::Initialize => (Reply::Initialized, None),
+            Call::Ping => (Reply::Pong, None),
+            Call::Discover => (Reply::Discovered, None),
+            Call::ToolsList => (Reply::Tools(self.list(caller, surface)), None),
             Call::ToolsCall(call) => self.call(caller, surface, call).await,
         };
-        gateway_mcp::render(&self.inner.server, era, &id, reply)
+        let row = row.as_ref().map(AuditRowId::as_str);
+        gateway_mcp::render_with_row(&self.inner.server, era, &id, reply, row)
     }
 
     /// `tools/list`: design section 6's steps 1 to 5 for every tool on the surface, keeping
@@ -264,15 +269,20 @@ impl RequestPath {
         entries(&policy, list_tools(policy.snapshot(), &caller))
     }
 
-    /// `tools/call`: design section 6's steps 1 to 9.
-    async fn call(&self, caller: Caller, surface: SurfaceName, call: ToolCall) -> Reply {
+    /// `tools/call`: design section 6's steps 1 to 9. The answer, and the row to name in it.
+    async fn call(
+        &self,
+        caller: Caller,
+        surface: SurfaceName,
+        call: ToolCall,
+    ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
         let Caller::Proved(principal) = caller else {
             tracing::warn!(
                 deployment = %gates.deployment(),
                 "refused a tool call because identity is disabled"
             );
-            return Reply::Denied(IDENTITY_DISABLED.to_owned());
+            return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);
         };
         let policy = gates.policy();
         self.decide_and_run(&policy, principal, surface, call).await
@@ -295,13 +305,15 @@ fn entries(policy: &ServedPolicy, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
 }
 
 impl RequestPath {
+    /// The answer to a call from a proved caller, and the row to name in it: the denial's row,
+    /// or the row of the call that ran, whether or not it could be completed.
     async fn decide_and_run(
         &self,
         policy: &ServedPolicy,
         principal: Proved<Principal>,
         surface: SurfaceName,
         call: ToolCall,
-    ) -> Reply {
+    ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
         let snapshot = policy.snapshot();
         let ToolCall {
@@ -344,7 +356,10 @@ impl RequestPath {
                     begin_us,
                     "refused a tool call: its audit row could not be written"
                 );
-                return Reply::Denied(failure.sentence().to_owned());
+                // No row is named. The row may not exist, or may exist and later be completed
+                // as an error by recovery, so its identifier would point the caller at a row
+                // that says something other than this refusal, or at nothing.
+                return (Reply::Denied(failure.sentence().to_owned()), None);
             }
             Ok(Begun::Denied(refusal)) => {
                 tracing::info!(
@@ -354,11 +369,13 @@ impl RequestPath {
                     begin_us,
                     "denied a tool call"
                 );
-                return Reply::Denied(refusal.sentence().to_owned());
+                let row = self.quotable(refusal.row());
+                return (Reply::Denied(refusal.sentence().to_owned()), row);
             }
             Ok(Begun::Allowed(guard)) => guard,
         };
         let row = guard.row().clone();
+        let named = self.quotable(&row);
         let tool = guard.tool().name.clone();
         let Some(registered) = gates.registered(&guard.tool().connector) else {
             // The boot gates refuse a tool on a surface whose connector is not registered.
@@ -367,8 +384,11 @@ impl RequestPath {
                 connector = %guard.tool().connector,
                 "an allowed tool's connector is not registered; its row stays open"
             );
-            return Reply::Internal(
-                "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
+            return (
+                Reply::Internal(
+                    "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
+                ),
+                named,
             );
         };
         let results = Some(registered.results);
@@ -410,13 +430,20 @@ impl RequestPath {
             finish_us,
             "ran a tool call"
         );
-        match finished.answer().clone() {
+        let reply = match finished.answer().clone() {
             Answer::Ok(value) if results == Some(Results::ToolResults) => passed_on(value),
             Answer::Ok(value) => Reply::ToolOk(value),
             Answer::Error(message) => Reply::ToolError(message),
             Answer::Refused(sentence) => Reply::Denied(sentence),
             Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),
-        }
+        };
+        (reply, named)
+    }
+
+    /// The row to name in the answer: `row`, unless audit is disabled. The disabled store
+    /// writes nothing, so its identifier would name no row.
+    fn quotable(&self, row: &AuditRowId) -> Option<AuditRowId> {
+        (self.inner.gates.audit_state() == GateState::On).then(|| row.clone())
     }
 
     /// The resources the call names, from the adapter registered with the connector of the
