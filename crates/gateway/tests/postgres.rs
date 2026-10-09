@@ -147,10 +147,14 @@ async fn run(
     let superuser_password = String::from_utf8(server.get_password().unwrap().to_vec()).unwrap();
     let as_superuser = url(server, &superuser, &superuser_password, database);
     let deployment = files.load_with(&[("AUDIT_URL", &as_superuser)]).unwrap();
-    let refused = prepare(deployment, Arc::new(SystemClock))
-        .await
-        .err()
-        .ok_or("a superuser was accepted")?;
+    let refused = prepare(
+        deployment,
+        gateway_core::InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .err()
+    .ok_or("a superuser was accepted")?;
     let said = refused.to_string();
     if !said.contains("the audit store will not start") || !said.contains("has SUPERUSER") {
         return Err(format!("refused for the wrong reason: {said}"));
@@ -159,9 +163,13 @@ async fn run(
     // As the gateway's role it starts.
     let as_gateway = url(server, GATEWAY_ROLE, DUMMY_PASSWORD, database);
     let deployment = files.load_with(&[("AUDIT_URL", &as_gateway)]).unwrap();
-    let prepared = prepare(deployment, Arc::new(SystemClock))
-        .await
-        .map_err(|error| error.to_string())?;
+    let prepared = prepare(
+        deployment,
+        gateway_core::InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     assert!(prepared.store.is_some());
     let path = RequestPath::new(prepared.gates);
     let token = kubernetes_token(&issuer, TEAM_A_SA, &[AUDIENCE]);
@@ -205,6 +213,28 @@ async fn run(
         "{}",
         refused.body
     );
+
+    // Each row is a call begun by this instance, due when the database's time at begin plus
+    // the store's 2 s and 30 s and the proxied server's 5 s call deadline have passed.
+    let deadlines: Vec<(String, String, i64, f64)> = setup
+        .query(
+            "SELECT instance, kind, allowance_ms,
+                    (extract(epoch FROM deadline - begun_at) * 1000)::float8
+               FROM switchboard_audit.call_rows ORDER BY begun_at",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    let due = (
+        "test-instance".to_owned(),
+        "call".to_owned(),
+        37_000,
+        37_000.0,
+    );
+    assert_eq!(deadlines, vec![due.clone(), due.clone(), due]);
 
     // Each row names the project its call named, as `system/kind/identifier`, so an allowed
     // read shows which project it read and a denial which one it refused.

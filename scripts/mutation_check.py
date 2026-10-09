@@ -1036,24 +1036,26 @@ mutate("fake-audit-double-finish-allowed", "a different second completion of a r
 mutate("testkit-finish-overwrites", "a different second completion overwrites the first", A,
        FAKE_FINISHED_DIFFERENTLY,
        "                Some(_) => {\n                    row.completion = Some(completion.completion().clone());\n                    Ok(())\n                }")
-FAKE_BEGIN_PUSH = "                    state.rows.push((row.clone(), record.clone()));"
+FAKE_BEGIN_PUSH = "                    state.rows.push((row.clone(), record.clone(), times));"
 mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A, FAKE_BEGIN_PUSH,
-       "                    state.rows.push((row.clone(), AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() }));")
+       "                    state.rows.push((row.clone(), AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() }, times));")
 mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A, FAKE_BEGIN_PUSH,
-       "                    state.rows.push((row.clone(), AuditRecord { resources_omitted: 0, ..record.clone() }));")
+       "                    state.rows.push((row.clone(), AuditRecord { resources_omitted: 0, ..record.clone() }, times));")
 FAKE_FINISH_WRITE = "                    row.completion = Some(completion.completion().clone());\n                    Ok(())"
 mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A, FAKE_FINISH_WRITE,
        "                    row.completion = Some(completion.completion().clone());\n                    row.resources_omitted = 0;\n                    Ok(())")
 mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A, FAKE_FINISH_WRITE,
        "                    row.completion = Some(completion.completion().clone());\n                    row.resources_omitted += 1;\n                    Ok(())")
 mutate("fake-audit-row-id-ignored", "the store keeps every row under one identifier, not the one begin was given", A,
-       FAKE_BEGIN_PUSH, '                    state.rows.push((AuditRowId::new("0"), record.clone()));')
+       FAKE_BEGIN_PUSH, '                    state.rows.push((AuditRowId::new("0"), record.clone(), times));')
 mutate("testkit-begin-duplicates-row", "a begin with a known identifier writes a second row", A,
-       "            match state.rows.iter().find(|(id, _)| id == row) {",
-       "            match state.rows.iter().find(|(id, _)| id == row && false) {")
+       "            match state.rows.iter().find(|(id, _, _)| id == row) {",
+       "            match state.rows.iter().find(|(id, _, _)| id == row && false) {")
 mutate("fake-audit-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", A,
-       "                Some((_, stored)) if stored.decision == record.decision => Ok(()),",
-       "                Some((_, stored)) if stored.decision == record.decision || true => Ok(()),")
+       "                Some((_, stored, _)) if stored.decision == record.decision => Ok(()),",
+       "                Some((_, stored, _)) if stored.decision == record.decision || true => Ok(()),")
+mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clock, not its own, for a row's times", A,
+       "        let begun_at = self.clock.now();", "        let begun_at = SystemTime::now();")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -1348,7 +1350,10 @@ mutate("gw-unknown-fields-IssuerKindEntry", "an issuer's kind accepts unknown fi
 mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
        "        if !connectors.contains_key(&tool.connector) {", "        if false && !connectors.contains_key(&tool.connector) {")
 mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice keeps the last one", BOOT,
-       "    for (name, registered) in registrations {\n"
+       "    for (name, mut registered) in registrations {\n"
+       "        if let Some(deadline) = call_deadlines.get(&name) {\n"
+       "            registered.call_deadline = *deadline;\n"
+       "        }\n"
        "        if connectors.insert(name.clone(), registered).is_some() {\n"
        "            return Err(BootError::DuplicateConnector(name));\n        }\n",
        "    for (name, registered) in registrations {\n        connectors.insert(name, registered);\n")
@@ -1413,7 +1418,7 @@ mutate("gw-dependency-testkit-as-build-dependency", "the gateway builds with the
 GW_BIN = GW + "bin/switchboard.rs"
 GW_DEPLOY = GW + "deployment.rs"
 BIN_PREPARE = (
-    "    let prepared = match start::prepare(deployment, Arc::new(SystemClock)).await {\n"
+    "    let prepared = match start::prepare(deployment, instance, Arc::new(SystemClock)).await {\n"
     "        Ok(prepared) => prepared,\n        Err(error) => return refuse(&error.to_string()),\n    };\n"
 )
 BIN_BIND = (
@@ -1429,6 +1434,8 @@ mutate("gw-bin-default-listen-ipv6-every-interface", "switchboard listens on eve
        DEFAULT_LISTEN, "SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 8080);")
 mutate("gw-bin-binds-before-boot-gates", "switchboard binds its socket before the audit store and the boot gates are ready", GW_BIN,
        BIN_PREPARE + BIN_BIND, BIN_BIND + BIN_PREPARE)
+mutate("gw-instance-unset-starts", "with nothing naming the instance, switchboard starts under a made-up name", GW + "start.rs",
+       "        .ok_or(StartError::NoInstance)", '        .or(Some(InstanceName::new("unnamed")))\n        .ok_or(StartError::NoInstance)')
 
 
 # --- gateway path --------------------------------------------------------------------------
@@ -1614,8 +1621,8 @@ mutate("dev-identity-off-by-default", "the fixture gateway starts with identity 
 mutate("dev-identity-option-ignored", "asking for identity disabled starts it enforced", DEV_START,
        '        config["identity"] = json!({"disabled": true});\n', "")
 mutate("dev-clock-option-ignored", "the gateway verifies on the system clock whatever clock it is given", DEV_START,
-       "    let mut wiring = Wiring::new(clock.clone()).connector(",
-       "    let mut wiring = Wiring::new(Arc::new(SystemClock)).connector(")
+       "    let mut wiring = Wiring::new(clock.clone()).instance(instance).connector(",
+       "    let mut wiring = Wiring::new(Arc::new(SystemClock)).instance(instance).connector(")
 mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
        "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
 mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into a row id, so the call runs with no row", DEV_PRINTER,
@@ -1969,6 +1976,8 @@ mutate("registry-links-testkit", "the registry, and so the gateway, links the te
 # pg-finish-pause-past-deadline and pg-finish-pause-uncapped.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
+# 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
+PG_ROW_DEADLINE = PG + "sql/migrations/0003_row_deadline.sql"
 PG_STORE = PG + "src/store.rs"
 PG_COLUMNS = PG + "src/columns.rs"
 mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_SQL,
@@ -1986,7 +1995,7 @@ mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_
        "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
 mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_SQL,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $complete_once$", "    LANGUAGE plpgsql\nAS $complete_once$")
-mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_SQL,
+mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_ROW_DEADLINE,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $set_times$", "    LANGUAGE plpgsql\nAS $set_times$")
 mutate("pg-grant-insert-begun-at", "the gateway may write the begin time", PG_SQL,
        "    tool_use_id, deployment, surface, profile, tool, connector, classification,\n",
@@ -2122,9 +2131,9 @@ mutate("pg-sql-omitted-nullable", "a row may leave out the count of resources le
        "    resources_omitted      bigint      NOT NULL CHECK", "    resources_omitted      bigint      CHECK")
 mutate("pg-check-unknown-resources-omitted", "resources nobody could name may have some left out", PG_SQL,
        "        resources <> '\"unknown\"'::jsonb OR resources_omitted = 0\n", "        true\n")
-mutate("pg-times-begun-at-from-insert", "an insert may choose its begin time", PG_SQL,
+mutate("pg-times-begun-at-from-insert", "an insert may choose its begin time", PG_ROW_DEADLINE,
        "    NEW.begun_at := clock_timestamp();\n", "    NEW.begun_at := coalesce(NEW.begun_at, clock_timestamp());\n")
-mutate("pg-times-finished-at-from-insert", "an insert may choose its completion time", PG_SQL,
+mutate("pg-times-finished-at-from-insert", "an insert may choose its completion time", PG_ROW_DEADLINE,
        "    NEW.finished_at := CASE WHEN NEW.outcome IS NULL THEN NULL ELSE NEW.begun_at END;\n", "")
 mutate("pg-times-trigger-not-created", "the trigger that sets the times is never attached", PG_SQL,
        "CREATE TRIGGER set_times\n    BEFORE INSERT ON switchboard_audit.call_rows\n"
@@ -2132,6 +2141,23 @@ mutate("pg-times-trigger-not-created", "the trigger that sets the times is never
 mutate("pg-times-begun-at-default", "the begin time falls back to a default the trigger need not set", PG_SQL,
        "    begun_at               timestamptz NOT NULL,\n",
        "    begun_at               timestamptz NOT NULL DEFAULT clock_timestamp(),\n")
+mutate("pg-set-times-no-deadline", "the trigger that sets the times sets no deadline", PG_ROW_DEADLINE,
+       "    NEW.deadline := CASE WHEN NEW.kind = 'call'\n"
+       "        THEN NEW.begun_at + NEW.allowance_ms * interval '1 millisecond' END;\n", "")
+mutate("pg-set-times-deadline-from-insert", "an insert may choose its deadline", PG_ROW_DEADLINE,
+       "    NEW.deadline := CASE WHEN NEW.kind = 'call'\n",
+       "    NEW.deadline := CASE WHEN NEW.deadline IS NOT NULL THEN NEW.deadline WHEN NEW.kind = 'call'\n")
+mutate("pg-deadline-shape-removed", "a call row may be stored without a deadline", PG_ROW_DEADLINE,
+       "    ADD CONSTRAINT deadline_shape CHECK ((kind = 'call') = (deadline IS NOT NULL));",
+       "    ADD CONSTRAINT deadline_shape CHECK (true);")
+mutate("pg-allowance-without-begin-budget", "a row's deadline leaves out the begin budget", PG_COLUMNS,
+       "    millis(budgets.begin)\n        .saturating_add(call_deadline_ms)\n", "    call_deadline_ms\n")
+mutate("pg-allowance-without-finish-deadline", "a row's deadline leaves out the finish deadline", PG_COLUMNS,
+       "        .saturating_add(millis(budgets.finish_deadline))\n", "\n")
+mutate("pg-allowance-wraps", "a long call deadline wraps round to a short allowance", PG_COLUMNS,
+       "        .saturating_add(call_deadline_ms)\n", "        .wrapping_add(call_deadline_ms)\n")
+mutate("pg-grant-insert-deadline", "the gateway may write the deadline", PG_ROW_DEADLINE,
+       "GRANT INSERT (instance, kind, allowance_ms)", "GRANT INSERT (instance, kind, allowance_ms, deadline)")
 
 # The store's time budgets, and its boot checks.
 PG_CHECK = PG + "src/check.rs"
@@ -2248,7 +2274,7 @@ mutate("pg-check-trigger-condition-ignored", "a trigger with a condition passes 
 mutate("pg-check-trigger-columns-ignored", "a trigger on some columns only passes the check", PG_CHECK,
        "AND cardinality(t.tgattr::int2[]) = 0", "AND (cardinality(t.tgattr::int2[]) = 0 OR true)")
 mutate("pg-check-set-times-unchecked", "the trigger that sets the times is not checked", PG_CHECK,
-       '    Trigger {\n        name: "set_times",\n        purpose: "sets both times from the database\'s clock",\n'
+       '    Trigger {\n        name: "set_times",\n        purpose: "sets both times and the deadline from the database\'s clock",\n'
        '        fires: "before each insert",\n        tgtype: 1 | 2 | 4,\n    },\n', "")
 mutate("pg-check-extra-column-ignored", "a column grant beyond the gateway's passes the check", PG_CHECK,
        "    for (privilege, column) in reachable.difference(&expected) {",

@@ -22,6 +22,10 @@ const BINARY: &str = env!("CARGO_BIN_EXE_switchboard");
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
+/// The instance every run is named, unless a test says otherwise. Set here and never left to
+/// a shell to export `HOSTNAME`, which it may not.
+const INSTANCE: &str = "binary-test";
+
 /// How long a run that should end on its own may take. It is generous because the first run
 /// of a freshly built binary can be slow on a loaded machine; it only has to be shorter than
 /// forever, so that a refused configuration that starts serving fails the test.
@@ -32,14 +36,17 @@ fn issuer() -> &'static LocalIssuer {
     ISSUER.get_or_init(cluster_issuer)
 }
 
-/// Runs the binary to its exit, with `env` added to its environment. One that is still running
-/// after [`EXIT_PATIENCE`] is killed and fails the test, so a configuration that should be
-/// refused but starts a server fails the test rather than hanging it.
+/// Runs the binary to its exit, named [`INSTANCE`] and with no `HOSTNAME`, with `env` added to
+/// its environment. One that is still running after [`EXIT_PATIENCE`] is killed and fails the
+/// test, so a configuration that should be refused but starts a server fails the test rather
+/// than hanging it.
 fn run_with(arguments: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(BINARY);
     command
         .args(arguments)
         .env_remove("SWITCHBOARD_MIGRATE_DATABASE_URL")
+        .env_remove("HOSTNAME")
+        .env("SWITCHBOARD_INSTANCE", INSTANCE)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (name, value) in env {
@@ -234,27 +241,58 @@ fn a_refused_deployment_is_refused_before_the_address_is_bound() {
     );
     let unreachable_store =
         held_at("[audit]\nmode = \"postgres\"\nurl_env = \"SWITCHBOARD_BINARY_TEST_URL\"\n");
-    for (name, deployment, reason) in [
-        ("unused-credential", unused_credential, "no server uses it"),
+    // With nothing naming the instance, an empty value counting as none, it refuses.
+    let no_instance = held_at("[audit]\nmode = \"disabled\"\n");
+    for (name, deployment, reason, instance) in [
+        (
+            "unused-credential",
+            unused_credential,
+            "no server uses it",
+            INSTANCE,
+        ),
         (
             "unreachable-store",
             unreachable_store,
             "the audit store will not start",
+            INSTANCE,
+        ),
+        (
+            "no-instance",
+            no_instance,
+            "nothing names this gateway instance",
+            "",
         ),
     ] {
         files.write("gateway.toml", &deployment);
         let output = run_with(
             &[&config],
-            &[(
-                "SWITCHBOARD_BINARY_TEST_URL",
-                "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
-            )],
+            &[
+                (
+                    "SWITCHBOARD_BINARY_TEST_URL",
+                    "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
+                ),
+                ("SWITCHBOARD_INSTANCE", instance),
+            ],
         );
         let said = stderr(&output);
         assert_eq!(output.status.code(), Some(1), "{name}: {said}");
         assert!(said.contains(reason), "{name}: {said}");
         assert!(!said.contains("cannot listen on"), "{name}: {said}");
     }
+
+    // `HOSTNAME`, as Kubernetes and Docker set it, names the instance when nothing else does:
+    // the binary then gets as far as the taken address.
+    files.write("gateway.toml", &held_at("[audit]\nmode = \"disabled\"\n"));
+    let named_by_host = run_with(
+        &[&config],
+        &[("SWITCHBOARD_INSTANCE", ""), ("HOSTNAME", "pod-7f9c")],
+    );
+    assert_eq!(named_by_host.status.code(), Some(1));
+    assert!(
+        stderr(&named_by_host).contains("cannot listen on"),
+        "{}",
+        stderr(&named_by_host)
+    );
     drop(held);
 }
 
@@ -271,6 +309,8 @@ impl Running {
         let mut child = Command::new(BINARY)
             .arg(format!("--config={}", files.path("gateway.toml").display()))
             .env("RUST_LOG", "info")
+            .env_remove("HOSTNAME")
+            .env("SWITCHBOARD_INSTANCE", INSTANCE)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -377,6 +417,7 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
     assert_eq!(field("subjects"), [json!(2)]);
     assert_eq!(field("audit"), [json!("disabled")]);
     assert_eq!(field("revision"), [json!("demo-1")]);
+    assert_eq!(field("instance"), [json!(INSTANCE)]);
 
     let team_a = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
     let read = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",

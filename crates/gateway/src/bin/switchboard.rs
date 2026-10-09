@@ -6,8 +6,10 @@
 //! ```
 //!
 //! **Serving.** Reads the deployment file (see [`gateway::deployment`]) and every file it
-//! names, connects the audit store and runs its checks, runs the boot gates, and serves
-//! `POST /mcp/{surface}` on the address the file gives until interrupted. The registry file is
+//! names, names the instance from `SWITCHBOARD_INSTANCE` or else `HOSTNAME` and refuses to
+//! start with neither (see [`gateway::start::instance`]), connects the audit store and runs
+//! its checks, runs the boot gates, and serves `POST /mcp/{surface}` on the address the file
+//! gives until interrupted. The registry file is
 //! read again every `registry.poll_seconds`, and a new version that passes is served from the
 //! next request. Logs go to standard output as JSON lines; a refusal to start goes to standard
 //! error as well, as plain text. Shutting down waits for the answers still running, and for the
@@ -111,7 +113,11 @@ async fn serve(config: PathBuf) -> ExitCode {
         Err(error) => return refuse(&error.to_string()),
     };
     let listen = deployment.listen;
-    let prepared = match start::prepare(deployment, Arc::new(SystemClock)).await {
+    let instance = match start::instance(|name| std::env::var(name).ok()) {
+        Ok(instance) => instance,
+        Err(error) => return refuse(&error.to_string()),
+    };
+    let prepared = match start::prepare(deployment, instance, Arc::new(SystemClock)).await {
         Ok(prepared) => prepared,
         Err(error) => return refuse(&error.to_string()),
     };

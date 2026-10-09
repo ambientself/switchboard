@@ -1081,22 +1081,30 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   decision. The audit table has no default for it, and the gateway's role may insert it. The
   retry is not built yet: the Postgres store still gives up at the budget.
 - A `BEFORE INSERT` trigger sets the time at begin and the deadline from the database's clock
-  and the allowance the gateway supplies, and the deadline is `NOT NULL`. Today the trigger,
-  `set_times`, sets the time at begin (and, for a row inserted complete, the completion time)
-  and there is no deadline.
-- Columns for the instance, the kind and the deadline. For decisions 0011 and 0012: how the
-  resources were found, with the reach by reference, the credential identity, the error kind,
-  an unverified delegation's failure kind, and a grant's digest, issuer, key ID, pod UID,
-  egress setting and currency answer. With #12, a column for the exception that allowed a
-  call, since the row's shape constraint rightly allows no reason on an allowed row.
+  and the allowance the gateway supplies, and a call row cannot be stored without a deadline.
+  Built: `set_times` sets the time at begin, the deadline (that time plus the row's
+  `allowance_ms`) and, for a row inserted complete, the completion time, overwriting whatever
+  the insert carried, for every role. The Postgres store's allowance is its begin budget, the
+  call deadline and its finish deadline. The deadline column is not `NOT NULL`, because a row
+  of kind `list` has none; the constraint `deadline_shape` requires one exactly when the kind
+  is `call`. The in-memory store sets the same times from its own clock. Nothing reads the
+  deadline yet: the open-row query is #47.
+- Columns for the instance, the kind and the deadline: built. The gateway names its instance
+  from `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, and refuses to start with neither. Rows
+  written before the migration read as calls by the instance `before-0003`, due when they were
+  completed or begun. Not built, for decisions 0011 and 0012: how the resources were found,
+  with the reach by reference, the credential identity, the error kind, an unverified
+  delegation's failure kind, and a grant's digest, issuer, key ID, pod UID, egress setting and
+  currency answer. With #12, a column for the exception that allowed a call, since the row's
+  shape constraint rightly allows no reason on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core.
 - For part 2: the outcomes `unknown` and `duplicate`, and an insert grant and shape constraint
   that let a row be written complete at begin, for the answers to a reused key. Today the
   outcome allows only `ok`, `error` and `refused`, and the gateway's role cannot insert an
   outcome.
-- The boot check covers all three triggers. Today it covers the two on the audit table, the
-  one that sets the times and the one that completes a row once; the third is the receipt
-  table's (part 2).
+- The boot check covers all three triggers. Today it covers the two on the audit table:
+  `set_times`, which now sets the deadline too and is still checked, and the one that
+  completes a row once. The third is the receipt table's (part 2).
 - If retention needs it, a partitioned audit table, with the boot check reading the triggers,
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.

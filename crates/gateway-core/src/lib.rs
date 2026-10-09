@@ -41,8 +41,9 @@ pub use decision::{
     Verdict, decide, list_tools,
 };
 pub use names::{
-    ConnectorName, DeploymentName, GroupId, InvalidToolName, Issuer, MAX_TOOL_NAME, Person,
-    PolicyRevision, ProfileName, RequestedTool, Subject, SurfaceName, TeamId, ToolName, ToolUseId,
+    ConnectorName, DeploymentName, GroupId, InstanceName, InvalidToolName, Issuer, MAX_TOOL_NAME,
+    Person, PolicyRevision, ProfileName, RequestedTool, Subject, SurfaceName, TeamId, ToolName,
+    ToolUseId,
 };
 pub use policy::{
     ApprovedTool, PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration,

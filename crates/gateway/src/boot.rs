@@ -31,10 +31,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
-    AuditStore, Connector, ConnectorName, DeploymentName, Issuer, PolicySnapshot, ProfileName,
-    SnapshotError, ToolName,
+    AuditStore, Connector, ConnectorName, DeploymentName, InstanceName, Issuer, PolicySnapshot,
+    ProfileName, SnapshotError, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_registry::{Registry, RulePrincipal};
@@ -47,6 +49,16 @@ use crate::policy::{LivePolicy, ServedPolicy};
 use crate::reload::Reloader;
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
+
+/// The call deadline of a connector registered with [`Wiring::connector`], which runs in the
+/// gateway's own process. It only feeds the allowance each audit row's deadline is set from:
+/// nothing stops such a connector at it yet (milestone 3).
+pub const DEFAULT_CALL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The instance [`Wiring::new`] names until [`Wiring::instance`] is called. The `switchboard`
+/// binary always names one, from its environment, and refuses to start without one
+/// ([`crate::start::instance`]).
+pub const UNNAMED_INSTANCE: &str = "unnamed";
 
 /// Whether a gate is on, or explicitly turned off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -158,24 +170,45 @@ pub struct Settings {
     pub http: HttpSection,
 }
 
-/// What code supplies to the gateway, beside its configuration: the clock, the audit store, and
-/// each connector with its resource adapter.
+/// What code supplies to the gateway, beside its configuration: the clock, the instance, the
+/// audit store, and each connector with its resource adapter.
 pub struct Wiring {
     clock: Arc<dyn Clock>,
+    instance: InstanceName,
     audit_store: Option<Arc<dyn AuditStore>>,
     connectors: Vec<(ConnectorName, Registered)>,
     proxied: Vec<(ConnectorName, Arc<dyn Connector>)>,
+    call_deadlines: BTreeMap<ConnectorName, Duration>,
 }
 
 impl Wiring {
-    /// Wiring with `clock`, no audit store and no connectors.
+    /// Wiring with `clock`, the instance [`UNNAMED_INSTANCE`], no audit store and no
+    /// connectors.
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             clock,
+            instance: InstanceName::new(UNNAMED_INSTANCE),
             audit_store: None,
             connectors: Vec::new(),
             proxied: Vec::new(),
+            call_deadlines: BTreeMap::new(),
         }
+    }
+
+    /// Names the gateway instance, which every audit row records as the one that began it.
+    pub fn instance(mut self, instance: InstanceName) -> Self {
+        self.instance = instance;
+        self
+    }
+
+    /// Gives the connector registered as `name` the call deadline it runs under, which each of
+    /// its rows' deadlines includes: for a proxied server, the deadline its connector was built
+    /// with. A proxied server not given one has the proxy's [`DEFAULT_DEADLINE`], and a
+    /// connector registered with [`connector`](Self::connector) has [`DEFAULT_CALL_DEADLINE`].
+    /// A deadline for a name nothing is registered under is ignored.
+    pub fn call_deadline(mut self, name: impl Into<ConnectorName>, deadline: Duration) -> Self {
+        self.call_deadlines.insert(name.into(), deadline);
+        self
     }
 
     /// Registers the connector for the registry's server `name`. [`check_registry`] wraps it
@@ -209,6 +242,7 @@ impl Wiring {
                 connector,
                 reads: Reads::Adapter(resources),
                 results: Results::Values,
+                call_deadline: DEFAULT_CALL_DEADLINE,
             },
         ));
         self
@@ -221,6 +255,7 @@ impl fmt::Debug for Wiring {
             self.connectors.iter().map(|(name, _)| name).collect();
         let proxied: Vec<&ConnectorName> = self.proxied.iter().map(|(name, _)| name).collect();
         f.debug_struct("Wiring")
+            .field("instance", &self.instance)
             .field("audit_store", &self.audit_store.is_some())
             .field("connectors", &connectors)
             .field("proxied", &proxied)
@@ -232,6 +267,8 @@ pub(crate) struct Registered {
     pub(crate) connector: Arc<dyn Connector>,
     pub(crate) reads: Reads,
     pub(crate) results: Results,
+    /// How long a call may run, which each row's deadline includes.
+    pub(crate) call_deadline: Duration,
 }
 
 /// How a connector's calls are read.
@@ -261,6 +298,7 @@ pub(crate) enum Results {
 /// that was refused.
 pub struct Gates {
     deployment: DeploymentName,
+    instance: InstanceName,
     clock: Arc<dyn Clock>,
     identity: Identity,
     identity_state: GateState,
@@ -284,6 +322,7 @@ impl fmt::Debug for Gates {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Gates")
             .field("deployment", &self.deployment)
+            .field("instance", &self.instance)
             .field("identity_state", &self.identity_state)
             .field("audit_state", &self.audit_state)
             .field("revision", self.policy.current().revision())
@@ -296,6 +335,11 @@ impl Gates {
     /// The deployment's name.
     pub fn deployment(&self) -> &DeploymentName {
         &self.deployment
+    }
+
+    /// The gateway instance, which every audit row records.
+    pub fn instance(&self) -> &InstanceName {
+        &self.instance
     }
 
     /// The clock calls are timed with.
@@ -378,9 +422,11 @@ impl Gates {
 pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
     let Wiring {
         clock,
+        instance,
         audit_store,
         connectors: registrations,
         proxied,
+        call_deadlines,
     } = wiring;
     if let Some((name, _)) = proxied.into_iter().next() {
         return Err(BootError::ProxiedWithoutRegistry(name));
@@ -410,7 +456,10 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
     catalog.check(&approved)?;
 
     let mut connectors = BTreeMap::new();
-    for (name, registered) in registrations {
+    for (name, mut registered) in registrations {
+        if let Some(deadline) = call_deadlines.get(&name) {
+            registered.call_deadline = *deadline;
+        }
         if connectors.insert(name.clone(), registered).is_some() {
             return Err(BootError::DuplicateConnector(name));
         }
@@ -442,6 +491,7 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
     warn_disabled(&config.deployment, identity_state, audit_state);
     Ok(Gates {
         deployment: config.deployment,
+        instance,
         clock,
         identity,
         identity_state,
@@ -465,9 +515,11 @@ pub fn check_registry(
 ) -> Result<(Gates, Reloader), BootError> {
     let Wiring {
         clock,
+        instance,
         audit_store,
         connectors: registrations,
         proxied,
+        call_deadlines,
     } = wiring;
     if let Some((name, _)) = registrations.into_iter().next() {
         return Err(BootError::AdapterBesideRegistry(name));
@@ -487,6 +539,10 @@ pub fn check_registry(
             connector,
             reads: Reads::Registry,
             results: Results::ToolResults,
+            call_deadline: call_deadlines
+                .get(&name)
+                .copied()
+                .unwrap_or(DEFAULT_DEADLINE),
         };
         if connectors.insert(name.clone(), registered).is_some() {
             return Err(BootError::DuplicateConnector(name));
@@ -503,6 +559,7 @@ pub fn check_registry(
     let reloader = Reloader::new(live.clone(), basis);
     let gates = Gates {
         deployment: settings.deployment,
+        instance,
         clock,
         identity,
         identity_state,

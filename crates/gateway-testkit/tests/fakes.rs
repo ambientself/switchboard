@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, Begun, Completion, DecisionKind, Outcome, RecordedResource,
-    RecordedResources, RequestMetadata, RowStart,
+    RecordedResources, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
     AuditGuard, AuditRecord, CallContext, ConnectorName, CredentialError, CredentialHandle,
@@ -17,12 +17,12 @@ use gateway_core::{
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
-    Caller, DRAFT_REFUSAL, DRAFT_TOOL, FIXTURE_NOW, FORBIDDEN_DOCUMENT, FOREIGN_DRAFT,
-    FakeCredentialSource, FixedClock, Fixture, FixtureConnector, GROUP_G_DOCUMENT, Gate,
-    InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM, SCOPE_REFUSAL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A, TEAM_A_DOCUMENT,
-    TEAM_B_DOCUMENT, WRITE_TOOL, WriteRecord, block_on, document, policy_data, poll_once,
-    row_start,
+    Caller, DRAFT_REFUSAL, DRAFT_TOOL, FIXTURE_CALL_DEADLINE_MS, FIXTURE_INSTANCE, FIXTURE_NOW,
+    FORBIDDEN_DOCUMENT, FOREIGN_DRAFT, FakeCredentialSource, FixedClock, Fixture, FixtureConnector,
+    GROUP_G_DOCUMENT, Gate, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND,
+    RESOURCE_SYSTEM, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock,
+    StoreBudgets, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, WriteRecord, block_on,
+    document, policy_data, poll_once, row_start,
 };
 use serde_json::{Value, json};
 
@@ -521,6 +521,72 @@ fn read_and_finish(
     block_on(audit::finish(store, ran, latency_ms))
         .failure()
         .map(ToString::to_string)
+}
+
+/// The store sets each row's time at begin and deadline from its own clock, as Postgres does:
+/// the time at begin plus the begin budget, the row's call deadline and the finish deadline.
+#[test]
+fn the_deadline_comes_from_the_stores_clock_and_includes_the_begin_budget() {
+    let fixture = fixture();
+    let clock = SteppableClock::at(FIXTURE_NOW);
+    let budgets = StoreBudgets {
+        begin: Duration::from_millis(1_500),
+        finish_deadline: Duration::from_secs(20),
+    };
+    let store = InMemoryAuditStore::new()
+        .with_clock(Arc::new(clock.clone()))
+        .with_budgets(budgets);
+    clock.advance(Duration::from_secs(90));
+    let start = RowStart {
+        call_deadline_ms: 7_250,
+        ..row_start()
+    };
+    assert_eq!(store.deadline(&start.row), None, "no row yet");
+    let denied = row_start();
+    assert!(begin_as(&fixture, &store, &start, READ_TOOL).is_ok());
+    clock.advance(Duration::from_secs(1));
+    assert!(begin_as(&fixture, &store, &denied, WRITE_TOOL).is_ok());
+
+    let begun_at = UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW + 90);
+    assert_eq!(store.begun_at(&start.row), Some(begun_at));
+    assert_eq!(
+        store.deadline(&start.row),
+        Some(begun_at + Duration::from_millis(1_500 + 7_250 + 20_000))
+    );
+    // A denial is a call row too, begun a second later, with the fixture's call deadline.
+    let begun_at = begun_at + Duration::from_secs(1);
+    assert_eq!(store.begun_at(&denied.row), Some(begun_at));
+    assert_eq!(
+        store.deadline(&denied.row),
+        Some(begun_at + Duration::from_millis(1_500 + FIXTURE_CALL_DEADLINE_MS + 20_000))
+    );
+
+    // The record carries the instance and the call deadline, and no time.
+    let row = store.row_with_id(&start.row).unwrap();
+    assert_eq!(row.kind, RowKind::Call);
+    assert_eq!(row.instance.as_str(), FIXTURE_INSTANCE);
+    assert_eq!(row.call_deadline_ms, 7_250);
+
+    // A retried begin keeps the first row's times.
+    clock.advance(Duration::from_secs(60));
+    assert!(begin_as(&fixture, &store, &start, READ_TOOL).is_ok());
+    assert_eq!(
+        store.begun_at(&start.row),
+        Some(UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW + 90))
+    );
+}
+
+#[test]
+fn the_default_budgets_are_the_postgres_stores() {
+    let store = InMemoryAuditStore::new();
+    let start = row_start();
+    assert!(begin_as(&fixture(), &store, &start, READ_TOOL).is_ok());
+    let begun_at = UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW);
+    assert_eq!(store.begun_at(&start.row), Some(begun_at));
+    assert_eq!(
+        store.deadline(&start.row),
+        Some(begun_at + Duration::from_millis(2_000 + FIXTURE_CALL_DEADLINE_MS + 30_000))
+    );
 }
 
 #[test]

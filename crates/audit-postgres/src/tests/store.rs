@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
 use super::{GATEWAY_ROLE, TestDatabase};
-use crate::{PgAuditError, PgAuditStore, PoolSizes};
+use crate::columns::allowance_ms;
+use crate::{Budgets, PgAuditError, PgAuditStore, PoolSizes};
 
 /// One call, as a test describes it.
 pub(super) struct Call {
@@ -93,7 +94,9 @@ pub(super) async fn through_core(
 }
 
 /// Reads a row back as the core's record, through a superuser session: the gateway's role
-/// cannot read who called.
+/// cannot read who called. The row must have been begun by a store with the default
+/// [`Budgets`]: the call deadline is its allowance less them. Checks on the way that the
+/// row's deadline is its time at begin plus its allowance.
 pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
     let row = admin
         .query_one(
@@ -101,7 +104,9 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
                     decision, reason, sentence, policy_revision,
                     proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                     proved_delegation_team, claimed_acting_person, claimed_team,
-                    outcome, outcome_sentence, latency_ms, resources, resources_omitted
+                    outcome, outcome_sentence, latency_ms, resources, resources_omitted,
+                    instance, kind, allowance_ms,
+                    deadline = begun_at + allowance_ms * interval '1 millisecond' AS on_time
              FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
             &[&row.as_str()],
         )
@@ -130,7 +135,13 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         Value::String(unknown) => json!(unknown),
         named => json!({ "named": named }),
     };
+    assert_eq!(row.get::<_, Option<bool>>("on_time"), Some(true));
+    let allowance = u64::try_from(row.get::<_, i64>("allowance_ms")).unwrap();
+    let budgets = allowance_ms(&Budgets::default(), 0);
     serde_json::from_value(json!({
+        "kind": text("kind"),
+        "instance": text("instance"),
+        "call_deadline_ms": allowance.checked_sub(budgets).unwrap(),
         "tool_use_id": text("tool_use_id"),
         "deployment": text("deployment"),
         "surface": text("surface"),
@@ -232,6 +243,9 @@ async fn a_record_with_every_value_set_reads_back_exactly() {
     let record = |value: Value| -> AuditRecord { serde_json::from_value(value).unwrap() };
     let common = |decision: &str| {
         json!({
+            "kind": "call",
+            "instance": format!("instance-{decision}"),
+            "call_deadline_ms": decision.len() * 1_000,
             "tool_use_id": format!("toolu-{decision}"),
             "deployment": format!("deployment-{decision}"),
             "surface": format!("surface-{decision}"),
