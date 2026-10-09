@@ -33,8 +33,10 @@
 #       ClusterIP and its endpoint IPs. The step waits at most --probe-wait seconds (default 60)
 #       for the probe to end, then reads its log: one ROUTE line per attempt and a RESULT line.
 #
-# Anything it cannot read is a FAIL ("could not read"), never a PASS. The last line is the
-# RESULT. The report goes to --report as JSON, and the exit status is non-zero on any FAIL.
+# Anything it cannot read is a FAIL ("could not read"), never a PASS, and so is anything it read
+# but could not parse: kubectl output that is not one JSON object, or a field of it in a shape jq
+# cannot take. The last line is the RESULT. The report goes to --report as JSON, and the exit
+# status is non-zero on any FAIL.
 #
 # The access it needs, and no more (deploy/kind/route-check/rbac.yaml): get and list on what it
 # reads, create on subjectaccessreviews, and patch on pods/ephemeralcontainers in the workload's
@@ -153,6 +155,9 @@ record() { jq -nc --arg result "$1" --arg name "$2" '{name: $name, result: $resu
 pass() { PASSES=$((PASSES + 1)); echo "PASS $1"; record PASS "$1"; }
 fail() { FAILS=$((FAILS + 1)); echo "FAIL $1"; record FAIL "$1"; }
 note() { echo "NOTE $1"; }
+# json_object TEXT: true when TEXT is exactly one JSON object. kubectl output that is empty, cut
+# short or more than one value is not read, since jq would take it as nothing to check.
+json_object() { jq -se 'length == 1 and (.[0] | type) == "object"' >/dev/null 2>&1 <<<"$1"; }
 
 # finish STATUS: writes the report, prints the RESULT line and exits; non-zero unless every check
 # passed and the run finished.
@@ -214,21 +219,25 @@ trap 'finish $?' EXIT
 
 pick_pod() {
   step "the pod: a running pod in $NAMESPACE matching $SELECTOR"
+  # It runs as an `if` condition, so set -e is off here: every read is checked.
   local pods
-  if ! pods=$(k get pods -n "$NAMESPACE" -l "$SELECTOR" -o json); then
+  if ! pods=$(k get pods -n "$NAMESPACE" -l "$SELECTOR" -o json) || ! json_object "$pods" ||
+    ! POD_JSON=$(jq -c '[.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)]
+      | sort_by(.metadata.name) | .[0] // empty' <<<"$pods"); then
     fail "a running pod matches $SELECTOR in $NAMESPACE: could not read the pods"
     return 1
   fi
-  POD_JSON=$(jq -c '[.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)]
-    | sort_by(.metadata.name) | .[0] // empty' <<<"$pods")
   if [ -z "$POD_JSON" ]; then
     fail "a running pod matches $SELECTOR in $NAMESPACE: there is none"
     return 1
   fi
-  POD_NAME=$(jq -r .metadata.name <<<"$POD_JSON")
+  if ! POD_NAME=$(jq -er '.metadata.name | strings' <<<"$POD_JSON") ||
+    ! NODE=$(jq -r '.spec.nodeName // ""' <<<"$POD_JSON") ||
+    ! SA_NAME=$(jq -r '.spec.serviceAccountName // "default"' <<<"$POD_JSON"); then
+    fail "a running pod matches $SELECTOR in $NAMESPACE: could not read the pods"
+    return 1
+  fi
   POD=$NAMESPACE/$POD_NAME
-  NODE=$(jq -r '.spec.nodeName // ""' <<<"$POD_JSON")
-  SA_NAME=$(jq -r '.spec.serviceAccountName // "default"' <<<"$POD_JSON")
   SA=$NAMESPACE/$SA_NAME
   pass "a running pod matches $SELECTOR in $NAMESPACE: $POD on node ${NODE:-?}, ServiceAccount $SA_NAME"
 }
@@ -266,16 +275,16 @@ kindnetd_default_on() {
 network_plugin() {
   step "(a) the network plugin and its enforcement"
   local daemonsets plugins
-  if ! daemonsets=$(k get daemonsets -n kube-system -o json); then
+  if ! daemonsets=$(k get daemonsets -n kube-system -o json) || ! json_object "$daemonsets" ||
+    ! plugins=$(jq -r '[.items[].metadata.name
+        | if startswith("kindnet") then "kindnet"
+          elif startswith("calico") then "calico"
+          elif startswith("cilium") then "cilium"
+          elif . == "aws-node" then "aws-node"
+          else empty end] | unique | join(",")' <<<"$daemonsets"); then
     fail "network policy enforcement: could not read the DaemonSets in kube-system"
     return
   fi
-  plugins=$(jq -r '[.items[].metadata.name
-      | if startswith("kindnet") then "kindnet"
-        elif startswith("calico") then "calico"
-        elif startswith("cilium") then "cilium"
-        elif . == "aws-node" then "aws-node"
-        else empty end] | unique | join(",")' <<<"$daemonsets")
   PLUGIN=${plugins:-unknown}
   if [ "$PLUGIN" != kindnet ]; then
     ENFORCEMENT=unknown
@@ -289,34 +298,37 @@ network_plugin() {
 kindnet_enforcement() {
   local daemonsets=$1 selector agents agent agent_name container image tag flags line value
   local state="" why="" release
-  selector=$(jq -r '[.items[] | select(.metadata.name | startswith("kindnet"))][0].spec.selector.matchLabels // {}
-    | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$daemonsets")
-  if [ -z "$selector" ]; then
+  if ! selector=$(jq -r '[.items[] | select(.metadata.name | startswith("kindnet"))][0].spec.selector.matchLabels // {}
+    | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$daemonsets"); then
+    why="could not read the kindnet DaemonSet"
+  elif [ -z "$selector" ]; then
     why="the kindnet DaemonSet has no label selector"
-  elif ! agents=$(k get pods -n kube-system -l "$selector" -o json); then
+  elif ! agents=$(k get pods -n kube-system -l "$selector" -o json) || ! json_object "$agents" ||
+    ! agent=$(jq -c --arg node "$NODE" '[.items[] | select(.spec.nodeName == $node and .status.phase == "Running")][0] // empty' <<<"$agents"); then
     why="could not read the kindnet pods"
-  else
-    agent=$(jq -c --arg node "$NODE" '[.items[] | select(.spec.nodeName == $node and .status.phase == "Running")][0] // empty' <<<"$agents")
-    if [ -z "$agent" ]; then
-      why="no running kindnet pod on node $NODE"
-    fi
+  elif [ -z "$agent" ]; then
+    why="no running kindnet pod on node $NODE"
   fi
   if [ -z "$why" ]; then
-    agent_name=$(jq -r .metadata.name <<<"$agent")
-    container=$(jq -c '[.spec.containers[] | select(.image | contains("kindnetd"))][0] // empty' <<<"$agent")
-    if [ -z "$container" ]; then
+    if ! agent_name=$(jq -er '.metadata.name | strings' <<<"$agent") ||
+      ! container=$(jq -c '[.spec.containers[] | select(.image | contains("kindnetd"))][0] // empty' <<<"$agent"); then
+      why="could not read the kindnet pods"
+    elif [ -z "$container" ]; then
       why="pod $agent_name runs no kindnetd image"
     fi
+  fi
+  # The flag, from the command, the arguments and the environment. A Go bool flag given with no
+  # value is true; a variable whose value comes from elsewhere cannot be read.
+  if [ -z "$why" ] && ! flags=$(jq -r '((.command // []) + (.args // []))[],
+      ((.env // [])[] | "\(.name)=\(.value // "<from elsewhere>")")' <<<"$container"); then
+    why="could not read the kindnetd container of $agent_name"
   fi
   if [ -z "$why" ]; then
     image=$(jq -r .image <<<"$container")
     image=${image%%@*}
     tag=""
     case ${image##*/} in *:*) tag=${image##*:} ;; esac
-    # The flag, from the command, the arguments and the environment. A Go bool flag given with
-    # no value is true; a variable whose value comes from elsewhere cannot be read.
-    flags=$(jq -r '((.command // []) + (.args // []))[], ((.env // [])[] | "\(.name)=\(.value // "<from elsewhere>")")' <<<"$container" |
-      grep -Ei 'network.?polic' || true)
+    flags=$(grep -Ei 'network.?polic' <<<"$flags" || true)
     if [ -n "$flags" ]; then
       state=on
       while IFS= read -r line; do
@@ -366,16 +378,24 @@ CONTAINERS='[(.spec.containers // [])[], (.spec.initContainers // [])[], (.spec.
 credentials() {
   step "(b) no credential in the pod"
   local found
-  found=$(jq -r '(.spec.volumes // [])[]
+  # Each check fails, never passes, when jq cannot take the pod's spec (pipefail keeps its status).
+  local check
+  check="no Secret volume"
+  if ! found=$(jq -r '(.spec.volumes // [])[]
       | select(.secret or any(.projected.sources[]?; .secret) or (.csi.driver == "secrets-store.csi.k8s.io"))
-      | .name' <<<"$POD_JSON" | paste -sd, -)
-  if [ -n "$found" ]; then fail "no Secret volume: $found"; else pass "no Secret volume"; fi
+      | .name' <<<"$POD_JSON" | paste -sd, -); then
+    fail "$check: could not read the pod's volumes"
+  elif [ -n "$found" ]; then fail "$check: $found"; else pass "$check"; fi
 
-  found=$(jq -r "$CONTAINERS"'[] | .name as $c | (.env // [])[] | select(.valueFrom.secretKeyRef) | "\($c)/\(.name)"' <<<"$POD_JSON" | paste -sd, -)
-  if [ -n "$found" ]; then fail "no variable from a Secret (secretKeyRef): $found"; else pass "no variable from a Secret (secretKeyRef)"; fi
+  check="no variable from a Secret (secretKeyRef)"
+  if ! found=$(jq -r "$CONTAINERS"'[] | .name as $c | (.env // [])[] | select(.valueFrom.secretKeyRef) | "\($c)/\(.name)"' <<<"$POD_JSON" | paste -sd, -); then
+    fail "$check: could not read the pod's variables"
+  elif [ -n "$found" ]; then fail "$check: $found"; else pass "$check"; fi
 
-  found=$(jq -r "$CONTAINERS"'[] | .name as $c | (.envFrom // [])[] | select(.secretRef) | "\($c)/\(.secretRef.name)"' <<<"$POD_JSON" | paste -sd, -)
-  if [ -n "$found" ]; then fail "no variables from a Secret (envFrom secretRef): $found"; else pass "no variables from a Secret (envFrom secretRef)"; fi
+  check="no variables from a Secret (envFrom secretRef)"
+  if ! found=$(jq -r "$CONTAINERS"'[] | .name as $c | (.envFrom // [])[] | select(.secretRef) | "\($c)/\(.secretRef.name)"' <<<"$POD_JSON" | paste -sd, -); then
+    fail "$check: could not read the pod's envFrom"
+  elif [ -n "$found" ]; then fail "$check: $found"; else pass "$check"; fi
 
   token_scan
   token_audiences
@@ -384,33 +404,46 @@ credentials() {
 # token_scan: the literal variables and every ConfigMap the pod reads, against token-patterns.txt.
 # Each value is a file; the report names the file's source and the pattern's line, not the value.
 token_scan() {
-  local items=$TMP/items literals count i configmaps name cm unreadable="" n=0 patterns line number files
+  local items=$TMP/items literals count i configmaps name cm keys unreadable="" n=0 patterns line number files
   local matches=()
   mkdir -p "$items"
   : >"$TMP/where"
   # The literal variables.
-  literals=$(jq -c "$CONTAINERS"' | map(.name as $c | (.env // [])[] | select(.value != null) | {where: "variable \($c)/\(.name)", value})' <<<"$POD_JSON")
-  count=$(jq length <<<"$literals")
+  if ! literals=$(jq -c "$CONTAINERS"' | map(.name as $c | (.env // [])[] | select(.value != null) | {where: "variable \($c)/\(.name)", value})' <<<"$POD_JSON") ||
+    ! count=$(jq length <<<"$literals"); then
+    fail "no string in a token format: could not read the pod's variables"
+    return
+  fi
   for ((i = 0; i < count; i++)); do
     jq -j --argjson i "$i" '.[$i].value' <<<"$literals" >"$items/$n"
     printf '%s\t%s\n' "$n" "$(jq -r --argjson i "$i" '.[$i].where' <<<"$literals")" >>"$TMP/where"
     n=$((n + 1))
   done
   # Every ConfigMap it mounts, takes variables from, or takes one variable from.
-  configmaps=$(jq -r '[((.spec.volumes // [])[] | .configMap.name // empty, (.projected.sources[]? | .configMap.name // empty)),
+  if ! configmaps=$(jq -r '[((.spec.volumes // [])[] | .configMap.name // empty, (.projected.sources[]? | .configMap.name // empty)),
       ('"$CONTAINERS"'[] | ((.envFrom // [])[] | .configMapRef.name // empty), ((.env // [])[] | .valueFrom.configMapKeyRef.name // empty))]
-      | unique[]' <<<"$POD_JSON")
+      | unique[]' <<<"$POD_JSON"); then
+    fail "no string in a token format: could not read which ConfigMaps the pod reads"
+    return
+  fi
+  # Each ConfigMap's keys are read into a variable first and jq's status checked: one it cannot
+  # parse is unreadable, never a ConfigMap with nothing in it.
   for name in $configmaps; do
-    if ! cm=$(k get configmap "$name" -n "$NAMESPACE" -o json); then
+    if ! cm=$(k get configmap "$name" -n "$NAMESPACE" -o json) || ! json_object "$cm" ||
+      ! keys=$(jq -r '((.data // {}) | keys[] | "data\t\(.)"), ((.binaryData // {}) | keys[] | "binaryData\t\(.)")' <<<"$cm"); then
       unreadable="$unreadable${unreadable:+,}$name"
       continue
     fi
+    [ -n "$keys" ] || continue
     while IFS= read -r line; do
-      jq -j --arg key "${line#*$'\t'}" --arg kind "${line%%$'\t'*}" \
-        'if $kind == "data" then .data[$key] else (.binaryData[$key] | @base64d) end' <<<"$cm" >"$items/$n"
+      if ! jq -j --arg key "${line#*$'\t'}" --arg kind "${line%%$'\t'*}" \
+        'if $kind == "data" then .data[$key] else (.binaryData[$key] | @base64d) end' <<<"$cm" >"$items/$n"; then
+        unreadable="$unreadable${unreadable:+,}$name"
+        break
+      fi
       printf '%s\tConfigMap %s key %s\n' "$n" "$name" "${line#*$'\t'}" >>"$TMP/where"
       n=$((n + 1))
-    done < <(jq -r '((.data // {}) | keys[] | "data\t\(.)"), ((.binaryData // {}) | keys[] | "binaryData\t\(.)")' <<<"$cm")
+    done <<<"$keys"
   done
   if [ -n "$unreadable" ]; then
     fail "no string in a token format: could not read ConfigMap $unreadable in $NAMESPACE"
@@ -446,19 +479,26 @@ token_scan() {
 # token_audiences: every projected ServiceAccount token's audience. One for a server would be a
 # credential for that server.
 token_audiences() {
-  local audience server bad=()
-  AUDIENCES=$(jq -c '[(.spec.volumes // [])[] | .name as $v | .projected.sources[]?
-      | select(.serviceAccountToken) | {volume: $v, audience: (.serviceAccountToken.audience // "")}]' <<<"$POD_JSON")
-  while IFS= read -r audience; do
-    echo "projected token for audience: ${audience:-(none set: the API server)}"
-    for server in "${SERVER_AUDIENCES[@]}"; do
-      if [ "$audience" = "$server" ]; then bad+=("$audience"); fi
-    done
-  done < <(jq -r '.[].audience' <<<"$AUDIENCES")
+  local audiences count audience server bad=()
+  if ! AUDIENCES=$(jq -c '[(.spec.volumes // [])[] | .name as $v | .projected.sources[]?
+      | select(.serviceAccountToken) | {volume: $v, audience: (.serviceAccountToken.audience // "")}]' <<<"$POD_JSON") ||
+    ! count=$(jq length <<<"$AUDIENCES") || ! audiences=$(jq -r '.[].audience' <<<"$AUDIENCES"); then
+    AUDIENCES=null
+    fail "no projected token for a server's audience: could not read the pod's projected volumes"
+    return
+  fi
+  if [ "$count" -gt 0 ]; then
+    while IFS= read -r audience; do
+      echo "projected token for audience: ${audience:-(none set: the API server)}"
+      for server in "${SERVER_AUDIENCES[@]}"; do
+        if [ "$audience" = "$server" ]; then bad+=("$audience"); fi
+      done
+    done <<<"$audiences"
+  fi
   if [ ${#bad[@]} -gt 0 ]; then
     fail "no projected token for a server's audience: $(printf '%s,' "${bad[@]}" | sed 's/,$//')"
   else
-    pass "no projected token for a server's audience ($(jq -r 'length' <<<"$AUDIENCES") projected)"
+    pass "no projected token for a server's audience ($count projected)"
   fi
 }
 
@@ -533,13 +573,14 @@ permissions() {
 
 cloud_identity() {
   step "(d) cloud identity bound to $SA, for the owner to check"
-  local sa
-  if ! sa=$(k get serviceaccount "$SA_NAME" -n "$NAMESPACE" -o json); then
+  local sa identity
+  if ! sa=$(k get serviceaccount "$SA_NAME" -n "$NAMESPACE" -o json) || ! json_object "$sa" ||
+    ! identity=$(jq -c --argjson keys "$CLOUD_IDENTITY_ANNOTATIONS" \
+      '(.metadata.annotations // {}) as $a | [$keys[] | select($a[.] != null) | {key: ., value: $a[.]}] | from_entries' <<<"$sa"); then
     fail "cloud identity of $SA: could not read the ServiceAccount"
     return
   fi
-  CLOUD_IDENTITY=$(jq -c --argjson keys "$CLOUD_IDENTITY_ANNOTATIONS" \
-    '(.metadata.annotations // {}) as $a | [$keys[] | select($a[.] != null) | {key: ., value: $a[.]}] | from_entries' <<<"$sa")
+  CLOUD_IDENTITY=$identity
   if [ "$CLOUD_IDENTITY" = "{}" ]; then
     note "no cloud identity annotation on $SA"
   else
@@ -555,14 +596,15 @@ server_addresses() {
   local service ns name svc slices addresses
   for service in "${SERVER_SERVICES[@]}"; do
     ns=${service%%/*} name=${service#*/}
-    if ! svc=$(k get service "$name" -n "$ns" -o json) ||
-      ! slices=$(k get endpointslices -n "$ns" -l "kubernetes.io/service-name=$name" -o json); then
+    if ! svc=$(k get service "$name" -n "$ns" -o json) || ! json_object "$svc" ||
+      ! slices=$(k get endpointslices -n "$ns" -l "kubernetes.io/service-name=$name" -o json) ||
+      ! json_object "$slices" ||
+      ! addresses=$(jq -rn --argjson svc "$svc" --argjson slices "$slices" '
+        [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[], ($slices.items[] | .endpoints[]? | .addresses[])]
+        | map(select(. != "None" and . != "")) | unique | join(",")'); then
       echo "could not read Service $service or its EndpointSlices" >&2
       return 1
     fi
-    addresses=$(jq -rn --argjson svc "$svc" --argjson slices "$slices" '
-      [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[], ($slices.items[] | .endpoints[]? | .addresses[])]
-      | map(select(. != "None" and . != "")) | unique | join(",")')
     if [ -z "$addresses" ]; then
       echo "Service $service has no ClusterIP and no endpoint address" >&2
       return 1
@@ -573,7 +615,7 @@ server_addresses() {
 
 probe() {
   step "(e) the probe in $POD"
-  local addresses routes custom deadline pod_now state="" log exit_code last bad
+  local addresses routes custom deadline pod_now state="" unread="" log exit_code last bad
   if ! addresses=$(server_addresses); then
     fail "the probe ran: could not read the servers' addresses"
     return
@@ -616,15 +658,24 @@ probe() {
   fi
   # Wait for it to end, at most --probe-wait seconds.
   deadline=$((SECONDS + PROBE_WAIT))
+  # A read that fails or cannot be parsed is tried again; if the last one did, the wait fails as
+  # could not read.
   while :; do
-    if pod_now=$(k get pod "$POD_NAME" -n "$NAMESPACE" -o json 2>/dev/null); then
+    if pod_now=$(k get pod "$POD_NAME" -n "$NAMESPACE" -o json 2>/dev/null) && json_object "$pod_now" &&
       state=$(jq -c --arg c "$PROBE_CONTAINER" \
-        '[(.status.ephemeralContainerStatuses // [])[] | select(.name == $c) | .state.terminated // empty][0] // empty' <<<"$pod_now")
+        '[(.status.ephemeralContainerStatuses // [])[] | select(.name == $c) | .state.terminated // empty][0] // empty' <<<"$pod_now"); then
+      unread=""
       [ -z "$state" ] || break
+    else
+      state="" unread=1
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then break; fi
     sleep 1
   done
+  if [ -n "$unread" ]; then
+    fail "the probe ended within $PROBE_WAIT s: could not read pod $POD_NAME"
+    return
+  fi
   if [ -z "$state" ]; then
     fail "the probe ended within $PROBE_WAIT s: $PROBE_CONTAINER had not"
     return

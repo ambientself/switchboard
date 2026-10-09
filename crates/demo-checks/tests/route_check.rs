@@ -41,7 +41,7 @@ RESULT: PASS\n";
 /// - `kubectl debug` by saving the partial container spec to `debug-custom.json` and the
 ///   container's name to `probe-container`;
 /// - `get pod` with the probe's container terminated (exit code in `probe-exit`), or running if
-///   `probe-running` exists;
+///   `probe-running` exists, or with the contents of `probe-pod` if that exists;
 /// - every other read from a file named for it; a missing file is NotFound.
 const FAKE_KUBECTL: &str = r#"#!/usr/bin/env bash
 set -u
@@ -92,6 +92,7 @@ case $args in
     done
     ;;
   "get pod "*)
+    if [ -f "$d/probe-pod" ]; then cat "$d/probe-pod"; exit 0; fi
     if [ -f "$d/probe-running" ]; then
       state='{"running": {"startedAt": "2026-10-08T00:00:00Z"}}'
     else
@@ -122,6 +123,8 @@ struct Cluster {
     probe_running: bool,
     /// Files the fake does not serve, so their reads fail.
     unreadable: Vec<&'static str>,
+    /// Files the fake serves as given, in place of what the cluster would write.
+    raw: Vec<(&'static str, &'static str)>,
 }
 
 impl Cluster {
@@ -195,6 +198,7 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
             probe_exit: 0,
             probe_running: false,
             unreadable: Vec::new(),
+            raw: Vec::new(),
         }
     }
 
@@ -253,6 +257,9 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
         }
         for name in &self.unreadable {
             std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        for (name, contents) in &self.raw {
+            write(dir, name, contents);
         }
     }
 }
@@ -951,6 +958,219 @@ fn an_unreadable_config_map_fails() {
         .retain(|(_, name, _)| *name != "agent-settings");
     check("configmap-unreadable", &cluster)
         .assert_failed("no string in a token format: could not read ConfigMap agent-settings");
+}
+
+/// kubectl output that is not one JSON object: cut short, empty, and two objects. jq reads the
+/// last two without an error, as nothing or as two values.
+const NOT_ONE_OBJECT: [(&str, &str); 3] = [
+    ("cut-short", "{\"items\": [{\"metadata\": "),
+    ("empty", ""),
+    ("two-objects", "{}\n{}\n"),
+];
+
+/// Runs the check once for each output in `NOT_ONE_OBJECT` served as `file`, and once for each
+/// of `shapes` (JSON that jq parses but cannot take), and expects each run to fail with `text`
+/// and never to pass a check containing it.
+fn fails_when_unparsed(name: &str, file: &'static str, shapes: &[&'static str], text: &str) {
+    let cases = NOT_ONE_OBJECT
+        .iter()
+        .map(|(case, contents)| ((*case).to_owned(), *contents))
+        .chain(
+            shapes
+                .iter()
+                .enumerate()
+                .map(|(i, shape)| (format!("shape-{i}"), *shape)),
+        );
+    let label = text.split(':').next().unwrap();
+    for (case, contents) in cases {
+        let mut cluster = Cluster::clean();
+        cluster.raw = vec![(file, contents)];
+        let checked = check(&format!("{name}-{case}"), &cluster);
+        checked.assert_failed(text);
+        assert!(
+            !checked.passed(label),
+            "{case}: a check {label:?} passed\n{}",
+            checked.run.transcript()
+        );
+    }
+}
+
+#[test]
+fn a_config_map_that_cannot_be_parsed_fails() {
+    fails_when_unparsed(
+        "configmap-unparsed",
+        "configmap-team-a-agent-settings.json",
+        &[
+            r#"{"data": "LOG_LEVEL=info"}"#,
+            r#"{"data": ["info"]}"#,
+            r#"{"binaryData": {"blob": "not base64 %%%"}}"#,
+        ],
+        "no string in a token format: could not read ConfigMap agent-settings",
+    );
+}
+
+#[test]
+fn workload_pods_that_cannot_be_parsed_fail() {
+    fails_when_unparsed(
+        "pods-unparsed",
+        "workload-pods.json",
+        &[
+            r#"{"kind": "List"}"#,
+            r#"{"items": [{"metadata": {"name": 7}, "status": {"phase": "Running"}}]}"#,
+        ],
+        "a running pod matches app=agent in team-a: could not read the pods",
+    );
+}
+
+#[test]
+fn daemonsets_that_cannot_be_parsed_fail() {
+    fails_when_unparsed(
+        "daemonsets-unparsed",
+        "daemonsets.json",
+        &[r#"{"items": [{"metadata": {"name": 7}}]}"#],
+        "network policy enforcement: could not read the DaemonSets in kube-system",
+    );
+}
+
+#[test]
+fn kindnet_pods_that_cannot_be_parsed_fail() {
+    fails_when_unparsed(
+        "kindnet-pods-unparsed",
+        "kindnet-pods.json",
+        &[r#"{"items": "kindnet-9qv4m"}"#],
+        "network policy enforcement: could not read (could not read the kindnet pods)",
+    );
+}
+
+/// A kindnetd container whose flags jq cannot take. Before the flags' read was checked, it
+/// counted as no flag set, and the image's default passed.
+#[test]
+fn a_kindnet_container_that_cannot_be_parsed_fails() {
+    for (name, field, value) in [
+        ("args", "args", json!("--network-policy=false")),
+        (
+            "command",
+            "command",
+            json!("/bin/kindnetd --network-policy=false"),
+        ),
+        ("env", "env", json!("NETWORK_POLICY=false")),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.kindnet_pod["spec"]["containers"][0][field] = value;
+        let checked = check(&format!("kindnet-container-unparsed-{name}"), &cluster);
+        checked.assert_failed(
+            "network policy enforcement: could not read (could not read the kindnetd container of kindnet-9qv4m)",
+        );
+        assert!(!checked.passed("network policy is enforced"), "{name}");
+        assert_eq!(checked.report()["enforcement"], "could not read");
+    }
+}
+
+/// A pod spec in a shape jq cannot take fails each check that reads that part of it, and the
+/// run goes on to the checks after it.
+#[test]
+fn a_pod_spec_that_cannot_be_parsed_fails() {
+    for (name, field, texts) in [
+        (
+            "volumes",
+            "volumes",
+            &[
+                "no Secret volume: could not read the pod's volumes",
+                "no string in a token format: could not read which ConfigMaps the pod reads",
+                "no projected token for a server's audience: could not read the pod's projected volumes",
+            ][..],
+        ),
+        (
+            "env",
+            "env",
+            &[
+                "no variable from a Secret (secretKeyRef): could not read the pod's variables",
+                "no string in a token format: could not read the pod's variables",
+            ][..],
+        ),
+        (
+            "envfrom",
+            "envFrom",
+            &[
+                "no variables from a Secret (envFrom secretRef): could not read the pod's envFrom",
+                "no string in a token format: could not read which ConfigMaps the pod reads",
+            ][..],
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        if field == "volumes" {
+            cluster.pod_spec()[field] = json!("gateway-token");
+        } else {
+            cluster.agent()[field] = json!("GATEWAY_URL");
+        }
+        let checked = check(&format!("pod-spec-unparsed-{name}"), &cluster);
+        for text in texts {
+            checked.assert_failed(text);
+        }
+        assert!(
+            checked.passed("the probe passed"),
+            "{name}: the run stopped\n{}",
+            checked.run.transcript()
+        );
+    }
+
+    // A projected token whose source is not an object.
+    let mut cluster = Cluster::clean();
+    cluster.pod_spec()["volumes"][0]["projected"]["sources"][0]["serviceAccountToken"] =
+        json!("mock-docs");
+    let checked = check("pod-spec-unparsed-token", &cluster);
+    checked.assert_failed(
+        "no projected token for a server's audience: could not read the pod's projected volumes",
+    );
+    assert!(checked.report()["token_audiences"].is_null());
+}
+
+#[test]
+fn a_service_account_that_cannot_be_parsed_fails() {
+    fails_when_unparsed(
+        "serviceaccount-unparsed",
+        "serviceaccount.json",
+        &[r#"{"metadata": {"annotations": "eks.amazonaws.com/role-arn"}}"#],
+        "cloud identity of team-a/mock-workload: could not read the ServiceAccount",
+    );
+}
+
+#[test]
+fn a_server_service_that_cannot_be_parsed_fails() {
+    fails_when_unparsed(
+        "service-unparsed",
+        "service-mock-docs-mock-docs.json",
+        &[r#"{"spec": {"clusterIPs": "10.96.12.34"}}"#],
+        "the probe ran: could not read the servers' addresses",
+    );
+    fails_when_unparsed(
+        "endpointslices-unparsed",
+        "endpointslices-mock-docs.json",
+        &[r#"{"items": [{"endpoints": [{"addresses": "10.244.0.7"}]}]}"#],
+        "the probe ran: could not read the servers' addresses",
+    );
+}
+
+/// The pod read while waiting for the probe cannot be parsed: the wait fails as could not read,
+/// not as a probe that ended.
+#[test]
+fn a_probe_pod_that_cannot_be_parsed_fails() {
+    for (case, contents) in NOT_ONE_OBJECT.iter().copied().chain([(
+        "shape",
+        r#"{"status": {"ephemeralContainerStatuses": "route-probe"}}"#,
+    )]) {
+        let mut cluster = Cluster::clean();
+        cluster.raw = vec![("probe-pod", contents)];
+        let checked = check_with(
+            &format!("probe-pod-unparsed-{case}"),
+            &cluster,
+            1,
+            Duration::from_secs(60),
+        );
+        checked.assert_failed("the probe ended within 1 s: could not read pod agent-0");
+        assert!(!checked.passed("the probe ended"), "{case}");
+        assert!(!checked.passed("the probe passed"), "{case}");
+    }
 }
 
 #[test]
