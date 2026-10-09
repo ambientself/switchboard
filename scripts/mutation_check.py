@@ -1740,7 +1740,8 @@ mutate_all(
     "the mock server gains a dependency outside the allowlist",
     (MOCK + "Cargo.toml", 'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\n',
      'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n'),
-    (MOCK + "Cargo.toml", '[dev-dependencies]\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n', "[dev-dependencies]\n"),
+    (MOCK + "Cargo.toml", 'features = ["getrandom"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n',
+     'features = ["getrandom"] }\n'),
 )
 
 

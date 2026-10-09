@@ -217,6 +217,162 @@ fn each_setting_is_read_and_a_bad_one_refused() {
     }
 }
 
+// --- The JWT mode's settings -------------------------------------------------------------
+
+const ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
+
+/// An RSA public key in JWK form, with `changes` applied; a `null` removes a member. The
+/// modulus is a few made-up bytes, not a key: configuration does not check its length, and
+/// nothing is verified here.
+fn jwk(changes: Value) -> Value {
+    let mut jwk = json!({
+        "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "key-1",
+        "n": "YSBtYWRlLXVwIG1vZHVsdXMsIG5vdCBhIGtleQ", "e": "AQAB",
+    });
+    for (name, value) in changes.as_object().unwrap() {
+        if value.is_null() {
+            jwk.as_object_mut().unwrap().remove(name);
+        } else {
+            jwk[name] = value.clone();
+        }
+    }
+    jwk
+}
+
+const JWT_VARS: [&str; 4] = [
+    "MOCK_DOCS_JWT_ISSUER",
+    "MOCK_DOCS_JWT_AUDIENCE",
+    "MOCK_DOCS_JWT_SUBJECT",
+    "MOCK_DOCS_JWKS_FILE",
+];
+
+/// The four JWT variables, with the JWK set file holding `jwks`.
+fn jwt_settings(test: &str, jwks: &str) -> Result<Settings, ConfigError> {
+    let path = token_file(&format!("jwks-{test}"), jwks);
+    settings(&[
+        ("MOCK_DOCS_JWT_ISSUER", ISSUER),
+        ("MOCK_DOCS_JWT_AUDIENCE", "mock-docs"),
+        (
+            "MOCK_DOCS_JWT_SUBJECT",
+            "system:serviceaccount:switchboard:gateway",
+        ),
+        ("MOCK_DOCS_JWKS_FILE", path.to_str().unwrap()),
+    ])
+}
+
+#[test]
+fn the_jwt_settings_give_the_jwt_mode() {
+    let jwks =
+        json!({"keys": [jwk(json!({})), jwk(json!({"kid": "key-2", "use": null, "alg": null}))]});
+    let Credential::Jwt(verifier) = jwt_settings("good", &jwks.to_string())
+        .unwrap()
+        .config
+        .accepted
+    else {
+        panic!("not the JWT mode");
+    };
+    assert_eq!(verifier.issuer(), ISSUER);
+    assert_eq!(verifier.audience(), "mock-docs");
+    assert_eq!(
+        verifier.subject(),
+        "system:serviceaccount:switchboard:gateway"
+    );
+    assert_eq!(verifier.key_ids(), ["key-1", "key-2"]);
+}
+
+#[test]
+fn a_static_credential_and_any_jwt_setting_together_are_refused() {
+    let digest = sha256_hex(TOKEN);
+    let file = token_file("static-and-jwt", TOKEN);
+    let file = file.to_str().unwrap();
+    for (static_var, static_value) in [
+        ("MOCK_DOCS_TOKEN_FILE", file),
+        ("MOCK_DOCS_TOKEN_SHA256", &digest),
+        ("MOCK_DOCS_TOKEN_SHA256_FILE", file),
+    ] {
+        let mut vars: Vec<(&str, &str)> = JWT_VARS.iter().map(|name| (*name, "x")).collect();
+        vars.push((static_var, static_value));
+        assert_eq!(
+            settings(&vars).unwrap_err(),
+            ConfigError::StaticAndJwt,
+            "{vars:?}"
+        );
+        for jwt_var in JWT_VARS {
+            assert_eq!(
+                settings(&[(static_var, static_value), (jwt_var, "x")]).unwrap_err(),
+                ConfigError::StaticAndJwt,
+                "{static_var} and {jwt_var}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_jwt_settings_must_all_be_set_and_not_empty() {
+    for missing in JWT_VARS {
+        let without: Vec<(&str, &str)> = JWT_VARS
+            .iter()
+            .filter(|name| **name != missing)
+            .map(|name| (*name, "x"))
+            .collect();
+        assert_eq!(
+            settings(&without).unwrap_err(),
+            ConfigError::JwtIncomplete(missing),
+            "without {missing}"
+        );
+        let empty: Vec<(&str, &str)> = JWT_VARS
+            .iter()
+            .map(|name| (*name, if *name == missing { " " } else { "x" }))
+            .collect();
+        assert_eq!(
+            settings(&empty).unwrap_err(),
+            ConfigError::JwtIncomplete(missing),
+            "{missing} empty"
+        );
+    }
+}
+
+#[test]
+fn the_jwk_set_must_hold_rs256_signing_keys_each_with_its_own_kid() {
+    let set = |keys: Vec<Value>| json!({ "keys": keys }).to_string();
+    for (name, jwks) in [
+        ("not-json", "{".to_owned()),
+        ("not-a-set", json!([jwk(json!({}))]).to_string()),
+        ("no-keys", set(vec![])),
+        ("no-kid", set(vec![jwk(json!({"kid": null}))])),
+        ("one-kid-twice", set(vec![jwk(json!({})), jwk(json!({}))])),
+        ("rs512", set(vec![jwk(json!({"alg": "RS512"}))])),
+        ("encryption", set(vec![jwk(json!({"use": "enc"}))])),
+        (
+            "elliptic-curve",
+            set(vec![json!({
+                "kty": "EC", "crv": "P-256", "kid": "key-1",
+                "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+                "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+            })]),
+        ),
+        (
+            "symmetric",
+            set(vec![json!({"kty": "oct", "kid": "key-1", "k": "ZHVtbXk"})]),
+        ),
+    ] {
+        assert!(
+            matches!(jwt_settings(name, &jwks), Err(ConfigError::Jwks(_))),
+            "{name}"
+        );
+    }
+    let missing = settings(&[
+        ("MOCK_DOCS_JWT_ISSUER", ISSUER),
+        ("MOCK_DOCS_JWT_AUDIENCE", "mock-docs"),
+        (
+            "MOCK_DOCS_JWT_SUBJECT",
+            "system:serviceaccount:switchboard:gateway",
+        ),
+        ("MOCK_DOCS_JWKS_FILE", "/nonexistent/jwks.json"),
+    ]);
+    assert!(matches!(missing, Err(ConfigError::Jwks(_))));
+}
+
 // --- The binary ----------------------------------------------------------------------------
 
 fn binary() -> Command {
@@ -299,4 +455,24 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
         assert!(line.get("caller").is_none(), "{line}");
         assert!(line.get("refusal").is_none(), "{line}");
     }
+}
+
+#[test]
+fn the_binary_refuses_to_start_with_a_static_credential_and_jwt_settings() {
+    let output = binary()
+        .env("MOCK_DOCS_TOKEN_SHA256", sha256_hex(TOKEN))
+        .env("MOCK_DOCS_JWT_ISSUER", ISSUER)
+        .env("MOCK_DOCS_JWT_AUDIENCE", "mock-docs")
+        .env(
+            "MOCK_DOCS_JWT_SUBJECT",
+            "system:serviceaccount:switchboard:gateway",
+        )
+        .env("MOCK_DOCS_JWKS_FILE", "/nonexistent/jwks.json")
+        .env("MOCK_DOCS_LISTEN", "127.0.0.1:0")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let line: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(line["event"], "boot_refused");
+    assert!(output.stdout.is_empty());
 }
