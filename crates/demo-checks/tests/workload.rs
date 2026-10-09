@@ -245,6 +245,7 @@ struct Workload {
     gateway: String,
     token: Option<PathBuf>,
     direct: Option<String>,
+    own_project: bool,
     dir: PathBuf,
 }
 
@@ -257,6 +258,7 @@ impl Workload {
             gateway,
             token: Some(token),
             direct: None,
+            own_project: true,
             dir,
         }
     }
@@ -276,6 +278,11 @@ impl Workload {
         self
     }
 
+    fn without_own_project(mut self) -> Self {
+        self.own_project = false;
+        self
+    }
+
     fn run(&self, mode: &str) -> Run {
         let bad = write(
             &self.dir,
@@ -287,7 +294,6 @@ impl Workload {
             .arg(repo().join("deploy/demo/workload.sh"))
             .arg(mode)
             .env("GATEWAY_URL", &self.gateway)
-            .env("OWN_PROJECT", OWN)
             .env("OTHER_PROJECT", OTHER)
             .env("BAD_TOKEN_FILES", &bad)
             .env("DIRECT_TIMEOUT", "1")
@@ -299,6 +305,11 @@ impl Workload {
         }
         if let Some(direct) = &self.direct {
             command.env("DIRECT_URL", direct);
+        }
+        if self.own_project {
+            command.env("OWN_PROJECT", OWN);
+        } else {
+            command.env_remove("OWN_PROJECT");
         }
         Run::from(command.output().unwrap())
     }
@@ -459,6 +470,14 @@ fn before_the_policy_the_server_must_answer_401() {
         .direct(serve(Fake::Server401))
         .run("before-policy");
     assert_passed(&passing);
+    // The positive control, in the same pod: the gateway's own call to the server succeeds.
+    assert!(
+        passing
+            .stdout
+            .contains("PASS before policy: read own project through the gateway: isError"),
+        "{}",
+        passing.transcript()
+    );
     let dropped = Workload::new("before-dropped", serve(Fake::Gateway))
         .direct(black_hole())
         .run("before-policy");
@@ -472,6 +491,32 @@ fn before_the_policy_the_server_must_answer_401() {
         &accepting,
         "before policy: the server refuses the workload's own token",
     );
+    // A gateway that refuses the read, or cannot be reached, shows nothing about the server.
+    let refusing = Workload::new("before-gateway-refuses", serve(Fake::DeniesOwnProject))
+        .direct(serve(Fake::Server401))
+        .run("before-policy");
+    assert_failed(
+        &refusing,
+        "before policy: read own project through the gateway: isError",
+    );
+    let unreachable = Workload::new("before-no-gateway", closed_port())
+        .direct(serve(Fake::Server401))
+        .run("before-policy");
+    assert_failed(
+        &unreachable,
+        "before policy: read own project through the gateway: HTTP status",
+    );
+}
+
+#[test]
+fn before_the_policy_the_workload_needs_its_own_project() {
+    let run = Workload::new("before-no-project", serve(Fake::Gateway))
+        .direct(serve(Fake::Server401))
+        .without_own_project()
+        .run("before-policy");
+    assert_ne!(run.status, Some(0), "{}", run.transcript());
+    assert!(run.lines("PASS ").is_empty(), "{}", run.transcript());
+    assert!(run.stderr.contains("OWN_PROJECT"), "{}", run.transcript());
 }
 
 #[test]
