@@ -244,13 +244,13 @@ pick_pod() {
 
 versions() {
   local version node
-  if version=$(k version -o json 2>/dev/null) &&
+  if version=$(k version -o json 2>/dev/null) && json_object "$version" &&
     version=$(jq -er '.serverVersion.gitVersion' <<<"$version"); then
     KUBERNETES_VERSION=$version
   else
     fail "the Kubernetes version is recorded: could not read"
   fi
-  if [ -n "$NODE" ] && node=$(k get node "$NODE" -o json) &&
+  if [ -n "$NODE" ] && node=$(k get node "$NODE" -o json) && json_object "$node" &&
     node=$(jq -er '.status.nodeInfo | select(.osImage != null) | "\(.osImage), kubelet \(.kubeletVersion), \(.containerRuntimeVersion)"' <<<"$node"); then
     NODE_IMAGE=$node
   else
@@ -374,6 +374,13 @@ kindnet_enforcement() {
 
 # The pod's containers of every kind, as jq takes them.
 CONTAINERS='[(.spec.containers // [])[], (.spec.initContainers // [])[], (.spec.ephemeralContainers // [])[]]'
+# A volume's projected sources, as jq takes them: none for a volume that is not projected, and an
+# error, never nothing, when the sources are not a list of objects.
+SOURCES='def sources: if .projected == null then empty
+  elif (.projected | type) != "object" then error("projected is not an object")
+  elif .projected.sources == null then empty
+  elif (.projected.sources | type) != "array" then error("projected sources are not a list")
+  else .projected.sources[] | if type == "object" then . else error("a projected source is not an object") end end;'
 
 credentials() {
   step "(b) no credential in the pod"
@@ -381,8 +388,8 @@ credentials() {
   # Each check fails, never passes, when jq cannot take the pod's spec (pipefail keeps its status).
   local check
   check="no Secret volume"
-  if ! found=$(jq -r '(.spec.volumes // [])[]
-      | select(.secret or any(.projected.sources[]?; .secret) or (.csi.driver == "secrets-store.csi.k8s.io"))
+  if ! found=$(jq -r "$SOURCES"'(.spec.volumes // [])[]
+      | select(.secret or any(sources; .secret) or (.csi.driver == "secrets-store.csi.k8s.io"))
       | .name' <<<"$POD_JSON" | paste -sd, -); then
     fail "$check: could not read the pod's volumes"
   elif [ -n "$found" ]; then fail "$check: $found"; else pass "$check"; fi
@@ -420,7 +427,7 @@ token_scan() {
     n=$((n + 1))
   done
   # Every ConfigMap it mounts, takes variables from, or takes one variable from.
-  if ! configmaps=$(jq -r '[((.spec.volumes // [])[] | .configMap.name // empty, (.projected.sources[]? | .configMap.name // empty)),
+  if ! configmaps=$(jq -r "$SOURCES"'[((.spec.volumes // [])[] | .configMap.name // empty, (sources | .configMap.name // empty)),
       ('"$CONTAINERS"'[] | ((.envFrom // [])[] | .configMapRef.name // empty), ((.env // [])[] | .valueFrom.configMapKeyRef.name // empty))]
       | unique[]' <<<"$POD_JSON"); then
     fail "no string in a token format: could not read which ConfigMaps the pod reads"
@@ -480,7 +487,7 @@ token_scan() {
 # credential for that server.
 token_audiences() {
   local audiences count audience server bad=()
-  if ! AUDIENCES=$(jq -c '[(.spec.volumes // [])[] | .name as $v | .projected.sources[]?
+  if ! AUDIENCES=$(jq -c "$SOURCES"'[(.spec.volumes // [])[] | .name as $v | sources
       | select(.serviceAccountToken) | {volume: $v, audience: (.serviceAccountToken.audience // "")}]' <<<"$POD_JSON") ||
     ! count=$(jq length <<<"$AUDIENCES") || ! audiences=$(jq -r '.[].audience' <<<"$AUDIENCES"); then
     AUDIENCES=null
@@ -600,7 +607,9 @@ server_addresses() {
       ! slices=$(k get endpointslices -n "$ns" -l "kubernetes.io/service-name=$name" -o json) ||
       ! json_object "$slices" ||
       ! addresses=$(jq -rn --argjson svc "$svc" --argjson slices "$slices" '
-        [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[], ($slices.items[] | .endpoints[]? | .addresses[])]
+        [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[],
+         ($slices.items[] | (.endpoints // []) | if type == "array" then .[] else error("endpoints are not a list") end
+          | .addresses[] | if type == "string" then . else error("an address is not a string") end)]
         | map(select(. != "None" and . != "")) | unique | join(",")'); then
       echo "could not read Service $service or its EndpointSlices" >&2
       return 1

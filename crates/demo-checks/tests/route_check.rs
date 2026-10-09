@@ -1434,6 +1434,74 @@ fn a_probe_that_never_ends_fails_within_the_wait() {
     assert_eq!(checked.report()["probe_result"], Value::Null);
 }
 
+/// Projected sources that are not a list of objects, which a real API server does not serve,
+/// fail each check that reads them, never pass as no source (issue #64).
+#[test]
+fn projected_sources_that_cannot_be_read_fail() {
+    for (name, projected) in [
+        ("sources-string", json!({"sources": "mock-docs"})),
+        ("source-string", json!({"sources": ["mock-docs"]})),
+        ("projected-string", json!("mock-docs")),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.pod_spec()["volumes"][0]["projected"] = projected;
+        let checked = check(&format!("projected-unparsed-{name}"), &cluster);
+        for text in [
+            "no Secret volume: could not read the pod's volumes",
+            "no string in a token format: could not read which ConfigMaps the pod reads",
+            "no projected token for a server's audience: could not read the pod's projected volumes",
+        ] {
+            checked.assert_failed(text);
+        }
+        for text in [
+            "no Secret volume",
+            "no string in a token format",
+            "no projected token",
+        ] {
+            assert!(!checked.passed(text), "{name}: {text} passed");
+        }
+    }
+}
+
+/// EndpointSlice endpoints that are not a list of addresses fail the address read, never leave
+/// the ClusterIP alone (issue #64).
+#[test]
+fn endpoints_that_cannot_be_read_fail() {
+    fails_when_unparsed(
+        "endpoints-unparsed",
+        "endpointslices-mock-docs.json",
+        &[
+            r#"{"items": [{"endpoints": "10.244.0.7"}]}"#,
+            r#"{"items": [{"endpoints": {"addresses": ["10.244.0.7"]}}]}"#,
+            r#"{"items": [{"endpoints": [{"addresses": [7]}]}]}"#,
+        ],
+        "the probe ran: could not read the servers' addresses",
+    );
+}
+
+/// A version or node read of two JSON objects is not read, though jq would take the last
+/// (issue #64).
+#[test]
+fn versions_read_as_more_than_one_object_fail() {
+    fails_when_unparsed(
+        "version-doubled",
+        "version.json",
+        &[
+            "{\"serverVersion\": {\"gitVersion\": \"v1.36.1\"}}\n{\"serverVersion\": {\"gitVersion\": \"v1.36.1\"}}\n",
+        ],
+        "the Kubernetes version is recorded: could not read",
+    );
+    fails_when_unparsed(
+        "node-doubled",
+        "node.json",
+        &[
+            "{\"status\": {\"nodeInfo\": {\"osImage\": \"Debian\", \"kubeletVersion\": \"v1.36.1\", \"containerRuntimeVersion\": \"containerd://2.1.1\"}}}\n\
+           {\"status\": {\"nodeInfo\": {\"osImage\": \"Debian\", \"kubeletVersion\": \"v1.36.1\", \"containerRuntimeVersion\": \"containerd://2.1.1\"}}}\n",
+        ],
+        &format!("the node image of {NODE} is recorded: could not read"),
+    );
+}
+
 #[test]
 fn it_refuses_to_run_without_a_server_audience_before_calling_anything() {
     require(&["bash"]);

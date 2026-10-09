@@ -2734,6 +2734,20 @@ mutate("route-check-pods-json-unchecked", "an empty or doubled pod list counts a
        """ || ! json_object "$pods" ||""", " ||")
 mutate("route-check-probe-pod-json-unchecked", "an empty or doubled pod read while waiting counts as the probe still running", ROUTE_CHECK,
        """ && json_object "$pod_now" &&""", " &&")
+# #64: projected sources, endpoints, and the version and node reads are validated, not skipped.
+mutate("route-check-secret-sources-unchecked", "projected sources that are not a list count as none in the Secret check", ROUTE_CHECK,
+       "any(sources; .secret)", "any(.projected.sources[]?; .secret)")
+mutate("route-check-configmap-sources-unchecked", "projected sources that are not a list count as none in the ConfigMap scan", ROUTE_CHECK,
+       "(sources | .configMap.name // empty)", "(.projected.sources[]? | .configMap.name // empty)")
+mutate("route-check-audience-sources-unchecked", "projected sources that are not a list count as no token", ROUTE_CHECK,
+       ".name as $v | sources\n", ".name as $v | .projected.sources[]?\n")
+mutate("route-check-endpoints-unchecked", "endpoints that are not a list are skipped, leaving the ClusterIP alone", ROUTE_CHECK,
+       """(.endpoints // []) | if type == "array" then .[] else error("endpoints are not a list") end""", ".endpoints[]?")
+mutate("route-check-version-json-unchecked", "a version read of two objects is read as the last", ROUTE_CHECK,
+       """ && json_object "$version" &&""", " &&")
+mutate("route-check-node-json-unchecked", "a node read of two objects is read as the last", ROUTE_CHECK,
+       """ && json_object "$node" &&""", " &&")
+
 # The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
 # tests/route_check.rs.
 PROBE = "deploy/route-check/probe.sh"
