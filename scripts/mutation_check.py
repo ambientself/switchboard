@@ -2494,6 +2494,66 @@ mutate("demo-policy-in-base", "the base applies the network policy before the di
        "  - workloads.yaml\n", "  - workloads.yaml\n  - ../policy\n")
 mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
        "35078c7e636169b1", "35078c7e636169b2")
+# #47: the gateway's call before the policy, and the rest of decision 0010's control 1.
+mutate("demo-before-policy-no-gateway-read", "before the policy, the gateway's call to the server is not made", WORKLOAD,
+       '  expect_allowed "$(call "$TOKEN" "$READ_TOOL" "{\\"project\\":\\"$OWN_PROJECT\\",\\"document\\":\\"$DOCUMENT\\"}")" "before policy: read own project through the gateway"\n', "")
+mutate("demo-before-policy-own-project-optional", "before-policy runs without OWN_PROJECT", WORKLOAD,
+       '  before-policy) : "${OWN_PROJECT:?}"; before_policy ;;\n', "  before-policy) before_policy ;;\n")
+mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
+       "                - {name: OWN_PROJECT, value: borealis}\n", "")
+mutate("demo-kind-accepted-count-6", "the kind bearer check still expects 6 calls, without the before-policy reads", DRIVER,
+       '"$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 8 accepted\n',
+       '"$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 6 accepted\n')
+mutate("demo-operator-checks-no-attach", "attach is not checked", DRIVER,
+       "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec portforward proxy; do\n")
+mutate_all("demo-operator-checks-no-impersonate", "impersonation is not checked",
+           (DRIVER, '    for resource in users groups; do\n      can_i_no "$team" impersonate "$resource"\n    done\n'
+                    '    sar_no "$team" impersonate authentication.k8s.io uids\n'
+                    '    sar_no "$team" impersonate authentication.k8s.io userextras scopes\n', ""),
+           (DRIVER, '      can_i_no "$team" impersonate serviceaccounts -n "$ns"\n', ""))
+mutate("demo-operator-checks-one-namespace", "the team's own namespace is not checked", DRIVER,
+       '    for ns in mock-docs switchboard "$team"; do\n', "    for ns in mock-docs switchboard; do\n")
+mutate("demo-operator-checks-unknown-resource-passes", "a can-i about a resource the API does not serve passes on its no", DRIVER,
+       """    *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\\n'*}" ;;\n""", "")
+mutate("demo-operator-checks-review-any-answer", "a SubjectAccessReview passes whatever it answers", DRIVER,
+       "    false) answer=no ;;\n    true) answer=yes ;;\n", "    *) answer=no ;;\n")
+mutate("demo-operator-checks-review-core-group", "the SubjectAccessReview asks about the core group, which no rule for impersonating a UID names", DRIVER,
+       "resourceAttributes: {verb: $verb, group: $group,", 'resourceAttributes: {verb: $verb, group: "",')
+
+# The route check's operator step (deploy/route-check), watched by tests/route_check.rs.
+ROUTE_CHECK = "deploy/route-check/route-check.sh"
+mutate("route-check-enforcement-unchecked", "kindnet with network policy off passes", ROUTE_CHECK,
+       """    off) fail "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""",
+       """    off) pass "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""")
+mutate("route-check-permissions-family-dropped", "the impersonation rows are gone from the permissions list", "deploy/route-check/permissions.tsv",
+       "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n"
+       "impersonate\tuids.authentication.k8s.io\t-\tcluster\nimpersonate\tuserextras.authentication.k8s.io\tscopes\tcluster\n", "")
+mutate("route-check-projected-audience-unchecked", "a projected token for a server's audience passes", ROUTE_CHECK,
+       """        if [ "$audience" = "$server" ]; then bad+=("$audience"); fi""", "        :")
+mutate("route-check-probe-wait-unbounded", "the step waits for the probe for ever", ROUTE_CHECK,
+       """    if [ "$SECONDS" -ge "$deadline" ]; then break; fi\n""", "")
+mutate("route-check-evaluation-error-settled", "a review not allowed with an evaluationError counts as a no", ROUTE_CHECK,
+       """\n                     and (.status.allowed or (.status.evaluationError // "") == ""))""", ")")
+mutate("route-check-version-unread-passes", "an unread Kubernetes version fails nothing", ROUTE_CHECK,
+       '    fail "the Kubernetes version is recorded: could not read"', "    :")
+mutate("route-check-node-unread-passes", "an unread node image fails nothing", ROUTE_CHECK,
+       '    fail "the node image of ${NODE:-its node} is recorded: could not read"', "    :")
+mutate("route-check-akamai-docs-shape-missed", "the Akamai pattern misses the docs examples' shape", "deploy/route-check/token-patterns.txt",
+       "akab-[A-Za-z0-9]{5,}-[A-Za-z0-9]{5,}", "akab-[A-Za-z0-9]{16}-[A-Za-z0-9]{16}")
+# What the step read but could not parse fails as could not read, never as nothing to check.
+mutate("route-check-configmap-parse-unchecked", "a ConfigMap whose keys jq cannot list counts as empty", ROUTE_CHECK,
+       """<<<"$cm"); then""", """<<<"$cm" || true); then""")
+mutate("route-check-configmap-json-unchecked", "an empty or doubled ConfigMap read counts as empty", ROUTE_CHECK,
+       """ || ! json_object "$cm" ||""", " ||")
+mutate("route-check-kindnet-container-parse-unchecked", "kindnetd flags jq cannot read count as no flag", ROUTE_CHECK,
+       """<<<"$container"); then""", """<<<"$container" || true); then""")
+mutate("route-check-audiences-parse-unchecked", "projected volumes jq cannot read count as no token", ROUTE_CHECK,
+       """<<<"$POD_JSON") ||\n    ! count=$(jq length <<<"$AUDIENCES")""",
+       """<<<"$POD_JSON" || true) ||\n    ! count=$(jq length <<<"$AUDIENCES")""")
+mutate("route-check-pods-json-unchecked", "an empty or doubled pod list counts as no running pod", ROUTE_CHECK,
+       """ || ! json_object "$pods" ||""", " ||")
+mutate("route-check-probe-pod-json-unchecked", "an empty or doubled pod read while waiting counts as the probe still running", ROUTE_CHECK,
+       """ && json_object "$pod_now" &&""", " &&")
 
 
 # --- gateway: the first slice from files ---------------------------------------------------
@@ -2620,7 +2680,7 @@ mutate("dev-issuer-no-subject", "the development issuer starts with no subjects"
 mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
        '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
 mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
-       'docs-credential.sha256")" 6 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
+       'docs-credential.sha256")" 8 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
 mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
        "\n.claude\n", "\n")
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
@@ -2687,7 +2747,7 @@ mutate("demo-driver-secrets-get-only", "only get is checked on secrets and confi
 mutate("demo-driver-no-node-proxy", "the node proxy is not checked", DRIVER,
        '      can_i_no "$team" "$verb" nodes --subresource=proxy\n', "      :\n")
 mutate("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked", DRIVER,
-       "        for subresource in exec portforward proxy; do\n", "        for subresource in exec; do\n")
+       "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec attach; do\n")
 mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", DRIVER,
        '        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"\n', "")
 mutate("demo-driver-no-team-b-probe", "team-b has no pre-policy probe", DRIVER,

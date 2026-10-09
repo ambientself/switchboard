@@ -8,7 +8,8 @@
 #   full           (default) initialize, tools/list, an allowed read, a denied read, a call that
 #                  names no project, identity failures, and, when DIRECT_URL is set, the direct
 #                  call to the server that network policy must stop
-#   before-policy  call DIRECT_URL with this workload's own token; the server must answer 401
+#   before-policy  call DIRECT_URL with this workload's own token; the server must answer 401.
+#                  Then one allowed read of OWN_PROJECT through the gateway, from the same pod
 #   refused        this workload's own token must be refused (a ServiceAccount not in the
 #                  team manifest)
 #   audit-down     one allowed read while the audit database is unavailable; the gateway must
@@ -190,6 +191,8 @@ before_policy() {
   code=$?
   check "$code" 0 "before policy: the direct call connects ($DIRECT_URL)"
   check "$status" 401 "before policy: the server refuses the workload's own token"
+  # The positive control: the gateway's call to the same server succeeds.
+  expect_allowed "$(call "$TOKEN" "$READ_TOOL" "{\"project\":\"$OWN_PROJECT\",\"document\":\"$DOCUMENT\"}")" "before policy: read own project through the gateway"
 }
 
 refused() {
@@ -216,7 +219,7 @@ withdrawn() {
 
 case "$MODE" in
   full) : "${OWN_PROJECT:?}" "${OTHER_PROJECT:?}"; full ;;
-  before-policy) before_policy ;;
+  before-policy) : "${OWN_PROJECT:?}"; before_policy ;;
   refused) refused ;;
   audit-down) : "${OWN_PROJECT:?}"; audit_down ;;
   withdrawn) : "${OWN_PROJECT:?}"; withdrawn ;;
