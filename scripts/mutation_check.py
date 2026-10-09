@@ -2260,7 +2260,8 @@ mutate("pg-complete-once-accepts-list-row", "the trigger tests only the decision
        "    IF OLD.decision IS DISTINCT FROM 'allow' THEN\n",
        "    IF OLD.decision <> 'allow' THEN\n")
 mutate("pg-set-times-gives-list-deadline", "the trigger that sets the times gives a list row a deadline", PG_ROW_DEADLINE,
-       "    NEW.deadline := CASE WHEN NEW.kind = 'call'\n", "    NEW.deadline := CASE WHEN true\n")
+       "        THEN NEW.begun_at + NEW.allowance_ms * interval '1 millisecond' END;\n",
+       "        THEN NEW.begun_at + NEW.allowance_ms * interval '1 millisecond' ELSE NEW.begun_at END;\n")
 mutate("pg-kind-shape-removed", "a row may hold the columns of either kind, or neither", PG_LIST_ROWS,
        "    ADD CONSTRAINT kind_shape CHECK (\n", "    ADD CONSTRAINT kind_shape CHECK (true OR\n")
 mutate("pg-kind-shape-list-null-hole", "a list row with no tools passes kind_shape, whose test of them is NULL", PG_LIST_ROWS,
