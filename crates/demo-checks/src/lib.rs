@@ -9,6 +9,7 @@
 //!   to count every failure.
 //! - `tests/manifests.rs` holds the Compose file and the kind manifests to what the demo claims:
 //!   only the gateway is published, and only on loopback; the network policy admits only the
-//!   gateway; each dummy credential's hash matches it.
+//!   gateway; in kind the gateway presents its own projected token and mock-docs accepts only
+//!   that identity; Compose's dummy credential's hash matches it.
 //!
 //! The scripts need `sh`, `bash`, `curl`, `jq` and `awk`, which CI's runners have.

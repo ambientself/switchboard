@@ -393,6 +393,7 @@ dependencies = [
  "connector-proxy",
  "gateway",
  "gateway-core",
+ "mock-docs-server",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

@@ -131,21 +131,197 @@ fn the_base_has_no_network_policy() {
 
 #[test]
 fn each_dummy_credentials_hash_matches_it() {
-    for dir in [
-        "deploy/compose/dummy-credentials",
-        "deploy/kind/base/dummy-credentials",
-    ] {
-        let credential = read(&format!("{dir}/docs-credential"));
+    // Only Compose has a dummy credential; in kind the gateway presents a projected token.
+    let dir = "deploy/compose/dummy-credentials";
+    let credential = read(&format!("{dir}/docs-credential"));
+    assert!(
+        credential.starts_with("dummy-"),
+        "{dir}: the credential must be an obvious dummy"
+    );
+    assert_eq!(
+        read(&format!("{dir}/docs-credential.sha256")).trim(),
+        sha256_hex(credential.as_bytes()),
+        "{dir}: mock-docs would refuse the gateway's credential"
+    );
+}
+
+/// The one Deployment in a kind manifest.
+fn only_deployment(path: &str) -> String {
+    let text = read(path);
+    let deployments = documents_with(&text, "kind: Deployment");
+    assert_eq!(deployments.len(), 1, "{path}");
+    deployments[0].to_owned()
+}
+
+/// The text after `prefix` on the one line of `text` that starts with it, without quotes.
+fn value_after<'a>(text: &'a str, prefix: &str) -> &'a str {
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .collect();
+    assert_eq!(lines.len(), 1, "want one line starting `{prefix}`:\n{text}");
+    lines[0].trim_matches('"')
+}
+
+/// The lines of the YAML block that follows the line `header` in `text`: those indented deeper
+/// than it.
+fn block_after(text: &str, header: &str) -> String {
+    let indent = header.len() - header.trim_start().len();
+    let after = text
+        .split_once(&format!("{header}\n"))
+        .unwrap_or_else(|| panic!("no line `{header}`:\n{text}"))
+        .1;
+    after
+        .lines()
+        .take_while(|line| line.len() - line.trim_start().len() > indent)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Decision 0010: in kind the gateway calls mock-docs with a projected token of its own
+/// ServiceAccount, for mock-docs' audience and short-lived, and holds no static credential.
+#[test]
+fn the_kind_gateway_presents_its_own_projected_token_and_holds_no_secret() {
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    let volume = block_after(&gateway, "        - name: mock-docs-token");
+    assert!(
+        volume.starts_with(
+            "          projected:\n            sources:\n              - serviceAccountToken:\n"
+        ),
+        "{volume}"
+    );
+    assert_eq!(
+        volume.matches("              - ").count(),
+        1,
+        "the volume projects one source:\n{volume}"
+    );
+    assert_eq!(
+        value_after(&volume, "                  audience: "),
+        "mock-docs"
+    );
+    assert_eq!(value_after(&volume, "                  path: "), "token");
+    let lifetime = number_after(&volume, "                  expirationSeconds: ", "");
+    assert!(
+        (600..=3600).contains(&lifetime),
+        "the gateway's token lives {lifetime} s; the kubelet's minimum is 600 and the demo's longest 3600"
+    );
+    assert!(gateway.contains(
+        "            - {name: mock-docs-token, mountPath: /var/run/secrets/switchboard/mock-docs, readOnly: true}\n"
+    ));
+    // No Secret volume, nor a Secret projected into one; the database URL comes from a Secret
+    // by secretKeyRef, which is not a credential for mock-docs.
+    for secret in ["secret:", "secretName"] {
         assert!(
-            credential.starts_with("dummy-"),
-            "{dir}: the credential must be an obvious dummy"
-        );
-        assert_eq!(
-            read(&format!("{dir}/docs-credential.sha256")).trim(),
-            sha256_hex(credential.as_bytes()),
-            "{dir}: mock-docs would refuse the gateway's credential"
+            !gateway.contains(secret),
+            "the gateway mounts a Secret:\n{gateway}"
         );
     }
+    assert!(!gateway.contains("automountServiceAccountToken: true"));
+    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
+    let account = documents_with(&accounts, "  name: gateway\n");
+    assert_eq!(account.len(), 1);
+    assert!(account[0].contains("\nautomountServiceAccountToken: false"));
+
+    // The deployment file names the token as the one credential, under the registry's
+    // reference.
+    let config = read("deploy/kind/base/config/gateway.toml");
+    let credentials = config
+        .split_once("[credentials]\n")
+        .expect("a [credentials] section")
+        .1;
+    let entries: Vec<&str> = credentials
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        entries,
+        ["docs-credential = \"/var/run/secrets/switchboard/mock-docs/token\""]
+    );
+
+    // The dummy credential and the Secrets made from it are gone.
+    assert!(
+        !common::repo()
+            .join("deploy/kind/base/dummy-credentials")
+            .exists()
+    );
+    let kustomization = read("deploy/kind/base/kustomization.yaml");
+    assert!(
+        !kustomization.contains("docs-credential"),
+        "{kustomization}"
+    );
+    assert!(
+        !kustomization.contains("dummy-credentials"),
+        "{kustomization}"
+    );
+}
+
+/// mock-docs in kind accepts only the gateway's ServiceAccount, signed by the cluster's issuer,
+/// for its own audience, and holds no static credential.
+#[test]
+fn the_kind_mock_docs_accepts_only_the_gateways_identity() {
+    use mock_docs_server::config;
+
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    let subject = format!(
+        "system:serviceaccount:{}:{}",
+        value_after(&gateway, "  namespace: "),
+        value_after(&gateway, "      serviceAccountName: "),
+    );
+    assert_eq!(subject, "system:serviceaccount:switchboard:gateway");
+    let audience = value_after(&gateway, "                  audience: ").to_owned();
+    let issuer = value_after(&read("deploy/kind/base/config/gateway.toml"), "issuer = ").to_owned();
+    let driver = read("deploy/demo/demo.sh");
+    assert_eq!(value_after(&driver, "KIND_ISSUER="), issuer);
+    assert_eq!(value_after(&driver, "KIND_GATEWAY_SUBJECT="), subject);
+
+    let mock_docs = only_deployment("deploy/kind/base/mock-docs.yaml");
+    let env: Vec<(String, String)> = block_after(&mock_docs, "          env:")
+        .lines()
+        .map(|line| {
+            let pair = line
+                .trim()
+                .strip_prefix("- {name: ")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .unwrap_or_else(|| panic!("an env line of another shape: {line}"));
+            let (name, value) = pair.split_once(", value: ").expect("a name and a value");
+            (name.to_owned(), value.trim_matches('"').to_owned())
+        })
+        .collect();
+    let jwks = "/etc/mock-docs/issuer/jwks.json";
+    let want: Vec<(String, String)> = [
+        (config::LISTEN_VAR, "0.0.0.0:8080"),
+        (config::JWT_ISSUER_VAR, issuer.as_str()),
+        (config::JWT_AUDIENCE_VAR, audience.as_str()),
+        (config::JWT_SUBJECT_VAR, subject.as_str()),
+        (config::JWKS_FILE_VAR, jwks),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect();
+    assert_eq!(env, want);
+    assert_eq!(audience, "mock-docs");
+    for name in config::STATIC_VARS {
+        assert!(!mock_docs.contains(name), "mock-docs sets {name}");
+    }
+    for secret in ["secret:", "secretName", "secretKeyRef"] {
+        assert!(
+            !mock_docs.contains(secret),
+            "mock-docs reads a Secret:\n{mock_docs}"
+        );
+    }
+
+    // The keys are the cluster's, which demo.sh copies into mock-docs' namespace too.
+    assert!(mock_docs.contains(
+        "            - {name: issuer-keys, mountPath: /etc/mock-docs/issuer, readOnly: true}\n"
+    ));
+    assert!(
+        mock_docs.contains(
+            "        - name: issuer-keys\n          configMap: {name: cluster-issuer-keys}"
+        )
+    );
+    assert!(driver.contains(
+        "  for ns in switchboard mock-docs; do\n    k -n \"$ns\" create configmap cluster-issuer-keys --from-file=jwks.json="
+    ));
 }
 
 #[test]

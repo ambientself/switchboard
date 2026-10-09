@@ -385,24 +385,138 @@ fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
     let kind = 2 * (before_policy + full + full_direct);
     assert_eq!((compose, kind), (4, 8));
 
+    // In kind each before-policy Job makes one direct call to mock-docs with the workload's own
+    // token, which the server refuses; after the policy no direct call reaches it.
+    let before_policy_body = workload
+        .split_once("\nbefore_policy() {\n")
+        .expect("workload.sh has before_policy()")
+        .1;
+    let before_policy_body = &before_policy_body[..before_policy_body.find("\n}\n").unwrap()];
+    assert_eq!(
+        before_policy_body.matches(" \"$DIRECT_URL\" \\\n").count(),
+        1
+    );
+    assert!(before_policy_body.contains("    -H \"Authorization: Bearer $TOKEN\""));
+
     let driver = common::read("deploy/demo/demo.sh");
-    for call in [
-        format!(
-            "\"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
-        ),
-        format!(
-            "\"$(cat \"$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256\")\" {kind} accepted\n"
-        ),
-    ] {
+    let probes = driver.matches(" mock-workload before-policy\n").count();
+    assert_eq!(probes, 2);
+    let compose_call = format!(
+        "  check_server_bearers \"$(mock_docs_log)\" \\\n    \"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
+    );
+    let kind_call = format!(
+        "  check_server_callers \"$(mock_docs_log)\" \"$KIND_GATEWAY_SUBJECT\" {kind} {probes}\n"
+    );
+    for call in [compose_call, kind_call] {
         assert_eq!(driver.matches(&call).count(), 1, "{call}");
     }
-    assert_eq!(
-        driver
-            .matches("  check_server_bearers \"$(mock_docs_log)\" \\\n")
-            .count(),
-        2,
-        "both bearer checks read only this run's mock-docs log"
+    // Compose's is the only bearer check, and kind's the only caller check.
+    assert_eq!(driver.matches("  check_server_bearers \"").count(), 1);
+    assert_eq!(driver.matches("  check_server_callers \"").count(), 1);
+}
+
+/// A line of mock-docs in its JWT mode: one request, accepted with `caller` or refused for
+/// `refusal`.
+fn jwt_line(accepted: bool, caller: Option<&str>, refusal: Option<&str>) -> String {
+    json!({
+        "event": "request",
+        "http_method": "POST",
+        "path": "/mcp",
+        "bearer_sha256": "35078c7e6361",
+        "accepted": accepted,
+        "caller": caller,
+        "refusal": refusal,
+    })
+    .to_string()
+}
+
+/// Runs check_server_callers on `lines` for the gateway's subject, 8 calls and 2 refusals.
+fn check_callers(lines: &[String]) -> Run {
+    sourced(&format!(
+        "check_server_callers '{}' \"$KIND_GATEWAY_SUBJECT\" 8 2\nFINISHED=1\nresult 0",
+        lines.join("\n")
+    ))
+}
+
+#[test]
+fn the_server_caller_check_admits_only_the_gateways_identity() {
+    let gateway = jwt_line(
+        true,
+        Some("system:serviceaccount:switchboard:gateway"),
+        None,
     );
+    let direct = jwt_line(false, None, Some("wrong_audience"));
+    let boot =
+        r#"{"event":"boot","mode":"jwt","subject":"system:serviceaccount:switchboard:gateway"}"#;
+    let run_of = |gateway_calls: usize, extra: &[String]| {
+        let mut lines = vec![boot.to_owned(), direct.clone(), direct.clone()];
+        lines.extend(std::iter::repeat_n(gateway.clone(), gateway_calls));
+        lines.extend_from_slice(extra);
+        check_callers(&lines)
+    };
+
+    let run = run_of(8, &[]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 4, "{}", run.transcript());
+
+    // A second caller from the trusted issuer, and a token accepted with no caller at all, as
+    // the static mode logs it.
+    let other = jwt_line(
+        true,
+        Some("system:serviceaccount:team-a:mock-workload"),
+        None,
+    );
+    let fake_gateway = jwt_line(
+        true,
+        Some("system:serviceaccount:switchboard:gateway x"),
+        None,
+    );
+    let static_line = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#;
+    for extra in [other, fake_gateway, static_line.to_owned()] {
+        let run = run_of(8, std::slice::from_ref(&extra));
+        assert!(
+            run.failed("mock-docs accepted no other caller, and no token without one"),
+            "{extra}\n{}",
+            run.transcript()
+        );
+    }
+
+    // One fewer than the calls the gateway allowed, or one more.
+    for calls in [7, 9] {
+        let run = run_of(calls, &[]);
+        assert!(
+            run.failed("on exactly the 8 calls the gateway allowed"),
+            "{calls}\n{}",
+            run.transcript()
+        );
+    }
+
+    // A refusal the direct calls do not explain, or a direct call refused for another reason.
+    let run = run_of(8, &[jwt_line(false, None, Some("wrong_subject"))]);
+    assert!(
+        run.failed("mock-docs refused nothing else"),
+        "{}",
+        run.transcript()
+    );
+    let mut lines = vec![direct.clone(), jwt_line(false, None, Some("expired"))];
+    lines.extend(std::iter::repeat_n(gateway.clone(), 8));
+    let run = check_callers(&lines);
+    assert!(
+        run.failed("mock-docs refused the 2 direct calls' tokens as meant for another audience"),
+        "{}",
+        run.transcript()
+    );
+}
+
+#[test]
+fn the_kind_identity_failure_count_reads_only_this_runs_gateway_log() {
+    // A run on an existing cluster may reuse the gateway's pod, whose whole log still holds an
+    // earlier run's identity failures.
+    let driver = common::read("deploy/demo/demo.sh");
+    assert!(driver.contains(
+        "  gateway_logs=$(k -n switchboard logs --since-time \"$LOG_SINCE\" deploy/gateway)\n"
+    ));
+    assert_eq!(driver.matches("gateway_logs=").count(), 1);
 }
 
 #[test]

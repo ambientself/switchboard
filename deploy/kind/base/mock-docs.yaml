@@ -1,5 +1,8 @@
-# The mock docs server (#14a). It accepts only the gateway's credential, of which it holds
-# only the sha256, and logs the sha256 prefix of every bearer it receives.
+# The mock docs server (#14a), in its JWT mode (decision 0010). It accepts only a token the
+# cluster signed for the gateway's ServiceAccount, for audience mock-docs, and in date. It checks
+# the signature against the cluster's keys, which demo.sh copies once into ConfigMap
+# mock-docs/cluster-issuer-keys, and holds no credential of its own. Each request's log line
+# names the verified caller, or why the token was refused.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,7 +34,10 @@ spec:
           command: ["mock-docs-server"]
           env:
             - {name: MOCK_DOCS_LISTEN, value: "0.0.0.0:8080"}
-            - {name: MOCK_DOCS_TOKEN_SHA256_FILE, value: /var/run/secrets/mock-docs/docs-credential.sha256}
+            - {name: MOCK_DOCS_JWT_ISSUER, value: "https://kubernetes.default.svc.cluster.local"}
+            - {name: MOCK_DOCS_JWT_AUDIENCE, value: mock-docs}
+            - {name: MOCK_DOCS_JWT_SUBJECT, value: "system:serviceaccount:switchboard:gateway"}
+            - {name: MOCK_DOCS_JWKS_FILE, value: /etc/mock-docs/issuer/jwks.json}
           ports:
             - containerPort: 8080
               name: http
@@ -44,13 +50,10 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
           volumeMounts:
-            - name: credential-sha256
-              mountPath: /var/run/secrets/mock-docs
-              readOnly: true
+            - {name: issuer-keys, mountPath: /etc/mock-docs/issuer, readOnly: true}
       volumes:
-        - name: credential-sha256
-          secret:
-            secretName: docs-credential-sha256
+        - name: issuer-keys
+          configMap: {name: cluster-issuer-keys}
 ---
 apiVersion: v1
 kind: Service

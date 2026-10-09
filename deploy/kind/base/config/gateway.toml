@@ -36,6 +36,7 @@ mode = "postgres"
 url_env = "SWITCHBOARD_DATABASE_URL"
 
 [credentials]
-# Secret switchboard/docs-credential, a dummy value. The proxy sends it upstream; the workload
-# never sees it.
-docs-credential = "/var/run/secrets/switchboard/docs-credential"
+# The gateway's own projected ServiceAccount token, for audience mock-docs (gateway.yaml). The
+# kubelet rotates it in place; the proxy reads it again on every call and sends it upstream. The
+# workload never sees it. The reference keeps its name, so the registry is the same as Compose's.
+docs-credential = "/var/run/secrets/switchboard/mock-docs/token"

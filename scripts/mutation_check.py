@@ -2600,9 +2600,9 @@ mutate("demo-before-policy-own-project-optional", "before-policy runs without OW
        '  before-policy) : "${OWN_PROJECT:?}"; before_policy ;;\n', "  before-policy) before_policy ;;\n")
 mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
        "                - {name: OWN_PROJECT, value: borealis}\n", "")
-mutate("demo-kind-accepted-count-6", "the kind bearer check still expects 6 calls, without the before-policy reads", DRIVER,
-       '"$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 8 accepted\n',
-       '"$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 6 accepted\n')
+mutate("demo-kind-accepted-count-6", "the kind caller check still expects 6 calls, without the before-policy reads", DRIVER,
+       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2\n',
+       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 6 2\n')
 mutate("demo-operator-checks-no-attach", "attach is not checked", DRIVER,
        "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec portforward proxy; do\n")
 mutate_all("demo-operator-checks-no-impersonate", "impersonation is not checked",
@@ -2782,7 +2782,7 @@ mutate("dev-issuer-no-subject", "the development issuer starts with no subjects"
 mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
        '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
 mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
-       'docs-credential.sha256")" 8 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
+       '"$KIND_GATEWAY_SUBJECT" 8 2\n', '"$KIND_GATEWAY_SUBJECT" 4 2\n')
 mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
        "\n.claude\n", "\n")
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
@@ -2865,6 +2865,28 @@ mutate("demo-kind-tcp-readiness-probe", "the kind probe only opens a connection,
        "            tcpSocket:\n              port: http\n")
 mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
        "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
+# #47: in kind the gateway presents its own projected token, and mock-docs accepts only that
+# identity (decision 0010).
+KIND_GATEWAY = "deploy/kind/base/gateway.yaml"
+KIND_MOCK_DOCS = "deploy/kind/base/mock-docs.yaml"
+mutate("demo-kind-gateway-still-mounts-docs-credential", "the kind gateway mounts a static credential from a Secret", KIND_GATEWAY,
+       "          projected:\n            sources:\n              - serviceAccountToken:\n"
+       "                  audience: mock-docs\n                  expirationSeconds: 600\n                  path: token\n",
+       "          secret: {secretName: docs-credential}\n")
+mutate("demo-kind-gateway-token-long-lived", "the gateway's token for mock-docs lives a day", KIND_GATEWAY,
+       "                  expirationSeconds: 600\n", "                  expirationSeconds: 86400\n")
+mutate("demo-kind-mock-docs-any-subject", "mock-docs accepts a workload's ServiceAccount", KIND_MOCK_DOCS,
+       '"system:serviceaccount:switchboard:gateway"', '"system:serviceaccount:team-a:mock-workload"')
+mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys only for the gateway", DRIVER,
+       "  for ns in switchboard mock-docs; do\n", "  for ns in switchboard; do\n")
+mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
+           (DRIVER, """'$1 == "accepted" && $2 == subject && NF == 2 { n++ }""", """'$1 == "accepted" { n++ }"""),
+           (DRIVER, """'$1 == "accepted" && !($2 == subject && NF == 2) { n++ }""", """'$1 == "accepted" && 0 { n++ }"""))
+mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls do not explain passes", DRIVER,
+       '  check "$refused" "$refusals" "mock-docs refused nothing else"\n', "")
+mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure count reads the gateway's whole log", DRIVER,
+       '  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" deploy/gateway)\n',
+       "  gateway_logs=$(k -n switchboard logs deploy/gateway)\n")
 
 # --- first slice: the Postgres store as PR #39 has it -----------------------------------------
 # The gateway logs each finish the store reports given up, and the demo's database, set up by

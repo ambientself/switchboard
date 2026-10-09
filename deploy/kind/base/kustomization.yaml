@@ -1,10 +1,12 @@
 # The kind demo, without network policy. demo.sh applies this first, shows that a direct call
 # to the mock docs server connects, and only then applies ../policy.
 #
-# Before applying this, demo.sh creates ConfigMap switchboard/cluster-issuer-keys from the
-# cluster's own issuer (kubectl get --raw /openid/v1/jwks). The gateway will not start without it.
+# Before applying this, demo.sh creates ConfigMap cluster-issuer-keys, in switchboard and in
+# mock-docs, from the cluster's own issuer (kubectl get --raw /openid/v1/jwks). Neither the
+# gateway nor mock-docs will start without it.
 #
-# Every password and credential here is a dummy value for this demo.
+# The gateway has no static credential for mock-docs: it presents a projected token of its own
+# ServiceAccount (gateway.yaml). Every password here is a dummy value for this demo.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -30,15 +32,6 @@ configMapGenerator:
     options:
       disableNameSuffixHash: true
 secretGenerator:
-  - name: docs-credential
-    namespace: switchboard
-    files:
-      - docs-credential=dummy-credentials/docs-credential
-  # The mock docs server holds only the sha256 of the gateway's credential.
-  - name: docs-credential-sha256
-    namespace: mock-docs
-    files:
-      - docs-credential.sha256=dummy-credentials/docs-credential.sha256
   - name: database
     namespace: switchboard
     literals:
