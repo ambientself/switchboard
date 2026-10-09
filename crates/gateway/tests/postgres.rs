@@ -20,6 +20,7 @@ use files::{
 };
 use gateway::path::RequestPath;
 use gateway::start::prepare;
+use gateway::undeclared_argument;
 use gateway_identity::SystemClock;
 use mock_docs_server::{AcceptedCredential, Config};
 use serde_json::{Value, json};
@@ -192,7 +193,8 @@ async fn run(
         "{}",
         denied.body
     );
-    let refused = call(
+    // An undeclared argument is a tool error, recorded as outcome `error`, with nothing sent.
+    let failed = call(
         &path,
         &token,
         LIST_TOOL,
@@ -200,11 +202,18 @@ async fn run(
     )
     .await;
     assert_eq!(
-        refused.body["error"]["code"],
-        json!(-32001),
+        failed.body["result"]["isError"],
+        json!(true),
         "{}",
-        refused.body
+        failed.body
     );
+    assert_eq!(
+        failed.body["result"]["content"][0]["text"],
+        json!(undeclared_argument(LIST_TOOL)),
+        "{}",
+        failed.body
+    );
+    assert!(failed.body.get("error").is_none(), "{}", failed.body);
 
     // Each row names the project its call named, as `system/kind/identifier`, so an allowed
     // read shows which project it read and a denial which one it refused.
@@ -244,9 +253,9 @@ async fn run(
             LIST_TOOL,
             "allow",
             "",
-            "refused",
+            "error",
             "",
-            "does not declare",
+            "",
             "docs/project/atlas",
         ],
     ];
