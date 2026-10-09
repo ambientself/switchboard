@@ -245,6 +245,8 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -391,6 +393,7 @@ dependencies = [
  "connector-proxy",
  "gateway",
  "gateway-core",
+ "mock-docs-server",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

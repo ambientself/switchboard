@@ -16,6 +16,8 @@ connector-proxy = { path = "../connector-proxy" }
 # The gateway's readiness removal, which the probe and the grace period are held to.
 gateway = { path = "../gateway" }
 gateway-core = { path = "../gateway-core" }
+# The names of the mock server's settings, which the kind manifest must use.
+mock-docs-server = { path = "../mock-docs-server" }
 serde_json = "1"
 sha2 = "0.10"
 # Sets up the demo's database from its scripts on a throwaway server, when one is given.

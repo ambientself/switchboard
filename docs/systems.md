@@ -84,7 +84,7 @@ or any other subject.
 | Akamai | Configuration and delivery data. | Built-in, reads only. | Yes, EdgeGrid API client. | Yes, per API. |
 | Salesforce | Read records. | Not yet. | No for the hosted server. Yes for the REST API. | Yes. |
 | MongoDB Atlas | Read cluster and collection data. | Proxy the vendor's hosted server. | Yes, service account. | Yes. |
-| Self-built | Whatever an Org team exposes. | Proxied, by definition. | The server accepts only the gateway's own workload identities, by a token with the server as audience (decision 0010). Milestone 2 builds the first, for the mock server. | Each tool's classification is assigned by a person. |
+| Self-built | Whatever an Org team exposes. | Proxied, by definition. | The server accepts only the gateway's own workload identities, by a token with the server as audience (decision 0010). Milestone 2 builds the first, for the mock server: in kind it accepts only `system:serviceaccount:switchboard:gateway`, by a projected token for audience `mock-docs`. | Each tool's classification is assigned by a person. |
 
 "Service identity: yes" is what the vendor documents. It stays unproven until the test named in
 each section has been run.

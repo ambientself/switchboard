@@ -15,9 +15,9 @@
 //!   1 MiB of text. A document is found only by its project and name together. A missing
 //!   project or document is a tool result with `isError: true`.
 //! - **One credential.** Every request on every path must carry `Authorization: Bearer` with
-//!   an accepted token, or it gets a 401 before its body is read. The server runs in one of two
-//!   modes ([`Credential`]). In the static mode it accepts one token and holds only its
-//!   SHA-256. In the JWT mode it accepts the tokens of one subject, signed with RS256 by a key
+//!   an accepted token, or it gets a 401 from its headers alone: its body is never read, nor
+//!   waited for. The server runs in one of two modes ([`Credential`]). In the static mode it
+//!   accepts one token and holds only its SHA-256. In the JWT mode it accepts the tokens of one subject, signed with RS256 by a key
 //!   in a fixed JWK set, from one issuer, for one audience, and in date; see [`JwtVerifier`].
 //! - **A log line per request.** Each line is a JSON object on standard output with
 //!   `bearer_sha256`, the first 12 hex digits of the SHA-256 of the bearer the request carried

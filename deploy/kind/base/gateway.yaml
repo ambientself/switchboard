@@ -1,7 +1,9 @@
 # The gateway. It verifies projected ServiceAccount tokens against the cluster's own issuer
 # keys (ConfigMap cluster-issuer-keys, which demo.sh creates), writes audit rows to Postgres as
-# switchboard_gateway, and forwards allowed calls to mock-docs with its own dummy credential.
-# Its deployment file (ConfigMap gateway-config) names everything else it reads.
+# switchboard_gateway, and forwards allowed calls to mock-docs with a projected token of its
+# own ServiceAccount, for audience mock-docs (decision 0010). The kubelet replaces that token
+# before it expires and the gateway reads it again on every call. There is no static
+# credential. Its deployment file (ConfigMap gateway-config) names everything else it reads.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -85,7 +87,7 @@ spec:
             # No subPath, so ConfigMap edits reach the running gateway.
             - {name: registry, mountPath: /etc/switchboard/registry, readOnly: true}
             - {name: issuer-keys, mountPath: /etc/switchboard/issuer, readOnly: true}
-            - {name: docs-credential, mountPath: /var/run/secrets/switchboard, readOnly: true}
+            - {name: mock-docs-token, mountPath: /var/run/secrets/switchboard/mock-docs, readOnly: true}
       volumes:
         - name: config
           configMap: {name: gateway-config}
@@ -93,8 +95,16 @@ spec:
           configMap: {name: registry}
         - name: issuer-keys
           configMap: {name: cluster-issuer-keys}
-        - name: docs-credential
-          secret: {secretName: docs-credential}
+        # The gateway's identity for mock-docs. automountServiceAccountToken stays false: a
+        # projected volume does not need it, and the default API token is not mounted. 600 s is
+        # the kubelet's minimum, so the token is replaced about every 8 minutes.
+        - name: mock-docs-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: mock-docs
+                  expirationSeconds: 600
+                  path: token
 ---
 apiVersion: v1
 kind: Service

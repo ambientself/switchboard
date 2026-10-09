@@ -6,7 +6,7 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-const ALLOWED: [&str; 7] = [
+const ALLOWED: [&str; 8] = [
     "gateway-core",
     "http-body-util",
     "hyper",
@@ -14,6 +14,7 @@ const ALLOWED: [&str; 7] = [
     "serde_json",
     "thiserror",
     "tokio",
+    "tracing",
 ];
 
 fn section(name: &str) -> Vec<String> {

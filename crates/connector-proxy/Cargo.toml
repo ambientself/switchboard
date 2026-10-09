@@ -18,12 +18,15 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
+# Why a call was refused for its credential reaches the gateway's log, not the caller.
+tracing = "0.1"
 
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }
 mock-docs-server = { path = "../mock-docs-server" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

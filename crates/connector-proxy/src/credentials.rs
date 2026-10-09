@@ -5,7 +5,8 @@
 //! file stops the gateway at boot rather than failing its first call. Each file is then read
 //! again on every call, with the same checks, so a token rotated in place, such as a projected
 //! service account token the kubelet replaces, is the one sent. A file that fails those checks
-//! later refuses the call, and nothing is sent.
+//! later refuses the call, and nothing is sent; the connector logs why at warn, naming the
+//! connector and the file but never what it holds.
 //!
 //! The secret never leaves this crate, and the source keeps no copy of it.
 //! [`CredentialSource::credential_for`] hands out a [`CredentialHandle`], which carries only a

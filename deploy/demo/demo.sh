@@ -27,7 +27,9 @@
 #     `"identity":"enforce"` and `"audit":"postgres"`, and one `"event":"identity_failed"` line
 #     per caller refused for identity;
 #   - mock-docs' JSON log lines (crates/mock-docs-server): one per request, with
-#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, and `accepted`;
+#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, and `accepted`. In kind
+#     the server runs in its JWT mode, and each line also has `caller`, the verified subject of
+#     an accepted token, and `refusal`, why a token was refused;
 #   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
 #     switchboard_reader.
 set -euo pipefail
@@ -47,6 +49,8 @@ IMG=switchboard-demo:dev
 IMG_RUN=$IMG
 COMPOSE_FILE=$ROOT/deploy/compose/compose.yaml
 KIND_ISSUER=https://kubernetes.default.svc.cluster.local
+# The gateway's ServiceAccount: the one caller mock-docs accepts in kind (deploy/kind/base).
+KIND_GATEWAY_SUBJECT=system:serviceaccount:switchboard:gateway
 AUDIT_TABLE=switchboard_audit.call_rows
 READ_TOOL=docs__read_document
 
@@ -288,6 +292,31 @@ check_server_bearers() {
   if [ "$scope" = all ]; then
     check "$stray" 0 "mock-docs never received any bearer but the gateway's"
   fi
+}
+
+# check_server_callers LOGS SUBJECT CALLS REFUSALS: what mock-docs received this run in its JWT
+# mode, where each log line names the verified caller of an accepted token, or why a token was
+# refused. Every request it accepted came from SUBJECT, the gateway's ServiceAccount, and CALLS
+# is exactly how many calls the gateway allowed so far: one more means a call it denied reached
+# the server, one fewer that an allowed call did not, or that the log is short. A request
+# accepted with any other caller, or with none (a static token), fails the check. Exactly
+# REFUSALS requests were refused, each as wrong_audience: a token the cluster signed for another
+# audience, the workloads' own on their direct calls before the policy. Any other refusal fails.
+check_server_callers() {
+  local logs=$1 subject=$2 calls=$3 refusals=$4 lines
+  lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
+    | if .accepted == true then "accepted \(.caller // "none")" else "refused \(.refusal // "none")" end')
+  echo "    requests seen by mock-docs, by answer and verified caller or refusal:"
+  printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
+  local gateway other audience refused
+  gateway=$(printf '%s\n' "$lines" | awk -v subject="$subject" '$1 == "accepted" && $2 == subject && NF == 2 { n++ } END { print n + 0 }')
+  other=$(printf '%s\n' "$lines" | awk -v subject="$subject" '$1 == "accepted" && !($2 == subject && NF == 2) { n++ } END { print n + 0 }')
+  audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
+  refused=$(printf '%s\n' "$lines" | awk '$1 == "refused" { n++ } END { print n + 0 }')
+  check "$gateway" "$calls" "mock-docs accepted the gateway's own token ($subject) on exactly the $calls calls the gateway allowed"
+  check "$other" 0 "mock-docs accepted no other caller, and no token without one"
+  check "$audience" "$refusals" "mock-docs refused the $refusals direct calls' tokens as meant for another audience"
+  check "$refused" "$refusals" "mock-docs refused nothing else"
 }
 
 # --- Compose --------------------------------------------------------------------------------
@@ -596,8 +625,12 @@ kind_run() {
   k get --raw /openid/v1/jwks >"$DEMO_DIR/cluster-jwks.json"
   check_at_least "$(jq '.keys | length' "$DEMO_DIR/cluster-jwks.json")" 1 "the cluster published its signing keys"
   k apply -f "$ROOT/deploy/kind/base/namespaces.yaml"
-  k -n switchboard create configmap cluster-issuer-keys --from-file=jwks.json="$DEMO_DIR/cluster-jwks.json" \
-    --dry-run=client -o yaml | k apply -f -
+  # The gateway verifies the workloads' tokens with these keys, and mock-docs the gateway's.
+  local ns
+  for ns in switchboard mock-docs; do
+    k -n "$ns" create configmap cluster-issuer-keys --from-file=jwks.json="$DEMO_DIR/cluster-jwks.json" \
+      --dry-run=client -o yaml | k apply -f -
+  done
 
   step "deploy Postgres, the migration, mock-docs and the gateway, with no network policy"
   # A run on an existing cluster starts from no policy, or the first probe below would mean nothing.
@@ -639,19 +672,20 @@ kind_run() {
   step "operator checks: in mock-docs, the gateway's namespace or its own, neither team's workload may start pods or the controllers that start them, mint tokens, impersonate a ServiceAccount, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create a binding; nor get, list or watch the gateway's or mock-docs' secrets or the gateway's configuration; nor, across the cluster, proxy to a node, impersonate a user, group, UID or extra, bind or escalate a cluster role, or create a cluster binding"
   operator_checks
 
-  step "the server never saw a workload token through the gateway, and no denied call reached it"
-  # The two direct calls before the policy, one per team, carried the workloads' own tokens and
-  # were refused (401); every request the server accepted carried the gateway's credential.
-  # Each team is allowed four calls, so 2 x 4 = 8: before the policy, the read through the
-  # gateway after its direct call; after it, its full run's list and read, and the same pod's
-  # read after its direct call times out. Its other calls are denied, and the stranger is
-  # refused.
-  check_server_bearers "$(mock_docs_log)" \
-    "$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 8 accepted
+  step "mock-docs accepted only the gateway's own identity, and no denied call reached it"
+  # Every request the server accepted carried the gateway's projected token, for audience
+  # mock-docs, and named its ServiceAccount. Each team is allowed four calls, so 2 x 4 = 8:
+  # before the policy, the read through the gateway after its direct call; after it, its full
+  # run's list and read, and the same pod's read after its direct call times out. Its other calls
+  # are denied, and the stranger is refused. The two direct calls before the policy, one per
+  # team, carried the workloads' own projected tokens, for audience switchboard, and were
+  # refused (401) as wrong_audience. After the policy no direct call reaches the server.
+  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2
 
   step "the gateway's view of identity failures (operators only; no audit rows)"
   local gateway_logs
-  gateway_logs=$(k -n switchboard logs deploy/gateway)
+  # Only this run's lines: a run on an existing cluster may reuse the gateway's pod.
+  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" deploy/gateway)
   printf '%s\n' "$gateway_logs" | grep 'identity_failed' | sed 's/^/    /' || echo "    (none)"
   # Two teams refused three ways each (no token, not a token, the default API token), and the
   # stranger once.
