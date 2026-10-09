@@ -83,6 +83,11 @@ name!(
     PolicyRevision
 );
 name!(
+    /// The gateway instance that began an audit row: a pod's name, or a container's. The core
+    /// records it escaped and capped, like the surface, since it comes from the environment.
+    InstanceName
+);
+name!(
     /// The caller's own identifier for one tool call, recorded so its control plane can find
     /// the decision.
     ToolUseId

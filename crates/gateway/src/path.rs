@@ -56,8 +56,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, Connector, IDENTITY_FAILURE,
-    Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide, list_tools,
+    ApprovedTool, CallContext, CallerContext, Classification, Connector, Decision,
+    IDENTITY_FAILURE, Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide,
+    list_tools,
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
@@ -68,7 +69,7 @@ use http::{HeaderMap, Method};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::boot::{GateState, Gates, Reads, Results};
+use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
 use crate::policy::ServedPolicy;
 use crate::proxied::{CheckedArguments, registry_resources};
@@ -329,6 +330,8 @@ impl RequestPath {
         // begin, when there is one, reuses it; it is never made again for the same call.
         let start = RowStart {
             row: AuditRowId::new(Uuid::now_v7().to_string()),
+            instance: gates.instance().clone(),
+            call_deadline_ms: millis(self.call_deadline(&decision)),
         };
         let begun = Instant::now();
         let begin = audit::begin(store, start, decision, arguments, metadata).await;
@@ -451,6 +454,16 @@ impl RequestPath {
         }
     }
 
+    /// The call deadline of the connector serving the tool `decision` approved, which the row's
+    /// deadline includes. A call denied before any tool was found, such as one naming no
+    /// approved tool, runs nothing; its row has [`DEFAULT_CALL_DEADLINE`].
+    fn call_deadline(&self, decision: &Decision) -> Duration {
+        decision
+            .tool()
+            .and_then(|tool| self.inner.gates.registered(&tool.connector))
+            .map_or(DEFAULT_CALL_DEADLINE, |registered| registered.call_deadline)
+    }
+
     /// Design section 6's step 3: the profile, from the configured rules. There is no
     /// delegation verifier yet.
     fn caller_context(
@@ -542,6 +555,10 @@ fn outcome_name(answer: &Answer) -> &'static str {
 /// A duration in whole microseconds, for the log.
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn elapsed_millis(clock: &dyn Clock, since: SystemTime) -> u64 {

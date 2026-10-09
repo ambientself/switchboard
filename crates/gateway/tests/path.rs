@@ -14,13 +14,15 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
+use gateway::boot::{DEFAULT_CALL_DEADLINE, UNNAMED_INSTANCE};
 use gateway::{
     AUDIT_DISABLED_NOTE, Config, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
     RequestPath, ResourceAdapter, Wiring, boot,
 };
-use gateway_core::audit::{Completion, DecisionKind, Outcome, RecordedResources};
+use gateway_core::audit::{Completion, DecisionKind, Outcome, RecordedResources, RowKind};
 use gateway_core::{
-    ApprovedTool, AuditRecord, Classification, IDENTITY_FAILURE, ReasonKind, Resources,
+    ApprovedTool, AuditRecord, Classification, IDENTITY_FAILURE, InstanceName, ReasonKind,
+    Resources,
 };
 use gateway_mcp::{
     CHALLENGE, CLIENT_CAPABILITIES_META, DENIAL_CODE, MODERN, PROTOCOL_VERSION_META,
@@ -402,6 +404,58 @@ fn an_allowed_read_returns_the_echo_and_completes_its_row() {
     );
     assert_eq!(world.connector.received().len(), 1);
     assert_eq!(world.credentials.requests().len(), 1);
+}
+
+/// Each row records the instance the gateway was wired with, and the call deadline of the
+/// connector that serves the tool: one given to it, or else the default for a connector in the
+/// gateway's own process. A call that names no tool runs nothing, and has the default.
+#[test]
+fn a_row_records_the_instance_and_the_connectors_call_deadline() {
+    let calls = |world: &World| {
+        world.call(
+            Caller::TeamA,
+            SURFACE_ALL,
+            READ_TOOL,
+            json!({"document": TEAM_A_DOCUMENT}),
+        );
+        world.call(
+            Caller::TeamA,
+            SURFACE_ALL,
+            WRITE_TOOL,
+            json!({"document": TEAM_A_DOCUMENT}),
+        );
+        world.call(Caller::TeamA, SURFACE_ALL, "no_such_tool", json!({}));
+        world.store.rows()
+    };
+
+    let given = World::with(
+        |_| {},
+        |wiring| {
+            wiring
+                .instance(InstanceName::new("switchboard-7f9c-abcde"))
+                .call_deadline(CONNECTOR, Duration::from_millis(7_250))
+        },
+    );
+    let rows = calls(&given);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter().map(|row| row.decision).collect::<Vec<_>>(),
+        [DecisionKind::Allow, DecisionKind::Deny, DecisionKind::Deny]
+    );
+    for (row, deadline) in rows.iter().zip([7_250, 7_250, 5_000]) {
+        assert_eq!(row.kind, RowKind::Call);
+        assert_eq!(row.instance.as_str(), "switchboard-7f9c-abcde");
+        assert_eq!(row.call_deadline_ms, deadline, "{}", row.tool);
+    }
+
+    let defaults = World::new();
+    for row in calls(&defaults) {
+        assert_eq!(row.instance.as_str(), UNNAMED_INSTANCE);
+        assert_eq!(
+            Duration::from_millis(row.call_deadline_ms),
+            DEFAULT_CALL_DEADLINE
+        );
+    }
 }
 
 #[test]

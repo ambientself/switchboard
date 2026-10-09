@@ -204,6 +204,9 @@ fn expected_row(
         }
     };
     let row = serde_json::json!({
+        "kind": "call",
+        "instance": common::INSTANCE,
+        "call_deadline_ms": common::CALL_DEADLINE_MS,
         "tool_use_id": metadata.tool_use_id,
         "deployment": world.deployment,
         // Every requested surface and tool in the table is printable ASCII apart from the

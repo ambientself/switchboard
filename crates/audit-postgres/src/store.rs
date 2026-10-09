@@ -436,7 +436,7 @@ impl PgAuditStore {
     }
 
     async fn insert(&self, id: &AuditRowId, record: &AuditRecord) -> Result<(), PgAuditError> {
-        let row = BeginRow::from_record(id, record)?;
+        let row = BeginRow::from_record(id, record, &self.budgets)?;
         let budget = self.budgets.begin;
         let deadline = Instant::now() + budget;
         let client = timeout_at(deadline, self.begin.get())

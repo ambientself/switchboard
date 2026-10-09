@@ -23,10 +23,14 @@ fn issuer() -> &'static LocalIssuer {
 
 /// The gates for the deployment in `files`, as the binary would build them.
 async fn gates(files: &Files) -> Gates {
-    gateway::start::prepare(files.load(), Arc::new(SystemClock))
-        .await
-        .unwrap()
-        .gates
+    gateway::start::prepare(
+        files.load(),
+        gateway_core::InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap()
+    .gates
 }
 
 /// The team a token proves, or the check that refused it.
@@ -124,10 +128,14 @@ async fn identity_the_identity_crate_refuses_stops_the_gateway() {
     let refused = |files: &Files| {
         let deployment = files.load();
         async move {
-            gateway::start::prepare(deployment, Arc::new(SystemClock))
-                .await
-                .unwrap_err()
-                .to_string()
+            gateway::start::prepare(
+                deployment,
+                gateway_core::InstanceName::new("test-instance"),
+                Arc::new(SystemClock),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
         }
     };
     // An empty team manifest.

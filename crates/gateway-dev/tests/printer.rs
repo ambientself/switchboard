@@ -52,6 +52,8 @@ async fn each_row_is_printed_as_it_is_begun_and_finished() {
         json!("allow"),
         "{printed:?}"
     );
+    assert_eq!(printed[0]["record"]["instance"], json!("switchboard-dev"));
+    assert_eq!(printed[0]["record"]["kind"], json!("call"));
     assert_eq!(printed[1]["audit"], json!("finished"));
     assert_eq!(
         printed[1]["row"],

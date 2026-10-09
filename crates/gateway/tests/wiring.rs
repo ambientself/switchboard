@@ -60,7 +60,12 @@ impl World {
     }
 
     async fn prepare(&self) -> Result<Prepared, StartError> {
-        prepare(self.files.load(), Arc::new(SystemClock)).await
+        prepare(
+            self.files.load(),
+            gateway_core::InstanceName::new("test-instance"),
+            Arc::new(SystemClock),
+        )
+        .await
     }
 
     /// The bearers the mock server has received, as logged prefixes.
@@ -574,19 +579,27 @@ async fn the_wiring_refuses_to_start_on_what_it_cannot_serve() {
             "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard?connect_timeout=2",
         )])
         .unwrap();
-    let said = prepare(deployment, Arc::new(SystemClock))
-        .await
-        .unwrap_err()
-        .to_string();
+    let said = prepare(
+        deployment,
+        gateway_core::InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(said.contains("the audit store will not start"), "{said}");
     let deployment = world
         .files
         .load_with(&[("WIRING_TEST_DATABASE_URL", "not a url at all")])
         .unwrap();
-    let said = prepare(deployment, Arc::new(SystemClock))
-        .await
-        .unwrap_err()
-        .to_string();
+    let said = prepare(
+        deployment,
+        gateway_core::InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(said.contains("does not parse"), "{said}");
 }
 
