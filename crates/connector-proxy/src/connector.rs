@@ -108,10 +108,11 @@ pub enum UpstreamError {
 ///
 /// Each call is bounded inside the connector: it is abandoned at the deadline, and an answer
 /// larger than the cap is discarded unread. Either way the outcome is
-/// [`ToolOutcome::Error`]. So is any failure of the server or of the exchange. A `403` from the
-/// server is its refusal of the call's scope and becomes [`ToolOutcome::Refused`], as do the
-/// calls this connector will not send at all; see [`outcome`](crate::outcome) for every
-/// sentence.
+/// [`ToolOutcome::Error`]. So is any failure of the server or of the exchange, and so are
+/// arguments that are not an object, which are never sent. A `403` from the server is its
+/// refusal of the call's scope and becomes [`ToolOutcome::Refused`], as does a call this
+/// connector does not serve or has no credential for; see [`outcome`](crate::outcome) for
+/// every sentence.
 ///
 /// Running a call needs a Tokio runtime.
 pub struct ProxyConnector {
@@ -202,7 +203,7 @@ impl ProxyConnector {
             return ToolOutcome::Refused(outcome::NOT_SERVED.to_owned());
         };
         let Value::Object(arguments) = call.arguments() else {
-            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());
+            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());
         };
         let secret = match self
             .credentials
