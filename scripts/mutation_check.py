@@ -1689,8 +1689,9 @@ MOCK = "crates/mock-docs-server/"
 MS = MOCK + "src/server.rs"
 MC = MOCK + "src/config.rs"
 MD = MOCK + "src/documents.rs"
+MJ = MOCK + "src/jwt.rs"
 mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
-       "                accepted: self.inner.accepted.accepts(token),", "                accepted: true,")
+       "                accepted: accepted.accepts(token),", "                accepted: true,")
 mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
@@ -1711,7 +1712,7 @@ mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools f
        '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
        '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
 mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
-       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(self.inner.accepted.logged_prefix()),")
+       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(accepted.logged_prefix()),")
 mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
 mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
        "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
@@ -1741,13 +1742,68 @@ mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice"
        "        if tools.contains(&tool) {", "        if false {")
 mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
        "                if tools.contains(&tool) {", "                if false {")
+# The JWT mode (decision 0010).
+mutate("mock-docs-jwt-subject-unchecked", "any subject from the trusted issuer is accepted", MJ,
+       "            Some(subject) if subject == self.subject => Ok(subject.to_owned()),",
+       "            Some(subject) => Ok(subject.to_owned()),")
+mutate("mock-docs-jwt-audience-off", "a token for any audience is accepted", MJ,
+       "        validation.set_audience(&[&self.audience]);", "        validation.validate_aud = false;")
+mutate("mock-docs-jwt-exp-off", "an expired token is accepted", MJ,
+       "        validation.validate_exp = true;", "        validation.validate_exp = false;")
+mutate("mock-docs-jwt-kid-fallback", "a token with no kid, or an unknown one, is checked against the only key", MJ,
+       "            .and_then(|kid| self.keys.get(kid))\n",
+       "            .and_then(|kid| self.keys.get(kid))\n            .or_else(|| self.keys.values().next())\n")
+mutate("mock-docs-jwt-logs-unverified-sub", "a refused token's claimed subject is logged as the caller", MS,
+       "        Err(refusal) => (None, Some(refusal)),",
+       "        Err(refusal) => (\n"
+       "            token\n"
+       "                .and_then(|token| jsonwebtoken::dangerous::insecure_decode_claims::<Value>(token).ok())\n"
+       "                .and_then(|claims| claims.get(\"sub\").and_then(Value::as_str).map(str::to_owned)),\n"
+       "            Some(refusal),\n"
+       "        ),")
+mutate("mock-docs-jwt-subject-before-audience", "the subject is checked before the issuer and audience", MJ,
+       "        validation.set_audience(&[&self.audience]);",
+       "        validation.set_audience(&[&self.audience]);\n        validation.sub = Some(self.subject.clone());")
+mutate("mock-docs-jwt-issuer-array", "an array of issuers that includes the trusted one is accepted", MJ,
+       "        if claims.get(\"iss\").and_then(Value::as_str) != Some(self.issuer.as_str()) {", "        if false {")
+# Without aud required, jsonwebtoken 11 accepts a token with no aud. Dropping iss from the list
+# is not registered: the exact-issuer check after decoding refuses a token with no iss anyway.
+mutate("mock-docs-jwt-aud-optional", "a token with no audience is accepted", MJ,
+       '        validation.set_required_spec_claims(&["exp", "iss", "aud"]);',
+       '        validation.set_required_spec_claims(&["exp", "iss"]);')
+mutate("mock-docs-jwt-exp-optional", "a token with no expiry is accepted", MJ,
+       '        validation.set_required_spec_claims(&["exp", "iss", "aud"]);',
+       '        validation.set_required_spec_claims(&["iss", "aud"]);')
+mutate("mock-docs-jwt-alg-unchecked", "a token whose header is not RS256 is refused only as malformed", MJ,
+       "        if header.alg != Algorithm::RS256 {", "        if false {")
+mutate("mock-docs-jwt-nbf-off", "a token not yet valid is accepted", MJ,
+       "        validation.validate_nbf = true;", "        validation.validate_nbf = false;")
+mutate("mock-docs-jwt-leeway-default", "the leeway is jsonwebtoken's 60 s, not 30 s", MJ,
+       "        validation.leeway = LEEWAY_SECONDS;\n", "")
+mutate("mock-docs-jwt-leeway-zero", "a token a few seconds past exp is refused", MJ,
+       "        validation.leeway = LEEWAY_SECONDS;", "        validation.leeway = 0;")
+mutate("mock-docs-jwt-static-and-jwt-takes-jwt", "with a static credential and JWT settings, the JWT mode starts", MC,
+       "            (true, true) => return Err(ConfigError::StaticAndJwt),\n"
+       "            (true, false) => Credential::Jwt(read_jwt(&var)?),",
+       "            (true, _) => Credential::Jwt(read_jwt(&var)?),")
+mutate("mock-docs-jwt-empty-setting-accepted", "a JWT setting of only whitespace counts as set", MC,
+       "            .filter(|value| !value.is_empty())\n", "")
+mutate("mock-docs-jwt-non-rsa-key-accepted", "a JWK set may hold an EC or symmetric key", MJ,
+       "            if !matches!(jwk.algorithm, AlgorithmParameters::RSA(_)) {", "            if false {")
+mutate("mock-docs-jwt-key-alg-unchecked", "a key declared for another algorithm is accepted", MJ,
+       "                .is_some_and(|algorithm| algorithm != KeyAlgorithm::RS256)", "                .is_some_and(|_| false)")
+mutate("mock-docs-jwt-key-use-unchecked", "a key declared for encryption is accepted", MJ,
+       "                .is_some_and(|key_use| *key_use != PublicKeyUse::Signature)", "                .is_some_and(|_| false)")
+mutate("mock-docs-jwt-duplicate-kid-accepted", "two keys with one kid are accepted, the last one kept", MJ,
+       "            if keys.insert(kid.clone(), key).is_some() {", "            if keys.insert(kid.clone(), key).is_some() && false {")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
     "the mock server gains a dependency outside the allowlist",
     (MOCK + "Cargo.toml", 'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\n',
      'features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n'),
-    (MOCK + "Cargo.toml", '[dev-dependencies]\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n', "[dev-dependencies]\n"),
+    (MOCK + "Cargo.toml", 'features = ["getrandom"] }\nreqwest = { version = "0.12", default-features = false, features = ["json"] }\n',
+     'features = ["getrandom"] }\n'),
 )
 
 

@@ -10,8 +10,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Map, Value, json};
 
-use crate::config::{AcceptedCredential, Config, logged_prefix, sha256};
+use crate::config::{Config, Credential, logged_prefix, sha256};
 use crate::documents::{Content, Documents, FAIL_CODE, FAIL_DOC, HUGE_BYTES, SLOW_DOC};
+use crate::jwt::{JwtVerifier, Refusal};
 use crate::tools::ToolName;
 
 /// The protocol version `initialize` answers with.
@@ -78,7 +79,7 @@ pub struct MockDocs {
 
 #[derive(Debug)]
 struct Inner {
-    accepted: AcceptedCredential,
+    accepted: Credential,
     slow: std::time::Duration,
     documents: Documents,
     tools: RwLock<Vec<ToolName>>,
@@ -90,6 +91,17 @@ struct Caller {
     /// The logged prefix of the bearer's SHA-256, or `None` if no bearer came.
     bearer_sha256: Option<String>,
     accepted: bool,
+    /// In the JWT mode, what verification found. `None` in the static mode, whose log lines
+    /// carry no more than they did before the JWT mode existed.
+    jwt: Option<JwtOutcome>,
+}
+
+/// What the JWT mode logs about a request beyond the bearer's hash.
+struct JwtOutcome {
+    /// The verified subject of an accepted token. Nothing is read from a token that failed.
+    caller: Option<String>,
+    /// Why the token was refused, if it was.
+    refusal: Option<Refusal>,
 }
 
 /// A JSON-RPC error answer.
@@ -175,14 +187,20 @@ impl MockDocs {
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(bearer_token);
+        let accepted = match &self.inner.accepted {
+            Credential::Static(accepted) => accepted,
+            Credential::Jwt(verifier) => return jwt_caller(verifier, token),
+        };
         match token {
             Some(token) => Caller {
                 bearer_sha256: Some(logged_prefix(&sha256(token))),
-                accepted: self.inner.accepted.accepts(token),
+                accepted: accepted.accepts(token),
+                jwt: None,
             },
             None => Caller {
                 bearer_sha256: None,
                 accepted: false,
+                jwt: None,
             },
         }
     }
@@ -271,6 +289,24 @@ impl MockDocs {
     }
 }
 
+/// A caller in the JWT mode: accepted if and only if `token` verifies.
+fn jwt_caller(verifier: &JwtVerifier, token: Option<&str>) -> Caller {
+    let verdict = match token {
+        Some(token) => verifier.verify(token),
+        None => Err(Refusal::NoBearer),
+    };
+    let accepted = verdict.is_ok();
+    let (caller, refusal) = match verdict {
+        Ok(subject) => (Some(subject), None),
+        Err(refusal) => (None, Some(refusal)),
+    };
+    Caller {
+        bearer_sha256: token.map(|token| logged_prefix(&sha256(token))),
+        accepted,
+        jwt: Some(JwtOutcome { caller, refusal }),
+    }
+}
+
 /// The token of an `Authorization: Bearer <token>` header. The scheme is matched without
 /// regard to case, as RFC 9110 says; any other scheme, or an empty token, is no bearer.
 fn bearer_token(value: &str) -> Option<&str> {
@@ -322,13 +358,18 @@ fn listing(project: &str, names: &[&str]) -> Value {
 }
 
 fn request_line(event: &str, method: &Method, uri: &Uri, caller: &Caller) -> Value {
-    json!({
+    let mut line = json!({
         "event": event,
         "http_method": method.as_str(),
         "path": uri.path(),
         "bearer_sha256": caller.bearer_sha256,
         "accepted": caller.accepted,
-    })
+    });
+    if let (Some(jwt), Some(fields)) = (&caller.jwt, line.as_object_mut()) {
+        fields.insert("caller".into(), json!(jwt.caller));
+        fields.insert("refusal".into(), json!(jwt.refusal.map(Refusal::as_str)));
+    }
+    line
 }
 
 fn unauthorized() -> Response {
