@@ -53,10 +53,11 @@ pub(crate) fn registry_resources(
 /// decision and the run must not let through an argument no decision saw. The policy served
 /// now is read only to see whether the tool was withdrawn meanwhile.
 ///
-/// The check runs inside the audited run, so its answer is recorded on the call's row with its
-/// sentence, and nothing is sent upstream. Arguments that fail the check are outcome `error`
-/// (decision 0011: `refused` is kept for calls that could never be allowed). A tool withdrawn
-/// meanwhile is outcome `refused`.
+/// The check runs inside the audited run, so its answer completes the call's row, and nothing
+/// is sent upstream. Arguments that fail the check are outcome `error` (decision 0011:
+/// `refused` is kept for calls that could never be allowed). The row records only the outcome
+/// and the latency; the sentence goes to the caller and is not on the row. A tool withdrawn
+/// meanwhile is outcome `refused`, and its sentence is recorded on the row.
 pub(crate) struct CheckedArguments<'a> {
     inner: &'a dyn Connector,
     policy: &'a ServedPolicy,
