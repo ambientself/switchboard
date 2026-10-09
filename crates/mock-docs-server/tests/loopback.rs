@@ -288,6 +288,59 @@ async fn the_credential_is_checked_before_anything_else() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// Sends `method path` to `address` with `token` as the bearer and a declared body of 1 MiB,
+/// of which not one byte is sent, and returns the status line that comes back within 5 s.
+fn status_without_a_body(address: &str, method: &str, path: &str, token: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
+    )
+    .unwrap();
+    let mut answer = Vec::new();
+    let mut buffer = [0; 1024];
+    while !answer.windows(2).any(|pair| pair == b"\r\n") {
+        match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => answer.extend_from_slice(&buffer[..read]),
+        }
+    }
+    String::from_utf8_lossy(&answer)
+        .lines()
+        .next()
+        .unwrap_or("no answer within 5 s")
+        .to_owned()
+}
+
+/// A refused caller is answered from its headers alone: its body is never waited for, so it
+/// cannot hold the server up or make it buffer anything.
+#[tokio::test]
+async fn a_refused_caller_is_answered_before_its_body_is_read() {
+    let server = server().await;
+    let mcp = server.address().to_string();
+    let admin = server
+        .admin_url()
+        .trim_start_matches("http://")
+        .trim_end_matches("/admin/tools")
+        .to_owned();
+    let answers = tokio::task::spawn_blocking(move || {
+        [
+            status_without_a_body(&mcp, "POST", "/mcp", OTHER_TOKEN),
+            status_without_a_body(&admin, "PUT", "/admin/tools", OTHER_TOKEN),
+        ]
+    })
+    .await
+    .unwrap();
+    for answer in answers {
+        assert_eq!(answer, "HTTP/1.1 401 Unauthorized");
+    }
+}
+
 // --- The log -----------------------------------------------------------------------------
 
 #[tokio::test]

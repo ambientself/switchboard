@@ -1746,6 +1746,14 @@ mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part
        "    let token = text.trim();", "    let token = text.as_str();")
 mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
        "        if tools.contains(&tool) {", "        if false {")
+mutate("mock-docs-mcp-body-read-before-auth", "POST /mcp waits for the whole body before checking the caller", MS,
+       '    let caller = server.authenticate(&headers);\n    let mut line = request_line("request", &method, &uri, &caller);\n',
+       '    let body = Body::from(read_body(body).await.unwrap_or_default());\n'
+       '    let caller = server.authenticate(&headers);\n    let mut line = request_line("request", &method, &uri, &caller);\n')
+mutate("mock-docs-admin-body-read-before-auth", "PUT /admin/tools waits for the whole body before checking the caller", MS,
+       '    let caller = server.authenticate(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n',
+       '    let body = Body::from(read_body(body).await.unwrap_or_default());\n'
+       '    let caller = server.authenticate(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n')
 mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
        "                if tools.contains(&tool) {", "                if false {")
 # The JWT mode (decision 0010).

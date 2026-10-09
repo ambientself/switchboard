@@ -358,7 +358,8 @@ async fn every_other_token_gets_a_401_and_its_refusal_in_the_log() {
             json!(bearer.as_deref().map(prefix)),
             "{name}: {line}"
         );
-        // Refused before the body is read.
+        // Refused from the headers: the body was never read (tests/loopback.rs shows it is not
+        // even waited for).
         assert!(line.get("rpc_method").is_none(), "{name}: {line}");
         // Nothing the token says is logged, nor the token itself.
         let text = line.to_string();

@@ -2,8 +2,9 @@
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use axum::body::Bytes;
-use axum::extract::State;
+use axum::body::{Body, Bytes};
+use axum::extract::{Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,6 +23,10 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const ACCEPTED_PROTOCOL_VERSIONS: [&str; 2] = ["2025-06-18", "2025-03-26"];
 /// The server's name in `initialize`.
 pub const SERVER_NAME: &str = "mock-docs-server";
+
+/// The largest request body read, once the caller is accepted: axum's default for a buffered
+/// body.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -392,13 +397,21 @@ fn rpc_error(status: StatusCode, id: Value, code: i64, message: &str) -> Respons
         .into_response()
 }
 
-async fn mcp_post(
-    State(server): State<MockDocs>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+/// The body of a request, read only after its caller was accepted.
+async fn read_body(body: Body) -> Result<Bytes, axum::Error> {
+    axum::body::to_bytes(body, MAX_BODY_BYTES).await
+}
+
+/// `POST /mcp`. The caller is checked from the headers alone; a refused caller's body is never
+/// read.
+async fn mcp_post(State(server): State<MockDocs>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Parts {
+        method,
+        uri,
+        headers,
+        ..
+    } = parts;
     let caller = server.authenticate(&headers);
     let mut line = request_line("request", &method, &uri, &caller);
     if !caller.accepted {
@@ -410,6 +423,15 @@ async fn mcp_post(
             line.extend(fields);
         }
         server.log().write(line);
+    };
+    let Ok(body) = read_body(body).await else {
+        log(line, json!({"refused": "body_unreadable"}));
+        return rpc_error(
+            StatusCode::BAD_REQUEST,
+            Value::Null,
+            INVALID_REQUEST,
+            "The request body could not be read, or is larger than 2 MiB",
+        );
     };
 
     if let Some(version) = headers.get("mcp-protocol-version") {
@@ -542,21 +564,25 @@ async fn admin_get_tools(
     Json(tool_names(&server.tools())).into_response()
 }
 
-async fn admin_put_tools(
-    State(server): State<MockDocs>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+/// `PUT /admin/tools`. As with `POST /mcp`, a refused caller's body is never read.
+async fn admin_put_tools(State(server): State<MockDocs>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Parts {
+        method,
+        uri,
+        headers,
+        ..
+    } = parts;
     let caller = server.authenticate(&headers);
     let line = request_line("admin", &method, &uri, &caller);
     if !caller.accepted {
         server.log().write(line);
         return unauthorized();
     }
-    let parsed = serde_json::from_slice::<Value>(&body)
+    let parsed = read_body(body)
+        .await
         .ok()
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
         .and_then(|body| body.get("tools").and_then(Value::as_array).cloned())
         .ok_or_else(|| "send {\"tools\": [\"list_documents\", …]}".to_owned())
         .and_then(|names| {
