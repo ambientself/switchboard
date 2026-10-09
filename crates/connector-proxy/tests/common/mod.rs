@@ -1,8 +1,10 @@
 //! What the connector's tests share: the core's audited path to run a call through, the
-//! gateway's dummy credential, and an upstream that answers with whatever bytes a test scripts.
+//! gateway's dummy credential, a credential file laid out as the kubelet lays one out, and an
+//! upstream that answers with whatever bytes a test scripts.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,13 +63,102 @@ pub fn temporary_file(contents: &[u8]) -> PathBuf {
     path
 }
 
+/// A file that is removed when dropped.
+pub struct TemporaryFile(PathBuf);
+
+impl TemporaryFile {
+    /// Writes `contents` to a fresh file.
+    pub fn new(contents: &[u8]) -> Self {
+        Self(temporary_file(contents))
+    }
+
+    /// Where the file is.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A credential source holding `token` for `connector`, read from a file that ends in a
 /// newline, as a mounted secret often does.
+///
+/// The source reads the file again on every call, so the file stays. It is named for the
+/// connector and the token, and every test that asks for the same pair shares it; it is
+/// replaced in one rename, so a test reading it never sees it half written.
 pub fn credentials_for(connector: &str, token: &str) -> Arc<FileCredentials> {
-    let path = temporary_file(format!("{token}\n").as_bytes());
-    let loaded = FileCredentials::load([(ConnectorName::new(connector), &path)]).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    Arc::new(loaded)
+    let path = std::env::temp_dir().join(format!(
+        "connector-proxy-test-credential-{}",
+        prefix(&format!("{connector} {token}"))
+    ));
+    let written = temporary_file(format!("{token}\n").as_bytes());
+    std::fs::rename(&written, &path).unwrap();
+    Arc::new(FileCredentials::load([(ConnectorName::new(connector), &path)]).unwrap())
+}
+
+/// A credential file laid out as the kubelet lays out a projected volume: the file's contents
+/// in a timestamped directory, `..data` a symbolic link to that directory, and `token` a
+/// symbolic link to `..data/token`. Removed when dropped.
+pub struct ProjectedVolume {
+    root: PathBuf,
+    current: Option<PathBuf>,
+    versions: u32,
+}
+
+impl ProjectedVolume {
+    /// A volume holding `token`, followed by a newline.
+    pub fn new(token: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "connector-proxy-test-projected-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut volume = Self {
+            root,
+            current: None,
+            versions: 0,
+        };
+        volume.rotate(token);
+        symlink("..data/token", volume.token()).unwrap();
+        volume
+    }
+
+    /// The path a pod reads: `token`, through `..data`.
+    pub fn token(&self) -> PathBuf {
+        self.root.join("token")
+    }
+
+    /// Replaces the token as the kubelet's atomic writer does: writes it into a new timestamped
+    /// directory, points `..data_tmp` at that directory, renames `..data_tmp` over `..data` in
+    /// one step, and removes the old directory.
+    pub fn rotate(&mut self, token: &str) {
+        self.versions += 1;
+        let name = format!(
+            "..2026_10_08_12_00_{:02}.{:09}",
+            self.versions, self.versions
+        );
+        let directory = self.root.join(&name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("token"), format!("{token}\n")).unwrap();
+        let swap = self.root.join("..data_tmp");
+        symlink(&name, &swap).unwrap();
+        std::fs::rename(&swap, self.root.join("..data")).unwrap();
+        if let Some(old) = self.current.replace(directory) {
+            std::fs::remove_dir_all(old).unwrap();
+        }
+    }
+}
+
+impl Drop for ProjectedVolume {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 /// The gateway's credential for the fixture's connector.

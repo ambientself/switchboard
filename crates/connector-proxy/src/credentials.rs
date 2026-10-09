@@ -1,17 +1,21 @@
 //! The gateway's own credentials for proxied servers, read from files.
 //!
 //! Each proxied server gets one credential file, named in configuration by the server's
-//! connector. The files are read once, when the source is loaded, so a missing, empty or
-//! malformed file stops the gateway at boot rather than failing its first call. Changing a
-//! credential means restarting the gateway.
+//! connector. Every file is read when the source is loaded, so a missing, empty or malformed
+//! file stops the gateway at boot rather than failing its first call. Each file is then read
+//! again on every call, with the same checks, so a token rotated in place, such as a projected
+//! service account token the kubelet replaces, is the one sent. A file that fails those checks
+//! later refuses the call, and nothing is sent.
 //!
-//! The secret never leaves this crate. [`CredentialSource::credential_for`] hands out a
-//! [`CredentialHandle`], which carries only a label; the bearer token itself is read by
-//! [`ProxyConnector`](crate::ProxyConnector) through a crate-private method, and only while it
-//! builds the upstream request.
+//! The secret never leaves this crate, and the source keeps no copy of it.
+//! [`CredentialSource::credential_for`] hands out a [`CredentialHandle`], which carries only a
+//! label; the bearer token itself is read by [`ProxyConnector`](crate::ProxyConnector) through
+//! a crate-private method, and only while it builds the upstream request.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use gateway_core::{
@@ -24,7 +28,8 @@ use thiserror::Error;
 /// the wrong file.
 pub const MAX_CREDENTIAL_BYTES: u64 = 8 * 1024;
 
-/// The gateway's credentials for proxied servers, one per connector, each read from a file.
+/// The gateway's credentials for proxied servers, one per connector, each read from its file on
+/// every call.
 ///
 /// These are gateway credentials: the same one is used for every caller of a connector, and
 /// the caller's own token is never among them. The caller is still passed in, as the core's
@@ -35,7 +40,7 @@ pub struct FileCredentials {
 
 struct Stored {
     label: String,
-    secret: Secret,
+    path: PathBuf,
 }
 
 /// A bearer token. It implements neither `Debug` nor `Display`, so it cannot be formatted by
@@ -111,7 +116,8 @@ pub enum CredentialFileError {
 }
 
 impl FileCredentials {
-    /// Reads one credential file per connector.
+    /// Reads one credential file per connector, and keeps each file's path to read it again on
+    /// every call.
     ///
     /// Each file holds one bearer token. Whitespace around it, such as a trailing newline, is
     /// trimmed. The token must be printable ASCII with no spaces, which is what an HTTP header
@@ -126,9 +132,11 @@ impl FileCredentials {
             if entries.contains_key(&connector) {
                 return Err(CredentialFileError::Duplicate(connector));
             }
-            let secret = read_secret(&connector, path.as_ref())?;
+            let path = path.as_ref();
+            read_secret(&connector, path)?;
             let label = format!("gateway credential for {connector}");
-            entries.insert(connector, Stored { label, secret });
+            let path = path.to_owned();
+            entries.insert(connector, Stored { label, path });
         }
         Ok(Self { entries })
     }
@@ -138,18 +146,24 @@ impl FileCredentials {
         self.entries.keys()
     }
 
-    /// The handle and the secret for a call to `connector`. Only this crate sees the secret.
+    /// The handle and the secret for a call to `connector`, with the secret read from its file
+    /// now. Only this crate sees the secret.
+    ///
+    /// A file that no longer passes the checks [`load`](Self::load) made refuses the call. The
+    /// refusal names the connector and the file, never what the file holds.
     pub(crate) fn issue(
         &self,
         connector: &ConnectorName,
         _caller: &Proved<Principal>,
-    ) -> Result<(CredentialHandle, &Secret), CredentialError> {
-        match self.entries.get(connector) {
-            Some(stored) => Ok((CredentialHandle::new(stored.label.clone()), &stored.secret)),
-            None => Err(CredentialError::Refused(format!(
+    ) -> Result<(CredentialHandle, Secret), CredentialError> {
+        let Some(stored) = self.entries.get(connector) else {
+            return Err(CredentialError::Refused(format!(
                 "no gateway credential is configured for connector `{connector}`"
-            ))),
-        }
+            )));
+        };
+        let secret = read_secret(connector, &stored.path)
+            .map_err(|failed| CredentialError::Refused(failed.to_string()))?;
+        Ok((CredentialHandle::new(stored.label.clone()), secret))
     }
 }
 
@@ -164,20 +178,25 @@ impl CredentialSource for FileCredentials {
     }
 }
 
+/// Reads and checks the token in `path`, reading no more than one byte past the limit, so a
+/// file that grows while it is read is still refused.
 fn read_secret(connector: &ConnectorName, path: &Path) -> Result<Secret, CredentialFileError> {
     let unreadable = |source| CredentialFileError::Unreadable {
         connector: connector.clone(),
         path: path.to_owned(),
         source,
     };
-    let length = std::fs::metadata(path).map_err(unreadable)?.len();
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(MAX_CREDENTIAL_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(unreadable)?;
+    let length = bytes.len() as u64;
     if length > MAX_CREDENTIAL_BYTES {
         return Err(CredentialFileError::TooLarge {
             connector: connector.clone(),
             path: path.to_owned(),
         });
     }
-    let bytes = std::fs::read(path).map_err(unreadable)?;
     let not_a_token = || CredentialFileError::NotAToken {
         connector: connector.clone(),
         path: path.to_owned(),
