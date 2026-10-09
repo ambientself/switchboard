@@ -1097,7 +1097,14 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   delegation's failure kind, and a grant's digest, issuer, key ID, pod UID, egress setting and
   currency answer. With #12, a column for the exception that allowed a call, since the row's
   shape constraint rightly allows no reason on an allowed row.
-- Rows of kind `list`, written complete, with a list form of the record in the core.
+- Rows of kind `list`, written complete, with a list form of the record in the core: built in
+  the core and the stores, and wired into `tools/list` by #40. The core's `listed` writes a
+  `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
+  escaped and capped, with the rest counted, and only then gives out the list as a `Listed`.
+  Every store has `list`, idempotent by identifier. Migration 0004 adds `listed_tools` and
+  `listed_omitted`, lets a list row leave a call's columns empty, and holds each kind to its
+  own columns with `kind_shape`. `complete_once` now refuses to complete a list row, which its
+  old test of the decision let through.
 - For part 2: the outcomes `unknown` and `duplicate`, and an insert grant and shape constraint
   that let a row be written complete at begin, for the answers to a reused key. Today the
   outcome allows only `ok`, `error` and `refused`, and the gateway's role cannot insert an
