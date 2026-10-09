@@ -118,8 +118,9 @@ check that the deployment files load.
   have written its row. Completing such a row as `error` is not built (design section 17), so
   the listing may show an `allow` row with no outcome inside the outage. The driver checks that
   the outage left at most that one row open, and that every other allowed row has an outcome.
-  The rest of decision 0009's row work (gateway-assigned identifiers, a deadline column, the
-  open-row query, `tools/list` rows) is not built.
+  The gateway now chooses each row's identifier, and a repeated begin with it writes no second
+  row. The rest of decision 0009's row work (retrying begin by identifier, a deadline column,
+  the open-row query, `tools/list` rows) is not built.
 - **Decisions 0009 and 0010 ask more of the slice than it has.** The gateway does not yet
   present its own projected identity to mock-docs, and there is no route-check program and no
   section 11 signals. Until those land (#47), mock-docs recognises the gateway only by a

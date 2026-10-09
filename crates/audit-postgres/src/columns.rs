@@ -9,7 +9,9 @@
 //! refuses the call. A latency or a count past its column's range is refused the same way.
 
 use gateway_core::PrincipalKind;
-use gateway_core::audit::{AuditRecord, Completion, DecisionKind, Outcome, RecordedResources};
+use gateway_core::audit::{
+    AuditRecord, AuditRowId, Completion, DecisionKind, Outcome, RecordedResources,
+};
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
@@ -18,6 +20,8 @@ use crate::store::PgAuditError;
 /// The columns begin writes, in the order of [`BeginRow::INSERT`]'s parameters.
 #[derive(Debug, PartialEq)]
 pub(crate) struct BeginRow {
+    /// The identifier the gateway chose, a UUID in the lowercase hyphenated form.
+    pub id: String,
     pub tool_use_id: Option<String>,
     pub deployment: String,
     pub surface: String,
@@ -42,22 +46,34 @@ pub(crate) struct BeginRow {
 }
 
 impl BeginRow {
-    /// Writes the first half of a row and returns the identifier the database assigned.
+    /// Writes the first half of a row under the identifier the gateway chose, unless a row
+    /// with that identifier is already stored. Inserts one row or none; when none,
+    /// [`DECISION`](Self::DECISION) reads what the stored row decided.
     pub const INSERT: &'static str = "INSERT INTO switchboard_audit.call_rows (
-            tool_use_id, deployment, surface, profile, tool, connector, classification,
+            id, tool_use_id, deployment, surface, profile, tool, connector, classification,
             resources, resources_omitted, decision, reason, sentence, policy_revision,
             proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
             proved_delegation_team, claimed_acting_person, claimed_team
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21
-        ) RETURNING id::text";
+            ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+            $16, $17, $18, $19, $20, $21, $22
+        ) ON CONFLICT (id) DO NOTHING";
 
-    /// The columns for `record`. Refuses a record that is already complete: begin writes the
-    /// first half of a row, and a completion handed to it would be silently dropped.
-    pub fn from_record(record: &AuditRecord) -> Result<Self, PgAuditError> {
+    /// The decision of the row already stored under an identifier, read with only the columns
+    /// the gateway's role may select. A retried begin compares this and nothing more.
+    pub const DECISION: &'static str =
+        "SELECT decision FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
+
+    /// The columns for `record`, as the row `id`. Refuses a record that is already complete:
+    /// begin writes the first half of a row, and a completion handed to it would be silently
+    /// dropped. Refuses an identifier that is not a UUID in the lowercase hyphenated form, the
+    /// form the gateway makes, so that one row has one spelling.
+    pub fn from_record(id: &AuditRowId, record: &AuditRecord) -> Result<Self, PgAuditError> {
         if record.completion.is_some() {
             return Err(PgAuditError::CompleteAtBegin);
+        }
+        if !is_uuid(id.as_str()) {
+            return Err(PgAuditError::Column("id"));
         }
         let principal = record.proved_principal.get();
         let (proved_kind, proved_team, proved_groups) = match &principal.kind {
@@ -79,6 +95,7 @@ impl BeginRow {
         };
         let (resources, resources_omitted) = resources(record)?;
         Ok(Self {
+            id: id.as_str().to_owned(),
             tool_use_id: optional(
                 "tool_use_id",
                 record.tool_use_id.as_ref().map(|id| id.as_str()),
@@ -122,8 +139,9 @@ impl BeginRow {
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 21] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 22] {
         [
+            &self.id,
             &self.tool_use_id,
             &self.deployment,
             &self.surface,
@@ -172,6 +190,16 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
         PgAuditError::Column("a count of resources left out past the column's range")
     })?;
     Ok((resources, omitted))
+}
+
+/// Whether `id` is a UUID in the lowercase hyphenated form: 8, 4, 4, 4 and 12 hex digits.
+/// Postgres would read other spellings of the same UUID too, so they are refused here.
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(at, c)| match at {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => matches!(c, '0'..='9' | 'a'..='f'),
+        })
 }
 
 /// `text`, for `column`, which cannot hold U+0000.
@@ -269,6 +297,13 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
+    /// A UUIDv7, as the gateway makes one.
+    const ID: &str = "0199c3a2-7b1e-7c3d-9f00-0123456789ab";
+
+    fn id() -> AuditRowId {
+        AuditRowId::new(ID)
+    }
+
     fn denied_user_with_delegation() -> AuditRecord {
         record(json!({
             "tool_use_id": "toolu_01",
@@ -328,10 +363,11 @@ mod tests {
 
     #[test]
     fn each_value_goes_to_its_own_column() {
-        let row = BeginRow::from_record(&denied_user_with_delegation()).unwrap();
+        let row = BeginRow::from_record(&id(), &denied_user_with_delegation()).unwrap();
         assert_eq!(
             row,
             BeginRow {
+                id: ID.into(),
                 tool_use_id: Some("toolu_01".into()),
                 deployment: "fixture".into(),
                 surface: "fixture-read".into(),
@@ -365,7 +401,8 @@ mod tests {
     #[test]
     fn a_nul_in_any_text_value_refuses_the_record() {
         let nul = |text: &str| json!(format!("{text}\u{0}x"));
-        let refused = |value: serde_json::Value| match BeginRow::from_record(&record(value)) {
+        let refused = |value: serde_json::Value| match BeginRow::from_record(&id(), &record(value))
+        {
             Err(PgAuditError::Nul { column }) => column,
             other => panic!("{other:?}"),
         };
@@ -430,8 +467,35 @@ mod tests {
     }
 
     #[test]
+    fn an_identifier_that_is_not_a_lowercase_uuid_is_refused() {
+        for accepted in [ID, "00000000-0000-4000-8000-000000000000"] {
+            let row = BeginRow::from_record(&AuditRowId::new(accepted), &allowed_workload());
+            assert_eq!(row.unwrap().id, accepted);
+        }
+        for refused in [
+            "",
+            "0",
+            "not-a-row",
+            "0199C3A2-7B1E-7C3D-9F00-0123456789AB",
+            "0199c3a27b1e7c3d9f000123456789ab",
+            "{0199c3a2-7b1e-7c3d-9f00-0123456789ab}",
+            "0199c3a2-7b1e-7c3d-9f00-0123456789a",
+            "0199c3a2-7b1e-7c3d-9f00-0123456789abc",
+            "0199c3a2+7b1e-7c3d-9f00-0123456789ab",
+            "0199c3a2-7b1e-7c3d-9f00-0123456789ag",
+            "0199c3a2-7b1e-7c3d-9f00-0123456789\u{e9}",
+        ] {
+            let row = BeginRow::from_record(&AuditRowId::new(refused), &allowed_workload());
+            assert!(
+                matches!(row, Err(PgAuditError::Column("id"))),
+                "{refused:?}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_workload_has_a_team_and_no_groups() {
-        let row = BeginRow::from_record(&allowed_workload()).unwrap();
+        let row = BeginRow::from_record(&id(), &allowed_workload()).unwrap();
         assert_eq!(row.decision, "allow");
         assert_eq!(row.proved_kind, "workload");
         assert_eq!(row.proved_team.as_deref(), Some("team-a"));
@@ -441,7 +505,7 @@ mod tests {
 
     #[test]
     fn resources_the_tool_could_not_name_are_the_string_unknown() {
-        let row = BeginRow::from_record(&allowed_workload()).unwrap();
+        let row = BeginRow::from_record(&id(), &allowed_workload()).unwrap();
         assert_eq!(row.resources, json!("unknown"));
         assert_eq!(row.resources_omitted, 0);
     }
@@ -450,7 +514,10 @@ mod tests {
     fn a_call_that_named_no_resource_records_an_empty_list() {
         let mut record = allowed_workload();
         record.resources = RecordedResources::Named(vec![]);
-        assert_eq!(BeginRow::from_record(&record).unwrap().resources, json!([]));
+        assert_eq!(
+            BeginRow::from_record(&id(), &record).unwrap().resources,
+            json!([])
+        );
     }
 
     #[test]
@@ -458,12 +525,14 @@ mod tests {
         let mut record = allowed_workload();
         record.resources_omitted = usize::try_from(i64::MAX).unwrap();
         assert_eq!(
-            BeginRow::from_record(&record).unwrap().resources_omitted,
+            BeginRow::from_record(&id(), &record)
+                .unwrap()
+                .resources_omitted,
             i64::MAX
         );
         record.resources_omitted = usize::MAX;
         assert!(matches!(
-            BeginRow::from_record(&record),
+            BeginRow::from_record(&id(), &record),
             Err(PgAuditError::Column(_))
         ));
     }
@@ -477,7 +546,7 @@ mod tests {
             "groups": []
         }))
         .unwrap();
-        let row = BeginRow::from_record(&record).unwrap();
+        let row = BeginRow::from_record(&id(), &record).unwrap();
         assert_eq!(row.proved_groups, Some(vec![]));
     }
 
@@ -497,14 +566,14 @@ mod tests {
             latency_ms: 3,
         });
         assert!(matches!(
-            BeginRow::from_record(&record),
+            BeginRow::from_record(&id(), &record),
             Err(PgAuditError::CompleteAtBegin)
         ));
     }
 
     #[test]
     fn the_insert_names_one_parameter_per_column() {
-        let row = BeginRow::from_record(&allowed_workload()).unwrap();
+        let row = BeginRow::from_record(&id(), &allowed_workload()).unwrap();
         let count = row.parameters().len();
         assert!(BeginRow::INSERT.contains(&format!("${count}")));
         assert!(!BeginRow::INSERT.contains(&format!("${}", count + 1)));

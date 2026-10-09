@@ -11,7 +11,7 @@ use gateway_core::audit::{self, Answer, AuditFailure, Begun, Outcome, Ran};
 use gateway_core::{CallContext, RequestedTool, decide};
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector, READ_TOOL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, row_start,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -98,15 +98,16 @@ fn decide_read(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
 async fn begin_read(store: &PgAuditStore, fixture: &Fixture) -> Result<Begun, AuditFailure> {
     let call = Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT);
     let decision = decide_read(fixture, &call);
-    audit::begin(store, decision, call.arguments, call.metadata).await
+    audit::begin(store, row_start(), decision, call.arguments, call.metadata).await
 }
 
 /// Begins and runs `call` through the core, ready to finish.
 async fn ran(store: &PgAuditStore, fixture: &Fixture, call: Call) -> (String, Ran) {
     let decision = decide_read(fixture, &call);
-    let Begun::Allowed(guard) = audit::begin(store, decision, call.arguments, call.metadata)
-        .await
-        .unwrap()
+    let Begun::Allowed(guard) =
+        audit::begin(store, row_start(), decision, call.arguments, call.metadata)
+            .await
+            .unwrap()
     else {
         panic!("denied");
     };

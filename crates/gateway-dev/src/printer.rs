@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 ///
 /// - `{"audit": "begun", "row": ..., "record": {...}}` when a row is written;
 /// - `{"audit": "finished", "row": ..., "completion": {...}}` when it is completed;
-/// - `{"audit": "begin_failed", "error": ...}` and `{"audit": "finish_failed", "row": ...,
-///   "error": ...}` when the store fails.
+/// - `{"audit": "begin_failed", "row": ..., "error": ...}` and `{"audit": "finish_failed",
+///   "row": ..., "error": ...}` when the store fails. The row is the identifier the gateway
+///   made for the call, so a failed begin names the row it was for.
 ///
 /// The store's result is passed on unchanged. A failed begin stays a failure, so the call is
 /// refused as it would be without the printer. A line that cannot be written is dropped:
@@ -49,15 +50,18 @@ impl std::fmt::Debug for AuditPrinter {
 impl AuditStore for AuditPrinter {
     fn begin<'a>(
         &'a self,
+        row: &'a AuditRowId,
         record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let begun = self.store.begin(record).await;
+            let begun = self.store.begin(row, record).await;
             match &begun {
-                Ok(row) => self.print(&json!({"audit": "begun", "row": row, "record": record})),
-                Err(error) => {
-                    self.print(&json!({"audit": "begin_failed", "error": error.to_string()}));
-                }
+                Ok(()) => self.print(&json!({"audit": "begun", "row": row, "record": record})),
+                Err(error) => self.print(&json!({
+                    "audit": "begin_failed",
+                    "row": row,
+                    "error": error.to_string(),
+                })),
             }
             begun
         })

@@ -505,6 +505,7 @@ proptest! {
         let store = common::MemoryStore::default();
         let begun = common::ready(gateway_core::audit::begin(
             &store,
+            common::start(),
             decide(&world.snapshot(), &call),
             serde_json::Value::Null,
             Default::default(),
@@ -675,6 +676,7 @@ fn row_and_denied(world: &World, call: &CallContext) -> (AuditRecord, Option<Res
     let store = common::MemoryStore::default();
     let begun = common::ready(audit::begin(
         &store,
+        common::start(),
         decide(&world.snapshot(), call),
         serde_json::Value::Null,
         Default::default(),

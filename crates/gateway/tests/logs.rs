@@ -72,8 +72,14 @@ async fn each_request_and_each_tool_call_is_logged_with_its_timings() {
     let fields = &ran[0]["fields"];
     assert_eq!(fields["tool"], json!(READ_TOOL));
     assert_eq!(fields["outcome"], json!("ok"));
-    // The in-memory store numbers its rows from zero.
-    assert_eq!(fields["row"], json!("0"));
+    // The row is the UUIDv7 the gateway made for the call: version 7 in the third group.
+    let row = fields["row"].as_str().unwrap();
+    let groups: Vec<&str> = row.split('-').collect();
+    assert_eq!(
+        groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+        [8, 4, 4, 4, 12]
+    );
+    assert!(groups[2].starts_with('7'), "{row}");
     for timing in ["latency_ms", "decide_us", "begin_us", "run_us", "finish_us"] {
         assert!(fields[timing].is_u64(), "{timing}: {fields}");
     }
@@ -88,6 +94,11 @@ async fn each_request_and_each_tool_call_is_logged_with_its_timings() {
     let denied = captured.events("denied a tool call");
     assert_eq!(denied.len(), 1, "{denied:?}");
     assert!(denied[0]["fields"]["begin_us"].is_u64());
+    assert_ne!(
+        denied[0]["fields"]["row"],
+        json!(row),
+        "each call has a row of its own"
+    );
 
     let answered = captured.events("answered a request");
     assert_eq!(answered.len(), 2);

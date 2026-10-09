@@ -8,13 +8,12 @@ use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    self, Answer, AuditRowId, Begun, Completion, Outcome, RecordedResource, RecordedResources,
-    RequestMetadata, RowCompletion, StoreError,
+    self, Answer, AuditFailure, Begun, Completion, DecisionKind, Outcome, RecordedResource,
+    RecordedResources, RequestMetadata, RowStart,
 };
 use gateway_core::{
-    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, ConnectorName, CredentialError,
-    CredentialHandle, CredentialSource, Principal, Proved, RequestedTool, Resource, Resources,
-    decide,
+    AuditGuard, AuditRecord, CallContext, ConnectorName, CredentialError, CredentialHandle,
+    CredentialSource, Principal, Proved, RequestedTool, Resource, Resources, decide,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
@@ -23,6 +22,7 @@ use gateway_testkit::{
     InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND, RESOURCE_SYSTEM, SCOPE_REFUSAL,
     SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock, TEAM_A, TEAM_A_DOCUMENT,
     TEAM_B_DOCUMENT, WRITE_TOOL, WriteRecord, block_on, document, policy_data, poll_once,
+    row_start,
 };
 use serde_json::{Value, json};
 
@@ -48,6 +48,7 @@ fn guard_for(
     assert!(decision.is_allowed(), "{decision:?}");
     match block_on(audit::begin(
         store,
+        row_start(),
         decision,
         arguments,
         RequestMetadata::default(),
@@ -233,6 +234,7 @@ fn a_row_keeps_its_count_of_omitted_resources_through_begin_and_finish() {
     assert!(decision.is_allowed(), "{decision:?}");
     let begun = block_on(audit::begin(
         &store,
+        row_start(),
         decision,
         json!({"document": "team-a-0"}),
         RequestMetadata::default(),
@@ -262,6 +264,7 @@ fn a_failed_begin_writes_nothing_and_the_next_one_works() {
     let decision = decide(&fixture.policy, &call);
     let failure = block_on(audit::begin(
         &store,
+        row_start(),
         decision,
         json!({}),
         RequestMetadata::default(),
@@ -299,6 +302,7 @@ fn every_begin_fails_until_told_to_stop() {
         };
         block_on(audit::begin(
             &store,
+            row_start(),
             decide(&fixture.policy, &call),
             json!({}),
             RequestMetadata::default(),
@@ -407,6 +411,7 @@ fn a_held_begin_writes_no_row_until_released() {
     let decision = decide(&fixture.policy, &call);
     let mut begin = pin!(audit::begin(
         &store,
+        row_start(),
         decision,
         json!({}),
         RequestMetadata::default()
@@ -466,6 +471,7 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
     };
     let mut begin = pin!(audit::begin(
         &store,
+        row_start(),
         decide(&fixture.policy, &call),
         json!({}),
         RequestMetadata::default()
@@ -476,83 +482,124 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
     assert!(store.rows().is_empty());
 }
 
-/// A store in front of the in-memory one that names every row it begins `"0"`. Finishing the
-/// second call therefore hands the in-memory store a completion for a row that is already
-/// finished, which the core's own path never does.
-struct EveryRowIsRowZero<'a>(&'a InMemoryAuditStore);
+/// Begins team A's call to `tool` naming its own notes, as the row `start` names. The read
+/// tool is allowed and the direct-write tool denied.
+fn begin_as(
+    fixture: &Fixture,
+    store: &InMemoryAuditStore,
+    start: &RowStart,
+    tool: &str,
+) -> Result<Begun, AuditFailure> {
+    let arguments = json!({"document": TEAM_A_DOCUMENT});
+    let call = CallContext {
+        caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
+        tool: RequestedTool::new(tool),
+        resources: FixtureConnector::resources_of(tool, &arguments),
+    };
+    block_on(audit::begin(
+        store,
+        start.clone(),
+        decide(&fixture.policy, &call),
+        arguments,
+        RequestMetadata::default(),
+    ))
+}
 
-impl AuditStore for EveryRowIsRowZero<'_> {
-    fn begin<'a>(
-        &'a self,
-        record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
-        Box::pin(async move {
-            self.0.begin(record).await?;
-            Ok(AuditRowId::new("0"))
-        })
-    }
-
-    fn finish<'a>(
-        &'a self,
-        completion: &'a RowCompletion,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.0.finish(completion)
-    }
+/// Begins, runs and finishes team A's read as the row `start` names, with `latency_ms`.
+fn read_and_finish(
+    fixture: &Fixture,
+    store: &InMemoryAuditStore,
+    start: &RowStart,
+    latency_ms: u64,
+) -> Option<String> {
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let Ok(Begun::Allowed(guard)) = begin_as(fixture, store, start, READ_TOOL) else {
+        panic!("the read was not allowed");
+    };
+    assert_eq!(guard.row(), &start.row);
+    let ran = block_on(audit::run(&connector, guard));
+    block_on(audit::finish(store, ran, latency_ms))
+        .failure()
+        .map(ToString::to_string)
 }
 
 #[test]
-fn a_row_that_is_already_finished_cannot_be_finished_again() {
+fn a_second_begin_with_one_identifier_writes_one_row() {
     let (fixture, store) = (fixture(), InMemoryAuditStore::new());
-    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
-    let forwarding = EveryRowIsRowZero(&store);
-    let guard = |n: u32| {
-        let arguments = json!({"document": "team-a-notes", "n": n});
-        let call = CallContext {
-            caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
-            tool: RequestedTool::new(READ_TOOL),
-            resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
-        };
-        let decision = decide(&fixture.policy, &call);
-        match block_on(audit::begin(
-            &forwarding,
-            decision,
-            arguments,
-            RequestMetadata::default(),
-        ))
-        .unwrap()
-        {
-            Begun::Allowed(guard) => guard,
-            Begun::Denied(refusal) => panic!("{refusal:?}"),
-        }
-    };
-    let (first, second) = (guard(1), guard(2));
-    assert_eq!(store.rows().len(), 2);
+    let start = row_start();
+    for _ in 0..2 {
+        let begun = begin_as(&fixture, &store, &start, READ_TOOL);
+        assert!(matches!(begun, Ok(Begun::Allowed(_))), "{begun:?}");
+    }
+    assert_eq!(store.rows().len(), 1, "a retried begin wrote a second row");
+    assert_eq!(store.begin_attempts(), 2);
+    assert_eq!(store.row_with_id(&start.row), store.row(0));
 
-    let finished = block_on(audit::finish(
-        &forwarding,
-        block_on(audit::run(&connector, first)),
-        5,
-    ));
-    assert!(finished.failure().is_none());
-    // The second call's completion is for row 0 too, with another latency.
-    let finished = block_on(audit::finish(
-        &forwarding,
-        block_on(audit::run(&connector, second)),
-        9,
-    ));
+    // Another identifier is another row.
+    let other = row_start();
+    assert_ne!(other, start);
+    assert!(begin_as(&fixture, &store, &other, READ_TOOL).is_ok());
+    assert_eq!(store.rows().len(), 2);
+    assert_eq!(store.row_with_id(&other.row), store.row(1));
+}
+
+#[test]
+fn a_begin_with_a_known_identifier_and_another_decision_is_refused() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let start = row_start();
+    let denied = begin_as(&fixture, &store, &start, WRITE_TOOL);
+    assert!(matches!(denied, Ok(Begun::Denied(_))), "{denied:?}");
+    let allowed = begin_as(&fixture, &store, &start, READ_TOOL);
     assert!(
-        finished.failure().is_some(),
-        "a second completion for one row was accepted"
+        allowed.is_err(),
+        "an allowed call was begun under a denial's identifier: {allowed:?}"
+    );
+    assert_eq!(store.rows().len(), 1);
+    let row = store.row_with_id(&start.row).unwrap();
+    assert_eq!(row.decision, DecisionKind::Deny, "the first row stands");
+    assert_eq!(row.tool, WRITE_TOOL);
+    assert_eq!(store.row_with_id(&row_start().row), None);
+}
+
+#[test]
+fn an_identical_second_completion_is_accepted() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let start = row_start();
+    assert_eq!(read_and_finish(&fixture, &store, &start, 5), None);
+    assert_eq!(
+        read_and_finish(&fixture, &store, &start, 5),
+        None,
+        "a retried finish with the same completion failed"
+    );
+    assert_eq!(store.rows().len(), 1);
+    assert_eq!(store.finish_attempts(), 2);
+    assert_eq!(
+        store.row(0).unwrap().completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 5
+        })
+    );
+}
+
+#[test]
+fn a_different_second_completion_is_refused_and_the_first_stands() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let start = row_start();
+    assert_eq!(read_and_finish(&fixture, &store, &start, 5), None);
+    assert!(
+        read_and_finish(&fixture, &store, &start, 9).is_some(),
+        "a second, different completion for one row was accepted"
     );
     assert_eq!(
-        store.rows()[0].completion,
+        store.row(0).unwrap().completion,
         Some(Completion {
             outcome: Outcome::Ok,
             latency_ms: 5
         }),
         "the row kept its first completion"
     );
-    assert_eq!(store.rows()[1].completion, None);
+    assert_eq!(store.rows().len(), 1);
     assert_eq!(store.finish_attempts(), 2);
 }
 
@@ -832,6 +879,7 @@ fn scoped(rig: &Rig, caller: Caller, document: &str) -> Answer {
     let decision = decide(&rig.fixture.policy, &call);
     let Begun::Allowed(guard) = block_on(audit::begin(
         &rig.store,
+        row_start(),
         decision,
         arguments,
         RequestMetadata::default(),

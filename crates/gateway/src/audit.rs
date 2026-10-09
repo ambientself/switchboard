@@ -3,9 +3,6 @@
 use gateway_core::audit::{AuditRowId, RowCompletion, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 
-/// The row identifier [`DisabledAuditStore`] hands out for every row.
-pub const DISABLED_ROW: &str = "audit-disabled";
-
 /// An [`AuditStore`] that writes nothing, for a deployment whose configuration says
 /// `"audit": {"disabled": true}`.
 ///
@@ -13,7 +10,8 @@ pub const DISABLED_ROW: &str = "audit-disabled";
 /// what the opt-out means, and design section 12 lets a gateway start that way only with a loud
 /// warning. So the type has no public constructor. [`boot::check`](crate::boot::check) makes
 /// one when, and only when, configuration opts out, and no other code path can put it where a
-/// real store belongs. Every row it is given gets the identifier [`DISABLED_ROW`].
+/// real store belongs. The identifier the gateway made for a row is carried through the call
+/// as usual and stored nowhere.
 #[derive(Debug)]
 pub struct DisabledAuditStore {
     _opted_out: (),
@@ -28,9 +26,10 @@ impl DisabledAuditStore {
 impl AuditStore for DisabledAuditStore {
     fn begin<'a>(
         &'a self,
+        _row: &'a AuditRowId,
         _record: &'a AuditRecord,
-    ) -> BoxFuture<'a, Result<AuditRowId, StoreError>> {
-        Box::pin(async { Ok(AuditRowId::new(DISABLED_ROW)) })
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
     }
 
     fn finish<'a>(
