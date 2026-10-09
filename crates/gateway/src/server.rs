@@ -1,4 +1,4 @@
-//! The HTTP endpoint: `POST /mcp/{surface}` over the [`RequestPath`].
+//! The HTTP endpoint: `POST /mcp/{surface}` over the [`RequestPath`], and `GET /readyz`.
 //!
 //! [`serve`] takes a bound listener and the [`Gates`], so nothing is served for a configuration
 //! that did not pass the boot gates. A connection has [`HEADER_READ_TIMEOUT`] to send each
@@ -23,11 +23,18 @@
 //!    for. A client that disconnects drops the handler, but not that task, so a tool call that
 //!    started still completes its audit row.
 //!
-//! Shutting down stops taking connections, and waits up to [`SHUTDOWN_GRACE`] for those still
-//! open, such as one whose client stopped part way through a request. It then closes any still
-//! open, so a request on them that has not started its answer never will. Last, it waits for
-//! the answer tasks, however long they take: a call whose client has gone is still running, and
-//! a process that exited under it would leave its row open.
+//! `GET /readyz` is the readiness check. It answers 200 `ready` while the gateway serves and 503
+//! once shutting down has begun; any other method is 405. It runs none of the steps above: a
+//! kubelet probes it with the pod's IP as the host, and the answer says nothing about the
+//! deployment.
+//!
+//! Shutting down follows decision 0009. First the readiness check fails, and the gateway goes
+//! on taking connections and serving them for [`READINESS_REMOVAL`], so that it is taken out of
+//! service before anything is refused. Then it stops taking connections, and waits up to
+//! [`SHUTDOWN_GRACE`] for those still open, such as one whose client stopped part way through a
+//! request. It then closes any still open, so a request on them that has not started its answer
+//! never will. Last, it waits for the answer tasks, however long they take: a call whose client
+//! has gone is still running, and a process that exited under it would leave its row open.
 //!
 //! Every request is logged once it is answered, with its status and how long it took. A
 //! disabled gate is logged at boot, and again every [`DISABLED_GATE_REMINDER`] while the
@@ -37,6 +44,7 @@ use std::future::Future;
 use std::io;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -45,9 +53,9 @@ use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::response::Response;
 use axum::routing::any;
 use gateway_mcp::{HttpResponse, INTERNAL_ERROR, Rejection};
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
+use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
 use http::request::Parts;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::LengthLimitError;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -77,14 +85,22 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Answer tasks already running are waited for however long they take.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
+/// How long the gateway goes on serving after its readiness check starts failing, before it
+/// stops taking connections: long enough for a readiness probe to see the failure and take the
+/// gateway out of service. The kind demo's probe needs three failures, two seconds apart.
+pub const READINESS_REMOVAL: Duration = Duration::from_secs(8);
+
 /// The time limits the server applies. [`Timeouts::default`] is [`HEADER_READ_TIMEOUT`],
-/// [`BODY_READ_TIMEOUT`] and [`SHUTDOWN_GRACE`].
+/// [`BODY_READ_TIMEOUT`], [`READINESS_REMOVAL`] and [`SHUTDOWN_GRACE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
     /// How long a connection may take to send a request's line and headers.
     pub header_read: Duration,
     /// How long a request's body may take to arrive once identity has passed.
     pub body_read: Duration,
+    /// How long the gateway goes on serving once its readiness check fails, before it stops
+    /// taking connections.
+    pub readiness_removal: Duration,
     /// How long shutting down waits for connections still open before it closes them.
     pub shutdown_grace: Duration,
 }
@@ -94,6 +110,7 @@ impl Default for Timeouts {
         Self {
             header_read: HEADER_READ_TIMEOUT,
             body_read: BODY_READ_TIMEOUT,
+            readiness_removal: READINESS_REMOVAL,
             shutdown_grace: SHUTDOWN_GRACE,
         }
     }
@@ -117,7 +134,8 @@ where
     serve_with_timeouts(listener, gates, shutdown, Timeouts::default()).await
 }
 
-/// Serves `gates` on `listener` until `shutdown` completes, then stops taking connections. It
+/// Serves `gates` on `listener` until `shutdown` completes. Then its readiness check fails, and
+/// it goes on serving for `timeouts.readiness_removal` before it stops taking connections. It
 /// waits for the connections still open to close, up to `timeouts.shutdown_grace`, and then
 /// closes those that have not, so no tool call starts after it returns. It returns once every
 /// tool call started has completed its audit row, including calls whose clients have gone.
@@ -142,10 +160,12 @@ where
     let path = RequestPath::new(gates);
     let reminder = tokio::spawn(remind(path.clone()));
     let answers = Answers::default();
+    let ready = Arc::new(AtomicBool::new(true));
     let service = TowerToHyperService::new(router(Endpoint {
         path,
         answers: answers.clone(),
         body_read: timeouts.body_read,
+        ready: ready.clone(),
     }));
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
@@ -153,28 +173,25 @@ where
     let connections = GracefulShutdown::new();
     // Every connection's task, so that those still open after the grace can be closed.
     let mut tasks: JoinSet<()> = JoinSet::new();
-    let mut shutdown = pin!(shutdown);
-    loop {
-        // Forget the connections that have closed, so the set holds only those still open.
-        while tasks.try_join_next().is_some() {}
-        let stream = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(error) => {
-                    accept_failed(&error).await;
-                    continue;
-                }
-            },
-            () = &mut shutdown => break,
-        };
-        let connection =
-            connections.watch(http.serve_connection(TokioIo::new(stream), service.clone()));
-        tasks.spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::debug!(%error, "a connection ended with an error");
-            }
-        });
-    }
+    let accepting = Accepting {
+        listener: &listener,
+        http: &http,
+        service: &service,
+        connections: &connections,
+    };
+    accepting.until(&mut tasks, shutdown).await;
+    // Decision 0009, Shutdown: fail the readiness check first, and go on serving while the
+    // probe notices, so that nothing is refused while the gateway is still in service.
+    ready.store(false, Ordering::SeqCst);
+    tracing::info!(
+        %address,
+        event = "readiness_failed",
+        removal_ms = u64::try_from(timeouts.readiness_removal.as_millis()).unwrap_or(u64::MAX),
+        "failing the readiness check before it stops taking connections"
+    );
+    accepting
+        .until(&mut tasks, tokio::time::sleep(timeouts.readiness_removal))
+        .await;
     drop(listener);
     reminder.abort();
     tracing::info!(%address, "stopped listening");
@@ -203,6 +220,44 @@ where
     Ok(())
 }
 
+/// What taking connections needs: the listener, and how each connection is served and watched.
+struct Accepting<'a> {
+    listener: &'a TcpListener,
+    http: &'a http1::Builder,
+    service: &'a TowerToHyperService<Router>,
+    connections: &'a GracefulShutdown,
+}
+
+impl Accepting<'_> {
+    /// Takes connections, each served on its own task in `tasks`, until `stop` completes.
+    async fn until(&self, tasks: &mut JoinSet<()>, stop: impl Future<Output = ()>) {
+        let mut stop = pin!(stop);
+        loop {
+            // Forget the connections that have closed, so the set holds only those still open.
+            while tasks.try_join_next().is_some() {}
+            let stream = tokio::select! {
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        accept_failed(&error).await;
+                        continue;
+                    }
+                },
+                () = &mut stop => return,
+            };
+            let connection = self.connections.watch(
+                self.http
+                    .serve_connection(TokioIo::new(stream), self.service.clone()),
+            );
+            tasks.spawn(async move {
+                if let Err(error) = connection.await {
+                    tracing::debug!(%error, "a connection ended with an error");
+                }
+            });
+        }
+    }
+}
+
 /// A connection that could not be accepted. One the client reset or aborted is its own
 /// problem; anything else, such as running out of file descriptors, is logged and waited out
 /// for a second, so the loop does not spin.
@@ -219,13 +274,15 @@ async fn accept_failed(error: &io::Error) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// What the endpoint's handler holds: the request path, the answers it has started, and how
-/// long a body may take.
+/// What the endpoint's handlers hold: the request path, the answers it has started, how long a
+/// body may take, and whether the gateway is ready.
 #[derive(Clone)]
 struct Endpoint {
     path: RequestPath,
     answers: Answers,
     body_read: Duration,
+    /// True until shutting down begins.
+    ready: Arc<AtomicBool>,
 }
 
 /// Counts the answer tasks that are running, whether or not anyone is still waiting for them.
@@ -270,7 +327,29 @@ impl Drop for Running {
 fn router(endpoint: Endpoint) -> Router {
     Router::new()
         .route("/mcp/{surface}", any(handle))
+        .route("/readyz", any(readyz))
         .with_state(endpoint)
+}
+
+/// The readiness check: 200 while serving, 503 once shutting down has begun. No host, origin or
+/// identity check runs, and the answer is one word.
+async fn readyz(State(endpoint): State<Endpoint>, method: Method) -> Response {
+    let (status, body) = if method != Method::GET {
+        (StatusCode::METHOD_NOT_ALLOWED, "")
+    } else if endpoint.ready.load(Ordering::SeqCst) {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        headers.insert(ALLOW, HeaderValue::from_static("GET"));
+    } else {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    }
+    response
 }
 
 /// Logs each disabled gate every [`DISABLED_GATE_REMINDER`]. Returns at once if none is.
