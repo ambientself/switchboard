@@ -274,7 +274,7 @@ async fn a_tool_routed_to_another_connector_is_refused_and_nothing_is_sent() {
 }
 
 #[tokio::test]
-async fn arguments_that_are_not_an_object_are_refused_and_nothing_is_sent() {
+async fn arguments_that_are_not_an_object_are_an_error_and_nothing_is_sent() {
     let server = mock().await;
     let harness = Harness::new();
     let connector = connector(upstream(&server.url()));
@@ -283,8 +283,10 @@ async fn arguments_that_are_not_an_object_are_refused_and_nothing_is_sent() {
         let answer = harness.call(&connector, READ_TOOL, arguments).await;
         assert_eq!(
             answer,
-            Answer::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned())
+            Answer::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned())
         );
+        let row = harness.rows().pop().unwrap();
+        assert_eq!(row.completion.unwrap().outcome, Outcome::Error);
     }
     assert!(server.log_lines().is_empty(), "{:?}", server.log_lines());
 }

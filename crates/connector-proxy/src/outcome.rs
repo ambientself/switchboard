@@ -3,12 +3,13 @@
 //! The outcome follows the core's meaning of each [`ToolOutcome`]:
 //!
 //! - [`ToolOutcome::Refused`] when the connector would not send the call because of what it
-//!   names ([`NOT_SERVED`], [`ARGUMENTS_NOT_AN_OBJECT`], [`NO_CREDENTIAL`]), and when the
-//!   server answered `403`, its refusal of the call's scope ([`UPSTREAM_REFUSED`]).
-//! - [`ToolOutcome::Error`] for everything that went wrong on the gateway's side or the
-//!   server's: the deadline, the size cap, a connection that failed, a credential the server
-//!   did not accept, any other HTTP status, an answer that is not MCP, a JSON-RPC error, and a
-//!   tool result marked `isError`.
+//!   names ([`NOT_SERVED`], [`NO_CREDENTIAL`]), and when the server answered `403`, its
+//!   refusal of the call's scope ([`UPSTREAM_REFUSED`]).
+//! - [`ToolOutcome::Error`] for arguments that are not an object, which are never sent
+//!   ([`ARGUMENTS_NOT_AN_OBJECT`]), and for everything that went wrong on the gateway's side
+//!   or the server's: the deadline, the size cap, a connection that failed, a credential the
+//!   server did not accept, any other HTTP status, an answer that is not MCP, a JSON-RPC error,
+//!   and a tool result marked `isError`.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
 //! A successful result is bounded only by the answer cap; the gateway passes its content and

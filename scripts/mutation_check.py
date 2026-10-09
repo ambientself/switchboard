@@ -1790,9 +1790,12 @@ mutate("proxy-exposed-name-sent", "the exposed name is sent instead of the upstr
        "self.request(id, upstream_name, arguments, secret)", "self.request(id, tool.name.as_str(), arguments, secret)")
 mutate("proxy-arguments-unchecked", "arguments that are not an object are sent as an empty object", PC,
        "        let Value::Object(arguments) = call.arguments() else {\n"
-       "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
+       "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
        "        let empty = Map::new();\n        let arguments = match call.arguments() {\n"
        "            Value::Object(arguments) => arguments,\n            _ => &empty,\n        };")
+mutate("proxy-arguments-not-object-refused", "arguments that are not an object are recorded as refused, not as an error", PC,
+       "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());",
+       "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());")
 # Statuses.
 mutate("proxy-401-not-named", "a rejected credential is reported as a bare status", PC,
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
@@ -2611,8 +2614,11 @@ mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing",
        "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
 
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
-       "            Err(sentence) => Box::pin(std::future::ready(ToolOutcome::Refused(sentence))),",
-       "            Err(_sentence) => self.inner.run(call),")
+       "            Err(outcome) => Box::pin(std::future::ready(outcome)),",
+       "            Err(_outcome) => self.inner.run(call),")
+mutate("gw-proxied-invalid-arguments-refused", "a call that fails the argument check is recorded as refused, not as an error", PROXIED,
+       "                    ToolOutcome::Error(undeclared_argument(tool.as_str()))",
+       "                    ToolOutcome::Refused(undeclared_argument(tool.as_str()))")
 mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
        "            Some(adapter) if !withdrawn => {", "            Some(adapter) => {")
 mutate("gw-proxied-checks-live-schema", "a call's arguments are checked against the policy served now, not the one it was decided under", PROXIED,

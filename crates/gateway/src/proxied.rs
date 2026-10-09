@@ -1,6 +1,8 @@
 //! What a proxied server's connector is wrapped in when the policy comes from the registry:
-//! the resources a call names, and the check that refuses arguments a tool's approved schema
-//! does not declare, both read from the policy version the call's request took.
+//! the resources a call names, and the check of its arguments against the tool's approved
+//! schema, both read from the policy version the call's request took. A call whose arguments
+//! fail the check is outcome `error` and nothing is sent upstream; a call whose tool was
+//! withdrawn meanwhile is outcome `refused`.
 
 use gateway_core::{ApprovedTool, BoxFuture, Connector, Resources, ToolCall, ToolOutcome};
 use gateway_registry::ArgumentError;
@@ -9,8 +11,8 @@ use serde_json::Value;
 use crate::policy::{LivePolicy, ServedPolicy};
 
 /// The sentence for a call whose arguments carry something the tool's approved schema does
-/// not declare. The call is not sent (draft 0011: the server is never trusted to check its own
-/// scope, so it is never handed arguments nobody approved).
+/// not declare. The call is not sent (decision 0011: the server is never trusted to check its
+/// own scope, so it is never handed arguments nobody approved).
 pub fn undeclared_argument(tool: &str) -> String {
     format!(
         "Tool `{tool}` was called with an argument its approved definition does not declare, so \
@@ -51,8 +53,11 @@ pub(crate) fn registry_resources(
 /// decision and the run must not let through an argument no decision saw. The policy served
 /// now is read only to see whether the tool was withdrawn meanwhile.
 ///
-/// The check runs inside the audited run, so a refusal is recorded on the call's row with its
-/// sentence, as outcome `refused`, and nothing is sent upstream.
+/// The check runs inside the audited run, so its answer completes the call's row, and nothing
+/// is sent upstream. Arguments that fail the check are outcome `error` (decision 0011:
+/// `refused` is kept for calls that could never be allowed). The row records only the outcome
+/// and the latency; the sentence goes to the caller and is not on the row. A tool withdrawn
+/// meanwhile is outcome `refused`, and its sentence is recorded on the row.
 pub(crate) struct CheckedArguments<'a> {
     inner: &'a dyn Connector,
     policy: &'a ServedPolicy,
@@ -78,7 +83,7 @@ impl Connector for CheckedArguments<'_> {
         let tool = call.tool().name.clone();
         let withdrawn = self.live.current().arguments(&tool).is_none();
         let adapter = self.policy.arguments(&tool);
-        let checked = match adapter {
+        let checked: Result<(), ToolOutcome> = match adapter {
             Some(adapter) if !withdrawn => {
                 adapter.check_arguments(call.arguments()).map_err(|error| {
                     // The path is the caller's own text, so only the tool goes in the sentence;
@@ -87,23 +92,25 @@ impl Connector for CheckedArguments<'_> {
                         ArgumentError::Undeclared { path, .. } => tracing::warn!(
                             %tool,
                             path = path.as_str(),
-                            "refused a call with an argument its tool does not declare"
+                            "a call with an undeclared argument failed the argument check"
                         ),
                         ArgumentError::NotAnObject { .. } => tracing::warn!(
                             %tool,
-                            "refused a call whose arguments are not an object"
+                            "a call whose arguments are not an object failed the argument check"
                         ),
                     }
-                    undeclared_argument(tool.as_str())
+                    ToolOutcome::Error(undeclared_argument(tool.as_str()))
                 })
             }
             // Withdrawn from the policy served now. The request's own version always holds an
             // adapter for a tool its decision allowed.
-            _ => Err(withdrawn_while_deciding(tool.as_str())),
+            _ => Err(ToolOutcome::Refused(withdrawn_while_deciding(
+                tool.as_str(),
+            ))),
         };
         match checked {
             Ok(()) => self.inner.run(call),
-            Err(sentence) => Box::pin(std::future::ready(ToolOutcome::Refused(sentence))),
+            Err(outcome) => Box::pin(std::future::ready(outcome)),
         }
     }
 }

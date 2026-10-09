@@ -12,8 +12,9 @@
 //! - **Bounds.** Each call is abandoned at its deadline, 5 s by default, and an answer larger
 //!   than its cap, 64 KiB by default, is discarded. Both are enforced here, inside the
 //!   connector, not by the core.
-//! - **Outcomes.** A failure or a timeout is [`ToolOutcome::Error`](gateway_core::ToolOutcome);
-//!   the server's `403`, and a call the connector will not send, is
+//! - **Outcomes.** A failure, a timeout, or arguments that are not an object is
+//!   [`ToolOutcome::Error`](gateway_core::ToolOutcome); the server's `403`, and a call for a
+//!   tool the connector does not serve or has no credential for, is
 //!   [`ToolOutcome::Refused`](gateway_core::ToolOutcome). The [`outcome`] module lists each
 //!   sentence.
 //!

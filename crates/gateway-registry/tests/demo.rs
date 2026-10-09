@@ -213,7 +213,7 @@ fn a_user_gets_no_profile_from_the_demo_rules() {
 }
 
 #[test]
-fn an_undeclared_argument_is_refused_before_forwarding() {
+fn an_undeclared_argument_fails_the_check_before_forwarding() {
     let registry = registry();
     let adapter = &registry.adapters()[&tool("docs__read_document")];
     assert!(
