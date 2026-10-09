@@ -2444,6 +2444,27 @@ mutate("demo-policy-in-base", "the base applies the network policy before the di
 mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
        "35078c7e636169b1", "35078c7e636169b2")
 
+# The route check's operator step (deploy/route-check), watched by tests/route_check.rs.
+ROUTE_CHECK = "deploy/route-check/route-check.sh"
+mutate("route-check-enforcement-unchecked", "kindnet with network policy off passes", ROUTE_CHECK,
+       """    off) fail "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""",
+       """    off) pass "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""")
+mutate("route-check-permissions-family-dropped", "the impersonation rows are gone from the permissions list", "deploy/route-check/permissions.tsv",
+       "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n"
+       "impersonate\tuids.authentication.k8s.io\t-\tcluster\nimpersonate\tuserextras.authentication.k8s.io\tscopes\tcluster\n", "")
+mutate("route-check-projected-audience-unchecked", "a projected token for a server's audience passes", ROUTE_CHECK,
+       """      if [ "$audience" = "$server" ]; then bad+=("$audience"); fi""", "      :")
+mutate("route-check-probe-wait-unbounded", "the step waits for the probe for ever", ROUTE_CHECK,
+       """    if [ "$SECONDS" -ge "$deadline" ]; then break; fi\n""", "")
+mutate("route-check-evaluation-error-settled", "a review not allowed with an evaluationError counts as a no", ROUTE_CHECK,
+       """\n                     and (.status.allowed or (.status.evaluationError // "") == ""))""", ")")
+mutate("route-check-version-unread-passes", "an unread Kubernetes version fails nothing", ROUTE_CHECK,
+       '    fail "the Kubernetes version is recorded: could not read"', "    :")
+mutate("route-check-node-unread-passes", "an unread node image fails nothing", ROUTE_CHECK,
+       '    fail "the node image of ${NODE:-its node} is recorded: could not read"', "    :")
+mutate("route-check-akamai-docs-shape-missed", "the Akamai pattern misses the docs examples' shape", "deploy/route-check/token-patterns.txt",
+       "akab-[A-Za-z0-9]{5,}-[A-Za-z0-9]{5,}", "akab-[A-Za-z0-9]{16}-[A-Za-z0-9]{16}")
+
 
 # --- gateway: the first slice from files ---------------------------------------------------
 # The deployment file, the wiring that builds the gateway from it, the registry-mode boot gates

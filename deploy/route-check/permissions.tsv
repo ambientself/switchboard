@@ -1,0 +1,73 @@
+# Decision 0010, control 1: the Kubernetes permissions an agent's ServiceAccount must not hold.
+# Each would let the workload reach a target system's credential, start something that holds
+# one, or reach a pod or node without passing the network policy.
+#
+# route-check.sh asks a SubjectAccessReview for every row, as the workload's ServiceAccount, and
+# every answer must be no. Columns, tab-separated:
+#
+#   verb  resource  subresource  scope
+#
+# The resource is written as `kubectl auth can-i` takes it: `name.group` outside the core group.
+# The subresource is `-` when there is none. The scope is `namespaced` (asked in the workload's,
+# the gateway's and each server's namespace, and across the cluster) or `cluster` (asked across
+# the cluster only, for resources that have no namespace).
+#
+# Reading Secrets. list and watch return a Secret's data too.
+get	secrets	-	namespaced
+list	secrets	-	namespaced
+watch	secrets	-	namespaced
+# Starting pods, directly or through a controller. A pod may mount any Secret in its namespace.
+create	pods	-	namespaced
+create	deployments.apps	-	namespaced
+update	deployments.apps	-	namespaced
+patch	deployments.apps	-	namespaced
+create	replicasets.apps	-	namespaced
+update	replicasets.apps	-	namespaced
+patch	replicasets.apps	-	namespaced
+create	statefulsets.apps	-	namespaced
+update	statefulsets.apps	-	namespaced
+patch	statefulsets.apps	-	namespaced
+create	daemonsets.apps	-	namespaced
+update	daemonsets.apps	-	namespaced
+patch	daemonsets.apps	-	namespaced
+create	jobs.batch	-	namespaced
+update	jobs.batch	-	namespaced
+patch	jobs.batch	-	namespaced
+create	cronjobs.batch	-	namespaced
+update	cronjobs.batch	-	namespaced
+patch	cronjobs.batch	-	namespaced
+# Running a command in, attaching to or forwarding a port of another pod. The traffic comes from
+# the API server, so the network policy does not stop it.
+create	pods	exec	namespaced
+get	pods	exec	namespaced
+create	pods	attach	namespaced
+get	pods	attach	namespaced
+create	pods	portforward	namespaced
+get	pods	portforward	namespaced
+# Adding a container to another pod, which then runs with that pod's mounts.
+patch	pods	ephemeralcontainers	namespaced
+update	pods	ephemeralcontainers	namespaced
+# Minting a token for another ServiceAccount, such as the gateway's.
+create	serviceaccounts	token	namespaced
+# Acting as another user, group or ServiceAccount.
+impersonate	users	-	cluster
+impersonate	groups	-	cluster
+impersonate	serviceaccounts	-	namespaced
+impersonate	uids.authentication.k8s.io	-	cluster
+impersonate	userextras.authentication.k8s.io	scopes	cluster
+# Granting itself more. A RoleBinding in a namespace can bind a ClusterRole, so binding
+# ClusterRoles is asked in each namespace too.
+bind	roles.rbac.authorization.k8s.io	-	namespaced
+escalate	roles.rbac.authorization.k8s.io	-	namespaced
+bind	clusterroles.rbac.authorization.k8s.io	-	namespaced
+escalate	clusterroles.rbac.authorization.k8s.io	-	cluster
+create	rolebindings.rbac.authorization.k8s.io	-	namespaced
+create	clusterrolebindings.rbac.authorization.k8s.io	-	cluster
+# The API server's proxy to a node, a pod or a Service, with both verbs a request through it can
+# use. Like exec, its traffic comes from the API server.
+get	nodes	proxy	cluster
+create	nodes	proxy	cluster
+get	pods	proxy	namespaced
+create	pods	proxy	namespaced
+get	services	proxy	namespaced
+create	services	proxy	namespaced
