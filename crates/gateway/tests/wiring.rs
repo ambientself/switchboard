@@ -1,7 +1,7 @@
 //! The gateway built from files, as the `switchboard` binary builds it, forwarding to the mock
 //! docs server on loopback: tools listed from the approved definitions, an allowed read
 //! forwarded with the gateway's own credential, a read outside the team's limit denied by the
-//! gateway, undeclared arguments refused before anything is sent, a registry reload, and every
+//! gateway, undeclared arguments an error with nothing sent, a registry reload, and every
 //! boot refusal of the wiring.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -253,7 +253,7 @@ async fn a_read_outside_the_teams_limit_is_denied_by_the_gateway_and_never_sent(
 }
 
 #[tokio::test]
-async fn an_argument_the_approved_schema_does_not_declare_is_refused_before_it_is_sent() {
+async fn an_argument_the_approved_schema_does_not_declare_is_an_error_and_is_not_sent() {
     let world = World::new("undeclared").await;
     let path = RequestPath::new(world.prepare().await.unwrap().gates);
     let team_a = token(TEAM_A_SA);
@@ -266,13 +266,24 @@ async fn an_argument_the_approved_schema_does_not_declare_is_refused_before_it_i
         } else {
             LIST_TOOL
         };
-        let refused = call(&path, &team_a, tool, arguments.clone()).await;
-        assert_eq!(refused.status, 200);
+        let failed = call(&path, &team_a, tool, arguments.clone()).await;
+        assert_eq!(failed.status, 200);
         assert_eq!(
-            refused.body["error"]["message"],
+            failed.body["result"]["isError"],
+            json!(true),
+            "{arguments}: {}",
+            failed.body
+        );
+        assert_eq!(
+            failed.body["result"]["content"][0]["text"],
             json!(undeclared_argument(tool)),
             "{arguments}: {}",
-            refused.body
+            failed.body
+        );
+        assert!(
+            failed.body.get("error").is_none(),
+            "{arguments}: {}",
+            failed.body
         );
     }
     assert_eq!(world.calls(), 0, "{:?}", world.mock.log_lines());

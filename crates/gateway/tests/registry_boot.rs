@@ -380,11 +380,18 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
 
     let answered = calling.await.unwrap();
     assert_eq!(
-        answered.body["error"]["message"],
+        answered.body["result"]["isError"],
+        json!(true),
+        "{}",
+        answered.body
+    );
+    assert_eq!(
+        answered.body["result"]["content"][0]["text"],
         json!(undeclared_argument(READ_TOOL)),
         "{}",
         answered.body
     );
+    assert!(answered.body.get("error").is_none(), "{}", answered.body);
     assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
     let rows = store.inner.rows();
     assert_eq!(rows.len(), 1);
@@ -393,12 +400,7 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
         .completion
         .as_ref()
         .map(|completion| completion.outcome.clone());
-    assert_eq!(
-        outcome,
-        Some(Outcome::Refused {
-            sentence: undeclared_argument(READ_TOOL)
-        })
-    );
+    assert_eq!(outcome, Some(Outcome::Error));
 
     // Under demo-2 the same call is decided with other_project read as a resource, and
     // team-a's limit does not hold borealis.
