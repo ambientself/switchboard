@@ -2711,7 +2711,7 @@ mutate("route-check-permissions-family-dropped", "the impersonation rows are gon
 mutate("route-check-projected-audience-unchecked", "a projected token for a server's audience passes", ROUTE_CHECK,
        """        if [ "$audience" = "$server" ]; then bad+=("$audience"); fi""", "        :")
 mutate("route-check-probe-wait-unbounded", "the step waits for the probe for ever", ROUTE_CHECK,
-       """    if [ "$SECONDS" -ge "$deadline" ]; then break; fi\n""", "")
+       """    if [ "$left" -le 0 ]; then break; fi\n""", "")
 mutate("route-check-evaluation-error-settled", "a review not allowed with an evaluationError counts as a no", ROUTE_CHECK,
        """\n                     and (.status.allowed or (.status.evaluationError // "") == ""))""", ")")
 mutate("route-check-version-unread-passes", "an unread Kubernetes version fails nothing", ROUTE_CHECK,
@@ -2734,6 +2734,13 @@ mutate("route-check-pods-json-unchecked", "an empty or doubled pod list counts a
        """ || ! json_object "$pods" ||""", " ||")
 mutate("route-check-probe-pod-json-unchecked", "an empty or doubled pod read while waiting counts as the probe still running", ROUTE_CHECK,
        """ && json_object "$pod_now" &&""", " &&")
+# #47: the probe's lines against the routes, and a wait that keeps to --probe-wait.
+mutate("route-check-route-lines-unmatched", "a probe that skipped, added or repeated an attempt passes", ROUTE_CHECK,
+       """  elif [ -n "$mismatch" ]; then\n""", "  elif false; then\n")
+mutate("route-check-probe-read-timeout-full", "each read while waiting for the probe may take 30 s, whatever the wait has left", ROUTE_CHECK,
+       "REQUEST_TIMEOUT=${left}s k get pod", "k get pod")
+mutate("route-check-probe-late-end-accepted", "a probe end first seen after the wait counts", ROUTE_CHECK,
+       """        [ "$SECONDS" -le "$deadline" ] || state=""\n""", "")
 # #64: projected sources, endpoints, and the version and node reads are validated, not skipped.
 mutate("route-check-secret-sources-unchecked", "projected sources that are not a list count as none in the Secret check", ROUTE_CHECK,
        "any(sources; .secret)", "any(.projected.sources[]?; .secret)")
