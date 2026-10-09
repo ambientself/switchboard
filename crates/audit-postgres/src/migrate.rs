@@ -31,11 +31,18 @@ pub struct Migration {
 }
 
 /// Every migration, in the order they are applied.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "call_rows",
-    sql: include_str!("../sql/migrations/0001_call_rows.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "call_rows",
+        sql: include_str!("../sql/migrations/0001_call_rows.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "row_ids",
+        sql: include_str!("../sql/migrations/0002_row_ids.sql"),
+    },
+];
 
 /// Any number, the same in every gateway: two migrators on one database take turns.
 const MIGRATION_LOCK: i64 = 0x5357_4244_4155_4401;

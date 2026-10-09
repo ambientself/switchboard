@@ -41,9 +41,10 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("latency_ms", "bigint"),
 ];
 
-/// The columns the gateway's role inserts: the first half of a row, without the identifier,
-/// the times or the completion.
+/// The columns the gateway's role inserts: the identifier it chose and the first half of a row,
+/// without the times or the completion.
 pub(crate) const INSERTED: &[&str] = &[
+    "id",
     "tool_use_id",
     "deployment",
     "surface",
@@ -1307,17 +1308,28 @@ mod tests {
     }
 
     #[test]
-    fn the_checked_privileges_are_the_ones_the_migration_grants() {
-        let sql = MIGRATIONS[0].sql;
-        let granted = |privilege: &str| -> Vec<String> {
-            let start = sql.find(&format!("GRANT {privilege} (")).unwrap();
-            let rest = &sql[start..];
-            let inner = &rest[rest.find('(').unwrap() + 1..rest.find(')').unwrap()];
-            inner.split(',').map(|c| c.trim().to_owned()).collect()
+    fn the_checked_privileges_are_the_ones_the_migrations_grant() {
+        // Every column the migrations grant `privilege` on, each granted once.
+        let granted = |privilege: &str| -> BTreeSet<String> {
+            let mut columns = BTreeSet::new();
+            for migration in MIGRATIONS {
+                let grant = format!("GRANT {privilege} (");
+                let mut sql = migration.sql;
+                while let Some(start) = sql.find(&grant) {
+                    let rest = &sql[start..];
+                    let inner = &rest[rest.find('(').unwrap() + 1..rest.find(')').unwrap()];
+                    for column in inner.split(',').map(|c| c.trim().to_owned()) {
+                        assert!(columns.insert(column), "granted twice");
+                    }
+                    sql = &rest[grant.len()..];
+                }
+            }
+            columns
         };
-        assert_eq!(granted("INSERT"), INSERTED);
-        assert_eq!(granted("UPDATE"), UPDATED);
-        assert_eq!(granted("SELECT"), SELECTED);
+        let set = |columns: &[&str]| columns.iter().map(|c| (*c).to_owned()).collect();
+        assert_eq!(granted("INSERT"), set(INSERTED));
+        assert_eq!(granted("UPDATE"), set(UPDATED));
+        assert_eq!(granted("SELECT"), set(SELECTED));
     }
 
     #[test]

@@ -355,6 +355,7 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
         let store = MemoryStore::default();
         let begun = common::ready(audit::begin(
             &store,
+            common::start(),
             decision,
             serde_json::json!({"case": index}),
             metadata.clone(),

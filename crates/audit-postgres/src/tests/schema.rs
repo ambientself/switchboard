@@ -10,8 +10,10 @@ use super::{
 };
 use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, ROLES, migrate};
 
-/// The begin columns of an allowed call by a workload, as `(column, value)` in SQL.
+/// The begin columns of an allowed call by a workload, as `(column, value)` in SQL. The
+/// identifier is a fresh UUID, as the gateway supplies one.
 const ALLOWED: &[(&str, &str)] = &[
+    ("id", "gen_random_uuid()"),
     ("deployment", "'fixture'"),
     ("surface", "'fixture-all'"),
     ("profile", "'workload-rw'"),
@@ -89,7 +91,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1]);
+    assert_eq!(recorded, vec![1, 2]);
 }
 
 #[tokio::test]
@@ -109,8 +111,8 @@ async fn only_the_owner_may_migrate() {
     ));
 }
 
-/// Two migrators on one database take turns: one applies the migration, and the other then
-/// finds it applied. Without the lock, both create the schema at once and one fails.
+/// Two migrators on one database take turns: each migration is applied by one of them, and the
+/// other then finds it applied. Without the lock, both create the schema at once and one fails.
 #[tokio::test]
 async fn two_migrators_at_once_take_turns() {
     let Some(db) = TestDatabase::create().await else {
@@ -125,9 +127,10 @@ async fn two_migrators_at_once_take_turns() {
         let mut first = db.connect_as(OWNER_ROLE).await;
         let mut second = db.connect_as(OWNER_ROLE).await;
         let (first, second) = tokio::join!(migrate(&mut first), migrate(&mut second));
-        let mut applied = vec![first.unwrap(), second.unwrap()];
+        let mut applied = first.unwrap();
+        applied.extend(second.unwrap());
         applied.sort_unstable();
-        assert_eq!(applied, vec![vec![], vec![1]]);
+        assert_eq!(applied, vec![1, 2], "each migration is applied once");
     }
 }
 
@@ -267,6 +270,7 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "connector"),
         ("INSERT", "decision"),
         ("INSERT", "deployment"),
+        ("INSERT", "id"),
         ("INSERT", "policy_revision"),
         ("INSERT", "profile"),
         ("INSERT", "proved_delegation_team"),
@@ -314,14 +318,29 @@ async fn the_gateway_holds_exactly_its_column_grants() {
 }
 
 #[tokio::test]
-async fn the_gateway_cannot_write_the_identifier_the_times_or_a_completion_at_insert() {
+async fn the_gateway_writes_the_identifier_but_not_the_times_or_a_completion_at_insert() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
     let gateway = db.connect_as(GATEWAY_ROLE).await;
-    insert_row(&gateway, &insert(&[])).await;
+    let chosen = "0199c3a2-7b1e-7c3d-9f00-0123456789ab";
+    let written = insert_row(&gateway, &insert(&[("id", &format!("'{chosen}'"))])).await;
+    assert_eq!(
+        written, chosen,
+        "the row is stored under the identifier given"
+    );
+    // The database assigns none: a row without one is not written.
+    let error = gateway
+        .query_one(&insert(&[("id", "")]), &[])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(&error),
+        Some(NOT_NULL_VIOLATION),
+        "{}",
+        message(&error)
+    );
     for column in [
-        ("id", "gen_random_uuid()"),
         ("begun_at", "now() - interval '1 day'"),
         ("finished_at", "now()"),
         ("outcome", "'ok'"),

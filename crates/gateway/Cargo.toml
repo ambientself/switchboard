@@ -42,6 +42,8 @@ toml = "1"
 tracing = "0.1"
 # Structured logs: one JSON object per line.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Each audit row's identifier, a UUIDv7 the gateway makes before begin (decision 0009).
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }

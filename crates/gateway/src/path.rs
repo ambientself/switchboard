@@ -54,7 +54,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
+use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, Connector, IDENTITY_FAILURE,
     Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide, list_tools,
@@ -66,6 +66,7 @@ use gateway_mcp::{
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::boot::{GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
@@ -324,8 +325,13 @@ impl RequestPath {
         };
 
         let store = gates.audit_store().as_ref();
+        // One identifier per call, made here and nowhere else (decision 0009). A retry of
+        // begin, when there is one, reuses it; it is never made again for the same call.
+        let start = RowStart {
+            row: AuditRowId::new(Uuid::now_v7().to_string()),
+        };
         let begun = Instant::now();
-        let begin = audit::begin(store, decision, arguments, metadata).await;
+        let begin = audit::begin(store, start, decision, arguments, metadata).await;
         let begin_us = micros(begun.elapsed());
         let guard = match begin {
             Err(failure) => {

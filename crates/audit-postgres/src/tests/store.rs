@@ -11,7 +11,7 @@ use gateway_core::{
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
     InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT,
-    TEAM_B_DOCUMENT, WRITE_TOOL, document,
+    TEAM_B_DOCUMENT, WRITE_TOOL, document, row_start,
 };
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
@@ -73,6 +73,7 @@ pub(super) async fn through_core(
     let decision = decide(&fixture.policy, &context);
     let begun = audit::begin(
         store,
+        row_start(),
         decision,
         call.arguments.clone(),
         call.metadata.clone(),
@@ -272,7 +273,8 @@ async fn a_record_with_every_value_set_reads_back_exactly() {
     });
 
     for written in [record(allowed), record(denied)] {
-        let row = store.begin(&written).await.unwrap();
+        let row = row_start().row;
+        store.begin(&row, &written).await.unwrap();
         assert_eq!(read_back(&admin, &row).await, written);
     }
 }
@@ -342,7 +344,7 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
             tool: RequestedTool::new(call.tool),
         };
         let decision = decide(&fixture.policy, &context);
-        let failure = audit::begin(&store, decision, call.arguments, metadata)
+        let failure = audit::begin(&store, row_start(), decision, call.arguments, metadata)
             .await
             .unwrap_err();
         let cause = std::error::Error::source(&failure)
@@ -383,21 +385,144 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
     assert_eq!(given_up.lock().unwrap().clone(), vec![error.to_string()]);
 }
 
+/// The decided call `call` in the fixture's policy.
+fn decided(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
+    let context = CallContext {
+        resources: FixtureConnector::resources_of(call.tool, &call.arguments),
+        caller: fixture.caller_context(call.caller, call.surface).unwrap(),
+        tool: RequestedTool::new(call.tool),
+    };
+    decide(&fixture.policy, &context)
+}
+
+/// How many rows the table holds, read as a superuser.
+async fn row_count(admin: &Client) -> i64 {
+    admin
+        .query_one("SELECT count(*) FROM switchboard_audit.call_rows", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
 #[tokio::test]
-async fn the_database_assigns_each_row_its_own_identifier() {
+async fn begin_stores_the_identifier_it_is_given() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
     let fixture = Fixture::new().unwrap();
     let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
     let call = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
-    let first = through_core(&store, &fixture, &call).await;
-    let second = through_core(&store, &fixture, &call).await;
-    assert_ne!(first, second);
-    for row in [&first, &second] {
-        let parts: Vec<usize> = row.as_str().split('-').map(str::len).collect();
-        assert_eq!(parts, vec![8, 4, 4, 4, 12], "{}", row.as_str());
+    let (first, second) = (row_start(), row_start());
+    for start in [&first, &second] {
+        let begun = audit::begin(
+            &store,
+            start.clone(),
+            decided(&fixture, &call),
+            call.arguments.clone(),
+            RequestMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let Begun::Denied(refusal) = begun else {
+            panic!("{begun:?}");
+        };
+        assert_eq!(refusal.row(), &start.row);
     }
+    let stored: Vec<String> = admin
+        .query(
+            "SELECT id::text FROM switchboard_audit.call_rows ORDER BY begun_at",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        stored,
+        vec![first.row.as_str(), second.row.as_str()],
+        "each row is stored under the identifier the gateway gave it"
+    );
+
+    // An identifier that is not a UUID is refused before anything is sent.
+    let error = store
+        .begin(
+            &AuditRowId::new("not-a-row"),
+            &read_back(&admin, &first.row).await,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<PgAuditError>(),
+            Some(PgAuditError::Column("id"))
+        ),
+        "{error}"
+    );
+    assert_eq!(row_count(&admin).await, 2);
+}
+
+#[tokio::test]
+async fn a_second_begin_with_one_identifier_writes_one_row() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let start = row_start();
+    for call in [
+        Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT),
+        // The same decision for another call: only the decision is compared, because the
+        // gateway's role cannot read who called what.
+        Call::new(Caller::TeamA, SURFACE_READ, READ_TOOL, TEAM_A_DOCUMENT),
+    ] {
+        let begun = audit::begin(
+            &store,
+            start.clone(),
+            decided(&fixture, &call),
+            call.arguments.clone(),
+            RequestMetadata::default(),
+        )
+        .await;
+        assert!(
+            matches!(&begun, Ok(Begun::Allowed(guard)) if guard.row() == &start.row),
+            "{begun:?}"
+        );
+    }
+    assert_eq!(
+        row_count(&admin).await,
+        1,
+        "a retried begin wrote a second row"
+    );
+    assert_eq!(
+        read_back(&admin, &start.row).await.surface.as_str(),
+        SURFACE_ALL,
+        "the first row stands"
+    );
+
+    // Another decision under the same identifier is refused, and the first row stands.
+    let denied = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
+    let failure = audit::begin(
+        &store,
+        start.clone(),
+        decided(&fixture, &denied),
+        denied.arguments.clone(),
+        RequestMetadata::default(),
+    )
+    .await
+    .unwrap_err();
+    let cause = std::error::Error::source(&failure)
+        .and_then(|source| source.downcast_ref::<PgAuditError>())
+        .unwrap();
+    assert!(
+        matches!(cause, PgAuditError::BegunDifferently { row } if row == start.row.as_str()),
+        "{cause}"
+    );
+    assert_eq!(row_count(&admin).await, 1);
+    let stored = read_back(&admin, &start.row).await;
+    assert_eq!(stored.decision, gateway_core::audit::DecisionKind::Allow);
 }
 
 /// An allowed call's row, begun through the core and not yet finished.
@@ -409,7 +534,7 @@ pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditR
         tool: RequestedTool::new(call.tool),
     };
     let decision = decide(&fixture.policy, &context);
-    match audit::begin(store, decision, call.arguments, call.metadata)
+    match audit::begin(store, row_start(), decision, call.arguments, call.metadata)
         .await
         .unwrap()
     {
@@ -608,7 +733,7 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
         tool: RequestedTool::new(call.tool),
     };
     let decision = decide(&fixture.policy, &context);
-    let failure = audit::begin(&store, decision, call.arguments, call.metadata)
+    let failure = audit::begin(&store, row_start(), decision, call.arguments, call.metadata)
         .await
         .unwrap_err();
     assert_eq!(

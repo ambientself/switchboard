@@ -59,7 +59,7 @@ pub mod server;
 pub mod start;
 pub mod telemetry;
 
-pub use audit::{DISABLED_ROW, DisabledAuditStore};
+pub use audit::DisabledAuditStore;
 pub use boot::{BootError, GateState, Gates, Settings, Wiring};
 pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
