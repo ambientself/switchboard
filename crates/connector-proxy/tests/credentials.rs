@@ -57,7 +57,7 @@ fn a_handle_is_issued_for_a_configured_connector_and_carries_only_a_label() {
 
 #[test]
 fn a_connector_with_no_file_is_refused_a_credential() {
-    let credentials = load(GATEWAY_TOKEN.as_bytes()).unwrap();
+    let (credentials, _file) = held(GATEWAY_TOKEN.as_bytes());
     let fixture = Fixture::new().unwrap();
     let caller = fixture.principal(Caller::TeamA).unwrap();
 
