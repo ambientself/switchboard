@@ -199,16 +199,20 @@ impl Default for Budgets {
 }
 
 /// What has become of the finishes a store was given, and of the allowed rows whose begin
-/// failed after its insert was sent, which the store completes as `error` on the finish pool.
+/// failed after its insert was executed, which the store completes as `error` on the finish
+/// pool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FinishCounts {
     /// Still trying to complete their row.
     pub in_flight: usize,
     /// Stopped without completing their row: the deadline passed, the database or the store
-    /// refused, or the task was dropped before it ended. Each such row keeps an empty outcome.
+    /// refused, or the task was dropped before it ended. Each such row, if it was written,
+    /// keeps an empty outcome. A failed begin's row whose last attempt got no answer, or a
+    /// refusal, is counted here even if its insert never committed: the store cannot tell.
     pub given_up: u64,
-    /// Failed begins whose row was not there at the finish deadline: the insert never
-    /// committed, so there was nothing to complete. Not given up, and not reported.
+    /// Failed begins whose row the last attempt before the finish deadline found missing: the
+    /// insert never committed, so there was nothing to complete. Not given up, and not
+    /// reported.
     pub never_written: u64,
 }
 
@@ -221,8 +225,8 @@ struct Counters {
 
 /// A finish that stopped without completing its row, which keeps an empty outcome. Decision
 /// 0009 makes each one a telemetry event naming the row and the outcome's kind. A row whose
-/// begin failed after its insert was sent, and which the store could not complete as `error`,
-/// is reported the same way, with the outcome `error`.
+/// begin failed after its insert was executed, and which the store could not complete as
+/// `error`, is reported the same way, with the outcome `error`.
 #[derive(Debug)]
 pub struct GivenUp<'a> {
     /// The row finish named.
@@ -355,15 +359,23 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   which stops one still waiting, for example on a lock.
 /// - A begin reported as failed may still have written its row (decision 0009): an insert
 ///   that commits before its cancel arrives, or one whose confirmation was lost with its
-///   connection. So when an allowed call's begin fails that way after sending an insert, the
-///   store completes the row as `error` with a latency of 0, on a task of its own on the
-///   finish pool, until [`Budgets::finish_deadline`]. Nothing ran, so the row overstates what
-///   ran rather than understate it. The insert may still commit, so that task alone tries
-///   again while the row is missing. A row still missing at the deadline was never written,
-///   and is counted in [`FinishCounts::never_written`]; a row there that could not be
-///   completed is given up and reported, as a finish is. A denial needs nothing: it is a
-///   complete record, which the table's trigger never lets be completed. Nor does a list row,
-///   which is written complete.
+///   connection. So when an allowed call's begin fails, after an insert was executed, with
+///   its budget spent or with a last error that trying again could fix, the store completes
+///   the row as `error` with a latency of 0, on a task of its own on the finish pool, until
+///   [`Budgets::finish_deadline`]. A begin that never got as far as executing an insert, for
+///   example one whose statement was still being prepared, starts nothing. The last error
+///   may also be an explicit refusal, such as a read-only server's: that begin starts the
+///   task too, because an earlier attempt may have lost its confirmation. Nothing ran, so the
+///   row overstates what ran rather than understate it. The insert may still commit, so that
+///   task alone tries again while the row is missing, and it starts no attempt that its
+///   deadline, rather than [`Budgets::answer`], could cut short. A row the last attempt found
+///   missing was never written, and is counted in [`FinishCounts::never_written`]. A row that
+///   could not be completed is given up and reported, as a finish is, and so is one whose
+///   last attempt got no answer: a database that stays unreachable, locked or read-only past
+///   the deadline leaves the store unable to tell, so a refusal that lasts that long is
+///   reported even when no row was written. A denial needs nothing: it is a complete record,
+///   which the table's trigger never lets be completed. Nor does a list row, which is
+///   written complete.
 /// - List writes a row of kind `list`, complete, with begin's pool, budget and handling of
 ///   an identifier already stored: a list row under it is this list's own, and a call row is
 ///   an error.
@@ -385,7 +397,7 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// completes a failed begin's row, which [`finishes`](Self::finishes) counts in flight, so a
 /// gateway shutting down waits for it too.
 ///
-/// Must be used inside a Tokio runtime: finish, and a begin that fails after sending its
+/// Must be used inside a Tokio runtime: finish, and a begin that fails after executing its
 /// insert, spawn their tasks there.
 pub struct PgAuditStore {
     pub(crate) begin: Pool,
@@ -505,7 +517,10 @@ impl PgAuditStore {
             }
             pause = longer(pause);
         };
-        // An insert was sent, and no answer said it failed: it may have committed.
+        // An insert was executed, and the begin ended without an answer, or with an error
+        // trying again could fix. That last error may be an explicit refusal, such as a
+        // read-only server's, but an earlier attempt may have committed and lost its answer:
+        // the row may exist.
         let unanswered =
             failed.is_transient() || matches!(failed, PgAuditError::BeginBudget { .. });
         // A denial is a complete record, and a list row is written complete: neither is left
@@ -520,8 +535,8 @@ impl PgAuditStore {
         Err(failed)
     }
 
-    /// One attempt at [`insert`](Self::insert), ending by `deadline`. Sets `sent` once it has a
-    /// connection to send the insert on.
+    /// One attempt at [`insert`](Self::insert), ending by `deadline`. Sets `sent` as the insert
+    /// itself goes out, after its statement is prepared: a prepare cannot commit a row.
     async fn insert_once(
         &self,
         row: &Insert,
@@ -532,8 +547,7 @@ impl PgAuditStore {
         let client = timeout_at(deadline, self.begin.get())
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
-        *sent = true;
-        match timeout_at(deadline, insert_on(&client, row)).await {
+        match timeout_at(deadline, insert_on(&client, row, sent)).await {
             Ok(Err(error)) if error.is_transient() => {
                 // A failure trying again could fix may be the connection's own: one that found
                 // the server read-only, as the old primary is after a failover, stays so. The
@@ -549,9 +563,9 @@ impl PgAuditStore {
         }
     }
 
-    /// Completes `row`, whose begin failed after its insert was sent, as `error` with a latency
-    /// of 0, on a task of its own on the finish pool, until the finish deadline. Counted in
-    /// flight until it ends.
+    /// Completes `row`, whose begin failed after its insert was executed, as `error` with a
+    /// latency of 0, on a task of its own on the finish pool, until the finish deadline.
+    /// Counted in flight until it ends.
     fn complete_lost_begin(&self, row: AuditRowId) {
         let settle = Settle {
             in_flight: InFlight::start(&self.counters),
@@ -661,11 +675,16 @@ enum Insert {
     List(ListRow),
 }
 
-/// Writes `row`, as begin or list.
-async fn insert_on(client: &ClientWrapper, row: &Insert) -> Result<(), PgAuditError> {
+/// Writes `row`, as begin or list. Sets `sent` just before the insert is executed: from then
+/// on it may commit, whatever answer comes back, or none.
+async fn insert_on(
+    client: &ClientWrapper,
+    row: &Insert,
+    sent: &mut bool,
+) -> Result<(), PgAuditError> {
     match row {
-        Insert::Call(row) => begin_on(client, row).await,
-        Insert::List(row) => list_on(client, row).await,
+        Insert::Call(row) => begin_on(client, row, sent).await,
+        Insert::List(row) => list_on(client, row, sent).await,
     }
 }
 
@@ -673,8 +692,13 @@ async fn insert_on(client: &ClientWrapper, row: &Insert) -> Result<(), PgAuditEr
 /// A row already stored with the same decision is this begin's own, written by an earlier
 /// attempt, which is success; one with another decision is not, and nor is a list row, which
 /// has none.
-async fn begin_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditError> {
+async fn begin_on(
+    client: &ClientWrapper,
+    row: &BeginRow,
+    sent: &mut bool,
+) -> Result<(), PgAuditError> {
     let statement = client.prepare_cached(BeginRow::INSERT).await?;
+    *sent = true;
     let inserted = client.execute(&statement, &row.parameters()).await?;
     if inserted == 1 {
         return Ok(());
@@ -705,8 +729,13 @@ async fn begin_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditE
 /// Inserts a list row under its identifier, unless that row is already stored. A list row
 /// already stored is this list's own, written by an earlier attempt, which is success; a call
 /// row is not.
-async fn list_on(client: &ClientWrapper, row: &ListRow) -> Result<(), PgAuditError> {
+async fn list_on(
+    client: &ClientWrapper,
+    row: &ListRow,
+    sent: &mut bool,
+) -> Result<(), PgAuditError> {
     let statement = client.prepare_cached(ListRow::INSERT).await?;
+    *sent = true;
     let inserted = client.execute(&statement, &row.parameters()).await?;
     if inserted == 1 {
         return Ok(());
@@ -784,13 +813,25 @@ struct Retry {
     finish: FinishRow,
     attempt: Duration,
     deadline: Instant,
-    /// The row's begin failed after sending its insert, which may yet commit, so a missing row
-    /// is waited for. For a finish the row was begun, and a missing one is final.
+    /// The row's begin failed after executing its insert, which may yet commit, so a missing
+    /// row is waited for, and no attempt starts that the deadline could cut short. For a
+    /// finish the row was begun, and a missing one is final.
     row_may_commit: bool,
 }
 
 impl Retry {
     async fn run(self) -> Result<(), PgAuditError> {
+        // When the task stops starting attempts. A completion of a failed begin's row starts
+        // none that its deadline, rather than its own time, could cut short: that attempt would
+        // end with no answer, and the row would be given up and reported though every attempt
+        // that answered found it never written. The others start attempts until the deadline.
+        let stop = if self.row_may_commit {
+            self.deadline
+                .checked_sub(self.attempt)
+                .unwrap_or(self.deadline)
+        } else {
+            self.deadline
+        };
         let mut pause = FIRST_PAUSE;
         loop {
             let last = match self.once().await {
@@ -799,11 +840,11 @@ impl Retry {
                 Err(error) if !error.is_transient() => return Err(error),
                 Err(error) => error,
             };
-            // A pause that reaches the deadline ends the task: no attempt starts there only to
-            // run out of time, so the error given up with is the last attempt's own.
+            // A pause that reaches the stop ends the task: no attempt starts there only to run
+            // out of time, so the error given up with is the last attempt's own.
             let now = Instant::now();
-            sleep_until((now + pause).min(self.deadline)).await;
-            if Instant::now() >= self.deadline {
+            sleep_until((now + pause).min(stop)).await;
+            if Instant::now() >= stop {
                 return Err(PgAuditError::Deadline {
                     row: self.row,
                     last: Box::new(last),

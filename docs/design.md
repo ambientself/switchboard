@@ -1120,11 +1120,16 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
   giving up a guard without running completes its row as `error`. The first half is built in
-  the Postgres store: when an allowed call's begin fails after sending its insert, without an
-  answer that says the insert failed, a task on the finish pool completes the row as `error`
-  with a latency of 0 until the finish deadline, counted in flight so shutdown waits for it.
-  That task alone waits for a missing row, which may still commit; a row still missing at the
-  deadline is counted as never written, not given up. Denials and list rows need nothing.
+  the Postgres store: when an allowed call's begin fails after executing its insert, with its
+  budget spent or a last error that trying again could fix, a task on the finish pool
+  completes the row as `error` with a latency of 0 until the finish deadline, counted in
+  flight so shutdown waits for it. That last error may be an explicit refusal, such as a
+  read-only server's, since an earlier attempt may have committed. That task alone waits for
+  a missing row, which may still commit, and starts no attempt its deadline could cut short;
+  a row its last attempt found missing is counted as never written, not given up. A
+  database that stays locked, unreachable or read-only past the deadline leaves the store
+  unable to tell, and that row is given up and reported. Denials and list rows need
+  nothing.
   Not built: giving up a guard. Today a guard can only be consumed by running it.
 - In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the

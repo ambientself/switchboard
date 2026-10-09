@@ -2341,10 +2341,10 @@ mutate("pg-begin-pool-wait-unbounded", "begin waits for a connection past its bu
 mutate("pg-finish-pool-wait-unbounded", "a finish attempt waits for a connection past its time", PG_STORE,
        "timeout_at(by, self.pool.get())", "timeout_at(by + Duration::from_secs(3600), self.pool.get())")
 mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget", PG_STORE,
-       "timeout_at(deadline, insert_on(&client, row))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, row))")
+       "timeout_at(deadline, insert_on(&client, row, sent))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, row, sent))")
 mutate("pg-begin-insert-budget-restarts", "begin's insert has a budget of its own after the wait for a connection", PG_STORE,
-       "match timeout_at(deadline, insert_on(&client, row)).await {",
-       "match timeout_at(Instant::now() + budget, insert_on(&client, row)).await {")
+       "match timeout_at(deadline, insert_on(&client, row, sent)).await {",
+       "match timeout_at(Instant::now() + budget, insert_on(&client, row, sent)).await {")
 mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
        "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
 mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
@@ -2369,9 +2369,9 @@ mutate("pg-finish-no-retry", "finish gives up after one failed attempt", PG_STOR
 mutate("pg-finish-retries-final-errors", "finish retries a failure that trying again cannot fix", PG_STORE,
        "                Err(error) if !error.is_transient() => return Err(error),", "                Err(error) if false => return Err(error),")
 mutate("pg-finish-no-deadline", "finish keeps trying past its deadline", PG_STORE,
-       "            if Instant::now() >= self.deadline {", "            if false {")
+       "            if Instant::now() >= stop {", "            if false {")
 mutate("pg-finish-pause-past-deadline", "a pause between finish attempts may run past the deadline", PG_STORE,
-       "sleep_until((now + pause).min(self.deadline)).await;", "sleep_until(now + pause).await;")
+       "sleep_until((now + pause).min(stop)).await;", "sleep_until(now + pause).await;")
 mutate("pg-finish-pause-uncapped", "the pause between attempts doubles without a cap", PG_STORE,
        "    (pause * 2).min(LONGEST_PAUSE)\n", "    pause * 2\n")
 mutate("pg-retry-connect-failure-final", "a connection that could not be made is not retried", PG_STORE,
@@ -2442,6 +2442,11 @@ mutate("pg-lost-confirmation-not-in-flight", "a lost confirmation's completion i
 mutate("pg-recovery-no-such-row-final", "a lost confirmation's completion stops at the first missing row", PG_STORE,
        "Err(error @ PgAuditError::NoSuchRow { .. }) if self.row_may_commit => error,",
        "Err(error @ PgAuditError::NoSuchRow { .. }) if false => error,")
+mutate("pg-lost-confirmation-before-insert-executed", "a begin whose insert was never executed starts a completion", PG_STORE,
+       "        match timeout_at(deadline, insert_on(&client, row, sent)).await {",
+       "        *sent = true;\n        match timeout_at(deadline, insert_on(&client, row, sent)).await {")
+mutate("pg-recovery-attempt-cut-by-deadline", "a lost confirmation's completion starts an attempt its deadline may cut", PG_STORE,
+       "        let stop = if self.row_may_commit {", "        let stop = if false {")
 mutate("pg-recovery-missing-row-given-up", "a row that was never written is reported as given up", PG_STORE,
        "                    if matches!(*last, PgAuditError::NoSuchRow { .. }) =>",
        "                    if false =>")

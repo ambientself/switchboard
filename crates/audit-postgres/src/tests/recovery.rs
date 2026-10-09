@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gateway_core::audit::{self, AuditFailure, AuditRowId, Begun};
 use gateway_testkit::{
@@ -322,20 +322,40 @@ async fn a_lost_confirmation_for_a_denial_leaves_the_denial_as_it_is() {
     assert!(reports_of(&reports).is_empty());
 }
 
-/// An insert still waiting on a lock when the begin budget runs out is cancelled, so it never
-/// commits. The store cannot know that, so it starts a completion, which finds no row until the
-/// finish deadline. That is counted as never written, not given up, and nothing is reported.
+/// Waits until no insert of the gateway's role is running in `db`: the store's cancel of the
+/// begin that ran out of time has arrived.
+async fn until_no_insert_runs(db: &TestDatabase, admin: &Client) {
+    until(
+        Duration::from_secs(5),
+        "the insert's cancellation",
+        || async {
+            count(
+                admin,
+                &format!(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE usename = '{GATEWAY_ROLE}' AND datname = '{}' AND state = 'active'
+                         AND query LIKE '%INSERT INTO switchboard_audit.call_rows%'",
+                    db.name()
+                ),
+            )
+            .await
+                == 0
+        },
+    )
+    .await;
+}
+
+/// A begin on a new connection prepares its insert first, and the prepare waits on the lock
+/// too. When the begin budget runs out there, no insert was executed, so none can commit, and
+/// the store starts nothing to complete the row.
 #[tokio::test]
-async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
+async fn a_begin_whose_insert_was_never_executed_starts_no_completion() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
     let fixture = Fixture::new().unwrap();
-    // The completion's first attempt waits on the lock until it is released, well within the
-    // answer budget, so it keeps its connection, and every later attempt is quick.
     let budgets = Budgets {
         begin: Duration::from_millis(300),
-        finish_deadline: Duration::from_secs(4),
         ..Budgets::default()
     };
     let (store, reports) = reporting(db.store(PoolSizes::default()).with_budgets(budgets));
@@ -353,30 +373,65 @@ async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
         matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
         "{failure}"
     );
-    assert_eq!(store.finishes().in_flight, 1);
-    until(
-        Duration::from_secs(5),
-        "the insert's cancellation",
-        || async {
-            count(
-                &admin,
-                &format!(
-                    "SELECT count(*) FROM pg_stat_activity
-                     WHERE usename = '{GATEWAY_ROLE}' AND datname = '{}' AND state = 'active'
-                         AND query LIKE '%INSERT INTO switchboard_audit.call_rows%'",
-                    db.name()
-                ),
-            )
-            .await
-                == 0
-        },
+    assert_eq!(store.finishes(), FinishCounts::default());
+    until_no_insert_runs(&db, &admin).await;
+    release(&lock).await;
+    assert_eq!(rows_under(&admin, &row).await, 0);
+    assert_eq!(store.finishes(), FinishCounts::default());
+    assert!(reports_of(&reports).is_empty());
+}
+
+/// An insert executed and still waiting on a lock when the begin budget runs out is
+/// cancelled, so it never commits. The store cannot know that, so it starts a completion,
+/// which finds no row. That is counted as never written, not given up, and nothing is
+/// reported. The completion starts no attempt that its deadline could cut short, so it stops
+/// one answer budget before the deadline, with its last attempt's answer.
+#[tokio::test]
+async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    // The completion's first attempt waits on the lock until it is released, well within the
+    // answer budget, so it keeps its connection, and every later attempt is quick.
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(2),
+        finish_deadline: Duration::from_secs(5),
+    };
+    // One begin connection, which the warm-up leaves with the insert prepared, so the begin
+    // under test executes its insert, which then waits on the lock.
+    let sizes = PoolSizes {
+        begin: 1,
+        ..PoolSizes::default()
+    };
+    let (store, reports) = reporting(db.store(sizes).with_budgets(budgets));
+    let admin = db.admin().await;
+    warm_up(&store, &fixture, allowed()).await;
+    let lock = lock_table(&db).await;
+
+    let row = row_start().row;
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
     )
-    .await;
+    .await
+    .unwrap_err();
+    let failed_at = Instant::now();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    assert_eq!(store.finishes().in_flight, 1);
+    until_no_insert_runs(&db, &admin).await;
     release(&lock).await;
 
+    // It stops by the deadline less one answer budget, not at the deadline: a second
+    // between the two either way.
+    let stops_by = failed_at + budgets.finish_deadline - budgets.answer + Duration::from_secs(1);
     until(
-        budgets.finish_deadline + SLACK,
-        "the completion to stop at its deadline",
+        stops_by.saturating_duration_since(Instant::now()),
+        "the completion to stop before its last answer budget",
         || async { store.finishes().in_flight == 0 },
     )
     .await;
@@ -391,10 +446,7 @@ async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
         reports_of(&reports)
     );
     assert!(reports_of(&reports).is_empty());
-    assert_eq!(
-        count(&admin, "SELECT count(*) FROM switchboard_audit.call_rows").await,
-        0
-    );
+    assert_eq!(rows_under(&admin, &row).await, 0);
 }
 
 /// The completion of a lost begin's row is counted in flight for as long as it keeps trying, so
