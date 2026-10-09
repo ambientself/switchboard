@@ -271,6 +271,11 @@ impl PolicySnapshot {
         self.surfaces.get(name)
     }
 
+    /// Every surface, in name order.
+    pub fn surfaces(&self) -> impl Iterator<Item = &Surface> {
+        self.surfaces.values()
+    }
+
     /// The profile with this name.
     pub fn profile(&self, name: &ProfileName) -> Option<&Profile> {
         self.profiles.get(name)
