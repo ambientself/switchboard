@@ -12,7 +12,9 @@ publish.workspace = true
 [dependencies]
 # The development issuer's HTTP server, as the gateway builds its own.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-gateway = { path = "../gateway" }
+# A development build of the gateway: world.rs serves a `propose` fixture tool, which the
+# receipt-store gate refuses in any other build.
+gateway = { path = "../gateway", features = ["test-support"] }
 gateway-core = { path = "../gateway-core" }
 gateway-identity = { path = "../gateway-identity" }
 gateway-mcp = { path = "../gateway-mcp" }
