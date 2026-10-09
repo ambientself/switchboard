@@ -1591,6 +1591,12 @@ mutate("gw-call-on-request-future", "the answer runs on the request's future, so
 mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
        "        return refused(&Rejection::request_timeout());",
        "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
+mutate("gw-ready-never-fails", "the readiness check still passes while the gateway stops", GW_SERVER,
+       "    ready.store(false, Ordering::SeqCst);\n", "")
+mutate("gw-stops-before-unready", "the gateway stops taking connections before the readiness removal, not after", GW_SERVER,
+       "    accepting\n        .until(&mut tasks, tokio::time::sleep(timeouts.readiness_removal))\n        .await;\n"
+       "    drop(listener);\n",
+       "    drop(listener);\n    tokio::time::sleep(timeouts.readiness_removal).await;\n")
 
 
 # --- gateway-dev ---------------------------------------------------------------------------
@@ -2732,6 +2738,9 @@ mutate("demo-kind-default-grace-period", "the kind gateway gets Kubernetes' defa
        "      terminationGracePeriodSeconds: 50\n", "      terminationGracePeriodSeconds: 30\n")
 mutate("demo-kind-slow-readiness-removal", "readiness removal takes longer than the grace period allows", "deploy/kind/base/gateway.yaml",
        "            failureThreshold: 3\n", "            failureThreshold: 10\n")
+mutate("demo-kind-tcp-readiness-probe", "the kind probe only opens a connection, which passes while the gateway stops", "deploy/kind/base/gateway.yaml",
+       "            httpGet:\n              path: /readyz\n              port: http\n",
+       "            tcpSocket:\n              port: http\n")
 mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
        "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
 
