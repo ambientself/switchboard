@@ -20,7 +20,7 @@ use tokio_postgres::{Client, NoTls};
 
 use super::{GATEWAY_ROLE, TestDatabase};
 use crate::columns::allowance_ms;
-use crate::{Budgets, PgAuditError, PgAuditStore, PoolSizes};
+use crate::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
 
 /// One call, as a test describes it.
 pub(super) struct Call {
@@ -912,6 +912,8 @@ async fn a_second_list_with_one_identifier_writes_one_row() {
         ),
         "{error:?}"
     );
+    // The database answered that begin, so nothing sets out to complete the list row.
+    assert_eq!(store.finishes(), FinishCounts::default());
     let call_row = begun_row(&store, &fixture).await;
     let listed = list(RowStart {
         row: call_row,
