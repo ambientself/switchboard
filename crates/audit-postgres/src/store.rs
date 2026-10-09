@@ -311,8 +311,8 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
 /// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE), and call
-/// [`check_at_boot`](Self::check_at_boot) before serving. The database assigns each row its
-/// identifier and both its times.
+/// [`check_at_boot`](Self::check_at_boot) before serving. The gateway chooses each row's
+/// identifier, and the database sets both its times.
 ///
 /// - Begin inserts the first half of a row and returns once the insert is committed. It has
 ///   [`Budgets::begin`], counted from asking for a connection. Past it, begin fails, so the
