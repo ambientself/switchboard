@@ -469,3 +469,13 @@ The rest matched section 10: 10 rows in each run, each matched to the call that 
 none wrong; mock-docs accepted 4 requests in Compose and 6 in kind, all with the gateway
 credential's hash, and refused only the two pre-policy probes in kind; 58 `kubectl auth can-i`
 checks answered `no`; 7 `identity_failed` lines and no row for the stranger.
+
+## 12. The kind dummy credential is gone
+
+On 2026-10-09 the kind deployment lost its dummy credential (#47). The gateway now presents a
+projected token of its own ServiceAccount to mock-docs, for audience `mock-docs` and valid
+600 s, and reads it again on every call. mock-docs runs in its JWT mode and accepts only
+`system:serviceaccount:switchboard:gateway`, signed by the cluster's keys. Compose keeps its
+own dummy credential, since it has no cluster issuer. The kind run passed (360/360): mock-docs
+accepted 8 requests, every one from the gateway's ServiceAccount, and refused only the two
+direct calls before the policy, as `wrong_audience`. No run waited for the token to rotate.
