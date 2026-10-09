@@ -431,8 +431,8 @@ can_i_no() {
   shift
   # can-i exits 1 when the answer is no; the answer itself, its last line, is what is checked.
   # can-i looks the resource up in the API's discovery. One it cannot find is still asked, as a
-  # core resource of the whole name that nothing grants, so the answer is no whatever the
-  # workload may do. Its warning fails the check.
+  # core-group resource of the whole name. That is not what the API server checks, so the
+  # answer, yes or no, says nothing about the permission. Its warning fails the check.
   if answer=$(k auth can-i "$@" --as="system:serviceaccount:$team:mock-workload" 2>&1); then :; fi
   case "$answer" in
     *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\n'*}" ;;
