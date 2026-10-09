@@ -41,7 +41,7 @@ mod world;
 
 pub use printer::AuditPrinter;
 pub use start::{
-    DevError, FixtureGateway, LISTEN_HOST, Options, start_fixture_gateway,
+    DEV_INSTANCE, DevError, FixtureGateway, LISTEN_HOST, Options, start_fixture_gateway,
     start_fixture_gateway_with,
 };
 pub use world::{

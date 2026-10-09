@@ -1,6 +1,11 @@
 //! Building a running gateway from a [`Deployment`]: what the `switchboard` binary does
 //! before it binds a socket.
 //!
+//! [`instance`] names the gateway instance from the environment, once, before anything else
+//! is prepared: `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, which Kubernetes sets to the pod's
+//! name and Docker to the container's. With neither, the gateway refuses to start. Every audit
+//! row records the instance that began it.
+//!
 //! [`prepare`] reads the registry file, loads each proxied server's credential, builds a
 //! [`ProxyConnector`] per server, connects the Postgres audit store and runs its boot checks
 //! (or takes audit as explicitly disabled), and then runs the boot gates
@@ -25,7 +30,7 @@ use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSi
 use connector_proxy::{
     CredentialFileError, FileCredentials, ProxyConnector, Upstream, UpstreamError,
 };
-use gateway_core::ConnectorName;
+use gateway_core::{ConnectorName, InstanceName};
 use gateway_identity::Clock;
 use gateway_registry::{Credential, Registry, RegistryError};
 use thiserror::Error;
@@ -41,12 +46,26 @@ use crate::reload::Reloader;
 /// The row keeps an empty outcome.
 pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";
 
+/// The environment variable that names the gateway instance, before [`HOSTNAME_VAR`].
+pub const INSTANCE_VAR: &str = "SWITCHBOARD_INSTANCE";
+
+/// The environment variable [`instance`] falls back to. Kubernetes sets it to the pod's name and
+/// Docker to the container's; a shell may not export it, so nothing should rely on one doing so.
+pub const HOSTNAME_VAR: &str = "HOSTNAME";
+
 /// How long the audit store's boot checks may take, connecting included.
 pub const AUDIT_CHECK_BUDGET: Duration = Duration::from_secs(15);
 
 /// Why the gateway refused to start.
 #[derive(Debug, Error)]
 pub enum StartError {
+    /// Nothing names the gateway instance, so its audit rows could not say which instance
+    /// began them.
+    #[error(
+        "nothing names this gateway instance: set {INSTANCE_VAR}, or {HOSTNAME_VAR} as \
+         Kubernetes and Docker do, so each audit row can record the instance that began it"
+    )]
+    NoInstance,
     /// The registry file could not be read or does not load.
     #[error(transparent)]
     Registry(#[from] RegistryError),
@@ -132,10 +151,23 @@ impl Watch {
     }
 }
 
-/// Builds the gateway `deployment` describes, on `clock`. See the [module
+/// The gateway instance's name, from `env`: [`INSTANCE_VAR`], or else [`HOSTNAME_VAR`]. An
+/// empty value counts as unset. With neither, [`StartError::NoInstance`]: the gateway does
+/// not make a name up.
+pub fn instance(env: impl Fn(&str) -> Option<String>) -> Result<InstanceName, StartError> {
+    [INSTANCE_VAR, HOSTNAME_VAR]
+        .into_iter()
+        .filter_map(env)
+        .find(|value| !value.is_empty())
+        .map(InstanceName::new)
+        .ok_or(StartError::NoInstance)
+}
+
+/// Builds the gateway `deployment` describes, as `instance`, on `clock`. See the [module
 /// documentation](self).
 pub async fn prepare(
     deployment: Deployment,
+    instance: InstanceName,
     clock: Arc<dyn Clock>,
 ) -> Result<Prepared, StartError> {
     let loaded = std::fs::read(&deployment.registry_file).map_err(|error| RegistryError::Read {
@@ -149,7 +181,7 @@ pub async fn prepare(
     let registry = Registry::from_toml_str(text)?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
-    let mut wiring = Wiring::new(clock);
+    let mut wiring = Wiring::new(clock).instance(instance.clone());
     for server in registry.servers().values() {
         let mut upstream = Upstream::new(server.name.clone(), server.address.clone());
         for (tool, route) in registry.routes() {
@@ -157,8 +189,11 @@ pub async fn prepare(
                 upstream = upstream.tool(tool.clone(), route.upstream_name.clone());
             }
         }
+        let deadline = upstream.deadline;
         let connector = ProxyConnector::new(upstream, credentials.clone())?;
-        wiring = wiring.proxied(server.name.clone(), Arc::new(connector));
+        wiring = wiring
+            .proxied(server.name.clone(), Arc::new(connector))
+            .call_deadline(server.name.clone(), deadline);
     }
 
     let store = match &deployment.audit {
@@ -208,6 +243,11 @@ pub async fn prepare(
     } else {
         tracing::warn!(event = "boot", audit = "disabled", "audit is disabled");
     }
+    tracing::info!(
+        event = "boot",
+        %instance,
+        "audit rows record this instance as the one that began them"
+    );
     tracing::info!(
         event = "boot",
         registry = %deployment.registry_file.display(),
@@ -304,4 +344,61 @@ fn identity_counts(identity: &IdentitySection) -> (usize, usize) {
         })
         .sum();
     (issuers.len(), subjects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An environment holding only `pairs`.
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(set, _)| set == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn the_instance_is_switchboard_instance_or_else_the_hostname() {
+        let named = |pairs: &[(&str, &str)]| instance(env(pairs)).ok();
+        assert_eq!(
+            named(&[(INSTANCE_VAR, "gateway-a"), (HOSTNAME_VAR, "pod-1")]),
+            Some(InstanceName::new("gateway-a"))
+        );
+        assert_eq!(
+            named(&[(HOSTNAME_VAR, "pod-1")]),
+            Some(InstanceName::new("pod-1"))
+        );
+        assert_eq!(
+            named(&[(INSTANCE_VAR, ""), (HOSTNAME_VAR, "pod-1")]),
+            Some(InstanceName::new("pod-1"))
+        );
+    }
+
+    #[test]
+    fn with_nothing_naming_the_instance_the_gateway_refuses_to_start() {
+        for pairs in [
+            &[][..],
+            &[(INSTANCE_VAR, "")],
+            &[(INSTANCE_VAR, ""), (HOSTNAME_VAR, "")],
+            &[("SWITCHBOARD_INSTANCE_NAME", "gateway-a")],
+        ] {
+            let refused = instance(env(pairs));
+            assert!(
+                matches!(refused, Err(StartError::NoInstance)),
+                "{pairs:?}: {refused:?}"
+            );
+        }
+        assert_eq!(
+            StartError::NoInstance.to_string(),
+            "nothing names this gateway instance: set SWITCHBOARD_INSTANCE, or HOSTNAME as \
+             Kubernetes and Docker do, so each audit row can record the instance that began it"
+        );
+    }
 }

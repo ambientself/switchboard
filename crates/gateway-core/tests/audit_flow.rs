@@ -9,14 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, Begun, Completion, DecisionKind, MAX_RECORDED_IDENTIFIER,
-    MAX_RECORDED_RESOURCES, Outcome, RecordedResource, RecordedResources, RequestMetadata,
+    MAX_RECORDED_RESOURCES, Outcome, RecordedResource, RecordedResources, RequestMetadata, RowKind,
+    RowStart,
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
-    Classification, Connector, ConnectorName, Decision, Delegation, PolicySnapshot, Principal,
-    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind, RequestedTool,
-    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, SnapshotData,
-    Surface, TeamId, ToolCall, ToolOutcome, decide,
+    Classification, Connector, ConnectorName, Decision, Delegation, InstanceName, PolicySnapshot,
+    Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind,
+    RequestedTool, Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources,
+    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, decide,
 };
 use serde_json::json;
 
@@ -538,6 +539,51 @@ fn hostile_requested_names_are_escaped_and_capped() {
             row.tool.chars().count()
         );
         assert_eq!(row.sentence.as_deref(), Some(sentence));
+    }
+}
+
+#[test]
+fn a_row_records_its_kind_the_instance_and_the_call_deadline_it_was_begun_with() {
+    let store = MemoryStore::default();
+    let _guard = allowed(&store, "fixture__read");
+    let _refusal = denied(&store, decide(&snapshot(), &call("fixture__nope")));
+    for row in store.rows() {
+        assert_eq!(row.kind, RowKind::Call);
+        assert_eq!(row.instance.as_str(), common::INSTANCE);
+        assert_eq!(row.call_deadline_ms, common::CALL_DEADLINE_MS);
+    }
+    let serialized = serde_json::to_value(store.last()).unwrap();
+    assert_eq!(serialized["kind"], "call");
+    assert_eq!(serialized["instance"], common::INSTANCE);
+    assert_eq!(serialized["call_deadline_ms"], common::CALL_DEADLINE_MS);
+}
+
+/// The instance comes from the environment, so the row holds it escaped and capped like a
+/// surface the caller chose.
+#[test]
+fn the_instance_is_escaped_and_capped() {
+    for (raw, recorded) in [
+        (
+            "pod-7f9c\nforged".to_owned(),
+            "pod-7f9c\\nforged".to_owned(),
+        ),
+        ("i".repeat(10_000), format!("{}…", "i".repeat(128))),
+    ] {
+        let store = MemoryStore::default();
+        let start = RowStart {
+            instance: InstanceName::new(raw),
+            ..common::start()
+        };
+        let begun = common::ready(audit::begin(
+            &store,
+            start,
+            decide(&snapshot(), &call("fixture__read")),
+            json!({}),
+            metadata(),
+        ))
+        .unwrap();
+        assert!(matches!(begun, Begun::Allowed(_)));
+        assert_eq!(store.last().instance.as_str(), recorded);
     }
 }
 

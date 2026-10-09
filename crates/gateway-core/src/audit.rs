@@ -35,8 +35,8 @@ use crate::classification::Classification;
 use crate::connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
 use crate::decision::{CallContext, Decision, Reason, ReasonKind, ResourceProblem, Verdict};
 use crate::names::{
-    ConnectorName, DeploymentName, Person, PolicyRevision, ProfileName, SurfaceName, TeamId,
-    ToolUseId,
+    ConnectorName, DeploymentName, InstanceName, Person, PolicyRevision, ProfileName, SurfaceName,
+    TeamId, ToolUseId,
 };
 use crate::policy::{ApprovedTool, Resource, Resources};
 use crate::principal::Principal;
@@ -91,6 +91,18 @@ pub enum DecisionKind {
     Deny,
 }
 
+/// What a row records: a tool call, or a listing of tools (decision 0009).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowKind {
+    /// A `tools/call` that reached a decision. It has a deadline, past which a row with no
+    /// outcome reads as open.
+    Call,
+    /// A `tools/list`, written complete. It has no deadline and is never open. Nothing in this
+    /// crate makes one yet.
+    List,
+}
+
 /// What happened to an allowed call once it ran.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
@@ -126,6 +138,15 @@ pub struct Completion {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditRecord {
+    /// A call or a listing. [`begin`] makes call rows only.
+    pub kind: RowKind,
+    /// The gateway instance that began the row, escaped and capped at 128 characters.
+    pub instance: InstanceName,
+    /// The call deadline of the connector the call names, in milliseconds, as the gateway
+    /// supplied it in [`RowStart`]. A store adds its own begin budget and finish deadline to
+    /// it for the allowance it gives the database, which sets the row's deadline from its own
+    /// clock. The time at begin and the deadline are not fields here: the store sets them.
+    pub call_deadline_ms: u64,
     /// The caller's identifier for this tool call, so its control plane can find the row.
     pub tool_use_id: Option<ToolUseId>,
     /// The deployment that received the call.
@@ -250,6 +271,11 @@ pub trait AuditStore: Send + Sync {
 pub struct RowStart {
     /// The row's identifier, chosen once per call. A retry of begin reuses it.
     pub row: AuditRowId,
+    /// The gateway instance beginning the row. The record holds it escaped and capped.
+    pub instance: InstanceName,
+    /// How long the connector the call names may run, in milliseconds. Recorded so the store
+    /// can give the row a deadline that covers the call; the core enforces nothing with it.
+    pub call_deadline_ms: u64,
 }
 
 /// The completion of one allowed row, for [`AuditStore::finish`]. Made only by [`finish`].
@@ -402,7 +428,18 @@ pub async fn begin(
             Some(sentence.clone()),
         ),
     };
+    let RowStart {
+        row,
+        instance,
+        call_deadline_ms,
+    } = start;
     let record = AuditRecord {
+        kind: RowKind::Call,
+        instance: InstanceName::new(sentences::escape(
+            instance.as_str(),
+            sentences::MAX_RENDERED,
+        )),
+        call_deadline_ms,
         tool_use_id: metadata.tool_use_id,
         deployment: call.caller.deployment.clone(),
         surface: SurfaceName::new(sentences::escape(
@@ -433,7 +470,6 @@ pub async fn begin(
         claimed_team: metadata.claimed_team,
         completion: None,
     };
-    let RowStart { row } = start;
     store
         .begin(&row, &record)
         .await

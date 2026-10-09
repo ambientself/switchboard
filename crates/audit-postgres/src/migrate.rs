@@ -42,6 +42,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "row_ids",
         sql: include_str!("../sql/migrations/0002_row_ids.sql"),
     },
+    Migration {
+        version: 3,
+        name: "row_deadline",
+        sql: include_str!("../sql/migrations/0003_row_deadline.sql"),
+    },
 ];
 
 /// Any number, the same in every gateway: two migrators on one database take turns.

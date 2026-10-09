@@ -1,0 +1,45 @@
+# Vendor token formats that route-check.sh looks for in a pod's literal variables and in the
+# ConfigMaps it reads. One extended regular expression (grep -E) per line, each under a comment
+# naming its source. Lines starting with # and blank lines are skipped.
+#
+# A match fails the check; the report names where it matched and which line of this file, never
+# the value. The patterns are not anchored, so a token inside a longer value still matches, and
+# lengths are lower bounds, so a format that grows still matches. This catches carelessness, not
+# intent: a token split, encoded or in a format not listed here is not found.
+#
+# GitHub: classic personal access tokens (ghp_), OAuth tokens (gho_), user-to-server (ghu_),
+# server-to-server and App installation tokens (ghs_) and refresh tokens (ghr_). GitHub docs,
+# "About authentication to GitHub", GitHub's token formats.
+gh[pousr]_[A-Za-z0-9]{30,}
+# GitHub fine-grained personal access tokens. Same page.
+github_pat_[A-Za-z0-9_]{22,}
+# Slack bot (xoxb-), user (xoxp-), workspace app (xoxa-), refresh (xoxr-) and legacy (xoxs-)
+# tokens. Slack API docs, "Tokens".
+xox[abprs]-[A-Za-z0-9-]{10,}
+# Slack app-level tokens. Same page.
+xapp-[0-9]+-[A-Za-z0-9-]{10,}
+# Slack rotating tokens and configuration tokens (xoxe- and xoxe.xoxp-). Same page.
+xoxe(\.xox[bp])?-[0-9]+-[A-Za-z0-9-]{10,}
+# AWS access key IDs: AKIA for a long-term key, ASIA for a temporary one from STS. AWS IAM User
+# Guide, "IAM identifiers", unique ID prefixes.
+(AKIA|ASIA)[A-Z0-9]{16}
+# Atlassian API tokens, which start ATATT (docs/systems.md, Atlassian, API token
+# authentication; prefix as issued by id.atlassian.com).
+ATATT[A-Za-z0-9_=+/-]{20,}
+# GitLab personal access tokens. GitLab docs, "GitLab token overview", token prefixes.
+glpat-[A-Za-z0-9_-]{20,}
+# New Relic user API keys. New Relic docs, "New Relic API keys".
+NRAK-[A-Z0-9]{20,}
+# New Relic Insights insert keys. Same page.
+NRII-[A-Za-z0-9_-]{20,}
+# New Relic license (ingest) keys: 40 characters ending NRAL. Same page.
+[A-Za-z0-9]{36}NRAL
+# Akamai EdgeGrid client and access tokens, as written in .edgerc (docs/systems.md, Akamai).
+# Akamai publishes no length. Its credential export (akamai/akamai-gen-edgerc, sample-auth.txt)
+# shows 16 characters, a hyphen and 16 more; its docs examples ("Create EdgeGrid authentication
+# credentials", "Authenticate with EdgeGrid") show 26 or 27, then 5 or 6. The pattern takes both,
+# and also the akab- host name in .edgerc, which only fails closed.
+akab-[A-Za-z0-9]{5,}-[A-Za-z0-9]{5,}
+# Salesforce access tokens: the 15- or 18-character org ID (00D...), "!", then the session.
+# Salesforce docs, OAuth flows, the access_token in each example response.
+00D[A-Za-z0-9]{12,}![A-Za-z0-9._]{20,}
