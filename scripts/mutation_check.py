@@ -1173,6 +1173,10 @@ mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON",
        ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
 mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
        ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
+mutate("mcp-row-meta-drops-server-info", "the row replaces a modern result's _meta instead of joining it", MCP_REPLY,
+       "        let meta = map.entry(\"_meta\").or_insert_with(|| json!({}));\n"
+       "        insert(meta, AUDIT_ROW_META, Value::from(row));\n",
+       "        map.insert(\"_meta\".to_owned(), json!({AUDIT_ROW_META: row}));\n")
 mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
        ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
 mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
@@ -1550,25 +1554,33 @@ mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a r
        "Answer::Error(message) => Reply::ToolError(message),",
        "Answer::Error(message) => Reply::Denied(message),")
 mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
-       "                return Reply::Denied(failure.sentence().to_owned());",
-       "                return Reply::ToolError(failure.sentence().to_owned());")
+       "                return (Reply::Denied(failure.sentence().to_owned()), None);",
+       "                return (Reply::ToolError(failure.sentence().to_owned()), None);")
 mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
-       "                return Reply::Denied(refusal.sentence().to_owned());",
-       "                return Reply::ToolError(refusal.sentence().to_owned());")
+       "                return (Reply::Denied(refusal.sentence().to_owned()), row);",
+       "                return (Reply::ToolError(refusal.sentence().to_owned()), row);")
 mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
-       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
-       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
+       "            return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);",
+       "            return (Reply::ToolError(IDENTITY_DISABLED.to_owned()), None);")
 mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
        "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
 mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
        "        if let Some(failure) = finished.failure() {\n",
        "        if let Some(failure) = finished.failure() {\n"
-       "            return Reply::Denied(failure.sentence().to_owned());\n")
+       "            return (Reply::Denied(failure.sentence().to_owned()), None);\n")
 mutate("gw-latency-not-measured", "every call is recorded as taking no time", GW_PATH,
        "let latency_ms = elapsed_millis(gates.clock().as_ref(), started);",
        "let latency_ms = 0;")
 mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
        "read_only: tool.classification == Classification::Read,", "read_only: true,")
+mutate("gw-row-not-in-meta", "a call that ran does not name its row in the answer", GW_PATH,
+       "        (reply, named)\n", "        let _ = named;\n        (reply, None)\n")
+mutate("gw-row-not-in-error-data", "a denial does not name its row in error.data", GW_PATH,
+       "                let row = self.quotable(refusal.row());\n",
+       "                let row: Option<AuditRowId> = None;\n")
+mutate("gw-disabled-row-leaked", "with audit disabled, the answer names a row nothing wrote", GW_PATH,
+       "        (self.inner.gates.audit_state() == GateState::On).then(|| row.clone())",
+       "        Some(row.clone())")
 
 
 # --- gateway server ------------------------------------------------------------------------
