@@ -13,6 +13,8 @@ publish.workspace = true
 # must outlast.
 audit-postgres = { path = "../audit-postgres" }
 connector-proxy = { path = "../connector-proxy" }
+# The gateway's readiness removal, which the probe and the grace period are held to.
+gateway = { path = "../gateway" }
 gateway-core = { path = "../gateway-core" }
 serde_json = "1"
 sha2 = "0.10"

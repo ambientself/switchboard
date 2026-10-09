@@ -8,6 +8,7 @@ mod common;
 use std::time::Duration;
 
 use common::read;
+use gateway::READINESS_REMOVAL;
 use sha2::{Digest, Sha256};
 
 /// The block of a top-level Compose service: its lines up to the next service.
@@ -216,7 +217,6 @@ fn the_gateway_is_given_time_to_complete_its_rows_when_it_stops() {
     let deployment = documents_with(&gateway, "kind: Deployment");
     assert_eq!(deployment.len(), 1, "{gateway}");
     let grace = number_after(deployment[0], "      terminationGracePeriodSeconds: ", "");
-    // Readiness removal: the probe's period times the failures it takes.
     let probe = deployment[0]
         .split_once("          readinessProbe:\n")
         .expect("the gateway has a readiness probe")
@@ -226,21 +226,38 @@ fn the_gateway_is_given_time_to_complete_its_rows_when_it_stops() {
         .take_while(|line| line.starts_with("            "))
         .collect::<Vec<_>>()
         .join("\n");
-    let removal = number_after(&probe, "            periodSeconds: ", "")
-        * number_after(&probe, "            failureThreshold: ", "");
-    let needed = Duration::from_secs(removal) + begin_call_and_finish();
+    // The probe asks the gateway's readiness check, which fails first when it stops.
+    assert!(
+        probe.starts_with(
+            "            httpGet:\n              path: /readyz\n              port: http\n"
+        ),
+        "{probe}"
+    );
+    // The gateway goes on serving after its check fails for as long as the probe takes to
+    // notice: its period times the failures it needs.
+    let noticed = Duration::from_secs(
+        number_after(&probe, "            periodSeconds: ", "")
+            * number_after(&probe, "            failureThreshold: ", ""),
+    );
+    assert!(
+        READINESS_REMOVAL >= noticed,
+        "kind: the probe takes {noticed:?} to notice, longer than the gateway's \
+         {READINESS_REMOVAL:?} readiness removal"
+    );
+    let needed = READINESS_REMOVAL + begin_call_and_finish();
     assert!(
         Duration::from_secs(grace) > needed,
         "kind: a grace period of {grace} s is not longer than {needed:?}"
     );
 
+    // Compose has no readiness probe, but the gateway waits out its readiness removal all the
+    // same.
     let compose = read("deploy/compose/compose.yaml");
     let service = compose_service(&compose, "gateway");
     let grace = number_after(&service, "    stop_grace_period: ", "s");
     assert!(
-        Duration::from_secs(grace) > begin_call_and_finish(),
-        "Compose: a grace period of {grace} s is not longer than {:?}",
-        begin_call_and_finish()
+        Duration::from_secs(grace) > needed,
+        "Compose: a grace period of {grace} s is not longer than {needed:?}"
     );
 }
 
