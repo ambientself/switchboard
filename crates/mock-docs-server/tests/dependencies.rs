@@ -5,7 +5,13 @@
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-const ALLOWED: [&str; 4] = ["axum", "serde_json", "sha2", "tokio"];
+const ALLOWED: [&str; 5] = ["axum", "jsonwebtoken", "serde_json", "sha2", "tokio"];
+
+/// `jsonwebtoken` exactly as `gateway-identity` has it: only the pure-Rust backend. It panics
+/// on first use if both backends are enabled anywhere in the build, and another feature set
+/// would also change `Cargo.lock`.
+const JSONWEBTOKEN: &str =
+    r#"jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }"#;
 
 fn section(name: &str) -> Vec<String> {
     let header = format!("[{name}]");
@@ -50,5 +56,21 @@ fn no_gateway_crate_appears_anywhere_in_the_manifest() {
             !MANIFEST.contains(&format!("[{kind}")),
             "the manifest has a [{kind}] section, which this test does not check"
         );
+    }
+}
+
+#[test]
+fn jsonwebtoken_has_the_same_single_backend_as_the_gateways_verifier() {
+    let identity = include_str!("../../gateway-identity/Cargo.toml");
+    for (crate_name, manifest) in [
+        ("mock-docs-server", MANIFEST),
+        ("gateway-identity", identity),
+    ] {
+        let lines: Vec<&str> = manifest
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("jsonwebtoken"))
+            .collect();
+        assert_eq!(lines, [JSONWEBTOKEN], "{crate_name}");
     }
 }

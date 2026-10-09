@@ -3,7 +3,11 @@
 //! - `MOCK_DOCS_TOKEN_FILE`: a file holding the one accepted bearer token; or
 //! - `MOCK_DOCS_TOKEN_SHA256`: the token's SHA-256 in hex; or
 //! - `MOCK_DOCS_TOKEN_SHA256_FILE`: a file holding the token's SHA-256 in hex. Exactly one of
-//!   the three.
+//!   the three, in the static mode.
+//! - `MOCK_DOCS_JWT_ISSUER`, `MOCK_DOCS_JWT_AUDIENCE`, `MOCK_DOCS_JWT_SUBJECT` and
+//!   `MOCK_DOCS_JWKS_FILE`: the JWT mode, in place of the static one. All four together: the
+//!   issuer and audience a token must name, the one subject accepted, and a file holding the
+//!   JWK set of the keys that sign tokens.
 //! - `MOCK_DOCS_LISTEN`: the MCP endpoint's address, default `0.0.0.0:8080`.
 //! - `MOCK_DOCS_ADMIN_LISTEN`: the admin endpoint's address. Unset, there is none.
 //! - `MOCK_DOCS_TOOLS`: the tools offered at start, comma-separated, default
@@ -15,8 +19,8 @@
 
 use std::process::ExitCode;
 
-use mock_docs_server::{Log, MockDocs, Settings};
-use serde_json::json;
+use mock_docs_server::{Credential, Log, MockDocs, Settings};
+use serde_json::{Value, json};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -42,14 +46,30 @@ async fn main() -> ExitCode {
         .iter()
         .map(|tool| tool.as_str())
         .collect();
-    server.log().write(json!({
+    let mut boot = json!({
         "event": "boot",
         "listen": bound(Some(&listener)),
         "admin_listen": bound(admin_listener.as_ref()),
         "tools": tools,
         "slow_ms": settings.config.slow.as_millis(),
-        "accepted_sha256": settings.config.accepted.logged_prefix(),
-    }));
+    });
+    let mode = match &settings.config.accepted {
+        Credential::Static(accepted) => json!({
+            "mode": "static",
+            "accepted_sha256": accepted.logged_prefix(),
+        }),
+        Credential::Jwt(verifier) => json!({
+            "mode": "jwt",
+            "issuer": verifier.issuer(),
+            "audience": verifier.audience(),
+            "subject": verifier.subject(),
+            "key_ids": verifier.key_ids(),
+        }),
+    };
+    if let (Some(boot), Value::Object(mode)) = (boot.as_object_mut(), mode) {
+        boot.extend(mode);
+    }
+    server.log().write(boot);
 
     let admin = async {
         match admin_listener {

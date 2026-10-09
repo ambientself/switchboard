@@ -15,12 +15,16 @@
 //!   1 MiB of text. A document is found only by its project and name together. A missing
 //!   project or document is a tool result with `isError: true`.
 //! - **One credential.** Every request on every path must carry `Authorization: Bearer` with
-//!   the one accepted token, or it gets a 401 before its body is read. The server holds only
-//!   the token's SHA-256.
+//!   an accepted token, or it gets a 401 before its body is read. The server runs in one of two
+//!   modes ([`Credential`]). In the static mode it accepts one token and holds only its
+//!   SHA-256. In the JWT mode it accepts the tokens of one subject, signed with RS256 by a key
+//!   in a fixed JWK set, from one issuer, for one audience, and in date; see [`JwtVerifier`].
 //! - **A log line per request.** Each line is a JSON object on standard output with
 //!   `bearer_sha256`, the first 12 hex digits of the SHA-256 of the bearer the request carried
 //!   (`null` if none), and `accepted`. A script can count these to show which credentials ever
-//!   reached the server.
+//!   reached the server. In the JWT mode each line also has `caller`, the verified subject of
+//!   an accepted token (`null` otherwise), and `refusal`, why a token was refused (`null` if it
+//!   was not; see [`Refusal`]). Nothing from a token that failed verification is logged.
 //!
 //! The binary, `mock-docs-server`, reads its settings from environment variables; see
 //! [`Settings::from_vars`]. Tests can run the server on loopback with [`start`].
@@ -29,16 +33,18 @@
 
 pub mod config;
 mod documents;
+mod jwt;
 mod server;
 mod tools;
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
-pub use config::{AcceptedCredential, Config, ConfigError, Settings};
+pub use config::{AcceptedCredential, Config, ConfigError, Credential, Settings};
 pub use documents::{
     FAIL_CODE, FAIL_DOC, HANG_DOC, HUGE_BYTES, HUGE_DOC, PLAN, PROJECTS, SLOW_DOC,
 };
+pub use jwt::{JwtVerifier, LEEWAY_SECONDS, Refusal};
 pub use server::{ACCEPTED_PROTOCOL_VERSIONS, Log, MockDocs, PROTOCOL_VERSION, SERVER_NAME};
 pub use tools::{ALL_TOOLS, DEFAULT_TOOLS, ToolName, parse_tool_list};
 

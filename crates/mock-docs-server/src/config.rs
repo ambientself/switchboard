@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::jwt::JwtVerifier;
 use crate::tools::{DEFAULT_TOOLS, ToolName, parse_tool_list};
 
 /// Where the MCP endpoint listens unless `MOCK_DOCS_LISTEN` says otherwise.
@@ -23,6 +24,25 @@ pub const TOKEN_SHA256_VAR: &str = "MOCK_DOCS_TOKEN_SHA256";
 /// The variable naming a file that holds the hex SHA-256 of the one accepted bearer
 /// credential, so a deployment can hand the server a secret file holding only the hash.
 pub const TOKEN_SHA256_FILE_VAR: &str = "MOCK_DOCS_TOKEN_SHA256_FILE";
+/// The variable holding the issuer a JWT must name, in the JWT mode.
+pub const JWT_ISSUER_VAR: &str = "MOCK_DOCS_JWT_ISSUER";
+/// The variable holding the audience a JWT must name, in the JWT mode.
+pub const JWT_AUDIENCE_VAR: &str = "MOCK_DOCS_JWT_AUDIENCE";
+/// The variable holding the one subject accepted in the JWT mode, such as
+/// `system:serviceaccount:switchboard:gateway`.
+pub const JWT_SUBJECT_VAR: &str = "MOCK_DOCS_JWT_SUBJECT";
+/// The variable naming the file that holds the JWK set a JWT must be signed by, in the shape a
+/// Kubernetes API server's `/openid/v1/jwks` returns.
+pub const JWKS_FILE_VAR: &str = "MOCK_DOCS_JWKS_FILE";
+/// The JWT mode's variables. All four are set together, or none is.
+pub const JWT_VARS: [&str; 4] = [
+    JWT_ISSUER_VAR,
+    JWT_AUDIENCE_VAR,
+    JWT_SUBJECT_VAR,
+    JWKS_FILE_VAR,
+];
+/// The static mode's variables. At most one is set.
+pub const STATIC_VARS: [&str; 3] = [TOKEN_FILE_VAR, TOKEN_SHA256_VAR, TOKEN_SHA256_FILE_VAR];
 /// The variable holding the MCP endpoint's listen address.
 pub const LISTEN_VAR: &str = "MOCK_DOCS_LISTEN";
 /// The variable holding the admin endpoint's listen address. Unset, there is no admin endpoint.
@@ -68,6 +88,22 @@ impl AcceptedCredential {
     pub fn logged_prefix(&self) -> String {
         logged_prefix(&self.digest)
     }
+
+    /// Reads the static mode's variables through `var`: exactly one must be set.
+    fn from_vars(var: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let accepted = match (
+            var(TOKEN_FILE_VAR),
+            var(TOKEN_SHA256_VAR),
+            var(TOKEN_SHA256_FILE_VAR),
+        ) {
+            (Some(path), None, None) => read_token_file(Path::new(&path))?,
+            (None, Some(hex), None) => AcceptedCredential::sha256_hex(&hex)?,
+            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,
+            (None, None, None) => return Err(ConfigError::NoCredential),
+            _ => return Err(ConfigError::TwoCredentials),
+        };
+        Ok(accepted)
+    }
 }
 
 impl fmt::Debug for AcceptedCredential {
@@ -76,11 +112,32 @@ impl fmt::Debug for AcceptedCredential {
     }
 }
 
+/// What the server accepts: one static bearer credential, or one subject's signed tokens.
+#[derive(Clone, Debug)]
+pub enum Credential {
+    /// The static mode: one bearer credential, held as its SHA-256.
+    Static(AcceptedCredential),
+    /// The JWT mode: tokens from one issuer, for one audience, about one subject.
+    Jwt(JwtVerifier),
+}
+
+impl From<AcceptedCredential> for Credential {
+    fn from(accepted: AcceptedCredential) -> Self {
+        Self::Static(accepted)
+    }
+}
+
+impl From<JwtVerifier> for Credential {
+    fn from(verifier: JwtVerifier) -> Self {
+        Self::Jwt(verifier)
+    }
+}
+
 /// What the server does: which credential it accepts, what it offers and how slow `slow-doc` is.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The one bearer credential accepted. Every other request gets a 401.
-    pub accepted: AcceptedCredential,
+    /// What is accepted. Every other request gets a 401.
+    pub accepted: Credential,
     /// The tools offered at start, in the order `tools/list` gives them.
     pub tools: Vec<ToolName>,
     /// How long `slow-doc` takes to answer.
@@ -89,9 +146,9 @@ pub struct Config {
 
 impl Config {
     /// A server accepting `accepted`, offering the default tools, with the default delay.
-    pub fn new(accepted: AcceptedCredential) -> Self {
+    pub fn new(accepted: impl Into<Credential>) -> Self {
         Self {
-            accepted,
+            accepted: accepted.into(),
             tools: DEFAULT_TOOLS.to_vec(),
             slow: DEFAULT_SLOW,
         }
@@ -111,20 +168,17 @@ pub struct Settings {
 
 impl Settings {
     /// Reads the settings through `var`, which returns a variable's value or `None` if it is
-    /// unset. Exactly one of [`TOKEN_FILE_VAR`], [`TOKEN_SHA256_VAR`] and
-    /// [`TOKEN_SHA256_FILE_VAR`] must be set; anything missing, contradictory or unreadable is
-    /// an error, and the server does not start.
+    /// unset. The server runs in one of two modes. In the static mode exactly one of
+    /// [`TOKEN_FILE_VAR`], [`TOKEN_SHA256_VAR`] and [`TOKEN_SHA256_FILE_VAR`] is set. In the
+    /// JWT mode all four of [`JWT_VARS`] are set, and none of the static ones. Anything
+    /// missing, contradictory or unreadable is an error, and the server does not start.
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let accepted = match (
-            var(TOKEN_FILE_VAR),
-            var(TOKEN_SHA256_VAR),
-            var(TOKEN_SHA256_FILE_VAR),
-        ) {
-            (Some(path), None, None) => read_token_file(Path::new(&path))?,
-            (None, Some(hex), None) => AcceptedCredential::sha256_hex(&hex)?,
-            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,
-            (None, None, None) => return Err(ConfigError::NoCredential),
-            _ => return Err(ConfigError::TwoCredentials),
+        let jwt_set = JWT_VARS.iter().any(|name| var(name).is_some());
+        let static_set = STATIC_VARS.iter().any(|name| var(name).is_some());
+        let accepted = match (jwt_set, static_set) {
+            (true, true) => return Err(ConfigError::StaticAndJwt),
+            (true, false) => Credential::Jwt(read_jwt(&var)?),
+            (false, _) => Credential::Static(AcceptedCredential::from_vars(&var)?),
         };
         let listen = address(
             LISTEN_VAR,
@@ -161,9 +215,9 @@ impl Settings {
 /// Why the settings were refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    /// Neither credential variable is set.
+    /// No credential variable is set, static or JWT.
     NoCredential,
-    /// Both credential variables are set, so which one counts is unclear.
+    /// Two static credential variables are set, so which one counts is unclear.
     TwoCredentials,
     /// The token file could not be read.
     TokenFile(String),
@@ -177,6 +231,12 @@ pub enum ConfigError {
     BadNumber(&'static str),
     /// The tool list names an unknown tool or one tool twice.
     Tools(String),
+    /// A static credential variable and a JWT variable are both set.
+    StaticAndJwt,
+    /// Some of the JWT variables are set but not this one, or it is empty.
+    JwtIncomplete(&'static str),
+    /// The JWK set file could not be read, or does not hold a set of RS256 keys.
+    Jwks(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -184,8 +244,9 @@ impl fmt::Display for ConfigError {
         match self {
             Self::NoCredential => write!(
                 formatter,
-                "set one of {TOKEN_FILE_VAR}, {TOKEN_SHA256_VAR} and {TOKEN_SHA256_FILE_VAR}: \
-                 the server accepts one credential"
+                "set one of {TOKEN_FILE_VAR}, {TOKEN_SHA256_VAR} and {TOKEN_SHA256_FILE_VAR}, \
+                 or all of {}: the server accepts one credential",
+                JWT_VARS.join(", ")
             ),
             Self::TwoCredentials => write!(
                 formatter,
@@ -202,11 +263,36 @@ impl fmt::Display for ConfigError {
             Self::BadAddress(var) => write!(formatter, "{var} is not an address like 0.0.0.0:8080"),
             Self::BadNumber(var) => write!(formatter, "{var} is not a whole number"),
             Self::Tools(reason) => write!(formatter, "{TOOLS_VAR}: {reason}"),
+            Self::StaticAndJwt => write!(
+                formatter,
+                "set either a static credential ({}) or the JWT settings ({}), not both",
+                STATIC_VARS.join(", "),
+                JWT_VARS.join(", ")
+            ),
+            Self::JwtIncomplete(var) => write!(
+                formatter,
+                "{var} is missing or empty: the JWT mode needs all of {}",
+                JWT_VARS.join(", ")
+            ),
+            Self::Jwks(reason) => write!(formatter, "{JWKS_FILE_VAR}: {reason}"),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
+
+fn read_jwt(var: &impl Fn(&str) -> Option<String>) -> Result<JwtVerifier, ConfigError> {
+    let [issuer, audience, subject, jwks_file] = JWT_VARS.map(|name| {
+        var(name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or(ConfigError::JwtIncomplete(name))
+    });
+    let (issuer, audience, subject, jwks_file) = (issuer?, audience?, subject?, jwks_file?);
+    let jwks = std::fs::read_to_string(&jwks_file)
+        .map_err(|error| ConfigError::Jwks(format!("cannot read {jwks_file}: {error}")))?;
+    JwtVerifier::new(&issuer, &audience, &subject, &jwks).map_err(ConfigError::Jwks)
+}
 
 fn read_token_file(path: &Path) -> Result<AcceptedCredential, ConfigError> {
     let text =

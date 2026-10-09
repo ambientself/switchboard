@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use mock_docs_server::{AcceptedCredential, ConfigError, DEFAULT_TOOLS, Settings, ToolName};
+use mock_docs_server::{
+    AcceptedCredential, ConfigError, Credential, DEFAULT_TOOLS, Settings, ToolName,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -28,6 +30,14 @@ fn settings(vars: &[(&str, &str)]) -> Result<Settings, ConfigError> {
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
     Settings::from_vars(|name| vars.get(name).cloned())
+}
+
+/// The static credential the settings accept. Panics on an error or in the JWT mode.
+fn accepted(settings: Result<Settings, ConfigError>) -> AcceptedCredential {
+    match settings.unwrap().config.accepted {
+        Credential::Static(accepted) => accepted,
+        Credential::Jwt(verifier) => panic!("expected the static mode, not {verifier:?}"),
+    }
 }
 
 /// A file holding `contents`, in a directory of its own for this test.
@@ -72,7 +82,7 @@ fn exactly_one_credential_must_be_configured() {
         [("MOCK_DOCS_TOKEN_SHA256", &digest)],
         [("MOCK_DOCS_TOKEN_SHA256_FILE", digest_file)],
     ] {
-        let accepted = settings(&vars).unwrap().config.accepted;
+        let accepted = accepted(settings(&vars));
         assert!(accepted.accepts(TOKEN));
         assert!(!accepted.accepts("dummy-workload-token-for-tests"));
         assert!(!accepted.accepts(""));
@@ -83,13 +93,7 @@ fn exactly_one_credential_must_be_configured() {
 fn the_digest_must_be_64_hex_digits_in_either_case() {
     let digest = sha256_hex(TOKEN);
     let upper = digest.to_uppercase();
-    assert!(
-        settings(&[("MOCK_DOCS_TOKEN_SHA256", &upper)])
-            .unwrap()
-            .config
-            .accepted
-            .accepts(TOKEN)
-    );
+    assert!(accepted(settings(&[("MOCK_DOCS_TOKEN_SHA256", &upper)])).accepts(TOKEN));
     for bad in [
         &digest[..62],
         &format!("{digest}00"),
@@ -148,10 +152,10 @@ fn every_byte_of_the_digest_counts() {
 #[test]
 fn a_token_file_loses_its_trailing_newline_and_must_not_be_empty() {
     let file = token_file("newline", &format!("{TOKEN}\n"));
-    let accepted = settings(&[("MOCK_DOCS_TOKEN_FILE", file.to_str().unwrap())])
-        .unwrap()
-        .config
-        .accepted;
+    let accepted = accepted(settings(&[(
+        "MOCK_DOCS_TOKEN_FILE",
+        file.to_str().unwrap(),
+    )]));
     assert_eq!(accepted, AcceptedCredential::token(TOKEN));
     assert!(!accepted.accepts(&format!("{TOKEN}\n")));
 
@@ -261,6 +265,7 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
     let boot: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
     assert_eq!(boot["event"], "boot");
     assert_eq!(boot["tools"], json!(["read_document"]));
+    assert_eq!(boot["mode"], "static");
     assert_eq!(boot["accepted_sha256"], sha256_hex(TOKEN)[..12]);
     assert_eq!(boot["admin_listen"], Value::Null);
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
@@ -289,4 +294,9 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
     );
     assert_eq!(second["bearer_sha256"], sha256_hex(TOKEN)[..12]);
     assert_eq!(second["accepted"], true);
+    // The JWT mode's fields are not in the static mode's lines.
+    for line in [&first, &second] {
+        assert!(line.get("caller").is_none(), "{line}");
+        assert!(line.get("refusal").is_none(), "{line}");
+    }
 }

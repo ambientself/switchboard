@@ -1683,7 +1683,7 @@ MS = MOCK + "src/server.rs"
 MC = MOCK + "src/config.rs"
 MD = MOCK + "src/documents.rs"
 mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
-       "                accepted: self.inner.accepted.accepts(token),", "                accepted: true,")
+       "                accepted: accepted.accepts(token),", "                accepted: true,")
 mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
@@ -1704,7 +1704,7 @@ mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools f
        '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
        '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
 mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
-       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(self.inner.accepted.logged_prefix()),")
+       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(accepted.logged_prefix()),")
 mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
 mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
        "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
