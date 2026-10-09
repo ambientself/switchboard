@@ -95,20 +95,40 @@ an edited file run first, and their dependents only if those pass; each run stop
 failing test binary. `--all-catchers` runs them together and to the end, and names every test
 that fails. A mutation whose scoped run passes runs again with `cargo test --workspace --locked --no-fail-fast` and is
 reported as surviving only if that passes too, so a gap in the table costs time, not a verdict.
-Each set of packages is first run once unmutated, and one that fails on its own is not used.
-When you add a test that reads a file of another crate or outside `crates/`, add it to the table.
+Each set of packages is first run once unmutated, and one that fails on its own is not used; the
+end of its output is printed. When you add a test that reads a file of another crate or outside
+`crates/`, add it to the table.
+
+The first step builds only the packages that hold or read an edited file. So by default, a
+mutation that compiles there but breaks the build of a package that depends on them is judged
+by those packages' tests, and is caught if one fails, though the whole workspace would not
+build. Such a mutation has gone stale: a trait changed in the core but not in a crate that
+implements it, for example. Run with `--all-catchers`, which builds the dependents too, to find
+these: they come back NO-VERDICT. Fix one by making the same change in the dependent.
 
 A full pass still takes hours. Split it with `--shard I/N`, which runs every N-th mutation from
-the I-th (0-based), one process per shard. Give each shard a Postgres of its own, started as
-below on ports 25430 to 25433:
+the I-th (0-based), one process per shard. Each shard copies and builds its own workspace and
+needs its own Postgres, because the tests change cluster-wide roles:
 
 ```sh
+for i in 0 1 2 3; do
+  docker run -d --rm --name sb-pg-$i -p 127.0.0.1:2543$i:5432 -e POSTGRES_PASSWORD=dev postgres:17-alpine
+done
 for i in 0 1 2 3; do
   SWITCHBOARD_TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:2543$i/postgres \
     python3 scripts/mutation_check.py --shard $i/4 > mutation-$i.log 2>&1 &
 done
 wait
+grep -hE '^(SURVIVED|ERROR|NO-VERDICT)' mutation-*.log
+tail -n 1 mutation-*.log
+for i in 0 1 2 3; do docker stop sb-pg-$i; done
 ```
+
+The `grep` prints every mutation that was not caught; `tail` prints each shard's totals, or why
+it stopped. The script warns when `SWITCHBOARD_TEST_DATABASE_URL` is not set.
+
+`python3 scripts/test_mutation_check.py` checks the script's own steps, with cargo replaced by a
+stub. Run it after changing the script.
 
 ## Tests against Postgres
 

@@ -23,7 +23,13 @@ only if those pass, the dependents. Each step stops at the first test binary tha
 --all-catchers runs both steps at once and to the end, to name every test that fails. The first
 time a set of packages is needed, it is run once unmutated ("baseline for [...]"): built on their
 own, packages get their dependencies with fewer features, and a set that fails that way is not
-used; its mutations run the whole workspace instead.
+used: the end of its output is printed, and its mutations run the whole workspace instead.
+
+The first step builds only its own packages. So a mutation that compiles there but breaks the
+build of a package that depends on them is judged by the first step's tests: it is CAUGHT if one
+of them fails, though the whole workspace would not build. That is a stale mutation, such as one
+that changes a trait in the core but not a crate that implements it. --all-catchers builds the
+dependents too and reports such a mutation as NO-VERDICT; run with it to find them.
 
 A scoped run that passes is not trusted on its own: the mutation runs again with the full
 `cargo test --workspace --locked --no-fail-fast`, and only if that passes too is it SURVIVED. A
@@ -77,6 +83,8 @@ TESTKIT = "crates/gateway-testkit/"
 TESTKIT_SRC = TESTKIT + "src/"
 REGRESSIONS = CRATE + "tests/properties.proptest-regressions"
 TIMEOUT_SECONDS = 1200
+# The tests that need Postgres skip, and pass, when this is not set (see CONTRIBUTING.md).
+DATABASE_VARIABLE = "SWITCHBOARD_TEST_DATABASE_URL"
 
 
 @dataclass(frozen=True)
@@ -769,10 +777,17 @@ mutate_all(
     (TESTKIT_SRC + "credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
     (TESTKIT_SRC + "credentials.rs", "        let principal = caller.get();\n", "        let principal = caller;\n"),
     (TESTKIT_SRC + "connector.rs", "self.credentials.credential_for(&connector, &caller).await", "self.credentials.credential_for(&connector, caller.get()).await"),
-    # The one test helper that calls the source directly is changed to match, so that what is
-    # left to fail is the compile-fail case for a plain principal, which compiles under this
-    # mutation: that is the guard under test.
+    # Connector-proxy's file source implements the trait too, and is changed the same way.
+    ("crates/connector-proxy/src/credentials.rs", "        _caller: &Proved<Principal>,\n", "        _caller: &Principal,\n"),
+    ("crates/connector-proxy/src/credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
+    ("crates/connector-proxy/src/connector.rs", ".issue(&self.connector, &call.call().caller.principal)", ".issue(&self.connector, call.call().caller.principal.get())"),
+    # The tests that call a source directly are changed to match, so that the whole workspace
+    # still builds and what is left to fail is the compile-fail case for a plain principal,
+    # which compiles under this mutation: that is the guard under test.
     (TESTKIT + "tests/fakes.rs", '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))', '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller.get()))'),
+    ("crates/connector-proxy/tests/credentials.rs", "credentials.credential_for(&ConnectorName::new(DOCS), &caller)", "credentials.credential_for(&ConnectorName::new(DOCS), caller.get())"),
+    ("crates/connector-proxy/tests/credentials.rs", 'credentials.credential_for(&ConnectorName::new("other"), &caller)', 'credentials.credential_for(&ConnectorName::new("other"), caller.get())'),
+    ("crates/connector-proxy/tests/credentials.rs", "credentials.credential_for(&ConnectorName::new(CONNECTOR), &caller)", "credentials.credential_for(&ConnectorName::new(CONNECTOR), caller.get())"),
 )
 
 # --- The identity verifier: the order and each check ---------------------------------------
@@ -3142,6 +3157,9 @@ def main() -> int:
         print(f"{len(selected)} mutations: {len(selected) - bad} targets match, {bad} do not")
         return 1 if bad else 0
 
+    if DATABASE_VARIABLE not in os.environ:
+        print(f"warning: {DATABASE_VARIABLE} is not set, so the Postgres tests skip and the mutations "
+              "only they catch are left to the whole-workspace run, where they survive", flush=True)
     scratch = Path(tempfile.mkdtemp(prefix="mutation-check-"))
     workspace, target = scratch / "workspace", scratch / "target"
     copy_workspace(workspace)
@@ -3179,8 +3197,10 @@ def main() -> int:
                 if applied:
                     restore()
                 began = time.monotonic()
-                code, _ = run_tests(workspace, target, chosen, fail_fast=True)
+                code, output = run_tests(workspace, target, chosen, fail_fast=True)
                 checked[chosen] = code == 0
+                if not checked[chosen]:
+                    print(output[-4000:])
                 result = "passes" if checked[chosen] else "FAILS unmutated, so it runs the whole workspace instead"
                 print(f"baseline for [{short(chosen)}] {result} ({time.monotonic() - began:.0f}s)", flush=True)
                 if applied:
