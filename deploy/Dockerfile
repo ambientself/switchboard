@@ -13,6 +13,13 @@
 # left out with a warning, unless REQUIRE_ALL_BINS=true, which demo.sh and Compose set: the demo
 # must not start with a binary missing. `switchboard` itself links nothing from the testkit;
 # crates/gateway/tests/dependencies.rs holds it to that.
+#
+# `switchboard` is the release build, built on its own with `-p gateway` and no features, and
+# copied out before anything else is built. Built with the workspace, it would take the
+# `test-support` feature that crates/gateway-dev turns on (Cargo unifies features across the
+# packages of one build), and a `test-support` build serves tools not classified `read` with no
+# receipt store (decision 0009). crates/demo-checks/tests/release.rs pins the line, and CI runs
+# the same command and checks the binary refuses such a tool.
 
 ARG RUST_IMAGE=rust:1.99.0-slim-trixie
 ARG RUNTIME_IMAGE=debian:trixie-slim
@@ -26,10 +33,14 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -eu; \
-    cargo build --release --locked --workspace --bins; \
-    mkdir -p /out/bin; \
+    mkdir -p /out/bin /out/release; \
+    cargo build --release --locked -p gateway --bin switchboard; \
+    cp target/release/switchboard /out/release/switchboard; \
+    cargo build --release --locked -p gateway-dev -p mock-docs-server --bins; \
     for bin in ${BINS}; do \
-      if [ -x "target/release/${bin}" ]; then \
+      if [ "${bin}" = switchboard ]; then \
+        cp /out/release/switchboard /out/bin/; \
+      elif [ -x "target/release/${bin}" ]; then \
         cp "target/release/${bin}" /out/bin/; \
       elif [ "${REQUIRE_ALL_BINS}" = "true" ]; then \
         echo "binary ${bin} is not built by this workspace" >&2; exit 1; \
