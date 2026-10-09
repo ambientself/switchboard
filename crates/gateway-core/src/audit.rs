@@ -3,7 +3,8 @@
 //! # The audited path
 //!
 //! ```text
-//! decide ─▶ Decision ─▶ begin ─┬─▶ AuditGuard ─▶ run ─▶ Ran ─▶ finish ─▶ Finished
+//! decide ─▶ Decision ─▶ begin ─┬─▶ AuditGuard ─┬─▶ run ─▶ Ran ─▶ finish ─▶ Finished
+//!                              │               └─▶ give_up ─▶ GaveUp (the row as error)
 //!                              └─▶ Refusal (the denial's sentence)
 //! ```
 //!
@@ -19,8 +20,15 @@
 //! - [`run`] consumes the guard, hands the connector a [`ToolCall`] that only
 //!   it can make, and returns a [`Ran`]. One guard runs one call, once.
 //! - [`finish`] consumes the `Ran`, completes the row through a [`RowCompletion`] that only it
-//!   can make, and only then gives out the answer, including a connector's refusal sentence.
-//!   A store's `finish` cannot be called for a denied row, or for a call that never ran.
+//!   and `give_up` can make, and only then gives out the answer, including a connector's
+//!   refusal sentence.
+//! - [`give_up`] consumes a guard instead of running it, calls no connector, and completes the
+//!   row as `error` with a latency of zero. It returns a [`GaveUp`], which holds no answer:
+//!   nothing ran, so the caller chooses its own reply.
+//!
+//! So a store's `finish` cannot be called for a denied row, and is called for an allowed row
+//! only with the outcome of its call or, for a guard given up, as `error`. A guard cannot be
+//! both run and given up.
 //!
 //! A `tools/list` takes a shorter path. [`listed`] writes a row of kind `list`, complete, and
 //! only then returns a [`Listed`]. A `Listed` cannot be made any other way, but the types do not
@@ -301,8 +309,8 @@ pub trait AuditStore: Send + Sync {
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Fills in the outcome and latency of a row that [`begin`](AuditStore::begin) wrote.
-    /// Takes a [`RowCompletion`], which only [`finish`] can make, from a
-    /// call that ran.
+    /// Takes a [`RowCompletion`], which only [`finish`] can make, from a call that ran, and
+    /// only [`give_up`], as `error`, from a guard given up without running.
     ///
     /// A repeat of the completion a row already has, the same outcome and latency, returns
     /// `Ok`, so finish can be retried. A different completion of a row already complete
@@ -338,7 +346,8 @@ pub struct RowStart {
     pub call_deadline_ms: u64,
 }
 
-/// The completion of one allowed row, for [`AuditStore::finish`]. Made only by [`finish`].
+/// The completion of one allowed row, for [`AuditStore::finish`]. Made only by [`finish`] and
+/// [`give_up`].
 #[derive(Debug)]
 pub struct RowCompletion {
     row: AuditRowId,
@@ -357,10 +366,11 @@ impl RowCompletion {
     }
 }
 
-/// Evidence that the audit row for an allowed call was written. Running the tool consumes it.
+/// Evidence that the audit row for an allowed call was written. Running the tool consumes it,
+/// and so does giving it up without running.
 ///
 /// Obtainable only from [`begin`]; see the [module documentation](self).
-#[must_use = "an allowed call whose guard is dropped never runs, and its row keeps an empty outcome"]
+#[must_use = "a guard is run or given up; one that is dropped leaves its row with an empty outcome"]
 #[derive(Debug)]
 pub struct AuditGuard {
     row: AuditRowId,
@@ -770,5 +780,52 @@ pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finish
             },
             failure: Some(AuditFailure::from_store(error)),
         },
+    }
+}
+
+/// A guard given up without running: its row, and whether the row could be completed. Made
+/// only by [`give_up`]. It holds no answer, because nothing ran.
+#[must_use = "a guard given up still needs a reply to the caller, and its failure reported"]
+#[derive(Debug)]
+pub struct GaveUp {
+    row: AuditRowId,
+    failure: Option<AuditFailure>,
+}
+
+impl GaveUp {
+    /// The row that was given up.
+    pub fn row(&self) -> &AuditRowId {
+        &self.row
+    }
+
+    /// Why the row could not be completed, if it could not. The row then keeps an empty
+    /// outcome, and reads as open once its deadline passes.
+    pub fn failure(&self) -> Option<&AuditFailure> {
+        self.failure.as_ref()
+    }
+}
+
+/// Gives up a guard without running its call: consumes the guard, calls no connector, and
+/// completes the row as `error` with a latency of zero (decision 0009). A row can overstate
+/// what ran, never understate it, so a call that never ran is never recorded as `ok`.
+///
+/// The caller chooses its own reply, since nothing ran.
+pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
+    let AuditGuard { row, .. } = guard;
+    let completion = RowCompletion {
+        row,
+        completion: Completion {
+            outcome: Outcome::Error,
+            latency_ms: 0,
+        },
+    };
+    let failure = store
+        .finish(&completion)
+        .await
+        .err()
+        .map(AuditFailure::from_store);
+    GaveUp {
+        row: completion.row,
+        failure,
     }
 }
