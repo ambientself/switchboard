@@ -5,7 +5,8 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{Map, Value, json};
 
 use crate::constants::{
-    DENIAL_CODE, INTERNAL_ERROR, LEGACY, LIST_TTL_MS, MODERN, SERVER_INFO_META,
+    AUDIT_ROW_DATA, AUDIT_ROW_META, DENIAL_CODE, INTERNAL_ERROR, LEGACY, LIST_TTL_MS, MODERN,
+    SERVER_INFO_META,
 };
 use crate::message::{Era, RequestId};
 
@@ -109,14 +110,39 @@ pub enum Reply {
     Internal(String),
 }
 
-/// Renders `reply` as the answer to the request `id` under `era`.
+/// Renders `reply` as the answer to the request `id` under `era`, naming no audit row.
 ///
 /// Under 2026-07-28 every result carries `resultType: "complete"` and names the server in
 /// `_meta`. Under 2025-06-18 results have neither.
 pub fn render(server: &ServerInfo, era: Era, id: &RequestId, reply: Reply) -> HttpResponse {
+    render_with_row(server, era, id, reply, None)
+}
+
+/// [`render`], naming the audit row `row` that the store wrote for the request, if there is
+/// one, so a person reporting a problem can quote it (decision 0009, "Row identifiers").
+///
+/// A tool result or a tool list names it in `_meta` under [`AUDIT_ROW_META`], in both eras.
+/// Under 2026-07-28 it sits beside the server's name in the same `_meta`. A denial or an
+/// internal error names it in `error.data` under [`AUDIT_ROW_DATA`]. `initialize`, `ping` and
+/// `server/discover` write no row, so they never name one. With no row the answer is exactly
+/// what [`render`] sends.
+pub fn render_with_row(
+    server: &ServerInfo,
+    era: Era,
+    id: &RequestId,
+    reply: Reply,
+    row: Option<&str>,
+) -> HttpResponse {
+    let data = row.map(|row| json!({AUDIT_ROW_DATA: row}));
     let result = match reply {
         Reply::Denied(sentence) => {
-            return error_response(StatusCode::OK, Some(id), DENIAL_CODE, &sentence, None);
+            return error_response(
+                StatusCode::OK,
+                Some(id),
+                DENIAL_CODE,
+                &sentence,
+                data.as_ref(),
+            );
         }
         Reply::Internal(message) => {
             return error_response(
@@ -124,7 +150,7 @@ pub fn render(server: &ServerInfo, era: Era, id: &RequestId, reply: Reply) -> Ht
                 Some(id),
                 INTERNAL_ERROR,
                 &message,
-                None,
+                data.as_ref(),
             );
         }
         Reply::Initialized => {
@@ -186,11 +212,23 @@ pub fn render(server: &ServerInfo, era: Era, id: &RequestId, reply: Reply) -> Ht
             "isError": true,
         }),
     };
-    let result = match era {
+    let mut result = match era {
         Era::Modern => complete(result, server),
         Era::Legacy => result,
     };
+    if let Some(row) = row {
+        add_row(&mut result, row);
+    }
     result_response(id, result)
+}
+
+/// Names the row in the result's `_meta`, adding `_meta` if the result has none and keeping
+/// what a 2026-07-28 result already holds there.
+fn add_row(result: &mut Value, row: &str) {
+    if let Value::Object(map) = result {
+        let meta = map.entry("_meta").or_insert_with(|| json!({}));
+        insert(meta, AUDIT_ROW_META, Value::from(row));
+    }
 }
 
 fn complete(mut result: Value, server: &ServerInfo) -> Value {

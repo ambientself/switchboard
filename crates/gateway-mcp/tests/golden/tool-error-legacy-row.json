@@ -1,0 +1,22 @@
+{
+  "body": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "_meta": {
+        "switchboard/auditRow": "01920000-0000-7000-8000-000000000000"
+      },
+      "content": [
+        {
+          "text": "The tool failed: dummy cause.",
+          "type": "text"
+        }
+      ],
+      "isError": true
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}
