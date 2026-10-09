@@ -23,7 +23,10 @@
 //!   A store's `finish` cannot be called for a denied row, or for a call that never ran.
 //!
 //! A `tools/list` takes a shorter path. [`listed`] writes a row of kind `list`, complete, and
-//! only then returns a [`Listed`], the one way the list leaves this crate for the caller.
+//! only then returns a [`Listed`]. A `Listed` cannot be made any other way, but the types do not
+//! make a path answer from one: the caller already holds the list it passes to `listed`, as
+//! [`list_tools`](crate::list_tools) gives it, so writing the row before answering is the
+//! path's job and its tests'.
 //!
 //! What the types cannot establish is that an [`AuditStore`] implementation really wrote the
 //! row when it says it did. That is the store's contract, and its own tests'.
@@ -409,9 +412,10 @@ impl Refusal {
     }
 }
 
-/// A `tools/list` answer whose row has been written. The only way the list leaves this crate
-/// through [`listed`], so a path cannot answer `tools/list` without a row, as a denial cannot be
-/// answered without one.
+/// A `tools/list` answer whose row has been written. It has private fields and comes only from
+/// [`listed`], so a `Listed` cannot be made without the row. Unlike a denial's sentence, which
+/// leaves this crate only through [`Refusal`], the list itself does not depend on it: the
+/// caller passes `listed` a list it already holds.
 #[must_use = "a list whose row was written is answered with its tools"]
 #[derive(Debug)]
 pub struct Listed {
@@ -579,8 +583,8 @@ pub async fn begin(
 /// The row names the first [`MAX_RECORDED_TOOLS`] tools, each escaped and capped, and counts
 /// the rest. The call deadline in `start` is not used: a list row has no deadline.
 ///
-/// Returns the [`Listed`] that answering requires, holding every tool. If the row cannot be
-/// written, returns [`AuditFailure`] and nothing is listed.
+/// Returns a [`Listed`] holding every tool. If the row cannot be written, returns
+/// [`AuditFailure`] and no `Listed`.
 pub async fn listed(
     store: &dyn AuditStore,
     start: RowStart,

@@ -691,7 +691,7 @@ mutate("core-list-cap-removed", "a list row names every tool the answer lists", 
        "            .take(MAX_RECORDED_TOOLS)\n", "")
 mutate("core-list-omitted-miscounted", "a list row counts the tools it names as left out too", SRC + "audit.rs",
        "    let tools_omitted = tools.len().saturating_sub(MAX_RECORDED_TOOLS);", "    let tools_omitted = tools.len();")
-mutate("core-list-fields-public", "a list can be answered without its row", SRC + "audit.rs",
+mutate("core-list-fields-public", "a Listed can be made without its row", SRC + "audit.rs",
        "pub struct Listed {\n    row: AuditRowId,\n    tools: Vec<ApprovedTool>,",
        "pub struct Listed {\n    pub row: AuditRowId,\n    pub tools: Vec<ApprovedTool>,")
 mutate("core-list-failure-swallowed", "a list whose row could not be written is answered", SRC + "audit.rs",
