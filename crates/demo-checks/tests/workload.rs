@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
-use common::{Run, repo, require, scratch, write};
+use common::{Run, black_hole, closed_port, repo, require, scratch, write};
 use gateway_core::IDENTITY_FAILURE;
 use serde_json::{Value, json};
 
@@ -57,30 +57,6 @@ fn serve(fake: Fake) -> String {
         }
     });
     format!("http://127.0.0.1:{port}/mcp/docs")
-}
-
-/// A port that accepts connections and never answers: what a dropped route looks like to curl,
-/// which then times out (exit 28).
-fn black_hole() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in listener.incoming().flatten() {
-            held.push(stream);
-        }
-    });
-    format!("http://127.0.0.1:{port}/mcp")
-}
-
-/// A port nothing listens on: curl's connection is refused (exit 7).
-fn closed_port() -> String {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    format!("http://127.0.0.1:{port}/mcp")
 }
 
 fn handle(mut stream: TcpStream, fake: Fake) {

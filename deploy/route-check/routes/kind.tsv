@@ -1,0 +1,8 @@
+# The direct routes the route check's probe tries in the kind run (decision 0010, "The route
+# check"). Columns, tab-separated: name, url, addresses, flags. addresses is a comma list of
+# address literals, or `resolve`; flags may hold reject_ok. route-check.sh replaces {{ADDR}} with
+# the Service's ClusterIP and each endpoint pod's IP, since kind's addresses are not fixed.
+#
+# A real cluster also lists the metadata endpoint (169.254.169.254) and the workload-identity
+# endpoint (169.254.170.23). Kind has neither, so this file lists no row for them.
+mock-docs	http://mock-docs.mock-docs.svc.cluster.local:8080/mcp	{{ADDR}}

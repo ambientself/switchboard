@@ -2734,6 +2734,24 @@ mutate("route-check-pods-json-unchecked", "an empty or doubled pod list counts a
        """ || ! json_object "$pods" ||""", " ||")
 mutate("route-check-probe-pod-json-unchecked", "an empty or doubled pod read while waiting counts as the probe still running", ROUTE_CHECK,
        """ && json_object "$pod_now" &&""", " &&")
+# The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
+# tests/route_check.rs.
+PROBE = "deploy/route-check/probe.sh"
+mutate("probe-dns-failure-refused", "a name that does not resolve counts as refused", PROBE,
+       'record "$row" name "$url" could-not-probe "$host does not resolve"',
+       'record "$row" name "$url" refused "$host does not resolve"')
+mutate("probe-any-curl-exit-refused", "any failed attempt counts as refused, not only a timeout", PROBE,
+       "    28) echo refused ;;\n", "    [0-9]*) echo refused ;;\n")
+mutate("probe-gateway-reach-skipped", "the routes are tried whether or not the gateway answered", PROBE,
+       """  '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;\n""", "  __never__) ;;\n")
+mutate("probe-sends-bearer", "each attempt carries a bearer", PROBE,
+       "-H 'Authorization:'", "-H 'Authorization: Bearer probe'")
+mutate("probe-reads-curlrc", "curl reads the caller's .curlrc, which may add a credential", PROBE,
+       "  curl -q -s ", "  curl -s ")
+mutate("probe-name-not-pinned", "curl resolves the name again, so a slow lookup can time out as refused", PROBE,
+       ' --resolve "$host:$port:$pinned"', "")
+mutate("probe-not-in-image", "the image does not install the probe", "deploy/Dockerfile",
+       "COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh\n", "")
 
 
 # --- gateway: the first slice from files ---------------------------------------------------

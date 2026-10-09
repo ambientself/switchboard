@@ -63,6 +63,10 @@ RUN set -eu; \
 COPY --from=build /out/bin/ /usr/local/bin/
 COPY deploy/demo/workload.sh deploy/demo/migrate.sh /usr/local/bin/
 COPY deploy/demo/roles.sql /usr/share/switchboard/roles.sql
+# The route check's probe (decision 0010), which route-check.sh starts in a workload's pod as an
+# ephemeral container from this image, and the routes it tries.
+COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh
+COPY deploy/route-check/routes/ /usr/share/switchboard/routes/
 USER 10001:10001
 WORKDIR /tmp
 CMD ["workload.sh"]
