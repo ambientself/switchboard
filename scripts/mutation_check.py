@@ -604,9 +604,11 @@ for field, old, new in [
     ("resources-omitted", "        resources_omitted,\n        decision,", "        resources_omitted: { let _ = resources_omitted; 0 },\n        decision,"),
     ("tool-use-id", "        tool_use_id: metadata.tool_use_id,", "        tool_use_id: None,"),
     ("claimed-team", "        claimed_team: metadata.claimed_team,", "        claimed_team: None,"),
-    ("revision", "        policy_revision,\n        proved_principal", '        policy_revision: { let _ = policy_revision; PolicyRevision::new("x") },\n        proved_principal'),
-    ("delegation-team", "            .map(|delegation| delegation.team().into()),", "            .map(|_| None).flatten(),"),
-    ("acting-person", "            .map(|delegation| delegation.acting_person()),", "            .map(|_| None).flatten(),"),
+    ("revision", "        policy_revision,\n        proved_principal: call.caller", '        policy_revision: { let _ = policy_revision; PolicyRevision::new("x") },\n        proved_principal: call.caller'),
+    ("delegation-team", "            .caller\n            .delegation\n            .as_ref()\n            .map(|delegation| delegation.team().into()),",
+     "            .caller\n            .delegation\n            .as_ref()\n            .map(|_| None).flatten(),"),
+    ("acting-person", "            .caller\n            .delegation\n            .as_ref()\n            .map(|delegation| delegation.acting_person()),",
+     "            .caller\n            .delegation\n            .as_ref()\n            .map(|_| None).flatten(),"),
     ("tool-unescaped", "        tool: sentences::escape(call.tool.as_str(), sentences::MAX_RENDERED),", "        tool: call.tool.as_str().to_owned(),"),
     ("surface-unescaped", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),\n            sentences::MAX_RENDERED,\n        )),",
      "        surface: call.caller.surface.clone(),"),
@@ -684,6 +686,17 @@ mutate("finish-refusal-unrecorded-answered", "a refusal that could not be record
        "")
 mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not the one recorded", SRC + "audit.rs",
        "            Answer::Refused(sentence),", "            Answer::Refused(sentence.to_uppercase()),")
+# A list row (decision 0009): the tools it names, its count, and the value only it can make.
+mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
+       "            .take(MAX_RECORDED_TOOLS)\n", "")
+mutate("core-list-omitted-miscounted", "a list row counts the tools it names as left out too", SRC + "audit.rs",
+       "    let tools_omitted = tools.len().saturating_sub(MAX_RECORDED_TOOLS);", "    let tools_omitted = tools.len();")
+mutate("core-list-fields-public", "a list can be answered without its row", SRC + "audit.rs",
+       "pub struct Listed {\n    row: AuditRowId,\n    tools: Vec<ApprovedTool>,",
+       "pub struct Listed {\n    pub row: AuditRowId,\n    pub tools: Vec<ApprovedTool>,")
+mutate("core-list-failure-swallowed", "a list whose row could not be written is answered", SRC + "audit.rs",
+       "    store\n        .list(&row, &record)\n        .await\n        .map_err(AuditFailure::from_store)?;",
+       "    let _ = store.list(&row, &record).await;")
 
 # --- Sentences -----------------------------------------------------------------------------
 
@@ -1020,7 +1033,9 @@ mutate("identity-second-crypto-backend", "the crypto feature list gains a second
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
 A = TESTKIT_SRC + "audit.rs"
-mutate("fake-audit-fail-next-begin-ignored", "a begin told to fail does not", A, "            if state.begin_failing.take() {", "            if false {")
+mutate("fake-audit-fail-next-begin-ignored", "a begin told to fail does not", A,
+       "            if state.begin_failing.take() {\n                return Err(down());\n            }\n            if state.list_rows",
+       "            if false {\n                return Err(down());\n            }\n            if state.list_rows")
 mutate("fake-audit-fail-next-finish-ignored", "a finish told to fail does not", A, "            if state.finish_failing.take() {", "            if false {")
 mutate("fake-audit-fail-next-is-fail-all", "a failure meant for the next call is never cleared", A,
        "            Failing::Next => {\n                *self = Failing::Never;\n                true\n            }", "            Failing::Next => true,")
@@ -2051,22 +2066,24 @@ PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
 PG_ROW_DEADLINE = PG + "sql/migrations/0003_row_deadline.sql"
+# 0004 replaces complete_once and decision_shape, so the mutations of their bodies edit 0004.
+PG_LIST_ROWS = PG + "sql/migrations/0004_list_rows.sql"
 PG_STORE = PG + "src/store.rs"
 PG_COLUMNS = PG + "src/columns.rs"
-mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_SQL,
+mutate("pg-trigger-second-completion-allowed", "a completed row can be completed again", PG_LIST_ROWS,
        "    IF OLD.outcome IS NOT NULL THEN", "    IF false THEN")
-mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_SQL,
-       "    IF OLD.decision <> 'allow' THEN", "    IF false THEN")
-mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_SQL,
+mutate("pg-trigger-denial-completed", "the trigger lets a denial be completed", PG_LIST_ROWS,
+       "    IF OLD.decision IS DISTINCT FROM 'allow' THEN", "    IF false THEN")
+mutate("pg-trigger-empty-completion-allowed", "an update with no outcome passes the trigger", PG_LIST_ROWS,
        "        RAISE EXCEPTION 'a completion of audit row % has no outcome', OLD.id;", "        NULL;")
-mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_SQL,
+mutate("pg-trigger-other-columns-allowed", "a completion may change other columns", PG_LIST_ROWS,
        "        RAISE EXCEPTION 'only the completion of audit row % may be written', OLD.id;", "        NULL;")
-mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_SQL,
+mutate("pg-trigger-finished-at-not-set", "the database does not set the completion time", PG_LIST_ROWS,
        "    NEW.finished_at := clock_timestamp();\n", "")
 mutate("pg-trigger-not-created", "the write-once trigger is never attached", PG_SQL,
        "CREATE TRIGGER complete_once\n    BEFORE UPDATE ON switchboard_audit.call_rows\n"
        "    FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();\n", "")
-mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_SQL,
+mutate("pg-trigger-search-path-unpinned", "the write-once trigger looks names up in the session's search path", PG_LIST_ROWS,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $complete_once$", "    LANGUAGE plpgsql\nAS $complete_once$")
 mutate("pg-times-search-path-unpinned", "the trigger that sets the times looks names up in the session's search path", PG_ROW_DEADLINE,
        "    LANGUAGE plpgsql\n    SET search_path = pg_catalog\nAS $set_times$", "    LANGUAGE plpgsql\nAS $set_times$")
@@ -2086,10 +2103,10 @@ mutate("pg-grant-gateway-creates", "the gateway may create objects in the databa
        "'GRANT CONNECT ON DATABASE %I TO switchboard_gateway'", "'GRANT CONNECT, CREATE ON DATABASE %I TO switchboard_gateway'")
 mutate("pg-roles-unlocked", "two runs of the roles script grant at once", PG + "sql/roles.sql",
        "    PERFORM pg_advisory_xact_lock(6005341489043162114);\n", "")
-mutate("pg-check-denial-sentence", "a denial may lack its sentence", PG_SQL,
+mutate("pg-check-denial-sentence", "a denial may lack its sentence", PG_LIST_ROWS,
        "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
        "WHEN 'deny' THEN reason IS NOT NULL AND outcome IS NULL")
-mutate("pg-check-allowed-connector", "an allowed call may lack its connector and classification", PG_SQL,
+mutate("pg-check-allowed-connector", "an allowed call may lack its connector and classification", PG_LIST_ROWS,
        "\n                AND connector IS NOT NULL AND classification IS NOT NULL", "")
 mutate("pg-check-workload-team", "a workload may lack its team", PG_SQL,
        "        (proved_kind = 'workload') = (proved_team IS NOT NULL)\n", "        true\n")
@@ -2097,19 +2114,19 @@ mutate("pg-check-refusal-sentence", "only a refusal carrying a sentence is not c
        "        AND coalesce(outcome = 'refused', false) = (outcome_sentence IS NOT NULL)\n", "")
 mutate("pg-check-resources-shape", "resources may be any JSON", PG_SQL,
        "        CHECK (jsonb_typeof(resources) = 'array' OR resources = '\"unknown\"'::jsonb),", "        CHECK (true),")
-mutate("pg-check-denial-reason", "a denial may lack its reason", PG_SQL,
+mutate("pg-check-denial-reason", "a denial may lack its reason", PG_LIST_ROWS,
        "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
        "WHEN 'deny' THEN sentence IS NOT NULL AND outcome IS NULL")
-mutate("pg-check-denial-outcome", "a denial may have an outcome", PG_SQL,
+mutate("pg-check-denial-outcome", "a denial may have an outcome", PG_LIST_ROWS,
        "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL AND outcome IS NULL",
        "WHEN 'deny' THEN reason IS NOT NULL AND sentence IS NOT NULL")
-mutate("pg-check-allowed-reason", "an allowed call may have a reason", PG_SQL,
-       "            ELSE reason IS NULL AND sentence IS NULL\n", "            ELSE sentence IS NULL\n")
-mutate("pg-check-allowed-sentence", "an allowed call may have a sentence", PG_SQL,
-       "            ELSE reason IS NULL AND sentence IS NULL\n", "            ELSE reason IS NULL\n")
-mutate("pg-check-allowed-connector-only", "an allowed call may lack its connector", PG_SQL,
+mutate("pg-check-allowed-reason", "an allowed call may have a reason", PG_LIST_ROWS,
+       "            WHEN 'allow' THEN reason IS NULL AND sentence IS NULL\n", "            WHEN 'allow' THEN sentence IS NULL\n")
+mutate("pg-check-allowed-sentence", "an allowed call may have a sentence", PG_LIST_ROWS,
+       "            WHEN 'allow' THEN reason IS NULL AND sentence IS NULL\n", "            WHEN 'allow' THEN reason IS NULL\n")
+mutate("pg-check-allowed-connector-only", "an allowed call may lack its connector", PG_LIST_ROWS,
        "AND connector IS NOT NULL AND classification IS NOT NULL", "AND classification IS NOT NULL")
-mutate("pg-check-allowed-classification-only", "an allowed call may lack its classification", PG_SQL,
+mutate("pg-check-allowed-classification-only", "an allowed call may lack its classification", PG_LIST_ROWS,
        "AND connector IS NOT NULL AND classification IS NOT NULL", "AND connector IS NOT NULL")
 mutate("pg-check-user-groups", "a user may lack its groups, and a workload have some", PG_SQL,
        "        AND (proved_kind = 'user') = (proved_groups IS NOT NULL)\n", "")
@@ -2139,11 +2156,12 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
-       '        ) ON CONFLICT (id) DO NOTHING";', '        )";')
+       '$24, $25\n        ) ON CONFLICT (id) DO NOTHING";', '$24, $25\n        )";')
 mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
        "    if decision == row.decision {", "    if true {")
 mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
-       "        if !is_uuid(id.as_str()) {", "        if false {")
+       "            return Err(PgAuditError::CompleteAtBegin);\n        }\n        if !is_uuid(id.as_str()) {",
+       "            return Err(PgAuditError::CompleteAtBegin);\n        }\n        if false {")
 PG_ROW_IDS = PG + "sql/migrations/0002_row_ids.sql"
 mutate("pg-row-ids-default-kept", "the database still makes an identifier for a row inserted without one", PG_ROW_IDS,
        "ALTER TABLE switchboard_audit.call_rows ALTER COLUMN id DROP DEFAULT;\n", "")
@@ -2165,13 +2183,14 @@ mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succ
 mutate("pg-columns-complete-record-begun", "begin drops a completion it was handed", PG_COLUMNS,
        "        if record.completion.is_some() {", "        if false {")
 mutate("pg-columns-claimed-team-from-delegation", "the claimed team column holds the proved delegation team", PG_COLUMNS,
-       "record.claimed_team.as_ref().map(|team| team.get().as_str()),", "record.proved_delegation_team.as_ref().map(|team| team.get().as_str()),")
+       "record.claimed_team.as_ref().map(|team| team.get().as_str()),\n            )?,\n            instance: stored(\"instance\", record.instance.as_str())?,\n            kind:",
+       "record.proved_delegation_team.as_ref().map(|team| team.get().as_str()),\n            )?,\n            instance: stored(\"instance\", record.instance.as_str())?,\n            kind:")
 mutate("pg-insert-delegation-and-acting-person-swapped", "the INSERT writes the proved delegation team and the claimed acting person in each other's columns", PG_COLUMNS,
-       "            &self.proved_delegation_team,\n            &self.claimed_acting_person,\n",
-       "            &self.claimed_acting_person,\n            &self.proved_delegation_team,\n")
+       "            &self.proved_delegation_team,\n            &self.claimed_acting_person,\n            &self.claimed_team,\n            &self.instance,\n            &self.kind,\n",
+       "            &self.claimed_acting_person,\n            &self.proved_delegation_team,\n            &self.claimed_team,\n            &self.instance,\n            &self.kind,\n")
 mutate("pg-columns-workload-team-as-group", "a workload's team is written as a group", PG_COLUMNS,
-       '                "workload",\n                Some(stored("proved_team", team.as_str())?),\n                None,',
-       '                "workload",\n                None,\n                Some(vec![stored("proved_team", team.as_str())?]),')
+       '            "workload",\n            Some(stored("proved_team", team.as_str())?),\n            None,',
+       '            "workload",\n            None,\n            Some(vec![stored("proved_team", team.as_str())?]),')
 mutate("pg-columns-latency-not-compared", "a completion with another latency counts as the same", PG_COLUMNS,
        "            && Some(self.latency_ms) == latency_ms\n", "")
 mutate("pg-columns-unknown-as-none", "resources nobody could name are written as none named", PG_COLUMNS,
@@ -2198,10 +2217,12 @@ mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
-mutate("pg-sql-resources-nullable", "a row may record no resources at all", PG_SQL,
-       "    resources              jsonb       NOT NULL\n", "    resources              jsonb\n")
-mutate("pg-sql-omitted-nullable", "a row may leave out the count of resources left out", PG_SQL,
-       "    resources_omitted      bigint      NOT NULL CHECK", "    resources_omitted      bigint      CHECK")
+mutate("pg-sql-resources-nullable", "a call row may record no resources at all", PG_LIST_ROWS,
+       "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
+       "                AND resources_omitted IS NOT NULL\n")
+mutate("pg-sql-omitted-nullable", "a call row may leave out the count of resources left out", PG_LIST_ROWS,
+       "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
+       "                AND resources IS NOT NULL\n")
 mutate("pg-check-unknown-resources-omitted", "resources nobody could name may have some left out", PG_SQL,
        "        resources <> '\"unknown\"'::jsonb OR resources_omitted = 0\n", "        true\n")
 mutate("pg-times-begun-at-from-insert", "an insert may choose its begin time", PG_ROW_DEADLINE,
@@ -2231,6 +2252,43 @@ mutate("pg-allowance-wraps", "a long call deadline wraps round to a short allowa
        "        .saturating_add(call_deadline_ms)\n", "        .wrapping_add(call_deadline_ms)\n")
 mutate("pg-grant-insert-deadline", "the gateway may write the deadline", PG_ROW_DEADLINE,
        "GRANT INSERT (instance, kind, allowance_ms)", "GRANT INSERT (instance, kind, allowance_ms, deadline)")
+# List rows (0004).
+mutate("pg-complete-once-accepts-list-row", "the trigger tests only the decision, which a list row lacks, and lets it be completed", PG_LIST_ROWS,
+       "    IF OLD.kind IS DISTINCT FROM 'call' THEN\n"
+       "        RAISE EXCEPTION 'audit row % records a listing, which is never completed', OLD.id;\n"
+       "    END IF;\n"
+       "    IF OLD.decision IS DISTINCT FROM 'allow' THEN\n",
+       "    IF OLD.decision <> 'allow' THEN\n")
+mutate("pg-set-times-gives-list-deadline", "the trigger that sets the times gives a list row a deadline", PG_ROW_DEADLINE,
+       "    NEW.deadline := CASE WHEN NEW.kind = 'call'\n", "    NEW.deadline := CASE WHEN true\n")
+mutate("pg-kind-shape-removed", "a row may hold the columns of either kind, or neither", PG_LIST_ROWS,
+       "    ADD CONSTRAINT kind_shape CHECK (\n", "    ADD CONSTRAINT kind_shape CHECK (true OR\n")
+mutate("pg-kind-shape-list-null-hole", "a list row with no tools passes kind_shape, whose test of them is NULL", PG_LIST_ROWS,
+       "WHEN 'list' THEN listed_tools IS NOT NULL AND jsonb_typeof(listed_tools) = 'array'",
+       "WHEN 'list' THEN jsonb_typeof(listed_tools) = 'array'")
+mutate("pg-kind-shape-list-call-columns", "a list row may carry a call's decision, outcome and deadline", PG_LIST_ROWS,
+       "                AND decision IS NULL AND reason IS NULL AND sentence IS NULL\n"
+       "                AND outcome IS NULL AND allowance_ms IS NULL AND deadline IS NULL\n", "")
+mutate("pg-kind-shape-call-lists-tools", "a call row may list tools", PG_LIST_ROWS,
+       "            WHEN 'call' THEN listed_tools IS NULL AND listed_omitted IS NULL\n",
+       "            WHEN 'call' THEN true\n")
+mutate("pg-list-not-granted", "the gateway may not write a list row's tools", PG_LIST_ROWS,
+       "GRANT INSERT (listed_tools, listed_omitted) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-list-kind-not-compared", "a list with a call row's identifier succeeds", PG_STORE,
+       '    if kind == "list" {', "    if true {")
+mutate("pg-begin-list-row-accepted", "a begin with a list row's identifier succeeds", PG_STORE,
+       "    let Some(decision) = decision else {\n        return Err(PgAuditError::OtherKind {\n            row: row.id.clone(),\n        });\n    };",
+       "    let Some(decision) = decision else {\n        return Ok(());\n    };")
+mutate("pg-list-no-on-conflict", "a retried list inserts again and fails on its own row", PG_COLUMNS,
+       '$15, $16\n        ) ON CONFLICT (id) DO NOTHING";', '$15, $16\n        )";')
+mutate("pg-list-columns-id-unchecked", "a list row's identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
+       "    pub fn from_record(id: &AuditRowId, record: &ListRecord) -> Result<Self, PgAuditError> {\n        if !is_uuid(id.as_str()) {",
+       "    pub fn from_record(id: &AuditRowId, record: &ListRecord) -> Result<Self, PgAuditError> {\n        if false {")
+mutate("pg-list-tools-omitted-saturates", "a count of tools left out past the column is cut short", PG_COLUMNS,
+       "            listed_omitted: i64::try_from(record.tools_omitted).map_err(|_| {\n"
+       "                PgAuditError::Column(\"a count of tools left out past the column's range\")\n"
+       "            })?,",
+       "            listed_omitted: i64::try_from(record.tools_omitted).unwrap_or(i64::MAX),")
 
 # The store's time budgets, and its boot checks.
 PG_CHECK = PG + "src/check.rs"
