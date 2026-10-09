@@ -1079,7 +1079,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   budget. The identifier and begin are built: the gateway makes one UUIDv7 per call before
   begin, and every store's begin takes it and is idempotent on it, comparing only the
   decision. The audit table has no default for it, and the gateway's role may insert it. The
-  retry is not built yet: the Postgres store still gives up at the budget.
+  retry is built in the Postgres store: a begin attempt that fails in a way trying again
+  could fix gives up its connection and is tried again on a new one, under the same
+  identifier, with pauses that double up to a second, all within the one begin budget. A
+  retry that finds its own row, written by an attempt whose confirmation was lost, succeeds.
 - A `BEFORE INSERT` trigger sets the time at begin and the deadline from the database's clock
   and the allowance the gateway supplies, and a call row cannot be stored without a deadline.
   Built: `set_times` sets the time at begin, the deadline (that time plus the row's
@@ -1116,8 +1119,13 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
-  giving up a guard without running completes its row as `error`. Today a guard can only be
-  consumed by running it, and a row whose insert commits after its begin failed stays open.
+  giving up a guard without running completes its row as `error`. The first half is built in
+  the Postgres store: when an allowed call's begin fails after sending its insert, without an
+  answer that says the insert failed, a task on the finish pool completes the row as `error`
+  with a latency of 0 until the finish deadline, counted in flight so shutdown waits for it.
+  That task alone waits for a missing row, which may still commit; a row still missing at the
+  deadline is counted as never written, not given up. Denials and list rows need nothing.
+  Not built: giving up a guard. Today a guard can only be consumed by running it.
 - In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
