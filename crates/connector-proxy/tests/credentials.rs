@@ -5,7 +5,10 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::io::Write as _;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use common::{
     GATEWAY_TOKEN, Harness, ProjectedVolume, Scripted, Step, TemporaryFile, json_response,
@@ -127,6 +130,47 @@ fn a_file_larger_than_the_limit_is_refused() {
     );
 }
 
+/// A file that never ends: a pipe whose writer sends one byte past the limit and then holds it
+/// open. The source stops reading one byte past the limit and refuses the file; a read with no
+/// bound would wait for an end that never comes.
+#[test]
+fn a_file_that_never_ends_is_refused_one_byte_past_the_limit() {
+    let fifo = TemporaryFile::new(b"");
+    std::fs::remove_file(fifo.path()).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(fifo.path())
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+    let path = fifo.path().to_owned();
+
+    let (release, held) = mpsc::channel::<()>();
+    let writer = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let mut pipe = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let size = usize::try_from(MAX_CREDENTIAL_BYTES).unwrap() + 1;
+            pipe.write_all(&vec![b'x'; size]).unwrap();
+            // Holds the pipe open, so the file has no end, until the test is done.
+            let _ = held.recv();
+        }
+    });
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(FileCredentials::load([(ConnectorName::new(DOCS), &path)]));
+    });
+
+    let refused = finished.recv_timeout(Duration::from_secs(10));
+    drop(release);
+
+    let refused = refused.expect("the source is still waiting for the end of the file");
+    assert!(
+        matches!(refused, Err(CredentialFileError::TooLarge { .. })),
+        "{refused:?}"
+    );
+    writer.join().unwrap();
+}
+
 #[test]
 fn a_missing_file_is_refused() {
     let missing = std::env::temp_dir().join("connector-proxy-test-no-such-file");
@@ -236,6 +280,68 @@ async fn a_file_grown_past_the_limit_after_boot_refuses_the_call_and_sends_nothi
 
     assert_refused_unsent(&server, &connector, GATEWAY_TOKEN).await;
     assert_refusal_names_the_file(&credentials, file.path(), GATEWAY_TOKEN);
+}
+
+/// A writer that keeps what a tracing subscriber writes, for a test to read.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// The lines written so far that report a credential that could not be read and name
+    /// `path`. Other tests in this binary log their own files' failures to the same writer.
+    fn unreadable(&self, path: &std::path::Path) -> Vec<String> {
+        let path = path.display().to_string();
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter(|line| line.contains("credential_unreadable") && line.contains(&path))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn each_refused_call_logs_why_once_naming_the_file_but_not_its_contents() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer({
+            let captured = captured.clone();
+            move || captured.clone()
+        })
+        .finish();
+    // The global default, not one scoped to this thread: tests running alongside reach the same
+    // log line first, and tracing would remember it as unwatched.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    let server = answering_server().await;
+    let file = TemporaryFile::new(format!("{GATEWAY_TOKEN}\n").as_bytes());
+    let connector = connector_with(&server, file.path());
+
+    // A space inside: the file no longer holds one bearer token.
+    std::fs::write(file.path(), format!("{GATEWAY_TOKEN} {ROTATED_TOKEN}")).unwrap();
+    assert_refused_unsent(&server, &connector, GATEWAY_TOKEN).await;
+    let first = captured.unreadable(file.path());
+    assert_refused_unsent(&server, &connector, GATEWAY_TOKEN).await;
+    let both = captured.unreadable(file.path());
+
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(both.len(), 2, "{both:?}");
+    for line in &both {
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains(CONNECTOR), "{line}");
+        assert!(!line.contains(GATEWAY_TOKEN), "{line}");
+        assert!(!line.contains(ROTATED_TOKEN), "{line}");
+    }
 }
 
 /// Asks `credentials` for the fixture connector's credential, and checks that it is refused

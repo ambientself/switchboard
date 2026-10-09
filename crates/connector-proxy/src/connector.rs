@@ -210,7 +210,16 @@ impl ProxyConnector {
             .issue(&self.connector, &call.call().caller.principal)
         {
             Ok((_handle, secret)) => secret,
-            Err(CredentialError::Refused(_)) => {
+            Err(CredentialError::Refused(reason)) => {
+                // The caller and the audit row see only that nothing was sent; the operator
+                // needs to know why. The reason names the connector and the file, never what
+                // the file holds. One line per refused call.
+                tracing::warn!(
+                    event = "credential_unreadable",
+                    connector = %self.connector,
+                    reason = %reason,
+                    "the gateway's credential could not be read; the call was refused and nothing was sent"
+                );
                 return ToolOutcome::Refused(outcome::NO_CREDENTIAL.to_owned());
             }
             Err(CredentialError::Unavailable(_)) => {

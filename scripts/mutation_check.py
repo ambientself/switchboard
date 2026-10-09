@@ -1910,6 +1910,18 @@ mutate("proxy-credential-size-unbounded", "a credential file of any size is read
        "    if length > MAX_CREDENTIAL_BYTES {", "    if false {")
 mutate("proxy-credential-size-off-by-one", "a credential file of exactly the limit is refused", PK,
        "    if length > MAX_CREDENTIAL_BYTES {", "    if length >= MAX_CREDENTIAL_BYTES {")
+mutate("proxy-credential-read-unbounded", "the whole credential file is read before its size is checked", PK,
+       ".and_then(|file| file.take(MAX_CREDENTIAL_BYTES + 1).read_to_end(&mut bytes))",
+       ".and_then(|mut file| file.read_to_end(&mut bytes))")
+mutate("proxy-credential-failure-not-logged", "a call refused for its credential logs nothing", PC,
+       "                tracing::warn!(\n"
+       '                    event = "credential_unreadable",\n'
+       "                    connector = %self.connector,\n"
+       "                    reason = %reason,\n"
+       "                    \"the gateway's credential could not be read; the call was refused and nothing was sent\"\n"
+       "                );\n", "                let _ = reason;\n")
+mutate("proxy-credential-failure-reason-dropped", "a call refused for its credential is logged without the reason", PC,
+       "                    reason = %reason,\n", "")
 mutate("proxy-duplicate-credential-accepted", "two files for one connector are accepted", PK,
        "            if entries.contains_key(&connector) {", "            if false {")
 mutate("proxy-credential-for-any-connector", "a credential is issued for a connector that has none", PK,
