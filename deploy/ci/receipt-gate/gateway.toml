@@ -1,0 +1,24 @@
+# CI's check of the release artifact: `switchboard --config=deploy/ci/receipt-gate/gateway.toml`
+# must exit 1, refusing the registry's `propose` tool because no receipt store is configured
+# (decision 0009). Identity and audit are disabled so nothing else is needed: no issuer, no
+# database. The format is in crates/gateway/src/deployment.rs. Every value here is a dummy.
+
+deployment = "ci-receipt-gate"
+listen = "127.0.0.1:0"
+
+[http]
+allowed_hosts = ["localhost"]
+allowed_origins = []
+
+[registry]
+file = "registry/registry.toml"
+poll_seconds = 2
+
+[identity]
+mode = "disabled"
+
+[audit]
+mode = "disabled"
+
+[credentials]
+docs-credential = "dummy-credential"
