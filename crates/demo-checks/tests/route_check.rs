@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Recorder, Run, black_hole, fake_getent, read, repo, require, scratch, write};
+use common::{Recorder, Run, dropped, fake_curl, fake_getent, read, repo, require, scratch, write};
 use serde_json::{Value, json};
 
 const CONTEXT: &str = "kind-switchboard-demo";
@@ -143,6 +143,8 @@ struct Cluster {
     /// Run deploy/route-check/probe.sh for `kubectl debug`, with these `NAME ADDRESS` lines for
     /// the fake `getent`, in place of the probe's log and exit code above.
     run_probe: Option<String>,
+    /// URLs whose ports the probe's curl drops (a fake curl), for `run_probe`.
+    dropped: Vec<String>,
     /// Seconds the fake waits before answering each `get pod`.
     probe_pod_delay: Option<u32>,
 }
@@ -224,6 +226,7 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
             routes: None,
             gateway_url: None,
             run_probe: None,
+            dropped: Vec::new(),
             probe_pod_delay: None,
         }
     }
@@ -361,6 +364,8 @@ fn check_with(name: &str, cluster: &Cluster, probe_wait: u32, limit: Duration) -
     let kubectl = write(&bin, "kubectl", FAKE_KUBECTL);
     std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755)).unwrap();
     fake_getent(&bin);
+    let dropped: Vec<&str> = cluster.dropped.iter().map(String::as_str).collect();
+    fake_curl(&bin, &dropped);
     cluster.write(&dir);
     write(&dir, "probe-container", "");
     let routes = write(
@@ -1602,7 +1607,7 @@ fn the_probe_must_report_each_attempt_the_routes_ask_for_once() {
 #[test]
 fn the_step_reads_the_probes_own_lines() {
     let gateway = Recorder::start(401);
-    let hole = black_hole();
+    let hole = dropped();
     let port = hole.rsplit(':').next().unwrap().trim_end_matches("/mcp");
     let routes = format!(
         "# the probe's own run\n\
@@ -1617,6 +1622,7 @@ fn the_step_reads_the_probes_own_lines() {
     cluster.gateway_url = Some(gateway.url.clone());
     cluster.run_probe =
         Some("mock-docs.mock-docs.svc.cluster.local 127.0.0.1\nhole.test 127.0.0.1\n".to_owned());
+    cluster.dropped = vec![hole.clone()];
     let checked = check("probe-itself", &cluster);
     assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
     assert!(

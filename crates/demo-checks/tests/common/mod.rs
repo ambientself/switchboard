@@ -57,8 +57,10 @@ pub fn require(tools: &[&str]) {
     }
 }
 
-/// A port that accepts connections and never answers: what a dropped route looks like to curl,
-/// which then times out (exit 28).
+/// A port that accepts connections and never answers. curl connects, sends its request and
+/// times out waiting for an answer (exit 28, one connection made). That is a server that is slow
+/// or stalled, not a dropped route: a dropped route never completes the connection. For a
+/// dropped route, use `dropped()` with `fake_curl`.
 pub fn black_hole() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -155,6 +157,68 @@ pub fn fake_getent(bin: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let path = write(bin, "getent", FAKE_GETENT);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A fake `curl` for the route probe. A request to `http://HOST:PORT/...`, where PORT is one of
+/// `dropped` and curl would connect to an address it was given (HOST is an address literal, or
+/// `--resolve` pins it), times out before it connects, as a route dropped on the way to its
+/// address does: it writes out what `-w` asks for with no HTTP status and no connection made,
+/// and exits 28 at once. Every other request goes to the real curl. Loopback cannot drop a
+/// connection on its own: a listener completes the handshake whether or not it accepts.
+pub const FAKE_CURL: &str = r#"#!/bin/sh
+format='' url='' pinned='' previous=''
+for arg do
+  case $previous in
+    -w) format=$arg ;;
+    --resolve) pinned=1 ;;
+  esac
+  previous=$arg
+  url=$arg
+done
+rest=${url#*://}
+authority=${rest%%/*}
+host=${authority%:*}
+port=${authority##*:}
+case $host in *[!0-9.]*) [ -n "$pinned" ] || port='' ;; esac
+case " __DROPPED__ " in
+  *" $port "*)
+    if [ -n "$port" ]; then
+      printf '%s' "$format" | sed -e 's/%{http_code}/000/g' -e 's/%{num_connects}/0/g'
+      exit 28
+    fi
+    ;;
+esac
+exec __CURL__ "$@"
+"#;
+
+/// Writes the fake `curl` into `bin`: requests to the ports of the `dropped` URLs time out
+/// before they connect, and every other request goes to the curl on PATH now.
+pub fn fake_curl(bin: &Path, dropped: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let real = Command::new("sh")
+        .arg("-c")
+        .arg("command -v curl")
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_owned();
+    assert!(real.starts_with('/'), "curl is not on PATH: {real:?}");
+    let ports: Vec<&str> = dropped.iter().map(|url| port_of(url)).collect();
+    let script = FAKE_CURL
+        .replace("__DROPPED__", &ports.join(" "))
+        .replace("__CURL__", &format!("'{real}'"));
+    let path = write(bin, "curl", &script);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The port of a `http://HOST:PORT/...` URL.
+pub fn port_of(url: &str) -> &str {
+    url.rsplit(':').next().unwrap().split('/').next().unwrap()
+}
+
+/// A URL that the fake `curl` drops: a port nothing listens on, so a request the fake does not
+/// drop is refused (exit 7) by the real curl, and the test sees it.
+pub fn dropped() -> String {
+    closed_port()
 }
 
 /// A port nothing listens on: curl's connection is refused (exit 7).

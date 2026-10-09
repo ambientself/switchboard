@@ -28,7 +28,10 @@
 #
 # Each attempt is classified from what curl saw:
 #   an HTTP status, whatever it is          open: something answered
-#   timed out (curl exit 28)                refused: dropped on the way to the address
+#   timed out before it connected           refused: dropped on the way to the address
+#     (curl exit 28, no connection made)
+#   connected, then timed out with no       could-not-probe: something took the connection, so
+#     answer (curl exit 28)                 the route was not refused, but nothing answered
 #   connection refused (curl exit 7)        refused for a row flagged reject_ok, where the route
 #                                           is refused by a reset; could-not-probe otherwise, as
 #                                           a stopped server or a wrong port looks the same
@@ -76,29 +79,38 @@ case $EXPECT in refused | open) ;; *) stop "EXPECT is refused or open, not $EXPE
 case $PROBE_TIMEOUT in '' | *[!0-9]* | 0) stop "PROBE_TIMEOUT is a number of seconds, not $PROBE_TIMEOUT" ;; esac
 [ -n "$GATEWAY_URL" ] || stop "GATEWAY_URL is not set"
 
-# post URL [CURL OPTION...]: one POST with no credential. Prints the HTTP status, 000 when
-# nothing answered, and returns curl's exit status. -q keeps any .curlrc out; the empty
+# post URL [CURL OPTION...]: one POST with no credential. Prints the HTTP status (000 when
+# nothing answered), a space and the number of connections curl made, and returns curl's exit
+# status. Both a connect that times out and an answer that does not come in time are curl exit
+# 28; only the count of connections tells them apart. -q keeps any .curlrc out; the empty
 # Authorization header keeps curl from adding one.
 post() {
   post_url=$1
   shift
-  curl -q -s -o /dev/null -w '%{http_code}' -X POST \
+  curl -q -s -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
     -H 'Authorization:' -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     --connect-timeout "$PROBE_TIMEOUT" --max-time "$PROBE_TIMEOUT" \
     --data "$BODY" "$@" "$post_url" </dev/null 2>/dev/null
 }
 
-# classify EXIT STATUS FLAGS: the result of one attempt.
+# classify EXIT STATUS CONNECTIONS FLAGS: the result of one attempt.
 classify() {
   case $2 in
     '' | 000) ;;
     *) echo open; return ;;
   esac
   case $1 in
-    28) echo refused ;;
+    28)
+      # Refused only when no connection was made. A connection that was made and then got no
+      # answer in time was taken by something: that is not a refusal.
+      case $3 in
+        0) echo refused ;;
+        *) echo could-not-probe ;;
+      esac
+      ;;
     7)
-      case ,$3, in
+      case ,$4, in
         *,reject_ok,*) echo refused ;;
         *) echo could-not-probe ;;
       esac
@@ -119,11 +131,20 @@ record() {
 attempt() {
   attempt_row=$1 attempt_by=$2 attempt_target=$3 attempt_url=$4 attempt_flags=$5
   shift 5
-  attempt_code=$(post "$attempt_url" "$@")
+  attempt_out=$(post "$attempt_url" "$@")
   attempt_exit=$?
-  attempt_result=$(classify "$attempt_exit" "$attempt_code" "$attempt_flags")
+  attempt_code=${attempt_out%% *}
+  case $attempt_out in
+    *' '*) attempt_connects=${attempt_out#* } ;;
+    *) attempt_connects='' ;;
+  esac
+  attempt_result=$(classify "$attempt_exit" "$attempt_code" "$attempt_connects" "$attempt_flags")
   if [ "$attempt_result" = could-not-probe ]; then
-    record "$attempt_row" "$attempt_by" "$attempt_target" "$attempt_result" "curl exit $attempt_exit"
+    attempt_why="curl exit $attempt_exit"
+    if [ "$attempt_exit" -eq 28 ] && [ -n "$attempt_connects" ] && [ "$attempt_connects" != 0 ]; then
+      attempt_why="connected, but nothing answered in ${PROBE_TIMEOUT}s (curl exit 28)"
+    fi
+    record "$attempt_row" "$attempt_by" "$attempt_target" "$attempt_result" "$attempt_why"
   else
     record "$attempt_row" "$attempt_by" "$attempt_target" "$attempt_result"
   fi
@@ -158,6 +179,7 @@ bracketed() {
 
 code=$(post "$GATEWAY_URL")
 status=$?
+code=${code%% *}
 case $code in
   '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;
 esac

@@ -2762,7 +2762,11 @@ mutate("probe-dns-failure-refused", "a name that does not resolve counts as refu
        'record "$row" name "$url" could-not-probe "$host does not resolve"',
        'record "$row" name "$url" refused "$host does not resolve"')
 mutate("probe-any-curl-exit-refused", "any failed attempt counts as refused, not only a timeout", PROBE,
-       "    28) echo refused ;;\n", "    [0-9]*) echo refused ;;\n")
+       "    28)\n      # Refused only", "    [0-9]*)\n      # Refused only")
+mutate("probe-connected-timeout-refused", "a connection that was made and then got no answer in time counts as refused", PROBE,
+       "        *) echo could-not-probe ;;\n      esac\n      ;;\n    7)", "        *) echo refused ;;\n      esac\n      ;;\n    7)")
+mutate("probe-connect-count-missing", "curl does not report whether it connected, so no timeout can be told apart", PROBE,
+       "-w '%{http_code} %{num_connects}'", "-w '%{http_code}'")
 mutate("probe-gateway-reach-skipped", "the routes are tried whether or not the gateway answered", PROBE,
        """  '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;\n""", "  __never__) ;;\n")
 mutate("probe-sends-bearer", "each attempt carries a bearer", PROBE,

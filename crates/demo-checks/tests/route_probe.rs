@@ -1,8 +1,10 @@
 //! `deploy/route-check/probe.sh`, the route check's probe (decision 0010, "The route check"),
-//! against fake servers on loopback and a fake `getent`. Only a dropped connection, or a reset on
-//! a row flagged reject_ok, counts as refused; a name that does not resolve could not be probed;
-//! an answer of any kind is open. An unreachable gateway fails the run before any route is
-//! tried, and no attempt carries a credential.
+//! against fake servers on loopback, a fake `getent` and a fake `curl` that drops the ports it is
+//! told to. Only a connection that times out before it is made, or a reset on a row flagged
+//! reject_ok, counts as refused; a connection that is made and then gets no answer in time, and
+//! a name that does not resolve, could not be probed; an answer of any kind is open. An
+//! unreachable gateway fails the run before any route is tried, and no attempt carries a
+//! credential.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -11,7 +13,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use common::{Recorder, Run, black_hole, closed_port, fake_getent, read, repo, require, scratch};
+use common::{
+    Recorder, Run, black_hole, closed_port, dropped, fake_curl, fake_getent, read, repo, require,
+    scratch,
+};
 
 /// `url` with its host replaced by `host`, keeping the port and the path.
 fn named(url: &str, host: &str) -> String {
@@ -24,6 +29,7 @@ struct Probe {
     routes: String,
     expect: Option<&'static str>,
     hosts: String,
+    dropped: Vec<String>,
     dir: PathBuf,
 }
 
@@ -35,6 +41,7 @@ impl Probe {
             routes: routes.to_owned(),
             expect: None,
             hosts: String::new(),
+            dropped: Vec::new(),
             dir: scratch(name),
         }
     }
@@ -50,10 +57,18 @@ impl Probe {
         self
     }
 
+    /// Requests to `url`'s port time out before they connect, as on a dropped route.
+    fn dropping(mut self, url: &str) -> Self {
+        self.dropped.push(url.to_owned());
+        self
+    }
+
     fn run(&self) -> Run {
         let bin = self.dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         fake_getent(&bin);
+        let dropped: Vec<&str> = self.dropped.iter().map(String::as_str).collect();
+        fake_curl(&bin, &dropped);
         let hosts = common::write(&self.dir, "hosts", &self.hosts);
         // A .curlrc that would add a bearer: the probe must not read it.
         let home = self.dir.join("home");
@@ -134,7 +149,7 @@ fn assert_no_credential(server: &Recorder) {
 #[test]
 fn dropped_routes_are_refused_by_name_and_by_address() {
     let gateway = Recorder::start(401);
-    let hole = black_hole();
+    let hole = dropped();
     let by_name = named(&hole, "hole.test");
     let routes = format!(
         "# a comment\n\
@@ -144,6 +159,7 @@ fn dropped_routes_are_refused_by_name_and_by_address() {
     );
     let run = Probe::new("dropped", &gateway.url, &routes)
         .host("hole.test", "127.0.0.1")
+        .dropping(&hole)
         .run();
     assert_result(&run, true);
     assert_eq!(
@@ -212,7 +228,7 @@ fn a_refused_connection_counts_as_refused_only_with_reject_ok() {
 #[test]
 fn a_name_that_does_not_resolve_could_not_be_probed() {
     let gateway = Recorder::start(401);
-    let hole = black_hole();
+    let hole = dropped();
     let nowhere = named(&hole, "nowhere.test");
     let slow = named(&hole, "slow.test");
     let routes = format!(
@@ -222,6 +238,7 @@ fn a_name_that_does_not_resolve_could_not_be_probed() {
     );
     let run = Probe::new("unresolved", &gateway.url, &routes)
         .host("slow.test", "slow")
+        .dropping(&hole)
         .run();
     assert_result(&run, false);
     assert_eq!(
@@ -249,7 +266,7 @@ fn a_name_that_does_not_resolve_could_not_be_probed() {
 #[test]
 fn a_resolve_row_tries_each_address_the_name_resolves_to() {
     let gateway = Recorder::start(401);
-    let hole = black_hole();
+    let hole = dropped();
     let by_name = named(&hole, "hole.test");
     let run = Probe::new(
         "resolve",
@@ -257,6 +274,7 @@ fn a_resolve_row_tries_each_address_the_name_resolves_to() {
         &format!("resolved\t{by_name}\tresolve\n"),
     )
     .host("hole.test", "127.0.0.1")
+    .dropping(&hole)
     .run();
     assert_result(&run, true);
     assert_eq!(
@@ -268,6 +286,49 @@ fn a_resolve_row_tries_each_address_the_name_resolves_to() {
         "{}",
         run.transcript()
     );
+}
+
+/// A connection that is made and then gets no answer in time is not a refusal: something took
+/// it, so the route is open at the network level. A slow server, a stalled TLS handshake or a
+/// tarpit looks like this. It could not be probed, which fails the run under either EXPECT.
+#[test]
+fn a_connection_that_gets_no_answer_in_time_could_not_be_probed() {
+    let gateway = Recorder::start(401);
+    let silent = black_hole();
+    let by_name = named(&silent, "silent.test");
+    for (expect, flags) in [("refused", ""), ("refused", "reject_ok"), ("open", "")] {
+        let run = Probe::new(
+            &format!("silent-{expect}-{flags}"),
+            &gateway.url,
+            &format!("silent\t{by_name}\t127.0.0.1\t{flags}\n"),
+        )
+        .host("silent.test", "127.0.0.1")
+        .expect(expect)
+        .run();
+        assert_result(&run, false);
+        assert_eq!(
+            attempts(&run),
+            [
+                format!("ROUTE silent name {by_name} could-not-probe"),
+                "ROUTE silent address 127.0.0.1 could-not-probe".to_owned(),
+            ],
+            "{}",
+            run.transcript()
+        );
+        assert!(
+            run.stdout.contains(
+                "NOTE silent address 127.0.0.1: connected, but nothing answered in 1s (curl exit 28)\n"
+            ),
+            "{}",
+            run.transcript()
+        );
+        assert!(
+            run.stdout
+                .contains(&format!("FAIL 2 of 2 attempts were not {expect}\n")),
+            "{}",
+            run.transcript()
+        );
+    }
 }
 
 #[test]
@@ -331,12 +392,14 @@ fn expect_open_inverts_the_result() {
     assert_eq!(attempts(&run), ["ROUTE server address 127.0.0.1 open"]);
     assert!(run.stdout.contains("PASS every route open (1 attempts)\n"));
 
+    let hole = dropped();
     let run = Probe::new(
         "expect-open-dropped",
         &gateway.url,
-        &format!("dropped\t{}\t127.0.0.1\n", black_hole()),
+        &format!("dropped\t{hole}\t127.0.0.1\n"),
     )
     .expect("open")
+    .dropping(&hole)
     .run();
     assert_result(&run, false);
     assert_eq!(attempts(&run), ["ROUTE dropped address 127.0.0.1 refused"]);
@@ -348,16 +411,23 @@ fn an_unreachable_gateway_fails_before_any_route_is_tried() {
     let server = Recorder::start(401);
     let by_name = named(&server.url, "server.test");
     let routes_text = format!("server\t{by_name}\t127.0.0.1\n");
-    for (name, gateway, exit) in [("refused", closed_port(), 7), ("dropped", black_hole(), 28)] {
+    for (name, gateway, exit) in [
+        ("refused", closed_port(), 7),
+        ("dropped", dropped(), 28),
+        ("silent", black_hole(), 28),
+    ] {
         for expect in ["refused", "open"] {
-            let run = Probe::new(
+            let mut probe = Probe::new(
                 &format!("no-gateway-{name}-{expect}"),
                 &gateway,
                 &routes_text,
             )
             .host("server.test", "127.0.0.1")
-            .expect(expect)
-            .run();
+            .expect(expect);
+            if name == "dropped" {
+                probe = probe.dropping(&gateway);
+            }
+            let run = probe.run();
             assert_result(&run, false);
             assert_eq!(
                 run.stdout,
