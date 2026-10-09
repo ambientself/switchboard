@@ -4,8 +4,9 @@ use std::fmt;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
-use gateway::{BootError, Config, Wiring, boot, serve_with_shutdown};
+use gateway::{BootError, Config, Timeouts, Wiring, boot, serve_with_timeouts};
 use gateway_core::AuditStore;
 use gateway_identity::{Clock, SigningAlgorithm, SystemClock};
 use gateway_testkit::{
@@ -187,10 +188,20 @@ pub async fn start_fixture_gateway_with(options: Options) -> Result<FixtureGatew
     let listener = TcpListener::bind(SocketAddr::from((LISTEN_HOST, port))).await?;
     let address = listener.local_addr()?;
     let (stop, stopped) = oneshot::channel::<()>();
-    let serving = tokio::spawn(serve_with_shutdown(listener, gates, async {
-        // A dropped sender stops the server too.
-        let _ = stopped.await;
-    }));
+    // Nothing probes the fixture gateway's readiness, so it stops taking connections at once.
+    let timeouts = Timeouts {
+        readiness_removal: Duration::ZERO,
+        ..Timeouts::default()
+    };
+    let serving = tokio::spawn(serve_with_timeouts(
+        listener,
+        gates,
+        async {
+            // A dropped sender stops the server too.
+            let _ = stopped.await;
+        },
+        timeouts,
+    ));
     Ok(FixtureGateway {
         address,
         clock,
