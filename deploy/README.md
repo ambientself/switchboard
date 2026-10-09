@@ -81,12 +81,19 @@ Secret's data too): 9 checks. That is 126 checks per team.
 
 ## Stopping the gateway
 
-Decision 0009 says the gateway's termination grace period must be longer than the
-readiness-removal delay plus the begin budget, the call deadline and the finish deadline, or a
-stop can leave open rows. Here that is 2 s + 5 s + 30 s, plus 6 s for the readiness probe in
-kind. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
+Decision 0009 says an instance that is told to stop first fails its readiness check, then stops
+accepting calls, and lets running calls and their finishes complete. On SIGTERM the gateway's
+`GET /readyz` turns from 200 to 503, and the gateway goes on serving for its readiness removal,
+8 s, before it stops taking connections. In kind the readiness probe asks `/readyz` every 2 s
+and takes the pod out of the Service after 3 failures, 6 s, inside that window. `/readyz` runs
+no host, origin or identity check, since the kubelet probes it by the pod's IP, and it answers
+one word. Compose has no probe, but the gateway still waits out the removal there.
+
+The termination grace period must be longer than the readiness removal plus the begin budget,
+the call deadline and the finish deadline, or a stop can leave open rows: 8 s + 2 s + 5 s +
+30 s, 45 s. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
 `kind/base/gateway.yaml` and `stop_grace_period` in `compose/compose.yaml`, in place of 30 s and
-10 s. `crates/demo-checks` holds both to the code's budgets.
+10 s. `crates/demo-checks` holds both to the code's budgets and the probe to the removal.
 
 ## Loading images into kind
 
