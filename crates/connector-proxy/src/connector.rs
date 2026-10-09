@@ -218,7 +218,7 @@ impl ProxyConnector {
             }
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let Some(request) = self.request(id, upstream_name, arguments, secret) else {
+        let Some(request) = self.request(id, upstream_name, arguments, &secret) else {
             return ToolOutcome::Error(outcome::NOT_SENT.to_owned());
         };
         match tokio::time::timeout(self.deadline, self.exchange(request)).await {

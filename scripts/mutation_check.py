@@ -1843,7 +1843,7 @@ mutate("proxy-unmapped-tool-sent-as-is", "a tool with no upstream name is sent u
        "            return ToolOutcome::Refused(outcome::NOT_SERVED.to_owned());\n        };",
        "        let upstream_name = self.tools.get(&tool.name).map_or(tool.name.as_str(), String::as_str);")
 mutate("proxy-exposed-name-sent", "the exposed name is sent instead of the upstream name", PC,
-       "self.request(id, upstream_name, arguments, secret)", "self.request(id, tool.name.as_str(), arguments, secret)")
+       "self.request(id, upstream_name, arguments, &secret)", "self.request(id, tool.name.as_str(), arguments, &secret)")
 mutate("proxy-arguments-unchecked", "arguments that are not an object are sent as an empty object", PC,
        "        let Value::Object(arguments) = call.arguments() else {\n"
        "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
@@ -1907,10 +1907,24 @@ mutate("proxy-credential-size-off-by-one", "a credential file of exactly the lim
 mutate("proxy-duplicate-credential-accepted", "two files for one connector are accepted", PK,
        "            if entries.contains_key(&connector) {", "            if false {")
 mutate("proxy-credential-for-any-connector", "a credential is issued for a connector that has none", PK,
-       "        match self.entries.get(connector) {", "        match self.entries.values().next() {")
-mutate("proxy-debug-shows-secret", "the source's debug output shows the secret", PK,
+       "        let Some(stored) = self.entries.get(connector) else {",
+       "        let Some(stored) = self.entries.values().next() else {")
+mutate("proxy-debug-shows-secret", "the source's debug output reads and shows the secret", PK,
        "                    .map(|(connector, stored)| (connector, &stored.label)),",
-       "                    .map(|(connector, stored)| (connector, &stored.secret.0)),")
+       "                    .map(|(connector, stored)| (connector, std::fs::read_to_string(&stored.path).unwrap_or_default())),")
+mutate("proxy-credential-unchecked-at-boot", "a credential file is not read until the first call", PK,
+       "            read_secret(&connector, path)?;\n", "")
+mutate_all(
+    "proxy-credential-cached-at-load",
+    "the credential is read once at load, so a rotated token is never sent",
+    (PK, "struct Stored {\n    label: String,\n    path: PathBuf,\n}",
+     "struct Stored {\n    label: String,\n    path: PathBuf,\n    secret: Secret,\n}"),
+    (PK, "            read_secret(&connector, path)?;\n", "            let secret = read_secret(&connector, path)?;\n"),
+    (PK, "            entries.insert(connector, Stored { label, path });",
+     "            entries.insert(connector, Stored { label, path, secret });"),
+    (PK, "        let secret = read_secret(connector, &stored.path)\n",
+     "        let secret = Ok::<_, CredentialFileError>(Secret(stored.secret.0.clone()))\n"),
+)
 # Moving a dev-dependency into the connector's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "proxy-dependency-added",

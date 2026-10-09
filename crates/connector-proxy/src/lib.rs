@@ -6,9 +6,10 @@
 //! connector could not forward it if it tried, because a [`ToolCall`](gateway_core::ToolCall)
 //! does not carry it.
 //!
-//! - **Credential.** [`FileCredentials`] reads one bearer token per connector from a file at
-//!   boot. It implements the core's [`CredentialSource`](gateway_core::CredentialSource), whose
-//!   handles carry only a label; the token stays inside this crate.
+//! - **Credential.** [`FileCredentials`] reads one bearer token per connector from a file,
+//!   once at boot to check it and again on every call. It implements the core's
+//!   [`CredentialSource`](gateway_core::CredentialSource), whose handles carry only a label;
+//!   the token stays inside this crate.
 //! - **Bounds.** Each call is abandoned at its deadline, 5 s by default, and an answer larger
 //!   than its cap, 64 KiB by default, is discarded. Both are enforced here, inside the
 //!   connector, not by the core.
