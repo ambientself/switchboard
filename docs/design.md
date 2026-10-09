@@ -1138,9 +1138,7 @@ that removes the exception-list check.
 
 **#47, what the first slice (#14) still lacks.** The mock server's own refusal of anything but the gateway's projected
 token; the route-check program, its operator step and its probe (decision 0010); the
-signals of section 11 exported; and the open-row query. Decision 0009's shutdown order, in which
-an instance first fails its readiness check and then stops accepting calls, is not built either:
-the manifests set the grace period, but nothing fails readiness first (#40).
+signals of section 11 exported; and the open-row query.
 
 **#22, the Otto adapter.** The Ed25519 turn-grant verifier with strict encoding; a delegation in
 the call context that is present and unverified, carrying the failure kind and an optional
@@ -1169,7 +1167,6 @@ off only in a development build, with CI's check of the release artifact; and th
 - The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
   harness enables and CI's check of the release artifact. Today boot accepts a tool not
   classified `read` even with audit off, and the harness serves a `propose` fixture tool.
-- A readiness endpoint that fails first on shutdown.
 - An allowed call whose connector is not registered completes its row as `error`, where today
   the row stays open.
 - The key read from its carriers, the tool-use identifier and the named `_meta` field.
@@ -1178,7 +1175,8 @@ off only in a development build, with CI's check of the release artifact; and th
   is stricter.
 - Already built and matching: identity failures write no row and keep the opaque sentence
   during an audit outage; begin, run and finish run on a spawned task the client cannot
-  cancel; and shutdown waits for running answers.
+  cancel; shutdown waits for running answers; and `GET /readyz` fails first on shutdown, while
+  the gateway serves on for its readiness removal before it stops accepting calls (#40).
 
 ## 18. Testing
 

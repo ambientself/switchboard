@@ -22,7 +22,7 @@
 //! - [`serve`] is the HTTP endpoint, `POST /mcp/{surface}`, over a listener and the [`Gates`]:
 //!   the host and origin checks, the body limit, time limits on a request's head and body, and
 //!   a task per answer, so a client that disconnects cannot cut a tool call off from its audit
-//!   row.
+//!   row. `GET /readyz` is its readiness check, which fails first when it shuts down.
 //! - [`telemetry::init`] sends logs to standard output as JSON lines.
 //!
 //! The first slice (decision 0008) runs from files:
@@ -78,6 +78,6 @@ pub use selector::{
     NO_PROFILE, ProfileSelector, SelectorError, SelectorRules, UserRule, WorkloadRule,
 };
 pub use server::{
-    BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES, SHUTDOWN_GRACE,
-    Timeouts, serve, serve_with_shutdown, serve_with_timeouts,
+    BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
+    READINESS_REMOVAL, SHUTDOWN_GRACE, Timeouts, serve, serve_with_shutdown, serve_with_timeouts,
 };

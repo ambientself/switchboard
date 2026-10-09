@@ -389,6 +389,7 @@ version = "0.1.0"
 dependencies = [
  "audit-postgres",
  "connector-proxy",
+ "gateway",
  "gateway-core",
  "serde_json",
  "sha2 0.10.9",

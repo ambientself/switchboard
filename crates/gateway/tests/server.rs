@@ -4,12 +4,12 @@
 //! The request path's own behaviour is tested in `path.rs`. These tests cover what the HTTP
 //! layer adds: the host and origin checks, the body limit, identity before the body is read, a
 //! task per answer that a disconnect cannot cancel, the time limits on a request's head and
-//! body, and shutting down.
+//! body, the readiness check, and shutting down.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gateway::{MAX_BODY_BYTES, Timeouts};
 use gateway_core::audit::{Completion, DecisionKind, Outcome};
@@ -373,11 +373,107 @@ async fn a_tool_call_completes_its_row_after_its_client_has_gone() {
     assert_eq!(server.store.finish_attempts(), 1);
 }
 
+// --- The readiness check --------------------------------------------------------------------
+
+/// A kubelet's probe: a GET from the pod's IP, with no token and no Origin.
+fn probe() -> Http {
+    Http::new("GET", "/readyz").header("host", "10.244.0.7:8080")
+}
+
+#[tokio::test]
+async fn the_readiness_check_is_ready_for_any_host_while_serving() {
+    let server = Server::start().await;
+    let ready = probe().send(&server).await;
+    assert_eq!(ready.status, 200, "{ready:?}");
+    assert_eq!(ready.body, b"ready");
+    assert_eq!(ready.header("content-type"), Some("text/plain"));
+
+    // No host, origin or identity check runs.
+    for request in [
+        probe().without("host"),
+        probe().without("host").header("host", "evil.example"),
+        probe().header("origin", "http://evil.example"),
+        probe().bearer("not-a-token"),
+    ] {
+        let answer = request.send(&server).await;
+        assert_eq!(
+            (answer.status, answer.body.as_slice()),
+            (200, &b"ready"[..])
+        );
+    }
+
+    for method in ["POST", "PUT", "DELETE"] {
+        let mut request = probe();
+        request.method = method.to_owned();
+        let answer = request.send(&server).await;
+        assert_eq!(answer.status, 405, "{method}: {answer:?}");
+        assert_eq!(answer.header("allow"), Some("GET"));
+    }
+    server.assert_nothing_ran();
+}
+
+#[tokio::test]
+async fn shutting_down_fails_readiness_first_and_serves_until_the_removal_is_over() {
+    let removal = Duration::from_secs(2);
+    let mut server = Server::start_with(Timeouts {
+        readiness_removal: removal,
+        ..short()
+    })
+    .await;
+    assert_eq!(probe().send(&server).await.status, 200);
+
+    server.stop.take().unwrap().send(()).unwrap();
+    let stopped = Instant::now();
+    let unready = tokio::time::timeout(PATIENCE, async {
+        loop {
+            let answer = probe().send(&server).await;
+            if answer.status != 200 {
+                return answer;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the readiness check still passes");
+    assert_eq!(unready.status, 503, "{unready:?}");
+    assert_eq!(unready.body, b"not ready");
+
+    // Still in the removal window: a call is taken, served and its row completed.
+    let read = server
+        .call(
+            Caller::TeamA,
+            SURFACE_READ,
+            READ_TOOL,
+            json!({"document": Caller::TeamA.own_document()}),
+        )
+        .send(&server)
+        .await;
+    assert_eq!(read.result()["isError"], json!(false), "{read:?}");
+    assert!(stopped.elapsed() < removal, "the test was too slow");
+    assert!(!server.serving.is_finished(), "stopped inside the removal");
+    let row = server.store.row(0).unwrap();
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(row.completion.map(|c| c.outcome), Some(Outcome::Ok));
+
+    // After it, nothing more is taken.
+    let returned = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    returned.expect("the server stopped").unwrap().unwrap();
+    assert!(stopped.elapsed() >= removal, "stopped before the removal");
+    assert!(
+        TcpStream::connect(server.address).await.is_err(),
+        "still listening"
+    );
+}
+
 // --- Shutting down --------------------------------------------------------------------------
 
 #[tokio::test]
 async fn the_server_stops_when_told_to() {
-    let mut server = Server::start().await;
+    let mut server = Server::start_with(Timeouts {
+        readiness_removal: Duration::from_millis(300),
+        ..Timeouts::default()
+    })
+    .await;
     let answer = server
         .post(SURFACE_READ, &legacy("ping", json!({})))
         .bearer(&server.token(Caller::TeamA))
@@ -399,6 +495,7 @@ fn short() -> Timeouts {
     Timeouts {
         header_read: Duration::from_millis(300),
         body_read: Duration::from_millis(300),
+        readiness_removal: Duration::from_millis(300),
         shutdown_grace: Duration::from_millis(300),
     }
 }

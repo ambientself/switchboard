@@ -98,12 +98,12 @@ services:
     # The deployment file names everything else: the registry, the dev issuer's keys, the team
     # manifest, the audit database's URL variable and the credential file.
     command: ["switchboard", "--config=/etc/switchboard/gateway.toml"]
-    # Decision 0009, Shutdown: on `docker compose stop` or `down`, the gateway must be given
-    # longer than the 2 s begin budget, the 5 s call deadline and the 30 s finish deadline,
-    # 37 s, before it is killed. Otherwise it can be killed while it is still completing rows,
-    # and they stay open. Compose has no readiness removal to add. Its default of 10 s is too
-    # short; 50 s is the kind manifest's value. crates/demo-checks holds this to the code's
-    # values.
+    # Decision 0009, Shutdown: on `docker compose stop` or `down`, the gateway serves on for its
+    # 8 s readiness removal, though nothing probes it here, and then needs the 2 s begin budget,
+    # the 5 s call deadline and the 30 s finish deadline: 45 s before it is killed. Otherwise
+    # it can be killed while it is still completing rows, and they stay open. Compose's default
+    # of 10 s is too short; 50 s is the kind manifest's value. crates/demo-checks holds this to
+    # the code's values.
     stop_grace_period: 50s
     ports:
       - "127.0.0.1:18080:8080"
