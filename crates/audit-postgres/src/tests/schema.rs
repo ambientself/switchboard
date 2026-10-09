@@ -8,12 +8,16 @@ use tokio_postgres::Client;
 use super::{
     CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, SETUP, TestDatabase, code, message,
 };
-use crate::{GATEWAY_ROLE, MigrateError, OWNER_ROLE, ROLES, migrate};
+use crate::{GATEWAY_ROLE, MIGRATIONS, MigrateError, OWNER_ROLE, ROLES, migrate};
 
 /// The begin columns of an allowed call by a workload, as `(column, value)` in SQL. The
-/// identifier is a fresh UUID, as the gateway supplies one.
+/// identifier is a fresh UUID, as the gateway supplies one. The allowance is the default
+/// budgets' 2 s and 30 s and a call deadline of 5 s.
 const ALLOWED: &[(&str, &str)] = &[
     ("id", "gen_random_uuid()"),
+    ("instance", "'fixture-instance'"),
+    ("kind", "'call'"),
+    ("allowance_ms", "37000"),
     ("deployment", "'fixture'"),
     ("surface", "'fixture-all'"),
     ("profile", "'workload-rw'"),
@@ -91,7 +95,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2]);
+    assert_eq!(recorded, vec![1, 2, 3]);
 }
 
 #[tokio::test]
@@ -130,7 +134,7 @@ async fn two_migrators_at_once_take_turns() {
         let mut applied = first.unwrap();
         applied.extend(second.unwrap());
         applied.sort_unstable();
-        assert_eq!(applied, vec![1, 2], "each migration is applied once");
+        assert_eq!(applied, vec![1, 2, 3], "each migration is applied once");
     }
 }
 
@@ -264,6 +268,7 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         .map(|row| (row.get(0), row.get(1)))
         .collect();
     let mut expected: Vec<(String, String)> = [
+        ("INSERT", "allowance_ms"),
         ("INSERT", "classification"),
         ("INSERT", "claimed_acting_person"),
         ("INSERT", "claimed_team"),
@@ -271,6 +276,8 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "decision"),
         ("INSERT", "deployment"),
         ("INSERT", "id"),
+        ("INSERT", "instance"),
+        ("INSERT", "kind"),
         ("INSERT", "policy_revision"),
         ("INSERT", "profile"),
         ("INSERT", "proved_delegation_team"),
@@ -286,8 +293,10 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "surface"),
         ("INSERT", "tool"),
         ("INSERT", "tool_use_id"),
+        ("SELECT", "deadline"),
         ("SELECT", "decision"),
         ("SELECT", "id"),
+        ("SELECT", "kind"),
         ("SELECT", "latency_ms"),
         ("SELECT", "outcome"),
         ("SELECT", "outcome_sentence"),
@@ -343,6 +352,7 @@ async fn the_gateway_writes_the_identifier_but_not_the_times_or_a_completion_at_
     for column in [
         ("begun_at", "now() - interval '1 day'"),
         ("finished_at", "now()"),
+        ("deadline", "now() + interval '1 day'"),
         ("outcome", "'ok'"),
         ("latency_ms", "1"),
     ] {
@@ -367,6 +377,10 @@ async fn the_gateway_updates_only_the_completion() {
         "decision = 'deny'",
         "begun_at = now()",
         "finished_at = now()",
+        "deadline = now()",
+        "instance = 'another'",
+        "kind = 'list'",
+        "allowance_ms = 0",
     ] {
         let error = gateway
             .execute(
@@ -390,14 +404,22 @@ async fn the_gateway_cannot_read_who_called_or_delete() {
     gateway
         .query_one(
             &format!(
-                "SELECT id, decision, outcome, outcome_sentence, latency_ms
+                "SELECT id, decision, outcome, outcome_sentence, latency_ms, kind, deadline
                  FROM switchboard_audit.call_rows WHERE id = '{id}'"
             ),
             &[],
         )
         .await
         .unwrap();
-    for column in ["proved_subject", "claimed_team", "tool", "begun_at", "*"] {
+    for column in [
+        "proved_subject",
+        "claimed_team",
+        "tool",
+        "begun_at",
+        "instance",
+        "allowance_ms",
+        "*",
+    ] {
         let error = gateway
             .query(
                 &format!("SELECT {column} FROM switchboard_audit.call_rows"),
@@ -466,6 +488,8 @@ async fn a_completion_writes_nothing_else_even_for_the_owner() {
         "tool = 'fixture__other'",
         "proved_subject = 'someone-else'",
         "begun_at = now() - interval '1 day'",
+        "deadline = now() + interval '1 day'",
+        "instance = 'another'",
     ] {
         let error = owner
             .execute(
@@ -508,22 +532,102 @@ async fn times(client: &Client, id: &str) -> (bool, Option<bool>) {
     (row.get(0), row.get(1))
 }
 
+/// The row's deadline, less its time at begin, in milliseconds; `None` when it has none.
+async fn deadline_after_begin(client: &Client, id: &str) -> Option<f64> {
+    client
+        .query_one(
+            &format!(
+                "SELECT (extract(epoch FROM deadline - begun_at) * 1000)::float8
+                 FROM switchboard_audit.call_rows WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
 #[tokio::test]
-async fn an_insert_cannot_choose_its_times_whoever_writes() {
+async fn the_deadline_is_the_database_time_plus_the_allowance() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let owner = db.connect_as(OWNER_ROLE).await;
+    for (allowance, expected) in [("37000", 37_000.0), ("1", 1.0), ("0", 0.0)] {
+        let id = insert_row(&gateway, &insert(&[("allowance_ms", allowance)])).await;
+        assert_eq!(times(&owner, &id).await, (true, None));
+        assert_eq!(
+            deadline_after_begin(&owner, &id).await,
+            Some(expected),
+            "{allowance}"
+        );
+    }
+    // A listing has no deadline, whatever allowance it carries.
+    for allowance in ["37000", ""] {
+        let id = insert_row(
+            &owner,
+            &insert(&[
+                ("kind", "'list'"),
+                ("allowance_ms", allowance),
+                ("outcome", "'ok'"),
+                ("latency_ms", "0"),
+            ]),
+        )
+        .await;
+        assert_eq!(deadline_after_begin(&owner, &id).await, None);
+    }
+    // A negative allowance would put the deadline before the row began.
+    let error = owner
+        .query_one(&insert(&[("allowance_ms", "-1")]), &[])
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(CHECK_VIOLATION), "{error}");
+}
+
+#[tokio::test]
+async fn an_insert_cannot_choose_its_begin_time_or_deadline_whoever_writes() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
     let owner = db.connect_as(OWNER_ROLE).await;
-    // A row begun with times of its own choosing is begun now, and not complete.
+    // A row begun with times of its own choosing is begun now, and not complete, and its
+    // deadline is its allowance from now.
     let id = insert_row(
         &owner,
         &insert(&[
             ("begun_at", "'2000-01-01T00:00:00Z'"),
             ("finished_at", "'2000-01-01T00:00:01Z'"),
+            ("deadline", "'2100-01-01T00:00:00Z'"),
         ]),
     )
     .await;
     assert_eq!(times(&owner, &id).await, (true, None));
+    assert_eq!(deadline_after_begin(&owner, &id).await, Some(37_000.0));
+    // A listing that names a deadline has none.
+    let id = insert_row(
+        &owner,
+        &insert(&[
+            ("kind", "'list'"),
+            ("deadline", "'2100-01-01T00:00:00Z'"),
+            ("outcome", "'ok'"),
+            ("latency_ms", "0"),
+        ]),
+    )
+    .await;
+    assert_eq!(deadline_after_begin(&owner, &id).await, None);
+    // The gateway's role may not even try.
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    for column in [
+        ("begun_at", "'2000-01-01T00:00:00Z'"),
+        ("deadline", "'2100-01-01T00:00:00Z'"),
+    ] {
+        let error = gateway
+            .query_one(&insert(&[column]), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{}", column.0);
+    }
     // A row written complete is complete at the moment it was begun.
     let id = insert_row(
         &owner,
@@ -543,6 +647,186 @@ async fn an_insert_cannot_choose_its_times_whoever_writes() {
         .unwrap();
     let error = owner.query_one(&insert(&[]), &[]).await.unwrap_err();
     assert_eq!(code(&error), Some(NOT_NULL_VIOLATION), "{error}");
+}
+
+#[tokio::test]
+async fn a_call_row_without_a_deadline_cannot_be_stored() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    // A call with no allowance gets no deadline from the trigger, so it is refused.
+    for client in [&gateway, &owner] {
+        let error = client
+            .query_one(&insert(&[("allowance_ms", "")]), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), Some(CHECK_VIOLATION), "{error}");
+        assert!(message(&error).contains("deadline_shape"), "{error}");
+    }
+    // Neither a kind nor an instance may be left out, and the kind is one of two.
+    for (case, changes, expected) in [
+        ("no kind", [("kind", "")], NOT_NULL_VIOLATION),
+        ("no instance", [("instance", "")], NOT_NULL_VIOLATION),
+        ("another kind", [("kind", "'other'")], CHECK_VIOLATION),
+    ] {
+        let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(expected), "{case}: {error}");
+    }
+    // With the trigger off, which only the owner can do, the constraint alone still refuses
+    // a call without a deadline, and a listing with one.
+    owner
+        .batch_execute("ALTER TABLE switchboard_audit.call_rows DISABLE TRIGGER set_times")
+        .await
+        .unwrap();
+    for (case, changes) in [
+        ("a call without a deadline", vec![("begun_at", "now()")]),
+        (
+            "a listing with a deadline",
+            vec![
+                ("begun_at", "now()"),
+                ("kind", "'list'"),
+                ("deadline", "now()"),
+            ],
+        ),
+    ] {
+        let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
+        assert!(
+            message(&error).contains("deadline_shape"),
+            "{case}: {error}"
+        );
+    }
+    insert_row(
+        &owner,
+        &insert(&[("begun_at", "now()"), ("deadline", "now()")]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_completion_cannot_change_the_deadline_or_instance() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let id = insert_row(&owner, &insert(&[])).await;
+    let before: (String, String) = {
+        let row = owner
+            .query_one(
+                &format!(
+                    "SELECT instance, deadline::text FROM switchboard_audit.call_rows
+                     WHERE id = '{id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    for assignment in [
+        "deadline = deadline + interval '1 day'",
+        "instance = 'another'",
+        "kind = 'list'",
+        "allowance_ms = 1",
+    ] {
+        let error = owner
+            .execute(
+                &format!(
+                    "UPDATE switchboard_audit.call_rows SET outcome = 'ok', latency_ms = 1,
+                     {assignment} WHERE id = '{id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            message(&error).contains("only the completion"),
+            "{assignment}: {error}"
+        );
+    }
+    assert_eq!(complete(&owner, &id, "ok").await.unwrap(), 1);
+    let after = owner
+        .query_one(
+            &format!(
+                "SELECT instance, deadline::text FROM switchboard_audit.call_rows
+                 WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!((after.get(0), after.get(1)), before);
+}
+
+/// The migration that adds the deadline applies to a table that already has rows: each becomes
+/// a call by an unrecorded instance, due when it was completed, or begun if it never was.
+#[tokio::test]
+async fn the_deadline_migration_keeps_the_rows_already_written() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let mut owner = db.connect_as(OWNER_ROLE).await;
+    owner
+        .batch_execute("DROP SCHEMA switchboard_audit CASCADE")
+        .await
+        .unwrap();
+    owner
+        .batch_execute(
+            "CREATE SCHEMA switchboard_audit;
+             CREATE TABLE switchboard_audit.migrations (
+                 version    integer     PRIMARY KEY,
+                 name       text        NOT NULL,
+                 applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+             );",
+        )
+        .await
+        .unwrap();
+    for migration in &MIGRATIONS[..2] {
+        owner.batch_execute(migration.sql).await.unwrap();
+        owner
+            .execute(
+                "INSERT INTO switchboard_audit.migrations (version, name) VALUES ($1, $2)",
+                &[&migration.version, &migration.name],
+            )
+            .await
+            .unwrap();
+    }
+    let before_0003 = |sql: String| {
+        sql.replace(", instance, kind, allowance_ms", "")
+            .replace(", 'fixture-instance', 'call', 37000", "")
+    };
+    let open = insert_row(&owner, &before_0003(insert(&[]))).await;
+    let completed = insert_row(&owner, &before_0003(insert(&[]))).await;
+    assert_eq!(complete(&owner, &completed, "ok").await.unwrap(), 1);
+    let refused = insert_row(&owner, &before_0003(denied())).await;
+
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3]);
+    for (id, due) in [
+        (&open, "begun_at"),
+        (&completed, "finished_at"),
+        (&refused, "begun_at"),
+    ] {
+        let row = owner
+            .query_one(
+                &format!(
+                    "SELECT instance, kind, allowance_ms, deadline = {due}
+                     FROM switchboard_audit.call_rows WHERE id = '{id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "before-0003");
+        assert_eq!(row.get::<_, String>(1), "call");
+        assert_eq!(row.get::<_, Option<i64>>(2), Some(0));
+        assert!(row.get::<_, bool>(3), "{id} is not due at its {due}");
+    }
+    // The trigger that completes a row once is back on.
+    let error = complete(&owner, &completed, "error").await.unwrap_err();
+    assert!(message(&error).contains("is already complete"), "{error}");
+    assert_eq!(complete(&owner, &open, "ok").await.unwrap(), 1);
 }
 
 /// Both trigger functions look names up in `pg_catalog` alone. Otherwise a role that can write
@@ -798,17 +1082,26 @@ async fn a_row_the_core_could_not_make_is_refused() {
             "an outcome without its time",
             with(&[
                 ("begun_at", "now()"),
+                ("deadline", "now()"),
                 ("outcome", "'ok'"),
                 ("latency_ms", "1"),
             ]),
         ),
         (
             "a time without an outcome",
-            with(&[("begun_at", "now()"), ("finished_at", "now()")]),
+            with(&[
+                ("begun_at", "now()"),
+                ("deadline", "now()"),
+                ("finished_at", "now()"),
+            ]),
         ),
     ] {
         let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
         assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
+        assert!(
+            message(&error).contains("completion_shape"),
+            "{case}: {error}"
+        );
     }
     owner.batch_execute(&set_times("ENABLE")).await.unwrap();
 }

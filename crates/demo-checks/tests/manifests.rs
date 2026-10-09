@@ -168,6 +168,27 @@ fn workload_tokens_are_for_the_gateways_audience_and_short_lived() {
     assert!(gateway.contains("max_lifetime_seconds = 3600"));
 }
 
+#[test]
+fn each_teams_workload_names_its_own_project() {
+    // Every Job demo.sh starts, the before-policy one included, keeps the template's
+    // environment, and both modes read OWN_PROJECT through the gateway.
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    for (team, own) in [("team-a", "atlas"), ("team-b", "borealis")] {
+        let cronjob = documents_with(&workloads, &format!("  namespace: {team}\n"))
+            .into_iter()
+            .filter(|doc| doc.contains("  name: mock-workload\n"))
+            .collect::<Vec<_>>();
+        assert_eq!(cronjob.len(), 1, "{team}");
+        assert!(
+            cronjob[0].contains(&format!(
+                "                - {{name: OWN_PROJECT, value: {own}}}\n"
+            )),
+            "{team}'s workload does not name {own}:\n{}",
+            cronjob[0]
+        );
+    }
+}
+
 /// The number on the one line of `text` that starts with `prefix`, after it.
 fn number_after(text: &str, prefix: &str, suffix: &str) -> u64 {
     let lines: Vec<&str> = text

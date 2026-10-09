@@ -52,12 +52,20 @@ pub fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// The instance every [`start`] names.
+pub const INSTANCE: &str = "test-instance";
+
+/// The call deadline every [`start`] gives, in milliseconds.
+pub const CALL_DEADLINE_MS: u64 = 5_000;
+
 /// A row identifier no other call in this test process has: the gateway chooses one per call,
-/// and the core only carries it.
+/// and the core only carries it. With [`INSTANCE`] and [`CALL_DEADLINE_MS`].
 pub fn start() -> RowStart {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     RowStart {
         row: AuditRowId::new(format!("row-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
+        instance: INSTANCE.into(),
+        call_deadline_ms: CALL_DEADLINE_MS,
     }
 }
 

@@ -1,19 +1,29 @@
 //! An audit store in memory that a test can read back and tell to fail or to wait.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
-use gateway_core::audit::{AuditRowId, RowCompletion, RowStart, StoreError};
-use gateway_core::{AuditRecord, AuditStore, BoxFuture};
+use gateway_core::audit::{AuditRowId, RowCompletion, RowKind, RowStart, StoreError};
+use gateway_core::{AuditRecord, AuditStore, BoxFuture, InstanceName};
+use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
 
+use crate::clock::FixedClock;
 use crate::gate::Gate;
+
+/// The instance [`row_start`] names.
+pub const FIXTURE_INSTANCE: &str = "fixture-instance";
+
+/// The call deadline [`row_start`] gives, in milliseconds: the proxy connector's default.
+pub const FIXTURE_CALL_DEADLINE_MS: u64 = 5_000;
 
 /// A row start with a fresh identifier, for a test that calls the core's `audit::begin` itself
 /// rather than through the gateway, which makes one per call.
 ///
 /// The identifier is a random UUID (version 4) in the lowercase hyphenated form, so every
 /// store accepts it, the Postgres store included, which refuses an identifier that is not a
-/// UUID. The gateway's own are UUIDv7s; a test needs only one no other row has.
+/// UUID. The gateway's own are UUIDv7s; a test needs only one no other row has. The row is
+/// begun by [`FIXTURE_INSTANCE`] with a call deadline of [`FIXTURE_CALL_DEADLINE_MS`].
 pub fn row_start() -> RowStart {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
@@ -29,7 +39,36 @@ pub fn row_start() -> RowStart {
             &hex[16..20],
             &hex[20..32]
         )),
+        instance: InstanceName::new(FIXTURE_INSTANCE),
+        call_deadline_ms: FIXTURE_CALL_DEADLINE_MS,
     }
+}
+
+/// The store's own time budgets, which the deadline of each call row includes. The defaults
+/// are the Postgres store's: 2 s to begin and 30 s to finish (decision 0009 point 9). The
+/// testkit cannot use that store's type, so it has its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreBudgets {
+    /// Begin, from the call to begin to the written row.
+    pub begin: Duration,
+    /// How long, from the call to finish, a store keeps trying to complete the row.
+    pub finish_deadline: Duration,
+}
+
+impl Default for StoreBudgets {
+    fn default() -> Self {
+        Self {
+            begin: Duration::from_secs(2),
+            finish_deadline: Duration::from_secs(30),
+        }
+    }
+}
+
+/// The times the store gave a row when it was begun, from its own clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Times {
+    begun_at: SystemTime,
+    deadline: Option<SystemTime>,
 }
 
 /// Whether the next operations of one kind fail.
@@ -57,7 +96,7 @@ impl Failing {
 
 #[derive(Default)]
 struct State {
-    rows: Vec<(AuditRowId, AuditRecord)>,
+    rows: Vec<(AuditRowId, AuditRecord, Times)>,
     begin_attempts: usize,
     finish_attempts: usize,
     begin_failing: Failing,
@@ -81,15 +120,78 @@ struct State {
 ///
 /// Both operations can be told to fail, once or until told otherwise, and both can be held
 /// at a [`Gate`] to stand in for a slow database without a real sleep.
-#[derive(Default)]
+///
+/// Like the Postgres store, it sets each row's time at begin and deadline itself, from its
+/// own clock and never from the record: the time at begin, plus the begin budget, the call
+/// deadline the record carries and the finish deadline. A row of kind `list` has no deadline.
+/// The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW) unless set.
 pub struct InMemoryAuditStore {
     state: Mutex<State>,
+    clock: Arc<dyn Clock>,
+    budgets: StoreBudgets,
+}
+
+impl Default for InMemoryAuditStore {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            clock: Arc::new(FixedClock::default()),
+            budgets: StoreBudgets::default(),
+        }
+    }
 }
 
 impl InMemoryAuditStore {
-    /// An empty store that works.
+    /// An empty store that works, on a [`FixedClock`] with the default [`StoreBudgets`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The same store, reading the time at begin from `clock`.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The same store, with `budgets` in each call row's deadline.
+    pub fn with_budgets(mut self, budgets: StoreBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
+    /// The time the store gave the row `id` when it was begun, if begin wrote one.
+    pub fn begun_at(&self, id: &AuditRowId) -> Option<SystemTime> {
+        self.times(id).map(|times| times.begun_at)
+    }
+
+    /// The deadline the store gave the row `id`: its time at begin plus the begin budget, its
+    /// call deadline and the finish deadline. `None` if begin wrote no such row, or for a row
+    /// of kind `list`, which has none.
+    pub fn deadline(&self, id: &AuditRowId) -> Option<SystemTime> {
+        self.times(id).and_then(|times| times.deadline)
+    }
+
+    fn times(&self, id: &AuditRowId) -> Option<Times> {
+        self.state()
+            .rows
+            .iter()
+            .find(|(stored, _, _)| stored == id)
+            .map(|(_, _, times)| *times)
+    }
+
+    /// The times for a row begun now. `None` when the deadline is past what a time can hold.
+    fn times_for(&self, record: &AuditRecord) -> Option<Times> {
+        let begun_at = self.clock.now();
+        let deadline = match record.kind {
+            RowKind::Call => Some(
+                begun_at
+                    .checked_add(self.budgets.begin)?
+                    .checked_add(Duration::from_millis(record.call_deadline_ms))?
+                    .checked_add(self.budgets.finish_deadline)?,
+            ),
+            RowKind::List => None,
+        };
+        Some(Times { begun_at, deadline })
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -101,7 +203,7 @@ impl InMemoryAuditStore {
         self.state()
             .rows
             .iter()
-            .map(|(_, record)| record.clone())
+            .map(|(_, record, _)| record.clone())
             .collect()
     }
 
@@ -110,7 +212,7 @@ impl InMemoryAuditStore {
         self.state()
             .rows
             .get(position)
-            .map(|(_, record)| record.clone())
+            .map(|(_, record, _)| record.clone())
     }
 
     /// The row stored under `id`, if begin wrote one.
@@ -118,8 +220,8 @@ impl InMemoryAuditStore {
         self.state()
             .rows
             .iter()
-            .find(|(stored, _)| stored == id)
-            .map(|(_, record)| record.clone())
+            .find(|(stored, _, _)| stored == id)
+            .map(|(_, record, _)| record.clone())
     }
 
     /// How many times `begin` was called, whether or not it wrote.
@@ -198,12 +300,15 @@ impl AuditStore for InMemoryAuditStore {
             if state.begin_failing.take() {
                 return Err(down());
             }
-            match state.rows.iter().find(|(id, _)| id == row) {
+            match state.rows.iter().find(|(id, _, _)| id == row) {
                 None => {
-                    state.rows.push((row.clone(), record.clone()));
+                    let times = self
+                        .times_for(record)
+                        .ok_or_else(|| StoreError::from("the row's deadline is out of range"))?;
+                    state.rows.push((row.clone(), record.clone(), times));
                     Ok(())
                 }
-                Some((_, stored)) if stored.decision == record.decision => Ok(()),
+                Some((_, stored, _)) if stored.decision == record.decision => Ok(()),
                 Some(_) => Err(format!(
                     "audit row {} was already begun, with another decision",
                     row.as_str()
@@ -230,10 +335,10 @@ impl AuditStore for InMemoryAuditStore {
             if state.finish_failing.take() {
                 return Err(down());
             }
-            let (_, row) = state
+            let (_, row, _) = state
                 .rows
                 .iter_mut()
-                .find(|(id, _)| id == completion.row())
+                .find(|(id, _, _)| id == completion.row())
                 .ok_or_else(|| StoreError::from("no such row"))?;
             match &row.completion {
                 None => {

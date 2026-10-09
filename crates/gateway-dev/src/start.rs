@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use gateway::{BootError, Config, Wiring, boot, serve_with_shutdown};
-use gateway_core::AuditStore;
+use gateway_core::{AuditStore, InstanceName};
 use gateway_identity::{Clock, SigningAlgorithm, SystemClock};
 use gateway_testkit::{
     AUDIENCE, CONNECTOR, Caller, FakeCredentialSource, FixtureConnector, GROUP_G,
@@ -24,6 +24,10 @@ use crate::world::{FixtureResources, fixture_config};
 
 /// The address the fixture gateway listens on: loopback, always.
 pub const LISTEN_HOST: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+/// The instance the fixture gateway's audit rows record, unless [`Options::instance`] says
+/// otherwise.
+pub const DEV_INSTANCE: &str = "switchboard-dev";
 
 /// Why the fixture gateway did not start.
 #[derive(Debug, Error)]
@@ -44,9 +48,10 @@ pub enum DevError {
 
 /// How to start the fixture gateway. [`Options::default`] is what
 /// [`start_fixture_gateway`] uses: an ephemeral port on loopback, identity enforced, audit in
-/// memory, the system clock, and no audit printing.
+/// memory, the system clock, the instance [`DEV_INSTANCE`], and no audit printing.
 pub struct Options {
     port: u16,
+    instance: InstanceName,
     identity_disabled: bool,
     audit_disabled: bool,
     clock: Arc<dyn Clock>,
@@ -57,6 +62,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             port: 0,
+            instance: InstanceName::new(DEV_INSTANCE),
             identity_disabled: false,
             audit_disabled: false,
             clock: Arc::new(SystemClock),
@@ -69,6 +75,7 @@ impl fmt::Debug for Options {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Options")
             .field("port", &self.port)
+            .field("instance", &self.instance)
             .field("identity_disabled", &self.identity_disabled)
             .field("audit_disabled", &self.audit_disabled)
             .field("audit_printer", &self.audit_printer.is_some())
@@ -85,6 +92,12 @@ impl Options {
     /// Listens on `port` on [`LISTEN_HOST`]. Zero, the default, picks a free port.
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Names the instance every audit row records as the one that began it.
+    pub fn instance(mut self, instance: InstanceName) -> Self {
+        self.instance = instance;
         self
     }
 
@@ -152,6 +165,7 @@ pub async fn start_fixture_gateway() -> Result<FixtureGateway, DevError> {
 pub async fn start_fixture_gateway_with(options: Options) -> Result<FixtureGateway, DevError> {
     let Options {
         port,
+        instance,
         identity_disabled,
         audit_disabled,
         clock,
@@ -167,7 +181,7 @@ pub async fn start_fixture_gateway_with(options: Options) -> Result<FixtureGatew
     if identity_disabled {
         config["identity"] = json!({"disabled": true});
     }
-    let mut wiring = Wiring::new(clock.clone()).connector(
+    let mut wiring = Wiring::new(clock.clone()).instance(instance).connector(
         CONNECTOR,
         connector.clone(),
         Arc::new(FixtureResources),

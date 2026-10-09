@@ -4,8 +4,9 @@
 //!
 //! Each fake can be told to fail, and each way it fails has a test in this crate that shows it:
 //!
-//! - [`InMemoryAuditStore`] keeps rows in order under the identifier begin was given, can fail
-//!   or hold `begin` and `finish`, and [`row_start`] makes a fresh identifier for a test.
+//! - [`InMemoryAuditStore`] keeps rows in order under the identifier begin was given, sets
+//!   each row's deadline from its own clock as the Postgres store does, can fail or hold
+//!   `begin` and `finish`, and [`row_start`] makes a fresh identifier for a test.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
 //!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a `propose` tool that acts only on drafts it
@@ -35,7 +36,9 @@ mod fixture;
 mod gate;
 mod issuer;
 
-pub use audit::{InMemoryAuditStore, row_start};
+pub use audit::{
+    FIXTURE_CALL_DEADLINE_MS, FIXTURE_INSTANCE, InMemoryAuditStore, StoreBudgets, row_start,
+};
 pub use clock::{FIXTURE_NOW, FixedClock, SteppableClock};
 pub use connector::{
     CONNECTOR, DOCUMENT_ARGUMENT, DRAFT_ARGUMENT, DRAFT_REFUSAL, DRAFT_TOOL, FORBIDDEN_DOCUMENT,
