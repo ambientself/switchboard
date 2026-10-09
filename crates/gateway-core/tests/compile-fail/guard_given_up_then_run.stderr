@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `guard`
+ --> tests/compile-fail/guard_given_up_then_run.rs:8:37
+  |
+6 | async fn both(store: &dyn AuditStore, connector: &dyn Connector, guard: AuditGuard) -> (GaveUp, Ran) {
+  |                                                                  ----- move occurs because `guard` has type `AuditGuard`, which does not implement the `Copy` trait
+7 |     let gave_up = audit::give_up(store, guard).await;
+  |                                         ----- value moved here
+8 |     let ran = audit::run(connector, guard).await;
+  |                                     ^^^^^ value used here after move
