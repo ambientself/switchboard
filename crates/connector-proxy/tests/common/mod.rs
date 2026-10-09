@@ -15,7 +15,7 @@ use gateway_core::{
 };
 use gateway_testkit::{
     CONNECTOR, Caller, Fixture, InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_READ,
-    TEAM_A_DOCUMENT, document,
+    TEAM_A_DOCUMENT, document, row_start,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -132,9 +132,15 @@ impl Harness {
         };
         let decision = decide(&self.fixture.policy, &call);
         assert!(decision.is_allowed(), "{decision:?}");
-        let begun = audit::begin(&self.store, decision, arguments, RequestMetadata::default())
-            .await
-            .unwrap();
+        let begun = audit::begin(
+            &self.store,
+            row_start(),
+            decision,
+            arguments,
+            RequestMetadata::default(),
+        )
+        .await
+        .unwrap();
         let Begun::Allowed(guard) = begun else {
             panic!("the call was denied: {begun:?}");
         };

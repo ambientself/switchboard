@@ -8,7 +8,7 @@ use gateway_core::audit::{self, Begun};
 use gateway_core::{CallContext, RequestedTool, decide};
 use gateway_testkit::{
     Caller, FakeCredentialSource, Fixture, FixtureConnector, READ_TOOL, SURFACE_ALL,
-    TEAM_A_DOCUMENT,
+    TEAM_A_DOCUMENT, row_start,
 };
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -30,7 +30,7 @@ async fn one_call(store: &PgAuditStore, fixture: &Fixture) -> (Duration, Duratio
     };
     let decision = decide(&fixture.policy, &context);
     let started = Instant::now();
-    let begun = audit::begin(store, decision, call.arguments, call.metadata)
+    let begun = audit::begin(store, row_start(), decision, call.arguments, call.metadata)
         .await
         .unwrap();
     let begin = started.elapsed();

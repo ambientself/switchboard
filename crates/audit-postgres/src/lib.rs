@@ -13,8 +13,8 @@
 //!
 //! What the database itself enforces, for the gateway's role:
 //!
-//! - It inserts the first half of a row, but not the identifier or the two times, which the
-//!   database sets.
+//! - It inserts the identifier the gateway chose and the first half of a row, but not the two
+//!   times, which the database sets.
 //! - It updates only the completion columns: outcome, its sentence, and latency.
 //! - It selects only the identifier, the decision and the completion. It cannot read who
 //!   called what, and it cannot delete.

@@ -570,8 +570,8 @@ mutate(
     "begin-failure-on-denial-swallowed",
     "a denial is answered even when its row could not be written",
     SRC + "audit.rs",
-    "    let row = store\n        .begin(&record)\n        .await\n        .map_err(AuditFailure::from_store)?;",
-    '    let row = match store.begin(&record).await {\n        Ok(row) => row,\n        Err(error) => match &decided {\n            Decided::Deny { .. } => AuditRowId::new("unwritten"),\n            Decided::Allow(_) => return Err(AuditFailure::from_store(error)),\n        },\n    };',
+    "    store\n        .begin(&row, &record)\n        .await\n        .map_err(AuditFailure::from_store)?;",
+    "    if let Err(error) = store.begin(&row, &record).await\n        && let Decided::Allow(_) = &decided\n    {\n        return Err(AuditFailure::from_store(error));\n    }",
 )
 REFUSAL = "        } => Begun::Denied(Refusal {\n            row,\n            reason,\n            sentence,\n        }),"
 mutate("refusal-sentence-truncated", "the caller's sentence is not the recorded one", SRC + "audit.rs", REFUSAL,
@@ -1030,20 +1030,30 @@ mutate("fake-audit-begin-hold-ignored", "a held begin is not held", A, "        
 mutate("fake-audit-finish-hold-ignored", "a held finish is not held", A, "            state.finish_gate.clone()", "            None::<Gate>")
 mutate("fake-audit-begin-attempts-not-counted", "begin attempts are not counted", A, "            state.begin_attempts += 1;\n", "")
 mutate("fake-audit-finish-attempts-not-counted", "finish attempts are not counted", A, "            state.finish_attempts += 1;\n", "")
-mutate("fake-audit-double-finish-allowed", "a row can be finished twice", A, "            if row.completion.is_some() {", "            if false {")
-mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A,
-       "            state.rows.push(record.clone());",
-       "            state.rows.push(AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() });")
-mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A,
-       "            state.rows.push(record.clone());",
-       "            state.rows.push(AuditRecord { resources_omitted: 0, ..record.clone() });")
-mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A,
-       "            row.completion = Some(completion.completion().clone());",
-       "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted = 0;")
-mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A,
-       "            row.completion = Some(completion.completion().clone());",
-       "            row.completion = Some(completion.completion().clone());\n            row.resources_omitted += 1;")
-mutate("fake-audit-row-ids-not-positions", "every row has the same identifier", A, "            Ok(AuditRowId::new(position.to_string()))", '            Ok(AuditRowId::new("0"))')
+FAKE_FINISHED_DIFFERENTLY = '                Some(_) => Err("the row was already finished, with a different completion".into()),'
+mutate("fake-audit-double-finish-allowed", "a different second completion of a row is accepted", A,
+       FAKE_FINISHED_DIFFERENTLY, "                Some(_) => Ok(()),")
+mutate("testkit-finish-overwrites", "a different second completion overwrites the first", A,
+       FAKE_FINISHED_DIFFERENTLY,
+       "                Some(_) => {\n                    row.completion = Some(completion.completion().clone());\n                    Ok(())\n                }")
+FAKE_BEGIN_PUSH = "                    state.rows.push((row.clone(), record.clone()));"
+mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A, FAKE_BEGIN_PUSH,
+       "                    state.rows.push((row.clone(), AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() }));")
+mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A, FAKE_BEGIN_PUSH,
+       "                    state.rows.push((row.clone(), AuditRecord { resources_omitted: 0, ..record.clone() }));")
+FAKE_FINISH_WRITE = "                    row.completion = Some(completion.completion().clone());\n                    Ok(())"
+mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A, FAKE_FINISH_WRITE,
+       "                    row.completion = Some(completion.completion().clone());\n                    row.resources_omitted = 0;\n                    Ok(())")
+mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A, FAKE_FINISH_WRITE,
+       "                    row.completion = Some(completion.completion().clone());\n                    row.resources_omitted += 1;\n                    Ok(())")
+mutate("fake-audit-row-id-ignored", "the store keeps every row under one identifier, not the one begin was given", A,
+       FAKE_BEGIN_PUSH, '                    state.rows.push((AuditRowId::new("0"), record.clone()));')
+mutate("testkit-begin-duplicates-row", "a begin with a known identifier writes a second row", A,
+       "            match state.rows.iter().find(|(id, _)| id == row) {",
+       "            match state.rows.iter().find(|(id, _)| id == row && false) {")
+mutate("fake-audit-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", A,
+       "                Some((_, stored)) if stored.decision == record.decision => Ok(()),",
+       "                Some((_, stored)) if stored.decision == record.decision || true => Ok(()),")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -1428,6 +1438,10 @@ LIST_SURFACE = (
     "entries(&self.inner.gates.policy(), snapshot.surface(&surface).map(|surface| surface.tools.iter()"
     ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
 )
+
+mutate("gw-row-id-fixed", "every call's row has one identifier, not one made per call", GW_PATH,
+       "            row: AuditRowId::new(Uuid::now_v7().to_string()),",
+       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),')
 
 mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
        "        let admitted = match self.admit(method, headers) {\n",
@@ -2036,6 +2050,17 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
        '"-c synchronous_commit=on -c search_path=pg_catalog,pg_temp"', '"-c synchronous_commit=on"')
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
+mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
+       '        ) ON CONFLICT (id) DO NOTHING";', '        )";')
+mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
+       "    if decision == row.decision {", "    if true {")
+mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
+       "        if !is_uuid(id.as_str()) {", "        if false {")
+PG_ROW_IDS = PG + "sql/migrations/0002_row_ids.sql"
+mutate("pg-row-ids-default-kept", "the database still makes an identifier for a row inserted without one", PG_ROW_IDS,
+       "ALTER TABLE switchboard_audit.call_rows ALTER COLUMN id DROP DEFAULT;\n", "")
+mutate("pg-row-ids-not-granted", "the gateway may not write the identifier it chose", PG_ROW_IDS,
+       "GRANT INSERT (id) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
        "            pool: self.finish.clone(),", "            pool: self.begin.clone(),")
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
@@ -2443,6 +2468,31 @@ mutate("demo-policy-in-base", "the base applies the network policy before the di
        "  - workloads.yaml\n", "  - workloads.yaml\n  - ../policy\n")
 mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
        "35078c7e636169b1", "35078c7e636169b2")
+# #47: the gateway's call before the policy, and the rest of decision 0010's control 1.
+mutate("demo-before-policy-no-gateway-read", "before the policy, the gateway's call to the server is not made", WORKLOAD,
+       '  expect_allowed "$(call "$TOKEN" "$READ_TOOL" "{\\"project\\":\\"$OWN_PROJECT\\",\\"document\\":\\"$DOCUMENT\\"}")" "before policy: read own project through the gateway"\n', "")
+mutate("demo-before-policy-own-project-optional", "before-policy runs without OWN_PROJECT", WORKLOAD,
+       '  before-policy) : "${OWN_PROJECT:?}"; before_policy ;;\n', "  before-policy) before_policy ;;\n")
+mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
+       "                - {name: OWN_PROJECT, value: borealis}\n", "")
+mutate("demo-kind-accepted-count-6", "the kind bearer check still expects 6 calls, without the before-policy reads", DRIVER,
+       '"$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 8 accepted\n',
+       '"$(cat "$ROOT/deploy/kind/base/dummy-credentials/docs-credential.sha256")" 6 accepted\n')
+mutate("demo-operator-checks-no-attach", "attach is not checked", DRIVER,
+       "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec portforward proxy; do\n")
+mutate_all("demo-operator-checks-no-impersonate", "impersonation is not checked",
+           (DRIVER, '    for resource in users groups; do\n      can_i_no "$team" impersonate "$resource"\n    done\n'
+                    '    sar_no "$team" impersonate authentication.k8s.io uids\n'
+                    '    sar_no "$team" impersonate authentication.k8s.io userextras scopes\n', ""),
+           (DRIVER, '      can_i_no "$team" impersonate serviceaccounts -n "$ns"\n', ""))
+mutate("demo-operator-checks-one-namespace", "the team's own namespace is not checked", DRIVER,
+       '    for ns in mock-docs switchboard "$team"; do\n', "    for ns in mock-docs switchboard; do\n")
+mutate("demo-operator-checks-unknown-resource-passes", "a can-i about a resource the API does not serve passes on its no", DRIVER,
+       """    *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\\n'*}" ;;\n""", "")
+mutate("demo-operator-checks-review-any-answer", "a SubjectAccessReview passes whatever it answers", DRIVER,
+       "    false) answer=no ;;\n    true) answer=yes ;;\n", "    *) answer=no ;;\n")
+mutate("demo-operator-checks-review-core-group", "the SubjectAccessReview asks about the core group, which no rule for impersonating a UID names", DRIVER,
+       "resourceAttributes: {verb: $verb, group: $group,", 'resourceAttributes: {verb: $verb, group: "",')
 
 # The route check's operator step (deploy/route-check), watched by tests/route_check.rs.
 ROUTE_CHECK = "deploy/route-check/route-check.sh"
@@ -2604,7 +2654,7 @@ mutate("dev-issuer-no-subject", "the development issuer starts with no subjects"
 mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
        '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
 mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
-       'docs-credential.sha256")" 6 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
+       'docs-credential.sha256")" 8 accepted\n', 'docs-credential.sha256")" 4 accepted\n')
 mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
        "\n.claude\n", "\n")
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
@@ -2671,7 +2721,7 @@ mutate("demo-driver-secrets-get-only", "only get is checked on secrets and confi
 mutate("demo-driver-no-node-proxy", "the node proxy is not checked", DRIVER,
        '      can_i_no "$team" "$verb" nodes --subresource=proxy\n', "      :\n")
 mutate("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked", DRIVER,
-       "        for subresource in exec portforward proxy; do\n", "        for subresource in exec; do\n")
+       "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec attach; do\n")
 mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", DRIVER,
        '        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"\n', "")
 mutate("demo-driver-no-team-b-probe", "team-b has no pre-policy probe", DRIVER,

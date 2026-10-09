@@ -4,7 +4,8 @@
 //!
 //! Each fake can be told to fail, and each way it fails has a test in this crate that shows it:
 //!
-//! - [`InMemoryAuditStore`] keeps rows in order, can fail or hold `begin` and `finish`.
+//! - [`InMemoryAuditStore`] keeps rows in order under the identifier begin was given, can fail
+//!   or hold `begin` and `finish`, and [`row_start`] makes a fresh identifier for a test.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
 //!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a `propose` tool that acts only on drafts it
@@ -34,7 +35,7 @@ mod fixture;
 mod gate;
 mod issuer;
 
-pub use audit::InMemoryAuditStore;
+pub use audit::{InMemoryAuditStore, row_start};
 pub use clock::{FIXTURE_NOW, FixedClock, SteppableClock};
 pub use connector::{
     CONNECTOR, DOCUMENT_ARGUMENT, DRAFT_ARGUMENT, DRAFT_REFUSAL, DRAFT_TOOL, FORBIDDEN_DOCUMENT,

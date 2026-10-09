@@ -1324,12 +1324,12 @@ async fn a_row(db: &TestDatabase) -> String {
         .await
         .query_one(
             "INSERT INTO switchboard_audit.call_rows (
-                 deployment, surface, profile, tool, connector, classification, resources,
+                 id, deployment, surface, profile, tool, connector, classification, resources,
                  resources_omitted, decision, policy_revision, proved_issuer, proved_subject,
                  proved_kind, proved_team)
-             VALUES ('fixture', 'fixture-all', 'workload-rw', 'fixture__read', 'fixture', 'read',
-                     '[]', 0, 'allow', 'fixture-1', 'https://issuer.fixture.test',
-                     'secret-subject', 'workload', 'team-a')
+             VALUES (gen_random_uuid(), 'fixture', 'fixture-all', 'workload-rw', 'fixture__read',
+                     'fixture', 'read', '[]', 0, 'allow', 'fixture-1',
+                     'https://issuer.fixture.test', 'secret-subject', 'workload', 'team-a')
              RETURNING id::text",
             &[],
         )
