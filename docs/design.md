@@ -1116,8 +1116,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
-  giving up a guard without running completes its row as `error`. Today a guard can only be
-  consumed by running it, and a row whose insert commits after its begin failed stays open.
+  giving up a guard without running completes its row as `error`. The second half is built in
+  the core: `audit::give_up` consumes a guard, calls no connector, and completes its row as
+  `error` with a latency of zero. The gateway does not call it yet: that is #40. Today a row
+  whose insert commits after its begin failed stays open.
 - In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
