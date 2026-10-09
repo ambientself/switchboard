@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use gateway_core::audit::{AuditRowId, RowCompletion, StoreError};
+use gateway_core::audit::{AuditRowId, ListRecord, RowCompletion, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use gateway_testkit::InMemoryAuditStore;
 use serde_json::{Value, json};
@@ -13,9 +13,11 @@ use serde_json::{Value, json};
 ///
 /// - `{"audit": "begun", "row": ..., "record": {...}}` when a row is written;
 /// - `{"audit": "finished", "row": ..., "completion": {...}}` when it is completed;
-/// - `{"audit": "begin_failed", "row": ..., "error": ...}` and `{"audit": "finish_failed",
-///   "row": ..., "error": ...}` when the store fails. The row is the identifier the gateway
-///   made for the call, so a failed begin names the row it was for.
+/// - `{"audit": "listed", "row": ..., "record": {...}}` when a list row is written;
+/// - `{"audit": "begin_failed", "row": ..., "error": ...}`, `{"audit": "finish_failed",
+///   "row": ..., "error": ...}` and `{"audit": "list_failed", "row": ..., "error": ...}` when
+///   the store fails. The row is the identifier the gateway made for the call, so a failed
+///   begin names the row it was for.
 ///
 /// The store's result is passed on unchanged. A failed begin stays a failure, so the call is
 /// refused as it would be without the printer. A line that cannot be written is dropped:
@@ -87,6 +89,25 @@ impl AuditStore for AuditPrinter {
                 })),
             }
             finished
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let listed = self.store.list(row, record).await;
+            match &listed {
+                Ok(()) => self.print(&json!({"audit": "listed", "row": row, "record": record})),
+                Err(error) => self.print(&json!({
+                    "audit": "list_failed",
+                    "row": row,
+                    "error": error.to_string(),
+                })),
+            }
+            listed
         })
     }
 }

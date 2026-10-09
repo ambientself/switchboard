@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
-use gateway_core::audit::{AuditRowId, RowCompletion, RowStart, StoreError};
+use gateway_core::audit::{AuditRowId, ListRecord, RowCompletion, RowStart, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, Provable, Proved, ToolName, Verifier};
 
 /// A stand-in verifier that accepts its fixture as given.
@@ -72,11 +72,13 @@ pub fn start() -> RowStart {
 /// An audit store in memory, keeping rows by identifier in the order they were begun. Begin is
 /// idempotent on the identifier as the interface says, comparing only the decision. Finish
 /// accepts an identical repeat and refuses a different one. Either half can be told to fail.
+/// List rows are kept apart, idempotent on the identifier too, and fail with begin.
 #[derive(Default)]
 pub struct MemoryStore {
     pub fail_begin: bool,
     pub fail_finish: bool,
     pub rows: Mutex<Vec<(AuditRowId, AuditRecord)>>,
+    pub list_rows: Mutex<Vec<(AuditRowId, ListRecord)>>,
 }
 
 impl MemoryStore {
@@ -101,6 +103,10 @@ impl MemoryStore {
     pub fn last(&self) -> AuditRecord {
         self.rows().pop().expect("no row was written")
     }
+
+    pub fn list_rows(&self) -> Vec<(AuditRowId, ListRecord)> {
+        self.list_rows.lock().unwrap().clone()
+    }
 }
 
 impl AuditStore for MemoryStore {
@@ -113,7 +119,14 @@ impl AuditStore for MemoryStore {
             Err("the store is down".into())
         } else {
             let mut rows = self.rows.lock().unwrap();
+            let listed = self
+                .list_rows
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == row);
             match rows.iter().find(|(id, _)| id == row) {
+                _ if listed => Err(format!("row {} is a list row", row.as_str()).into()),
                 Some((_, stored)) if stored.decision == record.decision => Ok(()),
                 Some(_) => {
                     Err(format!("row {} was begun with another decision", row.as_str()).into())
@@ -146,6 +159,25 @@ impl AuditStore for MemoryStore {
                     Some(_) => Err("the row was already finished differently".into()),
                 },
             }
+        };
+        Box::pin(now(result))
+    }
+
+    fn list<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let result = if self.fail_begin {
+            Err("the store is down".into())
+        } else if self.rows.lock().unwrap().iter().any(|(id, _)| id == row) {
+            Err(format!("row {} is a call row", row.as_str()).into())
+        } else {
+            let mut rows = self.list_rows.lock().unwrap();
+            if !rows.iter().any(|(id, _)| id == row) {
+                rows.push((row.clone(), record.clone()));
+            }
+            Ok(())
         };
         Box::pin(now(result))
     }

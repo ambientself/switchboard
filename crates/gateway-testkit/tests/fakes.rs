@@ -13,7 +13,7 @@ use gateway_core::audit::{
 };
 use gateway_core::{
     AuditGuard, AuditRecord, CallContext, ConnectorName, CredentialError, CredentialHandle,
-    CredentialSource, Principal, Proved, RequestedTool, Resource, Resources, decide,
+    CredentialSource, Principal, Proved, RequestedTool, Resource, Resources, decide, list_tools,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
@@ -574,6 +574,63 @@ fn the_deadline_comes_from_the_stores_clock_and_includes_the_begin_budget() {
         store.begun_at(&start.row),
         Some(UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW + 90))
     );
+}
+
+/// Lists team A's tools on the full surface as the row `start` names.
+fn list_as(
+    fixture: &Fixture,
+    store: &InMemoryAuditStore,
+    start: &RowStart,
+) -> Result<audit::Listed, AuditFailure> {
+    let caller = fixture.team_a_workload(SURFACE_ALL).unwrap();
+    block_on(audit::listed(
+        store,
+        start.clone(),
+        &caller,
+        fixture.policy.revision().clone(),
+        list_tools(&fixture.policy, &caller),
+        None,
+    ))
+}
+
+/// A list row is kept apart from call rows, has a time at begin from the store's clock and no
+/// deadline, and is written once per identifier. An identifier of the other kind is refused
+/// either way, and the stored row stands.
+#[test]
+fn a_list_row_has_no_deadline_and_is_written_once_per_identifier() {
+    let fixture = fixture();
+    let store = InMemoryAuditStore::new();
+    let start = row_start();
+    let listed = list_as(&fixture, &store, &start).unwrap();
+    assert_eq!(listed.row(), &start.row);
+    assert!(!listed.tools().is_empty());
+    assert!(
+        list_as(&fixture, &store, &start).is_ok(),
+        "a retried list failed"
+    );
+    let rows = store.list_rows();
+    assert_eq!(rows.len(), 1, "a retried list wrote a second row");
+    assert_eq!(rows[0].0, start.row);
+    assert_eq!(rows[0].1.instance.as_str(), FIXTURE_INSTANCE);
+    assert!(store.rows().is_empty(), "a list wrote a call row");
+    assert_eq!(
+        store.begun_at(&start.row),
+        Some(UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW))
+    );
+    assert_eq!(store.deadline(&start.row), None);
+    assert_eq!(store.begin_attempts(), 0);
+
+    assert!(begin_as(&fixture, &store, &start, READ_TOOL).is_err());
+    let call = row_start();
+    assert!(begin_as(&fixture, &store, &call, READ_TOOL).is_ok());
+    assert!(list_as(&fixture, &store, &call).is_err());
+    assert_eq!((store.rows().len(), store.list_rows().len()), (1, 1));
+
+    // A list fails as a begin would, and writes nothing.
+    store.fail_next_begin();
+    let failed = list_as(&fixture, &store, &row_start());
+    assert!(failed.is_err());
+    assert_eq!(store.list_rows().len(), 1);
 }
 
 #[test]

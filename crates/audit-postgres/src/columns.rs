@@ -10,10 +10,11 @@
 
 use std::time::Duration;
 
-use gateway_core::PrincipalKind;
 use gateway_core::audit::{
-    AuditRecord, AuditRowId, Completion, DecisionKind, Outcome, RecordedResources, RowKind,
+    AuditRecord, AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RecordedResources,
+    RowKind,
 };
+use gateway_core::{Principal, PrincipalKind};
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
@@ -91,23 +92,7 @@ impl BeginRow {
             return Err(PgAuditError::Column("id"));
         }
         let principal = record.proved_principal.get();
-        let (proved_kind, proved_team, proved_groups) = match &principal.kind {
-            PrincipalKind::Workload { team } => (
-                "workload",
-                Some(stored("proved_team", team.as_str())?),
-                None,
-            ),
-            PrincipalKind::User { groups } => (
-                "user",
-                None,
-                Some(
-                    groups
-                        .iter()
-                        .map(|group| stored("proved_groups", group.as_str()))
-                        .collect::<Result<_, _>>()?,
-                ),
-            ),
-        };
+        let (proved_kind, proved_team, proved_groups) = principal_kind(principal)?;
         let (resources, resources_omitted) = resources(record)?;
         Ok(Self {
             id: id.as_str().to_owned(),
@@ -185,6 +170,149 @@ impl BeginRow {
             &self.instance,
             &self.kind,
             &self.allowance_ms,
+        ]
+    }
+}
+
+/// The columns `proved_kind`, `proved_team` and `proved_groups`.
+type PrincipalKindColumns = (&'static str, Option<String>, Option<Vec<String>>);
+
+/// The principal's kind, and its team or its groups.
+fn principal_kind(principal: &Principal) -> Result<PrincipalKindColumns, PgAuditError> {
+    Ok(match &principal.kind {
+        PrincipalKind::Workload { team } => (
+            "workload",
+            Some(stored("proved_team", team.as_str())?),
+            None,
+        ),
+        PrincipalKind::User { groups } => (
+            "user",
+            None,
+            Some(
+                groups
+                    .iter()
+                    .map(|group| stored("proved_groups", group.as_str()))
+                    .collect::<Result<_, _>>()?,
+            ),
+        ),
+    })
+}
+
+/// The columns a list row writes, in the order of [`ListRow::INSERT`]'s parameters. Its kind is
+/// `list`, written by the statement itself, and it has none of a call's columns.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ListRow {
+    /// The identifier the gateway chose, a UUID in the lowercase hyphenated form.
+    pub id: String,
+    pub deployment: String,
+    pub surface: String,
+    pub profile: String,
+    pub policy_revision: String,
+    pub proved_issuer: String,
+    pub proved_subject: String,
+    pub proved_kind: &'static str,
+    pub proved_team: Option<String>,
+    pub proved_groups: Option<Vec<String>>,
+    pub proved_delegation_team: Option<String>,
+    pub claimed_acting_person: Option<String>,
+    pub claimed_team: Option<String>,
+    /// The gateway instance that wrote the row.
+    pub instance: String,
+    /// The names of the tools listed, as a JSON array of strings, in the record's order.
+    pub listed_tools: Value,
+    /// How many tools were listed past those named.
+    pub listed_omitted: i64,
+}
+
+impl ListRow {
+    /// Writes a list row, complete, under the identifier the gateway chose, unless a row with
+    /// that identifier is already stored. Inserts one row or none; when none,
+    /// [`KIND`](Self::KIND) reads what kind the stored row is.
+    pub const INSERT: &'static str = "INSERT INTO switchboard_audit.call_rows (
+            id, deployment, surface, profile, policy_revision, proved_issuer, proved_subject,
+            proved_kind, proved_team, proved_groups, proved_delegation_team,
+            claimed_acting_person, claimed_team, instance, kind, listed_tools, listed_omitted
+        ) VALUES (
+            ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'list',
+            $15, $16
+        ) ON CONFLICT (id) DO NOTHING";
+
+    /// The kind of the row already stored under an identifier, read with only the columns the
+    /// gateway's role may select. A retried list compares this and nothing more.
+    pub const KIND: &'static str =
+        "SELECT kind FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
+
+    /// The columns for `record`, as the row `id`. Refuses an identifier that is not a UUID in
+    /// the lowercase hyphenated form, a text value holding U+0000, and a count past the
+    /// column's range, as begin does.
+    pub fn from_record(id: &AuditRowId, record: &ListRecord) -> Result<Self, PgAuditError> {
+        if !is_uuid(id.as_str()) {
+            return Err(PgAuditError::Column("id"));
+        }
+        let principal = record.proved_principal.get();
+        let (proved_kind, proved_team, proved_groups) = principal_kind(principal)?;
+        Ok(Self {
+            id: id.as_str().to_owned(),
+            deployment: stored("deployment", record.deployment.as_str())?,
+            surface: stored("surface", record.surface.as_str())?,
+            profile: stored("profile", record.profile.as_str())?,
+            policy_revision: stored("policy_revision", record.policy_revision.as_str())?,
+            proved_issuer: stored("proved_issuer", principal.id.issuer.as_str())?,
+            proved_subject: stored("proved_subject", principal.id.subject.as_str())?,
+            proved_kind,
+            proved_team,
+            proved_groups,
+            proved_delegation_team: optional(
+                "proved_delegation_team",
+                record
+                    .proved_delegation_team
+                    .as_ref()
+                    .map(|team| team.get().as_str()),
+            )?,
+            claimed_acting_person: optional(
+                "claimed_acting_person",
+                record
+                    .claimed_acting_person
+                    .as_ref()
+                    .map(|person| person.get().as_str()),
+            )?,
+            claimed_team: optional(
+                "claimed_team",
+                record.claimed_team.as_ref().map(|team| team.get().as_str()),
+            )?,
+            instance: stored("instance", record.instance.as_str())?,
+            listed_tools: Value::Array(
+                record
+                    .tools
+                    .iter()
+                    .map(|name| stored("listed_tools", name).map(Value::String))
+                    .collect::<Result<_, _>>()?,
+            ),
+            listed_omitted: i64::try_from(record.tools_omitted).map_err(|_| {
+                PgAuditError::Column("a count of tools left out past the column's range")
+            })?,
+        })
+    }
+
+    /// The values for [`INSERT`](Self::INSERT), in order.
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 16] {
+        [
+            &self.id,
+            &self.deployment,
+            &self.surface,
+            &self.profile,
+            &self.policy_revision,
+            &self.proved_issuer,
+            &self.proved_subject,
+            &self.proved_kind,
+            &self.proved_team,
+            &self.proved_groups,
+            &self.proved_delegation_team,
+            &self.claimed_acting_person,
+            &self.claimed_team,
+            &self.instance,
+            &self.listed_tools,
+            &self.listed_omitted,
         ]
     }
 }
@@ -609,6 +737,101 @@ mod tests {
                 .kind,
             "list"
         );
+    }
+
+    fn list_record() -> ListRecord {
+        serde_json::from_value(json!({
+            "instance": "gateway-7f9c",
+            "deployment": "fixture",
+            "surface": "fixture-read",
+            "profile": "user-ro",
+            "policy_revision": "fixture-1",
+            "proved_principal": {
+                "id": {"issuer": "https://user-issuer.fixture.test", "subject": "user-1"},
+                "kind": "user",
+                "groups": ["group-g"]
+            },
+            "proved_delegation_team": "team-d",
+            "claimed_acting_person": "person@fixture.test",
+            "claimed_team": "team-c",
+            "tools": ["fixture__read", "fixture__write"],
+            "tools_omitted": 3
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn each_list_value_goes_to_its_own_column() {
+        assert_eq!(
+            ListRow::from_record(&id(), &list_record()).unwrap(),
+            ListRow {
+                id: ID.into(),
+                deployment: "fixture".into(),
+                surface: "fixture-read".into(),
+                profile: "user-ro".into(),
+                policy_revision: "fixture-1".into(),
+                proved_issuer: "https://user-issuer.fixture.test".into(),
+                proved_subject: "user-1".into(),
+                proved_kind: "user",
+                proved_team: None,
+                proved_groups: Some(vec!["group-g".into()]),
+                proved_delegation_team: Some("team-d".into()),
+                claimed_acting_person: Some("person@fixture.test".into()),
+                claimed_team: Some("team-c".into()),
+                instance: "gateway-7f9c".into(),
+                listed_tools: json!(["fixture__read", "fixture__write"]),
+                listed_omitted: 3,
+            }
+        );
+        let row = ListRow::from_record(&id(), &list_record()).unwrap();
+        let count = row.parameters().len();
+        assert!(ListRow::INSERT.contains(&format!("${count}")));
+        assert!(!ListRow::INSERT.contains(&format!("${}", count + 1)));
+    }
+
+    /// A list record is refused as a call's is: an identifier that is not a lowercase UUID, a
+    /// NUL in any text value, and a count past its column.
+    #[test]
+    fn a_list_record_the_row_cannot_hold_exactly_is_refused() {
+        assert!(matches!(
+            ListRow::from_record(&AuditRowId::new("not-a-row"), &list_record()),
+            Err(PgAuditError::Column("id"))
+        ));
+        let list = serde_json::to_value(list_record()).unwrap();
+        let refused = |value: serde_json::Value| match ListRow::from_record(
+            &id(),
+            &serde_json::from_value(value).unwrap(),
+        ) {
+            Err(PgAuditError::Nul { column }) => column,
+            other => panic!("{other:?}"),
+        };
+        for field in [
+            "instance",
+            "deployment",
+            "surface",
+            "profile",
+            "policy_revision",
+            "proved_delegation_team",
+            "claimed_acting_person",
+            "claimed_team",
+        ] {
+            let mut value = list.clone();
+            value[field] = json!(format!("{field}\u{0}x"));
+            assert_eq!(refused(value), field);
+        }
+        let mut value = list.clone();
+        value["tools"][1] = json!("fixture__\u{0}");
+        assert_eq!(refused(value), "listed_tools");
+        let mut value = list.clone();
+        value["proved_principal"]["groups"] = json!(["group-\u{0}"]);
+        assert_eq!(refused(value), "proved_groups");
+
+        let mut record = list_record();
+        record.tools_omitted = usize::MAX;
+        assert!(matches!(
+            ListRow::from_record(&id(), &record),
+            Err(PgAuditError::Column(_))
+        ));
     }
 
     #[test]

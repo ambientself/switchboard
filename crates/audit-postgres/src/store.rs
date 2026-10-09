@@ -7,7 +7,7 @@ use std::time::Duration;
 use deadpool_postgres::{
     ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod,
 };
-use gateway_core::audit::{AuditRowId, Completion, RowCompletion, StoreError};
+use gateway_core::audit::{AuditRowId, Completion, ListRecord, RowCompletion, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -15,7 +15,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{CancelToken, Socket};
 
-use crate::columns::{BeginRow, FinishRow};
+use crate::columns::{BeginRow, FinishRow, ListRow};
 
 /// Why a row could not be written. Returned to the core boxed, as its [`StoreError`]; a test
 /// can downcast it.
@@ -51,6 +51,13 @@ pub enum PgAuditError {
     #[error("audit row {row} was already begun, with another decision")]
     BegunDifferently {
         /// The row begin named.
+        row: String,
+    },
+    /// Begin or list named a row the table already holds, of the other kind: a list row for a
+    /// begin, or a call row for a list. The stored row stands.
+    #[error("audit row {row} is already stored, as a row of another kind")]
+    OtherKind {
+        /// The row begin or list named.
         row: String,
     },
     /// Finish named a row the table does not hold.
@@ -323,6 +330,9 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   `error` (design section 17), it keeps an empty outcome. A begin whose insert fails in a
 ///   way trying again could fix, such as a server that has become read-only, also discards its
 ///   connection, so the next begin makes a new one rather than fail on it too.
+/// - List writes a row of kind `list`, complete, with begin's pool, budget and handling of
+///   an identifier already stored: a list row under it is this list's own, and a call row is
+///   an error.
 /// - Finish writes the completion columns of a row that has none, on a task of its own. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
@@ -435,8 +445,9 @@ impl PgAuditStore {
         }
     }
 
-    async fn insert(&self, id: &AuditRowId, record: &AuditRecord) -> Result<(), PgAuditError> {
-        let row = BeginRow::from_record(id, record, &self.budgets)?;
+    /// Writes a call row's first half, or a list row, within the begin budget, on the begin
+    /// pool.
+    async fn insert(&self, row: Insert) -> Result<(), PgAuditError> {
         let budget = self.budgets.begin;
         let deadline = Instant::now() + budget;
         let client = timeout_at(deadline, self.begin.get())
@@ -525,10 +536,27 @@ impl PgAuditStore {
     }
 }
 
+/// What [`PgAuditStore::insert`] writes.
+enum Insert {
+    /// The first half of a call row, for begin.
+    Call(BeginRow),
+    /// A list row, complete.
+    List(ListRow),
+}
+
+/// Writes `row`, as begin or list.
+async fn insert_on(client: &ClientWrapper, row: &Insert) -> Result<(), PgAuditError> {
+    match row {
+        Insert::Call(row) => begin_on(client, row).await,
+        Insert::List(row) => list_on(client, row).await,
+    }
+}
+
 /// Inserts the first half of a row under its identifier, unless that row is already stored.
 /// A row already stored with the same decision is this begin's own, written by an earlier
-/// attempt, which is success; one with another decision is not.
-async fn insert_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditError> {
+/// attempt, which is success; one with another decision is not, and nor is a list row, which
+/// has none.
+async fn begin_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditError> {
     let statement = client.prepare_cached(BeginRow::INSERT).await?;
     let inserted = client.execute(&statement, &row.parameters()).await?;
     if inserted == 1 {
@@ -542,11 +570,41 @@ async fn insert_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAudit
             row: row.id.clone(),
         });
     };
-    let decision: String = stored.try_get(0)?;
+    let decision: Option<String> = stored.try_get(0)?;
+    let Some(decision) = decision else {
+        return Err(PgAuditError::OtherKind {
+            row: row.id.clone(),
+        });
+    };
     if decision == row.decision {
         Ok(())
     } else {
         Err(PgAuditError::BegunDifferently {
+            row: row.id.clone(),
+        })
+    }
+}
+
+/// Inserts a list row under its identifier, unless that row is already stored. A list row
+/// already stored is this list's own, written by an earlier attempt, which is success; a call
+/// row is not.
+async fn list_on(client: &ClientWrapper, row: &ListRow) -> Result<(), PgAuditError> {
+    let statement = client.prepare_cached(ListRow::INSERT).await?;
+    let inserted = client.execute(&statement, &row.parameters()).await?;
+    if inserted == 1 {
+        return Ok(());
+    }
+    let statement = client.prepare_cached(ListRow::KIND).await?;
+    let Some(stored) = client.query_opt(&statement, &[&row.id]).await? else {
+        return Err(PgAuditError::NoSuchRow {
+            row: row.id.clone(),
+        });
+    };
+    let kind: String = stored.try_get(0)?;
+    if kind == "list" {
+        Ok(())
+    } else {
+        Err(PgAuditError::OtherKind {
             row: row.id.clone(),
         })
     }
@@ -660,7 +718,12 @@ impl AuditStore for PgAuditStore {
         row: &'a AuditRowId,
         record: &'a AuditRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(async move { self.insert(row, record).await.map_err(StoreError::from) })
+        Box::pin(async move {
+            let row = BeginRow::from_record(row, record, &self.budgets)?;
+            self.insert(Insert::Call(row))
+                .await
+                .map_err(StoreError::from)
+        })
     }
 
     fn finish<'a>(
@@ -669,6 +732,19 @@ impl AuditStore for PgAuditStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             self.finish_within_budget(completion.row(), completion.completion())
+                .await
+                .map_err(StoreError::from)
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let row = ListRow::from_record(row, record)?;
+            self.insert(Insert::List(row))
                 .await
                 .map_err(StoreError::from)
         })

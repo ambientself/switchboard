@@ -22,6 +22,12 @@
 //!   can make, and only then gives out the answer, including a connector's refusal sentence.
 //!   A store's `finish` cannot be called for a denied row, or for a call that never ran.
 //!
+//! A `tools/list` takes a shorter path. [`listed`] writes a row of kind `list`, complete, and
+//! only then returns a [`Listed`]. A `Listed` cannot be made any other way, but the types do not
+//! make a path answer from one: the caller already holds the list it passes to `listed`, as
+//! [`list_tools`](crate::list_tools) gives it, so writing the row before answering is the
+//! path's job and its tests'.
+//!
 //! What the types cannot establish is that an [`AuditStore`] implementation really wrote the
 //! row when it says it did. That is the store's contract, and its own tests'.
 
@@ -33,7 +39,9 @@ use thiserror::Error;
 
 use crate::classification::Classification;
 use crate::connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
-use crate::decision::{CallContext, Decision, Reason, ReasonKind, ResourceProblem, Verdict};
+use crate::decision::{
+    CallContext, CallerContext, Decision, Reason, ReasonKind, ResourceProblem, Verdict,
+};
 use crate::names::{
     ConnectorName, DeploymentName, InstanceName, Person, PolicyRevision, ProfileName, SurfaceName,
     TeamId, ToolUseId,
@@ -46,6 +54,10 @@ use crate::sentences;
 /// The most named resources one audit row records. A call can name any number, so the rest are
 /// counted in [`AuditRecord::resources_omitted`] rather than written out.
 pub const MAX_RECORDED_RESOURCES: usize = 64;
+
+/// The most tool names one list row records. A surface can serve any number, so the rest are
+/// counted in [`ListRecord::tools_omitted`] rather than written out.
+pub const MAX_RECORDED_TOOLS: usize = 64;
 
 /// The longest a recorded resource identifier is, in characters after escaping, before it is
 /// cut short. An AWS ARN can be 2,048 characters, the longest of the identifier lengths
@@ -98,8 +110,8 @@ pub enum RowKind {
     /// A `tools/call` that reached a decision. It has a deadline, past which a row with no
     /// outcome reads as open.
     Call,
-    /// A `tools/list`, written complete. It has no deadline and is never open. Nothing in this
-    /// crate makes one yet.
+    /// A `tools/list`, written complete by [`listed`] as a [`ListRecord`]. It has no deadline
+    /// and is never open.
     List,
 }
 
@@ -200,6 +212,39 @@ pub struct AuditRecord {
     pub completion: Option<Completion>,
 }
 
+/// One row of kind `list`: a `tools/list` answer, written complete before the answer goes out
+/// (decision 0009). It has no tool, decision, resources, outcome or deadline, and is never
+/// open. Made only by [`listed`].
+///
+/// As in [`AuditRecord`], proved and claimed values are separate fields of separate types.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListRecord {
+    /// The gateway instance that wrote the row, escaped and capped at 128 characters.
+    pub instance: InstanceName,
+    /// The deployment that received the request.
+    pub deployment: DeploymentName,
+    /// The surface the request arrived on, made safe: the caller chose it.
+    pub surface: SurfaceName,
+    /// The profile the list was decided under.
+    pub profile: ProfileName,
+    /// The revision of the policy snapshot the list was decided from.
+    pub policy_revision: PolicyRevision,
+    /// The caller, as proved.
+    pub proved_principal: WasProved<Principal>,
+    /// The team the delegation was issued for, which its signature proves.
+    pub proved_delegation_team: Option<WasProved<TeamId>>,
+    /// The person the delegation names. Attested, not proved.
+    pub claimed_acting_person: Option<Claimed<Person>>,
+    /// A team the caller stated, for example in a header.
+    pub claimed_team: Option<Claimed<TeamId>>,
+    /// The names of the tools the answer lists, in the order it lists them: the first
+    /// [`MAX_RECORDED_TOOLS`], each escaped and capped at 128 characters.
+    pub tools: Vec<String>,
+    /// How many tools the answer lists past the first [`MAX_RECORDED_TOOLS`]. Zero when none.
+    pub tools_omitted: usize,
+}
+
 /// What the request carried that the decision does not use but the audit record keeps.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RequestMetadata {
@@ -264,6 +309,21 @@ pub trait AuditStore: Send + Sync {
     /// returns `Err`, and the first completion stands.
     fn finish<'a>(&'a self, completion: &'a RowCompletion)
     -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Writes `record` as the row `row`, of kind `list`, complete, before the list is
+    /// returned. It has no deadline, no completion, and is never open.
+    ///
+    /// - The row is durable when list returns `Ok`, and not before.
+    /// - A second list with an identifier already stored as a row of kind `list` returns `Ok`
+    ///   and writes no second row, so list can be retried by identifier. As with begin, nothing
+    ///   more is compared.
+    /// - A list with an identifier already stored as a row of kind `call` returns `Err`, and
+    ///   the stored row stands. So does a begin with an identifier stored as a list row.
+    fn list<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 /// What the gateway supplies for a row before [`begin`], besides the decision and the request.
@@ -349,6 +409,30 @@ impl Refusal {
     /// denial's sentence leaves this crate.
     pub fn sentence(&self) -> &str {
         &self.sentence
+    }
+}
+
+/// A `tools/list` answer whose row has been written. It has private fields and comes only from
+/// [`listed`], so a `Listed` cannot be made without the row. Unlike a denial's sentence, which
+/// leaves this crate only through [`Refusal`], the list itself does not depend on it: the
+/// caller passes `listed` a list it already holds.
+#[must_use = "a list whose row was written is answered with its tools"]
+#[derive(Debug)]
+pub struct Listed {
+    row: AuditRowId,
+    tools: Vec<ApprovedTool>,
+}
+
+impl Listed {
+    /// The row that records this list.
+    pub fn row(&self) -> &AuditRowId {
+        &self.row
+    }
+
+    /// The tools to answer with, in the order the row records them. Every one, including any
+    /// past the [`MAX_RECORDED_TOOLS`] the row names.
+    pub fn tools(&self) -> &[ApprovedTool] {
+        &self.tools
     }
 }
 
@@ -488,6 +572,65 @@ pub async fn begin(
             reason,
             sentence,
         }),
+    })
+}
+
+/// Writes the row of kind `list` for a `tools/list` answer, as the row `start` names, before
+/// the list is returned.
+///
+/// `tools` is the answer, as [`list_tools`](crate::list_tools) gives it for `caller` from the
+/// snapshot whose revision is `policy_revision`. `claimed_team` is a team the caller stated.
+/// The row names the first [`MAX_RECORDED_TOOLS`] tools, each escaped and capped, and counts
+/// the rest. The call deadline in `start` is not used: a list row has no deadline.
+///
+/// Returns a [`Listed`] holding every tool. If the row cannot be written, returns
+/// [`AuditFailure`] and no `Listed`.
+pub async fn listed(
+    store: &dyn AuditStore,
+    start: RowStart,
+    caller: &CallerContext,
+    policy_revision: PolicyRevision,
+    tools: Vec<&ApprovedTool>,
+    claimed_team: Option<Claimed<TeamId>>,
+) -> Result<Listed, AuditFailure> {
+    let RowStart { row, instance, .. } = start;
+    let tools_omitted = tools.len().saturating_sub(MAX_RECORDED_TOOLS);
+    let record = ListRecord {
+        instance: InstanceName::new(sentences::escape(
+            instance.as_str(),
+            sentences::MAX_RENDERED,
+        )),
+        deployment: caller.deployment.clone(),
+        surface: SurfaceName::new(sentences::escape(
+            caller.surface.as_str(),
+            sentences::MAX_RENDERED,
+        )),
+        profile: caller.profile.clone(),
+        policy_revision,
+        proved_principal: caller.principal.clone().into(),
+        proved_delegation_team: caller
+            .delegation
+            .as_ref()
+            .map(|delegation| delegation.team().into()),
+        claimed_acting_person: caller
+            .delegation
+            .as_ref()
+            .map(|delegation| delegation.acting_person()),
+        claimed_team,
+        tools: tools
+            .iter()
+            .take(MAX_RECORDED_TOOLS)
+            .map(|tool| sentences::escape(tool.name.as_str(), sentences::MAX_RENDERED))
+            .collect(),
+        tools_omitted,
+    };
+    store
+        .list(&row, &record)
+        .await
+        .map_err(AuditFailure::from_store)?;
+    Ok(Listed {
+        row,
+        tools: tools.into_iter().cloned().collect(),
     })
 }
 

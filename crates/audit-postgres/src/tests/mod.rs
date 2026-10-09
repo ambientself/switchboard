@@ -92,7 +92,7 @@ impl TestDatabase {
             }
         }
         let mut owner = database.connect_as(OWNER_ROLE).await;
-        assert_eq!(migrate(&mut owner).await.unwrap(), vec![1, 2, 3]);
+        assert_eq!(migrate(&mut owner).await.unwrap(), vec![1, 2, 3, 4]);
         Some(database)
     }
 

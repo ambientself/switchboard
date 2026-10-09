@@ -1,0 +1,9 @@
+error[E0451]: fields `row` and `tools` of struct `Listed` are private
+  --> tests/compile-fail/list_without_row.rs:10:9
+   |
+ 9 |     Listed {
+   |     ------ in this type
+10 |         row: AuditRowId::new("never written"),
+   |         ^^^ private field
+11 |         tools,
+   |         ^^^^^ private field
