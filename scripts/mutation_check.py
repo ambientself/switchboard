@@ -2494,6 +2494,41 @@ mutate("demo-operator-checks-review-any-answer", "a SubjectAccessReview passes w
 mutate("demo-operator-checks-review-core-group", "the SubjectAccessReview asks about the core group, which no rule for impersonating a UID names", DRIVER,
        "resourceAttributes: {verb: $verb, group: $group,", 'resourceAttributes: {verb: $verb, group: "",')
 
+# The route check's operator step (deploy/route-check), watched by tests/route_check.rs.
+ROUTE_CHECK = "deploy/route-check/route-check.sh"
+mutate("route-check-enforcement-unchecked", "kindnet with network policy off passes", ROUTE_CHECK,
+       """    off) fail "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""",
+       """    off) pass "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""")
+mutate("route-check-permissions-family-dropped", "the impersonation rows are gone from the permissions list", "deploy/route-check/permissions.tsv",
+       "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n"
+       "impersonate\tuids.authentication.k8s.io\t-\tcluster\nimpersonate\tuserextras.authentication.k8s.io\tscopes\tcluster\n", "")
+mutate("route-check-projected-audience-unchecked", "a projected token for a server's audience passes", ROUTE_CHECK,
+       """        if [ "$audience" = "$server" ]; then bad+=("$audience"); fi""", "        :")
+mutate("route-check-probe-wait-unbounded", "the step waits for the probe for ever", ROUTE_CHECK,
+       """    if [ "$SECONDS" -ge "$deadline" ]; then break; fi\n""", "")
+mutate("route-check-evaluation-error-settled", "a review not allowed with an evaluationError counts as a no", ROUTE_CHECK,
+       """\n                     and (.status.allowed or (.status.evaluationError // "") == ""))""", ")")
+mutate("route-check-version-unread-passes", "an unread Kubernetes version fails nothing", ROUTE_CHECK,
+       '    fail "the Kubernetes version is recorded: could not read"', "    :")
+mutate("route-check-node-unread-passes", "an unread node image fails nothing", ROUTE_CHECK,
+       '    fail "the node image of ${NODE:-its node} is recorded: could not read"', "    :")
+mutate("route-check-akamai-docs-shape-missed", "the Akamai pattern misses the docs examples' shape", "deploy/route-check/token-patterns.txt",
+       "akab-[A-Za-z0-9]{5,}-[A-Za-z0-9]{5,}", "akab-[A-Za-z0-9]{16}-[A-Za-z0-9]{16}")
+# What the step read but could not parse fails as could not read, never as nothing to check.
+mutate("route-check-configmap-parse-unchecked", "a ConfigMap whose keys jq cannot list counts as empty", ROUTE_CHECK,
+       """<<<"$cm"); then""", """<<<"$cm" || true); then""")
+mutate("route-check-configmap-json-unchecked", "an empty or doubled ConfigMap read counts as empty", ROUTE_CHECK,
+       """ || ! json_object "$cm" ||""", " ||")
+mutate("route-check-kindnet-container-parse-unchecked", "kindnetd flags jq cannot read count as no flag", ROUTE_CHECK,
+       """<<<"$container"); then""", """<<<"$container" || true); then""")
+mutate("route-check-audiences-parse-unchecked", "projected volumes jq cannot read count as no token", ROUTE_CHECK,
+       """<<<"$POD_JSON") ||\n    ! count=$(jq length <<<"$AUDIENCES")""",
+       """<<<"$POD_JSON" || true) ||\n    ! count=$(jq length <<<"$AUDIENCES")""")
+mutate("route-check-pods-json-unchecked", "an empty or doubled pod list counts as no running pod", ROUTE_CHECK,
+       """ || ! json_object "$pods" ||""", " ||")
+mutate("route-check-probe-pod-json-unchecked", "an empty or doubled pod read while waiting counts as the probe still running", ROUTE_CHECK,
+       """ && json_object "$pod_now" &&""", " &&")
+
 
 # --- gateway: the first slice from files ---------------------------------------------------
 # The deployment file, the wiring that builds the gateway from it, the registry-mode boot gates

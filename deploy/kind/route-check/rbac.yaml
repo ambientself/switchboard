@@ -1,0 +1,99 @@
+# The route check's operator step, deploy/route-check/route-check.sh (decision 0010, "The route
+# check"), runs as route-check/operator. It reads the pod specs, the network plugin's agent and
+# the Services it checks, asks SubjectAccessReviews about the workload's ServiceAccount, and
+# starts the probe as an ephemeral container in a team's pod. That is all it may do: no Secret
+# data, no exec, no impersonation, and no write but the ephemeral container.
+#
+# Not part of the base. The kind run applies it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: route-check
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: operator
+  namespace: route-check
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: route-check-operator
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, serviceaccounts, configmaps, nodes]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [get, list]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: route-check-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: route-check-operator
+subjects:
+  - kind: ServiceAccount
+    name: operator
+    namespace: route-check
+---
+# Starting the probe: an ephemeral container in a workload's pod, in that workload's namespace
+# only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: route-check-probe
+  namespace: team-a
+rules:
+  - apiGroups: [""]
+    resources: [pods/ephemeralcontainers]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: route-check-probe
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: route-check-probe
+subjects:
+  - kind: ServiceAccount
+    name: operator
+    namespace: route-check
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: route-check-probe
+  namespace: team-b
+rules:
+  - apiGroups: [""]
+    resources: [pods/ephemeralcontainers]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: route-check-probe
+  namespace: team-b
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: route-check-probe
+subjects:
+  - kind: ServiceAccount
+    name: operator
+    namespace: route-check
