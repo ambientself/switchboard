@@ -18,7 +18,7 @@ use gateway::path::RequestPath;
 use gateway::{
     AuditSection, NO_PROFILE, ResourceAdapter, undeclared_argument, withdrawn_while_deciding,
 };
-use gateway_core::audit::{AuditRowId, Outcome, RowCompletion, StoreError};
+use gateway_core::audit::{AuditRowId, ListRecord, Outcome, RowCompletion, StoreError};
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, Principal, PrincipalId, PrincipalKind,
     Resources,
@@ -216,6 +216,14 @@ impl AuditStore for HeldStore {
         completion: &'a RowCompletion,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.inner.finish(completion)
+    }
+
+    fn list<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.inner.list(row, record)
     }
 }
 

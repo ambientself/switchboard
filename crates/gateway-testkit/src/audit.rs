@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use gateway_core::audit::{AuditRowId, RowCompletion, RowKind, RowStart, StoreError};
+use gateway_core::audit::{AuditRowId, ListRecord, RowCompletion, RowKind, RowStart, StoreError};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, InstanceName};
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
@@ -97,6 +97,7 @@ impl Failing {
 #[derive(Default)]
 struct State {
     rows: Vec<(AuditRowId, AuditRecord, Times)>,
+    list_rows: Vec<(AuditRowId, ListRecord, SystemTime)>,
     begin_attempts: usize,
     finish_attempts: usize,
     begin_failing: Failing,
@@ -125,6 +126,13 @@ struct State {
 /// own clock and never from the record: the time at begin, plus the begin budget, the call
 /// deadline the record carries and the finish deadline. A row of kind `list` has no deadline.
 /// The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW) unless set.
+///
+/// List rows, which `list` writes, are kept apart and read back with
+/// [`list_rows`](Self::list_rows). They share identifiers with call rows, as one Postgres table
+/// does: a second list with a known list row's identifier writes nothing and succeeds, and a
+/// list or a begin with the identifier of a row of the other kind fails. A list counts as a
+/// begin for the failure settings and the gate: it fails when a begin would, and is held with
+/// the begins. It is not counted in [`begin_attempts`](Self::begin_attempts).
 pub struct InMemoryAuditStore {
     state: Mutex<State>,
     clock: Arc<dyn Clock>,
@@ -172,11 +180,22 @@ impl InMemoryAuditStore {
     }
 
     fn times(&self, id: &AuditRowId) -> Option<Times> {
-        self.state()
+        let state = self.state();
+        let call = state
             .rows
             .iter()
             .find(|(stored, _, _)| stored == id)
-            .map(|(_, _, times)| *times)
+            .map(|(_, _, times)| *times);
+        call.or_else(|| {
+            state
+                .list_rows
+                .iter()
+                .find(|(stored, _, _)| stored == id)
+                .map(|(_, _, begun_at)| Times {
+                    begun_at: *begun_at,
+                    deadline: None,
+                })
+        })
     }
 
     /// The times for a row begun now. `None` when the deadline is past what a time can hold.
@@ -204,6 +223,15 @@ impl InMemoryAuditStore {
             .rows
             .iter()
             .map(|(_, record, _)| record.clone())
+            .collect()
+    }
+
+    /// Every list row, with its identifier, in the order written.
+    pub fn list_rows(&self) -> Vec<(AuditRowId, ListRecord)> {
+        self.state()
+            .list_rows
+            .iter()
+            .map(|(id, record, _)| (id.clone(), record.clone()))
             .collect()
     }
 
@@ -300,6 +328,9 @@ impl AuditStore for InMemoryAuditStore {
             if state.begin_failing.take() {
                 return Err(down());
             }
+            if state.list_rows.iter().any(|(id, _, _)| id == row) {
+                return Err(format!("audit row {} is a list row", row.as_str()).into());
+            }
             match state.rows.iter().find(|(id, _, _)| id == row) {
                 None => {
                     let times = self
@@ -348,6 +379,32 @@ impl AuditStore for InMemoryAuditStore {
                 Some(written) if written == completion.completion() => Ok(()),
                 Some(_) => Err("the row was already finished, with a different completion".into()),
             }
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a ListRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let gate = self.state().begin_gate.clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            let mut state = self.state();
+            if state.begin_failing.take() {
+                return Err(down());
+            }
+            if state.rows.iter().any(|(id, _, _)| id == row) {
+                return Err(format!("audit row {} is a call row", row.as_str()).into());
+            }
+            if !state.list_rows.iter().any(|(id, _, _)| id == row) {
+                state
+                    .list_rows
+                    .push((row.clone(), record.clone(), self.clock.now()));
+            }
+            Ok(())
         })
     }
 }

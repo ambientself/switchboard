@@ -138,3 +138,48 @@ async fn a_finish_that_fails_is_printed_and_the_answer_stands() {
         "the failed finish names the row begin wrote"
     );
 }
+
+/// A list row is printed once it is written, and a list that fails is printed as failed. Until
+/// the path writes list rows (#40), the printer is driven directly.
+#[tokio::test]
+async fn a_list_row_is_printed_as_it_is_written() {
+    use std::sync::Arc;
+
+    use gateway_core::AuditStore;
+    use gateway_core::audit::{self, ListRecord};
+    use gateway_dev::AuditPrinter;
+    use gateway_testkit::{Fixture, InMemoryAuditStore, SURFACE_ALL, row_start};
+
+    let lines = Lines::default();
+    let store = Arc::new(InMemoryAuditStore::new());
+    let printer = AuditPrinter::new(store.clone(), Box::new(lines.clone()));
+    let fixture = Fixture::new().unwrap();
+    let caller = fixture.team_a_workload(SURFACE_ALL).unwrap();
+    let list = |start| {
+        audit::listed(
+            &printer as &dyn AuditStore,
+            start,
+            &caller,
+            fixture.policy.revision().clone(),
+            gateway_core::list_tools(&fixture.policy, &caller),
+            None,
+        )
+    };
+    let start = row_start();
+    let _ = list(start.clone()).await.unwrap();
+    store.fail_next_begin();
+    let failed = row_start();
+    assert!(list(failed.clone()).await.is_err());
+
+    let printed = lines.json();
+    assert_eq!(printed.len(), 2, "{printed:?}");
+    assert_eq!(printed[0]["audit"], json!("listed"));
+    assert_eq!(printed[0]["row"], json!(start.row.as_str()));
+    let (_, record) = store.list_rows().pop().unwrap();
+    assert_eq!(
+        serde_json::from_value::<ListRecord>(printed[0]["record"].clone()).unwrap(),
+        record
+    );
+    assert_eq!(printed[1]["audit"], json!("list_failed"));
+    assert_eq!(printed[1]["row"], json!(failed.row.as_str()));
+}

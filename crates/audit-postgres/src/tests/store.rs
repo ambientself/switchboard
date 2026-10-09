@@ -3,10 +3,12 @@
 use std::time::Duration;
 
 use gateway_core::audit::{self, AuditRowId, Begun, Completion, Outcome, RequestMetadata};
-use gateway_core::audit::{MAX_RECORDED_RESOURCES, RecordedResources};
+use gateway_core::audit::{
+    ListRecord, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, RecordedResources, RowStart,
+};
 use gateway_core::{
     AuditRecord, AuditStore, CallContext, Claimed, RequestedTool, Resources, TeamId, ToolUseId,
-    decide,
+    decide, list_tools,
 };
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
@@ -754,4 +756,178 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
         failure.sentence(),
         "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later."
     );
+}
+
+/// Reads a list row back as the core's list record, through a superuser session. Checks on the
+/// way that it is a list row, with no deadline, allowance or completion, begun just now.
+async fn read_back_list(admin: &Client, row: &AuditRowId) -> ListRecord {
+    let row = admin
+        .query_one(
+            "SELECT instance, deployment, surface, profile, policy_revision,
+                    proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
+                    proved_delegation_team, claimed_acting_person, claimed_team,
+                    listed_tools, listed_omitted, kind,
+                    begun_at > now() - interval '1 minute' AS begun_now,
+                    deadline IS NULL AND allowance_ms IS NULL AND outcome IS NULL
+                        AND finished_at IS NULL AS never_open
+             FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
+            &[&row.as_str()],
+        )
+        .await
+        .unwrap();
+    let text = |column: &str| row.get::<_, Option<String>>(column);
+    assert_eq!(text("kind").as_deref(), Some("list"));
+    assert!(row.get::<_, bool>("begun_now"));
+    assert!(row.get::<_, bool>("never_open"));
+    let mut principal = json!({
+        "id": {"issuer": text("proved_issuer"), "subject": text("proved_subject")},
+        "kind": text("proved_kind"),
+    });
+    match text("proved_kind").as_deref() {
+        Some("workload") => principal["team"] = json!(text("proved_team")),
+        _ => principal["groups"] = json!(row.get::<_, Option<Vec<String>>>("proved_groups")),
+    }
+    serde_json::from_value(json!({
+        "instance": text("instance"),
+        "deployment": text("deployment"),
+        "surface": text("surface"),
+        "profile": text("profile"),
+        "policy_revision": text("policy_revision"),
+        "proved_principal": principal,
+        "proved_delegation_team": text("proved_delegation_team"),
+        "claimed_acting_person": text("claimed_acting_person"),
+        "claimed_team": text("claimed_team"),
+        "tools": row.get::<_, Value>("listed_tools"),
+        "tools_omitted": row.get::<_, i64>("listed_omitted"),
+    }))
+    .unwrap()
+}
+
+/// A list row written through the core reads back as the record the core made, which the
+/// testkit's store keeps for the same list. So does one with every value set, and one naming
+/// more tools than a row holds.
+#[tokio::test]
+async fn a_list_row_reads_back_exactly() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let memory = InMemoryAuditStore::new();
+    let caller = fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap();
+    let start = row_start();
+    for written in [&store as &dyn AuditStore, &memory] {
+        let listed = audit::listed(
+            written,
+            start.clone(),
+            &caller,
+            fixture.policy.revision().clone(),
+            list_tools(&fixture.policy, &caller),
+            Some(Claimed::new(TeamId::new("team-claimed"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.row(), &start.row);
+    }
+    let (_, expected) = memory.list_rows().pop().unwrap();
+    assert!(!expected.tools.is_empty());
+    assert_eq!(read_back_list(&admin, &start.row).await, expected);
+
+    let mut every: ListRecord = serde_json::from_value(json!({
+        "instance": "gateway-7f9c",
+        "deployment": "fixture",
+        "surface": "fixture-read",
+        "profile": "user-ro",
+        "policy_revision": "fixture-1",
+        "proved_principal": {
+            "id": {"issuer": "https://user-issuer.fixture.test", "subject": "user-1"},
+            "kind": "user",
+            "groups": ["group-g", "group-h"]
+        },
+        "proved_delegation_team": "team-d",
+        "claimed_acting_person": "person@fixture.test",
+        "claimed_team": "team-c",
+        "tools": ["fixture__read", "back\\slash\\n"],
+        "tools_omitted": 7
+    }))
+    .unwrap();
+    let row = row_start().row;
+    store.list(&row, &every).await.unwrap();
+    assert_eq!(read_back_list(&admin, &row).await, every);
+    every.tools = (0..MAX_RECORDED_TOOLS)
+        .map(|n| format!("fixture__t{n}"))
+        .collect();
+    every.tools_omitted = 136;
+    let row = row_start().row;
+    store.list(&row, &every).await.unwrap();
+    assert_eq!(read_back_list(&admin, &row).await, every);
+}
+
+/// A list is retried by identifier as begin is: a second list with a list row's identifier
+/// writes nothing and succeeds. A list or a begin with the identifier of a row of the other
+/// kind fails, and the stored row stands.
+#[tokio::test]
+async fn a_second_list_with_one_identifier_writes_one_row() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let caller = fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap();
+    let list = |start| {
+        audit::listed(
+            &store,
+            start,
+            &caller,
+            fixture.policy.revision().clone(),
+            list_tools(&fixture.policy, &caller),
+            None,
+        )
+    };
+    let start = row_start();
+    let _ = list(start.clone()).await.unwrap();
+    let _ = list(start.clone()).await.unwrap();
+    assert_eq!(
+        row_count(&admin).await,
+        1,
+        "a retried list wrote a second row"
+    );
+
+    let call = Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT);
+    let begun = audit::begin(
+        &store,
+        start.clone(),
+        decided(&fixture, &call),
+        call.arguments.clone(),
+        RequestMetadata::default(),
+    )
+    .await;
+    let error = begun.expect_err("a call was begun under a list row's identifier");
+    assert!(
+        matches!(
+            std::error::Error::source(&error).and_then(|e| e.downcast_ref::<PgAuditError>()),
+            Some(PgAuditError::OtherKind { .. })
+        ),
+        "{error:?}"
+    );
+    let call_row = begun_row(&store, &fixture).await;
+    let listed = list(RowStart {
+        row: call_row,
+        ..row_start()
+    })
+    .await;
+    let error = listed.expect_err("a list was written under a call row's identifier");
+    assert!(
+        matches!(
+            std::error::Error::source(&error).and_then(|e| e.downcast_ref::<PgAuditError>()),
+            Some(PgAuditError::OtherKind { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(row_count(&admin).await, 2);
+    assert_eq!(read_back_list(&admin, &start.row).await.tools.len(), {
+        list_tools(&fixture.policy, &caller).len()
+    });
 }

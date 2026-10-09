@@ -15,7 +15,8 @@
 //!
 //! - It inserts the identifier the gateway chose and the first half of a row, with the
 //!   instance that began it, its kind and its allowance, but not the two times or the
-//!   deadline, which the database sets.
+//!   deadline, which the database sets. For a row of kind `list` it inserts the tools listed
+//!   and their count, and none of a call's columns.
 //! - It updates only the completion columns: outcome, its sentence, and latency.
 //! - It selects only the identifier, the decision, the completion, the kind and the deadline.
 //!   It cannot read who called what, and it cannot delete.
@@ -27,9 +28,10 @@
 //!
 //! And for every role, through two triggers: both times and the deadline come from the
 //! database's clock, whatever an insert or a completion carries; a row is completed at most
-//! once, a denial is never completed, and a completion writes nothing else. A call's deadline
-//! is its time at begin plus the allowance the store gives it: the begin budget, the call's
-//! deadline and the finish deadline ([`Budgets`]). A call row cannot be stored without one.
+//! once, a denial or a list row is never completed, and a completion writes nothing else. A
+//! call's deadline is its time at begin plus the allowance the store gives it: the begin
+//! budget, the call's deadline and the finish deadline ([`Budgets`]). A call row cannot be
+//! stored without one, and a list row cannot be stored with one or with a call's columns.
 //!
 //! # Tests against a database
 //!

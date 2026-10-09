@@ -43,11 +43,13 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("kind", "text"),
     ("allowance_ms", "bigint"),
     ("deadline", "timestamp with time zone"),
+    ("listed_tools", "jsonb"),
+    ("listed_omitted", "bigint"),
 ];
 
 /// The columns the gateway's role inserts: the identifier it chose and the first half of a row,
 /// with the instance, the kind and the allowance, and without the times, the deadline or the
-/// completion.
+/// completion; and for a list row, the tools listed and their count.
 pub(crate) const INSERTED: &[&str] = &[
     "id",
     "tool_use_id",
@@ -74,6 +76,8 @@ pub(crate) const INSERTED: &[&str] = &[
     "instance",
     "kind",
     "allowance_ms",
+    "listed_tools",
+    "listed_omitted",
 ];
 
 /// The columns the gateway's role updates: the completion.
@@ -1301,15 +1305,26 @@ async fn server_functions(
 mod tests {
     use super::*;
     use crate::MIGRATIONS;
-    use crate::columns::BeginRow;
+    use crate::columns::{BeginRow, ListRow};
 
     #[test]
     fn the_checked_columns_are_the_ones_the_store_writes() {
-        // Every inserted column is in the INSERT, in its order.
-        let insert = BeginRow::INSERT;
-        let listed = &insert[insert.find('(').unwrap() + 1..insert.find(')').unwrap()];
-        let listed: Vec<&str> = listed.split(',').map(str::trim).collect();
-        assert_eq!(listed, INSERTED);
+        // Every inserted column is in begin's INSERT or list's, and every column either names.
+        let columns = |insert: &'static str| -> BTreeSet<&'static str> {
+            insert[insert.find('(').unwrap() + 1..insert.find(')').unwrap()]
+                .split(',')
+                .map(str::trim)
+                .collect()
+        };
+        let begin = columns(BeginRow::INSERT);
+        let list = columns(ListRow::INSERT);
+        let inserted: BTreeSet<&str> = INSERTED.iter().copied().collect();
+        assert_eq!(&begin | &list, inserted);
+        assert_eq!(
+            &list - &begin,
+            ["listed_tools", "listed_omitted"].into(),
+            "a list row writes a column begin does not, besides its tools"
+        );
         for column in INSERTED.iter().chain(UPDATED).chain(SELECTED) {
             assert!(
                 COLUMNS.iter().any(|(name, _)| name == column),

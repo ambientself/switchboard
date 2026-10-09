@@ -8,16 +8,16 @@ use std::future::ready;
 use std::sync::{Arc, Mutex};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, Begun, Completion, DecisionKind, MAX_RECORDED_IDENTIFIER,
-    MAX_RECORDED_RESOURCES, Outcome, RecordedResource, RecordedResources, RequestMetadata, RowKind,
-    RowStart,
+    self, Answer, AuditFailure, Begun, Completion, DecisionKind, ListRecord,
+    MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, Outcome, RecordedResource,
+    RecordedResources, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
     Classification, Connector, ConnectorName, Decision, Delegation, InstanceName, PolicySnapshot,
     Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind,
     RequestedTool, Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources,
-    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, decide,
+    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, decide, list_tools,
 };
 use serde_json::json;
 
@@ -897,6 +897,147 @@ fn the_record_serializes_under_pinned_names_and_reads_back() {
         serde_json::from_value::<AuditRecord>(unknown).is_err(),
         "a recorded resource with a field it does not have was read"
     );
+}
+
+/// `count` approved tools, `fixture__t00` onwards, in that order.
+fn many_tools(count: usize) -> Vec<ApprovedTool> {
+    (0..count)
+        .map(|n| tool(&format!("fixture__t{n:02}"), Classification::Read))
+        .collect()
+}
+
+/// Lists `tools` for the caller of [`call`] on `store`, with the claimed team "search".
+fn list(store: &dyn AuditStore, tools: &[ApprovedTool]) -> Result<audit::Listed, AuditFailure> {
+    common::ready(audit::listed(
+        store,
+        common::start(),
+        &call("fixture__read").caller,
+        "audit-1".into(),
+        tools.iter().collect(),
+        Some(Claimed::new(TeamId::new("search"))),
+    ))
+}
+
+/// A list row names the first 64 tools in the order the answer lists them and counts the
+/// rest, while the answer keeps every tool. Each name is escaped and capped like any recorded
+/// value; a valid tool name escapes to itself.
+#[test]
+fn a_list_row_names_at_most_64_tools_in_list_order_and_counts_the_rest() {
+    assert_eq!(MAX_RECORDED_TOOLS, 64);
+    for (count, omitted) in [
+        (0, 0),
+        (1, 0),
+        (63, 0),
+        (64, 0),
+        (65, 1),
+        (70, 6),
+        (200, 136),
+    ] {
+        let store = MemoryStore::default();
+        let tools = many_tools(count);
+        let listed = list(&store, &tools).unwrap();
+        let names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        assert_eq!(listed.tools(), tools.as_slice(), "{count}");
+        let rows = store.list_rows();
+        assert_eq!(rows.len(), 1);
+        let (row, record) = &rows[0];
+        assert_eq!(row, listed.row());
+        assert_eq!(record.tools, names[..count.min(64)], "{count}");
+        assert_eq!(record.tools_omitted, omitted, "{count}");
+        for name in &record.tools {
+            assert_eq!(*name, gateway_core::escape(name, 128));
+        }
+        assert!(store.rows().is_empty(), "a list wrote a call row");
+    }
+    // Out of order in, out of order recorded: the row follows the answer.
+    let mut tools = many_tools(3);
+    tools.reverse();
+    let store = MemoryStore::default();
+    let _ = list(&store, &tools).unwrap();
+    assert_eq!(
+        store.list_rows()[0].1.tools,
+        ["fixture__t02", "fixture__t01", "fixture__t00"]
+    );
+}
+
+/// The caller columns of a list row: as a call row holds them, proved and claimed apart, with
+/// the surface and the instance made safe.
+#[test]
+fn a_list_row_records_the_caller_the_revision_and_the_instance() {
+    let store = MemoryStore::default();
+    let snapshot = snapshot();
+    let mut caller = call("fixture__read").caller;
+    let listed = common::ready(audit::listed(
+        &store,
+        common::start(),
+        &caller,
+        snapshot.revision().clone(),
+        list_tools(&snapshot, &caller),
+        Some(Claimed::new(TeamId::new("search"))),
+    ))
+    .unwrap();
+    let names: Vec<&str> = listed.tools().iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["fixture__read"]);
+    let (_, record) = store.list_rows().pop().unwrap();
+    let row = serde_json::to_value(&record).unwrap();
+    assert_eq!(
+        row,
+        json!({
+            "instance": common::INSTANCE,
+            "deployment": "test",
+            "surface": "fixture",
+            "profile": "readers",
+            "policy_revision": "audit-1",
+            "proved_principal": {
+                "id": {
+                    "issuer": "https://cluster-a.example.test",
+                    "subject": "system:serviceaccount:otto:sandbox-payments"
+                },
+                "kind": "workload",
+                "team": "payments"
+            },
+            "proved_delegation_team": "payments",
+            "claimed_acting_person": "requester@example.test",
+            "claimed_team": "search",
+            "tools": ["fixture__read"],
+            "tools_omitted": 0
+        })
+    );
+    assert_eq!(serde_json::from_value::<ListRecord>(row).unwrap(), record);
+
+    caller.surface = "fixture\nforged".into();
+    caller.delegation = None;
+    let start = RowStart {
+        instance: InstanceName::new("i".repeat(10_000)),
+        ..common::start()
+    };
+    let listed = common::ready(audit::listed(
+        &store,
+        start,
+        &caller,
+        "audit-1".into(),
+        Vec::new(),
+        None,
+    ))
+    .unwrap();
+    assert!(listed.tools().is_empty());
+    let (_, record) = store.list_rows().pop().unwrap();
+    assert_eq!(record.surface.as_str(), "fixture\\nforged");
+    assert_eq!(record.instance.as_str(), format!("{}…", "i".repeat(128)));
+    assert_eq!(record.proved_delegation_team, None);
+    assert_eq!(record.claimed_acting_person, None);
+    assert_eq!(record.claimed_team, None);
+}
+
+#[test]
+fn a_store_that_cannot_write_a_list_row_lists_nothing() {
+    let store = MemoryStore {
+        fail_begin: true,
+        ..MemoryStore::default()
+    };
+    let failure = list(&store, &many_tools(3)).expect_err("a list with no row was answered");
+    assert_eq!(failure.sentence(), AUDIT_FAILURE);
+    assert!(store.list_rows().is_empty());
 }
 
 /// Connectors of different kinds in one registry, and one store behind an `Arc`: what the
