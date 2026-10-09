@@ -8,14 +8,16 @@
 //! column, rather than written with another character in its place: begin fails, so the core
 //! refuses the call. A latency or a count past its column's range is refused the same way.
 
+use std::time::Duration;
+
 use gateway_core::PrincipalKind;
 use gateway_core::audit::{
-    AuditRecord, AuditRowId, Completion, DecisionKind, Outcome, RecordedResources,
+    AuditRecord, AuditRowId, Completion, DecisionKind, Outcome, RecordedResources, RowKind,
 };
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
-use crate::store::PgAuditError;
+use crate::store::{Budgets, PgAuditError};
 
 /// The columns begin writes, in the order of [`BeginRow::INSERT`]'s parameters.
 #[derive(Debug, PartialEq)]
@@ -43,6 +45,13 @@ pub(crate) struct BeginRow {
     pub proved_delegation_team: Option<String>,
     pub claimed_acting_person: Option<String>,
     pub claimed_team: Option<String>,
+    /// The gateway instance that began the row.
+    pub instance: String,
+    /// `call` or `list`.
+    pub kind: &'static str,
+    /// What the database adds to its own time at begin for the row's deadline, in
+    /// milliseconds: see [`allowance_ms`].
+    pub allowance_ms: i64,
 }
 
 impl BeginRow {
@@ -53,10 +62,11 @@ impl BeginRow {
             id, tool_use_id, deployment, surface, profile, tool, connector, classification,
             resources, resources_omitted, decision, reason, sentence, policy_revision,
             proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
-            proved_delegation_team, claimed_acting_person, claimed_team
+            proved_delegation_team, claimed_acting_person, claimed_team, instance, kind,
+            allowance_ms
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18, $19, $20, $21, $22
+            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The decision of the row already stored under an identifier, read with only the columns
@@ -64,11 +74,16 @@ impl BeginRow {
     pub const DECISION: &'static str =
         "SELECT decision FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
 
-    /// The columns for `record`, as the row `id`. Refuses a record that is already complete:
-    /// begin writes the first half of a row, and a completion handed to it would be silently
-    /// dropped. Refuses an identifier that is not a UUID in the lowercase hyphenated form, the
-    /// form the gateway makes, so that one row has one spelling.
-    pub fn from_record(id: &AuditRowId, record: &AuditRecord) -> Result<Self, PgAuditError> {
+    /// The columns for `record`, as the row `id`, begun by a store with `budgets`. Refuses a
+    /// record that is already complete: begin writes the first half of a row, and a
+    /// completion handed to it would be silently dropped. Refuses an identifier that is not a
+    /// UUID in the lowercase hyphenated form, the form the gateway makes, so that one row has
+    /// one spelling.
+    pub fn from_record(
+        id: &AuditRowId,
+        record: &AuditRecord,
+        budgets: &Budgets,
+    ) -> Result<Self, PgAuditError> {
         if record.completion.is_some() {
             return Err(PgAuditError::CompleteAtBegin);
         }
@@ -135,11 +150,15 @@ impl BeginRow {
                 "claimed_team",
                 record.claimed_team.as_ref().map(|team| team.get().as_str()),
             )?,
+            instance: stored("instance", record.instance.as_str())?,
+            kind: kind(record.kind),
+            allowance_ms: i64::try_from(allowance_ms(budgets, record.call_deadline_ms))
+                .map_err(|_| PgAuditError::Column("an allowance past the column's range"))?,
         })
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 22] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 25] {
         [
             &self.id,
             &self.tool_use_id,
@@ -163,7 +182,31 @@ impl BeginRow {
             &self.proved_delegation_team,
             &self.claimed_acting_person,
             &self.claimed_team,
+            &self.instance,
+            &self.kind,
+            &self.allowance_ms,
         ]
+    }
+}
+
+/// How long past the database's time at begin a row's deadline is, in milliseconds: the begin
+/// budget, the call's deadline and the finish deadline, so a row reads as open only once
+/// every step could have ended (decision 0009). Saturating, so a long deadline cannot wrap
+/// round to a short one; a sum past the column's range is then refused, not cut.
+pub(crate) fn allowance_ms(budgets: &Budgets, call_deadline_ms: u64) -> u64 {
+    millis(budgets.begin)
+        .saturating_add(call_deadline_ms)
+        .saturating_add(millis(budgets.finish_deadline))
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn kind(kind: RowKind) -> &'static str {
+    match kind {
+        RowKind::Call => "call",
+        RowKind::List => "list",
     }
 }
 
@@ -304,8 +347,20 @@ mod tests {
         AuditRowId::new(ID)
     }
 
+    /// Budgets unlike the defaults, so the allowance shows which is which.
+    fn budgets() -> Budgets {
+        Budgets {
+            begin: Duration::from_millis(1_500),
+            answer: Duration::from_secs(2),
+            finish_deadline: Duration::from_secs(20),
+        }
+    }
+
     fn denied_user_with_delegation() -> AuditRecord {
         record(json!({
+            "kind": "call",
+            "instance": "gateway-7f9c",
+            "call_deadline_ms": 5000,
             "tool_use_id": "toolu_01",
             "deployment": "fixture",
             "surface": "fixture-read",
@@ -336,6 +391,9 @@ mod tests {
 
     fn allowed_workload() -> AuditRecord {
         record(json!({
+            "kind": "call",
+            "instance": "gateway-7f9c",
+            "call_deadline_ms": 5000,
             "tool_use_id": null,
             "deployment": "fixture",
             "surface": "fixture-all",
@@ -363,7 +421,7 @@ mod tests {
 
     #[test]
     fn each_value_goes_to_its_own_column() {
-        let row = BeginRow::from_record(&id(), &denied_user_with_delegation()).unwrap();
+        let row = BeginRow::from_record(&id(), &denied_user_with_delegation(), &budgets()).unwrap();
         assert_eq!(
             row,
             BeginRow {
@@ -392,6 +450,9 @@ mod tests {
                 proved_delegation_team: Some("team-d".into()),
                 claimed_acting_person: Some("person@fixture.test".into()),
                 claimed_team: Some("team-c".into()),
+                instance: "gateway-7f9c".into(),
+                kind: "call",
+                allowance_ms: 1_500 + 5_000 + 20_000,
             }
         );
     }
@@ -401,13 +462,17 @@ mod tests {
     #[test]
     fn a_nul_in_any_text_value_refuses_the_record() {
         let nul = |text: &str| json!(format!("{text}\u{0}x"));
-        let refused = |value: serde_json::Value| match BeginRow::from_record(&id(), &record(value))
-        {
+        let refused = |value: serde_json::Value| match BeginRow::from_record(
+            &id(),
+            &record(value),
+            &budgets(),
+        ) {
             Err(PgAuditError::Nul { column }) => column,
             other => panic!("{other:?}"),
         };
         let user = serde_json::to_value(denied_user_with_delegation()).unwrap();
         for field in [
+            "instance",
             "tool_use_id",
             "deployment",
             "surface",
@@ -469,7 +534,8 @@ mod tests {
     #[test]
     fn an_identifier_that_is_not_a_lowercase_uuid_is_refused() {
         for accepted in [ID, "00000000-0000-4000-8000-000000000000"] {
-            let row = BeginRow::from_record(&AuditRowId::new(accepted), &allowed_workload());
+            let row =
+                BeginRow::from_record(&AuditRowId::new(accepted), &allowed_workload(), &budgets());
             assert_eq!(row.unwrap().id, accepted);
         }
         for refused in [
@@ -485,7 +551,8 @@ mod tests {
             "0199c3a2-7b1e-7c3d-9f00-0123456789ag",
             "0199c3a2-7b1e-7c3d-9f00-0123456789\u{e9}",
         ] {
-            let row = BeginRow::from_record(&AuditRowId::new(refused), &allowed_workload());
+            let row =
+                BeginRow::from_record(&AuditRowId::new(refused), &allowed_workload(), &budgets());
             assert!(
                 matches!(row, Err(PgAuditError::Column("id"))),
                 "{refused:?}: {row:?}"
@@ -493,9 +560,60 @@ mod tests {
         }
     }
 
+    /// The allowance is the begin budget, the call deadline and the finish deadline, and the
+    /// answer budget plays no part. A sum too large for the column is refused, not cut.
+    #[test]
+    fn the_allowance_is_the_begin_budget_the_call_deadline_and_the_finish_deadline() {
+        let mut record = allowed_workload();
+        record.call_deadline_ms = 7_250;
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+        assert_eq!(row.allowance_ms, 1_500 + 7_250 + 20_000);
+        let defaults = BeginRow::from_record(&id(), &record, &Budgets::default()).unwrap();
+        assert_eq!(defaults.allowance_ms, 2_000 + 7_250 + 30_000);
+
+        assert_eq!(allowance_ms(&budgets(), u64::MAX), u64::MAX);
+        let huge = Budgets {
+            begin: Duration::MAX,
+            ..budgets()
+        };
+        assert_eq!(allowance_ms(&huge, 0), u64::MAX);
+        for call_deadline_ms in [u64::MAX, i64::MAX.unsigned_abs()] {
+            record.call_deadline_ms = call_deadline_ms;
+            assert!(matches!(
+                BeginRow::from_record(&id(), &record, &budgets()),
+                Err(PgAuditError::Column(_))
+            ));
+        }
+        record.call_deadline_ms = i64::MAX.unsigned_abs() - 21_500;
+        assert_eq!(
+            BeginRow::from_record(&id(), &record, &budgets())
+                .unwrap()
+                .allowance_ms,
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn a_list_row_is_of_kind_list() {
+        let mut record = allowed_workload();
+        assert_eq!(
+            BeginRow::from_record(&id(), &record, &budgets())
+                .unwrap()
+                .kind,
+            "call"
+        );
+        record.kind = RowKind::List;
+        assert_eq!(
+            BeginRow::from_record(&id(), &record, &budgets())
+                .unwrap()
+                .kind,
+            "list"
+        );
+    }
+
     #[test]
     fn a_workload_has_a_team_and_no_groups() {
-        let row = BeginRow::from_record(&id(), &allowed_workload()).unwrap();
+        let row = BeginRow::from_record(&id(), &allowed_workload(), &budgets()).unwrap();
         assert_eq!(row.decision, "allow");
         assert_eq!(row.proved_kind, "workload");
         assert_eq!(row.proved_team.as_deref(), Some("team-a"));
@@ -505,7 +623,7 @@ mod tests {
 
     #[test]
     fn resources_the_tool_could_not_name_are_the_string_unknown() {
-        let row = BeginRow::from_record(&id(), &allowed_workload()).unwrap();
+        let row = BeginRow::from_record(&id(), &allowed_workload(), &budgets()).unwrap();
         assert_eq!(row.resources, json!("unknown"));
         assert_eq!(row.resources_omitted, 0);
     }
@@ -515,7 +633,9 @@ mod tests {
         let mut record = allowed_workload();
         record.resources = RecordedResources::Named(vec![]);
         assert_eq!(
-            BeginRow::from_record(&id(), &record).unwrap().resources,
+            BeginRow::from_record(&id(), &record, &budgets())
+                .unwrap()
+                .resources,
             json!([])
         );
     }
@@ -525,14 +645,14 @@ mod tests {
         let mut record = allowed_workload();
         record.resources_omitted = usize::try_from(i64::MAX).unwrap();
         assert_eq!(
-            BeginRow::from_record(&id(), &record)
+            BeginRow::from_record(&id(), &record, &budgets())
                 .unwrap()
                 .resources_omitted,
             i64::MAX
         );
         record.resources_omitted = usize::MAX;
         assert!(matches!(
-            BeginRow::from_record(&id(), &record),
+            BeginRow::from_record(&id(), &record, &budgets()),
             Err(PgAuditError::Column(_))
         ));
     }
@@ -546,7 +666,7 @@ mod tests {
             "groups": []
         }))
         .unwrap();
-        let row = BeginRow::from_record(&id(), &record).unwrap();
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
         assert_eq!(row.proved_groups, Some(vec![]));
     }
 
@@ -566,14 +686,14 @@ mod tests {
             latency_ms: 3,
         });
         assert!(matches!(
-            BeginRow::from_record(&id(), &record),
+            BeginRow::from_record(&id(), &record, &budgets()),
             Err(PgAuditError::CompleteAtBegin)
         ));
     }
 
     #[test]
     fn the_insert_names_one_parameter_per_column() {
-        let row = BeginRow::from_record(&id(), &allowed_workload()).unwrap();
+        let row = BeginRow::from_record(&id(), &allowed_workload(), &budgets()).unwrap();
         let count = row.parameters().len();
         assert!(BeginRow::INSERT.contains(&format!("${count}")));
         assert!(!BeginRow::INSERT.contains(&format!("${}", count + 1)));

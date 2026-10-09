@@ -39,10 +39,15 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("outcome", "text"),
     ("outcome_sentence", "text"),
     ("latency_ms", "bigint"),
+    ("instance", "text"),
+    ("kind", "text"),
+    ("allowance_ms", "bigint"),
+    ("deadline", "timestamp with time zone"),
 ];
 
 /// The columns the gateway's role inserts: the identifier it chose and the first half of a row,
-/// without the times or the completion.
+/// with the instance, the kind and the allowance, and without the times, the deadline or the
+/// completion.
 pub(crate) const INSERTED: &[&str] = &[
     "id",
     "tool_use_id",
@@ -66,18 +71,24 @@ pub(crate) const INSERTED: &[&str] = &[
     "proved_delegation_team",
     "claimed_acting_person",
     "claimed_team",
+    "instance",
+    "kind",
+    "allowance_ms",
 ];
 
 /// The columns the gateway's role updates: the completion.
 pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "latency_ms"];
 
-/// The columns the gateway's role reads: which row, whether it was allowed, its completion.
+/// The columns the gateway's role reads: which row, whether it was allowed, its completion,
+/// and its kind and deadline, which say whether an empty completion is open.
 pub(crate) const SELECTED: &[&str] = &[
     "id",
     "decision",
     "outcome",
     "outcome_sentence",
     "latency_ms",
+    "kind",
+    "deadline",
 ];
 
 /// The triggers on `call_rows`, each calling the schema's function of the same name, and when
@@ -86,7 +97,7 @@ pub(crate) const SELECTED: &[&str] = &[
 pub(crate) const TRIGGERS: &[Trigger] = &[
     Trigger {
         name: "set_times",
-        purpose: "sets both times from the database's clock",
+        purpose: "sets both times and the deadline from the database's clock",
         fires: "before each insert",
         tgtype: 1 | 2 | 4,
     },
@@ -1359,8 +1370,8 @@ mod tests {
         let missing = trigger_problem(trigger, None).unwrap();
         assert_eq!(
             missing.to_string(),
-            "the trigger set_times, which sets both times from the database's clock, is not on \
-             call_rows to fire before each insert on every row"
+            "the trigger set_times, which sets both times and the deadline from the database's \
+             clock, is not on call_rows to fire before each insert on every row"
         );
     }
 

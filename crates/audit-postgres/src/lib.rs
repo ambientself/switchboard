@@ -13,20 +13,23 @@
 //!
 //! What the database itself enforces, for the gateway's role:
 //!
-//! - It inserts the identifier the gateway chose and the first half of a row, but not the two
-//!   times, which the database sets.
+//! - It inserts the identifier the gateway chose and the first half of a row, with the
+//!   instance that began it, its kind and its allowance, but not the two times or the
+//!   deadline, which the database sets.
 //! - It updates only the completion columns: outcome, its sentence, and latency.
-//! - It selects only the identifier, the decision and the completion. It cannot read who
-//!   called what, and it cannot delete.
+//! - It selects only the identifier, the decision, the completion, the kind and the deadline.
+//!   It cannot read who called what, and it cannot delete.
 //!
 //! Those are the migration's grants on the table. Other objects can give a role more: a grant
 //! on a view over the table, a rule, a `SECURITY DEFINER` function, or a function that reaches
 //! the server's files. [`PgAuditStore::check_at_boot`] refuses the ones it knows of, and its
 //! documentation lists those it does not look for.
 //!
-//! And for every role, through two triggers: both times come from the database's clock,
-//! whatever an insert or a completion carries; a row is completed at most once, a denial is
-//! never completed, and a completion writes nothing else.
+//! And for every role, through two triggers: both times and the deadline come from the
+//! database's clock, whatever an insert or a completion carries; a row is completed at most
+//! once, a denial is never completed, and a completion writes nothing else. A call's deadline
+//! is its time at begin plus the allowance the store gives it: the begin budget, the call's
+//! deadline and the finish deadline ([`Budgets`]). A call row cannot be stored without one.
 //!
 //! # Tests against a database
 //!

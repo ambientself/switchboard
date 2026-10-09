@@ -745,6 +745,7 @@ async fn a_missing_column_or_one_of_another_type_is_refused() {
         .await
         .batch_execute(
             "ALTER TABLE switchboard_audit.call_rows DROP COLUMN claimed_team;
+             ALTER TABLE switchboard_audit.call_rows DROP COLUMN deadline;
              ALTER TABLE switchboard_audit.call_rows ALTER COLUMN latency_ms TYPE integer;",
         )
         .await
@@ -754,6 +755,11 @@ async fn a_missing_column_or_one_of_another_type_is_refused() {
         found.contains(&Problem::ColumnMissing {
             column: "claimed_team"
         }),
+        "{found:?}"
+    );
+    // The column the open-row query reads, and the trigger writes.
+    assert!(
+        found.contains(&Problem::ColumnMissing { column: "deadline" }),
         "{found:?}"
     );
     assert!(
@@ -1034,7 +1040,7 @@ async fn a_disabled_or_missing_trigger_is_refused() {
 fn missing(trigger: &'static str) -> Problem {
     let (purpose, fires) = match trigger {
         "set_times" => (
-            "sets both times from the database's clock",
+            "sets both times and the deadline from the database's clock",
             "before each insert",
         ),
         _ => ("completes a row at most once", "before each update"),
@@ -1326,10 +1332,11 @@ async fn a_row(db: &TestDatabase) -> String {
             "INSERT INTO switchboard_audit.call_rows (
                  id, deployment, surface, profile, tool, connector, classification, resources,
                  resources_omitted, decision, policy_revision, proved_issuer, proved_subject,
-                 proved_kind, proved_team)
+                 proved_kind, proved_team, instance, kind, allowance_ms)
              VALUES (gen_random_uuid(), 'fixture', 'fixture-all', 'workload-rw', 'fixture__read',
                      'fixture', 'read', '[]', 0, 'allow', 'fixture-1',
-                     'https://issuer.fixture.test', 'secret-subject', 'workload', 'team-a')
+                     'https://issuer.fixture.test', 'secret-subject', 'workload', 'team-a',
+                     'fixture-instance', 'call', 37000)
              RETURNING id::text",
             &[],
         )
