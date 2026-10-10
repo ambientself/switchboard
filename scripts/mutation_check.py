@@ -3189,6 +3189,10 @@ mutate("probe-literal-host-not-in-addresses", "a URL's address-literal host that
        """          *) broken "$number" "the host $host of the URL is not one of its addresses: $addresses"; continue ;;\n""", "")
 mutate("probe-bracketed-host-unchecked", "a bracketed host that is not an IPv6 literal passes the row check", PROBE,
        "        *[!0-9a-fA-F.:]*) ;;\n        *:*) literal=1 ;;\n", "        *) literal=1 ;;\n")
+mutate("probe-dotted-host-unchecked", "a host of digits and dots that is not an IPv4 literal passes, and curl looks it up as a name", PROBE,
+       """      if [ -n "$literal" ] && ! literals "$host"; then\n""", """      if false; then\n""")
+mutate("route-check-dotted-host-unchecked", "route-check.sh accepts a host of digits and dots that is not an IPv4 literal", ROUTE_CHECK,
+       """elif $literal and ($authority | startswith("[") | not)\n""", """elif false\n""")
 mutate("probe-literal-resolve-looked-up", "a resolve row with an address-literal host looks the host up instead of trying it", PROBE,
        "    found=$host\n", "    found=$(resolve \"$host\")\n")
 mutate("route-check-literal-host-not-in-addresses", "route-check.sh accepts a row whose address-literal host is not one of its addresses", ROUTE_CHECK,

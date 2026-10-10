@@ -7,7 +7,8 @@
 //! credential. Each attempt is one request: curl's URL globbing is off, a URL with a glob
 //! character fails its row, and output other than one request's status could not be probed.
 //! A refused connection after one was made is not a refusal, a URL whose host is an address
-//! literal must list that host among its addresses, and curl never goes through a proxy.
+//! literal must list that host among its addresses, a host of digits and dots must be an IPv4
+//! literal, and curl never goes through a proxy.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -395,6 +396,40 @@ fn an_address_literal_host_must_be_one_of_its_rows_addresses() {
         "{}",
         run.transcript()
     );
+}
+
+/// curl looks up a host of digits and dots that is not an IPv4 literal (10.0.0.256, 1.2.3.4.5)
+/// as a name. A `resolve` row tries an address-literal host with no lookup of its own, so a
+/// lookup in curl that timed out would read as refused, though nothing was tried. Such a host
+/// fails its row before any request (issue #86). Here the fake curl times each of them out.
+#[test]
+fn a_dotted_host_that_is_not_an_ipv4_address_fails_its_row() {
+    let gateway = Recorder::start(401);
+    let hole = dropped();
+    let hosts = [
+        "10.0.0.256",
+        "1.2.3.4.5",
+        "99999999999",
+        "010.0.0.1",
+        "1..2.3",
+    ];
+    let routes: String = hosts
+        .iter()
+        .map(|host| format!("server\t{}\tresolve\treject_ok\n", named(&hole, host)))
+        .collect();
+    let run = Probe::new("dotted", &gateway.url, &routes)
+        .dropping(&hole)
+        .run();
+    assert_result(&run, false);
+    for (line, host) in hosts.iter().enumerate() {
+        let text = format!(
+            "FAIL routes line {}: the URL has a host of digits and dots that is not an IPv4 address: {}\n",
+            line + 1,
+            named(&hole, host)
+        );
+        assert!(run.stdout.contains(&text), "{host}\n{}", run.transcript());
+    }
+    assert!(attempts(&run).is_empty(), "{}", run.transcript());
 }
 
 /// curl reads the proxy variables, and -q does not stop it. Through a proxy that refuses the

@@ -11,7 +11,9 @@
 # name is resolved with getent first, so a name that does not resolve, or whose lookup times
 # out, is "could-not-probe", never "refused" at the server's address. A URL whose host is an
 # address literal is tried only at that host, so the row's addresses must include it, or the
-# row fails: a refusal at some other address would say nothing about the host.
+# row fails: a refusal at some other address would say nothing about the host. A host of digits
+# and dots that is not an IPv4 literal (10.0.0.256) fails its row too: curl would look it up as
+# a name, with no getent first.
 #
 # Environment:
 #   ROUTES         the routes file's contents, with {{ADDR}} already replaced. Tab-separated
@@ -301,7 +303,15 @@ while IFS="$TAB" read -r row url addresses flags extra; do
       esac
       [ -n "$literal" ] || { broken "$number" "the URL has a bracketed host that is not an IPv6 address: $url"; continue; }
       ;;
-    *) case $host in *[!0-9.]*) ;; *) literal=1 ;; esac ;;
+    *)
+      case $host in *[!0-9.]*) ;; *) literal=1 ;; esac
+      # curl looks up a dotted host that is not an IPv4 literal (10.0.0.256) as a name, and a
+      # lookup that times out would count as refused.
+      if [ -n "$literal" ] && ! literals "$host"; then
+        broken "$number" "the URL has a host of digits and dots that is not an IPv4 address: $url"
+        continue
+      fi
+      ;;
   esac
   case $addresses in
     '') broken "$number" "no addresses"; continue ;;

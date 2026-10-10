@@ -1603,7 +1603,8 @@ fn the_probe_must_report_each_attempt_the_routes_ask_for_once() {
 
 /// The rows the probe fails for their host fail here too, and the probe is not started: an
 /// address-literal host that is not one of the row's addresses, which the probe would never
-/// try, and a bracketed host that is not an IPv6 literal (issue #86). Each probe log below
+/// try, a bracketed host that is not an IPv6 literal, and a host of digits and dots that is not
+/// an IPv4 literal, which curl would look up as a name (issue #86). Each probe log below
 /// matches the routes, so only the row check stands between it and a PASS.
 #[test]
 fn rows_the_probe_would_fail_for_their_host_fail_before_it_starts() {
@@ -1633,6 +1634,18 @@ fn rows_the_probe_would_fail_for_their_host_fail_before_it_starts() {
             "server\thttp://[127.0.0.1]:8000/mcp\t127.0.0.1\treject_ok\n",
             "ROUTE server address 127.0.0.1 refused\n",
             ": the URL has a bracketed host that is not an IPv6 address: http://[127.0.0.1]:8000/mcp",
+        ),
+        (
+            "not-ipv4-resolve",
+            "server\thttp://10.0.0.256:8000/mcp\tresolve\treject_ok\n",
+            "ROUTE server address 10.0.0.256 refused\n",
+            ": the URL has a host of digits and dots that is not an IPv4 address: http://10.0.0.256:8000/mcp",
+        ),
+        (
+            "leading-zero",
+            "server\thttp://010.0.0.1:8000/mcp\t010.0.0.1\treject_ok\n",
+            "ROUTE server address 010.0.0.1 refused\n",
+            ": the URL has a host of digits and dots that is not an IPv4 address: http://010.0.0.1:8000/mcp",
         ),
     ] {
         let mut cluster = Cluster::clean();

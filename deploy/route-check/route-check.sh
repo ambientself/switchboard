@@ -36,7 +36,8 @@
 #       unless the URL's host is an address literal, and by each address; a row whose
 #       addresses are `resolve` needs at least one address line. A missing, extra or repeated
 #       line fails the run. A row the probe would fail for its host fails here, and the probe
-#       is not started: a bracketed host that is not an IPv6 literal, or an address-literal host
+#       is not started: a bracketed host that is not an IPv6 literal, a host of digits and dots
+#       that is not an IPv4 literal (curl would look it up as a name), or an address-literal host
 #       that is not one of the row's addresses.
 #
 # Anything it cannot read is a FAIL ("could not read"), never a PASS, and so is anything it read
@@ -669,8 +670,10 @@ probe() {
   # address literal, as the probe does, and by each address. A `resolve` row's addresses are
   # found in the pod, so it asks for at least one address line, whatever its target.
   # The rows the probe fails as broken because of their host are broken here too, and the probe
-  # is not started: a bracketed host that is not an IPv6 literal, and an address-literal host
-  # that is not one of the row's addresses, which the probe would never try.
+  # is not started: a bracketed host that is not an IPv6 literal; a host of digits and dots
+  # that is not four octets from 0 to 255, which curl would look up as a name, so a lookup that
+  # timed out would read as refused; and an address-literal host that is not one of the row's
+  # addresses, which the probe would never try.
   if ! wanted=$(jq -R -s -c '
       split("\n") | map(select(length > 0 and (startswith("#") | not)) | split("\t")
         | if length >= 3 and (.[0] | length) > 0 and (.[2] | length) > 0 then . else error("bad row") end
@@ -683,6 +686,10 @@ probe() {
            resolve: (if $addresses == "resolve" then [$row] else [] end),
            broken: [if ($authority | startswith("[")) and ($host | test("^[0-9a-fA-F.:]*:[0-9a-fA-F.:]*$") | not) then
                       "\($row)\tthe URL has a bracketed host that is not an IPv6 address: \($url)"
+                    elif $literal and ($authority | startswith("[") | not)
+                      and ($host | if test("^(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2})){3}$")
+                                   then split(".") | all(tonumber <= 255) else false end | not) then
+                      "\($row)\tthe URL has a host of digits and dots that is not an IPv4 address: \($url)"
                     elif $literal and $addresses != "resolve" and (any($addresses | split(",")[]; . == $host) | not) then
                       "\($row)\tthe host \($host) of the URL is not one of its addresses: \($addresses)"
                     else empty end]})
