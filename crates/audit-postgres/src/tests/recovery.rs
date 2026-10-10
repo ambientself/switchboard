@@ -31,6 +31,7 @@ const CUT_EVERY: u8 = 2;
 const HOLD_EMPTY: u8 = 3;
 /// What [`Cutter`] is in once it holds an answer back.
 const HOLDING: u8 = 4;
+const HOLD_UNMATCHED: u8 = 5;
 
 /// The code a request to cancel a statement carries where a startup has its protocol version.
 const CANCEL_REQUEST_CODE: u32 = 80_877_102;
@@ -43,7 +44,8 @@ const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 ///
 /// Told to hold, it keeps back the next answer from the server that says a `SELECT` found no
 /// rows, on whichever connection, until it is told to pass again, and then sends it on. It
-/// passes everything else meanwhile, on that connection and the others.
+/// passes everything else meanwhile, on that connection and the others. Told to hold unmatched,
+/// it does the same with the next answer that says an `UPDATE` matched no row.
 ///
 /// Told to, it also throws away every request to cancel a statement, so the statement runs on
 /// as if the request had failed.
@@ -167,10 +169,15 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>, cuts: 
             CUT_ONCE => mode
                 .compare_exchange(CUT_ONCE, PASS, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok(),
-            HOLD_EMPTY => {
-                if finds_no_rows(&buffer[..read])
+            held @ (HOLD_EMPTY | HOLD_UNMATCHED) => {
+                let tag: &[u8] = if held == HOLD_EMPTY {
+                    b"SELECT 0\0"
+                } else {
+                    b"UPDATE 0\0"
+                };
+                if says(&buffer[..read], tag)
                     && mode
-                        .compare_exchange(HOLD_EMPTY, HOLDING, Ordering::SeqCst, Ordering::SeqCst)
+                        .compare_exchange(held, HOLDING, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                 {
                     while mode.load(Ordering::SeqCst) == HOLDING {
@@ -194,10 +201,10 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>, cuts: 
     upstream.abort();
 }
 
-/// Whether `answer`, bytes from the server, holds the end of a `SELECT` that found no rows: its
-/// command tag, as a `CommandComplete` message carries it.
-fn finds_no_rows(answer: &[u8]) -> bool {
-    let tag = b"SELECT 0\0";
+/// Whether `answer`, bytes from the server, holds the end of a statement with the command tag
+/// `tag`, as a `CommandComplete` message carries it: `SELECT 0` for a `SELECT` that found no
+/// rows, `UPDATE 0` for an `UPDATE` that matched none.
+fn says(answer: &[u8], tag: &[u8]) -> bool {
     answer.windows(tag.len()).any(|window| window == tag)
 }
 
@@ -846,6 +853,73 @@ async fn a_missing_row_answer_held_past_the_deadline_leaves_the_attempt_at_the_d
         reports_of(&reports)
     );
     assert_eq!(store.finishes(), FinishCounts::default());
+    assert!(reports_of(&reports).is_empty());
+}
+
+/// An executed insert waits past the begin budget, and the store's request to cancel it is
+/// lost. An attempt to complete the row runs its update, which matches nothing, since the
+/// insert has not committed; the answer saying so is held back while the insert commits. The
+/// attempt's select then finds the row with no completion. That is not a completion of another
+/// kind: the row is tried again, completed as `error`, and nothing is given up.
+#[tokio::test]
+async fn an_insert_that_commits_between_an_attempts_update_and_its_select_is_completed() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let cutter = Cutter::start(&db).await;
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(2),
+        finish_deadline: Duration::from_secs(10),
+    };
+    let (store, reports) = reporting(cutter.store(&db, budgets));
+    let admin = db.admin().await;
+    warm_up(&store, &fixture, allowed()).await;
+    drop(store.finish.get().await.unwrap());
+    let lock = hold_inserts(&db).await;
+    cutter.drop_cancels();
+
+    let row = row_start().row;
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    assert_eq!(store.finishes().in_flight, 1);
+
+    // The next attempt's update matches nothing, and its answer is held back.
+    cutter.set(HOLD_UNMATCHED);
+    until(SLACK, "an attempt's update to match nothing", || async {
+        cutter.mode() == HOLDING
+    })
+    .await;
+    // The insert commits before the attempt goes on to its select.
+    let_inserts_through(&lock).await;
+    until(SLACK, "the insert to commit", || async {
+        rows_under(&admin, &row).await == 1
+    })
+    .await;
+    assert_eq!(row_of(&admin, &row).await, ("allow".to_owned(), None, None));
+    cutter.set(PASS);
+    until(budgets.finish_deadline, "the row's completion", || async {
+        store.finishes().in_flight == 0
+    })
+    .await;
+    assert_eq!(
+        row_of(&admin, &row).await,
+        ("allow".to_owned(), Some("error".to_owned()), Some(0)),
+        "{:?} {:?}",
+        store.stats(),
+        reports_of(&reports)
+    );
+    assert_eq!(store.finishes(), FinishCounts::default());
+    assert_eq!(store.stats().finishes_given_up, GivenUpCauses::default());
     assert!(reports_of(&reports).is_empty());
 }
 

@@ -74,6 +74,17 @@ pub enum PgAuditError {
         /// The row finish named.
         row: String,
     },
+    /// The update that completes the row matched nothing, and the row read just after has no
+    /// completion: the update did not see the row, whose insert committed after it looked. The
+    /// task completing a failed begin's row, whose insert may commit late, tries again; a
+    /// finish, whose row was begun before it, gives up.
+    #[error(
+        "audit row {row} has no completion, and the update that would have written one did not find it"
+    )]
+    NotCompleted {
+        /// The row finish named.
+        row: String,
+    },
     /// Begin did not have a connection and a committed row within its budget. The call is
     /// refused. If the insert was sent, the store asked the server to cancel it, but a cancel
     /// is best effort: the row may still have been written, as decision 0009 allows for a
@@ -1055,7 +1066,12 @@ async fn complete_on(
     let latency_ms: Option<i64> = existing.try_get(2)?;
     match outcome {
         Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),
-        _ => Err(PgAuditError::CompletedDifferently {
+        Some(_) => Err(PgAuditError::CompletedDifferently {
+            row: row.to_owned(),
+        }),
+        // The update and this select each see what had committed when they began, so a row
+        // whose insert committed in between is seen here and was not seen by the update.
+        None => Err(PgAuditError::NotCompleted {
             row: row.to_owned(),
         }),
     }
@@ -1104,7 +1120,11 @@ impl Retry {
             };
             let error = match self.once(by).await {
                 Ok(()) => return Ok(()),
-                Err(error @ PgAuditError::NoSuchRow { .. }) if self.row_may_commit => error,
+                // A failed begin's row may commit late: it is missing, or the update did not
+                // see it.
+                Err(
+                    error @ (PgAuditError::NoSuchRow { .. } | PgAuditError::NotCompleted { .. }),
+                ) if self.row_may_commit => error,
                 Err(error) if !error.is_transient() => return Err(error),
                 Err(error) => error,
             };
@@ -1219,6 +1239,7 @@ mod unit {
         for final_error in [
             PgAuditError::NoSuchRow { row: "r".into() },
             PgAuditError::CompletedDifferently { row: "r".into() },
+            PgAuditError::NotCompleted { row: "r".into() },
             PgAuditError::BegunDifferently { row: "r".into() },
             PgAuditError::Pool(PoolError::Closed),
             PgAuditError::Column("x"),
