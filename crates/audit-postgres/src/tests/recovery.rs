@@ -22,7 +22,7 @@ use super::budgets::{
 };
 use super::store::Call;
 use super::{DUMMY_PASSWORD, GATEWAY_ROLE, TestDatabase, code};
-use crate::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
+use crate::{Budgets, FinishCounts, GivenUpCauses, PgAuditError, PgAuditStore, PoolSizes};
 
 /// What [`Cutter`] does with what the server sends.
 const PASS: u8 = 0;
@@ -515,6 +515,11 @@ async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
         "{:?}",
         reports_of(&reports)
     );
+    // Counted under its own name, not as given up.
+    let stats = store.stats();
+    assert_eq!(stats.begins_never_committed, 1);
+    assert_eq!(stats.finishes_given_up, GivenUpCauses::default());
+    assert_eq!(stats.begin_failures.budget_exceeded, 1);
     assert!(reports_of(&reports).is_empty());
     assert_eq!(rows_under(&admin, &row).await, 0);
 }

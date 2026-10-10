@@ -13,6 +13,7 @@ mod latency;
 mod open_rows;
 mod recovery;
 mod schema;
+mod stats;
 mod store;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
