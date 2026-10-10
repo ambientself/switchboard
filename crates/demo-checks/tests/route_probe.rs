@@ -6,6 +6,9 @@
 //! unreachable gateway fails the run before any route is tried, and no attempt carries a
 //! credential. Each attempt is one request: curl's URL globbing is off, a URL with a glob
 //! character fails its row, and output other than one request's status could not be probed.
+//! A refused connection after one was made is not a refusal, a URL whose host is an address
+//! literal must list that host among its addresses, a host of digits and dots must be an IPv4
+//! literal, and curl never goes through a proxy.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -32,6 +35,8 @@ struct Probe {
     hosts: String,
     dropped: Vec<String>,
     doubled: Vec<String>,
+    retried: Vec<String>,
+    env: Vec<(&'static str, String)>,
     dir: PathBuf,
 }
 
@@ -45,6 +50,8 @@ impl Probe {
             hosts: String::new(),
             dropped: Vec::new(),
             doubled: Vec::new(),
+            retried: Vec::new(),
+            env: Vec::new(),
             dir: scratch(name),
         }
     }
@@ -70,6 +77,19 @@ impl Probe {
     /// first connected and got no answer in time, the second was refused (curl exit 7).
     fn doubling(mut self, url: &str) -> Self {
         self.doubled.push(url.to_owned());
+        self
+    }
+
+    /// Requests to `url`'s port connect, then end refused (curl exit 7), as when curl retries
+    /// on its own after a server took the first connection and stopped listening.
+    fn retrying(mut self, url: &str) -> Self {
+        self.retried.push(url.to_owned());
+        self
+    }
+
+    /// Sets `name` to `value` for the run, after the proxy variables are cleared.
+    fn with_env(mut self, name: &'static str, value: &str) -> Self {
+        self.env.push((name, value.to_owned()));
         self
     }
 
@@ -118,6 +138,14 @@ impl Probe {
                     .map(|url| common::port_of(url))
                     .collect::<Vec<_>>()
                     .join(" "),
+            )
+            .env(
+                "FAKE_RETRIED",
+                self.retried
+                    .iter()
+                    .map(|url| common::port_of(url))
+                    .collect::<Vec<_>>()
+                    .join(" "),
             );
         for proxy in [
             "http_proxy",
@@ -134,6 +162,9 @@ impl Probe {
         }
         if let Some(expect) = self.expect {
             command.env("EXPECT", expect);
+        }
+        for (name, value) in &self.env {
+            command.env(name, value);
         }
         Run::from(command.output().unwrap())
     }
@@ -247,6 +278,188 @@ fn a_refused_connection_counts_as_refused_only_with_reject_ok() {
         "{}",
         run.transcript()
     );
+}
+
+/// curl retries on its own: after an HTTP/2 REFUSED_STREAM, for one, a server that took the
+/// first connection and then stopped listening refuses the retry. curl prints one result, with
+/// no HTTP status and one connection, and exits 7. Something was reached, so it is not refused,
+/// even on a row flagged reject_ok (issue #86).
+#[test]
+fn a_refusal_after_a_connection_is_not_refused() {
+    let gateway = Recorder::start(401);
+    let closed = closed_port();
+    let run = Probe::new(
+        "retried",
+        &gateway.url,
+        &format!("retried\t{closed}\t127.0.0.1\treject_ok\n"),
+    )
+    .retrying(&closed)
+    .run();
+    assert_result(&run, false);
+    assert_eq!(
+        attempts(&run),
+        ["ROUTE retried address 127.0.0.1 could-not-probe"],
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains(
+            "NOTE retried address 127.0.0.1: connected, then a connection was refused (curl exit 7)\n"
+        ),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout
+            .contains("FAIL 1 of 1 attempts were not refused\n"),
+        "{}",
+        run.transcript()
+    );
+}
+
+/// A URL whose host is an address literal is tried by address only, at the row's addresses. A
+/// row whose addresses leave out the URL's own host would never try it: a server there could
+/// answer while a refusal at another address passed the run. Such a row fails, and so does a
+/// bracketed host that is not an IPv6 literal (issue #86).
+#[test]
+fn an_address_literal_host_must_be_one_of_its_rows_addresses() {
+    let gateway = Recorder::start(401);
+    let server = Recorder::start(200);
+    let port = common::port_of(&server.url);
+    for (name, routes, text) in [
+        (
+            "elsewhere",
+            format!("server\t{}\t127.0.0.2\treject_ok\n", server.url),
+            "FAIL routes line 1: the host 127.0.0.1 of the URL is not one of its addresses: 127.0.0.2"
+                .to_owned(),
+        ),
+        (
+            "ipv6-elsewhere",
+            format!("server\thttp://[::1]:{port}/mcp\t127.0.0.1\treject_ok\n"),
+            "FAIL routes line 1: the host ::1 of the URL is not one of its addresses: 127.0.0.1"
+                .to_owned(),
+        ),
+        (
+            "not-ipv6",
+            format!("server\thttp://[not-ipv6]:{port}/\t127.0.0.1\treject_ok\n"),
+            format!(
+                "FAIL routes line 1: the URL has a bracketed host that is not an IPv6 address: http://[not-ipv6]:{port}/"
+            ),
+        ),
+        (
+            "not-ipv6-resolve",
+            format!("server\thttp://[not-ipv6]:{port}/\tresolve\treject_ok\n"),
+            format!(
+                "FAIL routes line 1: the URL has a bracketed host that is not an IPv6 address: http://[not-ipv6]:{port}/"
+            ),
+        ),
+        (
+            "bracketed-ipv4",
+            format!("server\thttp://[127.0.0.1]:{port}/mcp\t127.0.0.1\treject_ok\n"),
+            format!(
+                "FAIL routes line 1: the URL has a bracketed host that is not an IPv6 address: http://[127.0.0.1]:{port}/mcp"
+            ),
+        ),
+    ] {
+        let run = Probe::new(&format!("literal-{name}"), &gateway.url, &routes).run();
+        assert_result(&run, false);
+        assert!(
+            run.stdout.contains(&format!("{text}\n")),
+            "{name}\n{}",
+            run.transcript()
+        );
+        assert!(attempts(&run).is_empty(), "{name}\n{}", run.transcript());
+    }
+    assert!(server.heads().is_empty(), "{:?}", server.heads());
+
+    // The URL's own host among other addresses: each is tried. With `resolve`, the host stands
+    // for itself, with no lookup.
+    let hole = dropped();
+    let run = Probe::new(
+        "literal-listed",
+        &gateway.url,
+        &format!(
+            "listed\t{hole}\t127.0.0.2,127.0.0.1\treject_ok\n\
+             resolved\t{hole}\tresolve\n"
+        ),
+    )
+    .dropping(&hole)
+    .run();
+    assert_result(&run, true);
+    assert_eq!(
+        attempts(&run),
+        [
+            "ROUTE listed address 127.0.0.2 refused",
+            "ROUTE listed address 127.0.0.1 refused",
+            "ROUTE resolved address 127.0.0.1 refused",
+        ],
+        "{}",
+        run.transcript()
+    );
+}
+
+/// curl looks up a host of digits and dots that is not an IPv4 literal (10.0.0.256, 1.2.3.4.5)
+/// as a name. A `resolve` row tries an address-literal host with no lookup of its own, so a
+/// lookup in curl that timed out would read as refused, though nothing was tried. Such a host
+/// fails its row before any request (issue #86). Here the fake curl times each of them out.
+#[test]
+fn a_dotted_host_that_is_not_an_ipv4_address_fails_its_row() {
+    let gateway = Recorder::start(401);
+    let hole = dropped();
+    let hosts = [
+        "10.0.0.256",
+        "1.2.3.4.5",
+        "99999999999",
+        "010.0.0.1",
+        "1..2.3",
+    ];
+    let routes: String = hosts
+        .iter()
+        .map(|host| format!("server\t{}\tresolve\treject_ok\n", named(&hole, host)))
+        .collect();
+    let run = Probe::new("dotted", &gateway.url, &routes)
+        .dropping(&hole)
+        .run();
+    assert_result(&run, false);
+    for (line, host) in hosts.iter().enumerate() {
+        let text = format!(
+            "FAIL routes line {}: the URL has a host of digits and dots that is not an IPv4 address: {}\n",
+            line + 1,
+            named(&hole, host)
+        );
+        assert!(run.stdout.contains(&text), "{host}\n{}", run.transcript());
+    }
+    assert!(attempts(&run).is_empty(), "{}", run.transcript());
+}
+
+/// curl reads the proxy variables, and -q does not stop it. Through a proxy that refuses the
+/// connection, an attempt at a server that answers would read as refused. The probe turns
+/// proxies off for every curl run (issue #86).
+#[test]
+fn the_proxy_variables_cannot_send_an_attempt_through_a_proxy() {
+    let gateway = Recorder::start(401);
+    let server = Recorder::start(200);
+    let proxy = closed_port();
+    // NO_PROXY covers the gateway alone, so only the route attempt would use the proxy.
+    let gateway_url = gateway.url.replace("127.0.0.1", "localhost");
+    let run = Probe::new(
+        "proxy",
+        &gateway_url,
+        &format!("server\t{}\t127.0.0.1\treject_ok\n", server.url),
+    )
+    .with_env("http_proxy", &proxy)
+    .with_env("all_proxy", &proxy)
+    .with_env("NO_PROXY", "localhost")
+    .run();
+    assert_result(&run, false);
+    assert_eq!(
+        attempts(&run),
+        ["ROUTE server address 127.0.0.1 open"],
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(server.heads().len(), 1, "{}", run.transcript());
+    assert_no_credential(&server);
 }
 
 #[test]
@@ -652,9 +865,10 @@ fn a_url_glob_cannot_hide_a_connection_behind_a_refusal() {
     assert!(attempts(&run).is_empty(), "{}", run.transcript());
 }
 
-/// Every curl run the probe makes, the gateway's and each attempt's, turns URL globbing off.
+/// Every curl run the probe makes, the gateway's and each attempt's, turns URL globbing and
+/// proxies off.
 #[test]
-fn every_curl_run_turns_globbing_off() {
+fn every_curl_run_turns_globbing_and_proxies_off() {
     let gateway = Recorder::start(401);
     let hole = dropped();
     let by_name = named(&hole, "hole.test");
@@ -677,6 +891,12 @@ fn every_curl_run_turns_globbing_off() {
         assert!(
             args.lines().any(|arg| arg == "-g" || arg == "--globoff"),
             "a curl run with globbing on:\n{args}"
+        );
+        let args: Vec<&str> = args.lines().collect();
+        assert!(
+            args.windows(2).any(|pair| pair == ["--noproxy", "*"]),
+            "a curl run that may use a proxy:\n{}",
+            args.join("\n")
         );
     }
 }

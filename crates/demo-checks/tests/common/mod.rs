@@ -169,7 +169,10 @@ pub fn fake_getent(bin: &Path) {
 /// Two variables change it for one run. With `FAKE_CURL_ARGS` set to a file, each run appends
 /// its arguments there, one per line, then a line `<end>`. A request to a port listed in
 /// `FAKE_DOUBLED` writes out `-w` twice, as two requests in one run would: the first connected
-/// and got no answer, the second made no connection; and it exits 7, the second's status.
+/// and got no answer, the second made no connection; and it exits 7, the second's status. A
+/// request to a port listed in `FAKE_RETRIED` writes out `-w` once, with no HTTP status and one
+/// connection, and exits 7: curl's own retry after a server took the connection (an HTTP/2
+/// REFUSED_STREAM) and stopped listening.
 pub const FAKE_CURL: &str = r#"#!/bin/sh
 if [ -n "${FAKE_CURL_ARGS:-}" ]; then
   for arg do printf '%s\n' "$arg"; done >>"$FAKE_CURL_ARGS"
@@ -194,6 +197,14 @@ case " ${FAKE_DOUBLED:-} " in
     if [ -n "$port" ]; then
       printf '%s' "$format" | sed -e 's/%{http_code}/000/g' -e 's/%{num_connects}/1/g'
       printf '%s' "$format" | sed -e 's/%{http_code}/000/g' -e 's/%{num_connects}/0/g'
+      exit 7
+    fi
+    ;;
+esac
+case " ${FAKE_RETRIED:-} " in
+  *" $port "*)
+    if [ -n "$port" ]; then
+      printf '%s' "$format" | sed -e 's/%{http_code}/000/g' -e 's/%{num_connects}/1/g'
       exit 7
     fi
     ;;

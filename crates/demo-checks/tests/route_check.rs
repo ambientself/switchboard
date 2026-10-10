@@ -1601,6 +1601,95 @@ fn the_probe_must_report_each_attempt_the_routes_ask_for_once() {
     assert!(checked.passed("the probe passed: every route refused (7 attempts, EXPECT=refused)"));
 }
 
+/// The rows the probe fails for their host fail here too, and the probe is not started: an
+/// address-literal host that is not one of the row's addresses, which the probe would never
+/// try, a bracketed host that is not an IPv6 literal, and a host of digits and dots that is not
+/// an IPv4 literal, which curl would look up as a name (issue #86). Each probe log below
+/// matches the routes, so only the row check stands between it and a PASS.
+#[test]
+fn rows_the_probe_would_fail_for_their_host_fail_before_it_starts() {
+    let with =
+        |lines: &str| PASSING_PROBE.replace("RESULT: PASS\n", &format!("{lines}RESULT: PASS\n"));
+    for (name, row, line, text) in [
+        (
+            "elsewhere",
+            "server\thttp://127.0.0.1:8000/mcp\t127.0.0.2\treject_ok\n",
+            "ROUTE server address 127.0.0.2 refused\n",
+            ": the host 127.0.0.1 of the URL is not one of its addresses: 127.0.0.2",
+        ),
+        (
+            "ipv6-elsewhere",
+            "server\thttp://[::1]:8000/mcp\t127.0.0.1\treject_ok\n",
+            "ROUTE server address 127.0.0.1 refused\n",
+            ": the host ::1 of the URL is not one of its addresses: 127.0.0.1",
+        ),
+        (
+            "not-ipv6",
+            "server\thttp://[not-ipv6]:8000/\t::1\treject_ok\n",
+            "ROUTE server address ::1 refused\n",
+            ": the URL has a bracketed host that is not an IPv6 address: http://[not-ipv6]:8000/",
+        ),
+        (
+            "bracketed-ipv4",
+            "server\thttp://[127.0.0.1]:8000/mcp\t127.0.0.1\treject_ok\n",
+            "ROUTE server address 127.0.0.1 refused\n",
+            ": the URL has a bracketed host that is not an IPv6 address: http://[127.0.0.1]:8000/mcp",
+        ),
+        (
+            "not-ipv4-resolve",
+            "server\thttp://10.0.0.256:8000/mcp\tresolve\treject_ok\n",
+            "ROUTE server address 10.0.0.256 refused\n",
+            ": the URL has a host of digits and dots that is not an IPv4 address: http://10.0.0.256:8000/mcp",
+        ),
+        (
+            "leading-zero",
+            "server\thttp://010.0.0.1:8000/mcp\t010.0.0.1\treject_ok\n",
+            "ROUTE server address 010.0.0.1 refused\n",
+            ": the URL has a host of digits and dots that is not an IPv4 address: http://010.0.0.1:8000/mcp",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.routes = Some(format!("{ROUTES}{row}"));
+        cluster.probe_log = with(line);
+        let checked = check(&format!("host-row-{name}"), &cluster);
+        checked.assert_failed(text);
+        assert!(
+            checked.run.failed("the probe ran: row server of "),
+            "{name}\n{}",
+            checked.run.transcript()
+        );
+        assert!(
+            !checked.calls.iter().any(|call| call.contains(" debug ")),
+            "{name}: the probe was started\n{:?}",
+            checked.calls
+        );
+    }
+
+    // An address-literal host among the row's addresses, and an IPv6 one, are tried.
+    let mut cluster = Cluster::clean();
+    cluster.routes = Some(format!(
+        "{ROUTES}v6\thttp://[::1]:8000/mcp\t::1\treject_ok\n\
+         listed\thttp://127.0.0.1:8000/mcp\t127.0.0.2,127.0.0.1\n"
+    ));
+    cluster.probe_log = with(
+        "ROUTE v6 address ::1 refused\n\
+         ROUTE listed address 127.0.0.2 refused\n\
+         ROUTE listed address 127.0.0.1 refused\n",
+    );
+    let checked = check("host-row-listed", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert!(checked.passed("the probe passed: every route refused (7 attempts, EXPECT=refused)"));
+
+    // The kind run's routes file still loads.
+    let mut cluster = Cluster::clean();
+    cluster.routes = Some(read("deploy/route-check/routes/kind.tsv"));
+    cluster.probe_log =
+        PASSING_PROBE.replace("ROUTE metadata address 169.254.169.254 refused\n", "");
+    let checked = check("host-row-kind", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert!(checked.passed("the probe passed: every route refused (3 attempts, EXPECT=refused)"));
+}
+
 /// The probe itself, deploy/route-check/probe.sh, run for `kubectl debug` with the variables the
 /// step gives it: its lines are the ones the step reads, and it reaches the gateway with no
 /// credential.

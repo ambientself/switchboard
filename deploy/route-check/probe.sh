@@ -9,12 +9,17 @@
 # if it was not, the probe fails before it tries any route. Then it tries each route in ROUTES:
 # by name, unless the URL's host is an address literal, and by each address the row gives. The
 # name is resolved with getent first, so a name that does not resolve, or whose lookup times
-# out, is "could-not-probe", never "refused" at the server's address.
+# out, is "could-not-probe", never "refused" at the server's address. A URL whose host is an
+# address literal is tried only at that host, so the row's addresses must include it, or the
+# row fails: a refusal at some other address would say nothing about the host. A host of digits
+# and dots that is not an IPv4 literal (10.0.0.256) fails its row too: curl would look it up as
+# a name, with no getent first.
 #
 # Environment:
 #   ROUTES         the routes file's contents, with {{ADDR}} already replaced. Tab-separated
 #                  columns: name, url, addresses, flags. addresses is a comma list of address
-#                  literals, or `resolve` for the addresses the name resolves to in the pod. flags
+#                  literals, or `resolve` for the addresses the name resolves to in the pod (for
+#                  a URL whose host is an address literal, that host). flags
 #                  is empty or a comma list; reject_ok counts a refused connection as refused. A
 #                  line starting with # is a comment.
 #   GATEWAY_URL    the gateway's endpoint
@@ -33,8 +38,11 @@
 #   connected, then timed out with no       could-not-probe: something took the connection, so
 #     answer (curl exit 28)                 the route was not refused, but nothing answered
 #   connection refused (curl exit 7)        refused for a row flagged reject_ok, where the route
-#                                           is refused by a reset; could-not-probe otherwise, as
-#                                           a stopped server or a wrong port looks the same
+#                                           is refused by a reset, if no connection was made;
+#                                           could-not-probe otherwise, as a stopped server or a
+#                                           wrong port looks the same, and a refusal after a
+#                                           connection (curl retries on its own, as after an
+#                                           HTTP/2 REFUSED_STREAM) means something was reached
 #   a name that does not resolve (or 6)     could-not-probe
 #   curl printed anything but one status    could-not-probe: the attempt was not one request
 #     and one connection count
@@ -44,6 +52,9 @@
 # glob character ({, }, [ or ], other than the brackets of an IPv6 host) fails its row. Two
 # requests in one curl run print two results and exit with the last one's status, so a refused
 # second request could hide a first that connected.
+#
+# curl runs with proxies off (--noproxy '*'), whatever the environment says: through a proxy,
+# an attempt would test the route to the proxy, not to the target.
 #
 # Needs sh, curl and getent.
 set -u
@@ -90,12 +101,13 @@ case $PROBE_TIMEOUT in '' | *[!0-9]* | 0) stop "PROBE_TIMEOUT is a number of sec
 # nothing answered), a space and the number of connections curl made, and returns curl's exit
 # status. Both a connect that times out and an answer that does not come in time are curl exit
 # 28; only the count of connections tells them apart. -q keeps any .curlrc out; -g turns URL
-# globbing off, so the URL is one request; the empty Authorization header keeps curl from adding
-# one.
+# globbing off, so the URL is one request; --noproxy '*' keeps the proxy variables (http_proxy
+# and the rest) from sending it through a proxy; the empty Authorization header keeps curl from
+# adding one.
 post() {
   post_url=$1
   shift
-  curl -q -g -s -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
+  curl -q -g -s --noproxy '*' -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
     -H 'Authorization:' -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     --connect-timeout "$PROBE_TIMEOUT" --max-time "$PROBE_TIMEOUT" \
@@ -132,8 +144,11 @@ classify() {
       esac
       ;;
     7)
-      case ,$4, in
-        *,reject_ok,*) echo refused ;;
+      # Refused only on a row flagged reject_ok, and only when no connection was made. curl
+      # retries on its own (after an HTTP/2 REFUSED_STREAM, for one), so a refused retry can
+      # follow a connection to a server that was reached.
+      case ,$4,:$3 in
+        *,reject_ok,*:0) echo refused ;;
         *) echo could-not-probe ;;
       esac
       ;;
@@ -166,6 +181,8 @@ attempt() {
     attempt_why="curl exit $attempt_exit"
     if [ "$attempt_exit" -eq 28 ] && [ -n "$attempt_connects" ] && [ "$attempt_connects" != 0 ]; then
       attempt_why="connected, but nothing answered in ${PROBE_TIMEOUT}s (curl exit 28)"
+    elif [ "$attempt_exit" -eq 7 ] && [ -n "$attempt_connects" ] && [ "$attempt_connects" != 0 ]; then
+      attempt_why="connected, then a connection was refused (curl exit 7)"
     fi
     record "$attempt_row" "$attempt_by" "$attempt_target" "$attempt_result" "$attempt_why"
   else
@@ -275,11 +292,26 @@ while IFS="$TAB" read -r row url addresses flags extra; do
   case $host in
     '' | *[!0-9a-zA-Z.:_-]*) broken "$number" "the URL's host is not a name or an address"; continue ;;
   esac
-  # An address literal in the URL is tried by address only.
+  # An address literal in the URL is tried by address only. curl takes a bracketed host only as
+  # an IPv6 literal.
   literal=""
   case $authority in
-    '['*) literal=1 ;;
-    *) case $host in *[!0-9.]*) ;; *) literal=1 ;; esac ;;
+    '['*)
+      case $host in
+        *[!0-9a-fA-F.:]*) ;;
+        *:*) literal=1 ;;
+      esac
+      [ -n "$literal" ] || { broken "$number" "the URL has a bracketed host that is not an IPv6 address: $url"; continue; }
+      ;;
+    *)
+      case $host in *[!0-9.]*) ;; *) literal=1 ;; esac
+      # curl looks up a dotted host that is not an IPv4 literal (10.0.0.256) as a name, and a
+      # lookup that times out would count as refused.
+      if [ -n "$literal" ] && ! literals "$host"; then
+        broken "$number" "the URL has a host of digits and dots that is not an IPv4 address: $url"
+        continue
+      fi
+      ;;
   esac
   case $addresses in
     '') broken "$number" "no addresses"; continue ;;
@@ -289,11 +321,20 @@ while IFS="$TAB" read -r row url addresses flags extra; do
         *[!0-9a-fA-F.:,]* | ,* | *, | *,,*) broken "$number" "addresses are not address literals: $addresses"; continue ;;
       esac
       literals "$addresses" || { broken "$number" "addresses are not address literals: $addresses"; continue; }
+      # The host of a URL with an address literal is tried only by address, so it must be one.
+      if [ -n "$literal" ]; then
+        case ,$addresses, in
+          *,"$host",*) ;;
+          *) broken "$number" "the host $host of the URL is not one of its addresses: $addresses"; continue ;;
+        esac
+      fi
       ;;
   esac
 
-  found=""
-  if [ -z "$literal" ] || [ "$addresses" = resolve ]; then
+  if [ -n "$literal" ]; then
+    # An address literal stands for itself: `resolve` tries the URL's own host.
+    found=$host
+  else
     found=$(resolve "$host")
   fi
   if [ -z "$literal" ]; then
