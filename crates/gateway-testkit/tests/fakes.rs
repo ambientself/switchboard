@@ -8,12 +8,14 @@ use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, Begun, Completion, DecisionKind, Outcome, RecordedResource,
-    RecordedResources, RequestMetadata, RowKind, RowStart,
+    self, Answer, AuditFailure, Begun, Completion, DecisionKind, ListRecord, Outcome,
+    RecordedResource, RecordedResources, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
-    AuditGuard, AuditRecord, CallContext, ConnectorName, CredentialError, CredentialHandle,
-    CredentialSource, Principal, Proved, RequestedTool, Resource, Resources, decide, list_tools,
+    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, Claimed, Connector, ConnectorName,
+    CredentialError, CredentialHandle, CredentialSource, InstanceName, Principal, Proved,
+    RequestedTool, Resource, Resources, TeamId, ToolCall, ToolOutcome, ToolUseId, decide,
+    list_tools,
 };
 use gateway_identity::Clock;
 use gateway_testkit::{
@@ -33,7 +35,7 @@ fn fixture() -> Fixture {
 /// An allowed call's guard, from the real decision and the real begin step, written to `store`.
 fn guard_for(
     fixture: &Fixture,
-    store: &InMemoryAuditStore,
+    store: &dyn AuditStore,
     caller: Caller,
     tool: &str,
     arguments: Value,
@@ -724,6 +726,433 @@ fn a_different_second_completion_is_refused_and_the_first_stands() {
     );
     assert_eq!(store.rows().len(), 1);
     assert_eq!(store.finish_attempts(), 2);
+}
+
+// --- The audit store's faults ---------------------------------------------------------------
+
+/// The completion the store gives an allowed row whose begin confirmation was lost.
+fn completed_as_error() -> Option<Completion> {
+    Some(Completion {
+        outcome: Outcome::Error,
+        latency_ms: 0,
+    })
+}
+
+#[test]
+fn a_lost_confirmation_writes_the_row_and_completes_it_as_error() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    store.lose_next_begin_confirmation();
+    let start = row_start();
+    let begun = begin_as(&fixture, &store, &start, READ_TOOL);
+    assert!(
+        begun.is_err(),
+        "a begin whose confirmation was lost succeeded: {begun:?}"
+    );
+    let row = store
+        .row_with_id(&start.row)
+        .expect("a lost confirmation wrote no row");
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(
+        row.completion,
+        completed_as_error(),
+        "an allowed row whose confirmation was lost was left open"
+    );
+    assert!(store.deadline(&start.row).is_some());
+
+    // Only the next one was lost.
+    let next = row_start();
+    let begun = begin_as(&fixture, &store, &next, READ_TOOL);
+    assert!(matches!(begun, Ok(Begun::Allowed(_))), "{begun:?}");
+    assert_eq!(store.row_with_id(&next.row).unwrap().completion, None);
+
+    // Every one is lost until told to stop, a retry by identifier included, and each
+    // identifier is one row.
+    store.lose_all_begin_confirmations();
+    let retried = row_start();
+    let other = row_start();
+    for start in [&retried, &retried, &other] {
+        assert!(begin_as(&fixture, &store, start, READ_TOOL).is_err());
+    }
+    assert_eq!(store.rows().len(), 4);
+    for start in [&retried, &other] {
+        assert_eq!(
+            store.row_with_id(&start.row).unwrap().completion,
+            completed_as_error()
+        );
+    }
+    store.stop_failing();
+    let last = row_start();
+    let begun = begin_as(&fixture, &store, &last, READ_TOOL);
+    assert!(matches!(begun, Ok(Begun::Allowed(_))), "{begun:?}");
+    assert_eq!(store.row_with_id(&last.row).unwrap().completion, None);
+    assert_eq!(store.begin_attempts(), 6);
+}
+
+#[test]
+fn a_lost_confirmation_on_a_denial_leaves_the_denial() {
+    let fixture = fixture();
+    let (store, confirmed) = (InMemoryAuditStore::new(), InMemoryAuditStore::new());
+    store.lose_all_begin_confirmations();
+    let start = row_start();
+    assert!(begin_as(&fixture, &store, &start, WRITE_TOOL).is_err());
+    let denied = begin_as(&fixture, &confirmed, &start, WRITE_TOOL);
+    assert!(matches!(denied, Ok(Begun::Denied(_))), "{denied:?}");
+    let row = store
+        .row_with_id(&start.row)
+        .expect("a lost confirmation wrote no row");
+    assert_eq!(row.decision, DecisionKind::Deny);
+    assert_eq!(row.completion, None, "a denial was completed");
+    assert_eq!(
+        Some(row),
+        confirmed.row(0),
+        "the denial is the row a confirmed begin writes"
+    );
+
+    // A list row is written complete, and is left as it is too.
+    let listed = row_start();
+    assert!(list_as(&fixture, &store, &listed).is_err());
+    let rows = store.list_rows();
+    assert_eq!(rows.len(), 1, "a lost confirmation wrote no list row");
+    assert_eq!(rows[0].0, listed.row);
+    assert_eq!(store.rows().len(), 1);
+}
+
+#[test]
+fn finish_past_the_answer_budget_fails_and_completes_once_released() {
+    let (fixture, store) = (fixture(), InMemoryAuditStore::new());
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let read = || json!({"document": TEAM_A_DOCUMENT});
+    let guard = guard_for(&fixture, &store, Caller::TeamA, READ_TOOL, read());
+    let row = guard.row().clone();
+    let ran = block_on(audit::run(&connector, guard));
+    let gate = store.finish_past_answer_budget();
+
+    // The answer does not wait for the gate.
+    let mut finish = pin!(audit::finish(&store, ran, 9));
+    let Poll::Ready(finished) = poll_once(finish.as_mut()) else {
+        panic!("finish waited past the answer budget");
+    };
+    let failure = finished
+        .failure()
+        .expect("a finish past the answer budget succeeded")
+        .to_string();
+    assert!(failure.contains("answer budget"), "{failure}");
+    assert!(
+        matches!(finished.answer(), Answer::Ok(_)),
+        "{:?}",
+        finished.answer()
+    );
+    assert_eq!(
+        store.row_with_id(&row).unwrap().completion,
+        None,
+        "the row was completed before the gate opened"
+    );
+    assert_eq!(store.finish_attempts(), 1);
+
+    gate.open();
+    assert_eq!(
+        store.row_with_id(&row).unwrap().completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 9
+        }),
+        "the row was not completed once the gate opened"
+    );
+
+    // Once the gate is open, finish writes at once.
+    let guard = guard_for(&fixture, &store, Caller::TeamA, READ_TOOL, read());
+    let other = guard.row().clone();
+    let ran = block_on(audit::run(&connector, guard));
+    let finished = block_on(audit::finish(&store, ran, 4));
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert_eq!(
+        store
+            .row_with_id(&other)
+            .unwrap()
+            .completion
+            .map(|completion| completion.latency_ms),
+        Some(4)
+    );
+    assert_eq!(
+        store
+            .row_with_id(&row)
+            .unwrap()
+            .completion
+            .map(|completion| completion.latency_ms),
+        Some(9)
+    );
+}
+
+#[test]
+fn a_forgotten_finish_leaves_the_row_open_for_a_new_gateway() {
+    let fixture = fixture();
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let read = || json!({"document": TEAM_A_DOCUMENT});
+    let store = Arc::new(InMemoryAuditStore::new());
+
+    // The first gateway's process runs two calls. The finish of the first is still being tried
+    // past the answer budget when the process is lost, and the second has not finished.
+    let first: Arc<dyn AuditStore> = store.clone();
+    let late = guard_for(&fixture, first.as_ref(), Caller::TeamA, READ_TOOL, read());
+    let late_row = late.row().clone();
+    let gate = store.finish_past_answer_budget();
+    let ran = block_on(audit::run(&connector, late));
+    assert!(
+        block_on(audit::finish(first.as_ref(), ran, 3))
+            .failure()
+            .is_some()
+    );
+    let open = guard_for(&fixture, first.as_ref(), Caller::TeamA, READ_TOOL, read());
+    let open_row = open.row().clone();
+    let ran = block_on(audit::run(&connector, open));
+
+    store.forget_finishes();
+    let finished = block_on(audit::finish(first.as_ref(), ran, 5));
+    assert!(
+        finished.failure().is_some(),
+        "a finish from a lost process succeeded"
+    );
+    drop(first);
+    gate.open();
+
+    // A new gateway over the same store finds both rows open, and completes only its own.
+    store.stop_failing();
+    let second: Arc<dyn AuditStore> = store.clone();
+    for row in [&late_row, &open_row] {
+        assert_eq!(
+            store.row_with_id(row).unwrap().completion,
+            None,
+            "a row the lost process never finished was completed"
+        );
+        assert!(store.deadline(row).is_some());
+    }
+    let guard = guard_for(&fixture, second.as_ref(), Caller::TeamA, READ_TOOL, read());
+    let own = guard.row().clone();
+    let ran = block_on(audit::run(&connector, guard));
+    let finished = block_on(audit::finish(second.as_ref(), ran, 6));
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert!(store.row_with_id(&own).unwrap().completion.is_some());
+    for row in [&late_row, &open_row] {
+        assert_eq!(store.row_with_id(row).unwrap().completion, None);
+    }
+    assert_eq!(store.rows().len(), 3);
+}
+
+/// A connector that refuses every call with a sentence holding U+0000.
+struct NulRefusal;
+
+impl Connector for NulRefusal {
+    fn run(&self, _call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        Box::pin(async { ToolOutcome::Refused("refused\0here".to_owned()) })
+    }
+}
+
+/// An allowed call record and a denied one, as the core writes them for team A.
+fn records(fixture: &Fixture) -> (AuditRecord, AuditRecord) {
+    let scratch = InMemoryAuditStore::new();
+    assert!(begin_as(fixture, &scratch, &row_start(), READ_TOOL).is_ok());
+    assert!(begin_as(fixture, &scratch, &row_start(), WRITE_TOOL).is_ok());
+    (scratch.row(0).unwrap(), scratch.row(1).unwrap())
+}
+
+/// A list record, as the core writes it for team A.
+fn list_record(fixture: &Fixture) -> ListRecord {
+    let scratch = InMemoryAuditStore::new();
+    assert!(list_as(fixture, &scratch, &row_start()).is_ok());
+    scratch.list_rows().remove(0).1
+}
+
+/// Postgres text, text arrays and jsonb cannot hold U+0000, so the Postgres store refuses a
+/// record with it in any text value rather than write another character. The fake refuses the
+/// same records, and writes them without it.
+#[test]
+fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
+    let fixture = fixture();
+    let (allowed, denied) = records(&fixture);
+    let refused = [
+        AuditRecord {
+            tool: format!("{READ_TOOL}\0"),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            instance: InstanceName::new("instance\0"),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            tool_use_id: Some(ToolUseId::new("use\0")),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            claimed_team: Some(Claimed::new(TeamId::new("team\0"))),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            resources: RecordedResources::Named(vec![RecordedResource {
+                system: RESOURCE_SYSTEM.to_owned(),
+                kind: RESOURCE_KIND.to_owned(),
+                identifier: "notes\0".to_owned(),
+            }]),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            sentence: Some("denied\0".to_owned()),
+            ..denied.clone()
+        },
+    ];
+    let store = InMemoryAuditStore::new();
+    for record in &refused {
+        let error = block_on(store.begin(&row_start().row, record))
+            .expect_err("a record with U+0000 was written")
+            .to_string();
+        assert!(error.contains("U+0000"), "{error}");
+    }
+    assert!(store.rows().is_empty(), "a record with U+0000 left a row");
+    for record in [&allowed, &denied] {
+        assert!(block_on(store.begin(&row_start().row, record)).is_ok());
+    }
+    assert_eq!(store.rows().len(), 2);
+
+    // A list record with U+0000 in a tool's name.
+    let listed = list_record(&fixture);
+    let mut tools = listed.tools.clone();
+    tools.push("tool\0".to_owned());
+    let refused = ListRecord {
+        tools,
+        ..listed.clone()
+    };
+    assert!(block_on(store.list(&row_start().row, &refused)).is_err());
+    assert!(
+        store.list_rows().is_empty(),
+        "a list row with U+0000 was written"
+    );
+    assert!(block_on(store.list(&row_start().row, &listed)).is_ok());
+
+    // A connector's refusal sentence with U+0000 is not written as the row's completion.
+    let guard = guard_for(
+        &fixture,
+        &store,
+        Caller::TeamA,
+        READ_TOOL,
+        json!({"document": TEAM_A_DOCUMENT}),
+    );
+    let row = guard.row().clone();
+    let ran = block_on(audit::run(&NulRefusal, guard));
+    let finished = block_on(audit::finish(&store, ran, 5));
+    assert!(
+        finished.failure().is_some(),
+        "a completion with U+0000 was written"
+    );
+    assert_eq!(store.row_with_id(&row).unwrap().completion, None);
+}
+
+/// The Postgres store writes counts and latencies as `bigint`, and refuses one past it rather
+/// than write less than it was. The fake refuses the same, and accepts the largest.
+#[test]
+fn a_count_or_a_latency_past_a_postgres_bigint_is_refused_and_writes_nothing() {
+    let fixture = fixture();
+    let most = usize::try_from(i64::MAX).unwrap();
+    let (allowed, _) = records(&fixture);
+    let listed = list_record(&fixture);
+    let store = InMemoryAuditStore::new();
+    let too_many = AuditRecord {
+        resources_omitted: most + 1,
+        ..allowed.clone()
+    };
+    assert!(block_on(store.begin(&row_start().row, &too_many)).is_err());
+    let too_many = ListRecord {
+        tools_omitted: most + 1,
+        ..listed.clone()
+    };
+    assert!(block_on(store.list(&row_start().row, &too_many)).is_err());
+    assert!(store.rows().is_empty() && store.list_rows().is_empty());
+
+    let most_resources = AuditRecord {
+        resources_omitted: most,
+        ..allowed
+    };
+    assert!(block_on(store.begin(&row_start().row, &most_resources)).is_ok());
+    let most_tools = ListRecord {
+        tools_omitted: most,
+        ..listed
+    };
+    assert!(block_on(store.list(&row_start().row, &most_tools)).is_ok());
+
+    // A latency past a bigint is not written; the largest is.
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let guard = guard_for(
+        &fixture,
+        &store,
+        Caller::TeamA,
+        READ_TOOL,
+        json!({"document": TEAM_A_DOCUMENT}),
+    );
+    let row = guard.row().clone();
+    let ran = block_on(audit::run(&connector, guard));
+    let longest = i64::MAX.unsigned_abs();
+    assert!(
+        block_on(audit::finish(&store, ran, longest + 1))
+            .failure()
+            .is_some()
+    );
+    assert_eq!(store.row_with_id(&row).unwrap().completion, None);
+    let guard = guard_for(
+        &fixture,
+        &store,
+        Caller::TeamA,
+        READ_TOOL,
+        json!({"document": TEAM_A_DOCUMENT}),
+    );
+    let row = guard.row().clone();
+    let ran = block_on(audit::run(&connector, guard));
+    assert!(
+        block_on(audit::finish(&store, ran, longest))
+            .failure()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .row_with_id(&row)
+            .unwrap()
+            .completion
+            .map(|completion| completion.latency_ms),
+        Some(longest)
+    );
+}
+
+/// The deadline is worked out as the Postgres store does: the begin budget and the finish
+/// deadline in whole milliseconds, added to the call deadline without wrapping, and refused
+/// past a `bigint` of milliseconds.
+#[test]
+fn the_deadline_is_counted_in_whole_milliseconds_and_never_wraps() {
+    let fixture = fixture();
+    let store = InMemoryAuditStore::new().with_budgets(StoreBudgets {
+        begin: Duration::from_micros(1_500_999),
+        finish_deadline: Duration::from_nanos(20_000_999_999),
+    });
+    let start = RowStart {
+        call_deadline_ms: 7_250,
+        ..row_start()
+    };
+    assert!(begin_as(&fixture, &store, &start, READ_TOOL).is_ok());
+    let begun_at = UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW);
+    assert_eq!(
+        store.deadline(&start.row),
+        Some(begun_at + Duration::from_millis(1_500 + 7_250 + 20_000))
+    );
+
+    // An allowance one past a bigint, and one that would wrap round to a short one.
+    for call_deadline_ms in [i64::MAX.unsigned_abs() - 21_499, u64::MAX] {
+        let start = RowStart {
+            call_deadline_ms,
+            ..row_start()
+        };
+        assert!(
+            begin_as(&fixture, &store, &start, READ_TOOL).is_err(),
+            "a call deadline of {call_deadline_ms} ms was written"
+        );
+        assert_eq!(store.row_with_id(&start.row), None);
+    }
+    assert_eq!(store.rows().len(), 1);
 }
 
 // --- The credential source ------------------------------------------------------------------

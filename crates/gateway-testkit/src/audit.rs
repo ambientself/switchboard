@@ -3,10 +3,14 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use gateway_core::audit::{AuditRowId, ListRecord, RowCompletion, RowKind, RowStart, StoreError};
+use gateway_core::audit::{
+    AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RowCompletion, RowKind, RowStart,
+    StoreError,
+};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, InstanceName};
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
+use serde_json::Value;
 
 use crate::clock::FixedClock;
 use crate::gate::Gate;
@@ -64,6 +68,85 @@ impl Default for StoreBudgets {
     }
 }
 
+/// How long past its time at begin a call row's deadline is, in milliseconds, as the Postgres
+/// store works it out: the begin budget and the finish deadline each in whole milliseconds,
+/// and the call deadline, added without wrapping. A sum past what a Postgres `bigint` holds
+/// is refused at begin.
+fn allowance_ms(budgets: &StoreBudgets, call_deadline_ms: u64) -> u64 {
+    millis(budgets.begin)
+        .saturating_add(call_deadline_ms)
+        .saturating_add(millis(budgets.finish_deadline))
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whether `value` holds U+0000 in any string, which Postgres text, text arrays and jsonb
+/// cannot hold.
+fn holds_nul(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(items) => items.iter().any(holds_nul),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(name, value)| name.contains('\0') || holds_nul(value)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Refuses a record, list record or completion with U+0000 in any text value, naming the
+/// field, as the Postgres store refuses it before it writes.
+fn refuse_nul(record: Result<Value, serde_json::Error>) -> Result<(), StoreError> {
+    let Value::Object(fields) = record? else {
+        return Err("the record is not a set of fields".into());
+    };
+    match fields.iter().find(|(_, value)| holds_nul(value)) {
+        Some((field, _)) => Err(format!(
+            "the record's {field} holds U+0000, which a Postgres text value cannot hold"
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a count or a latency past what a Postgres `bigint` holds.
+fn refuse_past_bigint(what: &str, value: u64) -> Result<(), StoreError> {
+    if i64::try_from(value).is_err() {
+        return Err(format!("{what} is past what a Postgres bigint holds").into());
+    }
+    Ok(())
+}
+
+fn as_u64(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// The allowance for `record`'s deadline, or why the Postgres store would refuse to write it:
+/// a text value with U+0000, or a count or an allowance past a `bigint`.
+fn refused_at_begin(record: &AuditRecord, budgets: &StoreBudgets) -> Result<u64, StoreError> {
+    refuse_nul(serde_json::to_value(record))?;
+    refuse_past_bigint(
+        "the count of resources left out",
+        as_u64(record.resources_omitted),
+    )?;
+    let allowance = allowance_ms(budgets, record.call_deadline_ms);
+    refuse_past_bigint("the row's allowance", allowance)?;
+    Ok(allowance)
+}
+
+/// Why the Postgres store would refuse to write `record`, if it would.
+fn refused_at_list(record: &ListRecord) -> Result<(), StoreError> {
+    refuse_nul(serde_json::to_value(record))?;
+    refuse_past_bigint("the count of tools left out", as_u64(record.tools_omitted))
+}
+
+/// Why the Postgres store would refuse to write `completion`, if it would.
+fn refused_at_finish(completion: &Completion) -> Result<(), StoreError> {
+    refuse_nul(serde_json::to_value(completion))?;
+    refuse_past_bigint("the latency", completion.latency_ms)
+}
+
 /// The times the store gave a row when it was begun, from its own clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Times {
@@ -94,6 +177,14 @@ impl Failing {
     }
 }
 
+/// A completion still being tried after finish answered past the answer budget: written once
+/// its gate opens.
+struct Late {
+    gate: Gate,
+    row: AuditRowId,
+    completion: Completion,
+}
+
 #[derive(Default)]
 struct State {
     rows: Vec<(AuditRowId, AuditRecord, Times)>,
@@ -102,8 +193,45 @@ struct State {
     finish_attempts: usize,
     begin_failing: Failing,
     finish_failing: Failing,
+    confirmation_lost: Failing,
+    finishes_forgotten: bool,
     begin_gate: Option<Gate>,
     finish_gate: Option<Gate>,
+    answer_gate: Option<Gate>,
+    late: Vec<Late>,
+}
+
+impl State {
+    /// Writes each late completion whose gate has opened, as the Postgres store's own task
+    /// does once the database answers.
+    fn settle(&mut self) {
+        let (ready, waiting) = std::mem::take(&mut self.late)
+            .into_iter()
+            .partition::<Vec<_>, _>(|late| late.gate.is_open());
+        self.late = waiting;
+        for late in ready {
+            // A completion the row refuses is not written; the Postgres store's task gives
+            // it up the same way.
+            let _ = self.complete(&late.row, &late.completion);
+        }
+    }
+
+    /// Completes the row `id` with `completion`, unless it is complete already.
+    fn complete(&mut self, id: &AuditRowId, completion: &Completion) -> Result<(), StoreError> {
+        let (_, row, _) = self
+            .rows
+            .iter_mut()
+            .find(|(stored, _, _)| stored == id)
+            .ok_or_else(|| StoreError::from("no such row"))?;
+        match &row.completion {
+            None => {
+                row.completion = Some(completion.clone());
+                Ok(())
+            }
+            Some(written) if written == completion => Ok(()),
+            Some(_) => Err("the row was already finished, with a different completion".into()),
+        }
+    }
 }
 
 /// An [`AuditStore`] that keeps its rows in memory, in the order they were begun.
@@ -119,20 +247,38 @@ struct State {
 /// succeeds if it is identical to the completion the row has, and otherwise fails and leaves
 /// the first completion standing.
 ///
-/// Both operations can be told to fail, once or until told otherwise, and both can be held
-/// at a [`Gate`] to stand in for a slow database without a real sleep.
+/// It refuses what the Postgres store cannot write exactly, and writes nothing: a record, list
+/// record or completion with U+0000 in a text value, a count of resources or tools left out
+/// or a latency past a Postgres `bigint`, and a call row whose allowance is past one.
+///
+/// It fails the ways decision 0009 says the fake must, each until told otherwise or once:
+///
+/// - Before writing ([`fail_next_begin`](Self::fail_next_begin),
+///   [`fail_next_finish`](Self::fail_next_finish) and their `all` forms).
+/// - After writing, a lost confirmation
+///   ([`lose_next_begin_confirmation`](Self::lose_next_begin_confirmation)): begin writes the
+///   row and then fails, and the store completes an allowed row as `error`, as the Postgres
+///   store's finish pool does.
+/// - Slowly: both operations can be held at a [`Gate`] to stand in for a slow database without
+///   a real sleep, and finish can answer past the answer budget and write later
+///   ([`finish_past_answer_budget`](Self::finish_past_answer_budget)).
+/// - By losing the process between run and finish
+///   ([`forget_finishes`](Self::forget_finishes)). The store can be shared by [`Arc`] with a
+///   second gateway built over it, which sees the row still open.
 ///
 /// Like the Postgres store, it sets each row's time at begin and deadline itself, from its
 /// own clock and never from the record: the time at begin, plus the begin budget, the call
-/// deadline the record carries and the finish deadline. A row of kind `list` has no deadline.
-/// The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW) unless set.
+/// deadline the record carries and the finish deadline, in whole milliseconds. A row of kind
+/// `list` has no deadline. The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW)
+/// unless set.
 ///
 /// List rows, which `list` writes, are kept apart and read back with
 /// [`list_rows`](Self::list_rows). They share identifiers with call rows, as one Postgres table
 /// does: a second list with a known list row's identifier writes nothing and succeeds, and a
 /// list or a begin with the identifier of a row of the other kind fails. A list counts as a
-/// begin for the failure settings and the gate: it fails when a begin would, and is held with
-/// the begins. It is not counted in [`begin_attempts`](Self::begin_attempts).
+/// begin for the failure settings, a lost confirmation and the gate: it fails when a begin
+/// would, and is held with the begins. It is not counted in
+/// [`begin_attempts`](Self::begin_attempts).
 pub struct InMemoryAuditStore {
     state: Mutex<State>,
     clock: Arc<dyn Clock>,
@@ -198,23 +344,22 @@ impl InMemoryAuditStore {
         })
     }
 
-    /// The times for a row begun now. `None` when the deadline is past what a time can hold.
-    fn times_for(&self, record: &AuditRecord) -> Option<Times> {
+    /// The times for a row of `kind` begun now, with `allowance_ms` to its deadline. `None`
+    /// when the deadline is past what a time can hold.
+    fn times_for(&self, kind: RowKind, allowance_ms: u64) -> Option<Times> {
         let begun_at = self.clock.now();
-        let deadline = match record.kind {
-            RowKind::Call => Some(
-                begun_at
-                    .checked_add(self.budgets.begin)?
-                    .checked_add(Duration::from_millis(record.call_deadline_ms))?
-                    .checked_add(self.budgets.finish_deadline)?,
-            ),
+        let deadline = match kind {
+            RowKind::Call => Some(begun_at.checked_add(Duration::from_millis(allowance_ms))?),
             RowKind::List => None,
         };
         Some(Times { begun_at, deadline })
     }
 
+    /// The state, with every late completion whose gate has opened written.
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.settle();
+        state
     }
 
     /// Every row, in the order its begin was written, with its completion once finished.
@@ -282,11 +427,41 @@ impl InMemoryAuditStore {
         self.state().finish_failing = Failing::Always;
     }
 
-    /// Both operations work again.
+    /// The next `begin` or `list` that would succeed writes its row and then fails: its
+    /// confirmation is lost, as when the connection drops after the commit. An allowed call's
+    /// row is then completed as `error` with a latency of zero, as the Postgres store
+    /// completes it on its finish pool. A denial and a list row are complete records already,
+    /// and are left as they are. Later begins work.
+    pub fn lose_next_begin_confirmation(&self) {
+        self.state().confirmation_lost = Failing::Next;
+    }
+
+    /// Every `begin` and `list` loses its confirmation, as
+    /// [`lose_next_begin_confirmation`](Self::lose_next_begin_confirmation) says, until
+    /// [`stop_failing`](Self::stop_failing).
+    pub fn lose_all_begin_confirmations(&self) {
+        self.state().confirmation_lost = Failing::Always;
+    }
+
+    /// Every `finish` from here on is swallowed, until [`stop_failing`](Self::stop_failing):
+    /// it fails and writes nothing, and a completion still being tried past the answer budget
+    /// is dropped. This is the process lost between run and finish. A test drops the gateway
+    /// that ran the call, builds a new one over the same store, and sees the row stay open:
+    /// nothing completes it but the call's own finish.
+    pub fn forget_finishes(&self) {
+        let mut state = self.state();
+        state.finishes_forgotten = true;
+        state.late.clear();
+    }
+
+    /// Every operation works again, and finishes are no longer forgotten. A store holding
+    /// calls at a gate, or answering past the answer budget, still does.
     pub fn stop_failing(&self) {
         let mut state = self.state();
         state.begin_failing = Failing::Never;
         state.finish_failing = Failing::Never;
+        state.confirmation_lost = Failing::Never;
+        state.finishes_forgotten = false;
     }
 
     /// Holds every `begin` from here on at a gate, which is returned. The row is not written,
@@ -303,10 +478,25 @@ impl InMemoryAuditStore {
         self.state().finish_gate = Some(gate.clone());
         gate
     }
+
+    /// Every `finish` from here on, while the returned gate is closed, takes longer than the
+    /// answer budget: it fails at once with an error naming the budget, and its completion is
+    /// written once the gate opens, as the Postgres store keeps trying on a task of its own
+    /// after the answer has gone out. No time passes; the gate stands in for it. Once the
+    /// gate is open, finish writes at once again.
+    pub fn finish_past_answer_budget(&self) -> Gate {
+        let gate = Gate::closed();
+        self.state().answer_gate = Some(gate.clone());
+        gate
+    }
 }
 
 fn down() -> StoreError {
     "the in-memory audit store was told to fail".into()
+}
+
+fn lost() -> StoreError {
+    "the in-memory audit store wrote the row and was told to lose the confirmation".into()
 }
 
 impl AuditStore for InMemoryAuditStore {
@@ -321,6 +511,7 @@ impl AuditStore for InMemoryAuditStore {
             state.begin_gate.clone()
         };
         Box::pin(async move {
+            let allowance_ms = refused_at_begin(record, &self.budgets)?;
             if let Some(gate) = gate {
                 gate.wait().await;
             }
@@ -334,18 +525,31 @@ impl AuditStore for InMemoryAuditStore {
             match state.rows.iter().find(|(id, _, _)| id == row) {
                 None => {
                     let times = self
-                        .times_for(record)
+                        .times_for(record.kind, allowance_ms)
                         .ok_or_else(|| StoreError::from("the row's deadline is out of range"))?;
                     state.rows.push((row.clone(), record.clone(), times));
-                    Ok(())
                 }
-                Some((_, stored, _)) if stored.decision == record.decision => Ok(()),
-                Some(_) => Err(format!(
-                    "audit row {} was already begun, with another decision",
-                    row.as_str()
-                )
-                .into()),
+                Some((_, stored, _)) if stored.decision == record.decision => {}
+                Some(_) => {
+                    return Err(format!(
+                        "audit row {} was already begun, with another decision",
+                        row.as_str()
+                    )
+                    .into());
+                }
             }
+            if state.confirmation_lost.take() {
+                if record.decision == DecisionKind::Allow {
+                    let error = Completion {
+                        outcome: Outcome::Error,
+                        latency_ms: 0,
+                    };
+                    // A row completed before keeps its completion, as complete_once keeps it.
+                    let _ = state.complete(row, &error);
+                }
+                return Err(lost());
+            }
+            Ok(())
         })
     }
 
@@ -359,26 +563,30 @@ impl AuditStore for InMemoryAuditStore {
             state.finish_gate.clone()
         };
         Box::pin(async move {
+            refused_at_finish(completion.completion())?;
             if let Some(gate) = gate {
                 gate.wait().await;
             }
             let mut state = self.state();
+            if state.finishes_forgotten {
+                return Err("the process that would have finished this row was lost".into());
+            }
             if state.finish_failing.take() {
                 return Err(down());
             }
-            let (_, row, _) = state
-                .rows
-                .iter_mut()
-                .find(|(id, _, _)| id == completion.row())
-                .ok_or_else(|| StoreError::from("no such row"))?;
-            match &row.completion {
-                None => {
-                    row.completion = Some(completion.completion().clone());
-                    Ok(())
-                }
-                Some(written) if written == completion.completion() => Ok(()),
-                Some(_) => Err("the row was already finished, with a different completion".into()),
+            if let Some(gate) = state.answer_gate.clone().filter(|gate| !gate.is_open()) {
+                state.late.push(Late {
+                    gate,
+                    row: completion.row().clone(),
+                    completion: completion.completion().clone(),
+                });
+                return Err(format!(
+                    "audit row {} was not completed within the answer budget; the store is still trying",
+                    completion.row().as_str()
+                )
+                .into());
             }
+            state.complete(completion.row(), completion.completion())
         })
     }
 
@@ -389,6 +597,7 @@ impl AuditStore for InMemoryAuditStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let gate = self.state().begin_gate.clone();
         Box::pin(async move {
+            refused_at_list(record)?;
             if let Some(gate) = gate {
                 gate.wait().await;
             }
@@ -403,6 +612,9 @@ impl AuditStore for InMemoryAuditStore {
                 state
                     .list_rows
                     .push((row.clone(), record.clone(), self.clock.now()));
+            }
+            if state.confirmation_lost.take() {
+                return Err(lost());
             }
             Ok(())
         })

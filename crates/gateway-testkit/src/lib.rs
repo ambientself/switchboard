@@ -5,8 +5,11 @@
 //! Each fake can be told to fail, and each way it fails has a test in this crate that shows it:
 //!
 //! - [`InMemoryAuditStore`] keeps rows in order under the identifier begin was given, sets
-//!   each row's deadline from its own clock as the Postgres store does, can fail or hold
-//!   `begin` and `finish`, and [`row_start`] makes a fresh identifier for a test.
+//!   each row's deadline from its own clock as the Postgres store does, and refuses the
+//!   records that store cannot hold. It can fail or hold `begin` and `finish`, lose a begin's
+//!   confirmation after writing, answer a finish past the answer budget and write it later,
+//!   and forget finishes as a lost process would. [`row_start`] makes a fresh identifier for a
+//!   test.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
 //!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a `propose` tool that acts only on drafts it
