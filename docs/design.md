@@ -1129,7 +1129,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   process between run and finish, and keep the answer budget, so the contract suite runs on
   it. Already built for both test stores, the core's and the harness's: an identical second
   completion is accepted, and a different one is refused with the first standing. The fault
-  modes are not built.
+  modes are built in the harness's store: a lost confirmation writes the row and fails, and
+  an allowed row is then completed as `error` with a latency of zero; a finish past the answer
+  budget fails at once and writes when a gate opens; and forgotten finishes leave a row open
+  for a new gateway over the same store. It also refuses the records the Postgres store
+  cannot hold, and works out a deadline in whole milliseconds without wrapping, as that store
+  does. The contract suite itself is not built.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped, but no outcome carries a vendor reference yet.
@@ -1314,7 +1319,7 @@ that can do what Postgres cannot tests nothing.
 1. `begin` returns `Ok` only once the row is stored, and is idempotent by identifier.
 2. The stored row is exactly the record given, including the resources. A record the store
    cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
-   leaves no row. The fake must refuse the same records, which it does not yet.
+   leaves no row. The fake must refuse the same records.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the
