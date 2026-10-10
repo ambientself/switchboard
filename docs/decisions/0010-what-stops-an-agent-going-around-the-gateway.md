@@ -146,6 +146,11 @@ and checks:
   permissions, in the workload's, the gateway's or a server's namespace or across the cluster.
 - the cloud identity bound to the ServiceAccount, if any, for the owner to check.
 
+*Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):* the
+operator step also needs `get` and `list` on Roles, ClusterRoles, RoleBindings and
+ClusterRoleBindings across the cluster, so that it can find grants limited by `resourceNames`
+(#60).
+
 **The probe** runs as an ephemeral container in that pod, so it has the pod's network
 namespace, ServiceAccount and labels. It needs nothing from the agent's image. Copying a binary
 in was not taken: it needs `pods/exec`, and `tar` in the image. The probe sends no credential
@@ -255,6 +260,13 @@ recorded as open, and its owner and the register's owner are told. Each environm
 current evidence does not show that server refused has the governed path claim until it is
 closed, and the register's owner records which. Its tools stay listed: withdrawing them closes
 the governed route and leaves the open one.
+
+*Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):*
+milestone 3 has no registry workload. The probe runs in each gateway replica's drift pass, and
+registration is the approval pull request, which records a probe made by `switchboard probe`
+before the entry loads. The probe ServiceAccount's token, and each team service identity's, come
+by TokenRequest through a token-writer sidecar in the gateway pod. That sidecar is the only
+container holding a token the API server accepts.
 
 A self-built server identifies the gateway by a token for one of the gateway's own workload
 identities, with the server as its audience. It accepts only those identities: one for each
