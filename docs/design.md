@@ -1186,8 +1186,15 @@ off only in a development build, with CI's check of the release artifact; and th
   each one through `on_given_up`, and the gateway logs each report as `audit_row_given_up` at
   `ERROR`, with the row, the outcome's kind and the cause. A different second completion is
   told apart only by its cause, and is not counted apart.
-- On a disconnect, the connector is not called if it has not been, and a read is cancelled.
-  Today the spawned task always runs to completion.
+- On a disconnect, the connector is not called if it has not been, and a read is cancelled:
+  built (#40). The handler holds a signal that fires when it is dropped, which is what a
+  client going away does, and the answer task is given it. A call whose client has gone once
+  its row is begun is given up through the core's `give_up`: the connector is not called and
+  the row is completed as `error`. A read is run through the core's `run_unless`, which drops
+  the connector's future if the signal fires first and records the read as `error`. Any other
+  classification ignores the signal and runs to completion. Closing a connection at the end
+  of the shutdown grace is a disconnect too. `notifications/cancelled` is still accepted and
+  ignored.
 - The row's identifier in the result's `_meta`, or in `error.data`: built for `tools/call`
   (#40). A result names it under `switchboard/auditRow` in `_meta`, in both eras, beside the
   server's name under 2026-07-28; a denial or an internal error names it as `auditRow` in
@@ -1200,16 +1207,22 @@ off only in a development build, with CI's check of the release artifact; and th
   crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
   and CI builds it with the same command and checks it refuses a `propose` tool. The receipt
   store, audit and identity condition arrives with receipts (#10).
-- An allowed call whose connector is not registered completes its row as `error`, where today
-  the row stays open.
+- An allowed call whose connector is not registered completes its row as `error`: built
+  (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
+  in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
+  reaches it.
 - The key read from its carriers, the tool-use identifier and the named `_meta` field.
 - With identity disabled, reads served with rows whose identity is `disabled` (with #9 and
   #10). Until then the path refuses every `tools/call` and lists nothing, with no row, which
   is stricter.
 - Already built and matching: identity failures write no row and keep the opaque sentence
-  during an audit outage; begin, run and finish run on a spawned task the client cannot
-  cancel; shutdown waits for running answers; and `GET /readyz` fails first on shutdown, while
-  the gateway serves on for its readiness removal before it stops accepting calls (#40).
+  during an audit outage; begin, run and finish still run on a spawned task the client cannot
+  cancel, though a read is now cancelled through the disconnect signal; shutdown waits for
+  running answers; and `GET /readyz` fails first on shutdown, while the gateway serves on for
+  its readiness removal before it stops accepting calls (#40). Once it stops taking
+  connections no answer starts: a request whose body arrives during the shutdown grace is
+  answered 503 and nothing runs, so the grace period the deployments give covers the removal
+  plus one call (#40).
 
 ## 18. Testing
 

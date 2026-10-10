@@ -37,6 +37,15 @@
 //!   it wrote, in the result's `_meta` or in `error.data` (decision 0009), so a person can
 //!   quote it; see [`gateway_mcp::render_with_row`]. It names none when begin failed or audit
 //!   is disabled, because then no row was written under that identifier.
+//! - An allowed call whose connector is not registered is given up: its row is completed as
+//!   `error` and it is answered 500. The boot gates and every reload refuse such a policy, so
+//!   this is a fault in the gateway.
+//!
+//! A client that disconnects is told apart by the [`Disconnect`] `respond` is given (decision
+//! 0009, "Where a call runs"). If it has fired once the row is begun, the connector is not
+//! called and the row is completed as `error`. If it fires while a read runs, the read is
+//! cancelled and recorded as `error`. A side effect runs to completion whatever it does. Either
+//! way the answer is still made; nobody is left to read it.
 //!
 //! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
 //! everything from it, so a registry reload never splits one request across two versions.
@@ -57,7 +66,8 @@
 //! The future [`RequestPath::respond`] returns owns everything it uses and is `Send +
 //! 'static`. The HTTP layer must spawn it as its own task rather than await it on the
 //! request's future: a client that disconnects then cannot stop a call half way, between
-//! running the tool and completing its row.
+//! running the tool and completing its row. A disconnect reaches the call only through the
+//! [`Disconnect`], and only where decision 0009 says it may.
 
 use std::fmt;
 use std::future::Future;
@@ -78,6 +88,7 @@ use gateway_mcp::{
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
@@ -102,6 +113,93 @@ pub const AUDIT_DISABLED_NOTE: &str =
 
 /// The name the gateway gives itself in `serverInfo`.
 pub const SERVER_NAME: &str = "switchboard";
+
+/// What a call is answered with when its client disconnected before it ran. Nobody is left to
+/// read it; its row is completed as `error`.
+pub const DISCONNECTED_BEFORE_RUN: &str =
+    "The caller disconnected before the call ran, so nothing ran.";
+
+/// What a call whose connector is not registered is answered with, 500.
+const NO_CONNECTOR: &str =
+    "The gateway has no connector for this tool. This is a fault in the gateway's configuration.";
+
+/// Whether the client that sent a request has disconnected, for [`RequestPath::respond`].
+///
+/// [`Disconnect::pair`] makes one with the [`DisconnectOnDrop`] that fires it, and
+/// [`Disconnect::never`] one that never fires. It works with or without an async runtime.
+#[derive(Debug)]
+pub struct Disconnect(Signal);
+
+#[derive(Debug)]
+enum Signal {
+    /// Not fired yet, and it may.
+    Waiting(oneshot::Receiver<()>),
+    /// Fired.
+    Fired,
+    /// It never will: it was disarmed, or made by [`Disconnect::never`].
+    Never,
+}
+
+/// Fires its [`Disconnect`] when it is dropped, unless it was disarmed first. The HTTP layer
+/// holds it in the request's handler, whose future is dropped when the client goes away.
+#[derive(Debug)]
+pub struct DisconnectOnDrop(Option<oneshot::Sender<()>>);
+
+impl Disconnect {
+    /// A signal and what fires it.
+    pub fn pair() -> (DisconnectOnDrop, Disconnect) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            DisconnectOnDrop(Some(sender)),
+            Disconnect(Signal::Waiting(receiver)),
+        )
+    }
+
+    /// A signal that never fires: for a caller with no connection to lose.
+    pub fn never() -> Self {
+        Self(Signal::Never)
+    }
+
+    /// Whether it has fired.
+    fn has_fired(&mut self) -> bool {
+        if let Signal::Waiting(receiver) = &mut self.0 {
+            match receiver.try_recv() {
+                Ok(()) => self.0 = Signal::Fired,
+                Err(oneshot::error::TryRecvError::Closed) => self.0 = Signal::Never,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        matches!(self.0, Signal::Fired)
+    }
+
+    /// Completes when it fires, and never if it cannot.
+    async fn fired(self) {
+        let fired = match self.0 {
+            Signal::Waiting(receiver) => receiver.await.is_ok(),
+            Signal::Fired => true,
+            Signal::Never => false,
+        };
+        if !fired {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl DisconnectOnDrop {
+    /// The client is still here: dropping this no longer fires the signal.
+    pub fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DisconnectOnDrop {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            // The receiver may be gone already, with the answer it belonged to.
+            let _ = sender.send(());
+        }
+    }
+}
 
 /// The request path over one configuration that passed the boot gates. Cheap to clone; clones
 /// share the gates.
@@ -257,13 +355,15 @@ impl RequestPath {
     /// `surface` is the surface the URL named. The parse runs now; the future owns everything
     /// else it needs and is `Send + 'static`, so the HTTP layer can spawn it, and should, so
     /// that a client that goes away cannot cancel a call between running the tool and
-    /// completing its row.
+    /// completing its row. `disconnect` fires when the client goes away; see the
+    /// [module documentation](self) for what that does to a call.
     pub fn respond(
         &self,
         admitted: Admitted,
         surface: &str,
         headers: &HeaderMap,
         body: &[u8],
+        disconnect: Disconnect,
     ) -> impl Future<Output = HttpResponse> + Send + 'static + use<> {
         let parsed = gateway_mcp::parse(&Method::POST, headers, body);
         let path = self.clone();
@@ -286,14 +386,15 @@ impl RequestPath {
                     HttpResponse::accepted()
                 }
                 Ok(Inbound::Request(request)) => {
-                    path.answer(caller, source, surface, request).await
+                    path.answer(caller, source, surface, request, disconnect)
+                        .await
                 }
             }
         }
     }
 
     /// [`admit`](Self::admit), then [`respond`](Self::respond): the whole path, for a caller
-    /// that already holds the body.
+    /// that already holds the body. There is no connection to lose, so nothing is cancelled.
     pub async fn handle(
         &self,
         method: &Method,
@@ -306,7 +407,8 @@ impl RequestPath {
             Ok(admitted) => admitted,
             Err(response) => return response,
         };
-        self.respond(admitted, surface, headers, body).await
+        self.respond(admitted, surface, headers, body, Disconnect::never())
+            .await
     }
 
     /// Counts `event` and queues it for the log. Never waits.
@@ -320,6 +422,7 @@ impl RequestPath {
         source: Source,
         surface: SurfaceName,
         request: Request,
+        disconnect: Disconnect,
     ) -> HttpResponse {
         let Request { id, era, call } = request;
         let deployment = || self.inner.gates.deployment().clone();
@@ -349,7 +452,7 @@ impl RequestPath {
                 (Reply::Discovered, None)
             }
             Call::ToolsList => self.list(caller, surface).await,
-            Call::ToolsCall(call) => self.call(caller, surface, call).await,
+            Call::ToolsCall(call) => self.call(caller, surface, call, disconnect).await,
         };
         let row = row.as_ref().map(AuditRowId::as_str);
         gateway_mcp::render_with_row(&self.inner.server, era, &id, reply, row)
@@ -414,6 +517,7 @@ impl RequestPath {
         caller: Caller,
         surface: SurfaceName,
         call: ToolCall,
+        disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
         let Caller::Proved(principal) = caller else {
@@ -424,7 +528,8 @@ impl RequestPath {
             return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);
         };
         let policy = gates.policy();
-        self.decide_and_run(&policy, principal, surface, call).await
+        self.decide_and_run(&policy, principal, surface, call, disconnect)
+            .await
     }
 }
 
@@ -445,13 +550,14 @@ fn entries(policy: &ServedPolicy, tools: &[ApprovedTool]) -> Vec<ToolEntry> {
 
 impl RequestPath {
     /// The answer to a call from a proved caller, and the row to name in it: the denial's row,
-    /// or the row of the call that ran, whether or not it could be completed.
+    /// or the row of the call that ran or was given up, whether or not it could be completed.
     async fn decide_and_run(
         &self,
         policy: &ServedPolicy,
         principal: Proved<Principal>,
         surface: SurfaceName,
         call: ToolCall,
+        mut disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
         let snapshot = policy.snapshot();
@@ -516,19 +622,45 @@ impl RequestPath {
         let row = guard.row().clone();
         let named = self.quotable(&row);
         let tool = guard.tool().name.clone();
+        // Decision 0009: a client gone before the connector is called is not called for.
+        if disconnect.has_fired() {
+            let gave_up = audit::give_up(store, guard).await;
+            if let Some(failure) = gave_up.failure() {
+                tracing::error!(
+                    %failure,
+                    row = row.as_str(),
+                    "a tool call was given up but its audit row could not be completed"
+                );
+            }
+            tracing::info!(
+                row = row.as_str(),
+                %tool,
+                decide_us,
+                begin_us,
+                "gave up a tool call: its client disconnected before it ran, and its row was \
+                 completed as error"
+            );
+            return (Reply::ToolError(DISCONNECTED_BEFORE_RUN.to_owned()), named);
+        }
         let Some(registered) = gates.registered(&guard.tool().connector) else {
-            // The boot gates refuse a tool on a surface whose connector is not registered.
+            // The boot gates and every reload refuse a tool on a surface whose connector is not
+            // registered, so this is a fault in the gateway. Nothing can run; the row is
+            // completed as error rather than left open.
+            let connector = guard.tool().connector.clone();
+            let gave_up = audit::give_up(store, guard).await;
             tracing::error!(
-                row = guard.row().as_str(),
-                connector = %guard.tool().connector,
-                "an allowed tool's connector is not registered; its row stays open"
+                row = row.as_str(),
+                %connector,
+                "an allowed tool's connector is not registered; its row was completed as error"
             );
-            return (
-                Reply::Internal(
-                    "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
-                ),
-                named,
-            );
+            if let Some(failure) = gave_up.failure() {
+                tracing::error!(
+                    %failure,
+                    row = row.as_str(),
+                    "a tool call was given up but its audit row could not be completed"
+                );
+            }
+            return (Reply::Internal(NO_CONNECTOR.to_owned()), named);
         };
         let results = Some(registered.results);
         // A proxied server's call is checked against the schema of the policy this request
@@ -548,7 +680,8 @@ impl RequestPath {
 
         let started = gates.clock().now();
         let running = Instant::now();
-        let ran = audit::run(connector, guard).await;
+        // A read is cancelled if its client goes; a side effect runs to completion.
+        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;
         let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
         // No answer budget: the core gives out the answer when the store's finish returns.
@@ -798,6 +931,139 @@ mod tests {
         assert_eq!(kept("toolu\u{1b}[31m"), None);
         assert_eq!(kept("toolu_é"), None);
         assert_eq!(bounded_tool_use_id(None), None);
+    }
+
+    struct FixtureResources;
+
+    impl crate::ResourceAdapter for FixtureResources {
+        fn resources(&self, tool: &ApprovedTool, arguments: &Value) -> Resources {
+            gateway_testkit::FixtureConnector::resources_of(tool.name.as_str(), arguments)
+        }
+    }
+
+    /// The boot gates and every reload refuse a policy serving a tool whose connector is not
+    /// registered, so this is reached only by taking the connector out of gates that passed.
+    #[test]
+    fn an_allowed_call_whose_connector_is_not_registered_completes_its_row_as_error() {
+        use gateway_core::audit::{Completion, DecisionKind, Outcome};
+        use gateway_testkit::{
+            AUDIENCE, CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector,
+            InMemoryAuditStore, SCOPED_READ_TOOL, SURFACE_READ, TEAM_A, TEAM_A_SUBJECT,
+        };
+        use serde_json::json;
+
+        let fixture = Fixture::new().unwrap();
+        let connector = Arc::new(FixtureConnector::new(Arc::new(FakeCredentialSource::new())));
+        let store = Arc::new(InMemoryAuditStore::new());
+        let issuer = &fixture.workload_issuer;
+        let definition = |name: &str| {
+            json!({
+                "name": name,
+                "description": "A fixture tool.",
+                "input_schema": {"type": "object"},
+            })
+        };
+        let config: crate::Config = serde_json::from_value(json!({
+            "deployment": "path-unit-test",
+            "identity": {"enforce": [{
+                "issuer": issuer.issuer(),
+                "audiences": [AUDIENCE],
+                "kind": {"workload": {"subjects": {TEAM_A_SUBJECT: TEAM_A}}},
+                "algorithm": "ES256",
+                "keys": serde_json::to_value(issuer.jwk_set()).unwrap(),
+                "max_lifetime_secs": gateway_testkit::DEFAULT_MAX_LIFETIME,
+                "leeway_secs": gateway_testkit::DEFAULT_LEEWAY,
+            }]},
+            "audit": {},
+            "http": {"allowed_hosts": ["localhost"]},
+            "policy": gateway_testkit::policy_data(),
+            "catalog": [
+                definition(gateway_testkit::READ_TOOL),
+                definition(gateway_testkit::DRAFT_TOOL),
+                definition(gateway_testkit::WRITE_TOOL),
+                definition(SCOPED_READ_TOOL),
+            ],
+            "profiles": {"workloads": [{
+                "issuer": gateway_testkit::WORKLOAD_ISSUER,
+                "team": TEAM_A,
+                "profile": gateway_testkit::PROFILE_TEAM_A,
+            }]},
+        }))
+        .unwrap();
+        let wiring = crate::Wiring::new(Arc::new(fixture.clock.clone()))
+            .audit_store(store.clone())
+            .connector(CONNECTOR, connector.clone(), Arc::new(FixtureResources));
+        let gates = crate::boot::check(config, wiring)
+            .unwrap()
+            .without_connector(&CONNECTOR.into());
+        let path = RequestPath::new(gates);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        let token = format!("Bearer {}", fixture.token(Caller::TeamA));
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&token).unwrap());
+        // The scoped read tool checks its own scope, so a call that names no resource reaches
+        // the connector lookup rather than being denied for naming none.
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": SCOPED_READ_TOOL, "arguments": {}}});
+        let response = gateway_testkit::block_on(path.handle(
+            &Method::POST,
+            &headers,
+            SURFACE_READ,
+            body.to_string().as_bytes(),
+        ));
+
+        assert_eq!(response.status, http::StatusCode::INTERNAL_SERVER_ERROR);
+        let answer: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(answer["error"]["code"], json!(gateway_mcp::INTERNAL_ERROR));
+        assert_eq!(answer["error"]["message"], json!(NO_CONNECTOR));
+        assert!(connector.received().is_empty(), "a connector was called");
+        let rows = store.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decision, DecisionKind::Allow);
+        assert_eq!(
+            rows[0].completion,
+            Some(Completion {
+                outcome: Outcome::Error,
+                latency_ms: 0,
+            }),
+            "the row was left open"
+        );
+        assert_eq!(store.finish_attempts(), 1);
+        let row = answer["error"]["data"][gateway_mcp::AUDIT_ROW_DATA]
+            .as_str()
+            .expect("the answer names its row");
+        assert_eq!(
+            store
+                .row_with_id(&AuditRowId::new(row))
+                .and_then(|row| row.completion),
+            rows[0].completion
+        );
+    }
+
+    #[test]
+    fn a_disconnect_fires_when_dropped_and_not_once_disarmed() {
+        let (connected, mut disconnect) = Disconnect::pair();
+        assert!(!disconnect.has_fired());
+        drop(connected);
+        assert!(disconnect.has_fired());
+
+        let (connected, mut disconnect) = Disconnect::pair();
+        connected.disarm();
+        assert!(!disconnect.has_fired());
+        let fired = std::pin::pin!(disconnect.fired());
+        assert!(
+            gateway_testkit::poll_once(fired).is_pending(),
+            "a disarmed signal fired"
+        );
+
+        let (connected, disconnect) = Disconnect::pair();
+        drop(connected);
+        assert!(gateway_testkit::poll_once(std::pin::pin!(disconnect.fired())).is_ready());
+        assert!(
+            gateway_testkit::poll_once(std::pin::pin!(Disconnect::never().fired())).is_pending()
+        );
     }
 
     #[test]

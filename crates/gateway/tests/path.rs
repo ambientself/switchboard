@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use gateway::boot::{DEFAULT_CALL_DEADLINE, UNNAMED_INSTANCE};
 use gateway::{
-    AUDIT_DISABLED_NOTE, Config, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
-    RequestPath, ResourceAdapter, Source, Telemetry, TelemetryCounts, Wiring, boot,
+    AUDIT_DISABLED_NOTE, Config, Disconnect, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE,
+    MAX_TOOL_USE_ID, RequestPath, ResourceAdapter, Source, Telemetry, TelemetryCounts, Wiring,
+    boot,
 };
 use gateway_core::audit::{
     AuditRowId, Completion, DecisionKind, Outcome, RecordedResources, RowKind,
@@ -901,9 +902,13 @@ fn the_row_is_written_before_the_tool_runs_and_finished_before_the_answer() {
             .path
             .admit(&request.method, &request.headers, &Source::default())
             .unwrap();
-        world
-            .path
-            .respond(admitted, SURFACE_ALL, &request.headers, &request.body)
+        world.path.respond(
+            admitted,
+            SURFACE_ALL,
+            &request.headers,
+            &request.body,
+            Disconnect::never(),
+        )
     };
 
     // A connector that hangs: the row already exists, with an empty outcome.
@@ -966,6 +971,7 @@ fn the_answering_future_can_be_spawned() {
         SURFACE_ALL,
         &request.headers,
         &request.body,
+        Disconnect::never(),
     ));
     // The request it was made from is gone; the future still answers.
     drop(request);
@@ -1591,11 +1597,13 @@ fn the_list_row_is_written_before_the_answer() {
         .path
         .admit(&request.method, &request.headers, &Source::default())
         .unwrap();
-    let mut list = pin!(
-        world
-            .path
-            .respond(admitted, SURFACE_ALL, &request.headers, &request.body)
-    );
+    let mut list = pin!(world.path.respond(
+        admitted,
+        SURFACE_ALL,
+        &request.headers,
+        &request.body,
+        Disconnect::never()
+    ));
     assert!(
         poll_once(list.as_mut()).is_pending(),
         "answered before the row was written"

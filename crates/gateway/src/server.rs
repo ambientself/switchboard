@@ -21,7 +21,10 @@
 //!    ran, and the connection is closed.
 //! 7. **The answer** ([`RequestPath::respond`]) runs on its own task, which the handler waits
 //!    for. A client that disconnects drops the handler, but not that task, so a tool call that
-//!    started still completes its audit row.
+//!    started still completes its audit row. Dropping the handler fires the answer's
+//!    [`Disconnect`]: a call whose connector has not been called is given up, and a read that
+//!    is running is cancelled, each recorded as `error`; a side effect runs on (decision 0009).
+//!    An answer that completes disarms it.
 //!
 //! `GET /readyz` is the readiness check. It answers 200 `ready` while the gateway serves and 503
 //! once shutting down has begun; any other method is 405. It runs none of the steps above: a
@@ -33,9 +36,17 @@
 //! service before anything is refused. Then it stops taking connections, and waits up to
 //! [`SHUTDOWN_GRACE`] for those still open, such as one whose client stopped part way through a
 //! request. It then closes any still open, so a request on them that has not started its answer
-//! never will. Then it waits for the answer tasks, however long they take: a call whose client
-//! has gone is still running, and a process that exited under it would leave its row open.
-//! Last, it closes the telemetry queue and writes the events still in it.
+//! never will. Closing a connection is a disconnect like any other: a read still running on it
+//! is cancelled and recorded as `error`. Then it waits for the answer tasks, however long they
+//! take: a call whose client has gone is still running, and a process that exited under it
+//! would leave its row open. Last, it closes the telemetry queue and writes the events still in
+//! it.
+//!
+//! No answer starts once the gateway has stopped taking connections. A request on a connection
+//! still open, such as one whose body arrives during the grace, is answered 503 with nothing
+//! run. So every call starts within the readiness removal, and the longest a call can still
+//! need after shutting down begins is the removal plus one call's begin, run and finish, which
+//! the deployment's grace period is sized for.
 //!
 //! The request path's telemetry events name the surface and the connection's remote address.
 //! The surface is read from the URL before identity runs, so a refused caller's event names
@@ -73,7 +84,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::boot::{GateState, Gates};
-use crate::path::{RequestPath, Source};
+use crate::path::{Disconnect, RequestPath, Source};
 use crate::telemetry::{Drain, TELEMETRY_QUEUE, Telemetry};
 
 /// The largest request body read, in bytes: 1 MiB.
@@ -89,8 +100,13 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long shutting down waits for connections still open before it closes them.
-/// Answer tasks already running are waited for however long they take.
+/// Answer tasks already running are waited for however long they take. No answer starts in
+/// it: a request that reaches its answer then is refused with [`SHUTTING_DOWN`].
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// What a request that reaches its answer once the gateway has stopped taking connections is
+/// refused with, 503.
+pub const SHUTTING_DOWN: &str = "Service unavailable: the gateway is shutting down, so nothing ran";
 
 /// How long the gateway goes on serving after its readiness check starts failing, before it
 /// stops taking connections: long enough for a readiness probe to see the failure and take the
@@ -198,11 +214,13 @@ where
     let reminder = tokio::spawn(remind(path.clone()));
     let answers = Answers::default();
     let ready = Arc::new(AtomicBool::new(true));
+    let starting = Arc::new(AtomicBool::new(true));
     let router = router(Endpoint {
         path,
         answers: answers.clone(),
         body_read: timeouts.body_read,
         ready: ready.clone(),
+        starting: starting.clone(),
     });
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
@@ -229,6 +247,8 @@ where
     accepting
         .until(&mut tasks, tokio::time::sleep(timeouts.readiness_removal))
         .await;
+    // From here no answer starts, so no call starts after the readiness removal.
+    starting.store(false, Ordering::SeqCst);
     drop(listener);
     reminder.abort();
     tracing::info!(%address, "stopped listening");
@@ -323,7 +343,7 @@ async fn accept_failed(error: &io::Error) {
 }
 
 /// What the endpoint's handlers hold: the request path, the answers it has started, how long a
-/// body may take, and whether the gateway is ready.
+/// body may take, whether the gateway is ready, and whether it still starts answers.
 #[derive(Clone)]
 struct Endpoint {
     path: RequestPath,
@@ -331,6 +351,8 @@ struct Endpoint {
     body_read: Duration,
     /// True until shutting down begins.
     ready: Arc<AtomicBool>,
+    /// True until the gateway stops taking connections.
+    starting: Arc<AtomicBool>,
 }
 
 /// Counts the answer tasks that are running, whether or not anyone is still waiting for them.
@@ -494,7 +516,15 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
             return unreadable();
         }
     };
-    let answering = path.respond(admitted, &surface, &parts.headers, &body);
+    // Nothing awaits between this check and spawning the answer, so an answer either started
+    // before the gateway stopped taking connections or never starts.
+    if !endpoint.starting.load(Ordering::SeqCst) {
+        return shutting_down();
+    }
+    // Held by this handler: if the client goes away, the handler is dropped, and so is this,
+    // which fires the answer's signal. The answer task itself is not dropped.
+    let (connected, disconnect) = Disconnect::pair();
+    let answering = path.respond(admitted, &surface, &parts.headers, &body, disconnect);
     let span = tracing::info_span!("answer", %surface);
     // Its own task, so a client that goes away cannot stop a call between running the tool
     // and completing its row; counted, so that shutting down waits for it. Nothing awaits
@@ -505,7 +535,10 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
         let _running = running;
         answering.await
     };
-    match tokio::spawn(answering.instrument(span)).await {
+    let answered = tokio::spawn(answering.instrument(span)).await;
+    // The answer is done with the client still here.
+    connected.disarm();
+    match answered {
         Ok(response) => response,
         Err(error) => {
             tracing::error!(%error, "the task answering a request failed");
@@ -613,6 +646,26 @@ fn unreadable() -> HttpResponse {
         status: StatusCode::BAD_REQUEST,
         headers: HeaderMap::new(),
         body: Vec::new(),
+    }
+}
+
+/// A request that reached its answer after the gateway stopped taking connections: 503, with a
+/// sentence saying nothing ran.
+fn shutting_down() -> HttpResponse {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {
+            "code": INTERNAL_ERROR,
+            "message": SHUTTING_DOWN,
+        },
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    HttpResponse {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        body: body.to_string().into_bytes(),
     }
 }
 

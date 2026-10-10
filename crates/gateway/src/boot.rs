@@ -435,6 +435,14 @@ impl Gates {
     pub(crate) fn live_policy(&self) -> &LivePolicy {
         &self.policy
     }
+
+    /// These gates with the connector `name` unregistered, while the policy still serves its
+    /// tools: what the boot gates and every reload refuse, for the path's test of it.
+    #[cfg(test)]
+    pub(crate) fn without_connector(mut self, name: &ConnectorName) -> Self {
+        self.connectors.remove(name);
+        self
+    }
 }
 
 /// Runs every boot gate, in the order the [module documentation](self) gives.
