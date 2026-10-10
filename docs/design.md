@@ -1395,15 +1395,19 @@ that can do what Postgres cannot tests nothing.
    its own receipt, runs once, and is not refused as reuse. A begin whose confirmation was lost
    on every attempt leaves its row completed as `error` and its receipt `not_performed`.
 
-Items 1 to 4, and of item 5 that a `tools/list` row is stored complete with no deadline, are
-built. The test functions are in `crates/gateway-testkit/src/contract.rs`. Each takes a
-`ContractStore`: the store, a read-back of a row as the store holds it, and the store's budgets.
-`crates/gateway-testkit/tests/contract.rs` runs them on the in-memory store, and
-`crates/audit-postgres/src/tests/contract.rs` on the Postgres store, reading rows back as the
-superuser. Like the other Postgres tests, that runner is skipped without a test database, and
-CI's Postgres job fails on a skip. The read-backs are equally strict: the whole record, its kind
-and completion, whether the time at begin and the deadline were set, and the deadline less the
-time at begin. Each expectation is written to what Postgres does. The open-row query of item 5
+Items 1 to 3 are built. Of item 4, the suite checks that a call row's time at begin comes from
+the store's clock and that its deadline is that time plus the begin budget, the call deadline
+and the finish deadline. That times an insert carries are overwritten cannot be tried through
+the store's interface, whose callers pass no times, so it stays in the Postgres schema tests. Of
+item 5, a `tools/list` row stored complete with no deadline is built. The test functions are in
+`crates/gateway-testkit/src/contract.rs`. Each takes a `ContractStore`: the store, a read-back
+of a row as the store holds it, the budgets the runner gave the store, and the time on the
+store's clock. `crates/gateway-testkit/tests/contract.rs` runs them on the in-memory store, and
+`crates/audit-postgres/src/tests/contract.rs` on the Postgres store, reading rows back and the
+database's clock as the superuser. Like the other Postgres tests, that runner is skipped without
+a test database, and CI's Postgres job fails on a skip. The read-backs are equally strict: the
+whole record, its kind and completion, the time at begin, whether the deadline was set, and the
+deadline less the time at begin. Each expectation is written to what Postgres does. The open-row query of item 5
 is tested on Postgres alone for now (#47), and item 6 waits for receipts. The fault modes below
 are each store's own, and keep their own tests.
 

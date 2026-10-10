@@ -1,8 +1,11 @@
 //! The audit store contract suite on the in-memory store, in the per-change loop. The Postgres
 //! store runs the same functions in its own crate's tests.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use gateway_core::AuditStore;
+use gateway_core::audit::AuditRowId;
+use gateway_testkit::contract::{ContractStore, StoredRow};
 use gateway_testkit::{InMemoryAuditStore, StoreBudgets, block_on, contract};
 
 /// Budgets other than the defaults, so a store that ignores the ones it was given is caught.
@@ -11,12 +14,38 @@ const BUDGETS: StoreBudgets = StoreBudgets {
     finish_deadline: Duration::from_secs(45),
 };
 
+/// The in-memory store given [`BUDGETS`]. It answers the suite with [`BUDGETS`], not with the
+/// budgets the store holds, so a store that ignored them would fail the deadline cases.
+struct InMemory {
+    store: InMemoryAuditStore,
+}
+
+impl ContractStore for InMemory {
+    fn store(&self) -> &dyn AuditStore {
+        &self.store
+    }
+
+    async fn stored(&self, row: &AuditRowId) -> Option<StoredRow> {
+        ContractStore::stored(&self.store, row).await
+    }
+
+    fn budgets(&self) -> StoreBudgets {
+        BUDGETS
+    }
+
+    async fn now(&self) -> SystemTime {
+        ContractStore::now(&self.store).await
+    }
+}
+
 macro_rules! contract {
     ($($name:ident),* $(,)?) => {
         $(
             #[test]
             fn $name() {
-                block_on(contract::$name(&InMemoryAuditStore::new().with_budgets(BUDGETS)));
+                block_on(contract::$name(&InMemory {
+                    store: InMemoryAuditStore::new().with_budgets(BUDGETS),
+                }));
             }
         )*
     };

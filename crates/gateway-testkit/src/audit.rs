@@ -506,6 +506,11 @@ impl InMemoryAuditStore {
         self.budgets
     }
 
+    /// The time on the clock the store reads for a row's times.
+    pub(crate) fn store_now(&self) -> SystemTime {
+        self.clock.now()
+    }
+
     /// Every row, in the order its begin was written, with its completion once finished.
     pub fn rows(&self) -> Vec<AuditRecord> {
         self.state()

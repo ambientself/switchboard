@@ -2,7 +2,7 @@
 //! the testkit runs on its in-memory store. Rows are read back as the server's superuser, since
 //! the gateway's role cannot read who called what.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::AuditStore;
 use gateway_core::audit::{AuditRowId, RowKind};
@@ -44,7 +44,7 @@ impl ContractStore for Postgres {
                         proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                         proved_delegation_team, claimed_acting_person, claimed_team,
                         outcome, outcome_sentence, latency_ms, listed_tools, listed_omitted,
-                        begun_at IS NOT NULL AS begun_at_set,
+                        (extract(epoch FROM begun_at) * 1000000)::bigint AS begun_at_micros,
                         deadline IS NOT NULL AS deadline_set,
                         (extract(epoch FROM deadline - begun_at) * 1000000)::bigint
                             AS deadline_micros
@@ -141,7 +141,9 @@ impl ContractStore for Postgres {
             record,
             kind,
             completion: completion.map(|completion| serde_json::from_value(completion).unwrap()),
-            begun_at_set: row.get("begun_at_set"),
+            begun_at: row
+                .get::<_, Option<i64>>("begun_at_micros")
+                .map(micros_since_epoch),
             deadline_set: row.get("deadline_set"),
             deadline_after_begin: row
                 .get::<_, Option<i64>>("deadline_micros")
@@ -155,6 +157,24 @@ impl ContractStore for Postgres {
             finish_deadline: BUDGETS.finish_deadline,
         }
     }
+
+    /// The database's clock, which `set_times` reads for a row's time at begin.
+    async fn now(&self) -> SystemTime {
+        let now = self
+            .admin
+            .query_one(
+                "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint",
+                &[],
+            )
+            .await
+            .unwrap();
+        micros_since_epoch(now.get(0))
+    }
+}
+
+/// A time Postgres gave in whole microseconds since the epoch.
+fn micros_since_epoch(micros: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_micros(u64::try_from(micros).unwrap())
 }
 
 macro_rules! contract {

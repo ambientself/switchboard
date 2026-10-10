@@ -3,17 +3,21 @@
 //! and against the Postgres store in the slow loop.
 //!
 //! A runner gives each function a [`ContractStore`]: the store, a way to read a row back as the
-//! store holds it, and the store's budgets. The read-back belongs to the runner, not to the
+//! store holds it, the budgets the store was given, and the time on the store's clock. The
+//! read-back belongs to the runner, not to the
 //! store's interface, so it sees what that interface hides: the Postgres runner reads as a
 //! superuser, and [`InMemoryAuditStore`]'s reads the store's own state. Each expectation is
 //! written to what the Postgres store does, so a fake that does more than Postgres can fails
 //! it rather than passing a test the real store would fail.
 //!
-//! It covers the suite's items 1 to 4, and of item 5 that a list row is stored complete with
-//! no deadline. The open-row query and receipts are not here: the query is Postgres's alone
-//! for now, and receipts are not built.
+//! It covers the suite's items 1 to 3; of item 4, that a call row's time at begin comes from
+//! the store's clock and its deadline is that time plus the budgets and the call deadline; and
+//! of item 5, that a list row is stored complete with no deadline. That the store overwrites
+//! times an insert carries cannot be tried through [`AuditStore`], whose callers pass no times:
+//! the Postgres schema tests try it. The open-row query and receipts are not here: the query is
+//! Postgres's alone for now, and receipts are not built.
 //!
-//! The functions read no clock and spawn nothing, so they run on whatever executor the runner
+//! The functions read no clock but the store's, through [`ContractStore::now`], and spawn nothing, so they run on whatever executor the runner
 //! has: [`block_on`](crate::block_on) for the in-memory store, a Tokio runtime for Postgres.
 //! They are tests: a broken expectation panics, as an assertion does.
 
@@ -24,7 +28,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ListRecord,
@@ -47,19 +51,25 @@ use crate::fixture::{
     policy_data,
 };
 
-/// What a contract function needs of a store: the store, a read-back, and its budgets.
+/// What a contract function needs of a store: the store, a read-back, its budgets and its clock.
 pub trait ContractStore {
     /// The store under test.
     fn store(&self) -> &dyn AuditStore;
 
     /// The row stored under `row`, read back as the store holds it, or `None` if it holds none.
     /// As strict as the store allows: the whole record, its completion and kind, and whether
-    /// the store set a time at begin and a deadline. A store that holds two rows under one
+    /// the store's time at begin and whether it set a deadline. A store that holds two rows under one
     /// identifier, which Postgres's primary key forbids, makes this panic.
     fn stored(&self, row: &AuditRowId) -> impl Future<Output = Option<StoredRow>>;
 
-    /// The begin budget and the finish deadline the store adds to each call row's deadline.
+    /// The begin budget and the finish deadline the store was given, to add to each call row's
+    /// deadline. A runner answers with the budgets it gave the store, not with what the store
+    /// holds, so a store that ignores the ones it was given is caught.
     fn budgets(&self) -> StoreBudgets;
+
+    /// The time on the store's own clock: database time for Postgres, the store's clock for the
+    /// in-memory store. A row begun between two readings has its time at begin between them.
+    fn now(&self) -> impl Future<Output = SystemTime>;
 }
 
 /// The record a row holds.
@@ -80,8 +90,8 @@ pub struct StoredRow {
     pub kind: RowKind,
     /// The completion, as the store holds it.
     pub completion: Option<Completion>,
-    /// Whether the store set the row's time at begin.
-    pub begun_at_set: bool,
+    /// The row's time at begin, if the store set one.
+    pub begun_at: Option<SystemTime>,
     /// Whether the store set the row's deadline.
     pub deadline_set: bool,
     /// The deadline less the time at begin, where both are set.
@@ -110,7 +120,7 @@ impl ContractStore for InMemoryAuditStore {
             record,
             kind,
             completion,
-            begun_at_set: true,
+            begun_at: Some(begun_at),
             deadline_set: deadline.is_some(),
             deadline_after_begin: deadline.map(|deadline| {
                 deadline
@@ -120,8 +130,14 @@ impl ContractStore for InMemoryAuditStore {
         })
     }
 
+    /// The budgets the store holds. A runner that gave it budgets answers with those instead,
+    /// as `tests/contract.rs` does, or a store that ignored them would pass.
     fn budgets(&self) -> StoreBudgets {
         self.store_budgets()
+    }
+
+    async fn now(&self) -> SystemTime {
+        self.store_now()
     }
 }
 
@@ -428,7 +444,10 @@ pub async fn the_stored_row_is_exactly_the_record(contract: &impl ContractStore)
         assert_eq!(stored.record, StoredRecord::Call(written));
         assert_eq!(stored.kind, RowKind::Call);
         assert_eq!(stored.completion, None);
-        assert!(stored.begun_at_set && stored.deadline_set, "{stored:?}");
+        assert!(
+            stored.begun_at.is_some() && stored.deadline_set,
+            "{stored:?}"
+        );
     }
 }
 
@@ -679,9 +698,9 @@ async fn finish_touches_only_its_completion(
 
 // --- Item 4: the deadline -----------------------------------------------------------------------
 
-/// Each row of kind `call`, allowed or denied, has a time at begin and a deadline the store
-/// sets: its time at begin plus the begin budget, the call deadline and the finish deadline,
-/// each in whole milliseconds.
+/// Each row of kind `call`, allowed or denied, has a time at begin from the store's clock, and a
+/// deadline the store sets: its time at begin plus the begin budget, the call deadline and the
+/// finish deadline, each in whole milliseconds.
 pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline(
     contract: &impl ContractStore,
 ) {
@@ -699,11 +718,18 @@ pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_
             call_deadline_ms,
             ..row_start()
         };
+        let before = contract.now().await;
         let _ = begin(store, &fixture, &start, call, RequestMetadata::default())
             .await
             .expect("begin");
+        let after = contract.now().await;
         let stored = stored(contract, &start.row).await;
-        assert!(stored.begun_at_set, "{stored:?}");
+        let begun_at = stored.begun_at.expect("the row has no time at begin");
+        assert!(
+            before <= begun_at && begun_at <= after,
+            "the time at begin is not from the store's clock: {begun_at:?} is not between \
+             {before:?} and {after:?}"
+        );
         assert!(stored.deadline_set, "{stored:?}");
         let allowance = millis(budgets.begin) + call_deadline_ms + millis(budgets.finish_deadline);
         assert_eq!(
@@ -785,15 +811,17 @@ pub async fn a_list_row_is_stored_complete_with_no_deadline(contract: &impl Cont
     for (position, written) in records.iter().enumerate() {
         let row = row_start().row;
         store.list(&row, written).await.expect("list");
+        let first = stored(contract, &row).await;
+        assert!(first.begun_at.is_some(), "{first:?}");
         let expected = StoredRow {
             record: StoredRecord::List(written.clone()),
             kind: RowKind::List,
             completion: None,
-            begun_at_set: true,
+            begun_at: first.begun_at,
             deadline_set: false,
             deadline_after_begin: None,
         };
-        assert_eq!(stored(contract, &row).await, expected);
+        assert_eq!(first, expected);
 
         let other = &records[(position + 1) % records.len()];
         store.list(&row, other).await.expect("a retried list");
