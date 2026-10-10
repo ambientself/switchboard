@@ -27,23 +27,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ListRecord, Outcome,
-    RequestMetadata, RowKind, RowStart,
+    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ListRecord,
+    MAX_RECORDED_RESOURCES, Outcome, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
-    AuditGuard, AuditRecord, AuditStore, CallContext, Claimed, Decision, RequestedTool, TeamId,
-    ToolUseId, decide,
+    AuditGuard, AuditRecord, AuditStore, CallContext, Claimed, Decision, RequestedTool, Resource,
+    Resources, TeamId, ToolUseId, decide,
 };
 use serde_json::{Value, json};
 
 use crate::audit::{InMemoryAuditStore, StoreBudgets, row_start};
 use crate::connector::{
     DOCUMENT_ARGUMENT, FORBIDDEN_DOCUMENT, FixtureConnector, READ_TOOL, SCOPED_READ_TOOL,
-    WRITE_TOOL,
+    WRITE_TOOL, document,
 };
 use crate::credentials::FakeCredentialSource;
 use crate::fixture::{
-    Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+    Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+    policy_data,
 };
 
 /// What a contract function needs of a store: the store, a read-back, and its budgets.
@@ -577,7 +578,8 @@ pub async fn finish_completes_once_accepts_an_identical_repeat_and_refuses_a_dif
 }
 
 /// `finish` writes the completion and nothing else: the record, its kind, its time at begin
-/// and its deadline are as begin left them, for each outcome.
+/// and its deadline are as begin left them, for each outcome, and for a row that left some of
+/// its resources out.
 pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
     let store = contract.store();
     let fixture = fixture();
@@ -596,38 +598,83 @@ pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
             Ok(Begun::Allowed(guard)) => guard,
             other => panic!("{call:?} was not begun as allowed: {other:?}"),
         };
-        let before = stored(contract, &start.row).await;
         if fails {
             connector.fail_next();
         }
-        let ran = audit::run(&connector, guard).await;
-        let finished = audit::finish(store, ran, latency_ms).await;
-        assert!(finished.failure().is_none(), "{:?}", finished.failure());
-        let outcome = match finished.answer() {
-            Answer::Ok(_) => Outcome::Ok,
-            Answer::Error(_) => Outcome::Error,
-            Answer::Refused(sentence) => Outcome::Refused {
-                sentence: sentence.clone(),
-            },
-            Answer::AuditFailed { .. } => panic!("{:?}", finished.answer()),
-        };
-        let completion = Completion {
-            outcome,
-            latency_ms,
-        };
-        let StoredRecord::Call(record) = before.record.clone() else {
-            panic!("a call was stored as {:?}", before.record);
-        };
-        let expected = StoredRow {
-            record: StoredRecord::Call(AuditRecord {
-                completion: Some(completion.clone()),
-                ..record
-            }),
-            completion: Some(completion),
-            ..before
-        };
-        assert_eq!(stored(contract, &start.row).await, expected, "{call:?}");
+        finish_touches_only_its_completion(contract, &connector, guard, latency_ms).await;
     }
+
+    // Team A may reach more documents than a row names, and the call names them all.
+    let named: Vec<Resource> = (0..MAX_RECORDED_RESOURCES + 3)
+        .map(|n| document(&format!("team-a-{n}")))
+        .collect();
+    let mut data = policy_data();
+    data["limits"]["teams"][TEAM_A] =
+        serde_json::to_value(&named).expect("the documents are a limit");
+    let mut wide = Fixture::new().expect("the fixture builds");
+    wide.policy = serde_json::from_value(data).expect("the policy is well formed");
+    let context = CallContext {
+        caller: wide
+            .caller_context(Caller::TeamA, SURFACE_ALL)
+            .expect("the fixture knows team A"),
+        tool: RequestedTool::new(READ_TOOL),
+        resources: Resources::Named(named),
+    };
+    let begun = audit::begin(
+        store,
+        row_start(),
+        decide(&wide.policy, &context),
+        json!({ DOCUMENT_ARGUMENT: "team-a-0" }),
+        RequestMetadata::default(),
+    )
+    .await;
+    let Ok(Begun::Allowed(guard)) = begun else {
+        panic!("a call naming its own documents was not begun as allowed: {begun:?}");
+    };
+    let StoredRecord::Call(record) = stored(contract, guard.row()).await.record else {
+        panic!("a call was not stored as one");
+    };
+    assert_eq!(record.resources_omitted, 3);
+    finish_touches_only_its_completion(contract, &connector, guard, 5).await;
+}
+
+/// Runs and finishes `guard`, and checks that the row afterwards is the row before with the
+/// completion the core wrote.
+async fn finish_touches_only_its_completion(
+    contract: &impl ContractStore,
+    connector: &FixtureConnector,
+    guard: AuditGuard,
+    latency_ms: u64,
+) {
+    let row = guard.row().clone();
+    let before = stored(contract, &row).await;
+    let ran = audit::run(connector, guard).await;
+    let finished = audit::finish(contract.store(), ran, latency_ms).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    let outcome = match finished.answer() {
+        Answer::Ok(_) => Outcome::Ok,
+        Answer::Error(_) => Outcome::Error,
+        Answer::Refused(sentence) => Outcome::Refused {
+            sentence: sentence.clone(),
+        },
+        Answer::AuditFailed { .. } => panic!("{:?}", finished.answer()),
+    };
+    let completion = Completion {
+        outcome,
+        latency_ms,
+    };
+    let StoredRecord::Call(record) = before.record.clone() else {
+        panic!("a call was stored as {:?}", before.record);
+    };
+    let expected = StoredRow {
+        record: StoredRecord::Call(AuditRecord {
+            completion: Some(completion.clone()),
+            ..record
+        }),
+        completion: Some(completion),
+        ..before
+    };
+    assert_eq!(stored(contract, &row).await, expected);
 }
 
 // --- Item 4: the deadline -----------------------------------------------------------------------
