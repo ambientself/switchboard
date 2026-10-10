@@ -129,7 +129,8 @@ quote it.
   instance knows nothing ran, so it completes that row as `error`, as it will when a guard is
   given up without running (neither is built yet; design section 17), and settles a side
   effect's receipt as `not_performed` in the same transaction. It keeps trying on the finish
-  pool until the finish deadline; if the row never committed, there is nothing to complete. Only
+  pool until the finish deadline, and makes its last attempt then, which may take one answer
+  budget more; if the row had not committed by then, there is nothing to complete. Only
   a row it could not complete by then reads as open once its deadline passes. A row can
   overstate what ran. It never understates it.
 
@@ -238,8 +239,10 @@ times, and the two that refuse updates. Deletion for retention uses a separate r
 
 On termination, an instance first fails its readiness check, then stops accepting calls, and
 lets running calls and their finishes complete. Its termination grace period must be longer
-than the readiness-removal delay plus the begin budget, the call deadline and the finish
-deadline, or every deploy leaves open rows. Kubernetes' default of thirty seconds is shorter
+than the readiness-removal delay plus the begin budget, the call deadline, the finish deadline
+and one answer budget, or every deploy leaves open rows. The answer budget is for the last
+attempt to complete a row whose begin was reported as failed, which is made at the finish
+deadline. Kubernetes' default of thirty seconds is shorter
 than that, so it is set explicitly.
 
 ### Provisional values

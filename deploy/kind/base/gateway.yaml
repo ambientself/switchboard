@@ -25,7 +25,8 @@ spec:
       # Decision 0009, Shutdown: on SIGTERM the gateway fails /readyz and goes on serving for its
       # 8 s readiness removal, which covers the probe below (3 failures, 2 s apart). Only then
       # does it stop taking connections. The grace period must outlast that plus the 2 s begin
-      # budget, the 5 s call deadline and the 30 s finish deadline, 45 s. Otherwise a stop can
+      # budget, the 5 s call deadline, the 30 s finish deadline and a 2 s answer budget for the
+      # last attempt to complete a failed begin's row, 47 s. Otherwise a stop can
       # kill the gateway while it is still completing rows, and they stay open. Kubernetes'
       # default of 30 s is too short; 50 s leaves a margin. crates/demo-checks holds this to
       # the code's values.
