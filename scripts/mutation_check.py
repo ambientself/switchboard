@@ -1118,11 +1118,9 @@ mutate("fake-audit-begin-decision-not-compared", "a begin with a known identifie
 mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clock, not its own, for a row's times", A,
        "        let begun_at = self.clock.now();", "        let begun_at = SystemTime::now();")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
-       "                    let _ = state.complete(row, &error);", "                    let _ = &error;")
-mutate("testkit-lost-confirmation-completes-denial", "a denial whose begin confirmation was lost is completed as error", A,
-       "                if record.decision == DecisionKind::Allow {", "                if true {")
+       "                let _ = state.complete(row, &error);", "                let _ = &error;")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
-       "            if state.confirmation_lost.take() {\n                if record", "            if false {\n                if record")
+       "            if state.confirmation_lost.take() {\n                let error", "            if false {\n                let error")
 mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                return Err(lost());", "            if false {\n                return Err(lost());")
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
@@ -1156,6 +1154,21 @@ mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round 
 mutate("testkit-allowance-rounds-up", "a budget is counted in part milliseconds, not whole ones as Postgres counts it", A,
        "    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)",
        "    u64::try_from(duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 > 0)).unwrap_or(u64::MAX)")
+mutate("testkit-denial-completed", "the in-memory store completes a denial, which complete_once refuses", A,
+       "        if row.decision != DecisionKind::Allow {", "        if false {")
+mutate("testkit-list-row-completed", "the in-memory store finds no row, rather than a listing, when finish names a list row", A,
+       "        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {", "        if false {")
+mutate("testkit-list-kind-completed", "the in-memory store completes a call row of kind list, which complete_once refuses", A,
+       "        if row.kind != RowKind::Call {", "        if false {")
+mutate("testkit-deadline-past-postgres-end", "the in-memory store writes a deadline past what a Postgres time holds", A,
+       "    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {", "    if false {")
+mutate("testkit-deadline-end-accepted", "the in-memory store writes a deadline at the end of what a Postgres time holds", A,
+       "    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {",
+       "    if begun_micros + i128::from(span_micros) > POSTGRES_END_MICROS {")
+mutate("testkit-interval-overflow-accepted", "the in-memory store writes an allowance past what a Postgres interval holds", A,
+       "    if product >= TWO_TO_THE_63 {", "    if false {")
+mutate("testkit-deadline-exact-arithmetic", "the in-memory store adds the allowance exactly, not through float8 as Postgres does", A,
+       "    let span_micros = product as u64;", "    let span_micros = allowance_ms.saturating_mul(1000);")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"

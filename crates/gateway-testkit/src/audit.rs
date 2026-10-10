@@ -1,7 +1,7 @@
 //! An audit store in memory that a test can read back and tell to fail or to wait.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{
     AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RecordedResources, RowCompletion,
@@ -71,7 +71,8 @@ impl Default for StoreBudgets {
 /// How long past its time at begin a call row's deadline is, in milliseconds, as the Postgres
 /// store works it out: the begin budget and the finish deadline each in whole milliseconds,
 /// and the call deadline, added without wrapping. A sum past what a Postgres `bigint` holds
-/// is refused at begin.
+/// is refused at begin, and so is one whose deadline Postgres's `set_times` cannot work out:
+/// see [`postgres_deadline`].
 fn allowance_ms(budgets: &StoreBudgets, call_deadline_ms: u64) -> u64 {
     millis(budgets.begin)
         .saturating_add(call_deadline_ms)
@@ -80,6 +81,49 @@ fn allowance_ms(budgets: &StoreBudgets, call_deadline_ms: u64) -> u64 {
 
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The Postgres epoch, 2000-01-01 00:00:00 UTC, in seconds after the Unix epoch.
+const POSTGRES_EPOCH_SECS: u64 = 946_684_800;
+
+/// The end of what a Postgres `timestamptz` holds, in microseconds after the Postgres epoch:
+/// 294277-01-01 00:00:00 UTC, which is itself out of range (Postgres's `END_TIMESTAMP`).
+const POSTGRES_END_MICROS: i128 = 9_223_371_331_200_000_000;
+
+/// 2^63, the first value past what a Postgres interval's `int64` of microseconds holds, as a
+/// `float8`.
+const TWO_TO_THE_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// The deadline Postgres's `set_times` gives a call row begun at `begun_at` with
+/// `allowance_ms`: `begun_at + allowance_ms * interval '1 millisecond'`. `None` where Postgres
+/// refuses the insert.
+///
+/// The arithmetic is Postgres's own. The `bigint` is cast to `float8`, which is exact only up
+/// to 2^53, multiplied by the interval's 1000 microseconds and rounded to whole ones; a
+/// product of 2^63 microseconds or more is "interval out of range". The sum, in whole
+/// microseconds, must fall before 294277-01-01 UTC, or it is "timestamp out of range". With
+/// the default budgets and a row begun at [`FIXTURE_NOW`](crate::FIXTURE_NOW), the largest
+/// allowance accepted is 9,222,518,015,999,998 ms, whose deadline is 294276-12-31
+/// 23:59:59.997952 UTC.
+fn postgres_deadline(begun_at: SystemTime, allowance_ms: u64) -> Option<SystemTime> {
+    // The same cast, product and rounding as Postgres's interval_mul, which rounds half to
+    // even. The product is a whole number from 0 to below 2^63, so the cast back is exact.
+    let product = (1000.0 * allowance_ms as f64).round_ties_even();
+    if product >= TWO_TO_THE_63 {
+        return None;
+    }
+    let span_micros = product as u64;
+    // Postgres keeps a time in whole microseconds.
+    let begun_micros = match begun_at.duration_since(UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
+    }
+    .div_euclid(1000)
+        - i128::from(POSTGRES_EPOCH_SECS) * 1_000_000;
+    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {
+        return None;
+    }
+    begun_at.checked_add(Duration::from_micros(span_micros))
 }
 
 /// Whether `value` holds U+0000 in any string, which Postgres text, text arrays and jsonb
@@ -248,13 +292,35 @@ impl State {
         }
     }
 
-    /// Completes the row `id` with `completion`, unless it is complete already.
+    /// Completes the row `id` with `completion`, unless it is complete already. Every
+    /// completion comes through here, a late one and a lost begin's included. As Postgres's
+    /// `complete_once` does, it refuses a row of kind `list` and a denial, whatever the
+    /// completion: neither is ever completed.
     fn complete(&mut self, id: &AuditRowId, completion: &Completion) -> Result<(), StoreError> {
+        let listing = || {
+            StoreError::from(format!(
+                "audit row {} records a listing, which is never completed",
+                id.as_str()
+            ))
+        };
+        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {
+            return Err(listing());
+        }
         let (_, row, _) = self
             .rows
             .iter_mut()
             .find(|(stored, _, _)| stored == id)
             .ok_or_else(|| StoreError::from("no such row"))?;
+        if row.kind != RowKind::Call {
+            return Err(listing());
+        }
+        if row.decision != DecisionKind::Allow {
+            return Err(format!(
+                "audit row {} records a denial, which is never completed",
+                id.as_str()
+            )
+            .into());
+        }
         match &row.completion {
             None => {
                 row.completion = Some(completion.clone());
@@ -268,10 +334,16 @@ impl State {
 
 /// An [`AuditStore`] that keeps its rows in memory, in the order they were begun.
 ///
-/// It behaves as the interface says a store must. A row exists only once `begin` has returned
-/// `Ok`: a failed begin leaves nothing behind, and a begin that is being held has not written
-/// yet. A failed `finish` leaves the row as it was, with its outcome empty. A row cannot be
-/// finished before it was begun.
+/// It behaves as the interface says a store must. A begin that is being held has not written
+/// yet, and a begin told to fail leaves nothing behind. A begin told to lose its confirmation
+/// ([`lose_next_begin_confirmation`](Self::lose_next_begin_confirmation) and
+/// [`lose_all_begin_confirmations`](Self::lose_all_begin_confirmations)) is the exception: it
+/// fails after writing its row, as decision 0009 says a begin may. A failed `finish` leaves
+/// the row as it was, with its outcome empty, except one that answered past the answer budget
+/// ([`finish_past_answer_budget`](Self::finish_past_answer_budget)): its completion is written
+/// later, once the gate opens. A row cannot be finished before it was begun, and a denial or a
+/// list row cannot be finished at all, as Postgres's `complete_once` refuses them. That holds
+/// for every completion, a late one and a lost begin's included.
 ///
 /// Rows are kept under the identifier begin was given. A second begin with a known identifier
 /// writes nothing: it succeeds if the stored decision is the same, and fails if it differs. It
@@ -284,7 +356,8 @@ impl State {
 /// already complete, a record, list record or completion with U+0000 in a text value, a count
 /// of resources or tools left out or a latency past a Postgres `bigint`, and a call row whose
 /// allowance is past one. Of the table's own constraints it checks only one: unknown resources
-/// with a count left out.
+/// with a count left out. Of its triggers it follows both: `set_times`, which refuses a
+/// deadline past what a Postgres time holds, and `complete_once`.
 ///
 /// It fails the ways decision 0009 says the fake must, each until told otherwise or once:
 ///
@@ -303,7 +376,10 @@ impl State {
 ///
 /// Like the Postgres store, it sets each row's time at begin and deadline itself, from its
 /// own clock and never from the record: the time at begin, plus the begin budget, the call
-/// deadline the record carries and the finish deadline, in whole milliseconds. A row of kind
+/// deadline the record carries and the finish deadline, in whole milliseconds. It adds that
+/// allowance to the time at begin as Postgres's `set_times` does, through `float8`, and
+/// refuses a call row whose deadline Postgres would refuse: one at or past 294277-01-01 UTC,
+/// or an allowance of 2^63 microseconds or more. A row of kind
 /// `list` has no deadline. The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW)
 /// unless set.
 ///
@@ -380,11 +456,11 @@ impl InMemoryAuditStore {
     }
 
     /// The times for a row of `kind` begun now, with `allowance_ms` to its deadline. `None`
-    /// when the deadline is past what a time can hold.
+    /// when the deadline is past what Postgres's `set_times` accepts.
     fn times_for(&self, kind: RowKind, allowance_ms: u64) -> Option<Times> {
         let begun_at = self.clock.now();
         let deadline = match kind {
-            RowKind::Call => Some(begun_at.checked_add(Duration::from_millis(allowance_ms))?),
+            RowKind::Call => Some(postgres_deadline(begun_at, allowance_ms)?),
             RowKind::List => None,
         };
         Some(Times { begun_at, deadline })
@@ -463,10 +539,17 @@ impl InMemoryAuditStore {
     }
 
     /// The next `begin` or `list` that would succeed writes its row and then fails: its
-    /// confirmation is lost, as when the connection drops after the commit. An allowed call's
-    /// row is then completed as `error` with a latency of zero, as the Postgres store
-    /// completes it on its finish pool. A denial and a list row are complete records already,
-    /// and are left as they are. Later begins work.
+    /// confirmation is lost. An allowed call's row is then completed as `error` with a latency
+    /// of zero, as the Postgres store completes it on its finish pool. A denial and a list row
+    /// are complete records already, and are left as they are. Later begins work.
+    ///
+    /// This is a begin that the Postgres store reports as failed after writing: every attempt
+    /// within its begin budget lost its confirmation, or the budget ran out once the row was
+    /// written. One lost confirmation alone is not that. The Postgres store retries begin by
+    /// identifier within its budget, a retry finds the row it wrote, and begin succeeds with
+    /// the row open. The fake does not retry. A test that begins again under the same
+    /// identifier gets a guard for a row already completed as `error`, and that guard's finish
+    /// is refused unless it too is `error` with a latency of zero.
     pub fn lose_next_begin_confirmation(&self) {
         self.state().confirmation_lost = Failing::Next;
     }
@@ -574,14 +657,13 @@ impl AuditStore for InMemoryAuditStore {
                 }
             }
             if state.confirmation_lost.take() {
-                if record.decision == DecisionKind::Allow {
-                    let error = Completion {
-                        outcome: Outcome::Error,
-                        latency_ms: 0,
-                    };
-                    // A row completed before keeps its completion, as complete_once keeps it.
-                    let _ = state.complete(row, &error);
-                }
+                let error = Completion {
+                    outcome: Outcome::Error,
+                    latency_ms: 0,
+                };
+                // Only an allowed row is completed. A denial is refused, and a row completed
+                // before keeps its completion, as complete_once refuses and keeps them.
+                let _ = state.complete(row, &error);
                 return Err(lost());
             }
             Ok(())

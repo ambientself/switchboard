@@ -938,6 +938,89 @@ fn a_forgotten_finish_leaves_the_row_open_for_a_new_gateway() {
     assert_eq!(store.rows().len(), 3);
 }
 
+/// Postgres's `complete_once` refuses to complete a denial or a list row, whatever the
+/// completion. The fake refuses the same on every path a completion takes: a finish that
+/// writes at once, one written late past the answer budget, and a lost begin's (the denial in
+/// `a_lost_confirmation_on_a_denial_leaves_the_denial`). A test reaches such a row with a
+/// guard from one store and a second store that holds a denial or a list row under the
+/// guard's identifier.
+#[test]
+fn a_denial_or_a_list_row_is_never_completed() {
+    let fixture = fixture();
+    let connector = FixtureConnector::new(Arc::new(FakeCredentialSource::new()));
+    let allowed = InMemoryAuditStore::new();
+    let other = InMemoryAuditStore::new();
+    // An allowed call run under a guard from `allowed`, after `write` has written the row of
+    // the same identifier to `other`.
+    let ran_after = |write: &dyn Fn(&RowStart)| {
+        let read = json!({"document": TEAM_A_DOCUMENT});
+        let guard = guard_for(&fixture, &allowed, Caller::TeamA, READ_TOOL, read);
+        let row = guard.row().clone();
+        write(&RowStart {
+            row: row.clone(),
+            ..row_start()
+        });
+        (row, block_on(audit::run(&connector, guard)))
+    };
+    let deny = |start: &RowStart| {
+        let denied = begin_as(&fixture, &other, start, WRITE_TOOL);
+        assert!(matches!(denied, Ok(Begun::Denied(_))), "{denied:?}");
+    };
+
+    // A denial, finished at once.
+    let (denial, ran) = ran_after(&deny);
+    let failure = block_on(audit::finish(&other, ran, 7))
+        .failure()
+        .expect("a denial was completed")
+        .to_string();
+    assert!(failure.contains("records a denial"), "{failure}");
+    assert_eq!(other.row_with_id(&denial).unwrap().completion, None);
+
+    // A denial, finished past the answer budget and written once the gate opens.
+    let gate = other.finish_past_answer_budget();
+    let (late, ran) = ran_after(&deny);
+    assert!(block_on(audit::finish(&other, ran, 8)).failure().is_some());
+    gate.open();
+    assert_eq!(
+        other.row_with_id(&late).unwrap().completion,
+        None,
+        "a late completion completed a denial"
+    );
+
+    // A list row. It is not a call row, and finish does not make one.
+    let (listed, ran) = ran_after(&|start| assert!(list_as(&fixture, &other, start).is_ok()));
+    let failure = block_on(audit::finish(&other, ran, 9))
+        .failure()
+        .expect("a list row was completed")
+        .to_string();
+    assert!(failure.contains("records a listing"), "{failure}");
+    assert_eq!(other.row_with_id(&listed), None);
+
+    // A record of kind list handed to begin. The fake keeps it as a call row, where the
+    // Postgres table's kind_shape would refuse it, and finish refuses it by its kind.
+    let (call, _) = records(&fixture);
+    let (kind_list, ran) = ran_after(&|start| {
+        let record = AuditRecord {
+            kind: RowKind::List,
+            ..call.clone()
+        };
+        block_on(other.begin(&start.row, &record)).unwrap();
+    });
+    let failure = block_on(audit::finish(&other, ran, 10))
+        .failure()
+        .expect("a call row of kind list was completed")
+        .to_string();
+    assert!(failure.contains("records a listing"), "{failure}");
+    assert_eq!(other.row_with_id(&kind_list).unwrap().completion, None);
+
+    // The allowed rows themselves are open, and complete.
+    let (own, ran) = ran_after(&|_| {});
+    let finished = block_on(audit::finish(&allowed, ran, 11));
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert!(allowed.row_with_id(&own).unwrap().completion.is_some());
+    assert_eq!(allowed.rows().len(), 5);
+}
+
 /// A connector that refuses every call with a sentence holding U+0000.
 struct NulRefusal;
 
@@ -1213,6 +1296,64 @@ fn the_deadline_is_counted_in_whole_milliseconds_and_never_wraps() {
         );
         assert_eq!(store.row_with_id(&start.row), None);
     }
+    assert_eq!(store.rows().len(), 1);
+}
+
+/// Postgres's `set_times` gives a call row the deadline `begun_at + allowance_ms * interval
+/// '1 millisecond'`, and the insert fails where that arithmetic does: "timestamp out of range"
+/// at or past 294277-01-01 UTC, and "interval out of range" at 2^63 microseconds or more. The
+/// allowance is cast to `float8` on the way, so near those ends it moves by a few microseconds.
+/// The fake refuses the same begins and gives the same deadlines. Each boundary here is one
+/// Postgres 17 gives.
+#[test]
+fn the_deadline_is_refused_where_postgres_cannot_work_it_out() {
+    let fixture = fixture();
+    // The default budgets add 32,000 ms to the call deadline.
+    let begin = |store: &InMemoryAuditStore, allowance_ms: u64| {
+        let start = RowStart {
+            call_deadline_ms: allowance_ms - 32_000,
+            ..row_start()
+        };
+        let begun = begin_as(&fixture, store, &start, READ_TOOL);
+        (start.row, begun.is_ok())
+    };
+    let postgres_epoch = UNIX_EPOCH + Duration::from_secs(946_684_800);
+    let postgres_end = postgres_epoch + Duration::from_micros(9_223_371_331_200_000_000);
+
+    // Begun at FIXTURE_NOW, the largest allowance Postgres accepts has a deadline 2,048
+    // microseconds before the end: 294276-12-31 23:59:59.997952 UTC.
+    let store = InMemoryAuditStore::new();
+    let (row, begun) = begin(&store, 9_222_518_015_999_998);
+    assert!(begun, "the largest allowance Postgres accepts was refused");
+    assert_eq!(
+        store.deadline(&row),
+        Some(postgres_end - Duration::from_micros(2_048))
+    );
+    // One more is rounded to the end itself. A call deadline of 10^16 ms is within a bigint,
+    // and past both ends.
+    for allowance_ms in [
+        9_222_518_015_999_999,
+        9_222_518_016_000_000,
+        10_000_000_000_000_000 + 32_000,
+    ] {
+        let (row, begun) = begin(&store, allowance_ms);
+        assert!(!begun, "an allowance of {allowance_ms} ms was written");
+        assert_eq!(store.row_with_id(&row), None);
+    }
+    assert_eq!(store.rows().len(), 1);
+
+    // Begun at the Unix epoch, the end of a timestamp is further off than an interval holds,
+    // so the interval is what refuses.
+    let store = InMemoryAuditStore::new().with_clock(Arc::new(FixedClock::at(0)));
+    let (row, begun) = begin(&store, 9_223_372_036_854_774);
+    assert!(begun, "the largest interval Postgres accepts was refused");
+    assert_eq!(
+        store.deadline(&row),
+        Some(UNIX_EPOCH + Duration::from_micros(9_223_372_036_854_773_760))
+    );
+    let (row, begun) = begin(&store, 9_223_372_036_854_775);
+    assert!(!begun, "an interval of 2^63 microseconds was written");
+    assert_eq!(store.row_with_id(&row), None);
     assert_eq!(store.rows().len(), 1);
 }
 
