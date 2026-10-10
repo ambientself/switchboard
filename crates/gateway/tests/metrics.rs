@@ -198,6 +198,10 @@ async fn the_endpoint_answers_with_every_signal_and_nothing_else() {
     }
     let (status, head, _) = get(address, "POST", "/metrics").await;
     assert_eq!(status, 405, "{head}");
+    // HEAD is GET without the body, as axum answers it.
+    let (status, head, body) = get(address, "HEAD", "/metrics").await;
+    assert_eq!(status, 200, "{head}");
+    assert!(body.is_empty(), "{body}");
 }
 
 #[tokio::test]

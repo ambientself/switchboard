@@ -4,9 +4,10 @@
 //! [`serve_metrics`] answers `GET /metrics` on a listener of its own, which the deployment
 //! file's `[metrics]` names (see [`crate::deployment`]); without it nothing is served. The
 //! listener is never the MCP listener, and nothing else is on it: any other path is 404, and
-//! any other method on `/metrics` is 405. It runs no host, origin or identity check, so it
-//! belongs on a port only the operator's scraper can reach. No sink is chosen (decision 0009,
-//! Still open 3): this is the default until one is.
+//! any method on `/metrics` other than GET is 405, except HEAD, which axum answers as GET
+//! without a body. It runs no host, origin or identity check, so it belongs on a port only the
+//! operator's scraper can reach. No sink is chosen (decision 0009, Still open 3): this is the
+//! default until one is.
 //!
 //! [`Metrics::render`] writes, by hand and with no Prometheus crate:
 //!
