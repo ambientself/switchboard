@@ -1,6 +1,6 @@
 //! The gateway built from files with its audit rows in Postgres, as the demo runs it: the store
 //! passes its boot checks as the gateway's role, an allowed call, a denial and a refusal each
-//! leave their row, a completion the database refuses is logged as given up, naming its row,
+//! leave their row, a `tools/list` leaves a row of kind `list`, a completion the database refuses is logged as given up, naming its row,
 //! and a connection as a superuser refuses to start.
 //!
 //! Runs only when `SWITCHBOARD_TEST_DATABASE_URL` names a superuser on a throwaway server, as
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use audit_postgres::{GATEWAY_ROLE, OWNER_ROLE, ROLES, migrate};
 use files::{
-    AUDIENCE, Files, LIST_TOOL, READ_TOOL, TEAM_A_SA, call, cluster_issuer, kubernetes_token,
+    AUDIENCE, Files, LIST_TOOL, READ_TOOL, TEAM_A_SA, call, cluster_issuer, kubernetes_token, rpc,
 };
 use gateway::path::RequestPath;
 use gateway::start::prepare;
@@ -314,6 +314,42 @@ async fn run(
         assert_eq!(row[8], "demo-1");
         assert_eq!([&row[9], &row[10]], [resources, "0"], "{row:?}");
     }
+
+    // A tools/list writes its row, of kind list, naming what it listed, and the answer names
+    // that row.
+    let listed = rpc(&path, Some(&token), "tools/list", json!({})).await;
+    let names: Vec<&str> = listed.body["result"]["tools"]
+        .as_array()
+        .ok_or_else(|| format!("not a list: {}", listed.body))?
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(names, [LIST_TOOL, READ_TOOL], "{}", listed.body);
+    let list_rows = setup
+        .query(
+            "SELECT id::text, listed_tools::text, listed_omitted, policy_revision, proved_team,
+                    tool IS NULL AND decision IS NULL AND deadline IS NULL
+               FROM switchboard_audit.call_rows WHERE kind = 'list'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_rows.len(), 1, "one list, one row");
+    let list_row = &list_rows[0];
+    assert_eq!(
+        listed.body["result"]["_meta"][gateway_mcp::AUDIT_ROW_META],
+        json!(list_row.get::<_, String>(0)),
+        "{}",
+        listed.body
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(list_row.get(1)).unwrap(),
+        json!(names)
+    );
+    assert_eq!(list_row.get::<_, i64>(2), 0);
+    assert_eq!(list_row.get::<_, String>(3), "demo-1");
+    assert_eq!(list_row.get::<_, String>(4), "team-a");
+    assert!(list_row.get::<_, bool>(5), "a list row has no call columns");
 
     // A completion the database refuses is given up at once, and logged naming its row and
     // the outcome that was not written.

@@ -1098,7 +1098,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   currency answer. With #12, a column for the exception that allowed a call, since the row's
   shape constraint rightly allows no reason on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
-  the core and the stores, and wired into `tools/list` by #40. The core's `listed` writes a
+  the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
   escaped and capped, with the rest counted, and only then gives out the list as a `Listed`.
   Every store has `list`, idempotent by identifier. Migration 0004 adds `listed_tools` and
@@ -1159,7 +1159,11 @@ off only in a development build, with CI's check of the release artifact; and th
 
 **#26, the HTTP path.**
 
-- A row of kind `list` before answering `tools/list`.
+- A row of kind `list` before answering `tools/list`: built (#40). The path writes the row
+  through the core's `listed` and answers with the tools the `Listed` it returns holds, so
+  nothing is listed without its row. A store that cannot write the row refuses the list with
+  the audit sentence and lists nothing. With identity disabled nothing is listed and no row is
+  written.
 - Telemetry events that carry the surface and the source address, counters, and a bounded
   queue, with events for `initialize`, `ping`, `server/discover` and bodies that cannot be
   parsed. Today an identity failure is logged with the deployment and the cause only.
@@ -1175,7 +1179,7 @@ off only in a development build, with CI's check of the release artifact; and th
   (#40). A result names it under `switchboard/auditRow` in `_meta`, in both eras, beside the
   server's name under 2026-07-28; a denial or an internal error names it as `auditRow` in
   `error.data`. A refusal because begin failed names none, and with audit disabled nothing is
-  named. `tools/list` names its row once it writes one.
+  named. A `tools/list` result names its list row the same way, in `_meta`.
 - The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
   harness enables and CI's check of the release artifact: built (#40). Both boot paths and
   every registry reload refuse a snapshot serving a tool not classified `read`, since no
