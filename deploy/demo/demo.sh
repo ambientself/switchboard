@@ -5,7 +5,8 @@
 #                     and the gateway under Compose; run both teams' workloads; show a database
 #                     outage and a withdrawn tool; check the audit rows
 #   demo.sh kind      the same in the kind cluster switchboard-demo, with projected
-#                     ServiceAccount tokens, network policy and the operator's permission checks
+#                     ServiceAccount tokens, network policy, the operator's permission checks,
+#                     and the route check (deploy/route-check) before and after the policy
 #   demo.sh down compose   stop Compose and delete its volumes; the cluster is left alone
 #   demo.sh down kind      delete the kind cluster switchboard-demo; Compose is left alone
 #   demo.sh down all       both
@@ -56,6 +57,15 @@ AUDIT_TABLE=switchboard_audit.call_rows
 OPEN_ROWS_VIEW=switchboard_audit.open_call_rows
 READ_TOOL=docs__read_document
 LIST_TOOL=docs__list_documents
+# The gateway's surface as the workloads reach it in kind (deploy/kind/base/workloads.yaml).
+KIND_GATEWAY_URL=http://gateway.switchboard.svc.cluster.local:8080/mcp/docs
+# The route check (decision 0010): its operator step, the routes its probe tries in kind, and the
+# one list of permissions that it and the operator checks ask about. The step runs as the
+# ServiceAccount of deploy/kind/route-check/rbac.yaml, with that access and no more.
+ROUTE_CHECK=$ROOT/deploy/route-check/route-check.sh
+ROUTE_CHECK_ROUTES=$ROOT/deploy/route-check/routes/kind.tsv
+PERMISSIONS=$ROOT/deploy/route-check/permissions.tsv
+ROUTE_CHECK_OPERATOR=system:serviceaccount:route-check:operator
 
 PASSES=0
 FAILS=0
@@ -69,6 +79,11 @@ LOG_SINCE=""
 # The database outage step's span, in the database's clock (epoch seconds); 0 to 0 if there was none.
 OUTAGE_FROM=0
 OUTAGE_TO=0
+# The kind run's route checks: the last report written, and how many attempts the probe found
+# open before the policy.
+ROUTE_REPORT=""
+OPEN_ATTEMPTS=""
+GATEWAY_POD=""
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
@@ -362,29 +377,33 @@ check_server_bearers() {
   fi
 }
 
-# check_server_callers LOGS SUBJECT CALLS REFUSALS: what mock-docs received this run in its JWT
-# mode, where each log line names the verified caller of an accepted token, or why a token was
-# refused. Every request it accepted came from SUBJECT, the gateway's ServiceAccount, and CALLS
-# is exactly how many calls the gateway allowed so far: one more means a call it denied reached
-# the server, one fewer that an allowed call did not, or that the log is short. A request
+# check_server_callers LOGS SUBJECT CALLS REFUSALS PROBES: what mock-docs received this run in its
+# JWT mode, where each log line names the verified caller of an accepted token, or why a token
+# was refused. Every request it accepted came from SUBJECT, the gateway's ServiceAccount, and
+# CALLS is exactly how many calls the gateway allowed so far: one more means a call it denied
+# reached the server, one fewer that an allowed call did not, or that the log is short. A request
 # accepted with any other caller, or with none (a static token), fails the check. Exactly
-# REFUSALS requests were refused, each as wrong_audience: a token the cluster signed for another
-# audience, the workloads' own on their direct calls before the policy. Any other refusal fails.
+# REFUSALS requests were refused as wrong_audience: a token the cluster signed for another
+# audience, the workloads' own on their direct calls before the policy. Exactly PROBES were
+# refused as no_bearer: the route check's probe before the policy, which sends no credential,
+# one request per attempt it found open. Any other refusal fails.
 check_server_callers() {
-  local logs=$1 subject=$2 calls=$3 refusals=$4 lines
+  local logs=$1 subject=$2 calls=$3 refusals=$4 probes=$5 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
     | if .accepted == true then "accepted \(.caller // "none")" else "refused \(.refusal // "none")" end')
   echo "    requests seen by mock-docs, by answer and verified caller or refusal:"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
-  local gateway other audience refused
+  local gateway other audience bearerless refused
   gateway=$(printf '%s\n' "$lines" | awk -v subject="$subject" '$1 == "accepted" && $2 == subject && NF == 2 { n++ } END { print n + 0 }')
   other=$(printf '%s\n' "$lines" | awk -v subject="$subject" '$1 == "accepted" && !($2 == subject && NF == 2) { n++ } END { print n + 0 }')
   audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
+  bearerless=$(printf '%s\n' "$lines" | awk '$0 == "refused no_bearer" { n++ } END { print n + 0 }')
   refused=$(printf '%s\n' "$lines" | awk '$1 == "refused" { n++ } END { print n + 0 }')
   check "$gateway" "$calls" "mock-docs accepted the gateway's own token ($subject) on exactly the $calls calls the gateway allowed"
   check "$other" 0 "mock-docs accepted no other caller, and no token without one"
   check "$audience" "$refusals" "mock-docs refused the $refusals direct calls' tokens as meant for another audience"
-  check "$refused" "$refusals" "mock-docs refused nothing else"
+  check "$bearerless" "$probes" "mock-docs refused the route check's $probes open attempts before the policy, which carried no bearer"
+  check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"
 }
 
 # --- Compose --------------------------------------------------------------------------------
@@ -522,45 +541,149 @@ kind_workload() { # LABEL NAMESPACE CRONJOB MODE
   tally_workload "$label" "$JOB_STATUS" "$(k -n "$ns" logs "job/$JOB")"
 }
 
-# can_i_no TEAM ARGS...: the answer to `kubectl auth can-i ARGS` for TEAM's workload, checked
-# to be no.
-can_i_no() {
-  local team=$1 answer
-  shift
+# start_idle NAMESPACE: starts a new Job of the team's workload in its idle mode, a new pod with
+# the workload's labels and ServiceAccount that makes no call, and waits until the pod runs.
+# Sets JOB; returns non-zero if the pod is not running within 120 s.
+start_idle() {
+  local ns=$1 waited=0 phase
+  start_job "$ns" mock-workload idle
+  while :; do
+    phase=$(k -n "$ns" get pods -l "job-name=$JOB" -o jsonpath='{.items[*].status.phase}')
+    if [ "$phase" = Running ]; then return 0; fi
+    if [ "$waited" -ge 120 ]; then
+      echo "the idle pod of job $ns/$JOB is not running within 120 s (phase '$phase')" >&2
+      k -n "$ns" describe pods -l "job-name=$JOB" >&2
+      return 1
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+# stop_idle NAMESPACE NAME: deletes the idle Job and waits until its pod is gone. The pod ends
+# on the SIGTERM its deletion sends.
+stop_idle() {
+  k -n "$1" delete job "$2" --cascade=foreground --wait=true --timeout=120s
+}
+
+# route_check NAMESPACE EXPECT JOB: the route check's operator step (deploy/route-check), run as
+# the route-check operator with only its own access, against the running pod of the idle Job JOB
+# in NAMESPACE. Its probe expects every route of routes/kind.tsv to be EXPECT, by name and by
+# address. Its PASS and FAIL lines count as this run's, and any FAIL fails the run. The report
+# goes to .demo: route-check-<team>-<UTC time>.json for the check after the policy, with `open`
+# before the time for the control before it. Sets ROUTE_REPORT.
+route_check() {
+  local ns=$1 expect=$2 job=$3 when output status
+  when=$(date -u +%Y%m%dT%H%M%SZ)
+  if [ "$expect" = open ]; then
+    ROUTE_REPORT=$DEMO_DIR/route-check-$ns-open-$when.json
+  else
+    ROUTE_REPORT=$DEMO_DIR/route-check-$ns-$when.json
+  fi
+  if output=$("$ROUTE_CHECK" --kubeconfig "$KCFG" --context "kind-$CLUSTER" --as "$ROUTE_CHECK_OPERATOR" \
+      --namespace "$ns" --selector "app=mock-workload,job-name=$job" --gateway-ns switchboard \
+      --server-ns mock-docs --server-service mock-docs/mock-docs --server-audience mock-docs \
+      --routes "$ROUTE_CHECK_ROUTES" --gateway-url "$KIND_GATEWAY_URL" --expect "$expect" \
+      --probe-image "$IMG_RUN" --report "$ROUTE_REPORT" --environment "first slice, kind" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  tally_workload "route check in $ns, every route $expect" "$status" "$output"
+  echo "    report: $ROUTE_REPORT"
+}
+
+# open_route_attempts REPORT: how many of the probe's attempts in REPORT were open, each a
+# request mock-docs answered; nothing if the report cannot be read.
+open_route_attempts() {
+  jq -er '[.routes[] | select(.result == "open")] | length' "$1" 2>/dev/null || true
+}
+
+# gateway_pod: the gateway's pod of its Deployment's current ReplicaSet, by the ReplicaSet's
+# pod-template-hash. After a rollout the previous pod can still be running out its grace period,
+# and the Deployment's log may be read from that one, whose boot lines are the previous build's. Sets
+# GATEWAY_POD; returns non-zero unless exactly one such pod runs.
+gateway_pod() {
+  local revision sets hash pods
+  revision=$(k -n switchboard get deploy/gateway -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')
+  sets=$(k -n switchboard get replicasets -l app=gateway -o json)
+  # shellcheck disable=SC2016 # jq's own variables
+  hash=$(jq -r --arg revision "$revision" '[.items[]
+      | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision)
+      | .metadata.labels["pod-template-hash"] // empty]
+    | if length == 1 then .[0] else empty end' <<<"$sets")
+  if [ -z "$revision" ] || [ -z "$hash" ]; then
+    echo "cannot find the gateway's ReplicaSet of revision '$revision'" >&2
+    return 1
+  fi
+  pods=$(k -n switchboard get pods -l "app=gateway,pod-template-hash=$hash" -o json \
+    | jq -r '[.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)
+        | .metadata.name] | join(" ")')
+  case "$pods" in
+    '' | *' '*)
+      echo "want one running gateway pod of ReplicaSet $hash (revision $revision), got '$pods'" >&2
+      return 1
+      ;;
+  esac
+  GATEWAY_POD=$pods
+}
+
+# can_i_no_as USER WHO ARGS...: the answer to `kubectl auth can-i ARGS` as USER, checked to be
+# no, in a check named for WHO.
+can_i_no_as() {
+  local user=$1 who=$2 answer status=0 last
+  shift 2
   # can-i exits 1 when the answer is no; the answer itself, its last line, is what is checked.
+  # A kubectl that fails (it cannot reach the cluster, or may not impersonate) ends with
+  # neither: its whole message goes in the FAIL line, and the run goes on.
+  answer=$(k auth can-i "$@" --as="$user" 2>&1) || status=$?
   # can-i looks the resource up in the API's discovery. One it cannot find is still asked, as a
   # core-group resource of the whole name. That is not what the API server checks, so the
   # answer, yes or no, says nothing about the permission. Its warning fails the check.
-  if answer=$(k auth can-i "$@" --as="system:serviceaccount:$team:mock-workload" 2>&1); then :; fi
   case "$answer" in
     *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\n'*}" ;;
-    *) answer=${answer##*$'\n'} ;;
+    *)
+      last=${answer##*$'\n'}
+      case "$last" in
+        yes | no) answer=$last ;;
+        *) answer="no answer (kubectl exit $status): $(printf '%s' "$answer" | tr '\n' ' ')" ;;
+      esac
+      ;;
   esac
-  check "$answer" no "$team's workload may not: $*"
+  check "$answer" no "$who may not: $*"
 }
 
-# sar_no TEAM VERB GROUP RESOURCE [SUBRESOURCE]: as can_i_no, across the cluster, for what can-i
-# cannot name. The API server checks impersonating a UID as `uids` and an extra as
-# `userextras/<key>`, both in authentication.k8s.io, which serves neither as a resource. can-i
-# would warn and ask about a core resource of the whole name instead (see can_i_no). A
-# SubjectAccessReview names the group, resource and subresource as the API server asks them,
-# for the user and groups `--as` gives a ServiceAccount.
+# can_i_no TEAM ARGS...: can_i_no_as for TEAM's workload.
+can_i_no() {
+  local team=$1
+  shift
+  can_i_no_as "system:serviceaccount:$team:mock-workload" "$team's workload" "$@"
+}
+
+# sar_no TEAM VERB GROUP RESOURCE [SUBRESOURCE [NAMESPACE]]: as can_i_no, across the cluster or
+# in NAMESPACE, for what can-i cannot name. The API server checks impersonating a UID as `uids`
+# and an extra as `userextras/<key>`, both in authentication.k8s.io, which serves neither as a
+# resource. can-i would warn and ask about a core resource of the whole name instead (see
+# can_i_no_as). A SubjectAccessReview names the group, resource and subresource as the API
+# server asks them, for the user and groups `--as` gives a ServiceAccount. A kubectl that fails
+# gives no answer: its message goes in the FAIL line, and the run goes on.
 sar_no() {
-  local team=$1 verb=$2 group=$3 resource=$4 subresource=${5:-} allowed answer
+  local team=$1 verb=$2 group=$3 resource=$4 subresource=${5:-} namespace=${6:-} allowed answer status=0
   # shellcheck disable=SC2016 # jq's own variables
   allowed=$(jq -cn --arg team "$team" --arg verb "$verb" --arg group "$group" \
-      --arg resource "$resource" --arg subresource "$subresource" '{
+      --arg resource "$resource" --arg subresource "$subresource" --arg namespace "$namespace" '{
         apiVersion: "authorization.k8s.io/v1", kind: "SubjectAccessReview",
         spec: {user: "system:serviceaccount:\($team):mock-workload",
                groups: ["system:serviceaccounts", "system:serviceaccounts:\($team)", "system:authenticated"],
-               resourceAttributes: {verb: $verb, group: $group, resource: $resource, subresource: $subresource}}}' \
-    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)
-  case "$allowed" in
-    false) answer=no ;;
-    true) answer=yes ;;
-    *) answer="no answer: $allowed" ;;
+               resourceAttributes: {verb: $verb, group: $group, resource: $resource, subresource: $subresource}}}
+        | if $namespace == "" then . else .spec.resourceAttributes.namespace = $namespace end' \
+    | k create -f - -o jsonpath='{.status.allowed}' 2>&1) || status=$?
+  case "$status:$allowed" in
+    0:false) answer=no ;;
+    0:true) answer=yes ;;
+    *) answer="no answer (kubectl exit $status): $(printf '%s' "$allowed" | tr '\n' ' ')" ;;
   esac
-  check "$answer" no "$team's workload may not: $verb $group/$resource${subresource:+/$subresource}"
+  check "$answer" no "$team's workload may not: $verb $group/$resource${subresource:+/$subresource}${namespace:+ -n $namespace}"
 }
 
 # operator_checks: what each team's workload may not do through the cluster API (decision 0010,
@@ -573,57 +696,59 @@ sar_no() {
 # exec, attach, port-forward, the proxies, and ephemeral containers. Their traffic comes from
 # the API server, not the workload's pod, so the network policy does not stop it.
 #
-# Reading is checked as get, list and watch, since list and watch return a Secret's data too.
-# Each route is checked with both verbs a request through it can use, and an ephemeral
-# container with both that add one. What is namespaced is checked in mock-docs, in the
-# gateway's namespace and in the team's own; the rest across the cluster. Asked about a
-# cluster-wide resource, can-i asks in the kubeconfig's namespace, `default`, and warns; RBAC
-# then counts that namespace's RoleBindings as well as ClusterRoleBindings, so a no there holds
-# across the cluster too.
+# What is asked is every row of deploy/route-check/permissions.tsv, the list the route check's
+# operator step asks too, so there is one list. Reading is asked as get, list and watch, since
+# list and watch return a Secret's data too. Each route is asked with both verbs a request
+# through it can use, and an ephemeral container with both that add one.
+#
+# A row's scope means what it means to route-check.sh. A `namespaced` row is asked in mock-docs,
+# in the gateway's namespace, in the team's own and across the cluster (--all-namespaces, which
+# counts only ClusterRoleBindings). A `cluster` row is asked across the cluster only: can-i
+# then asks in the kubeconfig's namespace, `default`, and warns, and RBAC counts that
+# namespace's RoleBindings as well as ClusterRoleBindings, so a no there holds across the
+# cluster too. A list that cannot be read fails the step; nothing is asked from a list of its own.
 operator_checks() {
-  local team ns verb subresource resource
+  local rows team verb resource subresource scope ns
+  if ! rows=$(awk -F'\t' '/^#/ || NF == 0 { next }
+      NF != 4 || ($4 != "namespaced" && $4 != "cluster") { bad = 1; next }
+      { print }
+      END { exit bad }' "$PERMISSIONS") || [ -z "$rows" ]; then
+    fail "operator checks: every row of $PERMISSIONS is read (a row is not verb, resource, subresource and scope, or there is none)"
+    return
+  fi
   for team in team-a team-b; do
-    for verb in get list watch; do
-      can_i_no "$team" "$verb" secrets -n switchboard
-      can_i_no "$team" "$verb" secrets -n mock-docs
-      can_i_no "$team" "$verb" configmaps -n switchboard
-    done
-    for verb in create get; do
-      can_i_no "$team" "$verb" nodes --subresource=proxy
-    done
-    for resource in users groups; do
-      can_i_no "$team" impersonate "$resource"
-    done
-    sar_no "$team" impersonate authentication.k8s.io uids
-    sar_no "$team" impersonate authentication.k8s.io userextras scopes
-    for verb in bind escalate; do
-      can_i_no "$team" "$verb" clusterroles.rbac.authorization.k8s.io
-    done
-    can_i_no "$team" create clusterrolebindings.rbac.authorization.k8s.io
-    for ns in mock-docs switchboard "$team"; do
-      can_i_no "$team" create pods -n "$ns"
-      can_i_no "$team" create serviceaccounts --subresource=token -n "$ns"
-      can_i_no "$team" impersonate serviceaccounts -n "$ns"
-      for verb in create get; do
-        for subresource in exec attach portforward proxy; do
-          can_i_no "$team" "$verb" pods --subresource="$subresource" -n "$ns"
+    while IFS=$'\t' read -r verb resource subresource scope <&3; do
+      if [ "$scope" = cluster ]; then
+        operator_ask "$team" "$verb" "$resource" "$subresource" ""
+      else
+        for ns in mock-docs switchboard "$team" all; do
+          operator_ask "$team" "$verb" "$resource" "$subresource" "$ns"
         done
-        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"
-      done
-      for verb in patch update; do
-        can_i_no "$team" "$verb" pods --subresource=ephemeralcontainers -n "$ns"
-      done
-      for verb in bind escalate; do
-        can_i_no "$team" "$verb" roles.rbac.authorization.k8s.io -n "$ns"
-      done
-      can_i_no "$team" create rolebindings.rbac.authorization.k8s.io -n "$ns"
-      for resource in deployments.apps replicasets.apps statefulsets.apps daemonsets.apps jobs.batch cronjobs.batch; do
-        for verb in create update patch; do
-          can_i_no "$team" "$verb" "$resource" -n "$ns"
-        done
-      done
-    done
+      fi
+    done 3<<<"$rows"
   done
+}
+
+# operator_ask TEAM VERB RESOURCE SUBRESOURCE WHERE: one row of permissions.tsv for TEAM's
+# workload. WHERE is a namespace, `all` for every namespace, or empty for a `cluster` row.
+# RESOURCE is written as can-i takes it, `name.group` outside the core group, and SUBRESOURCE is
+# `-` for none. Impersonating a UID or an extra is asked by SubjectAccessReview (see sar_no).
+operator_ask() {
+  local team=$1 verb=$2 resource=$3 subresource=$4 where=$5 args
+  if [ "$verb" = impersonate ] && [ "${resource#*.}" = authentication.k8s.io ]; then
+    [ "$subresource" != - ] || subresource=""
+    [ "$where" != all ] || where=""
+    sar_no "$team" "$verb" authentication.k8s.io "${resource%%.*}" "$subresource" "$where"
+    return
+  fi
+  args=("$verb" "$resource")
+  [ "$subresource" = - ] || args+=("--subresource=$subresource")
+  case "$where" in
+    '') ;;
+    all) args+=(--all-namespaces) ;;
+    *) args+=(-n "$where") ;;
+  esac
+  can_i_no "$team" "${args[@]}"
 }
 
 # before_policy_probes: before the network policy, a new pod of each team calls mock-docs
@@ -635,6 +760,62 @@ operator_checks() {
 before_policy_probes() {
   kind_workload "team-a before policy" team-a mock-workload before-policy
   kind_workload "team-b before policy" team-b mock-workload before-policy
+}
+
+# route_checks_before_policy: the route check's positive control. Every check that shows a route
+# refused shows, in the same run, one that works (decision 0010, "Evidence"). Before the
+# network policy, from a new idle team-a pod, every route on the list must be open, by name and
+# by address: the probe reaches mock-docs, and mock-docs answers. Sets OPEN_ATTEMPTS: how many
+# attempts the probe found open, each a request mock-docs refused for carrying no bearer.
+route_checks_before_policy() {
+  local job
+  # The operator runs with its own access and no more: no Secret data, no exec, no pod of its
+  # own, and no probe outside the teams' namespaces.
+  can_i_no_as "$ROUTE_CHECK_OPERATOR" "the route-check operator" get secrets -n mock-docs
+  can_i_no_as "$ROUTE_CHECK_OPERATOR" "the route-check operator" create pods --subresource=exec -n team-a
+  can_i_no_as "$ROUTE_CHECK_OPERATOR" "the route-check operator" create pods -n team-a
+  can_i_no_as "$ROUTE_CHECK_OPERATOR" "the route-check operator" patch pods --subresource=ephemeralcontainers -n mock-docs
+  start_idle team-a
+  job=$JOB
+  route_check team-a open "$job"
+  OPEN_ATTEMPTS=$(open_route_attempts "$ROUTE_REPORT")
+  check_at_least "$OPEN_ATTEMPTS" 1 "the route check before the policy found routes open"
+  stop_idle team-a "$job"
+}
+
+# route_checks_after_policy: after the policy and its settle, a new idle pod of each team, then
+# 10 s more, since a new pod is briefly outside its policy; then the route check from each, with
+# every route refused. Each report records the network plugin and the kind version.
+route_checks_after_policy() {
+  local team jobs=() i=0
+  for team in team-a team-b; do
+    start_idle "$team"
+    jobs+=("$JOB")
+  done
+  sleep 10
+  for team in team-a team-b; do
+    route_check "$team" refused "${jobs[$i]}"
+    check_route_report "$team" "$ROUTE_REPORT"
+    i=$((i + 1))
+  done
+  i=0
+  for team in team-a team-b; do
+    stop_idle "$team" "${jobs[$i]}"
+    i=$((i + 1))
+  done
+}
+
+# check_route_report TEAM REPORT: the route check's report names the network plugin it read
+# enforcement from, kindnet, and the kind release whose kindnetd that is.
+check_route_report() {
+  local team=$1 report=$2 plugin kind
+  plugin=$(jq -r '.network_plugin' "$report" 2>/dev/null || true)
+  kind=$(jq -r '.kind_version' "$report" 2>/dev/null || true)
+  check "$plugin" kindnet "the route check's report for $team records the network plugin"
+  case "$kind" in
+    'kind v'[0-9]*) pass "the route check's report for $team records the kind version ($kind)" ;;
+    *) fail "the route check's report for $team records the kind version (got '$kind')" ;;
+  esac
 }
 
 # run_image: tags the image just built with its own ID and sets IMG_RUN to that tag. The
@@ -709,6 +890,8 @@ kind_run() {
   k -n team-a delete job -l app=stranger-workload --ignore-not-found
   k -n team-b delete job -l app=mock-workload --ignore-not-found
   apply_base
+  # The route check's operator: its ServiceAccount and only the access its step needs.
+  k apply -f "$ROOT/deploy/kind/route-check/rbac.yaml"
   k -n switchboard rollout status deploy/postgres --timeout=120s
   wait_job switchboard migrate 180
   k -n switchboard logs job/migrate | sed 's/^/    /'
@@ -721,11 +904,16 @@ kind_run() {
     "$IMG_RUN" "mock-docs runs this run's image"
   mark_start
 
-  step "the gateway's boot lines"
-  check_boot "$(k -n switchboard logs deploy/gateway)"
+  step "the gateway's boot lines (its pod of the current ReplicaSet)"
+  gateway_pod
+  echo "    pod $GATEWAY_POD"
+  check_boot "$(k -n switchboard logs "pod/$GATEWAY_POD")"
 
   step "before the policy: each team's direct call to mock-docs connects, the server refuses the workload's own token, and the gateway's call to mock-docs succeeds"
   before_policy_probes
+
+  step "before the policy: the route check, as the route-check operator, from a new idle team-a pod; every route to mock-docs is open, by name and by address (its positive control)"
+  route_checks_before_policy
 
   step "apply the network policy; new pods from here on; settle 10 s"
   k apply -k "$ROOT/deploy/kind/policy"
@@ -738,7 +926,10 @@ kind_run() {
   step "identity: a ServiceAccount not in the team manifest"
   kind_workload "stranger" team-a stranger-workload refused
 
-  step "operator checks: in mock-docs, the gateway's namespace or its own, neither team's workload may start pods or the controllers that start them, mint tokens, impersonate a ServiceAccount, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create a binding; nor get, list or watch the gateway's or mock-docs' secrets or the gateway's configuration; nor, across the cluster, proxy to a node, impersonate a user, group, UID or extra, bind or escalate a cluster role, or create a cluster binding"
+  step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
+  route_checks_after_policy
+
+  step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create a binding, nor get, list or watch secrets or configuration"
   operator_checks
 
   step "mock-docs accepted only the gateway's own identity, and no denied call reached it"
@@ -748,13 +939,15 @@ kind_run() {
   # run's list and read, and the same pod's read after its direct call times out. Its other calls
   # are denied, and the stranger is refused. The two direct calls before the policy, one per
   # team, carried the workloads' own projected tokens, for audience switchboard, and were
-  # refused (401) as wrong_audience. After the policy no direct call reaches the server.
-  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2
+  # refused (401) as wrong_audience. The route check's probe before the policy sent no
+  # credential, and each attempt it found open was refused as no_bearer. After the policy no
+  # direct call reaches the server.
+  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"
 
   step "the gateway's view of identity failures (operators only; no audit rows)"
   local gateway_logs
   # Only this run's lines: a run on an existing cluster may reuse the gateway's pod.
-  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" deploy/gateway)
+  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" "pod/$GATEWAY_POD")
   printf '%s\n' "$gateway_logs" | grep 'identity_failed' | sed 's/^/    /' || echo "    (none)"
   # Two teams refused three ways each (no token, not a token, the default API token), and the
   # stranger once.

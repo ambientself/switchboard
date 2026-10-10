@@ -460,6 +460,9 @@ const PERMISSIONS: &[(&str, &str, &str, &str)] = &[
     ("get", "secrets", "-", "namespaced"),
     ("list", "secrets", "-", "namespaced"),
     ("watch", "secrets", "-", "namespaced"),
+    ("get", "configmaps", "-", "namespaced"),
+    ("list", "configmaps", "-", "namespaced"),
+    ("watch", "configmaps", "-", "namespaced"),
     ("create", "pods", "-", "namespaced"),
     ("create", "deployments.apps", "-", "namespaced"),
     ("update", "deployments.apps", "-", "namespaced"),
@@ -1351,7 +1354,9 @@ fn the_flag_or_the_pinned_default_settles_enforcement_and_the_log_is_only_a_fall
     let checked = check("enforcement-default-log-rotated", &cluster);
     assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
     assert!(
-        checked.passed(&format!("network policy is enforced: kindnet, {default_on}")),
+        checked.passed(&format!(
+            "network policy is enforced: kindnet, {default_on}"
+        )),
         "{}",
         checked.run.transcript()
     );

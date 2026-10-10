@@ -635,10 +635,7 @@ fn idle_waits_until_sigterm_and_then_passes() {
         "{first:?}"
     );
     let pid = child.id().to_string();
-    let killed = Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .unwrap();
+    let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
     assert!(killed.success());
     let run = finish_within(child, first, Duration::from_secs(5));
     assert_passed(&run);
