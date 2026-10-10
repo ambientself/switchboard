@@ -70,7 +70,7 @@ pub use config::{
 pub use deployment::{AuditChoice, Deployment, DeploymentError};
 pub use path::{
     AUDIT_DISABLED_NOTE, Admitted, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
-    RequestPath, SERVER_NAME,
+    RequestPath, SERVER_NAME, Source,
 };
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{undeclared_argument, withdrawn_while_deciding};
@@ -81,7 +81,8 @@ pub use selector::{
 };
 pub use server::{
     BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
-    READINESS_REMOVAL, SHUTDOWN_GRACE, Timeouts, serve, serve_with_shutdown, serve_with_timeouts,
+    READINESS_REMOVAL, SHUTDOWN_GRACE, Timeouts, serve, serve_with_shutdown, serve_with_telemetry,
+    serve_with_timeouts,
 };
 pub use telemetry::{
     Drain, Event, MAX_SURFACE, Surface, TELEMETRY_QUEUE, Telemetry, TelemetryCounts,

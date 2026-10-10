@@ -12,6 +12,12 @@
 //!
 //! [`RequestPath::handle`] runs both, in that order.
 //!
+//! The path emits decision 0009's telemetry events to its [`Telemetry`], each naming the
+//! deployment and the request's [`Source`]: `identity_failed` for each caller `admit` refuses,
+//! with the cause and the issuer and subject the token claimed; `unparsable_body` for each
+//! protocol refusal, with its kind; and `initialize`, `ping` and `discover` for each one
+//! answered. Emitting never waits: a full queue drops the event and counts the drop.
+//!
 //! What `respond` does with each request:
 //!
 //! - A protocol refusal is answered as [`gateway_mcp`] renders it, and a notification gets 202
@@ -37,12 +43,10 @@
 //!
 //! What the path does not do yet, and why:
 //!
-//! - **Identity failures are logged, not audited**, as decision 0009 records: they are
-//!   telemetry, and an audit row needs a proved principal, which a failed caller does not have.
-//!   The log event carries the deployment and the cause; the surface, the source address,
-//!   counters and a bounded queue are still to come (design section 17). With identity
-//!   disabled there is no principal either, so `tools/list` lists nothing and every
-//!   `tools/call` is refused with [`IDENTITY_DISABLED`], with no row.
+//! - **Identity failures are telemetry, not audited**, as decision 0009 records: an audit row
+//!   needs a proved principal, which a failed caller does not have. With identity disabled
+//!   there is no principal either, so `tools/list` lists nothing and every `tools/call` is
+//!   refused with [`IDENTITY_DISABLED`], with no row.
 //! - **There is no answer budget.** The core gives out the answer only once the store's
 //!   `finish` returns, so the path waits for it, however long that takes. The budget belongs
 //!   inside the store (#10).
@@ -57,6 +61,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -79,6 +84,7 @@ use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
 use crate::policy::ServedPolicy;
 use crate::proxied::{CheckedArguments, registry_resources};
+use crate::telemetry::{Event, Surface, Telemetry};
 
 /// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
 pub const MAX_TOOL_USE_ID: usize = 128;
@@ -107,6 +113,7 @@ pub struct RequestPath {
 struct Inner {
     gates: Gates,
     server: ServerInfo,
+    telemetry: Telemetry,
 }
 
 impl fmt::Debug for RequestPath {
@@ -114,18 +121,42 @@ impl fmt::Debug for RequestPath {
         f.debug_struct("RequestPath")
             .field("gates", &self.inner.gates)
             .field("server", &self.inner.server)
+            .field("telemetry", &self.inner.telemetry)
             .finish()
+    }
+}
+
+/// Where a request came from, as its telemetry events record it: the surface its URL named,
+/// escaped and capped, and the peer's address. Either can be unknown: the URL's surface may not
+/// decode to text, and a request that did not come over a connection has no peer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Source {
+    /// The surface the URL named.
+    pub surface: Option<Surface>,
+    /// The peer's address.
+    pub address: Option<SocketAddr>,
+}
+
+impl Source {
+    /// The source of a request for `surface`, as the URL named it, from `address`.
+    pub fn new(surface: Option<&str>, address: Option<SocketAddr>) -> Self {
+        Self {
+            surface: surface.map(Surface::new),
+            address,
+        }
     }
 }
 
 /// A request [`RequestPath::admit`] let through: a JSON POST from a caller who was verified,
 /// or from anyone while identity is disabled.
 ///
-/// Its field is private and `admit` is the only way to make one, so [`RequestPath::respond`]
-/// cannot be reached without the identity check having run.
+/// Its fields are private and `admit` is the only way to make one, so [`RequestPath::respond`]
+/// cannot be reached without the identity check having run. It carries the [`Source`] `admit`
+/// was given, for the events `respond` emits.
 #[derive(Debug)]
 pub struct Admitted {
     caller: Caller,
+    source: Source,
 }
 
 impl Admitted {
@@ -146,18 +177,33 @@ enum Caller {
 }
 
 impl RequestPath {
-    /// The path for `gates`. `serverInfo` names the gateway [`SERVER_NAME`] at this crate's
-    /// version, and its instructions say which gates are turned off.
+    /// The path for `gates`, with [`Telemetry::detached`]: its events are counted, and dropped.
+    /// `serverInfo` names the gateway [`SERVER_NAME`] at this crate's version, and its
+    /// instructions say which gates are turned off.
     pub fn new(gates: Gates) -> Self {
+        Self::with_telemetry(gates, Telemetry::detached())
+    }
+
+    /// The path for `gates`, emitting its events to `telemetry`.
+    pub fn with_telemetry(gates: Gates, telemetry: Telemetry) -> Self {
         let server = server_info(&gates);
         Self {
-            inner: Arc::new(Inner { gates, server }),
+            inner: Arc::new(Inner {
+                gates,
+                server,
+                telemetry,
+            }),
         }
     }
 
     /// The gates the path serves.
     pub fn gates(&self) -> &Gates {
         &self.inner.gates
+    }
+
+    /// Where the path emits its events.
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.inner.telemetry
     }
 
     /// How the gateway describes itself to clients.
@@ -171,31 +217,39 @@ impl RequestPath {
     /// The token is the one `Authorization: Bearer` header; the scheme is matched without
     /// regard to case. A missing header, two of them, a value that is not text, or another
     /// scheme count as no token. Every identity failure is the same 401, with the core's one
-    /// sentence and a `Bearer` challenge. Its cause is logged, never sent, and no audit row is
-    /// written: decision 0009 makes an identity failure telemetry.
+    /// sentence and a `Bearer` challenge. No audit row is written: decision 0009 makes an
+    /// identity failure telemetry. Each one emits one `identity_failed` event naming `source`,
+    /// the cause, and the issuer and subject the token claimed, as the identity crate escaped
+    /// and capped them. None of that is sent.
     // The error is the response to send, which is large. It is built at most once per request
     // and sent as it is, so boxing it would only add an allocation.
     #[allow(clippy::result_large_err)]
-    pub fn admit(&self, method: &Method, headers: &HeaderMap) -> Result<Admitted, HttpResponse> {
+    pub fn admit(
+        &self,
+        method: &Method,
+        headers: &HeaderMap,
+        source: &Source,
+    ) -> Result<Admitted, HttpResponse> {
         gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;
         let gates = &self.inner.gates;
-        match gates.identity().check(bearer_token(headers)) {
-            Verification::Proved(principal) => Ok(Admitted {
-                caller: Caller::Proved(principal),
-            }),
-            Verification::Disabled => Ok(Admitted {
-                caller: Caller::Unchecked,
-            }),
+        let caller = match gates.identity().check(bearer_token(headers)) {
+            Verification::Proved(principal) => Caller::Proved(principal),
+            Verification::Disabled => Caller::Unchecked,
             Verification::Failed(failure) => {
-                tracing::warn!(
-                    event = "identity_failed",
-                    deployment = %gates.deployment(),
-                    cause = %failure.detail(),
-                    "refused a caller whose identity was not proved"
-                );
-                Err(Rejection::unauthorized(IDENTITY_FAILURE).response())
+                self.emit(Event::IdentityFailed {
+                    deployment: gates.deployment().clone(),
+                    surface: source.surface.clone(),
+                    source: source.address,
+                    cause: failure.detail().clone(),
+                    claimed: failure.claimed().clone(),
+                });
+                return Err(Rejection::unauthorized(IDENTITY_FAILURE).response());
             }
-        }
+        };
+        Ok(Admitted {
+            caller,
+            source: source.clone(),
+        })
     }
 
     /// Parses the request and returns the future that answers it.
@@ -215,9 +269,16 @@ impl RequestPath {
         let path = self.clone();
         let surface = SurfaceName::new(surface);
         async move {
+            let Admitted { caller, source } = admitted;
             match parsed {
                 Err(rejection) => {
                     tracing::debug!(%rejection, "refused a request at the protocol layer");
+                    path.emit(Event::Unparsable {
+                        deployment: path.inner.gates.deployment().clone(),
+                        surface: source.surface,
+                        source: source.address,
+                        rejection: rejection.kind(),
+                    });
                     rejection.response()
                 }
                 Ok(Inbound::Notification { method }) => {
@@ -225,7 +286,7 @@ impl RequestPath {
                     HttpResponse::accepted()
                 }
                 Ok(Inbound::Request(request)) => {
-                    path.answer(admitted.caller, surface, request).await
+                    path.answer(caller, source, surface, request).await
                 }
             }
         }
@@ -240,19 +301,53 @@ impl RequestPath {
         surface: &str,
         body: &[u8],
     ) -> HttpResponse {
-        let admitted = match self.admit(method, headers) {
+        let source = Source::new(Some(surface), None);
+        let admitted = match self.admit(method, headers, &source) {
             Ok(admitted) => admitted,
             Err(response) => return response,
         };
         self.respond(admitted, surface, headers, body).await
     }
 
-    async fn answer(self, caller: Caller, surface: SurfaceName, request: Request) -> HttpResponse {
+    /// Counts `event` and queues it for the log. Never waits.
+    fn emit(&self, event: Event) {
+        self.inner.telemetry.emit(event);
+    }
+
+    async fn answer(
+        self,
+        caller: Caller,
+        source: Source,
+        surface: SurfaceName,
+        request: Request,
+    ) -> HttpResponse {
         let Request { id, era, call } = request;
+        let deployment = || self.inner.gates.deployment().clone();
         let (reply, row) = match call {
-            Call::Initialize => (Reply::Initialized, None),
-            Call::Ping => (Reply::Pong, None),
-            Call::Discover => (Reply::Discovered, None),
+            Call::Initialize => {
+                self.emit(Event::Initialize {
+                    deployment: deployment(),
+                    surface: source.surface,
+                    source: source.address,
+                });
+                (Reply::Initialized, None)
+            }
+            Call::Ping => {
+                self.emit(Event::Ping {
+                    deployment: deployment(),
+                    surface: source.surface,
+                    source: source.address,
+                });
+                (Reply::Pong, None)
+            }
+            Call::Discover => {
+                self.emit(Event::Discover {
+                    deployment: deployment(),
+                    surface: source.surface,
+                    source: source.address,
+                });
+                (Reply::Discovered, None)
+            }
             Call::ToolsList => self.list(caller, surface).await,
             Call::ToolsCall(call) => self.call(caller, surface, call).await,
         };

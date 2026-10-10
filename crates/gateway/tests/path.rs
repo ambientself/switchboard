@@ -17,7 +17,7 @@ use std::time::Duration;
 use gateway::boot::{DEFAULT_CALL_DEADLINE, UNNAMED_INSTANCE};
 use gateway::{
     AUDIT_DISABLED_NOTE, Config, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
-    RequestPath, ResourceAdapter, Wiring, boot,
+    RequestPath, ResourceAdapter, Source, Telemetry, TelemetryCounts, Wiring, boot,
 };
 use gateway_core::audit::{
     AuditRowId, Completion, DecisionKind, Outcome, RecordedResources, RowKind,
@@ -86,9 +86,22 @@ impl World {
         Self::with(|_| {}, |wiring| wiring)
     }
 
+    /// A world whose path emits its events to `telemetry`.
+    fn telemetered(telemetry: Telemetry) -> Self {
+        Self::build(|_| {}, |wiring| wiring, Some(telemetry))
+    }
+
     /// A world whose configuration `configure` changes and whose wiring `wire` adds to. The
     /// audit store is wired in unless the configuration disables audit.
     fn with(configure: impl FnOnce(&mut Value), wire: impl FnOnce(Wiring) -> Wiring) -> Self {
+        Self::build(configure, wire, None)
+    }
+
+    fn build(
+        configure: impl FnOnce(&mut Value),
+        wire: impl FnOnce(Wiring) -> Wiring,
+        telemetry: Option<Telemetry>,
+    ) -> Self {
         let fixture = Fixture::new().unwrap();
         let credentials = Arc::new(FakeCredentialSource::new());
         let connector = Arc::new(FixtureConnector::new(credentials.clone()));
@@ -113,7 +126,10 @@ impl World {
             credentials,
             connector,
             resources,
-            path: RequestPath::new(gates),
+            path: match telemetry {
+                Some(telemetry) => RequestPath::with_telemetry(gates, telemetry),
+                None => RequestPath::new(gates),
+            },
         }
     }
 
@@ -881,7 +897,10 @@ fn the_row_is_written_before_the_tool_runs_and_finished_before_the_answer() {
     let send = |world: &World| {
         let request = tools_call(READ_TOOL, own(Caller::TeamA))
             .header("authorization", &format!("Bearer {token}"));
-        let admitted = world.path.admit(&request.method, &request.headers).unwrap();
+        let admitted = world
+            .path
+            .admit(&request.method, &request.headers, &Source::default())
+            .unwrap();
         world
             .path
             .respond(admitted, SURFACE_ALL, &request.headers, &request.body)
@@ -938,7 +957,10 @@ fn the_answering_future_can_be_spawned() {
         "authorization",
         &format!("Bearer {}", world.token(Caller::TeamA)),
     );
-    let admitted = world.path.admit(&request.method, &request.headers).unwrap();
+    let admitted = world
+        .path
+        .admit(&request.method, &request.headers, &Source::default())
+        .unwrap();
     let future = spawnable(world.path.respond(
         admitted,
         SURFACE_ALL,
@@ -1088,6 +1110,7 @@ fn every_identity_failure_is_the_same_401_and_nothing_runs() {
             Some(first) => assert_eq!(&got.body, first, "{case}: the bytes differ"),
         }
     };
+    let attempts_made = u64::try_from(attempts.len()).unwrap();
     for (case, request) in attempts {
         check(case, request);
     }
@@ -1105,6 +1128,55 @@ fn every_identity_failure_is_the_same_401_and_nothing_runs() {
         "identity failures are telemetry, not audit rows"
     );
     assert_eq!(world.store.begin_attempts(), 0);
+    // One event for each failure, and nothing else.
+    let failures = attempts_made + 1;
+    assert_eq!(
+        world.path.telemetry().counts(),
+        TelemetryCounts {
+            identity_failed: failures,
+            dropped: failures,
+            ..TelemetryCounts::default()
+        }
+    );
+}
+
+/// The telemetry queue never holds an answer up: with room for one event and nothing emptying
+/// it, every failure after the first is dropped and counted, and each is still the same 401.
+#[test]
+fn a_full_telemetry_queue_drops_events_and_still_answers_each_failure() {
+    let (telemetry, drain) = Telemetry::bounded(1);
+    let world = World::telemetered(telemetry.clone());
+    let flood = 50;
+    let mut first: Option<Vec<u8>> = None;
+    for _ in 0..flood {
+        let got = world.send(
+            Some("not-a-token"),
+            SURFACE_ALL,
+            tools_call(READ_TOOL, own(Caller::TeamA)),
+        );
+        assert_eq!(got.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            got.headers
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap()),
+            Some(CHALLENGE)
+        );
+        assert_eq!(got.json()["error"]["message"], json!(IDENTITY_FAILURE));
+        match &first {
+            None => first = Some(got.body),
+            Some(first) => assert_eq!(&got.body, first, "the bytes differ"),
+        }
+    }
+    assert_eq!(
+        telemetry.counts(),
+        TelemetryCounts {
+            identity_failed: flood,
+            dropped: flood - 1,
+            ..TelemetryCounts::default()
+        }
+    );
+    world.assert_nothing_ran();
+    drop(drain);
 }
 
 #[test]
@@ -1515,7 +1587,10 @@ fn the_list_row_is_written_before_the_answer() {
         &format!("Bearer {}", world.token(Caller::TeamA)),
     );
     let gate = world.store.hold_begins();
-    let admitted = world.path.admit(&request.method, &request.headers).unwrap();
+    let admitted = world
+        .path
+        .admit(&request.method, &request.headers, &Source::default())
+        .unwrap();
     let mut list = pin!(
         world
             .path
