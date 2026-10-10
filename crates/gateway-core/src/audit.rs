@@ -18,7 +18,8 @@
 //!   else in the crate's public interface can produce. So a call path that skips the row has
 //!   no guard to run with and no sentence to answer with.
 //! - [`run`] consumes the guard, hands the connector a [`ToolCall`] that only
-//!   it can make, and returns a [`Ran`]. One guard runs one call, once.
+//!   it can make, and returns a [`Ran`]. One guard runs one call, once. [`run_unless`] does the
+//!   same, except that a read whose caller goes away is cancelled and recorded as `error`.
 //! - [`finish`] consumes the `Ran`, completes the row through a [`RowCompletion`] that only it
 //!   and `give_up` can make, and only then gives out the answer, including a connector's
 //!   refusal sentence.
@@ -41,6 +42,9 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
+use std::task::Poll;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -704,6 +708,54 @@ pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
         arguments,
     } = guard;
     let outcome = connector.run(ToolCall::new(call, tool, arguments)).await;
+    Ran { row, outcome }
+}
+
+/// Runs the guarded call on `connector`, as [`run`] does, unless its caller goes away first:
+/// `gone` completes when the caller has disconnected. What that does depends on the tool's
+/// classification (decision 0009, "Where a call runs"):
+///
+/// - A tool classified `read` is cancelled. If `gone` has already completed, the connector is
+///   not called. Otherwise the call is raced against `gone`, and if `gone` completes first the
+///   connector's future is dropped. Either way the `Ran` records the call as an error, with the
+///   sentence that the caller disconnected, so [`finish`] completes the row as `error`. A read
+///   that has returned is never thrown away: the connector is polled before `gone`.
+/// - Any other classification ignores `gone`, which is never polled. A side effect runs to
+///   completion, so that its outcome is learned rather than made unknown by a cancellation.
+pub async fn run_unless(
+    connector: &dyn Connector,
+    guard: AuditGuard,
+    gone: impl Future<Output = ()>,
+) -> Ran {
+    if guard.tool.classification != Classification::Read {
+        return run(connector, guard).await;
+    }
+    let AuditGuard {
+        row,
+        call,
+        tool,
+        arguments,
+    } = guard;
+    let cancelled = || ToolOutcome::Error(sentences::CALLER_DISCONNECTED.to_owned());
+    let mut gone = pin!(gone);
+    // A caller already gone is not called for.
+    let already_gone = poll_fn(|context| Poll::Ready(gone.as_mut().poll(context).is_ready())).await;
+    if already_gone {
+        return Ran {
+            row,
+            outcome: cancelled(),
+        };
+    }
+    let mut running = connector.run(ToolCall::new(call, tool, arguments));
+    let outcome = poll_fn(|context| {
+        if let Poll::Ready(outcome) = running.as_mut().poll(context) {
+            return Poll::Ready(outcome);
+        }
+        gone.as_mut().poll(context).map(|()| cancelled())
+    })
+    .await;
+    // On a cancellation, this is what cancels the read.
+    drop(running);
     Ran { row, outcome }
 }
 

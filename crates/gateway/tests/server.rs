@@ -3,18 +3,21 @@
 //!
 //! The request path's own behaviour is tested in `path.rs`. These tests cover what the HTTP
 //! layer adds: the host and origin checks, the body limit, identity before the body is read, a
-//! task per answer that a disconnect cannot cancel, the time limits on a request's head and
-//! body, the readiness check, and shutting down.
+//! task per answer that a disconnect cannot cancel, what a disconnect does to a call (decision
+//! 0009), the time limits on a request's head and body, the readiness check, and shutting down.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
 
 use std::time::{Duration, Instant};
 
-use gateway::{MAX_BODY_BYTES, Timeouts};
+use gateway::{MAX_BODY_BYTES, SHUTTING_DOWN, Timeouts};
 use gateway_core::audit::{Completion, DecisionKind, Outcome};
-use gateway_mcp::{INVALID_REQUEST, LEGACY, MODERN, PARSE_ERROR};
-use gateway_testkit::{Caller, READ_TOOL, SURFACE_READ, TEAM_B_DOCUMENT};
+use gateway_core::{AuditRecord, Classification};
+use gateway_mcp::{INTERNAL_ERROR, INVALID_REQUEST, LEGACY, MODERN, PARSE_ERROR};
+use gateway_testkit::{
+    Caller, DRAFT_TOOL, READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -334,30 +337,63 @@ async fn identity_is_checked_before_the_body_is_read() {
 
 // --- The answer runs on its own task --------------------------------------------------------
 
-#[tokio::test]
-async fn a_tool_call_completes_its_row_after_its_client_has_gone() {
-    let server = Server::start().await;
-    let gate = server.connector.hang_next();
-    let request = server.call(
-        Caller::TeamA,
-        SURFACE_READ,
-        READ_TOOL,
-        json!({"document": Caller::TeamA.own_document()}),
-    );
+/// Sends `request` whole and does not read the answer: the stream, to drop when the client goes
+/// away.
+async fn send_and_wait(server: &Server, request: Http) -> TcpStream {
     let length = request.body.len().to_string();
     let request = request.header("content-length", &length);
     let mut bytes = request.head();
     bytes.extend_from_slice(&request.body);
-
     let mut stream = TcpStream::connect(server.address).await.unwrap();
     stream.write_all(&bytes).await.unwrap();
+    stream
+}
+
+/// Team A's call to the draft tool, a side effect.
+fn propose(server: &Server) -> Http {
+    server.call(
+        Caller::TeamA,
+        SURFACE_ALL,
+        DRAFT_TOOL,
+        json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."}),
+    )
+}
+
+/// Team A's call to the read tool.
+fn read(server: &Server) -> Http {
+    server.call(
+        Caller::TeamA,
+        SURFACE_READ,
+        READ_TOOL,
+        json!({"document": Caller::TeamA.own_document()}),
+    )
+}
+
+/// How long a test gives the server to notice that a client has gone.
+const NOTICE: Duration = Duration::from_millis(200);
+
+fn completion(row: &AuditRecord) -> Option<Outcome> {
+    row.completion
+        .as_ref()
+        .map(|completion| completion.outcome.clone())
+}
+
+#[tokio::test]
+async fn a_side_effect_completes_its_row_after_its_client_has_gone() {
+    let server = Server::start().await;
+    let gate = server.connector.hang_next();
+    let stream = send_and_wait(&server, propose(&server)).await;
     eventually("the call reaching the connector", || gate.waiting() == 1).await;
     let row = server.store.row(0).unwrap();
+    assert_eq!(row.classification, Some(Classification::Propose));
     assert_eq!((row.decision, row.completion), (DecisionKind::Allow, None));
 
-    // The client goes away while the tool is running, and the server notices.
+    // The client goes away while the tool is running, and the server notices. Nothing is
+    // cancelled: the call is still held, not dropped.
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(NOTICE).await;
+    assert_eq!(gate.waiting(), 1, "the side effect was cancelled");
+    assert_eq!(server.store.row(0).unwrap().completion, None);
     gate.open();
     eventually("the row's completion", || {
         server.store.row(0).unwrap().completion.is_some()
@@ -371,6 +407,76 @@ async fn a_tool_call_completes_its_row_after_its_client_has_gone() {
         })
     );
     assert_eq!(server.store.finish_attempts(), 1);
+    assert_eq!(server.connector.writes().len(), 1, "the draft was written");
+}
+
+#[tokio::test]
+async fn a_call_whose_client_goes_during_begin_is_not_run_and_its_row_is_an_error() {
+    let server = Server::start().await;
+    let gate = server.store.hold_begins();
+    let stream = send_and_wait(&server, propose(&server)).await;
+    eventually("begin reaching the store", || gate.waiting() == 1).await;
+
+    drop(stream);
+    tokio::time::sleep(NOTICE).await;
+    gate.open();
+    eventually("the row's completion", || {
+        server
+            .store
+            .row(0)
+            .is_some_and(|row| row.completion.is_some())
+    })
+    .await;
+    let row = server.store.row(0).unwrap();
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(
+        row.completion,
+        Some(Completion {
+            outcome: Outcome::Error,
+            latency_ms: 0
+        })
+    );
+    assert!(
+        server.connector.received().is_empty(),
+        "the connector was called for a client that had gone"
+    );
+    assert!(server.connector.writes().is_empty());
+    assert_eq!(server.store.finish_attempts(), 1);
+}
+
+#[tokio::test]
+async fn a_read_whose_client_goes_is_cancelled_and_its_row_is_an_error() {
+    let server = Server::start().await;
+    let gate = server.connector.hang_next();
+    let stream = send_and_wait(&server, read(&server)).await;
+    eventually("the call reaching the connector", || gate.waiting() == 1).await;
+
+    // The gate is never opened: the read is cancelled, and its future dropped.
+    drop(stream);
+    eventually("the row's completion", || {
+        server.store.row(0).unwrap().completion.is_some()
+    })
+    .await;
+    assert_eq!(
+        completion(&server.store.row(0).unwrap()),
+        Some(Outcome::Error)
+    );
+    assert_eq!(gate.waiting(), 0, "the read's future was not dropped");
+    assert_eq!(server.connector.received().len(), 1);
+    assert_eq!(server.store.finish_attempts(), 1);
+}
+
+#[tokio::test]
+async fn a_read_whose_client_stays_is_answered() {
+    let server = Server::start().await;
+    let gate = server.connector.hang_next();
+    let mut stream = send_and_wait(&server, read(&server)).await;
+    eventually("the call reaching the connector", || gate.waiting() == 1).await;
+    tokio::time::sleep(NOTICE).await;
+    gate.open();
+    let answer = read_answer(&mut stream).await;
+    assert_eq!(answer.result()["isError"], json!(false), "{answer:?}");
+    assert_eq!(completion(&server.store.row(0).unwrap()), Some(Outcome::Ok));
 }
 
 // --- The readiness check --------------------------------------------------------------------
@@ -633,18 +739,8 @@ async fn a_call_whose_body_arrives_after_shutting_down_never_starts() {
 async fn shutting_down_waits_past_the_grace_for_a_call_that_is_running() {
     let mut server = Server::start_with(short()).await;
     let gate = server.connector.hang_next();
-    let request = server.call(
-        Caller::TeamA,
-        SURFACE_READ,
-        READ_TOOL,
-        json!({"document": Caller::TeamA.own_document()}),
-    );
-    let length = request.body.len().to_string();
-    let request = request.header("content-length", &length);
-    let mut bytes = request.head();
-    bytes.extend_from_slice(&request.body);
-    let mut stream = TcpStream::connect(server.address).await.unwrap();
-    stream.write_all(&bytes).await.unwrap();
+    // A side effect: closing its connection after the grace cancels nothing.
+    let _stream = send_and_wait(&server, propose(&server)).await;
     eventually("the call reaching the connector", || gate.waiting() == 1).await;
 
     server.stop.take().unwrap().send(()).unwrap();
@@ -657,4 +753,43 @@ async fn shutting_down_waits_past_the_grace_for_a_call_that_is_running() {
     let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
     stopped.expect("the server stopped").unwrap().unwrap();
     assert!(server.store.row(0).unwrap().completion.is_some());
+}
+
+#[tokio::test]
+async fn a_call_whose_body_arrives_during_the_grace_is_refused_and_never_starts() {
+    let mut server = Server::start_with(Timeouts {
+        header_read: Duration::from_secs(60),
+        body_read: Duration::from_secs(60),
+        readiness_removal: Duration::from_millis(100),
+        shutdown_grace: Duration::from_secs(60),
+    })
+    .await;
+    let request = propose(&server);
+    let length = request.body.len().to_string();
+    let request = request.header("content-length", &length);
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&request.head()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    server.stop.take().unwrap().send(()).unwrap();
+    // Past the readiness removal the server stops taking connections, and waits for this one.
+    eventually("the server to stop taking connections", || {
+        std::net::TcpStream::connect(server.address).is_err()
+    })
+    .await;
+    assert!(!server.serving.is_finished());
+
+    stream.write_all(&request.body).await.unwrap();
+    let answer = read_answer(&mut stream).await;
+    assert_eq!(answer.status, 503, "{answer:?}");
+    assert_eq!(
+        answer.json(),
+        json!({"jsonrpc": "2.0", "id": null, "error": {
+            "code": INTERNAL_ERROR,
+            "message": SHUTTING_DOWN,
+        }})
+    );
+    server.assert_nothing_ran();
+    let stopped = tokio::time::timeout(PATIENCE, &mut server.serving).await;
+    stopped.expect("the server stopped").unwrap().unwrap();
 }

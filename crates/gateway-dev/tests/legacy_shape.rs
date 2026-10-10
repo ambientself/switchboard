@@ -48,6 +48,21 @@ async fn post(url: &str, token: &str, body: Value, extra: &[(&str, &str)]) -> An
     }
 }
 
+/// A `tools/list` answer without the list row it names, which each list has its own of.
+fn without_row(body: &Value) -> Value {
+    let mut body = body.clone();
+    let result = &mut body["result"];
+    let meta = result["_meta"]
+        .as_object_mut()
+        .expect("the list names its row in _meta");
+    meta.remove(AUDIT_ROW_META)
+        .expect("the list names its row in _meta");
+    if meta.is_empty() {
+        result.as_object_mut().unwrap().remove("_meta");
+    }
+    body
+}
+
 fn request(id: i64, method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 }
@@ -135,7 +150,7 @@ async fn a_legacy_client_with_no_version_header_is_served_throughout() {
     answers.push(answer);
 
     // The same list with the 2025-06-18 header, and with a session the gateway never issued:
-    // the same answer, and the session is not echoed.
+    // the same answer but for the row each list names, and the session is not echoed.
     let with_header = post(
         &url,
         &token,
@@ -143,7 +158,7 @@ async fn a_legacy_client_with_no_version_header_is_served_throughout() {
         &[(PROTOCOL_VERSION_HEADER, LEGACY)],
     )
     .await;
-    assert_eq!(with_header.body, listed);
+    assert_eq!(without_row(&with_header.body), without_row(&listed));
     answers.push(with_header);
     let with_session = post(
         &url,
@@ -152,7 +167,7 @@ async fn a_legacy_client_with_no_version_header_is_served_throughout() {
         &[(SESSION_ID_HEADER, "session-from-elsewhere")],
     )
     .await;
-    assert_eq!(with_session.body, listed);
+    assert_eq!(without_row(&with_session.body), without_row(&listed));
     answers.push(with_session);
 
     for answer in &answers {
@@ -190,4 +205,6 @@ async fn a_legacy_client_with_no_version_header_is_served_throughout() {
         Some(rows[1].clone())
     );
     assert_eq!(gateway.connector().received().len(), 1);
+    // Three lists, three list rows.
+    assert_eq!(store.list_rows().len(), 3);
 }

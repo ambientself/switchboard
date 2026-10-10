@@ -435,17 +435,26 @@ async fn a_scope_refusal_whose_finish_fails_gets_the_audit_sentence() {
 
 // --- A client that goes away -----------------------------------------------------------------
 
+/// Team A's call to the draft tool, a side effect: a client that goes away does not cancel it
+/// (decision 0009). A read would be cancelled.
+fn proposal(gateway: &FixtureGateway) -> Request {
+    Request::in_era(
+        Era::Legacy,
+        &gateway.url(SURFACE_ALL),
+        "tools/call",
+        call_params(
+            DRAFT_TOOL,
+            json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."}),
+        ),
+    )
+    .bearer(&gateway.token(Caller::TeamA))
+}
+
 #[tokio::test]
-async fn a_call_whose_client_goes_away_still_completes_its_row() {
+async fn a_side_effect_whose_client_goes_away_still_completes_its_row() {
     let gateway = start_fixture_gateway().await.unwrap();
     let gate = gateway.connector().hang_next();
-    let request = Request::in_era(
-        Era::Legacy,
-        &gateway.url(SURFACE_READ),
-        "tools/call",
-        call_params(READ_TOOL, document(TEAM_A_DOCUMENT)),
-    )
-    .bearer(&gateway.token(Caller::TeamA));
+    let request = proposal(&gateway);
     let sending = tokio::spawn(async move { request.send_on(&client()).await });
 
     eventually("the call reaching the connector", || gate.waiting() == 1).await;
@@ -498,17 +507,11 @@ async fn shutting_down_waits_for_a_call_in_flight_and_answers_it() {
 }
 
 #[tokio::test]
-async fn shutting_down_waits_for_a_call_whose_client_has_gone_to_complete_its_row() {
+async fn shutting_down_waits_for_a_side_effect_whose_client_has_gone_to_complete_its_row() {
     let gateway = start_fixture_gateway().await.unwrap();
     let store = gateway.store().clone();
     let gate = gateway.connector().hang_next();
-    let request = Request::in_era(
-        Era::Legacy,
-        &gateway.url(SURFACE_READ),
-        "tools/call",
-        call_params(READ_TOOL, document(TEAM_A_DOCUMENT)),
-    )
-    .bearer(&gateway.token(Caller::TeamA));
+    let request = proposal(&gateway);
     let sending = tokio::spawn(async move { request.send_on(&client()).await });
     eventually("the call reaching the connector", || gate.waiting() == 1).await;
     sending.abort();

@@ -45,7 +45,8 @@ async fn a_caller_is_listed_only_the_tools_it_may_call() {
         let (listed, _) = list(&gateway, Some(&team_b), era, "no-such-surface").await;
         assert_eq!(listed, Vec::<String>::new(), "{era}");
     }
-    // Listing writes no row and runs nothing.
+    // Each list writes one row of kind list, never a call row, and runs nothing.
+    assert_eq!(gateway.store().list_rows().len(), 10);
     assert_eq!(gateway.store().begin_attempts(), 0);
     assert_eq!(gateway.connector().received(), Vec::new());
 }
