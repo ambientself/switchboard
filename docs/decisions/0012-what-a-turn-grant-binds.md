@@ -314,6 +314,14 @@ None waits for grants to expire. A turn's reads cannot be stopped sooner than it
 except by the team, key or surface levers, which stop much more. Until Q11 sets a freshness
 bound, the team and surface levers are taken to need one rollout, and are tested against that.
 
+*Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):* the
+snapshot's freshness bound is set. The team and surface levers are edits to the registry, and
+take effect on a replica within the delivery bound plus one `registry.poll_seconds`: in kind, at
+most 120 s plus one poll once the ConfigMap is applied. A replica that cannot read its registry
+for longer than the maximum age, 60 s, refuses every call. The two levers are tested against
+that bound, not one rollout. The same holds for "Configuration levers take one rollout" under
+Decided by the owner.
+
 ### What Otto changes
 
 In one breaking change, before stage 1:

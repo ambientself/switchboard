@@ -1,8 +1,8 @@
 # Open questions
 
-Q1–Q8, Q14–Q16 and Q19 are settled below, and so is most of Q9, Q10, Q17 and Q18. Open are
-what remains of Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance
-requires of read auditing; Q11–Q13; and what remains of Q17 and Q18, which decisions 0010 and
+Q1–Q8, Q11, Q14–Q16 and Q19 are settled below, and so is most of Q9, Q10, Q17 and Q18. Open
+are what remains of Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance
+requires of read auditing; Q12 and Q13; and what remains of Q17 and Q18, which decisions 0010 and
 0012 leave to others. When resolved, move their requirements into [design.md](design.md) and
 remove the open question. Vendor research remains in [systems.md](systems.md).
 
@@ -118,6 +118,17 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   asked to make the changes this needs; none has been agreed with Otto's owners yet, and what
   waits on them is listed in the decision and under Q18 below. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
+- **2026-10-10 (Q11):** Each approval records two hashes: the definition the server serves, and
+  the server's binding (identity, address, destination, credential and, with connector entries,
+  the reach). Only JSON Schema 2020-12 loads. Each gateway replica runs its own drift pass,
+  every 300 s by default, and withdraws a changed tool or a widened reach for itself, with a
+  revision naming the withdrawn tools. In milestone 3 a withdrawal lasts until a new approval or
+  until that replica restarts, and every one is alerted on. A replica that cannot read its
+  registry for 60 s refuses every call. Emergency withdrawal, removing a tool or removing it
+  from its surfaces, is bounded by delivery plus one poll. The drift interval and how long a
+  withdrawal lasts are the owner's own answers, given by accepting the record. What platform
+  owners and IT decide is under Q17 and Q9. See [decision
+  0013](decisions/0013-registry-freshness-drift-and-withdrawal.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -150,8 +161,8 @@ record says what holds until each is answered. When they are answered, retire Q9
   accounts and who owns them, OAuth applications for per-user grants, ownership of the Okta
   groups, and the review of Otto's eighteen tool declarations. The asks of Otto's owners go in
   the one list of Otto requests under Q18.
-- Whether a per-user rate limit must come before employee proposals is tracked in Q12, and
-  how often the reach check runs in Q11. Whether Otto's `gateway_audit` table gains this
+- Whether a per-user rate limit must come before employee proposals is tracked in Q12. How
+  often the reach check runs is set by decision 0013. Whether Otto's `gateway_audit` table gains this
   record's audit columns is part of the question about that table in Q12.
 - **Blocks:** every policy file, and so milestone 2, until the code owners and the branch rule
   exist; every employee read and any broad read, until the security reviewer is named, since
@@ -188,35 +199,6 @@ compliance requires it for reads.
   0009's Still open 9 (who settles by hand) and 10 (how a resolution is recorded); Otto's
   write cutover also waits for its Still open 8 (Otto's key). Not milestone 2: the interim
   rule is enough for the first slice.
-
-## Q11. How quickly do policy changes and revocations take effect?
-
-The proxy reads an in-memory snapshot, but the design gives no maximum age or propagation
-bound. Drift detection and withdrawal now arrive together, in milestone 3.
-A definition hash detects interface changes, not a changed implementation behind the same schema.
-
-- **Recommendation:** use validated, versioned snapshots with atomic replacement and a
-  defined maximum age. Deny affected calls when policy freshness cannot be established within
-  the agreed bound. Record the policy revision with decisions. Define emergency withdrawal,
-  token/group staleness and grant revocation behavior explicitly.
-- **Grant revocation:** [decision 0012](decisions/0012-what-a-turn-grant-binds.md) defines the
-  levers. Removing a team from the allowlist of Otto's sandbox surface, and withdrawing Otto's
-  surfaces, are bounded by the snapshot freshness still to be set here, and are taken as one
-  rollout until then.
-- **Tool approval:** include server identity and routing/credential configuration in the
-  approval boundary. Detect drift from the first proxied rollout; define polling and
-  propagation bounds, and document the residual interval. Do not claim hash pinning proves
-  the downstream implementation is unchanged.
-- **How often the reach check runs**
-  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 4).
-  It bounds how long a widened service account goes unnoticed. For the owner; no
-  recommendation was made. Until it is set, no proxied entry is exposed outside development
-  and test deployments.
-- **How a withdrawal reaches every replica.** A reach mismatch withdraws tools by making a
-  snapshot of its own, with its own revision, swapped in atomically (decision 0011). How fast
-  every replica serves it, and what a replica does when it cannot learn of it, belong with
-  the maximum age above.
-- **Blocks:** the first production proxy deployment and its revocation guarantee.
 
 ## Q12. Which operational controls belong before broad rollout?
 
@@ -333,7 +315,6 @@ From the independent review of 2026-10-01. Accepted in principle, not yet design
 
 - Overload behavior for the audit store: admission control and bounded pools (Q12). An
   authentication flood no longer reaches the database (decision 0009).
-- Freshness and revocation bounds for group claims and team manifests (Q11).
 - Identity and audit opt-outs unavailable outside development builds (Q12). For turn-grant
   checking this is decided: it can be turned off only in a development build, enforced at boot
   ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).

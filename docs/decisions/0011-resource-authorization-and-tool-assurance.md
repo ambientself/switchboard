@@ -115,6 +115,11 @@ The gateway forwards its own serialization of the arguments the audit guard carr
 caller's bytes. A call that fails validation is completed with outcome `error` and is never
 forwarded.
 
+*Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):* a
+schema in another dialect is refused, at approval and at load. None is converted. Only 2020-12
+loads, so the dialect in the approval's hash is the constant `"2020-12"`, which each tool's
+`binding_sha256` covers.
+
 Without this, an adapter could check `project` while the server acted on a second argument
 the adapter never read. It covers undeclared arguments only. That no declared free-text
 argument or open object can name a resource is the reviewer's check; where one can, the tool
@@ -234,6 +239,20 @@ removal can only narrow what is allowed, so an unrelated change that breaks a lo
 cannot hold it up. Rows decided after it record its revision, so the revision on a row still
 says exactly what was in force. How a withdrawal reaches every gateway replica, and how it
 sits with a maximum snapshot age, are Q11's.
+
+*Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):*
+each gateway replica runs its own drift pass and withdraws for itself, so a change that lasts
+one interval plus one call deadline is withdrawn on every replica whose polls succeed, with
+nothing passed between them. A failed poll is not drift: while a replica's polls of an entry
+fail, a changed tool stays served on that replica, and the alert on failed polls covers it. The
+derived revision names the withdrawn tools literally. A replica that cannot read its
+registry for longer than the maximum age, 60 s, refuses every call. The residual: in milestone 3
+a withdrawal lives in each replica's memory, and lasts until a new approval or until that
+replica restarts. A restarted or new replica serves the tool again if the server has gone back
+to its approved definition, or the reach has narrowed again. "They return only through a new
+approval" then holds only on a replica that has not restarted since the withdrawal. Every
+withdrawal is logged at ERROR and alerted on, so that a person makes it standing by a new
+approval or a registry edit. Persisted withdrawals come in milestone 6.
 
 ### 5. Where each part of the decision is made
 
@@ -697,6 +716,10 @@ while they are open: each says what holds until it is answered.
 - **How often the reach check runs,** which bounds how long a widened service account goes
   unnoticed. No recommendation was made. Tracked in Q11, for the owner. A proxied entry is not
   exposed outside development and test deployments until it is set.
+
+  *Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):*
+  the reach check runs in the drift pass. That record recommends every 300 s by default,
+  configurable from 5 s to 900 s, as the owner's own answer, given by accepting it.
 - **Asks of IT and vendor administrators:** who creates and owns the gateway's narrow service
   accounts in Atlassian, Sumo Logic, MongoDB Atlas and AWS; agreement that changes to them go
   through the tool's approval; any administrative credential the reach check needs to read a
