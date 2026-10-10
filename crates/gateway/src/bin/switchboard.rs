@@ -7,11 +7,12 @@
 //!
 //! **Serving.** Reads the deployment file (see [`gateway::deployment`]) and every file it
 //! names, names the instance from `SWITCHBOARD_INSTANCE` or else `HOSTNAME` and refuses to
-//! start with neither (see [`gateway::start::instance`]), connects the audit store and runs
-//! its checks, runs the boot gates, and serves `POST /mcp/{surface}` on the address the file
-//! gives until interrupted. The registry file is
-//! read again every `registry.poll_seconds`, and a new version that passes is served from the
-//! next request. Logs go to standard output as JSON lines; a refusal to start goes to standard
+//! start with neither (see [`gateway::start::instance`]), fetches the keys of each issuer
+//! with a keys URL, connects the audit store and runs its checks, runs the boot gates, and
+//! serves `POST /mcp/{surface}` on the address the file gives until interrupted. The registry
+//! file is read again every `registry.poll_seconds`, and a new version that passes is served
+//! from the next request. Each keys URL is fetched again every `keys_refresh_seconds` (see
+//! [`gateway::keys`]). Both stop when the gateway shuts down. Logs go to standard output as JSON lines; a refusal to start goes to standard
 //! error as well, as plain text. Shutting down waits for the answers still running, and for the
 //! audit store to complete the rows it is still writing, up to its finish deadline.
 //!
@@ -126,8 +127,10 @@ async fn serve(config: PathBuf) -> ExitCode {
         Err(error) => return refuse(&format!("cannot listen on {listen}: {error}")),
     };
     let watching = tokio::spawn(prepared.watch.run());
+    let refreshing = tokio::spawn(prepared.keys.run());
     let served = serve_with_shutdown(listener, prepared.gates, shutdown()).await;
     watching.abort();
+    refreshing.abort();
     if let Some(store) = &prepared.store {
         finish_rows(store).await;
     }

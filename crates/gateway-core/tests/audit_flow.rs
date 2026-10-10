@@ -4,8 +4,11 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::ready;
+use std::future::{Future, pending, poll_fn, ready};
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, Begun, Completion, DecisionKind, ListRecord,
@@ -89,11 +92,18 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
         revision: "audit-1".into(),
         tools,
         surfaces,
-        profiles: vec![Profile {
-            name: "readers".into(),
-            classifications: [Classification::Read].into(),
-            requires_delegation: true,
-        }],
+        profiles: vec![
+            Profile {
+                name: "readers".into(),
+                classifications: [Classification::Read].into(),
+                requires_delegation: true,
+            },
+            Profile {
+                name: "proposers".into(),
+                classifications: [Classification::Read, Classification::Propose].into(),
+                requires_delegation: true,
+            },
+        ],
         limits: limits(),
     })
     .unwrap()
@@ -1115,4 +1125,184 @@ fn connectors_and_stores_work_as_trait_objects() {
     let ran = common::ready(audit::run(connector, guard));
     let finished = common::ready(audit::finish(store.as_ref(), ran, 1));
     assert_eq!(finished.answer(), &Answer::Ok(json!("a")));
+}
+
+// --- A caller that goes away (decision 0009, "Where a call runs") ---------------------------
+
+const CALLER_DISCONNECTED: &str = "The caller disconnected, so the read was cancelled.";
+
+/// The future a [`HangingConnector`] hands out: never ready, and it says when it is dropped.
+struct Hanging(Arc<AtomicBool>);
+
+impl Future for Hanging {
+    type Output = ToolOutcome;
+
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<ToolOutcome> {
+        Poll::Pending
+    }
+}
+
+impl Drop for Hanging {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A connector whose calls never return, counting the calls it was given and noting when the
+/// future of one is dropped.
+#[derive(Default)]
+struct HangingConnector {
+    calls: AtomicUsize,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Connector for HangingConnector {
+    fn run(&self, _call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(Hanging(self.dropped.clone()))
+    }
+}
+
+/// A connector whose calls are pending once, then return `ok`: a call that is still running when
+/// it is first polled.
+#[derive(Default)]
+struct SlowConnector {
+    calls: AtomicUsize,
+}
+
+impl Connector for SlowConnector {
+    fn run(&self, _call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut polled = false;
+        Box::pin(poll_fn(move |context| {
+            if polled {
+                Poll::Ready(ToolOutcome::Ok(json!({"draft": "draft-1"})))
+            } else {
+                polled = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }))
+    }
+}
+
+/// A guard for `tool` decided under the profile that permits `propose`.
+fn allowed_proposing(store: &dyn AuditStore, tool: &str) -> gateway_core::AuditGuard {
+    let mut context = call(tool);
+    context.caller.profile = "proposers".into();
+    match begin(store, decide(&snapshot(), &context)) {
+        Begun::Allowed(guard) => guard,
+        Begun::Denied(refusal) => panic!("expected a guard, got {refusal:?}"),
+    }
+}
+
+/// Polls `future` until it is ready, a few times at most: every future here is ready within two.
+fn polled<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..8 {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+    }
+    panic!("the future was not ready after eight polls")
+}
+
+#[test]
+fn a_read_whose_caller_goes_away_is_cancelled_and_finishes_as_error() {
+    let store = MemoryStore::default();
+    let connector = HangingConnector::default();
+    let guard = allowed(&store, "fixture__read");
+    let row = guard.row().clone();
+    let gone = AtomicBool::new(false);
+    let mut running = pin!(audit::run_unless(
+        &connector,
+        guard,
+        poll_fn(|_| {
+            if gone.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    ));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(running.as_mut().poll(&mut context).is_pending());
+    assert_eq!(
+        connector.calls.load(Ordering::SeqCst),
+        1,
+        "the read was called"
+    );
+    assert!(!connector.dropped.load(Ordering::SeqCst));
+
+    // The caller goes away while the read is running.
+    gone.store(true, Ordering::SeqCst);
+    let Poll::Ready(ran) = running.as_mut().poll(&mut context) else {
+        panic!("the read was not cancelled when its caller went away");
+    };
+    assert!(
+        connector.dropped.load(Ordering::SeqCst),
+        "the connector's future was not dropped"
+    );
+    let finished = common::ready(audit::finish(&store, ran, 7));
+    assert_eq!(
+        finished.answer(),
+        &Answer::Error(CALLER_DISCONNECTED.to_owned())
+    );
+    assert_eq!(store.ids(), vec![row]);
+    assert_eq!(
+        store.last().completion,
+        Some(Completion {
+            outcome: Outcome::Error,
+            latency_ms: 7,
+        })
+    );
+}
+
+#[test]
+fn a_read_whose_caller_has_already_gone_is_not_called() {
+    let store = MemoryStore::default();
+    let connector = HangingConnector::default();
+    let guard = allowed(&store, "fixture__read");
+    let ran = common::ready(audit::run_unless(&connector, guard, ready(())));
+    assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+    let finished = common::ready(audit::finish(&store, ran, 0));
+    assert_eq!(
+        finished.answer(),
+        &Answer::Error(CALLER_DISCONNECTED.to_owned())
+    );
+    assert_eq!(
+        store.last().completion.map(|completion| completion.outcome),
+        Some(Outcome::Error)
+    );
+}
+
+#[test]
+fn a_read_that_returns_is_answered_while_its_caller_stays() {
+    let store = MemoryStore::default();
+    let connector = RecordingConnector::answering(ToolOutcome::Ok(json!({"text": "hello"})));
+    let guard = allowed(&store, "fixture__read");
+    let ran = common::ready(audit::run_unless(&connector, guard, pending()));
+    let finished = common::ready(audit::finish(&store, ran, 3));
+    assert_eq!(finished.answer(), &Answer::Ok(json!({"text": "hello"})));
+    assert_eq!(connector.calls().len(), 1);
+}
+
+#[test]
+fn a_side_effect_runs_to_completion_though_its_caller_has_gone() {
+    let store = MemoryStore::default();
+    let connector = SlowConnector::default();
+    let guard = allowed_proposing(&store, "fixture__propose");
+    assert_eq!(guard.tool().classification, Classification::Propose);
+    let ran = polled(audit::run_unless(&connector, guard, ready(())));
+    assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+    let finished = common::ready(audit::finish(&store, ran, 4));
+    assert_eq!(finished.answer(), &Answer::Ok(json!({"draft": "draft-1"})));
+    assert_eq!(
+        store.last().completion,
+        Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 4,
+        })
+    );
 }

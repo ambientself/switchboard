@@ -117,7 +117,8 @@ pub enum IdentityConfig {
 }
 
 /// Why identity configuration was refused. Raised when the verifier is built, so a deployment
-/// with bad identity configuration does not start.
+/// with bad identity configuration does not start, and when an issuer's keys are replaced, so a
+/// bad set is not put in force.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConfigError {
     /// Enforcement was asked for with no issuer to enforce against.
@@ -210,4 +211,12 @@ pub enum ConfigError {
         /// What the backend found wrong with it, in its words.
         reason: String,
     },
+    /// Keys were supplied for an issuer the gate was not built with. Replacing keys cannot add
+    /// an issuer.
+    #[error("keys were supplied for issuer `{0}`, which is not configured")]
+    UnknownIssuerForKeys(Issuer),
+    /// Keys were supplied while identity checking is disabled. There are no issuers to give
+    /// them to, and supplying keys does not turn checking on.
+    #[error("keys were supplied for issuer `{0}`, but identity checking is disabled")]
+    KeysWhileDisabled(Issuer),
 }

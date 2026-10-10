@@ -31,7 +31,10 @@ http-body-util = "0.1"
 # already in the build through axum.
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
-serde = { version = "1", features = ["derive"] }
+# Fetches the keys of an issuer configured with a keys URL, from the issuer's own origin, under
+# a deadline and a body cap.
+issuer-keys = { path = "../issuer-keys" }
+serde ={ version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

@@ -12,6 +12,12 @@
 //!
 //! [`RequestPath::handle`] runs both, in that order.
 //!
+//! The path emits decision 0009's telemetry events to its [`Telemetry`], each naming the
+//! deployment and the request's [`Source`]: `identity_failed` for each caller `admit` refuses,
+//! with the cause and the issuer and subject the token claimed; `unparsable_body` for each
+//! protocol refusal, with its kind; and `initialize`, `ping` and `discover` for each one
+//! answered. Emitting never waits: a full queue drops the event and counts the drop.
+//!
 //! What `respond` does with each request:
 //!
 //! - A protocol refusal is answered as [`gateway_mcp`] renders it, and a notification gets 202
@@ -19,27 +25,37 @@
 //! - `initialize`, `ping` and `server/discover` are answered with no decision and no audit row:
 //!   decision 0009 makes them telemetry. They still need a verified caller, because `admit` ran
 //!   first.
-//! - `tools/list` selects the caller's profile and returns the tools on the surface that pass
-//!   the core's checks, with their catalog definitions. It writes no row yet; decision 0009
-//!   asks for a row of kind `list`, which needs the core's list record (#10).
+//! - `tools/list` selects the caller's profile and finds the tools on the surface that pass
+//!   the core's checks. It writes a row of kind `list` naming them ([`audit::listed`]), and
+//!   only then answers, with the tools the core hands back and their catalog definitions
+//!   (decision 0009). If the row cannot be written, the list is refused with the audit
+//!   sentence and lists nothing. The answer names the row in its `_meta`, unless audit is
+//!   disabled.
 //! - `tools/call` reads the call's resources through the adapter registered for the approved
 //!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
 //!   answers. A denial is answered with the sentence the row holds. The answer names the row
 //!   it wrote, in the result's `_meta` or in `error.data` (decision 0009), so a person can
 //!   quote it; see [`gateway_mcp::render_with_row`]. It names none when begin failed or audit
 //!   is disabled, because then no row was written under that identifier.
+//! - An allowed call whose connector is not registered is given up: its row is completed as
+//!   `error` and it is answered 500. The boot gates and every reload refuse such a policy, so
+//!   this is a fault in the gateway.
+//!
+//! A client that disconnects is told apart by the [`Disconnect`] `respond` is given (decision
+//! 0009, "Where a call runs"). If it has fired once the row is begun, the connector is not
+//! called and the row is completed as `error`. If it fires while a read runs, the read is
+//! cancelled and recorded as `error`. A side effect runs to completion whatever it does. Either
+//! way the answer is still made; nobody is left to read it.
 //!
 //! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
 //! everything from it, so a registry reload never splits one request across two versions.
 //!
 //! What the path does not do yet, and why:
 //!
-//! - **Identity failures are logged, not audited**, as decision 0009 records: they are
-//!   telemetry, and an audit row needs a proved principal, which a failed caller does not have.
-//!   The log event carries the deployment and the cause; the surface, the source address,
-//!   counters and a bounded queue are still to come (design section 17). With identity
-//!   disabled there is no principal either, so `tools/list` lists nothing and every
-//!   `tools/call` is refused with [`IDENTITY_DISABLED`], with no row.
+//! - **Identity failures are telemetry, not audited**, as decision 0009 records: an audit row
+//!   needs a proved principal, which a failed caller does not have. With identity disabled
+//!   there is no principal either, so `tools/list` lists nothing and every `tools/call` is
+//!   refused with [`IDENTITY_DISABLED`], with no row.
 //! - **There is no answer budget.** The core gives out the answer only once the store's
 //!   `finish` returns, so the path waits for it, however long that takes. The budget belongs
 //!   inside the store (#10).
@@ -50,10 +66,12 @@
 //! The future [`RequestPath::respond`] returns owns everything it uses and is `Send +
 //! 'static`. The HTTP layer must spawn it as its own task rather than await it on the
 //! request's future: a client that disconnects then cannot stop a call half way, between
-//! running the tool and completing its row.
+//! running the tool and completing its row. A disconnect reaches the call only through the
+//! [`Disconnect`], and only where decision 0009 says it may.
 
 use std::fmt;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -70,12 +88,14 @@ use gateway_mcp::{
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
 use serde_json::Value;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
 use crate::policy::ServedPolicy;
 use crate::proxied::{CheckedArguments, registry_resources};
+use crate::telemetry::{Event, Surface, Telemetry};
 
 /// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
 pub const MAX_TOOL_USE_ID: usize = 128;
@@ -94,6 +114,93 @@ pub const AUDIT_DISABLED_NOTE: &str =
 /// The name the gateway gives itself in `serverInfo`.
 pub const SERVER_NAME: &str = "switchboard";
 
+/// What a call is answered with when its client disconnected before it ran. Nobody is left to
+/// read it; its row is completed as `error`.
+pub const DISCONNECTED_BEFORE_RUN: &str =
+    "The caller disconnected before the call ran, so nothing ran.";
+
+/// What a call whose connector is not registered is answered with, 500.
+const NO_CONNECTOR: &str =
+    "The gateway has no connector for this tool. This is a fault in the gateway's configuration.";
+
+/// Whether the client that sent a request has disconnected, for [`RequestPath::respond`].
+///
+/// [`Disconnect::pair`] makes one with the [`DisconnectOnDrop`] that fires it, and
+/// [`Disconnect::never`] one that never fires. It works with or without an async runtime.
+#[derive(Debug)]
+pub struct Disconnect(Signal);
+
+#[derive(Debug)]
+enum Signal {
+    /// Not fired yet, and it may.
+    Waiting(oneshot::Receiver<()>),
+    /// Fired.
+    Fired,
+    /// It never will: it was disarmed, or made by [`Disconnect::never`].
+    Never,
+}
+
+/// Fires its [`Disconnect`] when it is dropped, unless it was disarmed first. The HTTP layer
+/// holds it in the request's handler, whose future is dropped when the client goes away.
+#[derive(Debug)]
+pub struct DisconnectOnDrop(Option<oneshot::Sender<()>>);
+
+impl Disconnect {
+    /// A signal and what fires it.
+    pub fn pair() -> (DisconnectOnDrop, Disconnect) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            DisconnectOnDrop(Some(sender)),
+            Disconnect(Signal::Waiting(receiver)),
+        )
+    }
+
+    /// A signal that never fires: for a caller with no connection to lose.
+    pub fn never() -> Self {
+        Self(Signal::Never)
+    }
+
+    /// Whether it has fired.
+    fn has_fired(&mut self) -> bool {
+        if let Signal::Waiting(receiver) = &mut self.0 {
+            match receiver.try_recv() {
+                Ok(()) => self.0 = Signal::Fired,
+                Err(oneshot::error::TryRecvError::Closed) => self.0 = Signal::Never,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        matches!(self.0, Signal::Fired)
+    }
+
+    /// Completes when it fires, and never if it cannot.
+    async fn fired(self) {
+        let fired = match self.0 {
+            Signal::Waiting(receiver) => receiver.await.is_ok(),
+            Signal::Fired => true,
+            Signal::Never => false,
+        };
+        if !fired {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl DisconnectOnDrop {
+    /// The client is still here: dropping this no longer fires the signal.
+    pub fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DisconnectOnDrop {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            // The receiver may be gone already, with the answer it belonged to.
+            let _ = sender.send(());
+        }
+    }
+}
+
 /// The request path over one configuration that passed the boot gates. Cheap to clone; clones
 /// share the gates.
 #[derive(Clone)]
@@ -104,6 +211,7 @@ pub struct RequestPath {
 struct Inner {
     gates: Gates,
     server: ServerInfo,
+    telemetry: Telemetry,
 }
 
 impl fmt::Debug for RequestPath {
@@ -111,18 +219,42 @@ impl fmt::Debug for RequestPath {
         f.debug_struct("RequestPath")
             .field("gates", &self.inner.gates)
             .field("server", &self.inner.server)
+            .field("telemetry", &self.inner.telemetry)
             .finish()
+    }
+}
+
+/// Where a request came from, as its telemetry events record it: the surface its URL named,
+/// escaped and capped, and the peer's address. Either can be unknown: the URL's surface may not
+/// decode to text, and a request that did not come over a connection has no peer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Source {
+    /// The surface the URL named.
+    pub surface: Option<Surface>,
+    /// The peer's address.
+    pub address: Option<SocketAddr>,
+}
+
+impl Source {
+    /// The source of a request for `surface`, as the URL named it, from `address`.
+    pub fn new(surface: Option<&str>, address: Option<SocketAddr>) -> Self {
+        Self {
+            surface: surface.map(Surface::new),
+            address,
+        }
     }
 }
 
 /// A request [`RequestPath::admit`] let through: a JSON POST from a caller who was verified,
 /// or from anyone while identity is disabled.
 ///
-/// Its field is private and `admit` is the only way to make one, so [`RequestPath::respond`]
-/// cannot be reached without the identity check having run.
+/// Its fields are private and `admit` is the only way to make one, so [`RequestPath::respond`]
+/// cannot be reached without the identity check having run. It carries the [`Source`] `admit`
+/// was given, for the events `respond` emits.
 #[derive(Debug)]
 pub struct Admitted {
     caller: Caller,
+    source: Source,
 }
 
 impl Admitted {
@@ -143,18 +275,33 @@ enum Caller {
 }
 
 impl RequestPath {
-    /// The path for `gates`. `serverInfo` names the gateway [`SERVER_NAME`] at this crate's
-    /// version, and its instructions say which gates are turned off.
+    /// The path for `gates`, with [`Telemetry::detached`]: its events are counted, and dropped.
+    /// `serverInfo` names the gateway [`SERVER_NAME`] at this crate's version, and its
+    /// instructions say which gates are turned off.
     pub fn new(gates: Gates) -> Self {
+        Self::with_telemetry(gates, Telemetry::detached())
+    }
+
+    /// The path for `gates`, emitting its events to `telemetry`.
+    pub fn with_telemetry(gates: Gates, telemetry: Telemetry) -> Self {
         let server = server_info(&gates);
         Self {
-            inner: Arc::new(Inner { gates, server }),
+            inner: Arc::new(Inner {
+                gates,
+                server,
+                telemetry,
+            }),
         }
     }
 
     /// The gates the path serves.
     pub fn gates(&self) -> &Gates {
         &self.inner.gates
+    }
+
+    /// Where the path emits its events.
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.inner.telemetry
     }
 
     /// How the gateway describes itself to clients.
@@ -168,31 +315,39 @@ impl RequestPath {
     /// The token is the one `Authorization: Bearer` header; the scheme is matched without
     /// regard to case. A missing header, two of them, a value that is not text, or another
     /// scheme count as no token. Every identity failure is the same 401, with the core's one
-    /// sentence and a `Bearer` challenge. Its cause is logged, never sent, and no audit row is
-    /// written: decision 0009 makes an identity failure telemetry.
+    /// sentence and a `Bearer` challenge. No audit row is written: decision 0009 makes an
+    /// identity failure telemetry. Each one emits one `identity_failed` event naming `source`,
+    /// the cause, and the issuer and subject the token claimed, as the identity crate escaped
+    /// and capped them. None of that is sent.
     // The error is the response to send, which is large. It is built at most once per request
     // and sent as it is, so boxing it would only add an allocation.
     #[allow(clippy::result_large_err)]
-    pub fn admit(&self, method: &Method, headers: &HeaderMap) -> Result<Admitted, HttpResponse> {
+    pub fn admit(
+        &self,
+        method: &Method,
+        headers: &HeaderMap,
+        source: &Source,
+    ) -> Result<Admitted, HttpResponse> {
         gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;
         let gates = &self.inner.gates;
-        match gates.identity().check(bearer_token(headers)) {
-            Verification::Proved(principal) => Ok(Admitted {
-                caller: Caller::Proved(principal),
-            }),
-            Verification::Disabled => Ok(Admitted {
-                caller: Caller::Unchecked,
-            }),
+        let caller = match gates.identity().check(bearer_token(headers)) {
+            Verification::Proved(principal) => Caller::Proved(principal),
+            Verification::Disabled => Caller::Unchecked,
             Verification::Failed(failure) => {
-                tracing::warn!(
-                    event = "identity_failed",
-                    deployment = %gates.deployment(),
-                    cause = %failure.detail(),
-                    "refused a caller whose identity was not proved"
-                );
-                Err(Rejection::unauthorized(IDENTITY_FAILURE).response())
+                self.emit(Event::IdentityFailed {
+                    deployment: gates.deployment().clone(),
+                    surface: source.surface.clone(),
+                    source: source.address,
+                    cause: failure.detail().clone(),
+                    claimed: failure.claimed().clone(),
+                });
+                return Err(Rejection::unauthorized(IDENTITY_FAILURE).response());
             }
-        }
+        };
+        Ok(Admitted {
+            caller,
+            source: source.clone(),
+        })
     }
 
     /// Parses the request and returns the future that answers it.
@@ -200,21 +355,30 @@ impl RequestPath {
     /// `surface` is the surface the URL named. The parse runs now; the future owns everything
     /// else it needs and is `Send + 'static`, so the HTTP layer can spawn it, and should, so
     /// that a client that goes away cannot cancel a call between running the tool and
-    /// completing its row.
+    /// completing its row. `disconnect` fires when the client goes away; see the
+    /// [module documentation](self) for what that does to a call.
     pub fn respond(
         &self,
         admitted: Admitted,
         surface: &str,
         headers: &HeaderMap,
         body: &[u8],
+        disconnect: Disconnect,
     ) -> impl Future<Output = HttpResponse> + Send + 'static + use<> {
         let parsed = gateway_mcp::parse(&Method::POST, headers, body);
         let path = self.clone();
         let surface = SurfaceName::new(surface);
         async move {
+            let Admitted { caller, source } = admitted;
             match parsed {
                 Err(rejection) => {
                     tracing::debug!(%rejection, "refused a request at the protocol layer");
+                    path.emit(Event::Unparsable {
+                        deployment: path.inner.gates.deployment().clone(),
+                        surface: source.surface,
+                        source: source.address,
+                        rejection: rejection.kind(),
+                    });
                     rejection.response()
                 }
                 Ok(Inbound::Notification { method }) => {
@@ -222,14 +386,15 @@ impl RequestPath {
                     HttpResponse::accepted()
                 }
                 Ok(Inbound::Request(request)) => {
-                    path.answer(admitted.caller, surface, request).await
+                    path.answer(caller, source, surface, request, disconnect)
+                        .await
                 }
             }
         }
     }
 
     /// [`admit`](Self::admit), then [`respond`](Self::respond): the whole path, for a caller
-    /// that already holds the body.
+    /// that already holds the body. There is no connection to lose, so nothing is cancelled.
     pub async fn handle(
         &self,
         method: &Method,
@@ -237,36 +402,113 @@ impl RequestPath {
         surface: &str,
         body: &[u8],
     ) -> HttpResponse {
-        let admitted = match self.admit(method, headers) {
+        let source = Source::new(Some(surface), None);
+        let admitted = match self.admit(method, headers, &source) {
             Ok(admitted) => admitted,
             Err(response) => return response,
         };
-        self.respond(admitted, surface, headers, body).await
+        self.respond(admitted, surface, headers, body, Disconnect::never())
+            .await
     }
 
-    async fn answer(self, caller: Caller, surface: SurfaceName, request: Request) -> HttpResponse {
+    /// Counts `event` and queues it for the log. Never waits.
+    fn emit(&self, event: Event) {
+        self.inner.telemetry.emit(event);
+    }
+
+    async fn answer(
+        self,
+        caller: Caller,
+        source: Source,
+        surface: SurfaceName,
+        request: Request,
+        disconnect: Disconnect,
+    ) -> HttpResponse {
         let Request { id, era, call } = request;
-        // tools/list writes no row yet, so it names none.
+        let deployment = || self.inner.gates.deployment().clone();
         let (reply, row) = match call {
-            Call::Initialize => (Reply::Initialized, None),
-            Call::Ping => (Reply::Pong, None),
-            Call::Discover => (Reply::Discovered, None),
-            Call::ToolsList => (Reply::Tools(self.list(caller, surface)), None),
-            Call::ToolsCall(call) => self.call(caller, surface, call).await,
+            Call::Initialize => {
+                self.emit(Event::Initialize {
+                    deployment: deployment(),
+                    surface: source.surface,
+                    source: source.address,
+                });
+                (Reply::Initialized, None)
+            }
+            Call::Ping => {
+                self.emit(Event::Ping {
+                    deployment: deployment(),
+                    surface: source.surface,
+                    source: source.address,
+                });
+                (Reply::Pong, None)
+            }
+            Call::Discover => {
+                self.emit(Event::Discover {
+                    deployment: deployment(),
+                    surface: source.surface,
+                    source: source.address,
+                });
+                (Reply::Discovered, None)
+            }
+            Call::ToolsList => self.list(caller, surface).await,
+            Call::ToolsCall(call) => self.call(caller, surface, call, disconnect).await,
         };
         let row = row.as_ref().map(AuditRowId::as_str);
         gateway_mcp::render_with_row(&self.inner.server, era, &id, reply, row)
     }
 
     /// `tools/list`: design section 6's steps 1 to 5 for every tool on the surface, keeping
-    /// those that pass.
-    fn list(&self, caller: Caller, surface: SurfaceName) -> Vec<ToolEntry> {
+    /// those that pass, then the row of kind `list` (decision 0009). The answer, and the row
+    /// to name in it.
+    ///
+    /// The answer is built from what [`audit::listed`] returns once the row is written, never
+    /// from the list handed to it, so nothing is listed without its row.
+    async fn list(&self, caller: Caller, surface: SurfaceName) -> (Reply, Option<AuditRowId>) {
         let Caller::Proved(principal) = caller else {
-            return Vec::new();
+            return (Reply::Tools(Vec::new()), None);
         };
-        let policy = self.inner.gates.policy();
+        let gates = &self.inner.gates;
+        let policy = gates.policy();
         let caller = self.caller_context(&policy, principal, surface);
-        entries(&policy, list_tools(policy.snapshot(), &caller))
+        let tools = list_tools(policy.snapshot(), &caller);
+        // One identifier per list, made here. A list row has no deadline, so none is given.
+        let start = RowStart {
+            row: AuditRowId::new(Uuid::now_v7().to_string()),
+            instance: gates.instance().clone(),
+            call_deadline_ms: 0,
+        };
+        let writing = Instant::now();
+        let written = audit::listed(
+            gates.audit_store().as_ref(),
+            start,
+            &caller,
+            policy.revision().clone(),
+            tools,
+            None,
+        )
+        .await;
+        let list_us = micros(writing.elapsed());
+        match written {
+            Err(failure) => {
+                tracing::error!(
+                    %failure,
+                    list_us,
+                    "refused a tool list: its audit row could not be written"
+                );
+                (Reply::Denied(failure.sentence().to_owned()), None)
+            }
+            Ok(listed) => {
+                tracing::info!(
+                    row = listed.row().as_str(),
+                    tools = listed.tools().len(),
+                    list_us,
+                    "listed tools"
+                );
+                let row = self.quotable(listed.row());
+                (Reply::Tools(entries(&policy, listed.tools())), row)
+            }
+        }
     }
 
     /// `tools/call`: design section 6's steps 1 to 9. The answer, and the row to name in it.
@@ -275,6 +517,7 @@ impl RequestPath {
         caller: Caller,
         surface: SurfaceName,
         call: ToolCall,
+        disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
         let Caller::Proved(principal) = caller else {
@@ -285,14 +528,15 @@ impl RequestPath {
             return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);
         };
         let policy = gates.policy();
-        self.decide_and_run(&policy, principal, surface, call).await
+        self.decide_and_run(&policy, principal, surface, call, disconnect)
+            .await
     }
 }
 
-fn entries(policy: &ServedPolicy, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
+fn entries(policy: &ServedPolicy, tools: &[ApprovedTool]) -> Vec<ToolEntry> {
     let catalog = policy.catalog();
     tools
-        .into_iter()
+        .iter()
         .filter_map(|tool| match catalog.definition(&tool.name) {
             Some(definition) => Some(entry(tool, definition)),
             None => {
@@ -306,13 +550,14 @@ fn entries(policy: &ServedPolicy, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
 
 impl RequestPath {
     /// The answer to a call from a proved caller, and the row to name in it: the denial's row,
-    /// or the row of the call that ran, whether or not it could be completed.
+    /// or the row of the call that ran or was given up, whether or not it could be completed.
     async fn decide_and_run(
         &self,
         policy: &ServedPolicy,
         principal: Proved<Principal>,
         surface: SurfaceName,
         call: ToolCall,
+        mut disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
         let snapshot = policy.snapshot();
@@ -377,19 +622,45 @@ impl RequestPath {
         let row = guard.row().clone();
         let named = self.quotable(&row);
         let tool = guard.tool().name.clone();
+        // Decision 0009: a client gone before the connector is called is not called for.
+        if disconnect.has_fired() {
+            let gave_up = audit::give_up(store, guard).await;
+            if let Some(failure) = gave_up.failure() {
+                tracing::error!(
+                    %failure,
+                    row = row.as_str(),
+                    "a tool call was given up but its audit row could not be completed"
+                );
+            }
+            tracing::info!(
+                row = row.as_str(),
+                %tool,
+                decide_us,
+                begin_us,
+                "gave up a tool call: its client disconnected before it ran, and its row was \
+                 completed as error"
+            );
+            return (Reply::ToolError(DISCONNECTED_BEFORE_RUN.to_owned()), named);
+        }
         let Some(registered) = gates.registered(&guard.tool().connector) else {
-            // The boot gates refuse a tool on a surface whose connector is not registered.
+            // The boot gates and every reload refuse a tool on a surface whose connector is not
+            // registered, so this is a fault in the gateway. Nothing can run; the row is
+            // completed as error rather than left open.
+            let connector = guard.tool().connector.clone();
+            let gave_up = audit::give_up(store, guard).await;
             tracing::error!(
-                row = guard.row().as_str(),
-                connector = %guard.tool().connector,
-                "an allowed tool's connector is not registered; its row stays open"
+                row = row.as_str(),
+                %connector,
+                "an allowed tool's connector is not registered; its row was completed as error"
             );
-            return (
-                Reply::Internal(
-                    "The gateway has no connector for this tool. This is a fault in the gateway's configuration.".to_owned(),
-                ),
-                named,
-            );
+            if let Some(failure) = gave_up.failure() {
+                tracing::error!(
+                    %failure,
+                    row = row.as_str(),
+                    "a tool call was given up but its audit row could not be completed"
+                );
+            }
+            return (Reply::Internal(NO_CONNECTOR.to_owned()), named);
         };
         let results = Some(registered.results);
         // A proxied server's call is checked against the schema of the policy this request
@@ -409,7 +680,8 @@ impl RequestPath {
 
         let started = gates.clock().now();
         let running = Instant::now();
-        let ran = audit::run(connector, guard).await;
+        // A read is cancelled if its client goes; a side effect runs to completion.
+        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;
         let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
         // No answer budget: the core gives out the answer when the store's finish returns.
@@ -659,6 +931,139 @@ mod tests {
         assert_eq!(kept("toolu\u{1b}[31m"), None);
         assert_eq!(kept("toolu_é"), None);
         assert_eq!(bounded_tool_use_id(None), None);
+    }
+
+    struct FixtureResources;
+
+    impl crate::ResourceAdapter for FixtureResources {
+        fn resources(&self, tool: &ApprovedTool, arguments: &Value) -> Resources {
+            gateway_testkit::FixtureConnector::resources_of(tool.name.as_str(), arguments)
+        }
+    }
+
+    /// The boot gates and every reload refuse a policy serving a tool whose connector is not
+    /// registered, so this is reached only by taking the connector out of gates that passed.
+    #[test]
+    fn an_allowed_call_whose_connector_is_not_registered_completes_its_row_as_error() {
+        use gateway_core::audit::{Completion, DecisionKind, Outcome};
+        use gateway_testkit::{
+            AUDIENCE, CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector,
+            InMemoryAuditStore, SCOPED_READ_TOOL, SURFACE_READ, TEAM_A, TEAM_A_SUBJECT,
+        };
+        use serde_json::json;
+
+        let fixture = Fixture::new().unwrap();
+        let connector = Arc::new(FixtureConnector::new(Arc::new(FakeCredentialSource::new())));
+        let store = Arc::new(InMemoryAuditStore::new());
+        let issuer = &fixture.workload_issuer;
+        let definition = |name: &str| {
+            json!({
+                "name": name,
+                "description": "A fixture tool.",
+                "input_schema": {"type": "object"},
+            })
+        };
+        let config: crate::Config = serde_json::from_value(json!({
+            "deployment": "path-unit-test",
+            "identity": {"enforce": [{
+                "issuer": issuer.issuer(),
+                "audiences": [AUDIENCE],
+                "kind": {"workload": {"subjects": {TEAM_A_SUBJECT: TEAM_A}}},
+                "algorithm": "ES256",
+                "keys": serde_json::to_value(issuer.jwk_set()).unwrap(),
+                "max_lifetime_secs": gateway_testkit::DEFAULT_MAX_LIFETIME,
+                "leeway_secs": gateway_testkit::DEFAULT_LEEWAY,
+            }]},
+            "audit": {},
+            "http": {"allowed_hosts": ["localhost"]},
+            "policy": gateway_testkit::policy_data(),
+            "catalog": [
+                definition(gateway_testkit::READ_TOOL),
+                definition(gateway_testkit::DRAFT_TOOL),
+                definition(gateway_testkit::WRITE_TOOL),
+                definition(SCOPED_READ_TOOL),
+            ],
+            "profiles": {"workloads": [{
+                "issuer": gateway_testkit::WORKLOAD_ISSUER,
+                "team": TEAM_A,
+                "profile": gateway_testkit::PROFILE_TEAM_A,
+            }]},
+        }))
+        .unwrap();
+        let wiring = crate::Wiring::new(Arc::new(fixture.clock.clone()))
+            .audit_store(store.clone())
+            .connector(CONNECTOR, connector.clone(), Arc::new(FixtureResources));
+        let gates = crate::boot::check(config, wiring)
+            .unwrap()
+            .without_connector(&CONNECTOR.into());
+        let path = RequestPath::new(gates);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        let token = format!("Bearer {}", fixture.token(Caller::TeamA));
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&token).unwrap());
+        // The scoped read tool checks its own scope, so a call that names no resource reaches
+        // the connector lookup rather than being denied for naming none.
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": SCOPED_READ_TOOL, "arguments": {}}});
+        let response = gateway_testkit::block_on(path.handle(
+            &Method::POST,
+            &headers,
+            SURFACE_READ,
+            body.to_string().as_bytes(),
+        ));
+
+        assert_eq!(response.status, http::StatusCode::INTERNAL_SERVER_ERROR);
+        let answer: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(answer["error"]["code"], json!(gateway_mcp::INTERNAL_ERROR));
+        assert_eq!(answer["error"]["message"], json!(NO_CONNECTOR));
+        assert!(connector.received().is_empty(), "a connector was called");
+        let rows = store.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decision, DecisionKind::Allow);
+        assert_eq!(
+            rows[0].completion,
+            Some(Completion {
+                outcome: Outcome::Error,
+                latency_ms: 0,
+            }),
+            "the row was left open"
+        );
+        assert_eq!(store.finish_attempts(), 1);
+        let row = answer["error"]["data"][gateway_mcp::AUDIT_ROW_DATA]
+            .as_str()
+            .expect("the answer names its row");
+        assert_eq!(
+            store
+                .row_with_id(&AuditRowId::new(row))
+                .and_then(|row| row.completion),
+            rows[0].completion
+        );
+    }
+
+    #[test]
+    fn a_disconnect_fires_when_dropped_and_not_once_disarmed() {
+        let (connected, mut disconnect) = Disconnect::pair();
+        assert!(!disconnect.has_fired());
+        drop(connected);
+        assert!(disconnect.has_fired());
+
+        let (connected, mut disconnect) = Disconnect::pair();
+        connected.disarm();
+        assert!(!disconnect.has_fired());
+        let fired = std::pin::pin!(disconnect.fired());
+        assert!(
+            gateway_testkit::poll_once(fired).is_pending(),
+            "a disarmed signal fired"
+        );
+
+        let (connected, disconnect) = Disconnect::pair();
+        drop(connected);
+        assert!(gateway_testkit::poll_once(std::pin::pin!(disconnect.fired())).is_ready());
+        assert!(
+            gateway_testkit::poll_once(std::pin::pin!(Disconnect::never().fired())).is_pending()
+        );
     }
 
     #[test]

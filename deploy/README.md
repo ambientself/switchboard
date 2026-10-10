@@ -94,7 +94,9 @@ one word. Compose has no probe, but the gateway still waits out the removal ther
 
 The termination grace period must be longer than the readiness removal plus the begin budget,
 the call deadline and the finish deadline, or a stop can leave open rows: 8 s + 2 s + 5 s +
-30 s, 45 s. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
+30 s, 45 s. No call starts after the removal: a request on a connection still open whose body
+arrives later is answered 503 and nothing runs. The gateway's 30 s wait for open connections
+after the removal fits inside the same 45 s. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
 `kind/base/gateway.yaml` and `stop_grace_period` in `compose/compose.yaml`, in place of 30 s and
 10 s. `crates/demo-checks` holds both to the code's budgets and the probe to the removal.
 
@@ -123,7 +125,7 @@ check that the deployment files load.
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
 | mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECT` (`system:serviceaccount:switchboard:gateway`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). The kind run checks that it accepted exactly the gateway's 8 allowed calls, all from the gateway's ServiceAccount, and refused only the two direct calls before the policy, as `wrong_audience`. |
-| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms` and `policy_revision`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. |
+| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `kind`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms`, `policy_revision`, `listed_tools` and `listed_omitted`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row of kind `call` to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. A row of kind `list` records one workload's `tools/list`, with no tool or resources; the listing shows the tools it listed. The driver counts these apart, 3 in Compose and 2 in kind, and checks that each names the tools its caller was shown under its policy revision, with none left out. |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
 ## What a run shows that is not settled
@@ -136,8 +138,9 @@ check that the deployment files load.
   the listing may show an `allow` row with no outcome inside the outage. The driver checks that
   the outage left at most that one row open, and that every other allowed row has an outcome.
   The gateway now chooses each row's identifier, and a repeated begin with it writes no second
-  row. The rest of decision 0009's row work (retrying begin by identifier, a deadline column,
-  the open-row query, `tools/list` rows) is not built.
+  row. Each `tools/list` writes a row of kind `list` before it answers. The rest of decision
+  0009's row work (retrying begin by identifier, a deadline column, the open-row query) is
+  not built.
 - **Decisions 0009 and 0010 ask more of the slice than it has.** In kind the gateway presents
   a projected token of its own ServiceAccount to mock-docs, which accepts only that identity.
   There is no route-check program and no section 11 signals yet (#47). Compose has no cluster

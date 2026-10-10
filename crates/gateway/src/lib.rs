@@ -23,7 +23,9 @@
 //!   the host and origin checks, the body limit, time limits on a request's head and body, and
 //!   a task per answer, so a client that disconnects cannot cut a tool call off from its audit
 //!   row. `GET /readyz` is its readiness check, which fails first when it shuts down.
-//! - [`telemetry::init`] sends logs to standard output as JSON lines.
+//! - [`telemetry::init`] sends logs to standard output as JSON lines. [`Telemetry`] is
+//!   decision 0009's telemetry: structured events and counters, off the request path, through
+//!   a bounded queue that a [`Drain`] writes to the log. Drops are counted.
 //!
 //! The first slice (decision 0008) runs from files:
 //!
@@ -35,8 +37,10 @@
 //!   argument adapters. The [`Gates`] serve the current version, and [`boot::check_registry`]
 //!   hands back a [`Reloader`] that replaces it when the registry file changes.
 //! - [`start::prepare`] builds the gateway: a `ProxyConnector` per registry server, behind the
-//!   registry's argument check; the Postgres audit store after its boot checks, or audit
-//!   explicitly disabled; and the boot gates.
+//!   registry's argument check; each keys URL's first fetch; the Postgres audit store after its
+//!   boot checks, or audit explicitly disabled; and the boot gates.
+//! - [`KeyRefresher`] fetches the keys of each issuer configured with a keys URL again on a
+//!   timer, from the issuer's own origin, and keeps the keys in use when a fetch fails.
 //!
 //! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves, and
 //! `switchboard migrate` brings the audit schema up to date. Nothing in it comes from the
@@ -49,6 +53,7 @@ pub mod boot;
 mod catalog;
 mod config;
 pub mod deployment;
+pub mod keys;
 pub mod path;
 mod policy;
 mod proxied;
@@ -65,10 +70,14 @@ pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
-pub use deployment::{AuditChoice, Deployment, DeploymentError};
+pub use deployment::{AuditChoice, Deployment, DeploymentError, KeysUrl};
+pub use keys::{
+    DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,
+    RefreshError,
+};
 pub use path::{
-    AUDIT_DISABLED_NOTE, Admitted, IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID,
-    RequestPath, SERVER_NAME,
+    AUDIT_DISABLED_NOTE, Admitted, DISCONNECTED_BEFORE_RUN, Disconnect, DisconnectOnDrop,
+    IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, RequestPath, SERVER_NAME, Source,
 };
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{undeclared_argument, withdrawn_while_deciding};
@@ -79,5 +88,9 @@ pub use selector::{
 };
 pub use server::{
     BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
-    READINESS_REMOVAL, SHUTDOWN_GRACE, Timeouts, serve, serve_with_shutdown, serve_with_timeouts,
+    READINESS_REMOVAL, SHUTDOWN_GRACE, SHUTTING_DOWN, Timeouts, serve, serve_with_shutdown,
+    serve_with_telemetry, serve_with_timeouts,
+};
+pub use telemetry::{
+    Drain, Event, MAX_SURFACE, Surface, TELEMETRY_QUEUE, Telemetry, TelemetryCounts,
 };

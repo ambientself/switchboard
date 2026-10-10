@@ -148,7 +148,6 @@ fn a_missing_field_is_refused() {
         ("mode", "mode = \"enforce\"\n"),
         ("audiences", "audiences = [\"switchboard\"]\n"),
         ("algorithm", "algorithm = \"RS256\"\n"),
-        ("keys_file", "keys_file = \"jwks.json\"\n"),
         ("max_lifetime_seconds", "max_lifetime_seconds = 3600\n"),
         ("leeway_seconds", "leeway_seconds = 30\n"),
         (
@@ -239,6 +238,102 @@ fn a_field_that_does_not_belong_to_the_mode_or_kind_is_refused() {
         "algorithm = \"HS256\"",
     );
     assert!(said.contains("unknown variant `HS256`"), "{said}");
+}
+
+/// The keys file line in the deployment file the tests edit.
+const KEYS_FILE: &str = "keys_file = \"jwks.json\"\n";
+
+#[test]
+fn an_issuer_takes_a_keys_url_instead_of_a_keys_file() {
+    let url = "keys_url = \"https://kubernetes.default.svc.cluster.local/openid/v1/jwks\"\n";
+    let loaded = load_edited("keys-url", KEYS_FILE, url).unwrap();
+    let issuers = loaded.identity.enforce.as_ref().unwrap();
+    // Nothing is fetched until the gateway starts.
+    assert_eq!(issuers[0].keys, serde_json::Value::Null);
+    assert_eq!(loaded.keys_urls.len(), 1);
+    assert_eq!(loaded.keys_urls[0].issuer.as_str(), CLUSTER_ISSUER);
+    assert_eq!(
+        loaded.keys_urls[0].url,
+        "https://kubernetes.default.svc.cluster.local/openid/v1/jwks"
+    );
+    assert_eq!(loaded.keys_urls[0].refresh, gateway::DEFAULT_KEYS_REFRESH);
+    assert_eq!(gateway::DEFAULT_KEYS_REFRESH, Duration::from_secs(300));
+    // The URL is not printed.
+    assert!(!format!("{:?}", loaded.keys_urls).contains("openid"));
+
+    for (seconds, refresh) in [(30, 30), (45, 45), (86_400, 86_400)] {
+        let loaded = load_edited(
+            &format!("keys-refresh-{seconds}"),
+            KEYS_FILE,
+            &format!("{url}keys_refresh_seconds = {seconds}\n"),
+        )
+        .unwrap();
+        assert_eq!(loaded.keys_urls[0].refresh, Duration::from_secs(refresh));
+    }
+
+    // A keys file is still read, and lists no keys URL.
+    let loaded = files("keys-file").load();
+    assert!(loaded.keys_urls.is_empty());
+}
+
+#[test]
+fn an_issuer_takes_exactly_one_place_for_its_keys() {
+    let url = "keys_url = \"https://kubernetes.default.svc.cluster.local/openid/v1/jwks\"\n";
+    let said = refused("keys-both", KEYS_FILE, &format!("{KEYS_FILE}{url}"));
+    assert_eq!(
+        said,
+        format!("issuer `{CLUSTER_ISSUER}` has both `keys_file` and `keys_url`; give one")
+    );
+    let said = refused("keys-neither", KEYS_FILE, "");
+    assert_eq!(
+        said,
+        format!("issuer `{CLUSTER_ISSUER}` needs `keys_file` or `keys_url`, where its keys are")
+    );
+
+    // The refresh interval belongs to a keys URL.
+    let said = refused(
+        "keys-file-refresh",
+        KEYS_FILE,
+        &format!("{KEYS_FILE}keys_refresh_seconds = 60\n"),
+    );
+    assert_eq!(
+        said,
+        format!(
+            "issuer `{CLUSTER_ISSUER}` has `keys_refresh_seconds`, which only an issuer with \
+             `keys_url` takes"
+        )
+    );
+    // At least 30 seconds.
+    for seconds in [0, 1, 29] {
+        let said = refused(
+            &format!("keys-refresh-{seconds}"),
+            KEYS_FILE,
+            &format!("{url}keys_refresh_seconds = {seconds}\n"),
+        );
+        assert_eq!(
+            said,
+            format!(
+                "issuer `{CLUSTER_ISSUER}` has `keys_refresh_seconds = {seconds}`; it must be at \
+                 least 30"
+            )
+        );
+    }
+    let said = refused(
+        "keys-refresh-negative",
+        KEYS_FILE,
+        &format!("{url}keys_refresh_seconds = -1\n"),
+    );
+    assert!(said.contains("not a valid deployment file"), "{said}");
+
+    // A token or CA file for fetching the keys is not taken yet (issue #88).
+    for field in ["keys_token_file", "keys_ca_file"] {
+        let said = refused(
+            &format!("keys-{field}"),
+            KEYS_FILE,
+            &format!("{url}{field} = \"token\"\n"),
+        );
+        assert!(said.contains(&format!("unknown field `{field}`")), "{said}");
+    }
 }
 
 #[test]
