@@ -1683,6 +1683,33 @@ mutate("gw-keys-url-and-file-both-accepted", "an issuer with both a keys file an
        "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
        "        (Some(file), _) => {\n")
 
+# Metrics. Every answer with the audit-failure sentence is counted, in one place; the open-row
+# poller starts with the metrics listener; the metrics listener never takes the MCP port. And
+# each proxied server's connector deadline reaches the wiring, which sets its rows' deadlines.
+GW_METRICS = GW + "metrics.rs"
+mutate("gw-audit-failure-answer-not-counted", "an answer with the audit-failure sentence is not counted", GW + "path.rs",
+       "        self.inner.telemetry.audit_failure_answered();\n        Reply::Denied(sentence.to_owned())",
+       "        Reply::Denied(sentence.to_owned())")
+mutate("gw-open-rows-poller-not-started", "the metrics listener serves without polling the open rows", GW_METRICS,
+       "        .map(|audit| AbortOnDrop(tokio::spawn(poll_open_rows(audit))));",
+       "        .map(|audit| AbortOnDrop(tokio::spawn(async move { drop(audit) })));")
+mutate("gw-metrics-on-mcp-listener", "a [metrics] listener on the MCP listener's port is accepted", GW_DEPLOY,
+       "            && takes_port(metrics.listen, file.listen)\n",
+       "            && false\n            && takes_port(metrics.listen, file.listen)\n")
+mutate("gw-start-call-deadline-not-wired", "a proxied server's connector deadline does not reach the wiring", GW + "start.rs",
+       "            .proxied(server.name.clone(), Arc::new(connector))\n"
+       "            .call_deadline(server.name.clone(), deadline);\n",
+       "            .proxied(server.name.clone(), Arc::new(connector));\n"
+       "        let _ = deadline;\n")
+mutate("gw-metrics-port-open-to-teams", "the gateway-from-teams policy admits the teams on the metrics port too",
+       "deploy/kind/policy/networkpolicies.yaml",
+       "              kubernetes.io/metadata.name: team-b\n      ports:\n        - port: 8080\n          protocol: TCP",
+       "              kubernetes.io/metadata.name: team-b\n      ports:\n        - port: 8080\n          protocol: TCP\n"
+       "        - port: 9090\n          protocol: TCP")
+mutate("gw-demo-outage-metrics-unchecked", "the Compose run does not check that its outage was counted",
+       "deploy/demo/demo.sh",
+       '  if [ "$outage" = outage ]; then\n', "  if false; then\n")
+
 # --- gateway path --------------------------------------------------------------------------
 
 GW_PATH = GW + "path.rs"
@@ -1755,7 +1782,7 @@ mutate("gw-list-no-row", "tools/list answers without writing its row", GW_PATH,
        "            gates.audit_store().as_ref(),\n            start,\n            &caller,\n",
        "            &crate::audit::DisabledAuditStore::new(),\n            start,\n            &caller,\n")
 mutate("gw-list-answered-when-row-fails", "a list whose row could not be written is answered with the tools", GW_PATH,
-       "                (Reply::Denied(failure.sentence().to_owned()), None)\n",
+       "                (self.audit_failed(failure.sentence()), None)\n",
        "                let _ = failure;\n"
        "                let tools: Vec<ApprovedTool> = list_tools(policy.snapshot(), &caller).into_iter().cloned().collect();\n"
        "                (Reply::Tools(entries(&policy, &tools)), None)\n")
@@ -1773,13 +1800,13 @@ mutate("gw-refusal-answered-as-success", "a scope refusal is answered as a resul
        "Answer::Refused(sentence) => Reply::Denied(sentence),",
        "Answer::Refused(sentence) => Reply::ToolOk(Value::from(sentence)),")
 mutate("gw-audit-failed-as-tool-error", "an unrecorded scope refusal is answered as a tool error", GW_PATH,
-       "Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),",
+       "Answer::AuditFailed { sentence } => self.audit_failed(sentence),",
        "Answer::AuditFailed { sentence } => Reply::ToolError(sentence.to_owned()),")
 mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a result", GW_PATH,
        "Answer::Error(message) => Reply::ToolError(message),",
        "Answer::Error(message) => Reply::Denied(message),")
 mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
-       "                return (Reply::Denied(failure.sentence().to_owned()), None);",
+       "                return (self.audit_failed(failure.sentence()), None);",
        "                return (Reply::ToolError(failure.sentence().to_owned()), None);")
 mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
        "                return (Reply::Denied(refusal.sentence().to_owned()), row);",
