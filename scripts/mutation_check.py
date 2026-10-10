@@ -3045,7 +3045,8 @@ mutate("demo-workload-limit-sentence-unchecked", "any denial sentence passes as 
 mutate("demo-workload-identity-sentence-unchecked", "an identity refusal's sentence is not checked", WORKLOAD,
        """  check "$(body '.error.message')" "$IDENTITY_FAILURE" "$2: sentence"\n""", "")
 mutate("demo-workload-direct-any-failure", "any failed direct call passes, not only a timeout", WORKLOAD,
-       """    check "$?" 28 "direct""", """    check "$([ $? -ne 0 ] && echo 28)" 28 "direct""")
+       '    check "curl exit $code, ${connects:-no} connections"',
+       '    check "curl exit $([ "$code" -ne 0 ] && echo 28 || echo "$code"), ${connects:-no} connections"')
 mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
        """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
 CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
@@ -3094,29 +3095,60 @@ mutate("demo-before-policy-own-project-optional", "before-policy runs without OW
 mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
        "                - {name: OWN_PROJECT, value: borealis}\n", "")
 mutate("demo-kind-accepted-count-6", "the kind caller check still expects 6 calls, without the before-policy reads", DRIVER,
-       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2\n',
-       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 6 2\n')
-mutate("demo-operator-checks-no-attach", "attach is not checked", DRIVER,
-       "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec portforward proxy; do\n")
-mutate_all("demo-operator-checks-no-impersonate", "impersonation is not checked",
-           (DRIVER, '    for resource in users groups; do\n      can_i_no "$team" impersonate "$resource"\n    done\n'
-                    '    sar_no "$team" impersonate authentication.k8s.io uids\n'
-                    '    sar_no "$team" impersonate authentication.k8s.io userextras scopes\n', ""),
-           (DRIVER, '      can_i_no "$team" impersonate serviceaccounts -n "$ns"\n', ""))
+       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n',
+       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 6 2 "$OPEN_ATTEMPTS"\n')
+PERMISSIONS = "deploy/route-check/permissions.tsv"
+mutate("demo-operator-checks-no-attach", "attach is not checked", PERMISSIONS,
+       "create\tpods\tattach\tnamespaced\nget\tpods\tattach\tnamespaced\n", "")
+mutate("demo-operator-checks-no-impersonate", "impersonating a user, a group or a ServiceAccount is not checked", PERMISSIONS,
+       "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n", "")
 mutate("demo-operator-checks-one-namespace", "the team's own namespace is not checked", DRIVER,
-       '    for ns in mock-docs switchboard "$team"; do\n', "    for ns in mock-docs switchboard; do\n")
+       '        for ns in mock-docs switchboard "$team" all; do\n', "        for ns in mock-docs switchboard all; do\n")
 mutate("demo-operator-checks-unknown-resource-passes", "a can-i about a resource the API does not serve passes on its no", DRIVER,
        """    *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\\n'*}" ;;\n""", "")
 mutate("demo-operator-checks-review-any-answer", "a SubjectAccessReview passes whatever it answers", DRIVER,
-       "    false) answer=no ;;\n    true) answer=yes ;;\n", "    *) answer=no ;;\n")
+       "    0:false) answer=no ;;\n    0:true) answer=yes ;;\n", "    *) answer=no ;;\n")
 mutate("demo-operator-checks-review-core-group", "the SubjectAccessReview asks about the core group, which no rule for impersonating a UID names", DRIVER,
        "resourceAttributes: {verb: $verb, group: $group,", 'resourceAttributes: {verb: $verb, group: "",')
+# #47's kind route-check run: the route check before and after the policy, the one permissions
+# list, the gateway's current pod, and #83's direct call that connected.
+mutate("demo-route-check-before-policy-only", "the kind run checks the routes open before the policy, and never refused after it", DRIVER,
+       "  route_checks_after_policy\n", "")
+mutate("demo-route-check-fail-ignored", "a FAIL from the route check does not count", DRIVER,
+       '  tally_workload "route check in $ns, every route $expect" "$status" "$output"\n', "  printf '%s\\n' \"$output\"\n")
+mutate("demo-route-check-not-impersonated", "the route check runs with the demo's own access, not as its operator", DRIVER,
+       ' --context "kind-$CLUSTER" --as "$ROUTE_CHECK_OPERATOR" \\\n', ' --context "kind-$CLUSTER" \\\n')
+mutate("demo-route-check-new-pods-unsettled", "after the policy the route check starts as soon as its new pods run", DRIVER,
+       "  sleep 10\n  for team in team-a team-b; do\n    route_check", "  for team in team-a team-b; do\n    route_check")
+mutate("demo-operator-checks-own-list", "the operator checks ask a list of their own, not permissions.tsv", DRIVER,
+       """      END { exit bad }' "$PERMISSIONS")""", """      END { exit bad }' <(printf 'get\\tsecrets\\t-\\tnamespaced\\n'))""")
+mutate("demo-operator-checks-uid-by-can-i", "impersonating a UID or an extra is asked by can-i, which cannot name it", DRIVER,
+       '  if [ "$verb" = impersonate ] && [ "${resource#*.}" = authentication.k8s.io ]; then\n', "  if false; then\n")
+mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kubectl cannot create stops the run", DRIVER,
+       """    | k create -f - -o jsonpath='{.status.allowed}' 2>&1) || status=$?\n""",
+       """    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)\n""")
+mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
+       "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
+mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whichever pod the Deployment's log picks", DRIVER,
+       '  check_boot "$(k -n switchboard logs "pod/$GATEWAY_POD")"\n', '  check_boot "$(k -n switchboard logs deploy/gateway)"\n')
+mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
+       """      | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision)\n""", "")
+mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
+       '    check "curl exit $code, ${connects:-no} connections"', '    check "curl exit $code, 0 connections"')
+mutate("demo-workload-idle-no-trap", "the idle workload has no trap, so SIGTERM kills it and it never passes", WORKLOAD,
+       """  trap 'kill "$sleeper" 2>/dev/null' TERM INT\n""", "")
 
 # The route check's operator step (deploy/route-check), watched by tests/route_check.rs.
 ROUTE_CHECK = "deploy/route-check/route-check.sh"
 mutate("route-check-enforcement-unchecked", "kindnet with network policy off passes", ROUTE_CHECK,
        """    off) fail "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""",
        """    off) pass "network policy is not enforced: kindnet, $ENFORCEMENT" ;;""")
+# #47's kind route-check run: kindnet's log is only the fallback, since the kubelet rotates it.
+mutate("route-check-kindnet-unread-log-fails", "a kindnet log that cannot be read fails enforcement the flag or the default settled", ROUTE_CHECK,
+       """        ENFORCEMENT="$ENFORCEMENT; its log could not be read, and is only a fallback"\n""",
+       """        state="" why="could not read the log of $agent_name"\n""")
+mutate("route-check-kindnet-fallback-unchecked", "with no flag and no known default, any readable kindnet log counts as enforcing", ROUTE_CHECK,
+       """      if grep -q '"Starting controller" name="kube-network-policies"' <<<"$log"; then\n""", "      if true; then\n")
 mutate("route-check-permissions-family-dropped", "the impersonation rows are gone from the permissions list", "deploy/route-check/permissions.tsv",
        "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n"
        "impersonate\tuids.authentication.k8s.io\t-\tcluster\nimpersonate\tuserextras.authentication.k8s.io\tscopes\tcluster\n", "")
@@ -3374,7 +3406,7 @@ mutate("dev-issuer-no-subject", "the development issuer starts with no subjects"
 mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
        '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
 mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
-       '"$KIND_GATEWAY_SUBJECT" 8 2\n', '"$KIND_GATEWAY_SUBJECT" 4 2\n')
+       '"$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n', '"$KIND_GATEWAY_SUBJECT" 4 2 "$OPEN_ATTEMPTS"\n')
 mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
        "\n.claude\n", "\n")
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
@@ -3460,16 +3492,16 @@ mutate("demo-driver-list-any-team", "the list check passes a list row from any t
 mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
        '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
 mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
-       "  for team in team-a team-b; do\n    for verb in get list watch; do\n",
-       "  for team in team-a; do\n    for verb in get list watch; do\n")
-mutate("demo-driver-secrets-get-only", "only get is checked on secrets and configuration, not list or watch", DRIVER,
-       "    for verb in get list watch; do\n", "    for verb in get; do\n")
-mutate("demo-driver-no-node-proxy", "the node proxy is not checked", DRIVER,
-       '      can_i_no "$team" "$verb" nodes --subresource=proxy\n', "      :\n")
-mutate("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked", DRIVER,
-       "        for subresource in exec attach portforward proxy; do\n", "        for subresource in exec attach; do\n")
-mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", DRIVER,
-       '        can_i_no "$team" "$verb" services --subresource=proxy -n "$ns"\n', "")
+       "  for team in team-a team-b; do\n    while IFS=", "  for team in team-a; do\n    while IFS=")
+mutate("demo-driver-secrets-get-only", "only get is checked on secrets, not list or watch", PERMISSIONS,
+       "list\tsecrets\t-\tnamespaced\nwatch\tsecrets\t-\tnamespaced\n", "")
+mutate("demo-driver-no-node-proxy", "the node proxy is not checked", PERMISSIONS,
+       "get\tnodes\tproxy\tcluster\ncreate\tnodes\tproxy\tcluster\n", "")
+mutate_all("demo-driver-no-port-forward-or-pod-proxy", "port-forward and the pod proxy are not checked",
+           (PERMISSIONS, "create\tpods\tportforward\tnamespaced\nget\tpods\tportforward\tnamespaced\n", ""),
+           (PERMISSIONS, "get\tpods\tproxy\tnamespaced\ncreate\tpods\tproxy\tnamespaced\n", ""))
+mutate("demo-driver-no-service-proxy", "the Service proxy is not checked", PERMISSIONS,
+       "get\tservices\tproxy\tnamespaced\ncreate\tservices\tproxy\tnamespaced\n", "")
 mutate("demo-driver-no-team-b-probe", "team-b has no pre-policy probe", DRIVER,
        '  kind_workload "team-b before policy" team-b mock-workload before-policy\n', "")
 mutate("demo-workload-wrapped-result-passes", "a result wrapped again passes as the server's own", WORKLOAD,
@@ -3500,11 +3532,11 @@ mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys 
 mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
            (DRIVER, """'$1 == "accepted" && $2 == subject && NF == 2 { n++ }""", """'$1 == "accepted" { n++ }"""),
            (DRIVER, """'$1 == "accepted" && !($2 == subject && NF == 2) { n++ }""", """'$1 == "accepted" && 0 { n++ }"""))
-mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls do not explain passes", DRIVER,
-       '  check "$refused" "$refusals" "mock-docs refused nothing else"\n', "")
+mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls and the probe do not explain passes", DRIVER,
+       '  check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"\n', "")
 mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure count reads the gateway's whole log", DRIVER,
-       '  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" deploy/gateway)\n',
-       "  gateway_logs=$(k -n switchboard logs deploy/gateway)\n")
+       '  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" "pod/$GATEWAY_POD")\n',
+       '  gateway_logs=$(k -n switchboard logs "pod/$GATEWAY_POD")\n')
 
 # --- first slice: the Postgres store as PR #39 has it -----------------------------------------
 # The gateway logs each finish the store reports given up, and the demo's database, set up by
