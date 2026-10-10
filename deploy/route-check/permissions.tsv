@@ -3,7 +3,8 @@
 # one, or reach a pod or node without passing the network policy.
 #
 # route-check.sh asks a SubjectAccessReview for every row, as the workload's ServiceAccount, and
-# every answer must be no. Columns, tab-separated:
+# every answer must be no. deploy/demo/demo.sh's operator checks ask every row too, for each
+# team's workload, so this is the one list. Columns, tab-separated:
 #
 #   verb  resource  subresource  scope
 #
@@ -16,6 +17,11 @@
 get	secrets	-	namespaced
 list	secrets	-	namespaced
 watch	secrets	-	namespaced
+# Reading the gateway's configuration, which names each server and the file that holds the
+# gateway's credential for it.
+get	configmaps	-	namespaced
+list	configmaps	-	namespaced
+watch	configmaps	-	namespaced
 # Starting pods, directly or through a controller. A pod may mount any Secret in its namespace.
 create	pods	-	namespaced
 create	deployments.apps	-	namespaced

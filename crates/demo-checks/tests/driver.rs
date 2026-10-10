@@ -405,7 +405,7 @@ fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
         "  check_server_bearers \"$(mock_docs_log)\" \\\n    \"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
     );
     let kind_call = format!(
-        "  check_server_callers \"$(mock_docs_log)\" \"$KIND_GATEWAY_SUBJECT\" {kind} {probes}\n"
+        "  check_server_callers \"$(mock_docs_log)\" \"$KIND_GATEWAY_SUBJECT\" {kind} {probes} \"$OPEN_ATTEMPTS\"\n"
     );
     for call in [compose_call, kind_call] {
         assert_eq!(driver.matches(&call).count(), 1, "{call}");
@@ -430,10 +430,11 @@ fn jwt_line(accepted: bool, caller: Option<&str>, refusal: Option<&str>) -> Stri
     .to_string()
 }
 
-/// Runs check_server_callers on `lines` for the gateway's subject, 8 calls and 2 refusals.
+/// Runs check_server_callers on `lines` for the gateway's subject, 8 calls, 2 refusals and 3
+/// open attempts of the route check's probe.
 fn check_callers(lines: &[String]) -> Run {
     sourced(&format!(
-        "check_server_callers '{}' \"$KIND_GATEWAY_SUBJECT\" 8 2\nFINISHED=1\nresult 0",
+        "check_server_callers '{}' \"$KIND_GATEWAY_SUBJECT\" 8 2 3\nFINISHED=1\nresult 0",
         lines.join("\n")
     ))
 }
@@ -446,10 +447,14 @@ fn the_server_caller_check_admits_only_the_gateways_identity() {
         None,
     );
     let direct = jwt_line(false, None, Some("wrong_audience"));
+    // The route check's probe before the policy sends no credential.
+    let mut probe = jwt_line(false, None, Some("no_bearer"));
+    probe = probe.replace("\"35078c7e6361\"", "null");
     let boot =
         r#"{"event":"boot","mode":"jwt","subject":"system:serviceaccount:switchboard:gateway"}"#;
     let run_of = |gateway_calls: usize, extra: &[String]| {
         let mut lines = vec![boot.to_owned(), direct.clone(), direct.clone()];
+        lines.extend(std::iter::repeat_n(probe.clone(), 3));
         lines.extend(std::iter::repeat_n(gateway.clone(), gateway_calls));
         lines.extend_from_slice(extra);
         check_callers(&lines)
@@ -457,7 +462,20 @@ fn the_server_caller_check_admits_only_the_gateways_identity() {
 
     let run = run_of(8, &[]);
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 4, "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 5, "{}", run.transcript());
+
+    // A request with no bearer that the probe's open attempts do not explain.
+    let run = run_of(8, std::slice::from_ref(&probe));
+    assert!(
+        run.failed("mock-docs refused the route check's 3 open attempts before the policy"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.failed("mock-docs refused nothing else"),
+        "{}",
+        run.transcript()
+    );
 
     // A second caller from the trusted issuer, and a token accepted with no caller at all, as
     // the static mode logs it.
@@ -514,9 +532,72 @@ fn the_kind_identity_failure_count_reads_only_this_runs_gateway_log() {
     // earlier run's identity failures.
     let driver = common::read("deploy/demo/demo.sh");
     assert!(driver.contains(
-        "  gateway_logs=$(k -n switchboard logs --since-time \"$LOG_SINCE\" deploy/gateway)\n"
+        "  gateway_logs=$(k -n switchboard logs --since-time \"$LOG_SINCE\" \"pod/$GATEWAY_POD\")\n"
     ));
     assert_eq!(driver.matches("gateway_logs=").count(), 1);
+}
+
+/// A fake `k` for gateway_pod: the gateway's Deployment at revision 2, the ReplicaSets of
+/// revisions 1 and 2, and the pods of revision 2's, one of them on its way out.
+const GATEWAY_ROLLOUT: &str = r#"k() {
+  case "$*" in
+    "-n switchboard get deploy/gateway -o jsonpath="*) echo 2 ;;
+    "-n switchboard get replicasets -l app=gateway -o json")
+      echo '{"items": [
+        {"metadata": {"annotations": {"deployment.kubernetes.io/revision": "1"}, "labels": {"app": "gateway", "pod-template-hash": "aaa"}}},
+        {"metadata": {"annotations": {"deployment.kubernetes.io/revision": "2"}, "labels": {"app": "gateway", "pod-template-hash": "bbb"}}}]}' ;;
+    "-n switchboard get pods -l app=gateway,pod-template-hash=bbb -o json")
+      echo '{"items": [
+        {"metadata": {"name": "gateway-bbb-old", "deletionTimestamp": "2026-10-10T00:00:00Z"}, "status": {"phase": "Running"}},
+        {"metadata": {"name": "gateway-bbb-new"}, "status": {"phase": "Running"}}]}' ;;
+    *) echo "unexpected: k $*" >&2; return 1 ;;
+  esac
+}"#;
+
+#[test]
+fn the_kind_boot_lines_are_read_from_the_current_replica_sets_pod() {
+    // After a rollout the previous pod can still be running out its grace period, and `logs
+    // deploy/gateway` may pick it: its boot lines are the previous build's.
+    require(&["jq"]);
+    let run = sourced(&format!(
+        "{GATEWAY_ROLLOUT}\ngateway_pod\necho \"pod=$GATEWAY_POD\""
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout.contains("pod=gateway-bbb-new\n"),
+        "{}",
+        run.transcript()
+    );
+
+    // No ReplicaSet of the Deployment's revision, or no running pod of it: no pod to read.
+    for (case, body) in [
+        (
+            "no-revision",
+            GATEWAY_ROLLOUT.replace("echo 2 ;;", "echo 3 ;;"),
+        ),
+        (
+            "no-pod",
+            GATEWAY_ROLLOUT.replace(
+                "\"name\": \"gateway-bbb-new\"",
+                "\"name\": \"gateway-bbb-new\", \"deletionTimestamp\": \"x\"",
+            ),
+        ),
+    ] {
+        let run = sourced(&format!("{body}\ngateway_pod && echo \"pod=$GATEWAY_POD\""));
+        assert_ne!(run.status, Some(0), "{case}: {}", run.transcript());
+        assert!(!run.stdout.contains("pod="), "{case}: {}", run.transcript());
+    }
+
+    // The kind run reads that pod's log for the boot lines, and never the Deployment's.
+    let driver = common::read("deploy/demo/demo.sh");
+    let found = driver
+        .find("\n  gateway_pod\n")
+        .expect("kind_run finds the gateway's pod");
+    let boot = driver
+        .find("\n  check_boot \"$(k -n switchboard logs \"pod/$GATEWAY_POD\")\"\n")
+        .expect("kind_run reads the boot lines from that pod");
+    assert!(found < boot);
+    assert!(!driver.contains("logs deploy/gateway"));
 }
 
 #[test]
@@ -942,7 +1023,8 @@ fn with_can_i(
     (run, asks, reviews)
 }
 
-/// What a team's workload must not be able to do, as `kubectl auth can-i` arguments.
+/// What the operator checks asked of a team's workload before they read permissions.tsv
+/// (#47's kind demo checks), as `kubectl auth can-i` arguments. Each must still be asked.
 fn operator_asks(team: &str) -> Vec<String> {
     let mut asks = Vec::new();
     // Reading a secret or the gateway's configuration: list and watch return the data too.
@@ -1010,17 +1092,87 @@ fn operator_asks(team: &str) -> Vec<String> {
     asks
 }
 
+/// The review sar_no asks for `team`'s workload.
+fn review(team: &str, resource: &str, subresource: &str, namespace: &str) -> Value {
+    let mut review = json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SubjectAccessReview",
+        "spec": {
+            "user": format!("system:serviceaccount:{team}:mock-workload"),
+            "groups": [
+                "system:serviceaccounts",
+                format!("system:serviceaccounts:{team}"),
+                "system:authenticated",
+            ],
+            "resourceAttributes": {
+                "verb": "impersonate",
+                "group": "authentication.k8s.io",
+                "resource": resource,
+                "subresource": subresource,
+            },
+        },
+    });
+    if !namespace.is_empty() {
+        review["spec"]["resourceAttributes"]["namespace"] = json!(namespace);
+    }
+    review
+}
+
+/// What the operator checks must ask of `team`'s workload: every row of
+/// deploy/route-check/permissions.tsv, read here on its own. A `namespaced` row is asked in
+/// mock-docs, the gateway's namespace, the team's own and across the cluster; a `cluster` row
+/// across the cluster only. Impersonating a UID or an extra is a review; the rest are can-i
+/// arguments. Returns the can-i arguments and the reviews.
+fn listed_asks(team: &str) -> (Vec<String>, Vec<Value>) {
+    let mut asks = Vec::new();
+    let mut reviews = Vec::new();
+    for line in common::read("deploy/route-check/permissions.tsv").lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let row: Vec<&str> = line.split('\t').collect();
+        let [verb, resource, subresource, scope] = row[..] else {
+            panic!("permissions.tsv: {line:?}");
+        };
+        let wheres: &[&str] = match scope {
+            "namespaced" => &["mock-docs", "switchboard", team, "all"],
+            "cluster" => &[""],
+            _ => panic!("permissions.tsv: {line:?}"),
+        };
+        for place in wheres {
+            if let ("impersonate", Some((name, "authentication.k8s.io"))) =
+                (verb, resource.split_once('.'))
+            {
+                let subresource = if subresource == "-" { "" } else { subresource };
+                let namespace = if *place == "all" { "" } else { place };
+                reviews.push(review(team, name, subresource, namespace));
+                continue;
+            }
+            let mut ask = format!("{verb} {resource}");
+            if subresource != "-" {
+                ask.push_str(&format!(" --subresource={subresource}"));
+            }
+            // Across the cluster is a can-i with no namespace, which asks in the kubeconfig's
+            // namespace and counts its RoleBindings as well as ClusterRoleBindings.
+            match *place {
+                "" | "all" => {}
+                namespace => ask.push_str(&format!(" -n {namespace}")),
+            }
+            asks.push(ask);
+        }
+    }
+    (asks, reviews)
+}
+
 #[test]
-fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy() {
+fn the_operator_checks_ask_every_row_of_the_route_checks_list_for_both_teams() {
     let (run, asks, reviews) = with_can_i("can-i-no", "no", "false", "operator_checks");
     assert_eq!(run.status, Some(0), "{}", run.transcript());
     let mut expected = Vec::new();
     let mut expected_reviews = Vec::new();
     for team in ["team-a", "team-b"] {
-        let team_asks = operator_asks(team);
-        // 9 reads, 7 across the cluster, and 36 in each of three namespaces.
-        assert_eq!(team_asks.len(), 9 + 7 + 3 * 36);
-        for ask in team_asks {
+        let (team_asks, team_reviews) = listed_asks(team);
+        for ask in &team_asks {
             let check = format!("PASS {team}'s workload may not: {ask}");
             assert!(
                 run.stdout.lines().any(|line| line == check),
@@ -1031,16 +1183,18 @@ fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy(
                 "k auth can-i {ask} --as=system:serviceaccount:{team}:mock-workload"
             ));
         }
+        // Every ask the operator checks made before they read the list is still made, as it
+        // was made.
+        for ask in operator_asks(team) {
+            assert!(team_asks.contains(&ask), "{team}: no longer asked: {ask}");
+        }
         // Impersonating a UID or an extra, which can-i cannot name, by SubjectAccessReview: the
         // group, resource and subresource the API server checks, for the user and groups `--as`
         // gives the team's ServiceAccount.
-        for (resource, subresource) in [("uids", ""), ("userextras", "scopes")] {
-            let named = [resource, subresource]
-                .iter()
-                .filter(|part| !part.is_empty())
-                .copied()
-                .collect::<Vec<_>>()
-                .join("/");
+        for (named, resource, subresource) in [
+            ("uids", "uids", ""),
+            ("userextras/scopes", "userextras", "scopes"),
+        ] {
             let check = format!(
                 "PASS {team}'s workload may not: impersonate authentication.k8s.io/{named}"
             );
@@ -1049,33 +1203,19 @@ fn the_operator_checks_cover_both_teams_and_the_routes_that_skip_network_policy(
                 "{check}\n{}",
                 run.transcript()
             );
-            expected_reviews.push(json!({
-                "apiVersion": "authorization.k8s.io/v1",
-                "kind": "SubjectAccessReview",
-                "spec": {
-                    "user": format!("system:serviceaccount:{team}:mock-workload"),
-                    "groups": [
-                        "system:serviceaccounts",
-                        format!("system:serviceaccounts:{team}"),
-                        "system:authenticated",
-                    ],
-                    "resourceAttributes": {
-                        "verb": "impersonate",
-                        "group": "authentication.k8s.io",
-                        "resource": resource,
-                        "subresource": subresource,
-                    },
-                },
-            }));
+            assert!(team_reviews.contains(&review(team, resource, subresource, "")));
         }
+        expected_reviews.extend(team_reviews);
     }
-    // Exactly these, and each once: 124 asks and 2 reviews per team.
+    // Exactly these, and each once: 43 namespaced rows asked four ways and 8 cluster rows, 178
+    // asks and 2 reviews per team.
     let mut called = asks.clone();
     called.sort();
     expected.sort();
     assert_eq!(called, expected, "{}", run.transcript());
-    assert_eq!(called.len(), 248);
+    assert_eq!(called.len(), 2 * 178);
     assert_eq!(reviews, expected_reviews, "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 2 * 180, "{}", run.transcript());
 
     // A yes, or no answer at all, fails the check.
     for (answer, allowed) in [("yes", "true"), ("''", "''")] {
@@ -1171,4 +1311,332 @@ fn a_new_job_keeps_its_templates_environment_and_takes_the_mode() {
         json!([{"name": "OWN_PROJECT", "value": "atlas"}]),
         "{applied}"
     );
+}
+
+#[test]
+fn a_permission_query_kubectl_cannot_answer_fails_with_its_message_and_the_run_goes_on() {
+    // kubectl itself fails: it cannot reach the cluster, or may not impersonate. The answer is
+    // neither yes nor no, and the check says what kubectl said; the run does not stop there.
+    require(&["jq"]);
+    let run = sourced(
+        "k() { echo 'error: You must be logged in to the server (Unauthorized)' >&2; return 1; }\n\
+         can_i_no team-a get secrets -n mock-docs\n\
+         sar_no team-a impersonate authentication.k8s.io uids\n\
+         pass 'the run went on'\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    for check in [
+        "team-a's workload may not: get secrets -n mock-docs (got 'no answer (kubectl exit 1): error: You must be logged in to the server (Unauthorized)",
+        "team-a's workload may not: impersonate authentication.k8s.io/uids (got 'no answer (kubectl exit 1): error: You must be logged in to the server (Unauthorized)",
+    ] {
+        assert!(run.failed(check), "{check}\n{}", run.transcript());
+    }
+    assert!(
+        run.stdout.contains("PASS the run went on\n"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(
+        run.stdout.lines().last(),
+        Some("RESULT: FAIL (2 of 3 failed)"),
+        "{}",
+        run.transcript()
+    );
+}
+
+/// A fake route-check.sh: it saves its arguments, one per line, to `args`, prints the lines in
+/// `$FAKE_OUTPUT`, writes `$FAKE_REPORT` to its --report file, and exits `$FAKE_STATUS`.
+const FAKE_ROUTE_CHECK: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+for arg do printf '%s\n' "$arg"; done >"$dir/args"
+while [ $# -gt 0 ]; do
+  case $1 in --report) report=$2 ;; esac
+  shift
+done
+printf '%s\n' "$FAKE_OUTPUT"
+[ -z "${FAKE_REPORT:-}" ] || printf '%s\n' "$FAKE_REPORT" >"$report"
+exit "${FAKE_STATUS:-0}"
+"#;
+
+/// Runs `body` with ROUTE_CHECK set to the fake, DEMO_DIR to a scratch directory, and the
+/// environment `env`. Returns the run and the fake's arguments.
+fn with_route_check(name: &str, env: &[(&str, &str)], body: &str) -> (Run, Vec<String>) {
+    require(&["jq"]);
+    let dir = scratch(name);
+    let fake = write(&dir, "route-check.sh", FAKE_ROUTE_CHECK);
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new("bash");
+    command.arg("-c").arg(format!(
+        "source '{}'\nROUTE_CHECK='{}'\nDEMO_DIR='{}'\nIMG_RUN=switchboard-demo:90d73467ace7\n{body}\n",
+        repo().join("deploy/demo/demo.sh").display(),
+        fake.display(),
+        dir.display()
+    ));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let run = Run::from(command.output().unwrap());
+    let args = std::fs::read_to_string(dir.join("args"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (run, args)
+}
+
+#[test]
+fn the_route_check_runs_as_its_operator_against_the_idle_pod() {
+    let (run, args) = with_route_check(
+        "route-check-args",
+        &[("FAKE_OUTPUT", "PASS one\nPASS two\n\nRESULT: PASS (2/2)")],
+        "route_check team-b refused mock-workload-idle-1\necho \"report=$ROUTE_REPORT\"\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.stdout.lines().last(),
+        Some("RESULT: PASS (2/2)"),
+        "{}",
+        run.transcript()
+    );
+    let own = own_kubeconfig();
+    let report = args[args.iter().position(|arg| arg == "--report").unwrap() + 1].clone();
+    assert!(
+        report.contains("/route-check-team-b-") && report.ends_with("Z.json"),
+        "{report}"
+    );
+    assert!(
+        run.stdout.contains(&format!("report={report}\n")),
+        "{}",
+        run.transcript()
+    );
+    let root = repo().canonicalize().unwrap();
+    let want = [
+        "--kubeconfig",
+        &own,
+        "--context",
+        "kind-switchboard-demo",
+        "--as",
+        "system:serviceaccount:route-check:operator",
+        "--namespace",
+        "team-b",
+        "--selector",
+        "app=mock-workload,job-name=mock-workload-idle-1",
+        "--gateway-ns",
+        "switchboard",
+        "--server-ns",
+        "mock-docs",
+        "--server-service",
+        "mock-docs/mock-docs",
+        "--server-audience",
+        "mock-docs",
+        "--routes",
+        &format!("{}/deploy/route-check/routes/kind.tsv", root.display()),
+        "--gateway-url",
+        "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs",
+        "--expect",
+        "refused",
+        "--probe-image",
+        "switchboard-demo:90d73467ace7",
+        "--report",
+        &report,
+        "--environment",
+        "first slice, kind",
+    ];
+    assert_eq!(args, want);
+
+    // The control before the policy expects every route open, and keeps its report apart.
+    let (run, args) = with_route_check(
+        "route-check-open",
+        &[("FAKE_OUTPUT", "PASS one")],
+        "route_check team-a open mock-workload-idle-2\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let at = args.iter().position(|arg| arg == "--expect").unwrap();
+    assert_eq!(args[at + 1], "open");
+    let at = args.iter().position(|arg| arg == "--report").unwrap();
+    assert!(
+        args[at + 1].contains("/route-check-team-a-open-"),
+        "{args:?}"
+    );
+}
+
+#[test]
+fn a_route_check_fail_fails_the_run() {
+    for (case, output, status) in [
+        (
+            "fail-line",
+            "PASS one\nFAIL the probe passed: RESULT: FAIL",
+            "1",
+        ),
+        // A FAIL with exit 0, or a non-zero exit with no FAIL, is caught too.
+        (
+            "fail-exit-0",
+            "PASS one\nFAIL the probe passed: RESULT: FAIL",
+            "0",
+        ),
+        ("exit-without-fail", "PASS one", "1"),
+    ] {
+        let (run, _) = with_route_check(
+            case,
+            &[("FAKE_OUTPUT", output), ("FAKE_STATUS", status)],
+            "pass before\nroute_check team-a refused mock-workload-idle-1\nFINISHED=1\nresult 0",
+        );
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(
+            run.stdout
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .starts_with("RESULT: FAIL ("),
+            "{case}: {}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn the_route_check_before_the_policy_counts_its_open_attempts() {
+    // Each open attempt is a request mock-docs refused for carrying no bearer; the server
+    // check counts them.
+    let report = json!({"routes": [
+        {"row": "mock-docs", "by": "name", "result": "open"},
+        {"row": "mock-docs", "by": "address", "result": "open"},
+        {"row": "mock-docs", "by": "address", "result": "open"},
+    ]})
+    .to_string();
+    let stubs = "can_i_no_as() { echo \"can-i as $1: ${*:3}\"; }\n\
+                 start_idle() { JOB=$1-idle-job; echo \"start_idle $1\"; }\n\
+                 stop_idle() { echo \"stop_idle $*\"; }\n";
+    let (run, args) = with_route_check(
+        "route-check-before",
+        &[("FAKE_OUTPUT", "PASS one"), ("FAKE_REPORT", &report)],
+        &format!("{stubs}route_checks_before_policy\necho \"open=$OPEN_ATTEMPTS\""),
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(run.stdout.contains("open=3\n"), "{}", run.transcript());
+    let at = args.iter().position(|arg| arg == "--selector").unwrap();
+    assert_eq!(args[at + 1], "app=mock-workload,job-name=team-a-idle-job");
+    // The operator's own access is checked first, and the idle Job is deleted after.
+    let lines: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("can-i as ") || line.contains("_idle "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "can-i as system:serviceaccount:route-check:operator: get secrets -n mock-docs",
+            "can-i as system:serviceaccount:route-check:operator: create pods --subresource=exec -n team-a",
+            "can-i as system:serviceaccount:route-check:operator: create pods -n team-a",
+            "can-i as system:serviceaccount:route-check:operator: patch pods --subresource=ephemeralcontainers -n mock-docs",
+            "start_idle team-a",
+            "stop_idle team-a team-a-idle-job",
+        ],
+        "{}",
+        run.transcript()
+    );
+
+    // A report that records no open attempt is a FAIL.
+    let (run, _) = with_route_check(
+        "route-check-before-none",
+        &[("FAKE_OUTPUT", "PASS one")],
+        &format!("{stubs}route_checks_before_policy\nFINISHED=1\nresult 0"),
+    );
+    assert!(
+        run.failed("the route check before the policy found routes open"),
+        "{}",
+        run.transcript()
+    );
+}
+
+#[test]
+fn after_the_policy_each_team_gets_a_new_pod_and_ten_seconds_before_its_route_check() {
+    let report = json!({"network_plugin": "kindnet", "kind_version": "kind v0.32.0", "routes": []})
+        .to_string();
+    let (run, _) = with_route_check(
+        "route-check-after",
+        &[("FAKE_OUTPUT", "PASS one"), ("FAKE_REPORT", &report)],
+        "start_idle() { JOB=$1-idle-job; echo \"step start_idle $1\"; }\n\
+         stop_idle() { echo \"step stop_idle $*\"; }\n\
+         sleep() { echo \"step sleep $*\"; }\n\
+         route_check() { echo \"step route_check $*\"; ROUTE_REPORT=$DEMO_DIR/report.json; printf '%s' \"$FAKE_REPORT\" >\"$ROUTE_REPORT\"; }\n\
+         route_checks_after_policy\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.lines("step "),
+        [
+            "step start_idle team-a",
+            "step start_idle team-b",
+            "step sleep 10",
+            "step route_check team-a refused team-a-idle-job",
+            "step route_check team-b refused team-b-idle-job",
+            "step stop_idle team-a team-a-idle-job",
+            "step stop_idle team-b team-b-idle-job",
+        ],
+        "{}",
+        run.transcript()
+    );
+    for team in ["team-a", "team-b"] {
+        for check in [
+            format!("PASS the route check's report for {team} records the network plugin"),
+            format!(
+                "PASS the route check's report for {team} records the kind version (kind v0.32.0)"
+            ),
+        ] {
+            assert!(
+                run.stdout.lines().any(|line| line == check),
+                "{check}\n{}",
+                run.transcript()
+            );
+        }
+    }
+
+    // A report with no kind version, or none at all, fails.
+    let report = json!({"network_plugin": "kindnet", "kind_version": "unknown"}).to_string();
+    let (run, _) = with_route_check(
+        "route-check-report",
+        &[("FAKE_REPORT", &report)],
+        "printf '%s' \"$FAKE_REPORT\" >\"$DEMO_DIR/r.json\"\ncheck_route_report team-a \"$DEMO_DIR/r.json\"\n\
+         check_route_report team-b \"$DEMO_DIR/missing.json\"\nFINISHED=1\nresult 0",
+    );
+    for check in [
+        "the route check's report for team-a records the kind version (got 'unknown')",
+        "the route check's report for team-b records the network plugin (got '', want 'kindnet')",
+    ] {
+        assert!(run.failed(check), "{check}\n{}", run.transcript());
+    }
+}
+
+#[test]
+fn the_kind_run_checks_the_routes_open_before_the_policy_and_refused_after_it() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let at = |text: &str| {
+        let found: Vec<_> = driver.match_indices(text).collect();
+        assert_eq!(found.len(), 1, "{text:?} in demo.sh: {}", found.len());
+        found[0].0
+    };
+    let rbac = at("\n  k apply -f \"$ROOT/deploy/kind/route-check/rbac.yaml\"\n");
+    let probes = at("\n  before_policy_probes\n");
+    let open = at("\n  route_checks_before_policy\n");
+    let policy = at("\n  k apply -k \"$ROOT/deploy/kind/policy\"\n  sleep 10\n");
+    let refused = at("\n  route_checks_after_policy\n");
+    let server = at("\n  check_server_callers \"$(mock_docs_log)\"");
+    assert!(
+        rbac < probes && probes < open && open < policy && policy < refused && refused < server
+    );
+    // The control expects every route open; the check after the policy, refused.
+    assert_eq!(
+        driver
+            .matches("  route_check team-a open \"$job\"\n")
+            .count(),
+        1
+    );
+    assert_eq!(
+        driver
+            .matches("    route_check \"$team\" refused \"${jobs[$i]}\"\n")
+            .count(),
+        1
+    );
+    assert_eq!(driver.matches("\n  route_check ").count(), 1);
 }

@@ -16,6 +16,9 @@
 #                  refuse it with the audit-failure sentence
 #   withdrawn      after docs__read_document is withdrawn from the registry: tools/list drops it
 #                  and a call to it is refused
+#   idle           makes no call: sleeps until SIGTERM, at most IDLE_SECONDS, then prints
+#                  `PASS idle`. It holds a running pod with the workload's labels and
+#                  ServiceAccount, for the route check to start its probe in
 #
 # Environment:
 #   GATEWAY_URL      the surface's endpoint, e.g. http://gateway:8080/mcp/docs
@@ -27,6 +30,7 @@
 #   BAD_TOKEN_URLS   space-separated URLs, each answering with such a token
 #   DIRECT_URL       the server's own address, bypassing the gateway
 #   DIRECT_TIMEOUT   seconds to wait on DIRECT_URL, default 3
+#   IDLE_SECONDS     how long idle waits for SIGTERM, 1 to 600, default 600
 #
 # The tool names and their arguments are the demo registry's (deploy/*/config/registry); the
 # `plan` document and the projects `atlas` and `borealis` are the mock server's
@@ -171,11 +175,16 @@ full() {
   done
 
   if [ -n "${DIRECT_URL:-}" ]; then
-    # Network policy must drop the connection, so curl times out: exit 28. Any other failure
-    # (a DNS miss, a refused port, a 401 from the server) proves nothing and fails the check.
-    curl -sS -m "${DIRECT_TIMEOUT:-3}" -o /dev/null "$DIRECT_URL" \
-      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' 2>/dev/null
-    check "$?" 28 "direct call to the server refused (curl exit 28 at $DIRECT_URL)"
+    # Network policy must drop the connection, so curl times out before it connects: exit 28
+    # with no connection made. curl also exits 28 when it connected and no answer came in time,
+    # from a slow or stalled server or a tarpit, which is not a dropped route; only the count of
+    # connections tells the two apart. Any other failure (a DNS miss, a refused port, a 401 from
+    # the server) proves nothing and fails the check.
+    connects=$(curl -sS -m "${DIRECT_TIMEOUT:-3}" -o /dev/null -w '%{num_connects}' \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' "$DIRECT_URL" 2>/dev/null)
+    code=$?
+    check "curl exit $code, ${connects:-no} connections" "curl exit 28, 0 connections" \
+      "direct call to the server refused before it connected ($DIRECT_URL)"
     # The positive control, in the same pod: the gateway is reachable and still reaches the server.
     check "$(rpc "$TOKEN" ping '{}')" 200 "same pod still reaches the gateway"
     expect_allowed "$(call "$TOKEN" "$READ_TOOL" "$own_args")" "same pod's read through the gateway"
@@ -217,12 +226,32 @@ withdrawn() {
     "call to the withdrawn tool: the not-available sentence"
 }
 
+# idle: the route check's pod. It makes no call and holds no state; it waits in the background so
+# the trap runs as soon as SIGTERM comes (a shell runs a trap only between commands), and as
+# PID 1 in its container it gets no default action for SIGTERM, so without the trap a deleted
+# pod would wait out its grace period.
+idle() {
+  seconds=${IDLE_SECONDS:-600}
+  case $seconds in '' | *[!0-9]*) setup_failed "IDLE_SECONDS is a number of seconds, not $seconds" ;; esac
+  [ "$seconds" -ge 1 ] && [ "$seconds" -le 600 ] || setup_failed "IDLE_SECONDS is 1 to 600, not $seconds"
+  sleep "$seconds" &
+  sleeper=$!
+  trap 'kill "$sleeper" 2>/dev/null' TERM INT
+  note "idle: waiting for SIGTERM, at most ${seconds}s"
+  wait "$sleeper"
+  # A signal ends the first wait early; this one reaps the sleep the trap killed.
+  wait "$sleeper" 2>/dev/null
+  trap - TERM INT
+  pass idle
+}
+
 case "$MODE" in
   full) : "${OWN_PROJECT:?}" "${OTHER_PROJECT:?}"; full ;;
   before-policy) : "${OWN_PROJECT:?}"; before_policy ;;
   refused) refused ;;
   audit-down) : "${OWN_PROJECT:?}"; audit_down ;;
   withdrawn) : "${OWN_PROJECT:?}"; withdrawn ;;
-  *) echo "usage: $0 [full|before-policy|refused|audit-down|withdrawn]" >&2; exit 2 ;;
+  idle) idle ;;
+  *) echo "usage: $0 [full|before-policy|refused|audit-down|withdrawn|idle]" >&2; exit 2 ;;
 esac
 finish
