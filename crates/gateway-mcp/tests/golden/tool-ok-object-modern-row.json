@@ -1,0 +1,31 @@
+{
+  "body": {
+    "id": "call-7",
+    "jsonrpc": "2.0",
+    "result": {
+      "_meta": {
+        "io.modelcontextprotocol/serverInfo": {
+          "name": "switchboard",
+          "version": "0.1.0"
+        },
+        "switchboard/auditRow": "01920000-0000-7000-8000-000000000000"
+      },
+      "content": [
+        {
+          "text": "{\"document\":\"team-a-notes\",\"text\":\"Dummy notes.\"}",
+          "type": "text"
+        }
+      ],
+      "isError": false,
+      "resultType": "complete",
+      "structuredContent": {
+        "document": "team-a-notes",
+        "text": "Dummy notes."
+      }
+    }
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use common::Raw;
 use gateway_mcp::{
     CHALLENGE, CLIENT_CAPABILITIES_META, Era, HttpResponse, Inbound, PROTOCOL_VERSION_META,
-    Rejection, Reply, RequestId, SESSION_ID_HEADER, ServerInfo, ToolEntry, render,
+    Rejection, Reply, RequestId, SESSION_ID_HEADER, ServerInfo, ToolEntry, render, render_with_row,
 };
 use http::Method;
 use serde_json::{Value, json};
@@ -58,6 +58,13 @@ fn reply(era: Era, id: RequestId, reply: Reply) -> HttpResponse {
     render(&server(), era, &id, reply)
 }
 
+/// A dummy audit row identifier, shaped as the gateway's UUIDv7s are.
+const DUMMY_ROW: &str = "01920000-0000-7000-8000-000000000000";
+
+fn with_row(era: Era, id: RequestId, reply: Reply) -> HttpResponse {
+    render_with_row(&server(), era, &id, reply, Some(DUMMY_ROW))
+}
+
 fn refusal(raw: Raw) -> HttpResponse {
     raw.parse()
         .expect_err("the request was accepted")
@@ -87,10 +94,17 @@ fn cases() -> Vec<(&'static str, HttpResponse)> {
         ("tool-result-non-object-legacy", reply(Legacy, one(), Reply::ToolResult { content: vec![json!({"type": "text", "text": "3"})], structured_content: Some(json!(3)) })),
         ("tool-error-legacy", reply(Legacy, one(), Reply::ToolError("The tool failed: dummy cause.".to_owned()))),
         ("tool-error-modern", reply(Modern, one(), Reply::ToolError("The tool failed: dummy cause.".to_owned()))),
+        // Results naming their audit row.
+        ("tool-ok-object-modern-row", with_row(Modern, named(), Reply::ToolOk(json!({"document": "team-a-notes", "text": "Dummy notes."})))),
+        ("tool-ok-string-legacy-row", with_row(Legacy, one(), Reply::ToolOk(json!("plain")))),
+        ("tool-error-legacy-row", with_row(Legacy, one(), Reply::ToolError("The tool failed: dummy cause.".to_owned()))),
         // Errors the gateway decides.
         ("denied-legacy", reply(Legacy, one(), Reply::Denied("Dummy denial sentence.".to_owned()))),
         ("denied-modern", reply(Modern, named(), Reply::Denied("Dummy denial sentence.".to_owned()))),
         ("internal", reply(Modern, one(), Reply::Internal("Internal error".to_owned()))),
+        // Errors naming their audit row.
+        ("denied-modern-row", with_row(Modern, named(), Reply::Denied("Dummy denial sentence.".to_owned()))),
+        ("denied-legacy-row", with_row(Legacy, one(), Reply::Denied("Dummy denial sentence.".to_owned()))),
         ("notification-accepted", HttpResponse::accepted()),
         // Refusals the HTTP layer builds.
         ("unauthorized", Rejection::unauthorized(DUMMY_IDENTITY_SENTENCE).response()),

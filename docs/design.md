@@ -1122,7 +1122,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   giving up a guard without running completes its row as `error`. The first half is built in
   the Postgres store: when an allowed call's begin fails, and any of its attempts executed
   its insert and then ran out of budget or failed with an error that trying again could fix,
-  a task on the finish pool completes the row as `error` with a latency of 0 until the
+  a task on the finish pool completes the row as `error` with a latency of zero until the
   finish deadline, counted in flight so shutdown waits for it. A later attempt's error does
   not undo that, and the error may be an explicit refusal, such as a read-only server's.
   That task alone waits for a missing row, which may still commit. It keeps trying through
@@ -1131,8 +1131,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   completed. A row its last attempt found missing is counted as never written, not given
   up. A database that stays locked, unreachable or read-only past the deadline leaves the
   store unable to tell, and that row is given up and reported. Denials and list rows need
-  nothing.
-  Not built: giving up a guard. Today a guard can only be consumed by running it.
+  nothing. The second half is built in the core: `audit::give_up` consumes a guard, calls no
+  connector, and completes its row as `error` with a latency of zero. The gateway does not
+  call it yet: that is #40.
 - In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
@@ -1184,7 +1185,11 @@ off only in a development build, with CI's check of the release artifact; and th
   told apart only by its cause, and is not counted apart.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled.
   Today the spawned task always runs to completion.
-- The row's identifier in the result's `_meta`, or in `error.data`.
+- The row's identifier in the result's `_meta`, or in `error.data`: built for `tools/call`
+  (#40). A result names it under `switchboard/auditRow` in `_meta`, in both eras, beside the
+  server's name under 2026-07-28; a denial or an internal error names it as `auditRow` in
+  `error.data`. A refusal because begin failed names none, and with audit disabled nothing is
+  named. `tools/list` names its row once it writes one.
 - The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
   harness enables and CI's check of the release artifact: built (#40). Both boot paths and
   every registry reload refuse a snapshot serving a tool not classified `read`, since no

@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
 """Break each guard in the gateway crates, one at a time, and require the tests to notice.
 
-    python3 scripts/mutation_check.py              # every mutation
-    python3 scripts/mutation_check.py --list       # what would run
-    python3 scripts/mutation_check.py --targets    # check every target still matches, no cargo
-    python3 scripts/mutation_check.py ID [ID ...]  # only these
+    python3 scripts/mutation_check.py                   # every mutation
+    python3 scripts/mutation_check.py --list            # what would run
+    python3 scripts/mutation_check.py --targets         # check every target still matches, no cargo
+    python3 scripts/mutation_check.py ID [ID ...]       # only these
+    python3 scripts/mutation_check.py --shard 0/4       # every fourth mutation, from the first
+    python3 scripts/mutation_check.py --all-catchers ID # name every test that catches it
 
-Each mutation is one or more exact text replacements in the crate's source. The script copies
-the workspace into a temporary directory, checks that the unmutated copy passes, and then for
-each mutation applies it to the copy, runs `cargo test --workspace --locked --no-fail-fast`,
-and restores the copy. The working tree is never written to.
+Each mutation is one or more exact text replacements in the workspace's files. The script copies
+the workspace into a temporary directory and checks that the unmutated copy passes
+`cargo test --workspace --locked`, which also builds everything once. Then for each mutation it
+applies the edits to the copy, runs the tests that can see them, and restores the copy. The
+working tree is never written to.
+
+The tests that can see a mutation are those of the packages that hold its edited files, of every
+workspace package that depends on those (normal, dev or build dependencies, all the way up), and
+of the packages that read the edited files from their tests (the READERS table below). A file
+outside every crate that the table does not name runs the whole workspace. They run in two steps:
+first the packages that hold or read an edited file, which build fastest and catch most; then,
+only if those pass, the dependents. Each step stops at the first test binary that fails.
+--all-catchers runs both steps at once and to the end, to name every test that fails. The first
+time a set of packages is needed, it is run once unmutated ("baseline for [...]"): built on their
+own, packages get their dependencies with fewer features, and a set that fails that way is not
+used: the end of its output is printed, and its mutations run the whole workspace instead.
+
+The first step builds only its own packages. So a mutation that compiles there but breaks the
+build of a package that depends on them is judged by the first step's tests: it is CAUGHT if one
+of them fails, though the whole workspace would not build. That is a stale mutation, such as one
+that changes a trait in the core but not a crate that implements it. --all-catchers builds the
+dependents too and reports such a mutation as NO-VERDICT; run with it to find them.
+
+A scoped run that passes is not trusted on its own: the mutation runs again with the full
+`cargo test --workspace --locked --no-fail-fast`, and only if that passes too is it SURVIVED. A
+scoped run with no verdict is retried the same way. So a gap in the table costs time, never a
+verdict. Each line names the packages that ran ("then workspace" after a retry) and the seconds.
+
+--shard I/N runs every N-th selected mutation starting at the I-th (0-based), after any IDs, so
+N processes can split a full run. Each process copies and builds its own workspace; give each its
+own Postgres too (see CONTRIBUTING.md).
 
 Verdicts, one line per mutation:
 
     CAUGHT      a test failed (the line names which), or, for a mutation marked as meaning to
                 break the build, the library itself did not compile
-    SURVIVED    every test passed: nothing watches this guard
+    SURVIVED    every test in the workspace passed: nothing watches this guard
     ERROR       the mutation's target text did not match exactly once, so the mutation is
                 stale and was not run; it is never counted as caught
-    NO-VERDICT  cargo failed without a test failing (a test target did not compile, a timeout):
-                nothing was learned
+    NO-VERDICT  cargo failed without a test failing (a test target did not compile, a timeout),
+                in the whole workspace too: nothing was learned
 
-The exit status is zero only if every mutation was caught. CI does not run this: it is one
-full test run per mutation. Run it after changing a guard or the tests that watch one, and add
-a mutation for every guard you add.
+The exit status is zero only if every mutation was caught. CI does not run this. Run it after
+changing a guard or the tests that watch one, and add a mutation for every guard you add.
 
 Needs Python 3.12 or later and nothing outside the standard library.
 """
@@ -31,6 +59,7 @@ Needs Python 3.12 or later and nothing outside the standard library.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -40,6 +69,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 if sys.version_info < (3, 12):
     sys.exit("mutation_check.py needs Python 3.12 or later")
@@ -53,6 +83,8 @@ TESTKIT = "crates/gateway-testkit/"
 TESTKIT_SRC = TESTKIT + "src/"
 REGRESSIONS = CRATE + "tests/properties.proptest-regressions"
 TIMEOUT_SECONDS = 1200
+# The tests that need Postgres skip, and pass, when this is not set (see CONTRIBUTING.md).
+DATABASE_VARIABLE = "SWITCHBOARD_TEST_DATABASE_URL"
 
 
 @dataclass(frozen=True)
@@ -678,7 +710,8 @@ mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "au
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: recorded,\n            latency_ms: { let _ = latency_ms; 0 },")
 mutate("finish-wrong-row", "finish completes row 0 whatever ran", SRC + "audit.rs",
-       "    let completion = RowCompletion {\n        row,", '    let completion = RowCompletion {\n        row: { let _ = row; AuditRowId::new("0") },')
+       "    let completion = RowCompletion {\n        row,\n        completion: Completion {\n            outcome: recorded,",
+       '    let completion = RowCompletion {\n        row: { let _ = row; AuditRowId::new("0") },\n        completion: Completion {\n            outcome: recorded,')
 mutate("finish-error-swallowed", "a store error on finish is not reported", SRC + "audit.rs",
        "            failure: Some(AuditFailure::from_store(error)),", "            failure: { let _ = error; None },")
 mutate("finish-refusal-unrecorded-answered", "a refusal that could not be recorded is still answered with its sentence", SRC + "audit.rs",
@@ -686,6 +719,12 @@ mutate("finish-refusal-unrecorded-answered", "a refusal that could not be record
        "")
 mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not the one recorded", SRC + "audit.rs",
        "            Answer::Refused(sentence),", "            Answer::Refused(sentence.to_uppercase()),")
+# A guard given up (decision 0009): its row is completed as error, never ok, through the store.
+mutate("core-give-up-completes-ok", "a guard given up records its call as ok", SRC + "audit.rs",
+       "            outcome: Outcome::Error,\n            latency_ms: 0,", "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+mutate("core-give-up-skips-finish", "a guard given up leaves its row open and reports no failure", SRC + "audit.rs",
+       "    let failure = store\n        .finish(&completion)\n        .await\n        .err()\n        .map(AuditFailure::from_store);",
+       "    let failure: Option<AuditFailure> = None;")
 # A list row (decision 0009): the tools it names, its count, and the value only it can make.
 mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
        "            .take(MAX_RECORDED_TOOLS)\n", "")
@@ -758,10 +797,17 @@ mutate_all(
     (TESTKIT_SRC + "credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
     (TESTKIT_SRC + "credentials.rs", "        let principal = caller.get();\n", "        let principal = caller;\n"),
     (TESTKIT_SRC + "connector.rs", "self.credentials.credential_for(&connector, &caller).await", "self.credentials.credential_for(&connector, caller.get()).await"),
-    # The one test helper that calls the source directly is changed to match, so that what is
-    # left to fail is the compile-fail case for a plain principal, which compiles under this
-    # mutation: that is the guard under test.
+    # Connector-proxy's file source implements the trait too, and is changed the same way.
+    ("crates/connector-proxy/src/credentials.rs", "        _caller: &Proved<Principal>,\n", "        _caller: &Principal,\n"),
+    ("crates/connector-proxy/src/credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
+    ("crates/connector-proxy/src/connector.rs", ".issue(&self.connector, &call.call().caller.principal)", ".issue(&self.connector, call.call().caller.principal.get())"),
+    # The tests that call a source directly are changed to match, so that the whole workspace
+    # still builds and what is left to fail is the compile-fail case for a plain principal,
+    # which compiles under this mutation: that is the guard under test.
     (TESTKIT + "tests/fakes.rs", '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))', '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller.get()))'),
+    ("crates/connector-proxy/tests/credentials.rs", "credentials.credential_for(&ConnectorName::new(DOCS), &caller)", "credentials.credential_for(&ConnectorName::new(DOCS), caller.get())"),
+    ("crates/connector-proxy/tests/credentials.rs", 'credentials.credential_for(&ConnectorName::new("other"), &caller)', 'credentials.credential_for(&ConnectorName::new("other"), caller.get())'),
+    ("crates/connector-proxy/tests/credentials.rs", "credentials.credential_for(&ConnectorName::new(CONNECTOR), &caller)", "credentials.credential_for(&ConnectorName::new(CONNECTOR), caller.get())"),
 )
 
 # --- The identity verifier: the order and each check ---------------------------------------
@@ -1173,6 +1219,10 @@ mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON",
        ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
 mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
        ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
+mutate("mcp-row-meta-drops-server-info", "the row replaces a modern result's _meta instead of joining it", MCP_REPLY,
+       "        let meta = map.entry(\"_meta\").or_insert_with(|| json!({}));\n"
+       "        insert(meta, AUDIT_ROW_META, Value::from(row));\n",
+       "        map.insert(\"_meta\".to_owned(), json!({AUDIT_ROW_META: row}));\n")
 mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
        ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
 mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
@@ -1550,25 +1600,33 @@ mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a r
        "Answer::Error(message) => Reply::ToolError(message),",
        "Answer::Error(message) => Reply::Denied(message),")
 mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
-       "                return Reply::Denied(failure.sentence().to_owned());",
-       "                return Reply::ToolError(failure.sentence().to_owned());")
+       "                return (Reply::Denied(failure.sentence().to_owned()), None);",
+       "                return (Reply::ToolError(failure.sentence().to_owned()), None);")
 mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
-       "                return Reply::Denied(refusal.sentence().to_owned());",
-       "                return Reply::ToolError(refusal.sentence().to_owned());")
+       "                return (Reply::Denied(refusal.sentence().to_owned()), row);",
+       "                return (Reply::ToolError(refusal.sentence().to_owned()), row);")
 mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
-       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
-       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
+       "            return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);",
+       "            return (Reply::ToolError(IDENTITY_DISABLED.to_owned()), None);")
 mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
        "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
 mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
        "        if let Some(failure) = finished.failure() {\n",
        "        if let Some(failure) = finished.failure() {\n"
-       "            return Reply::Denied(failure.sentence().to_owned());\n")
+       "            return (Reply::Denied(failure.sentence().to_owned()), None);\n")
 mutate("gw-latency-not-measured", "every call is recorded as taking no time", GW_PATH,
        "let latency_ms = elapsed_millis(gates.clock().as_ref(), started);",
        "let latency_ms = 0;")
 mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
        "read_only: tool.classification == Classification::Read,", "read_only: true,")
+mutate("gw-row-not-in-meta", "a call that ran does not name its row in the answer", GW_PATH,
+       "        (reply, named)\n", "        let _ = named;\n        (reply, None)\n")
+mutate("gw-row-not-in-error-data", "a denial does not name its row in error.data", GW_PATH,
+       "                let row = self.quotable(refusal.row());\n",
+       "                let row: Option<AuditRowId> = None;\n")
+mutate("gw-disabled-row-leaked", "with audit disabled, the answer names a row nothing wrote", GW_PATH,
+       "        (self.inner.gates.audit_state() == GateState::On).then(|| row.clone())",
+       "        Some(row.clone())")
 
 
 # --- gateway server ------------------------------------------------------------------------
@@ -3052,6 +3110,100 @@ mutate("demo-migrate-gateway-reads-everything", "the demo grants the gateway rol
        'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader;',
        'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader, switchboard_gateway;')
 
+# --- Which tests can see a mutation ----------------------------------------------------------
+#
+# A mutation runs the tests of the packages that can see its edits: the package that holds each
+# edited file, every workspace package that depends on that one (as a normal, dev or build
+# dependency, and so on up), and the packages whose tests read the file itself. If those pass, the
+# mutation runs again against the whole workspace before it is called SURVIVED, so a gap in the
+# table below costs time, never a verdict.
+
+# Files read across a package boundary: a path prefix, and the packages whose tests read the files
+# under it. Every prefix that matches an edited path adds its packages. These readers read in their
+# tests, not in code another package links, so their dependents are not added.
+#
+# A path outside every crate that no prefix matches runs the whole workspace. That covers the root
+# Cargo.toml and Cargo.lock, which every build reads, and docs/, scripts/, .github/, README.md and
+# CONTRIBUTING.md, which no test reads today.
+#
+# Left out on purpose: gateway-testkit's no_private_key_is_checked_in reads every file under
+# crates/. A mutation that wrote private key armour would be caught only by the whole-workspace run.
+READERS: list[tuple[str, frozenset[str]]] = [
+    # demo-checks runs and reads the scripts and manifests under deploy/ (tests/common reads from
+    # the repository root) and holds .dockerignore to the Dockerfile.
+    ("deploy/", frozenset({"demo-checks"})),
+    (".dockerignore", frozenset({"demo-checks"})),
+    # gateway/tests/deployment.rs loads both demo deployments; gateway/tests/files includes the
+    # kind registry.
+    ("deploy/compose/config/", frozenset({"gateway"})),
+    ("deploy/kind/base/config/", frozenset({"gateway"})),
+    # gateway-testkit/tests/issuer.rs searches conformance/ for private keys.
+    ("conformance/", frozenset({"gateway-testkit"})),
+    # demo-checks/tests/manifests.rs compares the demo registries with the registry crate's own.
+    ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
+    # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.
+    ("crates/gateway-identity/Cargo.toml", frozenset({"mock-docs-server"})),
+]
+
+
+@dataclass(frozen=True)
+class Packages:
+    # Each workspace package's directory, relative to the workspace root and ending in "/".
+    directories: dict[str, str]
+    # For each package, the workspace packages that name it as a dependency of any kind.
+    dependents: dict[str, frozenset[str]]
+
+
+def read_packages(workspace: Path) -> Packages:
+    output = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=workspace, capture_output=True, text=True, check=True,
+    ).stdout
+    metadata = json.loads(output)
+    root = Path(metadata["workspace_root"])
+    directories = {
+        package["name"]: Path(package["manifest_path"]).parent.relative_to(root).as_posix() + "/"
+        for package in metadata["packages"]
+    }
+    dependents: dict[str, set[str]] = {name: set() for name in directories}
+    for package in metadata["packages"]:
+        for dependency in package["dependencies"]:
+            if dependency["name"] in directories:
+                dependents[dependency["name"]].add(package["name"])
+    return Packages(directories, {name: frozenset(names) for name, names in dependents.items()})
+
+
+def scope(mutation: Mutation, packages: Packages) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The packages whose tests can see the mutation's edits, in two parts: those that hold or
+    read an edited file, and the other packages that depend on one that holds one. None means
+    the whole workspace."""
+    owners: set[str] = set()
+    readers: set[str] = set()
+    for edit in mutation.edits:
+        owner = max((name for name, directory in packages.directories.items() if edit.path.startswith(directory)),
+                    key=lambda name: len(packages.directories[name]), default=None)
+        matched = [names for prefix, names in READERS if edit.path.startswith(prefix)]
+        if owner is None and not matched:
+            return None
+        if owner is not None:
+            owners.add(owner)
+        for names in matched:
+            readers |= names
+    near = owners | readers
+    seen, waiting = set(owners), list(owners)
+    while waiting:
+        for dependent in packages.dependents[waiting.pop()] - seen:
+            seen.add(dependent)
+            waiting.append(dependent)
+    return frozenset(near), frozenset(seen - near)
+
+
+def short(chosen: frozenset[str] | None) -> str:
+    if chosen is None:
+        return "workspace"
+    return ",".join(sorted(name.removeprefix("gateway-") for name in chosen))
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
@@ -3082,8 +3234,18 @@ def apply(mutation: Mutation, read) -> dict[str, str] | str:
     return contents
 
 
-def run_tests(workspace: Path, target: Path) -> tuple[int | None, str]:
-    command = ["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]
+def run_tests(workspace: Path, target: Path, chosen: frozenset[str] | None = None, *,
+              fail_fast: bool = False) -> tuple[int | None, str]:
+    """`cargo test` over the chosen packages, or the whole workspace when none are chosen."""
+    command = ["cargo", "test"]
+    if chosen is None:
+        command.append("--workspace")
+    else:
+        for name in sorted(chosen):
+            command += ["-p", name]
+    command.append("--locked")
+    if not fail_fast:
+        command.append("--no-fail-fast")
     environment = {**os.environ, "CARGO_TARGET_DIR": str(target), "CARGO_TERM_COLOR": "never"}
     try:
         result = subprocess.run(command, cwd=workspace, env=environment, capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
@@ -3110,12 +3272,64 @@ def verdict(mutation: Mutation, code: int | None, output: str) -> tuple[str, str
     return "NO-VERDICT", "; ".join(lines[:2]) or f"cargo exited {code}"
 
 
+def steps(mutation: Mutation, packages: Packages, all_catchers: bool) -> list[frozenset[str] | None]:
+    """The runs a mutation takes before any whole-workspace retry; None is the whole workspace.
+
+    The packages that hold or read an edited file run first: they build fastest and catch most.
+    Only if they pass do the rest of their dependents run. With --all-catchers both run at once
+    and to the end."""
+    plan = scope(mutation, packages)
+    if plan is None:
+        chosen: list[frozenset[str] | None] = [None]
+    elif all_catchers:
+        chosen = [plan[0] | plan[1]]
+    else:
+        chosen = [plan[0]] + ([plan[1]] if plan[1] else [])
+    return [None if step is not None and step >= packages.directories.keys() else step for step in chosen]
+
+
+def judge(mutation: Mutation, workspace: Path, target: Path, planned: list[frozenset[str] | None],
+          usable: Callable[[frozenset[str]], bool], all_catchers: bool) -> tuple[str, str, str]:
+    """The verdict on the mutation as it stands in the workspace, its detail, and what ran.
+    A set of packages that is not usable is replaced by the whole workspace."""
+    ran = []
+    for chosen in planned:
+        if chosen is not None and not usable(chosen):
+            chosen = None
+        code, output = run_tests(workspace, target, chosen, fail_fast=not all_catchers)
+        status, detail = verdict(mutation, code, output)
+        ran.append(short(chosen))
+        if status != "SURVIVED" or chosen is None:
+            break
+    # A pass over the whole workspace has already run every test; fail-fast changes nothing when
+    # nothing fails. Anything else that is not CAUGHT is run again exactly as it always was.
+    whole = chosen is None and (status == "SURVIVED" or all_catchers)
+    if status in ("SURVIVED", "NO-VERDICT") and not whole:
+        code, output = run_tests(workspace, target)
+        status, detail = verdict(mutation, code, output)
+        ran.append("workspace")
+    if status == "SURVIVED":
+        detail = "every test in the workspace passed"
+    return status, detail, " then ".join(ran)
+
+
+def shard(text: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)/(\d+)", text)
+    if match is None or not int(match.group(1)) < int(match.group(2)):
+        raise argparse.ArgumentTypeError("expected I/N with 0 <= I < N, such as 0/4")
+    return int(match.group(1)), int(match.group(2))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("only", nargs="*", help="run only these mutation ids")
     parser.add_argument("--list", action="store_true", help="list the mutations and exit")
     parser.add_argument("--targets", action="store_true", help="check every target matches exactly once, without cargo")
     parser.add_argument("--keep", action="store_true", help="keep the temporary workspace")
+    parser.add_argument("--all-catchers", action="store_true",
+                        help="run every test of the chosen packages, not only up to the first failing test binary")
+    parser.add_argument("--shard", type=shard, metavar="I/N",
+                        help="run every N-th selected mutation, starting at the I-th (0-based)")
     arguments = parser.parse_args()
 
     sentence_mutations((ROOT / SRC / "sentences.rs").read_text())
@@ -3125,6 +3339,9 @@ def main() -> int:
     if unknown := [id for id in arguments.only if id not in known]:
         sys.exit(f"no such mutation: {', '.join(unknown)}")
     selected = [mutation for mutation in MUTATIONS if not arguments.only or mutation.id in arguments.only]
+    if arguments.shard:
+        first, every = arguments.shard
+        selected = selected[first::every]
 
     if arguments.list:
         for mutation in selected:
@@ -3141,45 +3358,82 @@ def main() -> int:
         print(f"{len(selected)} mutations: {len(selected) - bad} targets match, {bad} do not")
         return 1 if bad else 0
 
+    if DATABASE_VARIABLE not in os.environ:
+        print(f"warning: {DATABASE_VARIABLE} is not set, so the Postgres tests skip and the mutations "
+              "only they catch are left to the whole-workspace run, where they survive", flush=True)
     scratch = Path(tempfile.mkdtemp(prefix="mutation-check-"))
     workspace, target = scratch / "workspace", scratch / "target"
     copy_workspace(workspace)
     print(f"workspace copy: {workspace}", flush=True)
     try:
+        packages = read_packages(workspace)
         started = time.monotonic()
         code, output = run_tests(workspace, target)
         if code != 0:
             print(output[-4000:])
             print("the unmutated workspace does not pass its tests; nothing to measure against")
             return 2
-        print(f"baseline passes ({time.monotonic() - started:.0f}s); {len(selected)} mutations to run", flush=True)
+        part = f"shard {arguments.shard[0]}/{arguments.shard[1]}: " if arguments.shard else ""
+        print(f"baseline passes ({time.monotonic() - started:.0f}s); {part}{len(selected)} mutations to run", flush=True)
 
         pristine = {path: (workspace / path).read_text() for path in {edit.path for m in selected for edit in m.edits} | {REGRESSIONS}
                     if (workspace / path).exists()}
         counts = {"CAUGHT": 0, "SURVIVED": 0, "ERROR": 0, "NO-VERDICT": 0}
+        def restore() -> None:
+            # Written afresh, so every restored file is newer than the mutant's build and cargo
+            # cannot reuse it; the regression file is restored so that one mutation's saved
+            # cases do not change the next one's run.
+            for path, text in pristine.items():
+                (workspace / path).write_text(text)
+            shutil.rmtree(workspace / CRATE / "wip", ignore_errors=True)
+
+        # Each set of packages a mutation runs is first run once unmutated, when it is first
+        # needed. The baseline only shows that the whole workspace passes; tests run for a few
+        # packages build their dependencies with fewer features, and must pass that way too
+        # before a failure there is blamed on a mutation. A set that fails is not used.
+        checked: dict[frozenset[str], bool] = {}
+
+        def usable(chosen: frozenset[str], applied: dict[str, str] | None) -> bool:
+            if chosen not in checked:
+                if applied:
+                    restore()
+                began = time.monotonic()
+                code, output = run_tests(workspace, target, chosen, fail_fast=True)
+                checked[chosen] = code == 0
+                if not checked[chosen]:
+                    print(output[-4000:])
+                result = "passes" if checked[chosen] else "FAILS unmutated, so it runs the whole workspace instead"
+                print(f"baseline for [{short(chosen)}] {result} ({time.monotonic() - began:.0f}s)", flush=True)
+                if applied:
+                    for path, text in applied.items():
+                        (workspace / path).write_text(text)
+            return checked[chosen]
+
+        started = time.monotonic()
         for mutation in selected:
             applied = apply(mutation, lambda path: pristine[path])
             if isinstance(applied, str):
-                status, detail = "ERROR", applied
+                began = time.monotonic()
+                status, detail, ran = "ERROR", applied, "nothing"
             else:
+                planned = steps(mutation, packages, arguments.all_catchers)
+                if planned[0] is not None:
+                    usable(planned[0], None)
+                began = time.monotonic()
                 try:
                     for path, text in applied.items():
                         (workspace / path).write_text(text)
-                    code, output = run_tests(workspace, target)
-                    status, detail = verdict(mutation, code, output)
+                    status, detail, ran = judge(mutation, workspace, target, planned,
+                                                lambda chosen: usable(chosen, applied), arguments.all_catchers)
                 finally:
-                    # Written afresh, so every restored file is newer than the mutant's build
-                    # and cargo cannot reuse it; the regression file is restored so that one
-                    # mutation's saved cases do not change the next one's run.
-                    for path, text in pristine.items():
-                        (workspace / path).write_text(text)
-                    shutil.rmtree(workspace / CRATE / "wip", ignore_errors=True)
+                    restore()
             counts[status] += 1
-            print(f"{status:<10} {mutation.id:<48} {detail}", flush=True)
+            print(f"{status:<10} {mutation.id:<48} {time.monotonic() - began:>5.0f}s  [{ran}]  {detail}", flush=True)
 
         print(
             f"{len(selected)} mutations: {counts['CAUGHT']} caught, {counts['SURVIVED']} survived, "
-            f"{counts['ERROR']} errors, {counts['NO-VERDICT']} without a verdict"
+            f"{counts['ERROR']} errors, {counts['NO-VERDICT']} without a verdict "
+            f"({time.monotonic() - started:.0f}s)"
         )
         return 0 if counts["CAUGHT"] == len(selected) else 1
     finally:

@@ -1,0 +1,17 @@
+{
+  "body": {
+    "error": {
+      "code": -32001,
+      "data": {
+        "auditRow": "01920000-0000-7000-8000-000000000000"
+      },
+      "message": "Dummy denial sentence."
+    },
+    "id": "call-7",
+    "jsonrpc": "2.0"
+  },
+  "headers": {
+    "content-type": "application/json"
+  },
+  "status": 200
+}
