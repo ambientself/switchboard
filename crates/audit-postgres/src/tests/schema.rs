@@ -1057,6 +1057,14 @@ async fn a_row_the_core_could_not_make_is_refused() {
         let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
         assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
     }
+    // Since 0004, decision_shape refuses a decision that is neither too. The column's own check
+    // still refuses it first: a table's checks run in order of name, and its name comes first.
+    let error = owner
+        .query_one(&insert(&[("decision", "'maybe'")]), &[])
+        .await
+        .unwrap_err();
+    let refused = message(&error);
+    assert!(refused.contains("call_rows_decision_check"), "{refused}");
     // A call has its tool, decision and resources, and lists no tools.
     for (case, changes) in [
         ("no tool", with(&[("tool", "")])),

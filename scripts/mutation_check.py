@@ -1720,8 +1720,10 @@ mutate("dev-clock-option-ignored", "the gateway verifies on the system clock wha
        "    let mut wiring = Wiring::new(Arc::new(SystemClock)).instance(instance).connector(")
 mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
        "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
-mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into a row id, so the call runs with no row", DEV_PRINTER,
-       "            begun\n        })", '            begun.or_else(|_| Ok(AuditRowId::new("printed")))\n        })')
+mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into success, so the call runs with no row", DEV_PRINTER,
+       "            begun\n        })", "            begun.or_else(|_| Ok(()))\n        })")
+mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so the listing is answered with no row", DEV_PRINTER,
+       "            listed\n        })", "            listed.or_else(|_| Ok(()))\n        })")
 mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
        "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
 mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
@@ -2234,6 +2236,8 @@ mutate("pg-check-completion-latency", "an outcome may lack its latency", PG_SQL,
        "        (outcome IS NULL) = (latency_ms IS NULL)\n", "        true\n")
 mutate("pg-check-completion-time", "an outcome may lack its time", PG_SQL,
        "        AND (outcome IS NULL) = (finished_at IS NULL)\n", "")
+# Since 0004, decision_shape refuses a decision that is neither too, so pg-check-decision-any is
+# caught only because the test names the column's own check.
 for column, values in [
     ("classification", "'read', 'propose', 'write', 'destructive'"),
     ("decision", "'allow', 'deny'"),
