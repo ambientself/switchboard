@@ -51,7 +51,9 @@ fn once_runs_the_script_in_both_eras_and_prints_answers_and_rows() {
         .collect();
     assert_eq!(
         events,
-        ["begun", "finished", "begun", "begun", "finished", "begun"],
+        [
+            "listed", "begun", "finished", "begun", "listed", "begun", "finished", "begun"
+        ],
         "{stdout}"
     );
 

@@ -265,6 +265,26 @@ a verified token to a principal, which is identified by issuer and subject toget
 keys fetched only from the issuer's own host, expiry and not-before checked with leeway,
 audience membership required, and a ceiling on token lifetime.
 
+**Keys can change without a restart.** Each issuer's keys come from one of two places the
+deployment names. A keys file is read once, at boot. A keys URL, on the issuer's own origin
+(the same scheme, host and port), is fetched at boot and again on a timer: every 300 seconds
+unless the deployment says otherwise, and never more often than every 30. Each fetch is one
+bounded request that follows no redirect. A first fetch that fails refuses to start. The URL is
+configured, never discovered: nothing a token carries (`iss`, `jku`, `x5u`, an embedded `jwk`,
+or `kid`) causes a fetch, and a token naming an unknown `kid` is refused until a scheduled
+refresh brings its key.
+
+Each refresh goes through the identity gate's replacement of one configured issuer's keys: it
+builds a whole new verifier with the new set, which gets every check a set gets at boot, and
+puts it in force only if that succeeds. A refused set, or a fetch that fails, leaves the keys in
+use. The refresher names the issuer; nothing in a token chooses whose keys are replaced, and
+keys for an issuer that is not configured are refused. There is no maximum age: keys that
+cannot be refreshed stay in force until a refresh succeeds. A bound on how old they may get
+before tokens are refused is a freshness bound, and Q11 owns it.
+
+This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
+is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
+
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
 was refused". "We were not checking" is a row with identity `disabled`. For identity, "someone
@@ -1069,7 +1089,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   (decision 0012). Today neither the verifier nor the principal has it.
 - Already built: the claimed issuer and subject are available beside a verification error,
   escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
-  itself still carries nothing from the token. The event does not record them yet (#26).
+  itself still carries nothing from the token. The `identity_failed` event records them (#26).
 - With #10 and #26: a principal state for identity checking turned off, which a row can record
   as `disabled`.
 
@@ -1098,7 +1118,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   currency answer. With #12, a column for the exception that allowed a call, since the row's
   shape constraint rightly allows no reason on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
-  the core and the stores, and wired into `tools/list` by #40. The core's `listed` writes a
+  the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
   escaped and capped, with the rest counted, and only then gives out the list as a `Listed`.
   Every store has `list`, idempotent by identifier. Migration 0004 adds `listed_tools` and
@@ -1116,8 +1136,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
-  giving up a guard without running completes its row as `error`. Today a guard can only be
-  consumed by running it, and a row whose insert commits after its begin failed stays open.
+  giving up a guard without running completes its row as `error`. The second half is built in
+  the core: `audit::give_up` consumes a guard, calls no connector, and completes its row as
+  `error` with a latency of zero. The gateway does not call it yet: that is #40. Today a row
+  whose insert commits after its begin failed stays open.
 - In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties
@@ -1157,19 +1179,39 @@ off only in a development build, with CI's check of the release artifact; and th
 
 **#26, the HTTP path.**
 
-- A row of kind `list` before answering `tools/list`.
+- A row of kind `list` before answering `tools/list`: built (#40). The path writes the row
+  through the core's `listed` and answers with the tools the `Listed` it returns holds, so
+  nothing is listed without its row. A store that cannot write the row refuses the list with
+  the audit sentence and lists nothing. With identity disabled nothing is listed and no row is
+  written.
 - Telemetry events that carry the surface and the source address, counters, and a bounded
   queue, with events for `initialize`, `ping`, `server/discover` and bodies that cannot be
-  parsed. Today an identity failure is logged with the deployment and the cause only.
+  parsed: built (#40). Each event names the deployment, the surface from the URL (escaped and
+  capped) and the connection's remote address. An identity failure adds the cause and the
+  claimed issuer and subject; a refused body adds the protocol rejection's kind, for every
+  protocol rejection, not only bodies that are not JSON. Emitting never waits: a full queue
+  drops the event and counts the drop. At shutdown, once every answer has finished, the queue
+  is closed and what is in it is written. The counters are not exported yet.
 - The telemetry event for each finish given up, made from the audit store's report of it,
   naming the row and the outcome's kind, with a different second completion logged and counted
   apart from a finish that ran out of time (decision 0009). Today the Postgres store reports
   each one through `on_given_up`, and the gateway logs each report as `audit_row_given_up` at
   `ERROR`, with the row, the outcome's kind and the cause. A different second completion is
   told apart only by its cause, and is not counted apart.
-- On a disconnect, the connector is not called if it has not been, and a read is cancelled.
-  Today the spawned task always runs to completion.
-- The row's identifier in the result's `_meta`, or in `error.data`.
+- On a disconnect, the connector is not called if it has not been, and a read is cancelled:
+  built (#40). The handler holds a signal that fires when it is dropped, which is what a
+  client going away does, and the answer task is given it. A call whose client has gone once
+  its row is begun is given up through the core's `give_up`: the connector is not called and
+  the row is completed as `error`. A read is run through the core's `run_unless`, which drops
+  the connector's future if the signal fires first and records the read as `error`. Any other
+  classification ignores the signal and runs to completion. Closing a connection at the end
+  of the shutdown grace is a disconnect too. `notifications/cancelled` is still accepted and
+  ignored.
+- The row's identifier in the result's `_meta`, or in `error.data`: built for `tools/call`
+  (#40). A result names it under `switchboard/auditRow` in `_meta`, in both eras, beside the
+  server's name under 2026-07-28; a denial or an internal error names it as `auditRow` in
+  `error.data`. A refusal because begin failed names none, and with audit disabled nothing is
+  named. A `tools/list` result names its list row the same way, in `_meta`.
 - The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
   harness enables and CI's check of the release artifact: built (#40). Both boot paths and
   every registry reload refuse a snapshot serving a tool not classified `read`, since no
@@ -1177,16 +1219,22 @@ off only in a development build, with CI's check of the release artifact; and th
   crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
   and CI builds it with the same command and checks it refuses a `propose` tool. The receipt
   store, audit and identity condition arrives with receipts (#10).
-- An allowed call whose connector is not registered completes its row as `error`, where today
-  the row stays open.
+- An allowed call whose connector is not registered completes its row as `error`: built
+  (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
+  in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
+  reaches it.
 - The key read from its carriers, the tool-use identifier and the named `_meta` field.
 - With identity disabled, reads served with rows whose identity is `disabled` (with #9 and
   #10). Until then the path refuses every `tools/call` and lists nothing, with no row, which
   is stricter.
 - Already built and matching: identity failures write no row and keep the opaque sentence
-  during an audit outage; begin, run and finish run on a spawned task the client cannot
-  cancel; shutdown waits for running answers; and `GET /readyz` fails first on shutdown, while
-  the gateway serves on for its readiness removal before it stops accepting calls (#40).
+  during an audit outage; begin, run and finish still run on a spawned task the client cannot
+  cancel, though a read is now cancelled through the disconnect signal; shutdown waits for
+  running answers; and `GET /readyz` fails first on shutdown, while the gateway serves on for
+  its readiness removal before it stops accepting calls (#40). Once it stops taking
+  connections no answer starts: a request whose body arrives during the shutdown grace is
+  answered 503 and nothing runs, so the grace period the deployments give covers the removal
+  plus one call (#40).
 
 ## 18. Testing
 

@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
 """Break each guard in the gateway crates, one at a time, and require the tests to notice.
 
-    python3 scripts/mutation_check.py              # every mutation
-    python3 scripts/mutation_check.py --list       # what would run
-    python3 scripts/mutation_check.py --targets    # check every target still matches, no cargo
-    python3 scripts/mutation_check.py ID [ID ...]  # only these
+    python3 scripts/mutation_check.py                   # every mutation
+    python3 scripts/mutation_check.py --list            # what would run
+    python3 scripts/mutation_check.py --targets         # check every target still matches, no cargo
+    python3 scripts/mutation_check.py ID [ID ...]       # only these
+    python3 scripts/mutation_check.py --shard 0/4       # every fourth mutation, from the first
+    python3 scripts/mutation_check.py --all-catchers ID # name every test that catches it
 
-Each mutation is one or more exact text replacements in the crate's source. The script copies
-the workspace into a temporary directory, checks that the unmutated copy passes, and then for
-each mutation applies it to the copy, runs `cargo test --workspace --locked --no-fail-fast`,
-and restores the copy. The working tree is never written to.
+Each mutation is one or more exact text replacements in the workspace's files. The script copies
+the workspace into a temporary directory and checks that the unmutated copy passes
+`cargo test --workspace --locked`, which also builds everything once. Then for each mutation it
+applies the edits to the copy, runs the tests that can see them, and restores the copy. The
+working tree is never written to.
+
+The tests that can see a mutation are those of the packages that hold its edited files, of every
+workspace package that depends on those (normal, dev or build dependencies, all the way up), and
+of the packages that read the edited files from their tests (the READERS table below). A file
+outside every crate that the table does not name runs the whole workspace. They run in two steps:
+first the packages that hold or read an edited file, which build fastest and catch most; then,
+only if those pass, the dependents. Each step stops at the first test binary that fails.
+--all-catchers runs both steps at once and to the end, to name every test that fails. The first
+time a set of packages is needed, it is run once unmutated ("baseline for [...]"): built on their
+own, packages get their dependencies with fewer features, and a set that fails that way is not
+used: the end of its output is printed, and its mutations run the whole workspace instead.
+
+The first step builds only its own packages. So a mutation that compiles there but breaks the
+build of a package that depends on them is judged by the first step's tests: it is CAUGHT if one
+of them fails, though the whole workspace would not build. That is a stale mutation, such as one
+that changes a trait in the core but not a crate that implements it. --all-catchers builds the
+dependents too and reports such a mutation as NO-VERDICT; run with it to find them.
+
+A scoped run that passes is not trusted on its own: the mutation runs again with the full
+`cargo test --workspace --locked --no-fail-fast`, and only if that passes too is it SURVIVED. A
+scoped run with no verdict is retried the same way. So a gap in the table costs time, never a
+verdict. Each line names the packages that ran ("then workspace" after a retry) and the seconds.
+
+--shard I/N runs every N-th selected mutation starting at the I-th (0-based), after any IDs, so
+N processes can split a full run. Each process copies and builds its own workspace; give each its
+own Postgres too (see CONTRIBUTING.md).
 
 Verdicts, one line per mutation:
 
     CAUGHT      a test failed (the line names which), or, for a mutation marked as meaning to
                 break the build, the library itself did not compile
-    SURVIVED    every test passed: nothing watches this guard
+    SURVIVED    every test in the workspace passed: nothing watches this guard
     ERROR       the mutation's target text did not match exactly once, so the mutation is
                 stale and was not run; it is never counted as caught
-    NO-VERDICT  cargo failed without a test failing (a test target did not compile, a timeout):
-                nothing was learned
+    NO-VERDICT  cargo failed without a test failing (a test target did not compile, a timeout),
+                in the whole workspace too: nothing was learned
 
-The exit status is zero only if every mutation was caught. CI does not run this: it is one
-full test run per mutation. Run it after changing a guard or the tests that watch one, and add
-a mutation for every guard you add.
+The exit status is zero only if every mutation was caught. CI does not run this. Run it after
+changing a guard or the tests that watch one, and add a mutation for every guard you add.
 
 Needs Python 3.12 or later and nothing outside the standard library.
 """
@@ -31,6 +59,7 @@ Needs Python 3.12 or later and nothing outside the standard library.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -40,6 +69,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 if sys.version_info < (3, 12):
     sys.exit("mutation_check.py needs Python 3.12 or later")
@@ -53,6 +83,8 @@ TESTKIT = "crates/gateway-testkit/"
 TESTKIT_SRC = TESTKIT + "src/"
 REGRESSIONS = CRATE + "tests/properties.proptest-regressions"
 TIMEOUT_SECONDS = 1200
+# The tests that need Postgres skip, and pass, when this is not set (see CONTRIBUTING.md).
+DATABASE_VARIABLE = "SWITCHBOARD_TEST_DATABASE_URL"
 
 
 @dataclass(frozen=True)
@@ -558,7 +590,8 @@ mutate("tool-call-constructor-public", "a connector can be called around the aud
 mutate("connector-run-without-call", "a connector runs without being handed the call", SRC + "connector.rs",
        "    fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;", "    fn run(&self) -> BoxFuture<'_, ToolOutcome>;", breaks_build=True)
 mutate("run-drops-arguments", "the connector is not given the call's arguments", SRC + "audit.rs",
-       "connector.run(ToolCall::new(call, tool, arguments))", "connector.run(ToolCall::new(call, tool, serde_json::Value::Null))")
+       "    let outcome = connector.run(ToolCall::new(call, tool, arguments)).await;",
+       "    let outcome = connector.run(ToolCall::new(call, tool, serde_json::Value::Null)).await;")
 mutate(
     "guard-for-denied-tool",
     "begin hands out a guard for a denial whose tool the surface serves",
@@ -678,7 +711,8 @@ mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "au
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: recorded,\n            latency_ms: { let _ = latency_ms; 0 },")
 mutate("finish-wrong-row", "finish completes row 0 whatever ran", SRC + "audit.rs",
-       "    let completion = RowCompletion {\n        row,", '    let completion = RowCompletion {\n        row: { let _ = row; AuditRowId::new("0") },')
+       "    let completion = RowCompletion {\n        row,\n        completion: Completion {\n            outcome: recorded,",
+       '    let completion = RowCompletion {\n        row: { let _ = row; AuditRowId::new("0") },\n        completion: Completion {\n            outcome: recorded,')
 mutate("finish-error-swallowed", "a store error on finish is not reported", SRC + "audit.rs",
        "            failure: Some(AuditFailure::from_store(error)),", "            failure: { let _ = error; None },")
 mutate("finish-refusal-unrecorded-answered", "a refusal that could not be recorded is still answered with its sentence", SRC + "audit.rs",
@@ -686,6 +720,28 @@ mutate("finish-refusal-unrecorded-answered", "a refusal that could not be record
        "")
 mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not the one recorded", SRC + "audit.rs",
        "            Answer::Refused(sentence),", "            Answer::Refused(sentence.to_uppercase()),")
+# A guard given up (decision 0009): its row is completed as error, never ok, through the store.
+mutate("core-give-up-completes-ok", "a guard given up records its call as ok", SRC + "audit.rs",
+       "            outcome: Outcome::Error,\n            latency_ms: 0,", "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+mutate("core-give-up-skips-finish", "a guard given up leaves its row open and reports no failure", SRC + "audit.rs",
+       "    let failure = store\n        .finish(&completion)\n        .await\n        .err()\n        .map(AuditFailure::from_store);",
+       "    let failure: Option<AuditFailure> = None;")
+# A caller that goes away (decision 0009, "Where a call runs"): a read is cancelled, a side effect
+# is not.
+mutate("core-side-effect-cancelled", "a side effect is cancelled when its caller goes, like a read", SRC + "audit.rs",
+       "    if guard.tool.classification != Classification::Read {\n        return run(connector, guard).await;\n    }\n",
+       "")
+mutate("core-run-unless-drops-arguments", "a read run through run_unless is not given the call's arguments", SRC + "audit.rs",
+       "    let mut running = connector.run(ToolCall::new(call, tool, arguments));",
+       "    let mut running = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));")
+mutate("core-read-not-cancelled-mid-run", "a read whose caller goes while it runs is not cancelled", SRC + "audit.rs",
+       "        gone.as_mut().poll(context).map(|()| cancelled())\n",
+       "        Poll::Pending\n")
+mutate("core-read-gone-already-called", "a read whose caller has already gone is called all the same", SRC + "audit.rs",
+       "    if already_gone {\n", "    if false && already_gone {\n")
+mutate("core-read-cancel-outcome-ok", "a cancelled read is recorded as ok", SRC + "audit.rs",
+       "    let cancelled = || ToolOutcome::Error(sentences::CALLER_DISCONNECTED.to_owned());",
+       "    let cancelled = || ToolOutcome::Ok(serde_json::Value::Null);")
 # A list row (decision 0009): the tools it names, its count, and the value only it can make.
 mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
        "            .take(MAX_RECORDED_TOOLS)\n", "")
@@ -697,6 +753,27 @@ mutate("core-list-fields-public", "a Listed can be made without its row", SRC + 
 mutate("core-list-failure-swallowed", "a list whose row could not be written is answered", SRC + "audit.rs",
        "    store\n        .list(&row, &record)\n        .await\n        .map_err(AuditFailure::from_store)?;",
        "    let _ = store.list(&row, &record).await;")
+mutate("core-list-answer-cut", "a Listed holds only the tools its row names", SRC + "audit.rs",
+       "        tools: tools.into_iter().cloned().collect(),",
+       "        tools: tools.into_iter().take(MAX_RECORDED_TOOLS).cloned().collect(),")
+mutate("core-list-surface-unescaped", "a list row records the caller's surface as given", SRC + "audit.rs",
+       "        surface: SurfaceName::new(sentences::escape(\n            caller.surface.as_str(),\n"
+       "            sentences::MAX_RENDERED,\n        )),\n",
+       "        surface: caller.surface.clone(),\n")
+mutate("core-list-instance-uncapped", "a list row records the instance uncapped", SRC + "audit.rs",
+       "    let record = ListRecord {\n        instance: InstanceName::new(sentences::escape(\n"
+       "            instance.as_str(),\n            sentences::MAX_RENDERED,\n        )),\n",
+       "    let record = ListRecord {\n        instance,\n")
+mutate("core-list-delegation-team-dropped", "a list row leaves out the delegation's proved team", SRC + "audit.rs",
+       "        proved_delegation_team: caller\n            .delegation\n            .as_ref()\n"
+       "            .map(|delegation| delegation.team().into()),\n",
+       "        proved_delegation_team: None,\n")
+mutate("core-list-acting-person-dropped", "a list row leaves out the delegation's acting person", SRC + "audit.rs",
+       "            .map(|delegation| delegation.acting_person()),\n        claimed_team,\n",
+       "            .map(|delegation| delegation.acting_person()).filter(|_| false),\n        claimed_team,\n")
+mutate("core-list-claimed-team-dropped", "a list row leaves out the team the caller claimed", SRC + "audit.rs",
+       "        claimed_team,\n        tools: tools\n",
+       "        claimed_team: None,\n        tools: tools\n")
 
 # --- Sentences -----------------------------------------------------------------------------
 
@@ -758,10 +835,17 @@ mutate_all(
     (TESTKIT_SRC + "credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
     (TESTKIT_SRC + "credentials.rs", "        let principal = caller.get();\n", "        let principal = caller;\n"),
     (TESTKIT_SRC + "connector.rs", "self.credentials.credential_for(&connector, &caller).await", "self.credentials.credential_for(&connector, caller.get()).await"),
-    # The one test helper that calls the source directly is changed to match, so that what is
-    # left to fail is the compile-fail case for a plain principal, which compiles under this
-    # mutation: that is the guard under test.
+    # Connector-proxy's file source implements the trait too, and is changed the same way.
+    ("crates/connector-proxy/src/credentials.rs", "        _caller: &Proved<Principal>,\n", "        _caller: &Principal,\n"),
+    ("crates/connector-proxy/src/credentials.rs", "        caller: &'a Proved<Principal>,\n", "        caller: &'a Principal,\n"),
+    ("crates/connector-proxy/src/connector.rs", ".issue(&self.connector, &call.call().caller.principal)", ".issue(&self.connector, call.call().caller.principal.get())"),
+    # The tests that call a source directly are changed to match, so that the whole workspace
+    # still builds and what is left to fail is the compile-fail case for a plain principal,
+    # which compiles under this mutation: that is the guard under test.
     (TESTKIT + "tests/fakes.rs", '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller))', '    block_on(source.credential_for(&ConnectorName::from("fixture"), caller.get()))'),
+    ("crates/connector-proxy/tests/credentials.rs", "credentials.credential_for(&ConnectorName::new(DOCS), &caller)", "credentials.credential_for(&ConnectorName::new(DOCS), caller.get())"),
+    ("crates/connector-proxy/tests/credentials.rs", 'credentials.credential_for(&ConnectorName::new("other"), &caller)', 'credentials.credential_for(&ConnectorName::new("other"), caller.get())'),
+    ("crates/connector-proxy/tests/credentials.rs", "credentials.credential_for(&ConnectorName::new(CONNECTOR), &caller)", "credentials.credential_for(&ConnectorName::new(CONNECTOR), caller.get())"),
 )
 
 # --- The identity verifier: the order and each check ---------------------------------------
@@ -964,6 +1048,21 @@ mutate("identity-config-leeway-whole-seconds", "a leeway is compared in whole se
        "        if config.leeway.as_secs() > MAX_LEEWAY.as_secs() {")
 mutate("identity-config-second-user-issuer-allowed", "two user issuers can be configured", V,
        "                return Err(ConfigError::SecondUserIssuer { first, second });", "                let _ = (first, second);")
+# Replacing an issuer's keys while the gate runs: the new set goes through the boot checks by
+# rebuilding the whole verifier, and is stored only if that succeeds.
+REPLACE_SWAP = ("        *self\n            .verifier\n            .write()\n"
+                "            .unwrap_or_else(PoisonError::into_inner) = Arc::new(verifier);\n")
+REPLACE_BUILD = "        let verifier = TokenVerifier::new(next.clone(), Arc::clone(&self.clock))?;\n"
+mutate("identity-replace-keys-ignored", "a replacement reports success and leaves the old keys in force", IDENTITY_SRC + "identity.rs",
+       REPLACE_SWAP, "        drop(verifier);\n")
+mutate("identity-replace-keys-swaps-before-check", "a refused set is stored as the configuration later replacements build on", IDENTITY_SRC + "identity.rs",
+       REPLACE_BUILD, "        *issuers = next.clone();\n" + REPLACE_BUILD)
+mutate("identity-replace-keys-any-issuer", "keys for an issuer that is not configured replace the first issuer's", IDENTITY_SRC + "identity.rs",
+       "            .ok_or_else(|| ConfigError::UnknownIssuerForKeys(issuer.clone()))?;", "            .unwrap_or(0);")
+mutate("identity-replace-keys-drops-other-issuers", "a replacement rebuilds the verifier with only the replaced issuer", IDENTITY_SRC + "identity.rs",
+       REPLACE_BUILD, "        let verifier = TokenVerifier::new(vec![next[index].clone()], Arc::clone(&self.clock))?;\n")
+mutate("identity-replace-keys-while-disabled", "keys supplied to a disabled gate are accepted", IDENTITY_SRC + "identity.rs",
+       "            return Err(ConfigError::KeysWhileDisabled(issuer.clone()));", "            return Ok(KeysReplaced::default());")
 
 # --- The identity gate and the opaque failure ----------------------------------------------
 
@@ -972,7 +1071,7 @@ mutate("identity-missing-token-is-disabled", "no token reads as checking being o
 mutate("identity-failure-is-disabled", "a refused token reads as checking being off", IDENTITY_SRC + "identity.rs",
        "            Err(failure) => Verification::Failed(failure),", "            Err(_) => Verification::Disabled,")
 mutate("identity-enforcing-is-disabled", "configured checking is not applied", IDENTITY_SRC + "identity.rs",
-       "            IdentityConfig::Enforce(issuers) => Some(TokenVerifier::new(issuers, clock)?),", "            IdentityConfig::Enforce(issuers) => TokenVerifier::new(issuers, clock).ok().filter(|_| false),")
+       "            IdentityConfig::Enforce(issuers) => Some(Enforcing::new(issuers, clock)?),", "            IdentityConfig::Enforce(issuers) => Enforcing::new(issuers, clock).ok().filter(|_| false),")
 mutate("identity-failure-display-names-the-cause", "the failure displays as its cause", IDENTITY_SRC + "error.rs",
        "        f.write_str(IDENTITY_FAILURE)\n    }\n}\n\nimpl std::error::Error",
        "        write!(f, \"{}\", self.detail)\n    }\n}\n\nimpl std::error::Error")
@@ -1173,6 +1272,10 @@ mutate("mcp-accept-quality-zero-admits", "an Accept range with q=0 admits JSON",
        ".is_some_and(|(_, quality)| quality > 0.0)", ".is_some_and(|(_, quality)| quality >= 0.0)")
 mutate("mcp-accept-specificity-ignored", "a broader Accept range outvotes application/json;q=0", MCP + "headers.rs",
        ".max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))", ".max_by(|a, b| a.1.total_cmp(&b.1))")
+mutate("mcp-row-meta-drops-server-info", "the row replaces a modern result's _meta instead of joining it", MCP_REPLY,
+       "        let meta = map.entry(\"_meta\").or_insert_with(|| json!({}));\n"
+       "        insert(meta, AUDIT_ROW_META, Value::from(row));\n",
+       "        map.insert(\"_meta\".to_owned(), json!({AUDIT_ROW_META: row}));\n")
 mutate("mcp-accept-least-specific-wins", "the least specific Accept range decides", MCP + "headers.rs",
        ".max_by(|a, b| a.0.cmp(&b.0).then(", ".max_by(|a, b| a.0.cmp(&b.0).reverse().then(")
 mutate("mcp-allow-header-dropped", "a 405 does not say POST is allowed", MCP_REJECTION,
@@ -1475,23 +1578,77 @@ mutate("gw-instance-unset-starts", "with nothing naming the instance, switchboar
        "        .ok_or(StartError::NoInstance)", '        .or(Some(InstanceName::new("unnamed")))\n        .ok_or(StartError::NoInstance)')
 
 
+# Telemetry. emit counts every event, then queues it without waiting; a full or closed queue
+# drops it and counts the drop. A surface is escaped and capped when it is made.
+TELEMETRY = GW + "telemetry.rs"
+mutate("telemetry-drop-not-counted", "an event the queue had no room for is dropped without being counted", TELEMETRY,
+       "        if self.sender.try_send(event).is_err() {\n            self.counters.dropped.fetch_add(1, Ordering::Relaxed);\n        }\n",
+       "        let _ = self.sender.try_send(event);\n")
+mutate("telemetry-counter-skipped", "emit queues an event without counting it", TELEMETRY,
+       "        counter.fetch_add(1, Ordering::Relaxed);\n", "        let _ = counter;\n")
+mutate("telemetry-surface-unescaped", "a surface is kept as it arrived in the URL", TELEMETRY,
+       "        Self(escape(raw, MAX_SURFACE))", "        Self(raw.to_owned())")
+mutate("telemetry-emit-awaits", "emit blocks until the queue has room", TELEMETRY,
+       "        if self.sender.try_send(event).is_err() {", "        if self.sender.blocking_send(event).is_err() {")
+mutate("telemetry-identity-failed-info", "a refused identity is logged at info, below RUST_LOG=warn", TELEMETRY,
+       '        } => tracing::warn!(\n            event = "identity_failed",',
+       '        } => tracing::info!(\n            event = "identity_failed",')
+
+# Issuer keys. An issuer takes a keys file or a keys URL, never both. A keys URL is fetched at
+# boot, and a failed first fetch refuses to start; then it is fetched on a timer, and a failed
+# refresh keeps the keys in use. The stale key below is a P-256 public key nothing signs with.
+KEYS = GW + "keys.rs"
+STALE_KEY = ('{"keys": [{"kty": "EC", "crv": "P-256", "kid": "stale", '
+             '"x": "S8cWydNibCrzVUwFcMpa8CorM1ZTnJmxVTZWONUI_-o", '
+             '"y": "0ziqidx7IOWX78hzezpoVuoCwdilEjtBLXKRwcxVbeo"}]}')
+mutate("gw-keys-refresh-never-runs", "the refresh timer ticks and fetches nothing", KEYS,
+       "        let _ = refresh(&identity, &refreshed.source, &mut last_failure).await;\n",
+       "        let _ = (&identity, &refreshed.source, &mut last_failure);\n")
+mutate("gw-keys-refresh-failure-clears-keys", "a failed refresh drops the keys in use for a key the issuer does not sign with", KEYS,
+       "        Err(error) => Err(RefreshError::from(error)),\n",
+       "        Err(error) => {\n"
+       f"            let stale = serde_json::from_str(r#\"{STALE_KEY}\"#).unwrap_or_default();\n"
+       "            let _ = identity.replace_keys(issuer, stale);\n"
+       "            Err(RefreshError::from(error))\n        }\n")
+mutate("gw-keys-first-fetch-failure-starts", "the gateway starts without an issuer whose keys it could not fetch at boot", GW + "start.rs",
+       "        let keys = source\n            .fetch()\n            .await\n"
+       "            .map_err(|cause| StartError::KeysFetch {\n                issuer: issuer.clone(),\n"
+       "                cause,\n            })?;\n",
+       "        let Ok(keys) = source.fetch().await else {\n"
+       "            if let Some(issuers) = identity.enforce.as_mut() {\n"
+       "                issuers.retain(|entry| entry.issuer != issuer);\n            }\n"
+       "            continue;\n        };\n")
+mutate("gw-keys-url-and-file-both-accepted", "an issuer with both a keys file and a keys URL loads, reading the file", GW_DEPLOY,
+       "        (Some(_), Some(_)) => return Err(DeploymentError::KeysTwice(issuer.issuer)),\n"
+       "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
+       "        (Some(file), None) => {\n",
+       "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
+       "        (Some(file), _) => {\n")
+
 # --- gateway path --------------------------------------------------------------------------
 
 GW_PATH = GW + "path.rs"
 LIST_SURFACE = (
-    "entries(&self.inner.gates.policy(), snapshot.surface(&surface).map(|surface| surface.tools.iter()"
-    ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
+    "entries(&self.inner.gates.policy(), &snapshot.surface(&surface).map(|surface| surface.tools.iter()"
+    ".filter_map(|name| snapshot.tool(name)).cloned().collect::<Vec<_>>()).unwrap_or_default())"
 )
 
 mutate("gw-row-id-fixed", "every call's row has one identifier, not one made per call", GW_PATH,
-       "            row: AuditRowId::new(Uuid::now_v7().to_string()),",
-       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),')
+       "            row: AuditRowId::new(Uuid::now_v7().to_string()),\n            instance: gates.instance().clone(),\n"
+       "            call_deadline_ms: millis(",
+       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),\n            instance: gates.instance().clone(),\n'
+       "            call_deadline_ms: millis(")
+mutate("gw-list-row-id-fixed", "every list's row has one identifier, not one made per list", GW_PATH,
+       "            row: AuditRowId::new(Uuid::now_v7().to_string()),\n            instance: gates.instance().clone(),\n"
+       "            call_deadline_ms: 0,",
+       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),\n            instance: gates.instance().clone(),\n'
+       "            call_deadline_ms: 0,")
 
 mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
-       "        let admitted = match self.admit(method, headers) {\n",
+       "        let admitted = match self.admit(method, headers, &source) {\n",
        "        if let Err(rejection) = gateway_mcp::parse(method, headers, body) {\n"
        "            return rejection.response();\n        }\n"
-       "        let admitted = match self.admit(method, headers) {\n")
+       "        let admitted = match self.admit(method, headers, &source) {\n")
 mutate("gw-transport-after-identity", "identity is checked before the transport checks", GW_PATH,
        "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n"
        "        let gates = &self.inner.gates;\n",
@@ -1527,15 +1684,29 @@ mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the
        "            .registered(&gateway_core::ConnectorName::new(requested.as_str()))\n"
        "            .or(gates.registered(&approved.connector))\n")
 mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
-       "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
-       "        let Caller::Proved(principal) = caller else {\n"
+       "            return (Reply::Tools(Vec::new()), None);\n",
        "            let snapshot = self.inner.gates.snapshot();\n"
-       f"            return {LIST_SURFACE};\n        }};\n")
+       f"            return (Reply::Tools({LIST_SURFACE}), None);\n")
 mutate("gw-list-unfiltered", "tools/list returns every tool on the surface, undecided", GW_PATH,
-       "        let caller = self.caller_context(&policy, principal, surface);\n"
-       "        entries(&policy, list_tools(policy.snapshot(), &caller))\n",
-       "        let _ = principal;\n        let snapshot = self.inner.gates.snapshot();\n"
-       f"        {LIST_SURFACE}\n")
+       "        let tools = list_tools(policy.snapshot(), &caller);\n",
+       "        let snapshot = policy.snapshot();\n"
+       "        let tools: Vec<&ApprovedTool> = snapshot.surface(&caller.surface).map(|surface| surface.tools.iter()"
+       ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default();\n")
+# A tools/list row (decision 0009): written before the answer, which comes only from it.
+mutate("gw-list-no-row", "tools/list answers without writing its row", GW_PATH,
+       "            gates.audit_store().as_ref(),\n            start,\n            &caller,\n",
+       "            &crate::audit::DisabledAuditStore::new(),\n            start,\n            &caller,\n")
+mutate("gw-list-answered-when-row-fails", "a list whose row could not be written is answered with the tools", GW_PATH,
+       "                (Reply::Denied(failure.sentence().to_owned()), None)\n",
+       "                let _ = failure;\n"
+       "                let tools: Vec<ApprovedTool> = list_tools(policy.snapshot(), &caller).into_iter().cloned().collect();\n"
+       "                (Reply::Tools(entries(&policy, &tools)), None)\n")
+mutate("gw-list-row-not-in-meta", "a tools/list answer does not name its row", GW_PATH,
+       "                let row = self.quotable(listed.row());\n",
+       "                let row: Option<AuditRowId> = None;\n")
+mutate("gw-list-wrong-revision", "a list row records a revision other than the one served", GW_PATH,
+       "            policy.revision().clone(),\n            tools,\n",
+       "            \"not-the-served-revision\".into(),\n            tools,\n")
 mutate("gw-disabled-identity-unannounced", "initialize does not say identity is disabled", GW_PATH,
        "        notes.push(IDENTITY_DISABLED_NOTE);\n", "")
 mutate("gw-disabled-audit-unannounced", "initialize does not say audit is disabled", GW_PATH,
@@ -1550,25 +1721,84 @@ mutate("gw-tool-error-as-denial", "a tool error is answered as a denial, not a r
        "Answer::Error(message) => Reply::ToolError(message),",
        "Answer::Error(message) => Reply::Denied(message),")
 mutate("gw-begin-failure-as-tool-error", "a call whose row could not be begun is answered as a tool error", GW_PATH,
-       "                return Reply::Denied(failure.sentence().to_owned());",
-       "                return Reply::ToolError(failure.sentence().to_owned());")
+       "                return (Reply::Denied(failure.sentence().to_owned()), None);",
+       "                return (Reply::ToolError(failure.sentence().to_owned()), None);")
 mutate("gw-policy-denial-as-tool-error", "a policy denial is answered as a tool error, not a denial", GW_PATH,
-       "                return Reply::Denied(refusal.sentence().to_owned());",
-       "                return Reply::ToolError(refusal.sentence().to_owned());")
+       "                return (Reply::Denied(refusal.sentence().to_owned()), row);",
+       "                return (Reply::ToolError(refusal.sentence().to_owned()), row);")
 mutate("gw-identity-disabled-as-tool-error", "with identity disabled, a call is answered as a tool error", GW_PATH,
-       "            return Reply::Denied(IDENTITY_DISABLED.to_owned());",
-       "            return Reply::ToolError(IDENTITY_DISABLED.to_owned());")
+       "            return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);",
+       "            return (Reply::ToolError(IDENTITY_DISABLED.to_owned()), None);")
 mutate("gw-tool-use-id-empty-kept", "an empty tool-use identifier reaches the row", GW_PATH,
        "    let acceptable = !value.is_empty()\n", "    let acceptable = true\n")
 mutate("gw-finish-failure-replaces-success", "a failed finish replaces a result with the audit sentence", GW_PATH,
        "        if let Some(failure) = finished.failure() {\n",
        "        if let Some(failure) = finished.failure() {\n"
-       "            return Reply::Denied(failure.sentence().to_owned());\n")
+       "            return (Reply::Denied(failure.sentence().to_owned()), None);\n")
 mutate("gw-latency-not-measured", "every call is recorded as taking no time", GW_PATH,
        "let latency_ms = elapsed_millis(gates.clock().as_ref(), started);",
        "let latency_ms = 0;")
 mutate("gw-read-only-hint-always", "every tool is listed as read-only", GW_PATH,
        "read_only: tool.classification == Classification::Read,", "read_only: true,")
+mutate("gw-row-not-in-meta", "a call that ran does not name its row in the answer", GW_PATH,
+       "        (reply, named)\n", "        let _ = named;\n        (reply, None)\n")
+mutate("gw-row-not-in-error-data", "a denial does not name its row in error.data", GW_PATH,
+       "                let row = self.quotable(refusal.row());\n",
+       "                let row: Option<AuditRowId> = None;\n")
+mutate("gw-disabled-row-leaked", "with audit disabled, the answer names a row nothing wrote", GW_PATH,
+       "        (self.inner.gates.audit_state() == GateState::On).then(|| row.clone())",
+       "        Some(row.clone())")
+# Telemetry events (decision 0009): one identity_failed per refusal, naming where it came from
+# and nothing from the token but the claimed issuer and subject the identity crate escaped.
+mutate("gw-identity-event-no-surface", "an identity failure's event does not name the surface", GW_PATH,
+       "                    surface: source.surface.clone(),\n", "                    surface: None,\n")
+mutate("gw-identity-event-no-source", "an identity failure's event does not name the peer", GW_PATH,
+       "                    source: source.address,\n                    cause:",
+       "                    source: None,\n                    cause:")
+# ClaimedCaller's constructor is private to the identity crate, so the path cannot record the
+# token, or anything from it, as the claimed caller: this must not compile.
+mutate("gw-identity-event-carries-token", "the raw token is recorded as the claimed subject", GW_PATH,
+       "                    claimed: failure.claimed().clone(),\n",
+       "                    claimed: gateway_identity::ClaimedCaller::new(None, bearer_token(headers)),\n",
+       breaks_build=True)
+mutate("gw-ping-no-event", "a ping is answered with no event", GW_PATH,
+       "            Call::Ping => {\n"
+       "                self.emit(Event::Ping {\n"
+       "                    deployment: deployment(),\n"
+       "                    surface: source.surface,\n"
+       "                    source: source.address,\n"
+       "                });\n"
+       "                (Reply::Pong, None)\n"
+       "            }\n",
+       "            Call::Ping => (Reply::Pong, None),\n")
+# A call given up (decision 0009): with no connector registered, or with its client gone before
+# the connector is called, the row is completed as error and the connector is not called.
+mutate("gw-unregistered-row-left-open", "an allowed call whose connector is not registered leaves its row open", GW_PATH,
+       "            let gave_up = audit::give_up(store, guard).await;\n"
+       "            tracing::error!(\n"
+       "                row = row.as_str(),\n"
+       "                %connector,\n"
+       "                \"an allowed tool's connector is not registered; its row was completed as error\"\n"
+       "            );\n"
+       "            if let Some(failure) = gave_up.failure() {\n",
+       "            drop(guard);\n"
+       "            let _ = connector;\n"
+       "            if let Some(failure) = None::<gateway_core::audit::AuditFailure> {\n")
+mutate("gw-disconnect-before-run-ignored", "a call whose client has gone before it runs is run all the same", GW_PATH,
+       "        if disconnect.has_fired() {\n", "        if false && disconnect.has_fired() {\n")
+mutate("gw-read-not-cancelled", "a read whose client goes is run to completion", GW_PATH,
+       "        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;",
+       "        let ran = audit::run(connector, guard).await;")
+mutate("gw-disconnect-never-fires", "dropping the handler does not fire the disconnect", GW_PATH,
+       "            let _ = sender.send(());\n", "            drop(sender);\n")
+mutate("gw-unparsable-no-event", "a body refused at the protocol layer gives no event", GW_PATH,
+       "                    path.emit(Event::Unparsable {\n"
+       "                        deployment: path.inner.gates.deployment().clone(),\n"
+       "                        surface: source.surface,\n"
+       "                        source: source.address,\n"
+       "                        rejection: rejection.kind(),\n"
+       "                    });\n",
+       "")
 
 
 # --- gateway server ------------------------------------------------------------------------
@@ -1578,14 +1808,14 @@ HOST_CHECK = (
     "    if let Err(rejection) = check_host(gates, parts) {\n"
     "        return refused(&rejection);\n    }\n"
 )
-ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers) {\n"
+ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers, &source) {\n"
 
 mutate("gw-host-check-skipped", "a request for any Host is served", GW_SERVER, HOST_CHECK, "")
 mutate_all(
     "gw-host-after-identity",
     "the Host is checked after identity",
     (GW_SERVER, HOST_CHECK, ""),
-    (GW_SERVER, "    let Ok(Path(surface)) =", HOST_CHECK + "    let Ok(Path(surface)) ="),
+    (GW_SERVER, "    let Some(surface) = surface else {", HOST_CHECK + "    let Some(surface) = surface else {"),
 )
 mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
        "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
@@ -1630,8 +1860,29 @@ mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour fo
 mutate("gw-shutdown-leaves-connections-open", "a connection still open after the grace keeps serving after the server returns", GW_SERVER,
        "        tasks.spawn(async move {", "        tokio::spawn(async move {")
 mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
-       "    match tokio::spawn(answering.instrument(span)).await {",
-       "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
+       "    let answered = tokio::spawn(answering.instrument(span)).await;",
+       "    let answered = Ok::<_, tokio::task::JoinError>(answering.instrument(span).await);")
+# A disconnect reaches a call only through the signal (decision 0009): the answer task is never
+# dropped or aborted with the handler, so begin and a side effect run to their end.
+mutate("gw-begin-on-request-future", "a disconnect aborts the answer task wherever it is, begin included", GW_SERVER,
+       "    let answered = tokio::spawn(answering.instrument(span)).await;",
+       "    struct Abort(tokio::task::AbortHandle);\n"
+       "    impl Drop for Abort {\n        fn drop(&mut self) {\n            self.0.abort();\n        }\n    }\n"
+       "    let task = tokio::spawn(answering.instrument(span));\n"
+       "    let abort = Abort(task.abort_handle());\n"
+       "    let answered = task.await;\n"
+       "    std::mem::forget(abort);")
+mutate("gw-side-effect-cancelled-on-disconnect", "the path drops any call, a side effect too, when its client goes", GW_PATH,
+       "        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;",
+       "        let ran = tokio::select! {\n"
+       "            ran = audit::run(connector, guard) => ran,\n"
+       "            () = disconnect.fired() => return (Reply::ToolError(DISCONNECTED_BEFORE_RUN.to_owned()), named),\n"
+       "        };")
+# No answer starts once the gateway stops taking connections, and every one starts until then.
+mutate("gw-calls-start-in-grace", "a request whose body arrives during the shutdown grace starts its call", GW_SERVER,
+       "    if !endpoint.starting.load(Ordering::SeqCst) {\n", "    if false && !endpoint.starting.load(Ordering::SeqCst) {\n")
+mutate("gw-calls-stop-at-unready", "no call starts once the readiness check fails, inside the removal", GW_SERVER,
+       "    ready.store(false, Ordering::SeqCst);\n", "    ready.store(false, Ordering::SeqCst);\n    starting.store(false, Ordering::SeqCst);\n")
 mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
        "        return refused(&Rejection::request_timeout());",
        "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
@@ -1639,8 +1890,22 @@ mutate("gw-ready-never-fails", "the readiness check still passes while the gatew
        "    ready.store(false, Ordering::SeqCst);\n", "")
 mutate("gw-stops-before-unready", "the gateway stops taking connections before the readiness removal, not after", GW_SERVER,
        "    accepting\n        .until(&mut tasks, tokio::time::sleep(timeouts.readiness_removal))\n        .await;\n"
+       "    // From here no answer starts, so no call starts after the readiness removal.\n"
+       "    starting.store(false, Ordering::SeqCst);\n"
        "    drop(listener);\n",
-       "    drop(listener);\n    tokio::time::sleep(timeouts.readiness_removal).await;\n")
+       "    drop(listener);\n    tokio::time::sleep(timeouts.readiness_removal).await;\n"
+       "    starting.store(false, Ordering::SeqCst);\n")
+# Telemetry at shutdown (decision 0009): the queue is closed and emptied before serving returns.
+mutate("gw-drain-not-awaited-on-shutdown", "serving returns without waiting for the queued events to be written", GW_SERVER,
+       "    if let Err(error) = draining.await {\n"
+       "        tracing::error!(%error, \"the task writing telemetry failed\");\n    }\n",
+       "    let _ = draining;\n")
+mutate("gw-event-source-not-peer", "events name the gateway's own address, not the peer's", GW_SERVER,
+       "                    Ok(accepted) => accepted,\n",
+       "                    Ok((stream, _)) => match self.listener.local_addr() {\n"
+       "                        Ok(local) => (stream, local),\n"
+       "                        Err(_) => continue,\n"
+       "                    },\n")
 
 
 # --- gateway-dev ---------------------------------------------------------------------------
@@ -1662,8 +1927,10 @@ mutate("dev-clock-option-ignored", "the gateway verifies on the system clock wha
        "    let mut wiring = Wiring::new(Arc::new(SystemClock)).instance(instance).connector(")
 mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
        "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
-mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into a row id, so the call runs with no row", DEV_PRINTER,
-       "            begun\n        })", '            begun.or_else(|_| Ok(AuditRowId::new("printed")))\n        })')
+mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into success, so the call runs with no row", DEV_PRINTER,
+       "            begun\n        })", "            begun.or_else(|_| Ok(()))\n        })")
+mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so audit::listed hands out a Listed with no row stored", DEV_PRINTER,
+       "            listed\n        })", "            listed.or_else(|_| Ok(()))\n        })")
 mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
        "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
 mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
@@ -2176,13 +2443,16 @@ mutate("pg-check-completion-latency", "an outcome may lack its latency", PG_SQL,
        "        (outcome IS NULL) = (latency_ms IS NULL)\n", "        true\n")
 mutate("pg-check-completion-time", "an outcome may lack its time", PG_SQL,
        "        AND (outcome IS NULL) = (finished_at IS NULL)\n", "")
+# Since 0004, decision_shape refuses a decision that is neither allow nor deny as well, so
+# pg-check-decision-any is caught only because the test names the column's own check.
 for column, values in [
     ("classification", "'read', 'propose', 'write', 'destructive'"),
     ("decision", "'allow', 'deny'"),
     ("proved_kind", "'workload', 'user'"),
     ("outcome", "'ok', 'error', 'refused'"),
 ]:
-    mutate(f"pg-check-{column.replace('_', '-')}-any", f"the {column} column takes any text", PG_SQL,
+    what = "the decision column's own check accepts" if column == "decision" else f"the {column} column takes"
+    mutate(f"pg-check-{column.replace('_', '-')}-any", f"{what} any text", PG_SQL,
            f"CHECK ({column} IN ({values}))", "CHECK (true)")
 for column in ["resources_omitted", "latency_ms"]:
     mutate(f"pg-check-{column.replace('_', '-')}-negative", f"the {column} column takes a negative number", PG_SQL,
@@ -2915,8 +3185,8 @@ mutate("gw-reload-never-reads-again", "the watcher never serves a new file", REL
 
 mutate("gw-policy-no-rule-gets-a-profile", "a caller no registry rule covers gets the demo's profile", POLICY_RS,
        "                    ProfileName::new(NO_PROFILE)\n", "                    ProfileName::new(\"workload-read\")\n")
-mutate("gw-path-identity-failure-unnamed", "an identity failure's log line has no event name", GW + "path.rs",
-       "                    event = \"identity_failed\",\n", "")
+mutate("gw-path-identity-failure-unnamed", "an identity failure's log line has no event name", GW + "telemetry.rs",
+       "            event = \"identity_failed\",\n", "")
 
 mutate("mock-digest-file-beside-token", "a digest file and a token file may both be set", MOCK_CONFIG,
        "            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,",
@@ -3007,7 +3277,22 @@ mutate("mcp-tool-result-legacy-structured-non-object", "a legacy pass-through re
 mutate("demo-driver-unknown-row-as-none", "the row check takes none for the resources of a tool the gateway does not know", DRIVER,
        '        elif .reason == "unknown_tool" then "unknown"\n', '        elif .reason == "unknown_tool" then []\n')
 mutate("demo-driver-row-check-counts-nothing", "the row check passes whatever rows were wrong", DRIVER,
-       '    check "$(count_lines . "$wrong")" 0 "audit: every row', '    check 0 0 "audit: every row')
+       '    check "$(count_lines . "$wrong")" 0 \\\n      "audit: every row', '    check 0 0 \\\n      "audit: every row')
+# List rows (decision 0009): counted apart, one per tools/list, each naming what was shown.
+mutate("demo-driver-list-row-any-resources", "the row check passes a list row whatever resources it names", DRIVER,
+       '        if .kind == "list" then null\n', '        if .kind == "list" then .resources\n')
+mutate("demo-driver-row-any-kind", "the row check judges a row of any kind as a call", DRIVER,
+       '        elif .kind != "call" then "no call of the demo makes this row"\n', "")
+mutate("demo-driver-list-count-unchecked", "the list check passes whatever number of list rows there are", DRIVER,
+       '  check "$lists" "$expected" "audit: one list row', '  check "$expected" "$expected" "audit: one list row')
+mutate("demo-driver-list-check-counts-nothing", "the list check passes whatever list rows were wrong", DRIVER,
+       '  check "$(count_lines . "$wrong")" 0 "audit: each list row', '  check 0 0 "audit: each list row')
+mutate("demo-driver-list-withdrawn-shown", "the list check expects the withdrawn tool after the withdrawal too", DRIVER,
+       '"demo-2": [$list]}', '"demo-2": [$list, $read]}')
+mutate("demo-driver-list-omitted-unchecked", "the list check passes a list row that left tools out", DRIVER,
+       "            and .omitted == 0) | not)\n", "            and true) | not)\n")
+mutate("demo-driver-list-any-team", "the list check passes a list row from any team", DRIVER,
+       '        | select(((.team == "team-a" or .team == "team-b")\n', "        | select(((true)\n")
 mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
        '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
 mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
@@ -3081,6 +3366,153 @@ mutate("demo-migrate-gateway-reads-everything", "the demo grants the gateway rol
        'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader;',
        'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader, switchboard_gateway;')
 
+# --- issuer-keys ---------------------------------------------------------------------------
+# The key fetcher reaches the issuer's own origin and nothing else, and each fetch is bounded.
+
+IK = "crates/issuer-keys/src/source.rs"
+# Only the issuer's origin.
+mutate("issuer-keys-other-host-allowed", "a keys URL on another host is accepted", IK,
+       "        if url.host() != origin.host() {", "        if false {")
+mutate("issuer-keys-other-port-allowed", "a keys URL on another port is accepted", IK,
+       "        if found != expected {", "        if false {")
+mutate("issuer-keys-http-for-https-issuer", "an http keys URL is accepted for an https issuer", IK,
+       "        if url.scheme() != origin.scheme() {", "        if false {")
+mutate("issuer-keys-userinfo-allowed", "a keys URL with a user name or password is accepted", IK,
+       "        if !url.username().is_empty() || url.password().is_some() {", "        if false {")
+mutate("issuer-keys-fragment-allowed", "a keys URL with a fragment is accepted", IK,
+       "        if url.fragment().is_some() {", "        if false {")
+mutate("issuer-keys-https-accepted", "an https source is accepted with no TLS client to fetch it", IK,
+       '        if url.scheme() != "http" {', "        if false {")
+mutate("issuer-keys-zero-deadline-allowed", "a zero deadline is accepted", IK,
+       "        if options.deadline.is_zero() {", "        if false {")
+mutate("issuer-keys-zero-cap-allowed", "a zero body cap is accepted", IK,
+       "        if options.max_body_bytes == 0 {", "        if false {")
+mutate("issuer-keys-redirect-followed", "a redirect is followed once, wherever it points", IK,
+       "        let response = self.send(self.uri.clone()).await?;\n",
+       "        let mut response = self.send(self.uri.clone()).await?;\n"
+       "        if response.status().is_redirection() {\n"
+       "            let next = response\n"
+       "                .headers()\n"
+       "                .get(hyper::header::LOCATION)\n"
+       "                .and_then(|location| location.to_str().ok())\n"
+       "                .and_then(|location| Url::parse(&self.uri.to_string()).ok()?.join(location).ok())\n"
+       "                .and_then(|next| next.as_str().parse::<Uri>().ok());\n"
+       "            if let Some(next) = next {\n"
+       "                response = self.send(next).await?;\n"
+       "            }\n"
+       "        }\n")
+mutate("issuer-keys-status-unchecked", "only a server error status is refused", IK,
+       "        if status != StatusCode::OK {", "        if status.is_server_error() {")
+# The bounds.
+mutate("issuer-keys-no-deadline", "a fetch is never abandoned", IK,
+       "        let body = match tokio::time::timeout(self.deadline, self.exchange()).await {",
+       "        let body = match Ok::<_, ()>(self.exchange().await) {")
+mutate("issuer-keys-default-deadline-longer", "the default deadline is 30 s", IK,
+       "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
+mutate("issuer-keys-body-uncapped", "a streamed body is read whatever its size", IK,
+       "                if received.len() + data.len() > self.max_body_bytes {", "                if false {")
+mutate("issuer-keys-cap-off-by-one", "a body of exactly the cap is refused", IK,
+       "                if received.len() + data.len() > self.max_body_bytes {",
+       "                if received.len() + data.len() >= self.max_body_bytes {")
+mutate("issuer-keys-declared-length-ignored", "a declared length over the cap is not refused before reading", IK,
+       "            .is_some_and(|length| length > self.max_body_bytes as u64)", "            .is_some_and(|_| false)")
+mutate("issuer-keys-default-cap-larger", "the default body cap is 1 MiB", IK,
+       "usize = 256 * 1024;", "usize = 1024 * 1024;")
+
+# --- Which tests can see a mutation ----------------------------------------------------------
+#
+# A mutation runs the tests of the packages that can see its edits: the package that holds each
+# edited file, every workspace package that depends on that one (as a normal, dev or build
+# dependency, and so on up), and the packages whose tests read the file itself. If those pass, the
+# mutation runs again against the whole workspace before it is called SURVIVED, so a gap in the
+# table below costs time, never a verdict.
+
+# Files read across a package boundary: a path prefix, and the packages whose tests read the files
+# under it. Every prefix that matches an edited path adds its packages. These readers read in their
+# tests, not in code another package links, so their dependents are not added.
+#
+# A path outside every crate that no prefix matches runs the whole workspace. That covers the root
+# Cargo.toml and Cargo.lock, which every build reads, and docs/, scripts/, .github/, README.md and
+# CONTRIBUTING.md, which no test reads today.
+#
+# Left out on purpose: gateway-testkit's no_private_key_is_checked_in reads every file under
+# crates/. A mutation that wrote private key armour would be caught only by the whole-workspace run.
+READERS: list[tuple[str, frozenset[str]]] = [
+    # demo-checks runs and reads the scripts and manifests under deploy/ (tests/common reads from
+    # the repository root) and holds .dockerignore to the Dockerfile.
+    ("deploy/", frozenset({"demo-checks"})),
+    (".dockerignore", frozenset({"demo-checks"})),
+    # gateway/tests/deployment.rs loads both demo deployments; gateway/tests/files includes the
+    # kind registry.
+    ("deploy/compose/config/", frozenset({"gateway"})),
+    ("deploy/kind/base/config/", frozenset({"gateway"})),
+    # gateway-testkit/tests/issuer.rs searches conformance/ for private keys.
+    ("conformance/", frozenset({"gateway-testkit"})),
+    # demo-checks/tests/manifests.rs compares the demo registries with the registry crate's own.
+    ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
+    # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.
+    ("crates/gateway-identity/Cargo.toml", frozenset({"mock-docs-server"})),
+]
+
+
+@dataclass(frozen=True)
+class Packages:
+    # Each workspace package's directory, relative to the workspace root and ending in "/".
+    directories: dict[str, str]
+    # For each package, the workspace packages that name it as a dependency of any kind.
+    dependents: dict[str, frozenset[str]]
+
+
+def read_packages(workspace: Path) -> Packages:
+    output = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=workspace, capture_output=True, text=True, check=True,
+    ).stdout
+    metadata = json.loads(output)
+    root = Path(metadata["workspace_root"])
+    directories = {
+        package["name"]: Path(package["manifest_path"]).parent.relative_to(root).as_posix() + "/"
+        for package in metadata["packages"]
+    }
+    dependents: dict[str, set[str]] = {name: set() for name in directories}
+    for package in metadata["packages"]:
+        for dependency in package["dependencies"]:
+            if dependency["name"] in directories:
+                dependents[dependency["name"]].add(package["name"])
+    return Packages(directories, {name: frozenset(names) for name, names in dependents.items()})
+
+
+def scope(mutation: Mutation, packages: Packages) -> tuple[frozenset[str], frozenset[str]] | None:
+    """The packages whose tests can see the mutation's edits, in two parts: those that hold or
+    read an edited file, and the other packages that depend on one that holds one. None means
+    the whole workspace."""
+    owners: set[str] = set()
+    readers: set[str] = set()
+    for edit in mutation.edits:
+        owner = max((name for name, directory in packages.directories.items() if edit.path.startswith(directory)),
+                    key=lambda name: len(packages.directories[name]), default=None)
+        matched = [names for prefix, names in READERS if edit.path.startswith(prefix)]
+        if owner is None and not matched:
+            return None
+        if owner is not None:
+            owners.add(owner)
+        for names in matched:
+            readers |= names
+    near = owners | readers
+    seen, waiting = set(owners), list(owners)
+    while waiting:
+        for dependent in packages.dependents[waiting.pop()] - seen:
+            seen.add(dependent)
+            waiting.append(dependent)
+    return frozenset(near), frozenset(seen - near)
+
+
+def short(chosen: frozenset[str] | None) -> str:
+    if chosen is None:
+        return "workspace"
+    return ",".join(sorted(name.removeprefix("gateway-") for name in chosen))
+
+
 # --- Running -------------------------------------------------------------------------------
 
 
@@ -3111,8 +3543,18 @@ def apply(mutation: Mutation, read) -> dict[str, str] | str:
     return contents
 
 
-def run_tests(workspace: Path, target: Path) -> tuple[int | None, str]:
-    command = ["cargo", "test", "--workspace", "--locked", "--no-fail-fast"]
+def run_tests(workspace: Path, target: Path, chosen: frozenset[str] | None = None, *,
+              fail_fast: bool = False) -> tuple[int | None, str]:
+    """`cargo test` over the chosen packages, or the whole workspace when none are chosen."""
+    command = ["cargo", "test"]
+    if chosen is None:
+        command.append("--workspace")
+    else:
+        for name in sorted(chosen):
+            command += ["-p", name]
+    command.append("--locked")
+    if not fail_fast:
+        command.append("--no-fail-fast")
     environment = {**os.environ, "CARGO_TARGET_DIR": str(target), "CARGO_TERM_COLOR": "never"}
     try:
         result = subprocess.run(command, cwd=workspace, env=environment, capture_output=True, text=True, timeout=TIMEOUT_SECONDS)
@@ -3130,7 +3572,7 @@ def verdict(mutation: Mutation, code: int | None, output: str) -> tuple[str, str
     trybuild = sorted(set(re.findall(r"^test (tests/compile-fail/\S+) \.\.\. (?:error|mismatch)$", output, re.M)))
     if failed:
         return "CAUGHT", ", ".join(failed + trybuild)
-    broken = re.findall(r"could not compile `gateway-[a-z]+` \(([^)]*)\)", output)
+    broken = re.findall(r"could not compile `gateway(?:-[a-z]+)?` \(([^)]*)\)", output)
     if mutation.breaks_build and "lib" in broken:
         return "CAUGHT", "the library does not compile, as intended"
     if broken:
@@ -3139,12 +3581,64 @@ def verdict(mutation: Mutation, code: int | None, output: str) -> tuple[str, str
     return "NO-VERDICT", "; ".join(lines[:2]) or f"cargo exited {code}"
 
 
+def steps(mutation: Mutation, packages: Packages, all_catchers: bool) -> list[frozenset[str] | None]:
+    """The runs a mutation takes before any whole-workspace retry; None is the whole workspace.
+
+    The packages that hold or read an edited file run first: they build fastest and catch most.
+    Only if they pass do the rest of their dependents run. With --all-catchers both run at once
+    and to the end."""
+    plan = scope(mutation, packages)
+    if plan is None:
+        chosen: list[frozenset[str] | None] = [None]
+    elif all_catchers:
+        chosen = [plan[0] | plan[1]]
+    else:
+        chosen = [plan[0]] + ([plan[1]] if plan[1] else [])
+    return [None if step is not None and step >= packages.directories.keys() else step for step in chosen]
+
+
+def judge(mutation: Mutation, workspace: Path, target: Path, planned: list[frozenset[str] | None],
+          usable: Callable[[frozenset[str]], bool], all_catchers: bool) -> tuple[str, str, str]:
+    """The verdict on the mutation as it stands in the workspace, its detail, and what ran.
+    A set of packages that is not usable is replaced by the whole workspace."""
+    ran = []
+    for chosen in planned:
+        if chosen is not None and not usable(chosen):
+            chosen = None
+        code, output = run_tests(workspace, target, chosen, fail_fast=not all_catchers)
+        status, detail = verdict(mutation, code, output)
+        ran.append(short(chosen))
+        if status != "SURVIVED" or chosen is None:
+            break
+    # A pass over the whole workspace has already run every test; fail-fast changes nothing when
+    # nothing fails. Anything else that is not CAUGHT is run again exactly as it always was.
+    whole = chosen is None and (status == "SURVIVED" or all_catchers)
+    if status in ("SURVIVED", "NO-VERDICT") and not whole:
+        code, output = run_tests(workspace, target)
+        status, detail = verdict(mutation, code, output)
+        ran.append("workspace")
+    if status == "SURVIVED":
+        detail = "every test in the workspace passed"
+    return status, detail, " then ".join(ran)
+
+
+def shard(text: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)/(\d+)", text)
+    if match is None or not int(match.group(1)) < int(match.group(2)):
+        raise argparse.ArgumentTypeError("expected I/N with 0 <= I < N, such as 0/4")
+    return int(match.group(1)), int(match.group(2))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("only", nargs="*", help="run only these mutation ids")
     parser.add_argument("--list", action="store_true", help="list the mutations and exit")
     parser.add_argument("--targets", action="store_true", help="check every target matches exactly once, without cargo")
     parser.add_argument("--keep", action="store_true", help="keep the temporary workspace")
+    parser.add_argument("--all-catchers", action="store_true",
+                        help="run every test of the chosen packages, not only up to the first failing test binary")
+    parser.add_argument("--shard", type=shard, metavar="I/N",
+                        help="run every N-th selected mutation, starting at the I-th (0-based)")
     arguments = parser.parse_args()
 
     sentence_mutations((ROOT / SRC / "sentences.rs").read_text())
@@ -3154,6 +3648,9 @@ def main() -> int:
     if unknown := [id for id in arguments.only if id not in known]:
         sys.exit(f"no such mutation: {', '.join(unknown)}")
     selected = [mutation for mutation in MUTATIONS if not arguments.only or mutation.id in arguments.only]
+    if arguments.shard:
+        first, every = arguments.shard
+        selected = selected[first::every]
 
     if arguments.list:
         for mutation in selected:
@@ -3170,45 +3667,82 @@ def main() -> int:
         print(f"{len(selected)} mutations: {len(selected) - bad} targets match, {bad} do not")
         return 1 if bad else 0
 
+    if DATABASE_VARIABLE not in os.environ:
+        print(f"warning: {DATABASE_VARIABLE} is not set, so the Postgres tests skip and the mutations "
+              "only they catch are left to the whole-workspace run, where they survive", flush=True)
     scratch = Path(tempfile.mkdtemp(prefix="mutation-check-"))
     workspace, target = scratch / "workspace", scratch / "target"
     copy_workspace(workspace)
     print(f"workspace copy: {workspace}", flush=True)
     try:
+        packages = read_packages(workspace)
         started = time.monotonic()
         code, output = run_tests(workspace, target)
         if code != 0:
             print(output[-4000:])
             print("the unmutated workspace does not pass its tests; nothing to measure against")
             return 2
-        print(f"baseline passes ({time.monotonic() - started:.0f}s); {len(selected)} mutations to run", flush=True)
+        part = f"shard {arguments.shard[0]}/{arguments.shard[1]}: " if arguments.shard else ""
+        print(f"baseline passes ({time.monotonic() - started:.0f}s); {part}{len(selected)} mutations to run", flush=True)
 
         pristine = {path: (workspace / path).read_text() for path in {edit.path for m in selected for edit in m.edits} | {REGRESSIONS}
                     if (workspace / path).exists()}
         counts = {"CAUGHT": 0, "SURVIVED": 0, "ERROR": 0, "NO-VERDICT": 0}
+        def restore() -> None:
+            # Written afresh, so every restored file is newer than the mutant's build and cargo
+            # cannot reuse it; the regression file is restored so that one mutation's saved
+            # cases do not change the next one's run.
+            for path, text in pristine.items():
+                (workspace / path).write_text(text)
+            shutil.rmtree(workspace / CRATE / "wip", ignore_errors=True)
+
+        # Each set of packages a mutation runs is first run once unmutated, when it is first
+        # needed. The baseline only shows that the whole workspace passes; tests run for a few
+        # packages build their dependencies with fewer features, and must pass that way too
+        # before a failure there is blamed on a mutation. A set that fails is not used.
+        checked: dict[frozenset[str], bool] = {}
+
+        def usable(chosen: frozenset[str], applied: dict[str, str] | None) -> bool:
+            if chosen not in checked:
+                if applied:
+                    restore()
+                began = time.monotonic()
+                code, output = run_tests(workspace, target, chosen, fail_fast=True)
+                checked[chosen] = code == 0
+                if not checked[chosen]:
+                    print(output[-4000:])
+                result = "passes" if checked[chosen] else "FAILS unmutated, so it runs the whole workspace instead"
+                print(f"baseline for [{short(chosen)}] {result} ({time.monotonic() - began:.0f}s)", flush=True)
+                if applied:
+                    for path, text in applied.items():
+                        (workspace / path).write_text(text)
+            return checked[chosen]
+
+        started = time.monotonic()
         for mutation in selected:
             applied = apply(mutation, lambda path: pristine[path])
             if isinstance(applied, str):
-                status, detail = "ERROR", applied
+                began = time.monotonic()
+                status, detail, ran = "ERROR", applied, "nothing"
             else:
+                planned = steps(mutation, packages, arguments.all_catchers)
+                if planned[0] is not None:
+                    usable(planned[0], None)
+                began = time.monotonic()
                 try:
                     for path, text in applied.items():
                         (workspace / path).write_text(text)
-                    code, output = run_tests(workspace, target)
-                    status, detail = verdict(mutation, code, output)
+                    status, detail, ran = judge(mutation, workspace, target, planned,
+                                                lambda chosen: usable(chosen, applied), arguments.all_catchers)
                 finally:
-                    # Written afresh, so every restored file is newer than the mutant's build
-                    # and cargo cannot reuse it; the regression file is restored so that one
-                    # mutation's saved cases do not change the next one's run.
-                    for path, text in pristine.items():
-                        (workspace / path).write_text(text)
-                    shutil.rmtree(workspace / CRATE / "wip", ignore_errors=True)
+                    restore()
             counts[status] += 1
-            print(f"{status:<10} {mutation.id:<48} {detail}", flush=True)
+            print(f"{status:<10} {mutation.id:<48} {time.monotonic() - began:>5.0f}s  [{ran}]  {detail}", flush=True)
 
         print(
             f"{len(selected)} mutations: {counts['CAUGHT']} caught, {counts['SURVIVED']} survived, "
-            f"{counts['ERROR']} errors, {counts['NO-VERDICT']} without a verdict"
+            f"{counts['ERROR']} errors, {counts['NO-VERDICT']} without a verdict "
+            f"({time.monotonic() - started:.0f}s)"
         )
         return 0 if counts["CAUGHT"] == len(selected) else 1
     finally:

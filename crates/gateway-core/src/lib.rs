@@ -32,7 +32,7 @@ mod principal;
 pub mod proof;
 mod sentences;
 
-pub use audit::{AuditGuard, AuditRecord, AuditStore};
+pub use audit::{AuditGuard, AuditRecord, AuditStore, GaveUp, give_up};
 pub use classification::{Classification, UnrecognizedClassification};
 pub use connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
 pub use credential::{CredentialError, CredentialHandle, CredentialSource};
@@ -51,4 +51,4 @@ pub use policy::{
 };
 pub use principal::{Delegation, Principal, PrincipalId, PrincipalKind};
 pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
-pub use sentences::{IDENTITY_FAILURE, escape};
+pub use sentences::{IDENTITY_FAILURE, MAX_RENDERED, escape};

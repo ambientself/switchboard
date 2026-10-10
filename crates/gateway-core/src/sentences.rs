@@ -7,9 +7,10 @@
 //!
 //! The module is private. A denial's sentence leaves the crate only on a
 //! [`Refusal`](crate::audit::Refusal), after its row is written; the audit-failure sentence only
-//! through [`AuditFailure::sentence`](crate::audit::AuditFailure::sentence); and the identity
-//! failure sentence, which no decision produces, is re-exported as
-//! [`IDENTITY_FAILURE`](crate::IDENTITY_FAILURE).
+//! through [`AuditFailure::sentence`](crate::audit::AuditFailure::sentence); the sentence for a
+//! read cancelled because its caller disconnected only as the error
+//! [`run_unless`](crate::audit::run_unless) records; and the identity failure sentence, which no
+//! decision produces, is re-exported as [`IDENTITY_FAILURE`](crate::IDENTITY_FAILURE).
 //!
 //! Every value put into a sentence passes through [`escape`]: control characters, non-ASCII,
 //! backticks and backslashes are escaped and the length is capped, because some of these
@@ -82,12 +83,17 @@ pub const IDENTITY_FAILURE: &str =
 /// The sentence for a call refused because its audit row could not be written.
 pub(crate) const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
 
-/// The longest a value is rendered, in characters after escaping, before it is cut short.
-pub(crate) const MAX_RENDERED: usize = 128;
+/// The error a read is recorded with when its caller disconnected before it returned, and the
+/// read was cancelled (decision 0009). Nobody is left to read it; the row holds it as `error`.
+pub(crate) const CALLER_DISCONNECTED: &str = "The caller disconnected, so the read was cancelled.";
+
+/// The longest a value is rendered, in characters after escaping, before it is cut short. The
+/// gateway's telemetry caps a surface at the same length.
+pub const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 16] = [
+const SENTENCES: [&str; 17] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -104,6 +110,7 @@ const SENTENCES: [&str; 16] = [
     RESOURCES_NONE_NAMED,
     IDENTITY_FAILURE,
     AUDIT_FAILURE,
+    CALLER_DISCONNECTED,
 ];
 
 /// The sentence for `reason`.
@@ -341,7 +348,7 @@ mod tests {
     /// Pinned as literal text: the constants are the thing under test, so comparing a constant
     /// with itself would prove nothing.
     #[test]
-    fn the_two_fixed_sentences_say_what_they_should() {
+    fn the_three_fixed_sentences_say_what_they_should() {
         assert_eq!(
             IDENTITY_FAILURE,
             "The gateway could not verify who is calling, so the call was refused."
@@ -349,6 +356,10 @@ mod tests {
         assert_eq!(
             AUDIT_FAILURE,
             "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later."
+        );
+        assert_eq!(
+            CALLER_DISCONNECTED,
+            "The caller disconnected, so the read was cancelled."
         );
         assert!(
             !IDENTITY_FAILURE.contains('{'),

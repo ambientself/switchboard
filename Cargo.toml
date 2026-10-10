@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/audit-postgres", "crates/connector-proxy", "crates/demo-checks", "crates/gateway", "crates/gateway-core", "crates/gateway-dev", "crates/gateway-identity", "crates/gateway-mcp", "crates/gateway-registry", "crates/gateway-testkit", "crates/mock-docs-server"]
+members = ["crates/audit-postgres", "crates/connector-proxy", "crates/demo-checks", "crates/gateway", "crates/gateway-core", "crates/gateway-dev", "crates/gateway-identity", "crates/gateway-mcp", "crates/gateway-registry", "crates/gateway-testkit", "crates/issuer-keys", "crates/mock-docs-server"]
 
 [workspace.package]
 edition = "2024"
@@ -19,7 +19,7 @@ expect_used = "warn"
 
 # Third-party crates are built optimised even in the dev profile. The tests generate RSA keys
 # (the local issuer never uses a checked-in key), and in an unoptimised build that costs seconds
-# per key; the mutation check runs the whole suite once per mutation, so it adds up. The
+# per key; the mutation check runs the tests again for every mutation, so it adds up. The
 # workspace's own crates stay unoptimised, so a failing test still debugs normally.
 [profile.dev.package."*"]
 opt-level = 2

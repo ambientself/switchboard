@@ -243,7 +243,20 @@ fn a_refused_deployment_is_refused_before_the_address_is_bound() {
         held_at("[audit]\nmode = \"postgres\"\nurl_env = \"SWITCHBOARD_BINARY_TEST_URL\"\n");
     // With nothing naming the instance, an empty value counting as none, it refuses.
     let no_instance = held_at("[audit]\nmode = \"disabled\"\n");
+    // An issuer whose keys URL nothing answers.
+    let unreachable_keys = held_at(
+        "[[identity.issuers]]\nissuer = \"http://127.0.0.1:1\"\nkind = \"user\"\n\
+         audiences = [\"switchboard\"]\nalgorithm = \"ES256\"\n\
+         keys_url = \"http://127.0.0.1:1/keys\"\nmax_lifetime_seconds = 3600\n\
+         leeway_seconds = 30\n\n[audit]\nmode = \"disabled\"\n",
+    );
     for (name, deployment, reason, instance) in [
+        (
+            "unreachable-keys",
+            unreachable_keys,
+            "cannot fetch the keys of issuer `http://127.0.0.1:1` at boot",
+            INSTANCE,
+        ),
         (
             "unused-credential",
             unused_credential,
