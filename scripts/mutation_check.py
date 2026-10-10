@@ -590,7 +590,8 @@ mutate("tool-call-constructor-public", "a connector can be called around the aud
 mutate("connector-run-without-call", "a connector runs without being handed the call", SRC + "connector.rs",
        "    fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;", "    fn run(&self) -> BoxFuture<'_, ToolOutcome>;", breaks_build=True)
 mutate("run-drops-arguments", "the connector is not given the call's arguments", SRC + "audit.rs",
-       "connector.run(ToolCall::new(call, tool, arguments))", "connector.run(ToolCall::new(call, tool, serde_json::Value::Null))")
+       "    let outcome = connector.run(ToolCall::new(call, tool, arguments)).await;",
+       "    let outcome = connector.run(ToolCall::new(call, tool, serde_json::Value::Null)).await;")
 mutate(
     "guard-for-denied-tool",
     "begin hands out a guard for a denial whose tool the surface serves",
@@ -725,6 +726,22 @@ mutate("core-give-up-completes-ok", "a guard given up records its call as ok", S
 mutate("core-give-up-skips-finish", "a guard given up leaves its row open and reports no failure", SRC + "audit.rs",
        "    let failure = store\n        .finish(&completion)\n        .await\n        .err()\n        .map(AuditFailure::from_store);",
        "    let failure: Option<AuditFailure> = None;")
+# A caller that goes away (decision 0009, "Where a call runs"): a read is cancelled, a side effect
+# is not.
+mutate("core-side-effect-cancelled", "a side effect is cancelled when its caller goes, like a read", SRC + "audit.rs",
+       "    if guard.tool.classification != Classification::Read {\n        return run(connector, guard).await;\n    }\n",
+       "")
+mutate("core-run-unless-drops-arguments", "a read run through run_unless is not given the call's arguments", SRC + "audit.rs",
+       "    let mut running = connector.run(ToolCall::new(call, tool, arguments));",
+       "    let mut running = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));")
+mutate("core-read-not-cancelled-mid-run", "a read whose caller goes while it runs is not cancelled", SRC + "audit.rs",
+       "        gone.as_mut().poll(context).map(|()| cancelled())\n",
+       "        Poll::Pending\n")
+mutate("core-read-gone-already-called", "a read whose caller has already gone is called all the same", SRC + "audit.rs",
+       "    if already_gone {\n", "    if false && already_gone {\n")
+mutate("core-read-cancel-outcome-ok", "a cancelled read is recorded as ok", SRC + "audit.rs",
+       "    let cancelled = || ToolOutcome::Error(sentences::CALLER_DISCONNECTED.to_owned());",
+       "    let cancelled = || ToolOutcome::Ok(serde_json::Value::Null);")
 # A list row (decision 0009): the tools it names, its count, and the value only it can make.
 mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
        "            .take(MAX_RECORDED_TOOLS)\n", "")
@@ -1723,6 +1740,26 @@ mutate("gw-ping-no-event", "a ping is answered with no event", GW_PATH,
        "                (Reply::Pong, None)\n"
        "            }\n",
        "            Call::Ping => (Reply::Pong, None),\n")
+# A call given up (decision 0009): with no connector registered, or with its client gone before
+# the connector is called, the row is completed as error and the connector is not called.
+mutate("gw-unregistered-row-left-open", "an allowed call whose connector is not registered leaves its row open", GW_PATH,
+       "            let gave_up = audit::give_up(store, guard).await;\n"
+       "            tracing::error!(\n"
+       "                row = row.as_str(),\n"
+       "                %connector,\n"
+       "                \"an allowed tool's connector is not registered; its row was completed as error\"\n"
+       "            );\n"
+       "            if let Some(failure) = gave_up.failure() {\n",
+       "            drop(guard);\n"
+       "            let _ = connector;\n"
+       "            if let Some(failure) = None::<gateway_core::audit::AuditFailure> {\n")
+mutate("gw-disconnect-before-run-ignored", "a call whose client has gone before it runs is run all the same", GW_PATH,
+       "        if disconnect.has_fired() {\n", "        if false && disconnect.has_fired() {\n")
+mutate("gw-read-not-cancelled", "a read whose client goes is run to completion", GW_PATH,
+       "        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;",
+       "        let ran = audit::run(connector, guard).await;")
+mutate("gw-disconnect-never-fires", "dropping the handler does not fire the disconnect", GW_PATH,
+       "            let _ = sender.send(());\n", "            drop(sender);\n")
 mutate("gw-unparsable-no-event", "a body refused at the protocol layer gives no event", GW_PATH,
        "                    path.emit(Event::Unparsable {\n"
        "                        deployment: path.inner.gates.deployment().clone(),\n"
@@ -1792,8 +1829,29 @@ mutate("gw-shutdown-waits-for-every-connection", "shutting down waits an hour fo
 mutate("gw-shutdown-leaves-connections-open", "a connection still open after the grace keeps serving after the server returns", GW_SERVER,
        "        tasks.spawn(async move {", "        tokio::spawn(async move {")
 mutate("gw-call-on-request-future", "the answer runs on the request's future, so a disconnect cancels it", GW_SERVER,
-       "    match tokio::spawn(answering.instrument(span)).await {",
-       "    match Ok::<_, tokio::task::JoinError>(answering.instrument(span).await) {")
+       "    let answered = tokio::spawn(answering.instrument(span)).await;",
+       "    let answered = Ok::<_, tokio::task::JoinError>(answering.instrument(span).await);")
+# A disconnect reaches a call only through the signal (decision 0009): the answer task is never
+# dropped or aborted with the handler, so begin and a side effect run to their end.
+mutate("gw-begin-on-request-future", "a disconnect aborts the answer task wherever it is, begin included", GW_SERVER,
+       "    let answered = tokio::spawn(answering.instrument(span)).await;",
+       "    struct Abort(tokio::task::AbortHandle);\n"
+       "    impl Drop for Abort {\n        fn drop(&mut self) {\n            self.0.abort();\n        }\n    }\n"
+       "    let task = tokio::spawn(answering.instrument(span));\n"
+       "    let abort = Abort(task.abort_handle());\n"
+       "    let answered = task.await;\n"
+       "    std::mem::forget(abort);")
+mutate("gw-side-effect-cancelled-on-disconnect", "the path drops any call, a side effect too, when its client goes", GW_PATH,
+       "        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;",
+       "        let ran = tokio::select! {\n"
+       "            ran = audit::run(connector, guard) => ran,\n"
+       "            () = disconnect.fired() => return (Reply::ToolError(DISCONNECTED_BEFORE_RUN.to_owned()), named),\n"
+       "        };")
+# No answer starts once the gateway stops taking connections, and every one starts until then.
+mutate("gw-calls-start-in-grace", "a request whose body arrives during the shutdown grace starts its call", GW_SERVER,
+       "    if !endpoint.starting.load(Ordering::SeqCst) {\n", "    if false && !endpoint.starting.load(Ordering::SeqCst) {\n")
+mutate("gw-calls-stop-at-unready", "no call starts once the readiness check fails, inside the removal", GW_SERVER,
+       "    ready.store(false, Ordering::SeqCst);\n", "    ready.store(false, Ordering::SeqCst);\n    starting.store(false, Ordering::SeqCst);\n")
 mutate("gw-request-timeout-bare", "a body that does not arrive in time gets a bare 408 with no sentence", GW_SERVER,
        "        return refused(&Rejection::request_timeout());",
        "        return HttpResponse { status: StatusCode::REQUEST_TIMEOUT, headers: HeaderMap::new(), body: Vec::new() };")
@@ -1801,8 +1859,11 @@ mutate("gw-ready-never-fails", "the readiness check still passes while the gatew
        "    ready.store(false, Ordering::SeqCst);\n", "")
 mutate("gw-stops-before-unready", "the gateway stops taking connections before the readiness removal, not after", GW_SERVER,
        "    accepting\n        .until(&mut tasks, tokio::time::sleep(timeouts.readiness_removal))\n        .await;\n"
+       "    // From here no answer starts, so no call starts after the readiness removal.\n"
+       "    starting.store(false, Ordering::SeqCst);\n"
        "    drop(listener);\n",
-       "    drop(listener);\n    tokio::time::sleep(timeouts.readiness_removal).await;\n")
+       "    drop(listener);\n    tokio::time::sleep(timeouts.readiness_removal).await;\n"
+       "    starting.store(false, Ordering::SeqCst);\n")
 # Telemetry at shutdown (decision 0009): the queue is closed and emptied before serving returns.
 mutate("gw-drain-not-awaited-on-shutdown", "serving returns without waiting for the queued events to be written", GW_SERVER,
        "    if let Err(error) = draining.await {\n"

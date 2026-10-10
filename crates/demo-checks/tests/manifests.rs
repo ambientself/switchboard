@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use common::read;
-use gateway::READINESS_REMOVAL;
+use gateway::{READINESS_REMOVAL, SHUTDOWN_GRACE};
 use sha2::{Digest, Sha256};
 
 /// The block of a top-level Compose service: its lines up to the next service.
@@ -420,7 +420,10 @@ fn the_gateway_is_given_time_to_complete_its_rows_when_it_stops() {
         "kind: the probe takes {noticed:?} to notice, longer than the gateway's \
          {READINESS_REMOVAL:?} readiness removal"
     );
-    let needed = READINESS_REMOVAL + begin_call_and_finish();
+    // No call starts once the gateway stops taking connections, so the last starts within the
+    // readiness removal. After the removal the gateway waits up to its shutdown grace for the
+    // connections still open, and for the calls running however long they take.
+    let needed = READINESS_REMOVAL + begin_call_and_finish().max(SHUTDOWN_GRACE);
     assert!(
         Duration::from_secs(grace) > needed,
         "kind: a grace period of {grace} s is not longer than {needed:?}"
