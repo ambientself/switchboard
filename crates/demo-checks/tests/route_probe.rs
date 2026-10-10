@@ -467,6 +467,27 @@ fn rows_the_probe_cannot_try_fail_the_run() {
             format!("server\t{}\tserver.test\n", server.url),
             "FAIL routes line 1: addresses are not address literals: server.test",
         ),
+        // curl would look these up as names, and a lookup that times out would read as refused.
+        (
+            "hex-name",
+            format!("server\t{}\tdeadbeef\n", server.url),
+            "FAIL routes line 1: addresses are not address literals: deadbeef",
+        ),
+        (
+            "octet",
+            format!("server\t{}\t127.0.0.1,10.0.0.256\n", server.url),
+            "FAIL routes line 1: addresses are not address literals: 127.0.0.1,10.0.0.256",
+        ),
+        (
+            "five-parts",
+            format!("server\t{}\t1.2.3.4.5\n", server.url),
+            "FAIL routes line 1: addresses are not address literals: 1.2.3.4.5",
+        ),
+        (
+            "leading-zero",
+            format!("server\t{}\t127.0.0.01\n", server.url),
+            "FAIL routes line 1: addresses are not address literals: 127.0.0.01",
+        ),
         (
             "no-address",
             format!("server\t{}\n", server.url),
@@ -494,7 +515,7 @@ fn rows_the_probe_cannot_try_fail_the_run() {
             .contains("FAIL EXPECT is refused or open, not dropped")
     );
     // The gateway was not asked either.
-    assert_eq!(gateway.heads().len(), 7);
+    assert_eq!(gateway.heads().len(), 11);
 }
 
 /// route-check.sh starts `/usr/local/bin/route-probe.sh` from the demo image; the image must

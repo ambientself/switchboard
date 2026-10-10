@@ -615,8 +615,10 @@ server_addresses() {
       ! json_object "$slices" ||
       ! addresses=$(jq -rn --argjson svc "$svc" --argjson slices "$slices" '
         [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[],
-         ($slices.items[] | (.endpoints // []) | if type == "array" then .[] else error("endpoints are not a list") end
-          | .addresses[] | if type == "string" then . else error("an address is not a string") end)]
+         ($slices.items | if type == "array" then .[] else error("items are not a list") end
+          | .endpoints | if . == null then empty elif type == "array" then .[] else error("endpoints are not a list") end
+          | .addresses | if type == "array" then .[] else error("addresses are not a list") end
+          | if type == "string" then . else error("an address is not a string") end)]
         | map(select(. != "None" and . != "")) | unique | join(",")'); then
       echo "could not read Service $service or its EndpointSlices" >&2
       return 1

@@ -170,6 +170,26 @@ unique() {
   done
 }
 
+# literals ADDRESSES: whether each entry of a comma list is an address literal. One without a
+# colon must be four decimal octets, 0 to 255, with no leading zero: curl looks up anything else
+# (deadbeef, 10.0.0.256) as a name, and a lookup that times out would count as refused. One with
+# a colon goes to curl in brackets, which curl takes only as an IPv6 literal, never as a name.
+literals() {
+  for literal_entry in $(IFS=,; for entry in $1; do echo "$entry"; done); do
+    case $literal_entry in
+      *:*) continue ;;
+      *[!0-9.]* | .* | *. | *..*) return 1 ;;
+    esac
+    # shellcheck disable=SC2046 # split on the dots
+    set -- $(IFS=.; for octet in $literal_entry; do echo "$octet"; done)
+    [ $# -eq 4 ] || return 1
+    for octet; do
+      case $octet in 0) ;; 0* | ????*) return 1 ;; esac
+      [ "$octet" -le 255 ] || return 1
+    done
+  done
+}
+
 # bracketed ADDRESS: an IPv6 literal in brackets, as a URL and curl's --resolve take it.
 bracketed() {
   case $1 in *:*) echo "[$1]" ;; *) echo "$1" ;; esac
@@ -237,6 +257,7 @@ while IFS="$TAB" read -r row url addresses flags extra; do
       case $addresses in
         *[!0-9a-fA-F.:,]* | ,* | *, | *,,*) broken "$number" "addresses are not address literals: $addresses"; continue ;;
       esac
+      literals "$addresses" || { broken "$number" "addresses are not address literals: $addresses"; continue; }
       ;;
   esac
 

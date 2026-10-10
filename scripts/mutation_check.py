@@ -2749,7 +2749,13 @@ mutate("route-check-configmap-sources-unchecked", "projected sources that are no
 mutate("route-check-audience-sources-unchecked", "projected sources that are not a list count as no token", ROUTE_CHECK,
        ".name as $v | sources\n", ".name as $v | .projected.sources[]?\n")
 mutate("route-check-endpoints-unchecked", "endpoints that are not a list are skipped, leaving the ClusterIP alone", ROUTE_CHECK,
-       """(.endpoints // []) | if type == "array" then .[] else error("endpoints are not a list") end""", ".endpoints[]?")
+       """.endpoints | if . == null then empty elif type == "array" then .[] else error("endpoints are not a list") end""", ".endpoints[]?")
+mutate("route-check-endpoints-false-skipped", "endpoints of false read as none, leaving the ClusterIP alone", ROUTE_CHECK,
+       "| .endpoints | if . == null then", "| (.endpoints // []) | if . == null then")
+mutate("route-check-addresses-unchecked", "endpoint addresses given as an object are read as its values", ROUTE_CHECK,
+       """.addresses | if type == "array" then .[] else error("addresses are not a list") end""", ".addresses[]")
+mutate("route-check-slices-unchecked", "EndpointSlices given as an object are read as its values", ROUTE_CHECK,
+       """$slices.items | if type == "array" then .[] else error("items are not a list") end""", "$slices.items[]")
 mutate("route-check-version-json-unchecked", "a version read of two objects is read as the last", ROUTE_CHECK,
        """ && json_object "$version" &&""", " &&")
 mutate("route-check-node-json-unchecked", "a node read of two objects is read as the last", ROUTE_CHECK,
@@ -2775,6 +2781,12 @@ mutate("probe-reads-curlrc", "curl reads the caller's .curlrc, which may add a c
        "  curl -q -s ", "  curl -s ")
 mutate("probe-name-not-pinned", "curl resolves the name again, so a slow lookup can time out as refused", PROBE,
        ' --resolve "$host:$port:$pinned"', "")
+mutate("probe-address-literal-unchecked", "an address column of hex letters or bad numbers goes to curl, which looks it up as a name", PROBE,
+       """      literals "$addresses" || { broken "$number" "addresses are not address literals: $addresses"; continue; }\n""", "")
+mutate("probe-octet-unbounded", "an octet over 255 passes as an address literal", PROBE,
+       '      [ "$octet" -le 255 ] || return 1\n', "")
+mutate("probe-octet-leading-zero", "an octet with a leading zero, which curl reads as octal, passes", PROBE,
+       "      case $octet in 0) ;; 0* | ????*) return 1 ;; esac\n", "      case $octet in ????*) return 1 ;; esac\n")
 mutate("probe-not-in-image", "the image does not install the probe", "deploy/Dockerfile",
        "COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh\n", "")
 

@@ -1706,6 +1706,10 @@ fn endpoints_that_cannot_be_read_fail() {
             r#"{"items": [{"endpoints": "10.244.0.7"}]}"#,
             r#"{"items": [{"endpoints": {"addresses": ["10.244.0.7"]}}]}"#,
             r#"{"items": [{"endpoints": [{"addresses": [7]}]}]}"#,
+            // jq's `//` reads false as null, and `.[]` iterates an object's values.
+            r#"{"items": [{"endpoints": false}]}"#,
+            r#"{"items": [{"endpoints": [{"addresses": {"ip": "10.244.0.7"}}]}]}"#,
+            r#"{"items": {"slice": {"endpoints": [{"addresses": ["10.244.0.7"]}]}}}"#,
         ],
         "the probe ran: could not read the servers' addresses",
     );
