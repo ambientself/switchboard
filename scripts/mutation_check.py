@@ -3179,6 +3179,24 @@ mutate("probe-multi-transfer-unrefused", "an attempt whose output is not one req
        "  if ! one_transfer \"$attempt_out\"; then\n", "  if ! one_transfer \"$attempt_out\" && false; then\n")
 mutate("probe-gateway-multi-transfer-accepted", "the gateway check reads two requests' results as one", PROBE,
        """one_transfer "$out" || stop""", """one_transfer "$out" || true ||  stop""")
+# #86: a refusal after a connection, an address-literal host the row never tries, a bracketed
+# host that is not IPv6, and the proxy variables.
+mutate("probe-reject-ok-after-connect-refused", "a refused retry after curl connected counts as refused under reject_ok", PROBE,
+       "        *,reject_ok,*:0) echo refused ;;\n", "        *,reject_ok,*) echo refused ;;\n")
+mutate("probe-proxy-on", "curl reads the proxy variables, so an attempt can go to a proxy", PROBE,
+       "  curl -q -g -s --noproxy '*' -o ", "  curl -q -g -s -o ")
+mutate("probe-literal-host-not-in-addresses", "a URL's address-literal host that is not one of the row's addresses passes, and is never tried", PROBE,
+       """          *) broken "$number" "the host $host of the URL is not one of its addresses: $addresses"; continue ;;\n""", "")
+mutate("probe-bracketed-host-unchecked", "a bracketed host that is not an IPv6 literal passes the row check", PROBE,
+       "        *[!0-9a-fA-F.:]*) ;;\n        *:*) literal=1 ;;\n", "        *) literal=1 ;;\n")
+mutate("probe-literal-resolve-looked-up", "a resolve row with an address-literal host looks the host up instead of trying it", PROBE,
+       "    found=$host\n", "    found=$(resolve \"$host\")\n")
+mutate("route-check-literal-host-not-in-addresses", "route-check.sh accepts a row whose address-literal host is not one of its addresses", ROUTE_CHECK,
+       """elif $literal and $addresses != "resolve" and (any($addresses | split(",")[]; . == $host) | not) then""", "elif false then")
+mutate("route-check-bracketed-host-unchecked", "route-check.sh accepts a bracketed host that is not an IPv6 literal", ROUTE_CHECK,
+       """if ($authority | startswith("[")) and ($host | test("^[0-9a-fA-F.:]*:[0-9a-fA-F.:]*$") | not) then""", "if false then")
+mutate("route-check-broken-rows-ignored", "route-check.sh starts the probe whatever rows it found broken", ROUTE_CHECK,
+       """  if [ -n "$broken" ]; then\n    local row why\n""", """  if false; then\n    local row why\n""")
 mutate("probe-not-in-image", "the image does not install the probe", "deploy/Dockerfile",
        "COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh\n", "")
 
