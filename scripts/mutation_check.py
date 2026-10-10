@@ -3350,7 +3350,7 @@ def verdict(mutation: Mutation, code: int | None, output: str) -> tuple[str, str
     trybuild = sorted(set(re.findall(r"^test (tests/compile-fail/\S+) \.\.\. (?:error|mismatch)$", output, re.M)))
     if failed:
         return "CAUGHT", ", ".join(failed + trybuild)
-    broken = re.findall(r"could not compile `gateway-[a-z]+` \(([^)]*)\)", output)
+    broken = re.findall(r"could not compile `gateway(?:-[a-z]+)?` \(([^)]*)\)", output)
     if mutation.breaks_build and "lib" in broken:
         return "CAUGHT", "the library does not compile, as intended"
     if broken:
