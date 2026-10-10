@@ -250,8 +250,8 @@ the ConfigMap is the pipeline's, and is stated with it.
 **Emergency withdrawal** is an edit to the registry: removing the tool from its surfaces, or
 removing the tool or its entry. It takes effect on a replica within the delivery bound plus one
 `registry.poll_seconds`: in kind, at most 120 s plus one poll once the ConfigMap is applied, and
-in Compose, one poll. Restarting
-the deployment after applying the ConfigMap bounds it by the rollout instead. The same bound
+in Compose, one poll. Restarting the deployment after applying the ConfigMap bounds it by the
+rollout instead. The same bound
 applies to every lever that is a registry edit, including the two in decision 0012: removing a
 team from a surface's allowlist, and withdrawing a surface.
 
@@ -309,10 +309,11 @@ in the gateway pod only the token-writer container mounts an API token, and no w
 **Fetching the API server's keys (#88) does not give the gateway container a token.** A second
 projected token cannot help: every projected token authenticates as the pod's own
 ServiceAccount, with its TokenRequest grants. Instead, in kind, the gateway fetches
-`/openid/v1/jwks` with no token. This project binds `system:service-account-issuer-discovery` to `system:unauthenticated`
-in the kind cluster, which serves the issuer's discovery document and public keys and nothing
-else, and the gateway trusts `kube-root-ca.crt` for it. Other clusters publish their issuer's
-keys at a URL that needs no token. Where that binding is not wanted, kind keeps its keys file.
+`/openid/v1/jwks` with no token. In the kind cluster this project binds
+`system:service-account-issuer-discovery` to `system:unauthenticated`, which serves the
+issuer's discovery document and public keys and nothing else, and the gateway trusts
+`kube-root-ca.crt` for it. EKS publishes its issuer's keys at a public URL that needs no token.
+In a cluster whose owner does not want that binding, the gateway keeps a keys file there.
 
 ### 11. Acceptance scenarios
 
@@ -355,16 +356,18 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
   with the TokenRequest grants, in the process that handles callers' requests.
 - **Signed snapshot expiry now.** Nothing signs snapshots yet. The maximum age covers a replica
   that cannot read its file, and the delivery path's bound is stated separately.
-- **A hash of the withdrawn names in the revision** (the first draft of this record). A row's
+- **A hash of the withdrawn names in the revision,** as first proposed for this record. A row's
   revision would not say what was in force once the logs mapping the hash were gone.
-- **Treating a failed poll as drift.** A server that is down would lose its tools on every
-  replica, and one that is slow on purpose could withdraw its own tools.
+- **Treating a failed poll as drift.** A server that is down for one interval would lose its
+  tools on every replica, and get them back only through a new approval, for an outage that
+  changed nothing.
 
 ## Consequences
 
 - **#11 builds:** `binding_sha256` and its recomputation; the identity and destination rules;
   the dialect refusal; the drift pass with its derived revisions and standing withdrawals; the
-  probe command and record; the token writer; and the scenarios above. The loader gains these
+  probe command and record; the token writer; the maximum age and the stale-policy refusal;
+  and the scenarios above. The loader gains these
   rules, each with a case and a mutation in `scripts/mutation_check.py`: both hashes
   recomputed, identity equal to the address's host, the destination rules, a probe record on
   every proxied entry, the dialect, and at most 16 proxied tools.
