@@ -7,15 +7,21 @@
 //! row records the instance that began it.
 //!
 //! [`prepare`] reads the registry file, loads each proxied server's credential, builds a
-//! [`ProxyConnector`] per server, connects the Postgres audit store and runs its boot checks
-//! (or takes audit as explicitly disabled), and then runs the boot gates
-//! ([`boot::check_registry`]). Any failure refuses to start, naming the reason, before
-//! anything is served.
+//! [`ProxyConnector`] per server, fetches the keys of each issuer configured with a keys URL,
+//! connects the Postgres audit store and runs its boot checks (or takes audit as explicitly
+//! disabled), and then runs the boot gates ([`boot::check_registry`]). Any failure refuses to
+//! start, naming the reason, before anything is served.
+//!
+//! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
+//! own origin, and plain `http`, since this build cannot fetch over TLS (issue #88). Then each
+//! issuer's keys are fetched once, and a fetch that fails refuses to start, naming the issuer
+//! and the cause. The [`KeyRefresher`] in [`Prepared`] fetches them again on a timer.
 //!
 //! It logs one `"event":"boot"` line per gate, which an operator (and the demo) reads to see
 //! how the gateway was started: identity enforced or disabled, with how many issuers and
-//! subjects; audit in Postgres, with the role and its check, or disabled; and the registry's
-//! revision.
+//! subjects; each issuer whose keys were fetched, with how many keys and how often they are
+//! fetched again; audit in Postgres, with the role and its check, or disabled; and the
+//! registry's revision.
 //!
 //! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
@@ -30,14 +36,16 @@ use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSi
 use connector_proxy::{
     CredentialFileError, FileCredentials, ProxyConnector, Upstream, UpstreamError,
 };
-use gateway_core::{ConnectorName, InstanceName};
+use gateway_core::{ConnectorName, InstanceName, Issuer};
 use gateway_identity::Clock;
 use gateway_registry::{Credential, Registry, RegistryError};
+use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError};
 use thiserror::Error;
 
 use crate::boot::{self, BootError, Gates, Settings, Wiring};
 use crate::config::{IdentitySection, IssuerKindEntry};
-use crate::deployment::{AuditChoice, Deployment};
+use crate::deployment::{AuditChoice, Deployment, KeysUrl};
+use crate::keys::KeyRefresher;
 use crate::reload::Reloader;
 
 /// The `event` field of the error logged for each audit row the Postgres store stops trying to
@@ -89,6 +97,24 @@ pub enum StartError {
     /// A server's connector could not be built.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
+    /// An issuer's keys URL is `https`, and this build cannot fetch over TLS.
+    #[error(
+        "the keys URL for issuer `{0}` is https, and this gateway cannot fetch keys over TLS \
+         yet (issue #88); give the issuer a keys_file instead"
+    )]
+    KeysOverTls(Issuer),
+    /// An issuer's keys URL breaks a rule of the key source, such as being off the issuer's
+    /// origin.
+    #[error(transparent)]
+    KeysUrl(SourceError),
+    /// An issuer's keys could not be fetched at boot.
+    #[error("cannot fetch the keys of issuer `{issuer}` at boot: {cause}")]
+    KeysFetch {
+        /// The issuer.
+        issuer: Issuer,
+        /// Why the fetch failed.
+        cause: FetchError,
+    },
     /// The database URL does not parse.
     #[error("the audit database URL does not parse: {0}")]
     DatabaseUrl(String),
@@ -117,6 +143,9 @@ pub struct Prepared {
     pub store: Option<Arc<PgAuditStore>>,
     /// What keeps the policy in step with the registry file.
     pub watch: Watch,
+    /// What fetches the keys of each issuer with a keys URL again, on its timer. Run it beside
+    /// the watch, and stop it when the gateway shuts down.
+    pub keys: KeyRefresher,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -125,6 +154,7 @@ impl std::fmt::Debug for Prepared {
             .field("gates", &self.gates)
             .field("store", &self.store.is_some())
             .field("watch", &self.watch)
+            .field("keys", &self.keys)
             .finish()
     }
 }
@@ -196,6 +226,9 @@ pub async fn prepare(
             .call_deadline(server.name.clone(), deadline);
     }
 
+    let mut identity = deployment.identity;
+    let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;
+
     let store = match &deployment.audit {
         AuditChoice::Disabled => None,
         AuditChoice::Postgres { url } => Some(audit_store(url).await?),
@@ -204,11 +237,11 @@ pub async fn prepare(
         wiring = wiring.audit_store(store.clone());
     }
 
-    let (issuers, subjects) = identity_counts(&deployment.identity);
-    let identity_enforced = !deployment.identity.disabled;
+    let (issuers, subjects) = identity_counts(&identity);
+    let identity_enforced = !identity.disabled;
     let settings = Settings {
         deployment: deployment.deployment,
-        identity: deployment.identity,
+        identity,
         audit: deployment.audit.section(),
         http: deployment.http,
     };
@@ -216,6 +249,22 @@ pub async fn prepare(
     let tools = registry.routes().len();
     let servers = registry.servers().len();
     let (gates, reloader) = boot::check_registry(settings, registry, wiring)?;
+    let mut keys = KeyRefresher::new(gates.shared_identity());
+    for Fetched {
+        source,
+        refresh,
+        count,
+    } in fetched
+    {
+        tracing::info!(
+            event = "boot",
+            keys_issuer = source.issuer().as_str(),
+            keys = count,
+            refresh_seconds = refresh.as_secs(),
+            "fetched the issuer's keys from its keys URL"
+        );
+        keys.add(source, refresh);
+    }
 
     if identity_enforced {
         tracing::info!(
@@ -267,7 +316,62 @@ pub async fn prepare(
             every: deployment.poll,
             loaded,
         },
+        keys,
     })
+}
+
+/// An issuer's key source, with how often to fetch again and how many keys its first fetch
+/// returned.
+struct Fetched {
+    source: KeySource,
+    refresh: Duration,
+    count: usize,
+}
+
+/// Checks every keys URL, then fetches each issuer's keys once and puts them in its entry in
+/// `identity`. Refuses a URL the key source refuses, an `https` one by name, and a fetch that
+/// fails.
+async fn fetch_keys(
+    keys_urls: &[KeysUrl],
+    identity: &mut IdentitySection,
+) -> Result<Vec<Fetched>, StartError> {
+    let mut sources = Vec::with_capacity(keys_urls.len());
+    for keys_url in keys_urls {
+        let source = KeySource::new(&keys_url.issuer, &keys_url.url, FetchOptions::default())
+            .map_err(|error| match error {
+                SourceError::TlsUnavailable(issuer) => StartError::KeysOverTls(issuer),
+                other => StartError::KeysUrl(other),
+            })?;
+        sources.push((source, keys_url.refresh));
+    }
+    let mut fetched = Vec::with_capacity(sources.len());
+    for (source, refresh) in sources {
+        let issuer = source.issuer().clone();
+        let keys = source
+            .fetch()
+            .await
+            .map_err(|cause| StartError::KeysFetch {
+                issuer: issuer.clone(),
+                cause,
+            })?;
+        let count = keys.keys.len();
+        let entry = identity
+            .enforce
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.issuer == issuer);
+        if let Some(entry) = entry {
+            // A JWK set always serializes. If it somehow did not, `null` is not a JWK set, and
+            // the identity gate refuses to build.
+            entry.keys = serde_json::to_value(&keys).unwrap_or_default();
+        }
+        fetched.push(Fetched {
+            source,
+            refresh,
+            count,
+        });
+    }
+    Ok(fetched)
 }
 
 /// The gateway's credential for each server, from the file the deployment gives for its
