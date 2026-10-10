@@ -1099,7 +1099,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   budget. The identifier and begin are built: the gateway makes one UUIDv7 per call before
   begin, and every store's begin takes it and is idempotent on it, comparing only the
   decision. The audit table has no default for it, and the gateway's role may insert it. The
-  retry is not built yet: the Postgres store still gives up at the budget.
+  retry is built in the Postgres store: a begin attempt that fails in a way trying again
+  could fix gives up its connection and is tried again on a new one, under the same
+  identifier, with pauses that double up to a second, all within the one begin budget. A
+  retry that finds its own row, written by an attempt whose confirmation was lost, succeeds.
 - A `BEFORE INSERT` trigger sets the time at begin and the deadline from the database's clock
   and the allowance the gateway supplies, and a call row cannot be stored without a deadline.
   Built: `set_times` sets the time at begin, the deadline (that time plus the row's
@@ -1136,10 +1139,21 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.
 - A row whose begin confirmation was lost is completed as `error` on the finish pool, and
-  giving up a guard without running completes its row as `error`. The second half is built in
-  the core: `audit::give_up` consumes a guard, calls no connector, and completes its row as
-  `error` with a latency of zero. The gateway does not call it yet: that is #40. Today a row
-  whose insert commits after its begin failed stays open.
+  giving up a guard without running completes its row as `error`. The first half is built in
+  the Postgres store: when an allowed call's begin fails, and any of its attempts executed
+  its insert and then ran out of budget or failed with an error that trying again could fix,
+  a task on the finish pool completes the row as `error` with a latency of zero until the
+  finish deadline, counted in flight so shutdown waits for it. A later attempt's error does
+  not undo that, and the error may be an explicit refusal, such as a read-only server's.
+  That task alone waits for a missing row, which may still commit. It keeps trying through
+  the deadline, makes its last attempt at the deadline, and lets the deadline cut no
+  attempt short, so an insert whose cancel failed and that commits before the deadline is
+  completed. A row its last attempt found missing is counted as never written, not given
+  up. A database that stays locked, unreachable or read-only past the deadline leaves the
+  store unable to tell, and that row is given up and reported. Denials and list rows need
+  nothing. The second half is built in the core: `audit::give_up` consumes a guard, calls no
+  connector, and completes its row as `error` with a latency of zero. The gateway does not
+  call it yet: that is #40.
 - In the core: `Begun` gains the answers to a reused key;
   `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
   key check joins `decide` after check 6, skipped for `tools/list`; and the properties

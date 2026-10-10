@@ -76,7 +76,7 @@ pub enum PgAuditError {
     /// Begin did not have a connection and a committed row within its budget. The call is
     /// refused. If the insert was sent, the store asked the server to cancel it, but a cancel
     /// is best effort: the row may still have been written, as decision 0009 allows for a
-    /// begin reported as failed.
+    /// begin reported as failed. The store then completes an allowed row as `error`.
     #[error("the audit row was not written within the begin budget of {budget:?}")]
     BeginBudget {
         /// The budget that ran out.
@@ -116,7 +116,8 @@ impl PgAuditError {
     /// Whether trying again could succeed: the database could not be reached, the connection
     /// broke, the server is short of something, shutting down or read-only, a lock was not had
     /// in time, or an attempt took too long. A refusal by the database itself, a missing row
-    /// or a different completion is final.
+    /// or a different completion is final; only the task completing a failed begin's row waits
+    /// for a missing one.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {
@@ -197,24 +198,35 @@ impl Default for Budgets {
     }
 }
 
-/// What has become of the finishes a store was given.
+/// What has become of the finishes a store was given, and of the allowed rows whose begin
+/// failed after its insert was executed, which the store completes as `error` on the finish
+/// pool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FinishCounts {
     /// Still trying to complete their row.
     pub in_flight: usize,
     /// Stopped without completing their row: the deadline passed, the database or the store
-    /// refused, or the task was dropped before it ended. Each such row keeps an empty outcome.
+    /// refused, or the task was dropped before it ended. Each such row, if it was written,
+    /// keeps an empty outcome. A failed begin's row whose last attempt got no answer, or a
+    /// refusal, is counted here even if its insert never committed: the store cannot tell.
     pub given_up: u64,
+    /// Failed begins whose row the last attempt, made at the finish deadline, found missing:
+    /// the insert had not committed by then, so there was nothing to complete. Not given up,
+    /// and not reported.
+    pub never_written: u64,
 }
 
 #[derive(Default)]
 struct Counters {
     in_flight: AtomicUsize,
     given_up: AtomicU64,
+    never_written: AtomicU64,
 }
 
 /// A finish that stopped without completing its row, which keeps an empty outcome. Decision
-/// 0009 makes each one a telemetry event naming the row and the outcome's kind.
+/// 0009 makes each one a telemetry event naming the row and the outcome's kind. A row whose
+/// begin failed after its insert was executed, and which the store could not complete as
+/// `error`, is reported the same way, with the outcome `error`.
 #[derive(Debug)]
 pub struct GivenUp<'a> {
     /// The row finish named.
@@ -268,6 +280,16 @@ impl Settle {
         }
     }
 
+    /// Settles the completion of a failed begin's row that never appeared: nothing was
+    /// written, so nothing is left open, and nothing is reported.
+    fn never_written(mut self) {
+        self.settled = true;
+        self.in_flight
+            .0
+            .never_written
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     fn give_up(&self, error: &PgAuditError) {
         self.in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
         (self.report)(GivenUp {
@@ -307,10 +329,15 @@ pub(crate) const SESSION_SETTINGS: &[(&str, &str)] = &[
 /// [`SESSION_SETTINGS`] as startup options.
 const SESSION_OPTIONS: &str = "-c synchronous_commit=on -c search_path=pg_catalog,pg_temp";
 
-/// The first pause between attempts to complete a row; each pause after doubles, up to
-/// [`LONGEST_PAUSE`].
+/// The first pause between attempts to write or complete a row; each pause after doubles, up
+/// to [`LONGEST_PAUSE`].
 const FIRST_PAUSE: Duration = Duration::from_millis(50);
 const LONGEST_PAUSE: Duration = Duration::from_secs(1);
+
+/// The pause after `pause`.
+fn longer(pause: Duration) -> Duration {
+    (pause * 2).min(LONGEST_PAUSE)
+}
 
 /// How long a request to cancel a statement may take before the store stops asking.
 pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
@@ -322,14 +349,34 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// identifier, and the database sets both its times.
 ///
 /// - Begin inserts the first half of a row and returns once the insert is committed. It has
-///   [`Budgets::begin`], counted from asking for a connection. Past it, begin fails, so the
-///   core refuses the call, and the connection is discarded. The store asks the server to
-///   cancel the insert, which stops one still waiting, for example on a lock. One that has
-///   already committed, or commits before the cancel arrives, stays: a begin reported as
-///   failed may still have written its row (decision 0009). Until that row is completed as
-///   `error` (design section 17), it keeps an empty outcome. A begin whose insert fails in a
-///   way trying again could fix, such as a server that has become read-only, also discards its
-///   connection, so the next begin makes a new one rather than fail on it too.
+///   [`Budgets::begin`], counted from asking for a connection. An attempt that fails in a way
+///   trying again could fix, such as a broken connection or a server that has become
+///   read-only, discards its connection, and begin tries again on a new one, under the same
+///   identifier, after a pause that doubles each time and never runs past the budget. A retry
+///   that finds the row stored with the same decision has found its own row, written by an
+///   attempt whose confirmation was lost, and succeeds. Past the budget, begin fails, so the
+///   core refuses the call, and the store asks the server to cancel an insert still running,
+///   which stops one still waiting, for example on a lock.
+/// - A begin reported as failed may still have written its row (decision 0009): an insert
+///   that commits before its cancel arrives, or one whose confirmation was lost with its
+///   connection. So when an allowed call's begin fails, and any of its attempts executed an
+///   insert and then ran out of budget or failed in a way that trying again could fix, the
+///   store completes the row as `error` with a latency of 0, on a task of its own on the
+///   finish pool, until [`Budgets::finish_deadline`]. A later attempt's error, of whatever
+///   kind, does not undo that. An attempt that never got as far as executing its insert, for
+///   example one whose statement was still being prepared, counts for nothing. The error
+///   that trying again could fix may be an explicit refusal, such as a read-only server's:
+///   it starts the task too. Nothing ran, so the row overstates what ran rather than
+///   understate it. The insert may still commit, so that task alone tries again while the
+///   row is missing. It keeps trying until the deadline, makes its last attempt at the
+///   deadline itself, and lets each attempt run its full [`Budgets::answer`], so it can end
+///   up to one answer budget after the deadline. A row the last attempt found missing had
+///   not been written by then, and is counted in [`FinishCounts::never_written`]. A row that could not
+///   be completed is given up and reported, as a finish is, and so is one whose last attempt
+///   got no answer: a database that stays unreachable, locked or read-only past the deadline
+///   leaves the store unable to tell, so a refusal that lasts that long is reported even
+///   when no row was written. A denial needs nothing: it is a complete record, which the
+///   table's trigger never lets be completed. Nor does a list row, which is written complete.
 /// - List writes a row of kind `list`, complete, with begin's pool, budget and handling of
 ///   an identifier already stored: a list row under it is this list's own, and a call row is
 ///   an error.
@@ -347,9 +394,12 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   column's range, and gives up.
 ///
 /// If the caller stops waiting for finish, its task still completes the row. If the runtime
-/// drops the task first, the finish is counted and reported as given up.
+/// drops the task first, the finish is counted and reported as given up. So is the task that
+/// completes a failed begin's row, which [`finishes`](Self::finishes) counts in flight, so a
+/// gateway shutting down waits for it too.
 ///
-/// Must be used inside a Tokio runtime: finish spawns its task there.
+/// Must be used inside a Tokio runtime: finish, and a begin that fails after executing its
+/// insert, spawn their tasks there.
 pub struct PgAuditStore {
     pub(crate) begin: Pool,
     pub(crate) finish: Pool,
@@ -436,28 +486,76 @@ impl PgAuditStore {
         self.budgets
     }
 
-    /// How many finishes are still trying, and how many gave up. A gateway shutting down can
-    /// wait for `in_flight` to reach zero; `given_up` is for its telemetry.
+    /// How many finishes, and completions of failed begins' rows, are still trying, how many
+    /// gave up, and how many found no row to complete. A gateway shutting down can wait for
+    /// `in_flight` to reach zero; `given_up` is for its telemetry.
     pub fn finishes(&self) -> FinishCounts {
         FinishCounts {
             in_flight: self.counters.in_flight.load(Ordering::SeqCst),
             given_up: self.counters.given_up.load(Ordering::SeqCst),
+            never_written: self.counters.never_written.load(Ordering::SeqCst),
         }
     }
 
     /// Writes a call row's first half, or a list row, within the begin budget, on the begin
-    /// pool.
+    /// pool, trying again by identifier while the failure is one that trying again could fix.
     async fn insert(&self, row: Insert) -> Result<(), PgAuditError> {
+        let deadline = Instant::now() + self.budgets.begin;
+        // Whether an attempt executed its insert and ended without an answer, or with an error
+        // trying again could fix, so that the row may exist. That error may be an explicit
+        // refusal, such as a read-only server's. Once set it stays set: what a later attempt
+        // finds does not undo an insert that may have committed.
+        let mut may_be_written = false;
+        let mut pause = FIRST_PAUSE;
+        let failed = loop {
+            let mut sent = false;
+            let error = match self.insert_once(&row, deadline, &mut sent).await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            let unanswered =
+                error.is_transient() || matches!(error, PgAuditError::BeginBudget { .. });
+            may_be_written |= sent && unanswered;
+            if !error.is_transient() {
+                break error;
+            }
+            // The same row again, under the same identifier: if the last attempt committed,
+            // the next finds that row rather than write a second.
+            let now = Instant::now();
+            sleep_until((now + pause).min(deadline)).await;
+            if Instant::now() >= deadline {
+                break error;
+            }
+            pause = longer(pause);
+        };
+        // A denial is a complete record, and a list row is written complete: neither is left
+        // open.
+        if may_be_written
+            && let Insert::Call(call) = &row
+            && call.decision == "allow"
+        {
+            self.complete_lost_begin(AuditRowId::new(call.id.clone()));
+        }
+        Err(failed)
+    }
+
+    /// One attempt at [`insert`](Self::insert), ending by `deadline`. Sets `sent` as the insert
+    /// itself goes out, after its statement is prepared: a prepare cannot commit a row.
+    async fn insert_once(
+        &self,
+        row: &Insert,
+        deadline: Instant,
+        sent: &mut bool,
+    ) -> Result<(), PgAuditError> {
         let budget = self.budgets.begin;
-        let deadline = Instant::now() + budget;
         let client = timeout_at(deadline, self.begin.get())
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
-        match timeout_at(deadline, insert_on(&client, &row)).await {
+        match timeout_at(deadline, insert_on(&client, row, sent)).await {
             Ok(Err(error)) if error.is_transient() => {
                 // A failure trying again could fix may be the connection's own: one that found
                 // the server read-only, as the old primary is after a failover, stays so. The
-                // next begin makes a new connection rather than fail on this one.
+                // next attempt makes a new connection rather than fail on this one.
                 drop(Object::take(client));
                 Err(error)
             }
@@ -467,6 +565,42 @@ impl PgAuditStore {
                 Err(PgAuditError::BeginBudget { budget })
             }
         }
+    }
+
+    /// Completes `row`, whose begin failed after its insert was executed, as `error` with a
+    /// latency of 0, on a task of its own on the finish pool, until the finish deadline.
+    /// Counted in flight until it ends.
+    fn complete_lost_begin(&self, row: AuditRowId) {
+        let settle = Settle {
+            in_flight: InFlight::start(&self.counters),
+            report: Arc::clone(&self.given_up),
+            row: row.clone(),
+            outcome: "error",
+            settled: false,
+        };
+        let task = Retry {
+            pool: self.finish.clone(),
+            cancel: Arc::clone(&self.cancel),
+            row: row.as_str().to_owned(),
+            finish: FinishRow {
+                outcome: "error",
+                outcome_sentence: None,
+                latency_ms: 0,
+            },
+            attempt: self.budgets.answer,
+            deadline: Instant::now() + self.budgets.finish_deadline,
+            row_may_commit: true,
+        };
+        tokio::spawn(async move {
+            match task.run().await {
+                Err(PgAuditError::Deadline { last, .. })
+                    if matches!(*last, PgAuditError::NoSuchRow { .. }) =>
+                {
+                    settle.never_written();
+                }
+                result => settle.settle(&result),
+            }
+        });
     }
 
     /// Completes `row` in one attempt, on a connection from the finish pool, with no budget.
@@ -514,6 +648,7 @@ impl PgAuditStore {
             finish,
             attempt: self.budgets.answer,
             deadline: started + self.budgets.finish_deadline,
+            row_may_commit: false,
         };
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
@@ -544,11 +679,16 @@ enum Insert {
     List(ListRow),
 }
 
-/// Writes `row`, as begin or list.
-async fn insert_on(client: &ClientWrapper, row: &Insert) -> Result<(), PgAuditError> {
+/// Writes `row`, as begin or list. Sets `sent` just before the insert is executed: from then
+/// on it may commit, whatever answer comes back, or none.
+async fn insert_on(
+    client: &ClientWrapper,
+    row: &Insert,
+    sent: &mut bool,
+) -> Result<(), PgAuditError> {
     match row {
-        Insert::Call(row) => begin_on(client, row).await,
-        Insert::List(row) => list_on(client, row).await,
+        Insert::Call(row) => begin_on(client, row, sent).await,
+        Insert::List(row) => list_on(client, row, sent).await,
     }
 }
 
@@ -556,8 +696,13 @@ async fn insert_on(client: &ClientWrapper, row: &Insert) -> Result<(), PgAuditEr
 /// A row already stored with the same decision is this begin's own, written by an earlier
 /// attempt, which is success; one with another decision is not, and nor is a list row, which
 /// has none.
-async fn begin_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditError> {
+async fn begin_on(
+    client: &ClientWrapper,
+    row: &BeginRow,
+    sent: &mut bool,
+) -> Result<(), PgAuditError> {
     let statement = client.prepare_cached(BeginRow::INSERT).await?;
+    *sent = true;
     let inserted = client.execute(&statement, &row.parameters()).await?;
     if inserted == 1 {
         return Ok(());
@@ -588,8 +733,13 @@ async fn begin_on(client: &ClientWrapper, row: &BeginRow) -> Result<(), PgAuditE
 /// Inserts a list row under its identifier, unless that row is already stored. A list row
 /// already stored is this list's own, written by an earlier attempt, which is success; a call
 /// row is not.
-async fn list_on(client: &ClientWrapper, row: &ListRow) -> Result<(), PgAuditError> {
+async fn list_on(
+    client: &ClientWrapper,
+    row: &ListRow,
+    sent: &mut bool,
+) -> Result<(), PgAuditError> {
     let statement = client.prepare_cached(ListRow::INSERT).await?;
+    *sent = true;
     let inserted = client.execute(&statement, &row.parameters()).await?;
     if inserted == 1 {
         return Ok(());
@@ -667,6 +817,11 @@ struct Retry {
     finish: FinishRow,
     attempt: Duration,
     deadline: Instant,
+    /// The row's begin failed after executing its insert, which may yet commit. So a missing
+    /// row is waited for, attempts go on until the deadline, the last one at the deadline
+    /// itself, and the deadline cuts none short. For a finish the row was begun, and a missing
+    /// one is final.
+    row_may_commit: bool,
 }
 
 impl Retry {
@@ -675,24 +830,39 @@ impl Retry {
         loop {
             let last = match self.once().await {
                 Ok(()) => return Ok(()),
+                Err(error @ PgAuditError::NoSuchRow { .. }) if self.row_may_commit => error,
                 Err(error) if !error.is_transient() => return Err(error),
                 Err(error) => error,
             };
+            let deadline_passed = || PgAuditError::Deadline {
+                row: self.row.clone(),
+                last: Box::new(last),
+            };
+            // An attempt that ended at or past the deadline was the last.
             let now = Instant::now();
             if now >= self.deadline {
-                return Err(PgAuditError::Deadline {
-                    row: self.row,
-                    last: Box::new(last),
-                });
+                return Err(deadline_passed());
             }
             sleep_until((now + pause).min(self.deadline)).await;
-            pause = (pause * 2).min(LONGEST_PAUSE);
+            // A finish stops when a pause reaches its deadline: an attempt started there would
+            // be cut short at once. A completion of a failed begin's row makes one more
+            // attempt, at the deadline, with its full answer budget: an insert that committed
+            // by then is completed, and the task ends with that attempt's own answer, so a row
+            // never written is told apart from one that could not be completed.
+            if !self.row_may_commit && Instant::now() >= self.deadline {
+                return Err(deadline_passed());
+            }
+            pause = longer(pause);
         }
     }
 
-    /// One attempt, bounded by the answer budget and by the deadline.
+    /// One attempt, bounded by the answer budget, and for a finish by the deadline too.
     async fn once(&self) -> Result<(), PgAuditError> {
-        let by = (Instant::now() + self.attempt).min(self.deadline);
+        let by = if self.row_may_commit {
+            Instant::now() + self.attempt
+        } else {
+            (Instant::now() + self.attempt).min(self.deadline)
+        };
         let client = timeout_at(by, self.pool.get())
             .await
             .map_err(|_| PgAuditError::AttemptTimedOut)??;
@@ -964,7 +1134,8 @@ mod unit {
             store.finishes(),
             FinishCounts {
                 in_flight: 1,
-                given_up: 0
+                given_up: 0,
+                never_written: 0
             }
         );
 
@@ -973,7 +1144,8 @@ mod unit {
             store.finishes(),
             FinishCounts {
                 in_flight: 0,
-                given_up: 1
+                given_up: 1,
+                never_written: 0
             }
         );
         let lost = PgAuditError::FinishTaskLost {

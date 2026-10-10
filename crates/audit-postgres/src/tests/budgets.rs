@@ -11,7 +11,8 @@ use gateway_core::audit::{self, Answer, AuditFailure, Begun, Outcome, Ran};
 use gateway_core::{CallContext, RequestedTool, decide};
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector, READ_TOOL,
-    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, row_start,
+    SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL,
+    row_start,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,13 +28,13 @@ use crate::store::CANCEL_WAIT;
 use crate::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
 
 /// How much later than its budget a step may end and still count as on time.
-const SLACK: Duration = Duration::from_secs(2);
+pub(super) const SLACK: Duration = Duration::from_secs(2);
 
 /// What a store reported of each finish that gave up: the row, the outcome, and why.
-type Reports = Arc<std::sync::Mutex<Vec<(String, &'static str, String)>>>;
+pub(super) type Reports = Arc<std::sync::Mutex<Vec<(String, &'static str, String)>>>;
 
 /// `store`, keeping what it reports of each finish that gives up.
-fn reporting(store: PgAuditStore) -> (PgAuditStore, Reports) {
+pub(super) fn reporting(store: PgAuditStore) -> (PgAuditStore, Reports) {
     let reports = Reports::default();
     let kept = Arc::clone(&reports);
     let store = store.on_given_up(move |given_up| {
@@ -50,19 +51,19 @@ fn reporting(store: PgAuditStore) -> (PgAuditStore, Reports) {
     (store, reports)
 }
 
-fn reports_of(reports: &Reports) -> Vec<(String, &'static str, String)> {
+pub(super) fn reports_of(reports: &Reports) -> Vec<(String, &'static str, String)> {
     reports.lock().unwrap().clone()
 }
 
 /// A test's own guard against a step that never ends: past `limit`, the test fails.
-async fn within<T>(limit: Duration, step: impl Future<Output = T>) -> T {
+pub(super) async fn within<T>(limit: Duration, step: impl Future<Output = T>) -> T {
     tokio::time::timeout(limit, step)
         .await
         .unwrap_or_else(|_| panic!("did not end within {limit:?}"))
 }
 
 /// Polls `condition` every 20 ms until it holds, failing the test after `limit`.
-async fn until<F, Fut>(limit: Duration, what: &str, mut condition: F)
+pub(super) async fn until<F, Fut>(limit: Duration, what: &str, mut condition: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
@@ -78,14 +79,14 @@ where
 }
 
 /// The store's own error behind the core's audit failure.
-fn cause(failure: &AuditFailure) -> &PgAuditError {
+pub(super) fn cause(failure: &AuditFailure) -> &PgAuditError {
     failure
         .source()
         .and_then(|source| source.downcast_ref::<PgAuditError>())
         .expect("the failure came from the Postgres store")
 }
 
-fn decide_read(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
+pub(super) fn decide_read(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
     let context = CallContext {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
@@ -118,7 +119,7 @@ async fn ran(store: &PgAuditStore, fixture: &Fixture, call: Call) -> (String, Ra
 
 /// A session holding a lock on `call_rows` that blocks every insert and update until
 /// [`release`].
-async fn lock_table(db: &TestDatabase) -> Client {
+pub(super) async fn lock_table(db: &TestDatabase) -> Client {
     let lock = db.admin().await;
     lock.batch_execute("BEGIN; LOCK TABLE switchboard_audit.call_rows IN SHARE MODE")
         .await
@@ -126,7 +127,7 @@ async fn lock_table(db: &TestDatabase) -> Client {
     lock
 }
 
-async fn release(lock: &Client) {
+pub(super) async fn release(lock: &Client) {
     lock.batch_execute("COMMIT").await.unwrap();
 }
 
@@ -142,11 +143,11 @@ async fn allow_connections(db: &TestDatabase, allow: bool) {
         .unwrap();
 }
 
-async fn count(admin: &Client, sql: &str) -> i64 {
+pub(super) async fn count(admin: &Client, sql: &str) -> i64 {
     admin.query_one(sql, &[]).await.unwrap().get(0)
 }
 
-async fn outcome_of(admin: &Client, row: &str) -> Option<String> {
+pub(super) async fn outcome_of(admin: &Client, row: &str) -> Option<String> {
     admin
         .query_one(
             "SELECT outcome FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
@@ -397,7 +398,8 @@ async fn finish_answers_at_its_budget_and_completes_the_rows_later() {
         store.finishes(),
         FinishCounts {
             in_flight: 0,
-            given_up: 0
+            given_up: 0,
+            never_written: 0
         }
     );
     assert_eq!(
@@ -450,7 +452,12 @@ async fn finish_tries_again_until_the_database_takes_connections() {
 }
 
 /// Sets `setting` for new sessions on the test database, or resets it with `None`.
-async fn set_for_new_sessions(server: &Config, name: &str, setting: &str, value: Option<&str>) {
+pub(super) async fn set_for_new_sessions(
+    server: &Config,
+    name: &str,
+    setting: &str,
+    value: Option<&str>,
+) {
     let change = match value {
         Some(value) => format!("SET {setting} = '{value}'"),
         None => format!("RESET {setting}"),
@@ -502,9 +509,10 @@ async fn finish_tries_again_on_a_new_connection_while_the_server_is_read_only() 
     assert_eq!(outcome_of(&admin, &row).await.as_deref(), Some("ok"));
 }
 
-/// A begin that finds the server read-only fails, so the core refuses the call. The connection
-/// that found it read-only stays read-only, so it does not go back to the pool: once the server
-/// is writable again, the next begin makes a new connection and writes its row.
+/// A begin that finds the server read-only tries again until its budget runs out, and fails, so
+/// the core refuses the call. The connection that found it read-only stays read-only, so it
+/// does not go back to the pool: once the server is writable again, the next begin makes a new
+/// connection and writes its row.
 #[tokio::test]
 async fn begin_makes_a_new_connection_after_the_server_was_read_only() {
     let Some(db) = TestDatabase::create().await else {
@@ -521,6 +529,8 @@ async fn begin_makes_a_new_connection_after_the_server_was_read_only() {
     let failure = begin_read(&store, &fixture).await.unwrap_err();
     match cause(&failure) {
         PgAuditError::Database(error) => assert_eq!(super::code(error), Some("25006")),
+        // On a loaded machine the last retry's new connection can outlast the budget.
+        PgAuditError::BeginBudget { .. } => {}
         other => panic!("{other}"),
     }
     assert_eq!(store.begin.status().size, 0);
@@ -661,7 +671,8 @@ async fn finish_does_not_retry_what_trying_again_cannot_fix() {
         store.finishes(),
         FinishCounts {
             in_flight: 0,
-            given_up: 2
+            given_up: 2,
+            never_written: 0
         }
     );
     assert_eq!(
@@ -714,7 +725,8 @@ async fn an_attempt_ends_at_the_deadline() {
         store.finishes(),
         FinishCounts {
             in_flight: 0,
-            given_up: 1
+            given_up: 1,
+            never_written: 0
         }
     );
     assert_eq!(
@@ -802,7 +814,8 @@ async fn finish_tries_again_when_its_connection_is_killed() {
         store.finishes(),
         FinishCounts {
             in_flight: 0,
-            given_up: 0
+            given_up: 0,
+            never_written: 0
         }
     );
 }
@@ -879,7 +892,8 @@ async fn finish_counts_waiting_for_a_connection_in_each_attempt() {
         store.finishes(),
         FinishCounts {
             in_flight: 0,
-            given_up: 1
+            given_up: 1,
+            never_written: 0
         }
     );
     assert_eq!(
@@ -952,7 +966,8 @@ async fn finish_tries_again_after(code: &str) {
         store.finishes(),
         FinishCounts {
             in_flight: 0,
-            given_up: 0
+            given_up: 0,
+            never_written: 0
         }
     );
 }
@@ -1096,9 +1111,18 @@ async fn a_cancel_the_server_does_not_answer_is_given_up() {
     let lock = lock_table(&db).await;
 
     // Begin runs out of time, and asks the server to cancel its insert, over a new connection.
-    let failure = within(budgets.begin + SLACK, begin_read(&store, &fixture))
-        .await
-        .unwrap_err();
+    // The call is a denial, so the store opens no finish connection to complete its row, and
+    // the only new connection is the cancel's.
+    let denied = Call::new(Caller::TeamB, SURFACE_ALL, WRITE_TOOL, TEAM_B_DOCUMENT);
+    let decision = decide_read(&fixture, &denied);
+    let begin = audit::begin(
+        &store,
+        row_start(),
+        decision,
+        denied.arguments,
+        denied.metadata,
+    );
+    let failure = within(budgets.begin + SLACK, begin).await.unwrap_err();
     assert!(
         matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
         "{failure}"

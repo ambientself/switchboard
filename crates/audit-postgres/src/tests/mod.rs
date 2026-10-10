@@ -10,6 +10,7 @@
 mod budgets;
 mod check;
 mod latency;
+mod recovery;
 mod schema;
 mod store;
 
