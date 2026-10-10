@@ -48,6 +48,9 @@
 # requests in one curl run print two results and exit with the last one's status, so a refused
 # second request could hide a first that connected.
 #
+# curl runs with proxies off (--noproxy '*'), whatever the environment says: through a proxy,
+# an attempt would test the route to the proxy, not to the target.
+#
 # Needs sh, curl and getent.
 set -u
 
@@ -93,12 +96,13 @@ case $PROBE_TIMEOUT in '' | *[!0-9]* | 0) stop "PROBE_TIMEOUT is a number of sec
 # nothing answered), a space and the number of connections curl made, and returns curl's exit
 # status. Both a connect that times out and an answer that does not come in time are curl exit
 # 28; only the count of connections tells them apart. -q keeps any .curlrc out; -g turns URL
-# globbing off, so the URL is one request; the empty Authorization header keeps curl from adding
-# one.
+# globbing off, so the URL is one request; --noproxy '*' keeps the proxy variables (http_proxy
+# and the rest) from sending it through a proxy; the empty Authorization header keeps curl from
+# adding one.
 post() {
   post_url=$1
   shift
-  curl -q -g -s -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
+  curl -q -g -s --noproxy '*' -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
     -H 'Authorization:' -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     --connect-timeout "$PROBE_TIMEOUT" --max-time "$PROBE_TIMEOUT" \
