@@ -386,10 +386,11 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 ///   last attempt's answer ends the task. An earlier attempt may have found the row missing
 ///   just before the insert committed, so its answer does not stand for the deadline, however
 ///   late it came. A row the last attempt found missing had not been written by the deadline,
-///   and is counted in [`FinishCounts::never_written`]. A row that could not be completed is given up and reported, as a finish is, and so is one whose last attempt
-///   got no answer: a database that stays unreachable, locked or read-only past the deadline
-///   leaves the store unable to tell, so a refusal that lasts that long is reported even
-///   when no row was written. A denial needs nothing: it is a complete record, which the
+///   and is counted in [`FinishCounts::never_written`]. A row that could not be completed is
+///   given up and reported, as a finish is, and so is one whose last attempt got no answer:
+///   a database that stays unreachable, locked or read-only past the deadline leaves the
+///   store unable to tell, so a refusal that lasts that long is reported even when no row
+///   was written. A denial needs nothing: it is a complete record, which the
 ///   table's trigger never lets be completed. Nor does a list row, which is written complete.
 /// - List writes a row of kind `list`, complete, with begin's pool, budget and handling of
 ///   an identifier already stored: a list row under it is this list's own, and a call row is
