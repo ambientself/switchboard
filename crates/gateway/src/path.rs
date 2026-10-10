@@ -19,9 +19,12 @@
 //! - `initialize`, `ping` and `server/discover` are answered with no decision and no audit row:
 //!   decision 0009 makes them telemetry. They still need a verified caller, because `admit` ran
 //!   first.
-//! - `tools/list` selects the caller's profile and returns the tools on the surface that pass
-//!   the core's checks, with their catalog definitions. It writes no row yet; decision 0009
-//!   asks for a row of kind `list`, which needs the core's list record (#10).
+//! - `tools/list` selects the caller's profile and finds the tools on the surface that pass
+//!   the core's checks. It writes a row of kind `list` naming them ([`audit::listed`]), and
+//!   only then answers, with the tools the core hands back and their catalog definitions
+//!   (decision 0009). If the row cannot be written, the list is refused with the audit
+//!   sentence and lists nothing. The answer names the row in its `_meta`, unless audit is
+//!   disabled.
 //! - `tools/call` reads the call's resources through the adapter registered for the approved
 //!   tool's connector, decides, writes the row, runs the tool if allowed, completes the row and
 //!   answers. A denial is answered with the sentence the row holds. The answer names the row
@@ -246,12 +249,11 @@ impl RequestPath {
 
     async fn answer(self, caller: Caller, surface: SurfaceName, request: Request) -> HttpResponse {
         let Request { id, era, call } = request;
-        // tools/list writes no row yet, so it names none.
         let (reply, row) = match call {
             Call::Initialize => (Reply::Initialized, None),
             Call::Ping => (Reply::Pong, None),
             Call::Discover => (Reply::Discovered, None),
-            Call::ToolsList => (Reply::Tools(self.list(caller, surface)), None),
+            Call::ToolsList => self.list(caller, surface).await,
             Call::ToolsCall(call) => self.call(caller, surface, call).await,
         };
         let row = row.as_ref().map(AuditRowId::as_str);
@@ -259,14 +261,56 @@ impl RequestPath {
     }
 
     /// `tools/list`: design section 6's steps 1 to 5 for every tool on the surface, keeping
-    /// those that pass.
-    fn list(&self, caller: Caller, surface: SurfaceName) -> Vec<ToolEntry> {
+    /// those that pass, then the row of kind `list` (decision 0009). The answer, and the row
+    /// to name in it.
+    ///
+    /// The answer is built from what [`audit::listed`] returns once the row is written, never
+    /// from the list handed to it, so nothing is listed without its row.
+    async fn list(&self, caller: Caller, surface: SurfaceName) -> (Reply, Option<AuditRowId>) {
         let Caller::Proved(principal) = caller else {
-            return Vec::new();
+            return (Reply::Tools(Vec::new()), None);
         };
-        let policy = self.inner.gates.policy();
+        let gates = &self.inner.gates;
+        let policy = gates.policy();
         let caller = self.caller_context(&policy, principal, surface);
-        entries(&policy, list_tools(policy.snapshot(), &caller))
+        let tools = list_tools(policy.snapshot(), &caller);
+        // One identifier per list, made here. A list row has no deadline, so none is given.
+        let start = RowStart {
+            row: AuditRowId::new(Uuid::now_v7().to_string()),
+            instance: gates.instance().clone(),
+            call_deadline_ms: 0,
+        };
+        let writing = Instant::now();
+        let written = audit::listed(
+            gates.audit_store().as_ref(),
+            start,
+            &caller,
+            policy.revision().clone(),
+            tools,
+            None,
+        )
+        .await;
+        let list_us = micros(writing.elapsed());
+        match written {
+            Err(failure) => {
+                tracing::error!(
+                    %failure,
+                    list_us,
+                    "refused a tool list: its audit row could not be written"
+                );
+                (Reply::Denied(failure.sentence().to_owned()), None)
+            }
+            Ok(listed) => {
+                tracing::info!(
+                    row = listed.row().as_str(),
+                    tools = listed.tools().len(),
+                    list_us,
+                    "listed tools"
+                );
+                let row = self.quotable(listed.row());
+                (Reply::Tools(entries(&policy, listed.tools())), row)
+            }
+        }
     }
 
     /// `tools/call`: design section 6's steps 1 to 9. The answer, and the row to name in it.
@@ -289,10 +333,10 @@ impl RequestPath {
     }
 }
 
-fn entries(policy: &ServedPolicy, tools: Vec<&ApprovedTool>) -> Vec<ToolEntry> {
+fn entries(policy: &ServedPolicy, tools: &[ApprovedTool]) -> Vec<ToolEntry> {
     let catalog = policy.catalog();
     tools
-        .into_iter()
+        .iter()
         .filter_map(|tool| match catalog.definition(&tool.name) {
             Some(definition) => Some(entry(tool, definition)),
             None => {

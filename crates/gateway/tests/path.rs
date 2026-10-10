@@ -1191,6 +1191,10 @@ fn with_identity_disabled_nothing_is_listed_every_call_is_refused_and_it_says_so
     }
     world.assert_nothing_ran();
     assert!(world.store.rows().is_empty());
+    assert!(
+        world.store.list_rows().is_empty(),
+        "a list with no principal wrote a row"
+    );
     assert_eq!(world.store.begin_attempts(), 0);
     assert!(world.resources.asked().is_empty());
 
@@ -1391,7 +1395,7 @@ fn a_refusal_because_begin_failed_names_no_row() {
 }
 
 #[test]
-fn identity_disabled_and_list_answers_name_no_row() {
+fn with_identity_disabled_no_row_is_named() {
     let world = World::with(
         |config| config["identity"] = json!({"disabled": true}),
         |wiring| wiring,
@@ -1403,9 +1407,7 @@ fn identity_disabled_and_list_answers_name_no_row() {
         "{}",
         refused.json()
     );
-
-    let world = World::new();
-    let listed = world.send(Some(&world.token(Caller::TeamA)), SURFACE_ALL, tools_list());
+    let listed = world.send(None, SURFACE_ALL, tools_list());
     assert_eq!(listed.row_in_meta(), None, "{}", listed.result());
 }
 
@@ -1440,8 +1442,152 @@ fn tools_list_returns_only_what_the_caller_may_call() {
     let team_a: BTreeSet<String> = list(Caller::TeamA, SURFACE_ALL).into_iter().collect();
     assert!(team_a.contains(READ_TOOL));
 
-    assert!(world.store.rows().is_empty(), "a list writes no row");
+    assert!(world.store.rows().is_empty(), "a list wrote a call row");
+    assert_eq!(world.store.list_rows().len(), 6, "one list row per list");
     world.assert_nothing_ran();
+}
+
+/// The names a list row records.
+fn recorded_names(world: &World, position: usize) -> Vec<String> {
+    world.store.list_rows()[position].1.tools.clone()
+}
+
+#[test]
+fn a_list_writes_one_row_of_kind_list_naming_what_it_answers_with() {
+    let world = World::new();
+    let listed = world.send(Some(&world.token(Caller::TeamA)), SURFACE_ALL, tools_list());
+    let names = listed.tool_names();
+    assert_eq!(names, [DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL]);
+
+    let rows = world.store.list_rows();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let (id, record) = &rows[0];
+    assert_eq!(record.tools, names, "the row names exactly what was listed");
+    assert_eq!(record.tools_omitted, 0);
+    let served = gateway_testkit::policy().unwrap();
+    assert_eq!(&record.policy_revision, served.revision());
+    assert_eq!(record.profile.as_str(), PROFILE_TEAM_A);
+    assert_eq!(record.surface.as_str(), SURFACE_ALL);
+    assert_eq!(record.deployment.as_str(), "path-test");
+    assert_eq!(record.instance.as_str(), UNNAMED_INSTANCE);
+    assert_eq!(record.claimed_team, None);
+    assert!(world.store.rows().is_empty(), "a list wrote a call row");
+    assert!(
+        world.store.begun_at(id).is_some(),
+        "the store wrote the row"
+    );
+    assert_eq!(world.store.deadline(id), None, "a list row has no deadline");
+
+    // The answer names the row it wrote, in both eras, and each list has its own row.
+    assert_eq!(listed.row_in_meta().as_deref(), Some(id.as_str()));
+    let legacy = world.send(
+        Some(&world.token(Caller::TeamB)),
+        SURFACE_ALL,
+        Raw::legacy("tools/list", json!({})),
+    );
+    let rows = world.store.list_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(legacy.row_in_meta().as_deref(), Some(rows[1].0.as_str()));
+    assert_ne!(rows[0].0, rows[1].0);
+    assert_eq!(recorded_names(&world, 1), legacy.tool_names());
+    assert_eq!(rows[1].1.profile.as_str(), PROFILE_TEAM_B);
+
+    // A list that lists nothing is a list too, and has its row.
+    let empty = world.send(
+        Some(&world.token(Caller::UserInGroupG)),
+        SURFACE_ALL,
+        tools_list(),
+    );
+    assert!(empty.tool_names().is_empty());
+    assert!(recorded_names(&world, 2).is_empty());
+    assert_eq!(
+        empty.row_in_meta().as_deref(),
+        Some(world.store.list_rows()[2].0.as_str())
+    );
+    world.assert_nothing_ran();
+}
+
+#[test]
+fn the_list_row_is_written_before_the_answer() {
+    let world = World::new();
+    let request = tools_list().header(
+        "authorization",
+        &format!("Bearer {}", world.token(Caller::TeamA)),
+    );
+    let gate = world.store.hold_begins();
+    let admitted = world.path.admit(&request.method, &request.headers).unwrap();
+    let mut list = pin!(
+        world
+            .path
+            .respond(admitted, SURFACE_ALL, &request.headers, &request.body)
+    );
+    assert!(
+        poll_once(list.as_mut()).is_pending(),
+        "answered before the row was written"
+    );
+    assert!(world.store.list_rows().is_empty());
+    gate.open();
+    let Poll::Ready(response) = poll_once(list.as_mut()) else {
+        panic!("not answered once the row was written")
+    };
+    let got = Got::from(response);
+    assert_eq!(got.tool_names(), [DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL]);
+    assert_eq!(world.store.list_rows().len(), 1);
+}
+
+#[test]
+fn a_list_whose_row_cannot_be_written_is_refused_and_lists_nothing() {
+    let world = World::new();
+    let token = world.token(Caller::TeamA);
+    for era in ["modern", "legacy"] {
+        world.store.fail_next_begin();
+        let request = match era {
+            "modern" => tools_list(),
+            _ => Raw::legacy("tools/list", json!({})),
+        };
+        let refused = world.send(Some(&token), SURFACE_ALL, request);
+        assert_eq!(refused.denial(), AUDIT_FAILURE, "{era}");
+        let body = refused.json();
+        assert!(body.get("result").is_none(), "{era}: {body}");
+        assert!(
+            body["error"].get("data").is_none(),
+            "{era}: no row is named: {body}"
+        );
+        assert!(world.store.list_rows().is_empty(), "{era}");
+    }
+
+    // A store that is down refuses every list while it is down, and lists again once it is back.
+    world.store.fail_all_begins();
+    for _ in 0..2 {
+        let refused = world.send(Some(&token), SURFACE_ALL, tools_list());
+        assert_eq!(refused.denial(), AUDIT_FAILURE);
+    }
+    world.store.stop_failing();
+    let listed = world.send(Some(&token), SURFACE_ALL, tools_list());
+    assert_eq!(
+        listed.tool_names(),
+        [DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL]
+    );
+    assert_eq!(world.store.list_rows().len(), 1);
+    world.assert_nothing_ran();
+}
+
+#[test]
+fn with_audit_disabled_tools_are_listed_and_no_row_is_named() {
+    let world = World::with(
+        |config| config["audit"] = json!({"disabled": true}),
+        |wiring| wiring,
+    );
+    let listed = world.send(Some(&world.token(Caller::TeamA)), SURFACE_ALL, tools_list());
+    assert_eq!(
+        listed.tool_names(),
+        [DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL]
+    );
+    assert_eq!(listed.row_in_meta(), None, "{}", listed.result());
+    assert!(
+        world.store.list_rows().is_empty(),
+        "the store was never wired in"
+    );
 }
 
 #[test]
