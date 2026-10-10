@@ -5,13 +5,14 @@
 
 mod common;
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use common::{Run, black_hole, closed_port, repo, require, scratch, write};
+use common::{Run, black_hole, closed_port, dropped, fake_curl, repo, require, scratch, write};
 use gateway_core::IDENTITY_FAILURE;
 use serde_json::{Value, json};
 
@@ -223,6 +224,8 @@ struct Workload {
     direct: Option<String>,
     own_project: bool,
     dir: PathBuf,
+    /// A directory put first on PATH, holding the fake `curl`.
+    bin: Option<PathBuf>,
 }
 
 impl Workload {
@@ -236,6 +239,7 @@ impl Workload {
             direct: None,
             own_project: true,
             dir,
+            bin: None,
         }
     }
 
@@ -254,12 +258,29 @@ impl Workload {
         self
     }
 
+    /// A direct call to a route network policy drops: the fake `curl` times out on it before it
+    /// connects, as a dropped route does (exit 28, no connection made). Every other request goes
+    /// to the real curl.
+    fn direct_dropped(mut self) -> Self {
+        let url = dropped();
+        let bin = self.dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        fake_curl(&bin, &[&url]);
+        self.bin = Some(bin);
+        self.direct = Some(url);
+        self
+    }
+
     fn without_own_project(mut self) -> Self {
         self.own_project = false;
         self
     }
 
     fn run(&self, mode: &str) -> Run {
+        Run::from(self.command(mode).output().unwrap())
+    }
+
+    fn command(&self, mode: &str) -> Command {
         let bad = write(
             &self.dir,
             "wrong-audience-token",
@@ -275,7 +296,18 @@ impl Workload {
             .env("DIRECT_TIMEOUT", "1")
             .env_remove("TOKEN_URL")
             .env_remove("BAD_TOKEN_URLS")
-            .env_remove("DIRECT_URL");
+            .env_remove("DIRECT_URL")
+            .env_remove("IDLE_SECONDS");
+        if let Some(bin) = &self.bin {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        }
         if let Some(token) = &self.token {
             command.env("TOKEN_FILE", token);
         }
@@ -287,7 +319,7 @@ impl Workload {
         } else {
             command.env_remove("OWN_PROJECT");
         }
-        Run::from(command.output().unwrap())
+        command
     }
 }
 
@@ -339,14 +371,14 @@ fn a_gateway_that_behaves_passes_every_check() {
 }
 
 #[test]
-fn a_direct_call_that_times_out_passes_with_the_gateway_still_reachable() {
+fn a_direct_call_dropped_before_it_connects_passes_with_the_gateway_still_reachable() {
     let run = Workload::new("direct-dropped", serve(Fake::Gateway))
-        .direct(black_hole())
+        .direct_dropped()
         .run("full");
     assert_passed(&run);
     assert!(
         run.stdout
-            .contains("PASS direct call to the server refused (curl exit 28"),
+            .contains("PASS direct call to the server refused before it connected ("),
         "{}",
         run.transcript()
     );
@@ -415,6 +447,24 @@ fn a_direct_call_that_is_refused_rather_than_dropped_fails_the_run() {
 }
 
 #[test]
+fn a_direct_call_that_connects_and_gets_no_answer_fails_the_run() {
+    // curl exits 28 here too, but it connected: a slow or stalled server, or a tarpit, took the
+    // connection (issue #83). That is not a route network policy dropped.
+    let run = Workload::new("direct-connected", serve(Fake::Gateway))
+        .direct(black_hole())
+        .run("full");
+    assert_failed(
+        &run,
+        "direct call to the server refused before it connected (http://127.0.0.1:",
+    );
+    assert!(
+        run.failed("(got 'curl exit 28, 1 connections', want 'curl exit 28, 0 connections')"),
+        "{}",
+        run.transcript()
+    );
+}
+
+#[test]
 fn a_direct_call_the_server_answers_fails_the_run() {
     let run = Workload::new("direct-answered", serve(Fake::Gateway))
         .direct(serve(Fake::Server401))
@@ -455,9 +505,14 @@ fn before_the_policy_the_server_must_answer_401() {
         passing.transcript()
     );
     let dropped = Workload::new("before-dropped", serve(Fake::Gateway))
-        .direct(black_hole())
+        .direct_dropped()
         .run("before-policy");
     assert_failed(&dropped, "before policy: the direct call connects");
+    // A server that takes the connection and never answers did not answer 401 either.
+    let stalled = Workload::new("before-stalled", serve(Fake::Gateway))
+        .direct(black_hole())
+        .run("before-policy");
+    assert_failed(&stalled, "before policy: the direct call connects");
     // A server that accepts the workload's own token would mean the workload could go around
     // the gateway.
     let accepting = Workload::new("before-accepting", serve(Fake::Gateway))
@@ -534,4 +589,76 @@ fn the_workloads_sentences_are_the_cores() {
         script.contains(&format!("AUDIT_FAILURE='{AUDIT_FAILURE}'")),
         "workload.sh's audit sentence differs"
     );
+}
+
+/// Starts `workload.sh idle` and returns it, with its first line, once it says it is waiting.
+fn start_idle(name: &str, seconds: Option<&str>) -> (std::process::Child, String) {
+    let workload = Workload::new(name, closed_port());
+    let mut command = workload.command("idle");
+    if let Some(seconds) = seconds {
+        command.env("IDLE_SECONDS", seconds);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    stdout.read_line(&mut first).unwrap();
+    child.stdout = Some(stdout.into_inner());
+    (child, first)
+}
+
+/// Waits for `child` at most `limit`, and returns its run: `first`, then the rest it printed.
+fn finish_within(mut child: std::process::Child, first: String, limit: Duration) -> Run {
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            panic!("workload.sh idle did not end within {limit:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut run = Run::from(child.wait_with_output().unwrap());
+    run.stdout = first + &run.stdout;
+    run
+}
+
+#[test]
+fn idle_waits_until_sigterm_and_then_passes() {
+    // The route check's pod runs until the driver deletes its Job, and the pod then gets
+    // SIGTERM. It must end at once and pass, not wait out its 600 s or die by the signal.
+    let (child, first) = start_idle("idle-term", None);
+    assert!(
+        first.contains("idle: waiting for SIGTERM, at most 600s"),
+        "{first:?}"
+    );
+    let pid = child.id().to_string();
+    let killed = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let run = finish_within(child, first, Duration::from_secs(5));
+    assert_passed(&run);
+    assert_eq!(run.lines("PASS "), ["PASS idle"], "{}", run.transcript());
+}
+
+#[test]
+fn idle_ends_and_passes_after_its_seconds() {
+    let (child, first) = start_idle("idle-timeout", Some("1"));
+    let run = finish_within(child, first, Duration::from_secs(5));
+    assert_passed(&run);
+    assert_eq!(run.lines("PASS "), ["PASS idle"], "{}", run.transcript());
+}
+
+#[test]
+fn idle_waits_at_most_ten_minutes() {
+    for seconds in ["0", "601", "ten"] {
+        let mut command = Workload::new("idle-bad", closed_port()).command("idle");
+        let run = Run::from(command.env("IDLE_SECONDS", seconds).output().unwrap());
+        assert_failed(&run, "setup: IDLE_SECONDS");
+        assert!(run.lines("PASS ").is_empty(), "{}", run.transcript());
+    }
 }
