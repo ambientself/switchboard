@@ -655,7 +655,7 @@ fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
     );
 }
 
-/// A row as `row_resources_json` reads it.
+/// A call row as `row_resources_json` reads it.
 fn row(
     team: &str,
     decision: &str,
@@ -664,11 +664,23 @@ fn row(
     resources: Value,
 ) -> Value {
     json!({
-        "team": team, "tool": "docs__read_document", "decision": decision, "reason": reason,
+        "kind": "call", "team": team, "tool": "docs__read_document", "decision": decision,
+        "reason": reason,
         "sentence": if sentence.is_empty() { Value::Null } else { json!(sentence) },
-        "resources": resources,
+        "resources": resources, "revision": "demo-1", "listed": null, "omitted": null,
     })
 }
+
+/// A list row as `row_resources_json` reads it: no tool, decision or resources.
+fn list_row(team: &str, revision: &str, listed: &[&str]) -> Value {
+    json!({
+        "kind": "list", "team": team, "tool": null, "decision": null, "reason": null,
+        "sentence": null, "resources": null, "revision": revision, "listed": listed,
+        "omitted": 0,
+    })
+}
+
+const BOTH_TOOLS: [&str; 2] = ["docs__list_documents", "docs__read_document"];
 
 fn project(name: &str) -> Value {
     json!([{"system": "docs", "kind": "project", "identifier": name}])
@@ -721,6 +733,10 @@ fn demo_rows() -> Vec<Value> {
             "Tool `docs__read_document` is not available on surface `docs`.",
             json!("unknown"),
         ),
+        // Each team's list, and team-a's after the withdrawal, under the next revision.
+        list_row("team-a", "demo-1", &BOTH_TOOLS),
+        list_row("team-b", "demo-1", &BOTH_TOOLS),
+        list_row("team-a", "demo-2", &["docs__list_documents"]),
     ]
 }
 
@@ -741,7 +757,8 @@ fn each_row_must_record_what_its_call_named() {
     let run = check_rows("rows-good", &Value::from(demo_rows()).to_string());
     assert_eq!(run.status, Some(0), "{}", run.transcript());
     assert!(
-        run.stdout.contains(&format!("PASS {ROWS_CHECK} (7 rows)")),
+        run.stdout
+            .contains(&format!("PASS {ROWS_CHECK} (10 rows: 7 calls, 3 lists)")),
         "{}",
         run.transcript()
     );
@@ -758,6 +775,9 @@ fn each_row_must_record_what_its_call_named() {
         ("deny-names-own", wrong(1, project("atlas"))),
         ("none-named-names-one", wrong(2, project("atlas"))),
         ("named-as-unknown", wrong(3, json!("unknown"))),
+        // A list names no resources.
+        ("list-names-resources", wrong(7, project("atlas"))),
+        ("list-names-none", wrong(8, json!([]))),
     ] {
         let run = check_rows(case, &rows);
         assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
@@ -781,6 +801,17 @@ fn each_row_must_record_what_its_call_named() {
     let run = check_rows("rows-unexpected", &Value::from(rows).to_string());
     assert!(run.failed(ROWS_CHECK), "{}", run.transcript());
 
+    // Nor can a row of a kind the demo does not write, or of no kind.
+    for (case, kind) in [
+        ("rows-other-kind", json!("other")),
+        ("rows-no-kind", Value::Null),
+    ] {
+        let mut rows = demo_rows();
+        rows[0]["kind"] = kind;
+        let run = check_rows(case, &Value::from(rows).to_string());
+        assert!(run.failed(ROWS_CHECK), "{case}: {}", run.transcript());
+    }
+
     // No rows, or no JSON, checks nothing and fails.
     for (case, rows) in [
         ("rows-empty", "[]"),
@@ -790,6 +821,96 @@ fn each_row_must_record_what_its_call_named() {
         let run = check_rows(case, rows);
         assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
         assert!(run.failed(ROWS_CHECK), "{case}: {}", run.transcript());
+    }
+}
+
+/// Runs check_list_rows on `rows`, given as the text psql would print, expecting `expected`.
+fn check_lists(name: &str, rows: &str, expected: usize) -> Run {
+    require(&["jq"]);
+    let file = write(&scratch(name), "rows.json", rows);
+    sourced(&format!(
+        "check_list_rows \"$(cat '{}')\" {expected}\nFINISHED=1\nresult 0",
+        file.display()
+    ))
+}
+
+const LISTS_COUNTED: &str = "audit: one list row for each of the workloads'";
+const LISTS_NAMED: &str = "audit: each list row names the tools its caller was shown";
+
+#[test]
+fn each_list_row_is_one_of_the_workloads_lists() {
+    let rows = Value::from(demo_rows()).to_string();
+    let run = check_lists("lists-good", &rows, 3);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout
+            .contains(&format!("PASS {LISTS_COUNTED} 3 tools/list calls")),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains(&format!("PASS {LISTS_NAMED}")),
+        "{}",
+        run.transcript()
+    );
+
+    // One list more or less than the workloads made fails the count.
+    for expected in [2, 4] {
+        let run = check_lists("lists-count", &rows, expected);
+        assert_eq!(run.status, Some(1), "{expected}: {}", run.transcript());
+        assert!(
+            run.failed(LISTS_COUNTED),
+            "{expected}: {}",
+            run.transcript()
+        );
+    }
+
+    let wrong = |position: usize, field: &str, value: Value| {
+        let mut rows = demo_rows();
+        rows[position][field] = value;
+        Value::from(rows).to_string()
+    };
+    for (case, rows) in [
+        // The withdrawn tool listed after the withdrawal, or missing before it.
+        ("withdrawn-listed", wrong(9, "listed", json!(BOTH_TOOLS))),
+        (
+            "read-missing",
+            wrong(7, "listed", json!(["docs__list_documents"])),
+        ),
+        ("nothing-listed", wrong(8, "listed", json!([]))),
+        ("listed-null", wrong(8, "listed", Value::Null)),
+        ("tools-omitted", wrong(7, "omitted", json!(1))),
+        ("other-team", wrong(7, "team", json!("team-c"))),
+        ("no-team", wrong(7, "team", Value::Null)),
+        ("unknown-revision", wrong(7, "revision", json!("demo-3"))),
+    ] {
+        let run = check_lists(case, &rows, 3);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(LISTS_NAMED), "{case}: {}", run.transcript());
+        assert!(
+            run.stdout.contains("    wrong: "),
+            "{case}: {}",
+            run.transcript()
+        );
+    }
+
+    // The order a row lists its tools in does not matter.
+    let run = check_lists(
+        "lists-reordered",
+        &wrong(
+            7,
+            "listed",
+            json!(["docs__read_document", "docs__list_documents"]),
+        ),
+        3,
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+
+    // No JSON checks nothing and fails.
+    for (case, rows) in [("lists-none", ""), ("lists-not-json", "(0 rows)")] {
+        let run = check_lists(case, rows, 3);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(LISTS_COUNTED), "{case}: {}", run.transcript());
     }
 }
 

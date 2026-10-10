@@ -53,6 +53,7 @@ KIND_ISSUER=https://kubernetes.default.svc.cluster.local
 KIND_GATEWAY_SUBJECT=system:serviceaccount:switchboard:gateway
 AUDIT_TABLE=switchboard_audit.call_rows
 READ_TOOL=docs__read_document
+LIST_TOOL=docs__list_documents
 
 PASSES=0
 FAILS=0
@@ -180,36 +181,43 @@ mock_docs_log() {
 project_json() { printf '[{"system":"docs","kind":"project","identifier":"%s"}]' "$1"; }
 
 # row_resources_json: every row from this run, as one JSON array of what check_row_resources
-# reads.
+# and check_list_rows read.
 row_resources_json() {
-  psql_reader -Atc "select coalesce(json_agg(json_build_object('team', proved_team, 'tool', tool,
-      'decision', decision, 'reason', reason, 'sentence', sentence, 'resources', resources)
+  psql_reader -Atc "select coalesce(json_agg(json_build_object('kind', kind, 'team', proved_team,
+      'tool', tool, 'decision', decision, 'reason', reason, 'sentence', sentence,
+      'resources', resources, 'revision', policy_revision, 'listed', listed_tools,
+      'omitted', listed_omitted)
       order by begun_at), '[]') from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE)"
 }
 
 # check_row_resources ROWS: every row records what its call named. ROWS is a JSON array of
-# {team, tool, decision, reason, sentence, resources}. Each row is matched to the demo's call
-# that made it, and its resources must be what that call named:
+# {kind, team, tool, decision, reason, sentence, resources, ...}. Each row of kind `call` is
+# matched to the demo's call that made it, and its resources must be what that call named:
 #   - an allowed call: its team's own project (team-a atlas, team-b borealis);
 #   - a call denied for naming no project: none, [];
 #   - a call denied for its project: the other team's project;
 #   - a call to a tool the gateway does not know: "unknown", since no adapter read the call.
-# A row that matches none of the demo's calls fails the check too.
+# A row of kind `list` records a tools/list, which names no resources: its resources are null.
+# check_list_rows counts those rows and checks what they name. A row that matches none of the
+# demo's calls or lists fails the check too.
 check_row_resources() {
-  local rows=$1 total wrong
+  local rows=$1 total lists wrong
   # shellcheck disable=SC2016 # jq's own variables
   if ! wrong=$(printf '%s' "$rows" | jq -c '
       def project($name): [{system: "docs", kind: "project", identifier: $name}];
       def own: {"team-a": "atlas", "team-b": "borealis"}[.team // ""];
       def other: {"team-a": "borealis", "team-b": "atlas"}[.team // ""];
       def named:
-        if .decision == "allow" then project(own)
+        if .kind == "list" then null
+        elif .kind != "call" then "no call of the demo makes this row"
+        elif .decision == "allow" then project(own)
         elif .reason == "unknown_tool" then "unknown"
         elif .reason == "resource_outside_limit" and (.sentence // "" | contains("named none of them")) then []
         elif .reason == "resource_outside_limit" then project(other)
         else "no call of the demo makes this row" end;
-      .[] | select(.resources != named) | {team, tool, decision, reason, resources, named: named}') \
-    || ! total=$(printf '%s' "$rows" | jq -e 'length'); then
+      .[] | select(.resources != named) | {kind, team, tool, decision, reason, resources, named: named}') \
+    || ! total=$(printf '%s' "$rows" | jq -e 'length') \
+    || ! lists=$(printf '%s' "$rows" | jq -e '[.[] | select(.kind == "list")] | length'); then
     fail "audit: every row records the resources its call named (the rows are not a JSON array)"
     return
   fi
@@ -219,17 +227,53 @@ check_row_resources() {
   if [ "$total" -eq 0 ]; then
     fail "audit: every row records the resources its call named (there are no rows)"
   else
-    check "$(count_lines . "$wrong")" 0 "audit: every row records the resources its call named ($total rows)"
+    check "$(count_lines . "$wrong")" 0 \
+      "audit: every row records the resources its call named ($total rows: $((total - lists)) calls, $lists lists)"
   fi
 }
 
-# The columns are crates/audit-postgres's (sql/migrations/0001_call_rows.sql). `resources` is a
-# JSON array of the {system, kind, identifier} each call named, or "unknown"; the listing shows
-# each as system/kind/identifier.
+# check_list_rows ROWS EXPECTED: the rows of kind `list` are the workloads' tools/list calls,
+# exactly EXPECTED of them: one per tools/list a workload made (decision 0009). An identity
+# failure writes no row, so a refused caller's list leaves none. Each list row was made by
+# team-a or team-b and names the tools that caller was shown under the row's policy revision:
+# both tools under demo-1, and only $LIST_TOOL under demo-2, after $READ_TOOL is withdrawn.
+# None is left out. ROWS is what row_resources_json prints.
+check_list_rows() {
+  local rows=$1 expected=$2 lists wrong
+  # shellcheck disable=SC2016 # jq's own variables
+  if ! lists=$(printf '%s' "$rows" | jq -e '[.[] | select(.kind == "list")] | length') \
+    || ! wrong=$(printf '%s' "$rows" | jq -c --arg list "$LIST_TOOL" --arg read "$READ_TOOL" '
+        def shown: {"demo-1": [$list, $read], "demo-2": [$list]}[.revision // ""];
+        .[] | select(.kind == "list")
+        | select(((.team == "team-a" or .team == "team-b")
+            and shown != null and (.listed | type) == "array"
+            and (.listed | sort) == (shown | sort)
+            and .omitted == 0) | not)
+        | {team, revision, listed, omitted, shown: shown}'); then
+    fail "audit: one list row for each of the workloads' tools/list calls (the rows are not a JSON array)"
+    return
+  fi
+  if [ -n "$wrong" ]; then
+    printf '%s\n' "$wrong" | sed 's/^/    wrong: /'
+  fi
+  check "$lists" "$expected" "audit: one list row for each of the workloads' $expected tools/list calls"
+  check "$(count_lines . "$wrong")" 0 "audit: each list row names the tools its caller was shown"
+}
+
+# The columns are crates/audit-postgres's (sql/migrations/0001_call_rows.sql and
+# 0004_list_rows.sql). `resources` is a JSON array of the {system, kind, identifier} each call
+# named, or "unknown"; the listing shows each as system/kind/identifier. A row of kind `list`
+# has no tool or resources; the listing shows the tools it listed in the tool column.
+#
+# audit_rows LISTS: checks this run's rows, LISTS of them of kind `list`: one per tools/list
+# the workloads made.
 audit_rows() {
+  local lists=$1
   step "audit rows from this run"
-  psql_reader -c "select to_char(begun_at, 'HH24:MI:SS') as at, proved_subject, proved_team as team,
-      tool, coalesce((select string_agg(concat_ws('/', r->>'system', r->>'kind', r->>'identifier'), ',')
+  psql_reader -c "select to_char(begun_at, 'HH24:MI:SS') as at, kind, proved_subject, proved_team as team,
+      coalesce(tool, 'listed: ' || coalesce((select string_agg(t, ',')
+          from jsonb_array_elements_text(listed_tools) as t), 'nothing')) as tool,
+      coalesce((select string_agg(concat_ws('/', r->>'system', r->>'kind', r->>'identifier'), ',')
           from jsonb_array_elements(case when jsonb_typeof(resources) = 'array' then resources
                                          else '[]'::jsonb end) as r), resources #>> '{}') as resources,
       decision, reason, outcome, latency_ms as ms, policy_revision as rev
@@ -251,11 +295,15 @@ audit_rows() {
         and sentence like '%named none of them%'")" 1 \
       "audit: $team's call that named no project records none"
   done
-  check_row_resources "$(row_resources_json)"
+  local rows
+  rows=$(row_resources_json)
+  check_row_resources "$rows"
+  check_list_rows "$rows" "$lists"
   # A begin that ran past its budget may still commit: the store asks the server to cancel the
   # insert, but a paused server cannot act on that before it commits. Nothing completes such a
   # row yet (decision 0009), so the outage step's one refused call may leave its row open. No
-  # other allowed row may.
+  # other allowed row may. A list row has no decision and is written complete, so it is never
+  # open and these counts never include one; the outage step makes no list.
   local outage="begun_at between to_timestamp($OUTAGE_FROM) and to_timestamp($OUTAGE_TO)"
   check "$(audit_count "decision = 'allow' and outcome is null and not ($outage)")" 0 \
     "audit: no allowed row outside the database outage is left without an outcome"
@@ -408,7 +456,8 @@ compose_run() {
   # Let the gateway load the restored registry before anything else runs against it.
   sleep 4
 
-  audit_rows
+  # Three lists: each team's full run, and the run after the withdrawal.
+  audit_rows 3
   FINISHED=1
 }
 
@@ -691,7 +740,9 @@ kind_run() {
   # stranger once.
   check_at_least "$(count_lines '"event":"identity_failed"' "$gateway_logs")" 7 "the gateway logged every identity failure"
 
-  audit_rows
+  # Two lists: each team's full run. The probes before the policy make none, and the
+  # stranger's is refused for identity, which writes no row.
+  audit_rows 2
   FINISHED=1
 }
 
