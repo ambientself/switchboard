@@ -8,8 +8,8 @@
 //! It performs no network I/O. Keys are supplied as JWK sets: in configuration at boot, and
 //! through [`Identity::replace_keys`] while the gateway runs, which puts a new set for one
 //! issuer in force only if it passes every check a set gets at boot. Fetching sets from an
-//! issuer's own host lives in its own crate beside this one, which hands what it fetches to the
-//! gate. Time comes from a [`Clock`], so tests choose what time it is.
+//! issuer's own host is a later change that belongs in its own crate beside this one. Time comes
+//! from a [`Clock`], so tests choose what time it is.
 //!
 //! - [`TokenVerifier`] is the [`Verifier`](gateway_core::Verifier) for principals: the place
 //!   proof is created, and the code to read when reviewing it.
