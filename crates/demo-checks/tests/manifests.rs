@@ -139,7 +139,10 @@ fn listeners(config: &str) -> (&str, &str) {
         .split_once("\n[")
         .expect("a table after [metrics]")
         .0;
-    (value_after(top, "listen = "), value_after(metrics, "listen = "))
+    (
+        value_after(top, "listen = "),
+        value_after(metrics, "listen = "),
+    )
 }
 
 /// In kind the metrics are on a containerPort of their own, which the teams cannot reach: the
