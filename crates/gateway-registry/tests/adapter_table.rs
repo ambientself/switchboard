@@ -196,12 +196,65 @@ fn arguments_that_are_not_an_object_are_refused() {
 
 #[test]
 fn a_schema_that_lists_no_properties_accepts_any() {
-    let mut table = base();
-    common::remove(&mut table, "tools.1.input_schema", "properties");
-    rehash(&mut table);
-    let registry = load(&table).unwrap();
-    let adapter = adapter(&registry, "wiki__search");
-    assert_eq!(adapter.check_arguments(&json!({"anything": 1})), Ok(()));
+    for schema in [
+        r#"{ type = "object" }"#,
+        r#"{ type = "object", additionalProperties = true }"#,
+        r#"{ type = "object", additionalProperties = { type = "string" } }"#,
+    ] {
+        let mut table = base();
+        set(&mut table, "tools.1", "input_schema", value(schema));
+        rehash(&mut table);
+        let registry = load(&table).unwrap();
+        let adapter = adapter(&registry, "wiki__search");
+        for arguments in [json!({}), json!({"anything": {"at": ["any", "depth"]}})] {
+            assert_eq!(adapter.check_arguments(&arguments), Ok(()), "{schema}");
+        }
+    }
+}
+
+#[test]
+fn closed_objects_without_properties_refuse_every_property_at_any_depth() {
+    let cases = [
+        (
+            r#"{ type = "object", additionalProperties = false }"#,
+            json!({}),
+            json!({"query": "atlas"}),
+            "/query",
+        ),
+        (
+            r#"{ type = "object", additionalProperties = false }"#,
+            json!({}),
+            json!({"a~/b": null}),
+            "/a~0~1b",
+        ),
+        (
+            r#"{ type = "object", properties = { "a/b" = { type = "object", additionalProperties = false } } }"#,
+            json!({"a/b": {}}),
+            json!({"a/b": {"c~d": false}}),
+            "/a~1b/c~0d",
+        ),
+        (
+            r#"{ type = "object", properties = { tags = { type = "array", items = { type = "object", additionalProperties = false } } } }"#,
+            json!({"tags": [{}, {}]}),
+            json!({"tags": [{}, {"a~/b": []}]}),
+            "/tags/1/a~0~1b",
+        ),
+    ];
+    for (schema, accepted, refused, path) in cases {
+        let mut table = base();
+        set(&mut table, "tools.1", "input_schema", value(schema));
+        rehash(&mut table);
+        let registry = load(&table).unwrap();
+        let adapter = adapter(&registry, "wiki__search");
+        assert_eq!(adapter.check_arguments(&accepted), Ok(()), "{schema}");
+        match adapter.check_arguments(&refused) {
+            Err(ArgumentError::Undeclared { tool, path: got }) => {
+                assert_eq!(tool.as_str(), "wiki__search");
+                assert_eq!(got.as_str(), path, "{schema}: {refused}");
+            }
+            other => panic!("{schema}: {refused}: {other:?}"),
+        }
+    }
 }
 
 #[test]

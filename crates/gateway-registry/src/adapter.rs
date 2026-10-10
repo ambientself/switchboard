@@ -139,8 +139,9 @@ impl ArgumentAdapter {
     ///
     /// Where an object in the schema lists its `properties`, any other property is refused, at
     /// any depth, whatever the schema says about `additionalProperties`; array elements are
-    /// checked against `items`. An object the schema leaves open (no `properties`) is accepted
-    /// as one value. The loader has already refused schemas whose keywords this walk cannot
+    /// checked against `items`. With no `properties`, `additionalProperties: false` declares
+    /// no arguments; otherwise the object is left open and accepted as one value.
+    /// The loader has already refused schemas whose keywords this walk cannot
     /// follow, such as `$ref` or `anyOf`. This is not full JSON Schema validation: types,
     /// `required` and formats are not checked here.
     pub fn check_arguments(&self, arguments: &Value) -> Result<(), ArgumentError> {
@@ -162,7 +163,13 @@ impl ArgumentAdapter {
 fn undeclared(schema: &Value, value: &Value, at: &JsonPointer) -> Option<JsonPointer> {
     match value {
         Value::Object(object) => {
-            let properties = schema.get("properties").and_then(Value::as_object)?;
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                    object.keys().next().map(|key| at.child(key))
+                } else {
+                    None
+                };
+            };
             object
                 .iter()
                 .find_map(|(key, value)| match properties.get(key) {

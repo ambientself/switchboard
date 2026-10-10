@@ -2392,6 +2392,10 @@ mutate("adapter-empty-identifier-accepted", "the empty string names a resource",
        "Some(Value::String(identifier)) if !identifier.is_empty() => {", "Some(Value::String(identifier)) => {")
 mutate("adapter-not-an-object-accepted", "arguments that are not an object pass the check", RA,
        "        if !arguments.is_object() {", "        if false {")
+mutate("adapter-closed-without-properties-accepted", "a closed object without properties admits arguments", RA,
+       'schema.get("additionalProperties") == Some(&Value::Bool(false))', "false")
+mutate("adapter-open-without-properties-refused", "an open object without properties refuses arguments", RA,
+       'schema.get("additionalProperties") == Some(&Value::Bool(false))', "true")
 mutate("adapter-undeclared-accepted", "an undeclared argument passes the check", RA,
        "                    None => Some(at.child(key)),", "                    None => None,")
 mutate("adapter-undeclared-not-nested", "nested objects are not checked", RA,
