@@ -242,8 +242,10 @@ sits with a maximum snapshot age, are Q11's.
 
 *Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):*
 each gateway replica runs its own drift pass and withdraws for itself, so a change that lasts
-one interval plus one call deadline is withdrawn on every replica, with nothing passed between
-them. The derived revision names the withdrawn tools literally. A replica that cannot read its
+one interval plus one call deadline is withdrawn on every replica whose polls succeed, with
+nothing passed between them. A failed poll is not drift: while a replica's polls of an entry
+fail, a changed tool stays served on that replica, and the alert on failed polls covers it. The
+derived revision names the withdrawn tools literally. A replica that cannot read its
 registry for longer than the maximum age, 60 s, refuses every call. The residual: in milestone 3
 a withdrawal lives in each replica's memory, and lasts until a new approval or until that
 replica restarts. A restarted or new replica serves the tool again if the server has gone back

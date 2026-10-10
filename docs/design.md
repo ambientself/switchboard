@@ -514,8 +514,11 @@ registry file for longer than the maximum age, 60 s by default and never less th
 poll interval, fails `/readyz` and refuses `tools/call` and `tools/list` with a fixed sentence
 and no row. How long a merged change takes to reach the file is the delivery path's own bound,
 stated with it: kubelet's part was measured at up to 88 s in kind, and is stated as at most
-120 s. Any change to the registry, including an emergency withdrawal or a team removed from a
-surface, takes effect within that bound plus one poll. Group claims are as fresh as their
+120 s. A change the reloader accepts takes effect within that bound plus one poll. That
+includes an emergency withdrawal, which removes a tool or removes it from its surfaces, and a
+team removed from a surface. A version that removes or changes a server entry, or changes a
+remaining tool's route, is refused on reload and keeps the last good policy, so it takes effect
+only through a restart, within the rollout. Group claims are as fresh as their
 token, at most an hour for a user issuer; a team manifest change takes one rollout; a per-user
 grant is looked up on every call, so deleting it takes effect on the next. A token for a deleted
 pod or ServiceAccount is accepted until it expires ([decision
@@ -1005,16 +1008,19 @@ interface. It does not detect a changed implementation behind the same interface
 a risk, covered by the owner's accountability, monitoring and emergency withdrawal.
 
 A withdrawal makes a snapshot of its own, with the revision `{base}+withdrawn:{names}`, the
-withdrawn tools' exposed names sorted and joined by commas. It survives a reload while the
-tool's hashes and `approved_at` are unchanged; a new approval clears it. The first pass runs at
-boot, before `/readyz` passes. A poll that fails, by being unreachable, late or unparsable, is
-not drift: the tools stay served and the failure is counted and alerted on. Each replica checks
-for itself, so a change that lasts one interval plus one call deadline, about 305 s at the
-defaults, is withdrawn on every replica. In milestone 3 a withdrawal lives in each replica's
-memory: it lasts until a new approval or until that replica restarts, and a restarted replica
-serves the tool again if the server has gone back to its approved definition. Every withdrawal
-is logged at ERROR and alerted on, so that a person makes it standing by a new approval or a
-registry edit. Persisted withdrawals come with the registry service ([decision
+withdrawn tools' exposed names sorted and joined by commas. The loader refuses a registry
+revision containing `+`, so the derived form cannot be mistaken for a loaded one. It survives a
+reload while the tool's hashes and `approved_at` are unchanged; a new approval clears it. The
+first pass runs at boot, before `/readyz` passes. A poll that fails, by being unreachable, late
+or unparsable, is not drift: the tools stay served and the failure is counted and alerted on.
+Each replica checks for itself, so a change that lasts one interval plus one call deadline,
+about 305 s at the defaults, is withdrawn on every replica whose polls succeed. While a
+replica's polls of an entry fail, a changed tool stays served on that replica, and the alert on
+failed polls covers it. In milestone 3 a withdrawal lives in each replica's memory: it lasts
+until a new approval or until that replica restarts, and a restarted replica serves the tool
+again if the server has gone back to its approved definition. Every withdrawal is logged at
+ERROR and alerted on, so that a person makes it standing by a new approval or a registry edit.
+Persisted withdrawals come with the registry service ([decision
 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 
 The three calls of step 2 repeat on each poll. A server that starts dispatching any of them

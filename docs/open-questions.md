@@ -118,17 +118,17 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   asked to make the changes this needs; none has been agreed with Otto's owners yet, and what
   waits on them is listed in the decision and under Q18 below. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
-- **2026-10-10 (Q11):** Each approval records two hashes: the definition the server serves,
-  and the server's binding (identity, address, destination, credential and, with connector
-  entries, the reach). Only JSON Schema 2020-12 loads. Each gateway replica runs its own drift
-  pass, every 300 s by default, and withdraws a changed tool or a widened reach for itself,
-  with a revision naming the withdrawn tools. In milestone 3 a withdrawal lasts until a new
-  approval or until that replica restarts, and every one is alerted on. A replica that cannot
-  read its registry for 60 s refuses every call. Emergency withdrawal is a registry edit,
-  bounded by delivery plus one poll. The drift interval and how long a withdrawal lasts are
-  the owner's own answers, given by accepting the record. What platform owners and IT decide
-  is under Q17 and Q9. See
-  [decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md).
+- **2026-10-10 (Q11):** Each approval records two hashes: the definition the server serves, and
+  the server's binding (identity, address, destination, credential and, with connector entries,
+  the reach). Only JSON Schema 2020-12 loads. Each gateway replica runs its own drift pass,
+  every 300 s by default, and withdraws a changed tool or a widened reach for itself, with a
+  revision naming the withdrawn tools. In milestone 3 a withdrawal lasts until a new approval or
+  until that replica restarts, and every one is alerted on. A replica that cannot read its
+  registry for 60 s refuses every call. Emergency withdrawal, removing a tool or removing it
+  from its surfaces, is bounded by delivery plus one poll. The drift interval and how long a
+  withdrawal lasts are the owner's own answers, given by accepting the record. What platform
+  owners and IT decide is under Q17 and Q9. See [decision
+  0013](decisions/0013-registry-freshness-drift-and-withdrawal.md).
 
 ## Q9. What does authorization check beyond tool classification?
 

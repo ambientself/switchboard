@@ -158,14 +158,17 @@ first poll does not hold readiness back.
 **How often (for the owner).** The recommendation is every 300 s per proxied entry by default,
 set by an optional `[drift]` table in the deployment file, `interval_seconds`, refused below 5
 or above 900. The demos set 10. A changed definition or a widened reach can then still be served
-for one interval plus one call deadline on each replica, about 305 s at the defaults. Decision
-0011 left this question to the owner with no recommendation, so it is not adopted under the
-standing instruction. Until the owner answers, decision 0011 keeps every proxied entry to
-development and test deployments.
+for one interval plus one call deadline on each replica whose polls succeed, about 305 s at the
+defaults. Decision 0011 left this question to the owner with no recommendation, so it is not
+adopted under the standing instruction. Until the owner answers, decision 0011 keeps every
+proxied entry to development and test deployments.
 
 **What every replica sees.** Each replica checks for itself, with nothing passed between them.
-A change that lasts at least one interval plus one call deadline is withdrawn on every replica.
-A shorter change may be seen by some replicas, or by none.
+A change that lasts at least one interval plus one call deadline is withdrawn on every replica
+whose polls succeed. A shorter change may be seen by some replicas, or by none. The residual:
+while a replica's polls of an entry fail, a changed tool stays served on that replica, for as
+long as the failures last, and `tools/call` may keep working meanwhile. The alert on failed
+polls is what covers it.
 
 ### 6. Withdrawal in a replica
 
@@ -181,16 +184,18 @@ by byte and joined by commas, for example:
 demo-3+withdrawn:docs__list_documents,docs__read_document
 ```
 
-An exposed name is at most 64 characters of ASCII letters, digits, `_` and `-`, so the text
-after the last `+withdrawn:` reads back unambiguously, whatever the base revision holds. A row
-decided under a withdrawal then says exactly what was in force, with nothing more than the base
-snapshot, which decision 0011 keeps as long as the rows. No log is needed to read it.
+**The derived form is reserved.** The loader refuses a registry whose revision contains `+`,
+so only a withdrawal makes a revision with one, and the first `+` ends the base. An exposed
+name is at most 64 characters of ASCII letters, digits, `_` and `-`, so the text after
+`+withdrawn:` reads back unambiguously. A row decided under a withdrawal then says exactly what
+was in force, with nothing more than the base snapshot, which decision 0011 keeps as long as
+the rows. No log is needed to read it.
 
-**The set is capped at 16 tools,** so the part after the base is at most 1,039 bytes. In
-milestone 3 the loader refuses a registry that serves more than 16 proxied tools, so no
-withdrawal set can pass the cap. Above it, a revision would have to carry a hash of the set,
-and the set would then have to be kept as long as the rows that cite it. That store arrives
-with the persisted withdrawals of section 7, and the loader's limit is lifted then.
+**The set is always literal in milestone 3.** Its length is bounded by the registry:
+`+withdrawn:` and at most 65 bytes for each proxied tool the registry serves. The audit column
+is unbounded `text`. A cap of 16 tools, above which the revision carries a hash of the set
+instead, arrives with the persisted withdrawals of section 7, whose table keeps the set as long
+as the rows that cite it. The registry's size is not limited.
 
 **A standing withdrawal outlives a reload.** It is keyed by the tool's name,
 `definition_sha256`, `binding_sha256` and `approved_at`. When a new version of the registry
@@ -218,8 +223,8 @@ approved again" hold only on a replica that has not restarted since the withdraw
 0011 carries a dated note saying so.
 
 What covers it. Every `tool_withdrawn` is logged at ERROR and alerted on, so that a person makes
-the withdrawal standing: approves the tool again after review, or removes the tool or its entry
-from the registry, which then holds on every replica, restarts included. The alert is what
+the withdrawal standing: approves the tool again after review, or removes the tool from the
+registry, which then holds on every replica, restarts included. The alert is what
 turns a withdrawal in one replica's memory into a decision that lasts.
 
 Persisting withdrawals, in a table in the audit database read at boot and on each poll, is
@@ -247,13 +252,17 @@ to the ConfigMap, and from the ConfigMap to the mounted file. Kubelet's part was
 to 88 s in kind, and is stated as at most 120 s. How long a deployment pipeline takes to apply
 the ConfigMap is the pipeline's, and is stated with it.
 
-**Emergency withdrawal** is an edit to the registry: removing the tool from its surfaces, or
-removing the tool or its entry. It takes effect on a replica within the delivery bound plus one
-`registry.poll_seconds`: in kind, at most 120 s plus one poll once the ConfigMap is applied, and
-in Compose, one poll. Restarting the deployment after applying the ConfigMap bounds it by the
-rollout instead. The same bound
-applies to every lever that is a registry edit, including the two in decision 0012: removing a
-team from a surface's allowlist, and withdrawing a surface.
+**Emergency withdrawal** is an edit to the registry that removes the tool from its surfaces, or
+removes the tool. The reloader accepts both. It takes effect on a replica within the delivery
+bound plus one `registry.poll_seconds`: in kind, at most 120 s plus one poll once the ConfigMap
+is applied, and in Compose, one poll. Restarting the deployment after applying the ConfigMap
+bounds it by the rollout instead. The same bound applies to the two levers in decision 0012,
+removing a team from a surface's allowlist and withdrawing a surface, which the reloader also
+accepts. Removing or changing a server entry, or changing a remaining tool's route, is not an
+emergency withdrawal: as built, the reloader refuses such a version, logs it and keeps the last
+good policy, which includes the tool, until the replica restarts. Such a file reads, so the
+maximum age does not fire. That edit takes effect only through a restart, and so within the
+rollout. To withdraw all of a server's tools quickly, remove each tool and leave the entry.
 
 **How stale identity inputs may be:**
 
@@ -335,7 +344,7 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
 - A standing withdrawal survives a reload that leaves its key unchanged, and the derived
   revision names the new base.
 - A server entry changed without its tools approved again is refused at boot and at reload.
-- A registry serving more than 16 proxied tools is refused.
+- A registry whose revision contains `+` is refused at boot and at reload.
 
 ## Alternatives rejected
 
@@ -358,6 +367,10 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
   that cannot read its file, and the delivery path's bound is stated separately.
 - **A hash of the withdrawn names in the revision,** as first proposed for this record. A row's
   revision would not say what was in force once the logs mapping the hash were gone.
+- **Limiting the registry to 16 proxied tools until the hashed form has a store.** It would cap
+  what the product can serve, with no committed end, for a revision that is already bounded by
+  the registry. Jira's and Confluence's read groups ([systems.md](../systems.md)) each pass 16
+  tools on their own.
 - **Treating a failed poll as drift.** A server that is down for one interval would lose its
   tools on every replica, and get them back only through a new approval, for an outage that
   changed nothing.
@@ -370,7 +383,7 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
   and the scenarios above. The loader gains these
   rules, each with a case and a mutation in `scripts/mutation_check.py`: both hashes
   recomputed, identity equal to the address's host, the destination rules, a probe record on
-  every proxied entry, the dialect, and at most 16 proxied tools.
+  every proxied entry, the dialect, and no `+` in the registry's revision.
 - **The deployment file gains** an optional `[drift]` table (`interval_seconds`, default 300,
   from 5 to 900) and `registry.max_age_seconds` (default 60, at least twice `poll_seconds`). The
   demos set 10 s for drift. A user issuer's `max_lifetime_seconds` above 3600 is refused.
@@ -386,7 +399,8 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
   the branch rule requiring their review exist. So #48 (a `CODEOWNERS` entry and a code-owner
   branch rule, set by the owner) must land before the approval-binding work of #11 merges, or
   the owner rules that those files are fixtures, not policy files.
-- **Persisted withdrawals** get a home issue in milestone 6, with the hashed revision's store.
+- **Persisted withdrawals** get a home issue in milestone 6, with the hashed revision above
+  the cap and the table that keeps its set.
 - **Q11 is settled,** except what others decide (Still open). Decisions 0010, 0011 and 0012
   carry dated notes. Design sections 7, 8, 13 and 15 change to match.
 - **Decision 0012's two levers** take effect within the delivery bound plus one poll, not one
