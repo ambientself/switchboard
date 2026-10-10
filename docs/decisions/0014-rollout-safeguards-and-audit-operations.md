@@ -34,8 +34,8 @@ What is built today:
   item 5 of its amendment). #69 holds the work decision 0009 describes instead: reads served,
   each with a row whose identity is `disabled`.
 
-What the first slice measured ([first-slice-findings.md](../first-slice-findings.md), #14),
-against Postgres in the same kind cluster:
+What the first slice measured ([first-slice-findings.md](../first-slice-findings.md), #14), on
+one laptop, in the Compose stack and the kind cluster:
 
 - Begin and finish each take under 1 ms at p95 one call at a time, and 2 to 3.3 ms with 8 calls
   at a time.
@@ -115,10 +115,10 @@ limit is answered (Still open).
 The release binary refuses `[identity] mode = "disabled"` and `[audit] mode = "disabled"` at
 boot, before it makes any connection. Only a development build, with the `test-support`
 feature, accepts them, as it alone may serve a tool not classified `read` without a receipt
-store (pull request #72). The receipt gate moves to run right after the registry loads, so that CI's
-receipt-gate configuration can enforce identity from a checked-in public key file and name a
-database it never reaches. CI's release-artifact job gains a refusal step for each opt-out.
-The harness and the conformance suite's Rust target stay development builds on fakes.
+store (pull request #72). The receipt gate moves to run right after the registry loads, so
+that CI's receipt-gate configuration can enforce identity from a checked-in public key file and
+name a database it never reaches. CI's release-artifact job gains a refusal step for each
+opt-out. The harness and the conformance suite's Rust target stay development builds on fakes.
 
 With identity disabled, the stricter behaviour stays: nothing is listed and every `tools/call`
 is refused, with no row. #69, serving reads with rows whose identity is `disabled`, is not
@@ -240,11 +240,12 @@ is no longer a question in Q12.
 
 ## Consequences
 
-- #11 builds sections 1 to 4 and 9: per-server limits in the deployment file and their
-  ceilings, the three caps with the capacity sentence, the opt-out refusals and CI's checks of
-  the release artifact, configurable pools, the row bound and its test, the new signals, and a
-  demo of overload and a hanging server. The grace check moves to the largest configured
-  deadline.
+- #11 builds sections 1 to 4, the row bound of section 7, and section 9: per-server limits in
+  the deployment file and their ceilings, the three caps with the capacity sentence, the
+  opt-out refusals and CI's checks of the release artifact, configurable pools, the row bound
+  and its test, the new signals, and a demo of overload and a hanging server. The grace check
+  moves to the largest configured deadline. The configured entry identity is one of the
+  columns #56 adds.
 - Decision 0009's `refused` covers a call refused by the per-server or per-team cap, and its
   call deadlines are set per server. Its provisional values become final for milestone 3. Each
   is a dated note on that record. Its Still open 6 is answered in part: the schema stays here,
