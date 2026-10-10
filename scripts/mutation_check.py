@@ -1144,32 +1144,84 @@ mutate("fake-audit-begin-hold-ignored", "a held begin is not held", A, "        
 mutate("fake-audit-finish-hold-ignored", "a held finish is not held", A, "            state.finish_gate.clone()", "            None::<Gate>")
 mutate("fake-audit-begin-attempts-not-counted", "begin attempts are not counted", A, "            state.begin_attempts += 1;\n", "")
 mutate("fake-audit-finish-attempts-not-counted", "finish attempts are not counted", A, "            state.finish_attempts += 1;\n", "")
-FAKE_FINISHED_DIFFERENTLY = '                Some(_) => Err("the row was already finished, with a different completion".into()),'
+FAKE_FINISHED_DIFFERENTLY = '            Some(_) => Err("the row was already finished, with a different completion".into()),'
 mutate("fake-audit-double-finish-allowed", "a different second completion of a row is accepted", A,
-       FAKE_FINISHED_DIFFERENTLY, "                Some(_) => Ok(()),")
+       FAKE_FINISHED_DIFFERENTLY, "            Some(_) => Ok(()),")
 mutate("testkit-finish-overwrites", "a different second completion overwrites the first", A,
        FAKE_FINISHED_DIFFERENTLY,
-       "                Some(_) => {\n                    row.completion = Some(completion.completion().clone());\n                    Ok(())\n                }")
+       "            Some(_) => {\n                row.completion = Some(completion.clone());\n                Ok(())\n            }")
 FAKE_BEGIN_PUSH = "                    state.rows.push((row.clone(), record.clone(), times));"
 mutate("fake-audit-begin-drops-resources", "the store keeps a row without the resources begin recorded", A, FAKE_BEGIN_PUSH,
        "                    state.rows.push((row.clone(), AuditRecord { resources: gateway_core::audit::RecordedResources::Unknown, ..record.clone() }, times));")
 mutate("fake-audit-begin-resets-omitted", "the store keeps a row without the count of resources begin omitted", A, FAKE_BEGIN_PUSH,
        "                    state.rows.push((row.clone(), AuditRecord { resources_omitted: 0, ..record.clone() }, times));")
-FAKE_FINISH_WRITE = "                    row.completion = Some(completion.completion().clone());\n                    Ok(())"
+FAKE_FINISH_WRITE = "                row.completion = Some(completion.clone());\n                Ok(())"
 mutate("fake-audit-finish-resets-omitted", "finishing a row clears its count of omitted resources", A, FAKE_FINISH_WRITE,
-       "                    row.completion = Some(completion.completion().clone());\n                    row.resources_omitted = 0;\n                    Ok(())")
+       "                row.completion = Some(completion.clone());\n                row.resources_omitted = 0;\n                Ok(())")
 mutate("fake-audit-finish-rewrites-row", "finishing a row changes more than its completion", A, FAKE_FINISH_WRITE,
-       "                    row.completion = Some(completion.completion().clone());\n                    row.resources_omitted += 1;\n                    Ok(())")
+       "                row.completion = Some(completion.clone());\n                row.resources_omitted += 1;\n                Ok(())")
 mutate("fake-audit-row-id-ignored", "the store keeps every row under one identifier, not the one begin was given", A,
        FAKE_BEGIN_PUSH, '                    state.rows.push((AuditRowId::new("0"), record.clone(), times));')
 mutate("testkit-begin-duplicates-row", "a begin with a known identifier writes a second row", A,
        "            match state.rows.iter().find(|(id, _, _)| id == row) {",
        "            match state.rows.iter().find(|(id, _, _)| id == row && false) {")
 mutate("fake-audit-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", A,
-       "                Some((_, stored, _)) if stored.decision == record.decision => Ok(()),",
-       "                Some((_, stored, _)) if stored.decision == record.decision || true => Ok(()),")
+       "                Some((_, stored, _)) if stored.decision == record.decision => {}",
+       "                Some((_, stored, _)) if stored.decision == record.decision || true => {}")
 mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clock, not its own, for a row's times", A,
        "        let begun_at = self.clock.now();", "        let begun_at = SystemTime::now();")
+mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
+       "                let _ = state.complete(row, &error);", "                let _ = &error;")
+mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
+       "            if state.confirmation_lost.take() {\n                let error", "            if false {\n                let error")
+mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confirmation succeeds", A,
+       "            if state.confirmation_lost.take() {\n                return Err(lost());", "            if false {\n                return Err(lost());")
+mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
+       "            if state.begin_failing.take() {\n                return Err(down());\n            }\n            if state.list_rows",
+       "            if state.begin_failing.take() || state.confirmation_lost.take() {\n                return Err(down());\n            }\n            if state.list_rows")
+mutate("testkit-answer-budget-written-at-once", "a finish past the answer budget is written before its gate opens", A,
+       "state.answer_gate.clone().filter(|gate| !gate.is_open())", "None::<Gate>")
+mutate("testkit-answer-budget-never-written", "a finish past the answer budget is never written", A,
+       ".partition::<Vec<_>, _>(|late| late.gate.is_open());", ".partition::<Vec<_>, _>(|late| late.gate.is_open() && false);")
+mutate("testkit-forgotten-finish-written", "a finish from a lost process is written", A,
+       "            if state.finishes_forgotten {", "            if false {")
+mutate("testkit-forgotten-late-completion-written", "a completion still being tried when the process is lost is written", A,
+       "        state.late.clear();\n", "")
+mutate("testkit-nul-accepted", "the in-memory store writes a value with U+0000, which Postgres cannot hold", A,
+       "        Value::String(text) => text.contains('\\0'),", "        Value::String(_) => false,")
+mutate("testkit-past-bigint-accepted", "the in-memory store writes a count, latency or allowance past a Postgres bigint", A,
+       "    if i64::try_from(value).is_err() {", "    if false {")
+mutate("testkit-list-unchecked", "the in-memory store writes any list record", A,
+       "            refused_at_list(row, record)?;\n", "")
+mutate("testkit-non-uuid-accepted", "the in-memory store writes a row under an identifier that is not a lowercase hyphenated UUID", A,
+       "    if !uuid {\n", "    if false {\n")
+mutate("testkit-complete-at-begin-accepted", "the in-memory store's begin writes a record that is already complete", A,
+       "    if record.completion.is_some() {\n", "    if false {\n")
+mutate("testkit-unknown-resources-omitted-accepted", "the in-memory store writes unknown resources with a count left out", A,
+       "    if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {",
+       "    if false {")
+mutate("testkit-completion-unchecked", "the in-memory store writes any completion", A,
+       "            refused_at_finish(completion.completion())?;\n", "")
+mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round to a short deadline", A,
+       "        .saturating_add(call_deadline_ms)", "        .wrapping_add(call_deadline_ms)")
+mutate("testkit-allowance-rounds-up", "a budget is counted in part milliseconds, not whole ones as Postgres counts it", A,
+       "    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)",
+       "    u64::try_from(duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 > 0)).unwrap_or(u64::MAX)")
+mutate("testkit-denial-completed", "the in-memory store completes a denial, which complete_once refuses", A,
+       "        if row.decision != DecisionKind::Allow {", "        if false {")
+mutate("testkit-list-row-completed", "the in-memory store finds no row, rather than a listing, when finish names a list row", A,
+       "        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {", "        if false {")
+mutate("testkit-list-kind-completed", "the in-memory store completes a call row of kind list, which complete_once refuses", A,
+       "        if row.kind != RowKind::Call {", "        if false {")
+mutate("testkit-deadline-past-postgres-end", "the in-memory store writes a deadline past what a Postgres time holds", A,
+       "    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {", "    if false {")
+mutate("testkit-deadline-end-accepted", "the in-memory store writes a deadline at the end of what a Postgres time holds", A,
+       "    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {",
+       "    if begun_micros + i128::from(span_micros) > POSTGRES_END_MICROS {")
+mutate("testkit-interval-overflow-accepted", "the in-memory store writes an allowance past what a Postgres interval holds", A,
+       "    if product >= TWO_TO_THE_63 {", "    if false {")
+mutate("testkit-deadline-exact-arithmetic", "the in-memory store adds the allowance exactly, not through float8 as Postgres does", A,
+       "    let span_micros = product as u64;", "    let span_micros = allowance_ms.saturating_mul(1000);")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"

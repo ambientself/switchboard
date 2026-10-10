@@ -48,6 +48,11 @@ impl Gate {
         }
     }
 
+    /// Whether the gate has been opened.
+    pub fn is_open(&self) -> bool {
+        locked(&self.state).open
+    }
+
     /// How many waits are pending at the gate right now: how a test sees that a call has
     /// arrived and is held.
     pub fn waiting(&self) -> usize {
