@@ -1168,6 +1168,12 @@ mutate("testkit-begin-duplicates-row", "a begin with a known identifier writes a
 mutate("fake-audit-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", A,
        "                Some((_, stored, _)) if stored.decision == record.decision => {}",
        "                Some((_, stored, _)) if stored.decision == record.decision || true => {}")
+# A fake doing what Postgres cannot: its role cannot read who called what, so it compares only the
+# decision. The contract suite expects Postgres's behaviour, and passes against Postgres.
+mutate("testkit-begin-compares-more-than-decision", "a begin with a known identifier and the same decision is refused when the rest of its record differs", A,
+       "                Some((_, stored, _)) if stored.decision == record.decision => {}",
+       "                Some((_, stored, _)) if stored.decision == record.decision\n"
+       "                    && AuditRecord { completion: None, ..stored.clone() } == *record => {}")
 mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clock, not its own, for a row's times", A,
        "        let begun_at = self.clock.now();", "        let begun_at = SystemTime::now();")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,

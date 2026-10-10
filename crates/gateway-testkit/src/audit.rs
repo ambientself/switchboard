@@ -13,6 +13,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::Value;
 
 use crate::clock::FixedClock;
+use crate::contract::StoredRecord;
 use crate::gate::Gate;
 
 /// The instance [`row_start`] names.
@@ -471,6 +472,43 @@ impl InMemoryAuditStore {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.settle();
         state
+    }
+
+    /// Every row stored under `id`, of either kind, with the time at begin and the deadline the
+    /// store gave it: for the contract suite's read-back, which refuses more than one.
+    pub(crate) fn stored_under(
+        &self,
+        id: &AuditRowId,
+    ) -> Vec<(StoredRecord, SystemTime, Option<SystemTime>)> {
+        let state = self.state();
+        let calls =
+            state
+                .rows
+                .iter()
+                .filter(|(stored, _, _)| stored == id)
+                .map(|(_, record, times)| {
+                    (
+                        StoredRecord::Call(record.clone()),
+                        times.begun_at,
+                        times.deadline,
+                    )
+                });
+        let lists = state
+            .list_rows
+            .iter()
+            .filter(|(stored, _, _)| stored == id)
+            .map(|(_, record, begun_at)| (StoredRecord::List(record.clone()), *begun_at, None));
+        calls.chain(lists).collect()
+    }
+
+    /// The budgets in each call row's deadline.
+    pub(crate) fn store_budgets(&self) -> StoreBudgets {
+        self.budgets
+    }
+
+    /// The time on the clock the store reads for a row's times.
+    pub(crate) fn store_now(&self) -> SystemTime {
+        self.clock.now()
     }
 
     /// Every row, in the order its begin was written, with its completion once finished.

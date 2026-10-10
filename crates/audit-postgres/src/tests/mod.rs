@@ -9,6 +9,7 @@
 
 mod budgets;
 mod check;
+mod contract;
 mod latency;
 mod open_rows;
 mod recovery;
