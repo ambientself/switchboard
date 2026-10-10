@@ -10,6 +10,9 @@
 //!   confirmation after writing, answer a finish past the answer budget and write it later,
 //!   and forget finishes as a lost process would. [`row_start`] makes a fresh identifier for a
 //!   test.
+//! - [`contract`] is the audit store contract suite: test functions that every store must
+//!   pass, run on [`InMemoryAuditStore`] by this crate's tests and on the Postgres store by
+//!   that crate's.
 //! - [`FakeCredentialSource`] issues labelled dummy credentials, records every request, and
 //!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a `propose` tool that acts only on drafts it
@@ -33,6 +36,7 @@
 mod audit;
 mod clock;
 mod connector;
+pub mod contract;
 mod credentials;
 mod exec;
 mod fixture;
