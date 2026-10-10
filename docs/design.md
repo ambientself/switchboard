@@ -1327,9 +1327,14 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
 - **A refused route is shown beside one that works**
   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The kind
   run's direct call first connects and is refused by the server, and the gateway's call
-  succeeds before and after the network policy. The route check has its own tests in kind,
-  with each control present and then removed. When milestone 3 builds the registry's probe,
-  each of its guards gets an entry in `scripts/mutation_check.py`.
+  succeeds before and after the network policy. The kind run also runs the route check: before
+  the policy from a team-a pod, where its probe finds every route open, and after it from a pod
+  of each team, with every control present and every route refused. The cases with a control
+  removed, where the check must fail (a Secret mounted, a permission granted, enforcement off,
+  a route left open), are tested against a fake cluster, in
+  `crates/demo-checks/tests/route_check.rs`. No run has been made against a cluster that does
+  not enforce policy. When milestone 3 builds the registry's probe, each of its guards gets an
+  entry in `scripts/mutation_check.py`.
 - A `propose` tool's run-time guards (section 8), refusals and forced values such as a draft,
   are guards like any other. Its connector has a test against the fake vendor that fails
   without each one, and a mutation that removes it. Such a guard cannot sit inside a proxied

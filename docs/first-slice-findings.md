@@ -39,7 +39,8 @@ cannot show that, and these numbers do not change it.
   between, and all four runs passed: Compose 90/90 both times and kind 156/156 both times.
 - **The route check in the kind run** (section 13). Compose passed 93/93 from `db8f519`, and
   kind passed 661/661 twice in a row from `5fc485e`. The route check found every route to
-  mock-docs open before the policy and refused after it, for both teams.
+  mock-docs open before the policy, from a team-a pod, and refused after it, from a pod of each
+  team.
 
 ## Where and how
 
