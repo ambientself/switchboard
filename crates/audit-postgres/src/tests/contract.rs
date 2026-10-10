@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use tokio_postgres::Client;
 
 use super::TestDatabase;
-use crate::columns::allowance_ms;
 use crate::{Budgets, PgAuditStore, PoolSizes};
 
 /// Budgets other than the defaults, so a store that ignores the ones it was given is caught.
@@ -85,12 +84,15 @@ impl ContractStore for Postgres {
                     named => json!({ "named": named }),
                 };
                 // The table holds the allowance, which is the store's budgets and the call
-                // deadline.
+                // deadline. The budgets are worked out here, not with the store's own
+                // arithmetic, so a store that leaves one out is caught.
+                let budgets_ms =
+                    u64::try_from((BUDGETS.begin + BUDGETS.finish_deadline).as_millis()).unwrap();
                 let allowance = row
                     .get::<_, Option<i64>>("allowance_ms")
                     .map(|allowance| u64::try_from(allowance).unwrap());
-                let call_deadline_ms = allowance
-                    .map(|allowance| allowance.checked_sub(allowance_ms(&BUDGETS, 0)).unwrap());
+                let call_deadline_ms =
+                    allowance.map(|allowance| allowance.checked_sub(budgets_ms).unwrap());
                 StoredRecord::Call(
                     serde_json::from_value(json!({
                         "kind": "call",
