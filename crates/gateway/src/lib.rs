@@ -23,7 +23,9 @@
 //!   the host and origin checks, the body limit, time limits on a request's head and body, and
 //!   a task per answer, so a client that disconnects cannot cut a tool call off from its audit
 //!   row. `GET /readyz` is its readiness check, which fails first when it shuts down.
-//! - [`telemetry::init`] sends logs to standard output as JSON lines.
+//! - [`telemetry::init`] sends logs to standard output as JSON lines. [`Telemetry`] is
+//!   decision 0009's telemetry: structured events and counters, off the request path, through
+//!   a bounded queue that a [`Drain`] writes to the log. Drops are counted.
 //!
 //! The first slice (decision 0008) runs from files:
 //!
@@ -80,4 +82,7 @@ pub use selector::{
 pub use server::{
     BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
     READINESS_REMOVAL, SHUTDOWN_GRACE, Timeouts, serve, serve_with_shutdown, serve_with_timeouts,
+};
+pub use telemetry::{
+    Drain, Event, MAX_SURFACE, Surface, TELEMETRY_QUEUE, Telemetry, TelemetryCounts,
 };
