@@ -278,9 +278,12 @@ Each refresh goes through the identity gate's replacement of one configured issu
 builds a whole new verifier with the new set, which gets every check a set gets at boot, and
 puts it in force only if that succeeds. A refused set, or a fetch that fails, leaves the keys in
 use. The refresher names the issuer; nothing in a token chooses whose keys are replaced, and
-keys for an issuer that is not configured are refused. There is no maximum age: keys that
-cannot be refreshed stay in force until a refresh succeeds. A bound on how old they may get
-before tokens are refused is a freshness bound, and Q11 owns it.
+keys for an issuer that is not configured are refused. Keys that cannot be refreshed stay in
+force until a refresh succeeds, with no maximum age ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Refusing every token because
+a refresh failed would turn an outage of the issuer's host into an outage of the gateway. Each
+issuer's key age is to be exported instead, as `switchboard_issuer_keys_age_seconds{issuer}`
+(#91), with an alert condition at four refresh intervals (Q12).
 
 This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
 is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
@@ -503,6 +506,20 @@ rule is about every profile, not Otto's. Instead the decision function refuses a
 a property that such a tool is never allowed or listed, decision-table cases for each
 profile, and mutations that remove each half of the check
 ([decision 0006](decisions/0006-what-the-decision-function-sees.md), amended 2026-10-04).
+
+**Freshness.** Each replica serves one snapshot at a time, with a revision every row records. A
+new version of the registry loads whole or not at all and replaces it atomically; one that does
+not load is logged, and the last good one keeps serving. A replica that has not read its
+registry file for longer than the maximum age, 60 s by default and never less than twice the
+poll interval, fails `/readyz` and refuses `tools/call` and `tools/list` with a fixed sentence
+and no row. How long a merged change takes to reach the file is the delivery path's own bound,
+stated with it: kubelet's part was measured at up to 88 s in kind, and is stated as at most
+120 s. A change to the registry, an emergency withdrawal or the removal of a team from a surface
+included, takes effect within that bound plus one poll. Group claims are as fresh as their
+token, at most an hour for a user issuer; a team manifest change takes one rollout; a per-user
+grant is looked up on every call, so deleting it takes effect on the next. A token for a deleted
+pod or ServiceAccount is accepted until it expires ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 
 ## 9. Credentials
 
@@ -935,8 +952,9 @@ proxied server usually cannot be checked that way. The rules are in
   write. A mismatch withdraws the entry's tools from every surface. A withdrawal does not wait
   for the next snapshot to load from the policy files: it makes a snapshot of its own, the one
   in force less the withdrawn tools, with a revision naming both, and swaps it in atomically.
-  How it reaches every replica is Q11. A per-user entry is not checked on a schedule, since its
-  reach is already the whole site; its test shows that another site is refused.
+  Each replica checks and withdraws for itself (Drift, below). A per-user entry is not checked
+  on a schedule, since its reach is already the whole site; its test shows that another site is
+  refused.
 
 **Built-in connectors** are gateway code calling a vendor API. The GitHub connector is the
 model: it brokers a GitHub App token, limits every call to one organization before any request
@@ -953,13 +971,23 @@ leaves, bounds result sizes, and tags every result as external evidence.
    None may get a JSON-RPC result or error, which would show the call was dispatched.
    Otherwise the server is not registered. The third token comes from TokenRequest for the
    registry's own probe ServiceAccount
-   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)).
+   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). Until
+   the registry is a service, registration is the approval pull request:
+   `switchboard probe --config=FILE --server=NAME` sends the three calls, and the entry records
+   `probe = { result = "refused", date = ... }`. The loader refuses a proxied entry without
+   it, and a probe that could not connect is never recorded as refused
+   ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 3. The registry reads the server's tool list.
 4. A person assigns each tool a classification and approves it. A server is never trusted to
    classify its own tools.
-5. Each approval records a hash of the tool's name, description and input schema, together
-   with the server's identity, its address, its credential configuration, the schema's
-   dialect, and the reach and the date of its test. A second reviewer approves it.
+5. Each approval records two hashes. `definition_sha256` covers the tool's upstream name,
+   title, description and input schema, exactly as the server serves them. `binding_sha256`
+   covers the schema's dialect, which is always `"2020-12"`, and the server's binding: its
+   identity, address and destination, its credential mode and reference, and its connector
+   entry's principal, narrowing, what the credential permits, reach and the date of its reach
+   test. `outputSchema` and annotations are in neither. The loader recomputes both at boot and
+   on every reload, and refuses a registry in which either differs. A schema in another dialect
+   is refused, never converted. A second reviewer approves it.
 6. Approved tools are added to tool surfaces.
 
 A side-effecting tool's approval also declares how an `unknown` receipt is settled, by a
@@ -967,12 +995,27 @@ lookup by marker or by a person, and, for a proxied tool, whether its errors are
 the vendor did nothing (section 11). A connector attaches the receipt marker to what it makes,
 and sends the receipt identifier as the vendor's idempotency key where the vendor honors one.
 
-**Drift.** The registry re-reads each server's tool list on a schedule. A tool whose
-definition no longer matches its hash is withdrawn from every surface until it is approved
-again. A description is text an agent reads as guidance, so a changed description is a changed
-interface and a possible attack. The hash detects a changed interface. It does not detect a
-changed implementation behind the same interface; that remains a risk, covered by the owner's
-accountability, monitoring and emergency withdrawal.
+**Drift.** Every gateway replica runs a drift pass beside its registry reloader, every 300 s
+by default (from 5 s to 900 s; 10 s in the demos). For each proxied entry it reads the tool
+list with the entry's own credential, sends the three calls of step 2, and makes the reach
+check. A tool whose served definition no longer matches `definition_sha256`, or that the
+server no longer lists, is withdrawn. A description is text an agent reads as guidance, so a
+changed description is a changed interface and a possible attack. The hash detects a changed
+interface. It does not detect a changed implementation behind the same interface; that remains
+a risk, covered by the owner's accountability, monitoring and emergency withdrawal.
+
+A withdrawal makes a snapshot of its own, with the revision `{base}+withdrawn:{names}`, the
+withdrawn tools' exposed names sorted and joined by commas. It survives a reload while the
+tool's hashes and `approved_at` are unchanged; a new approval clears it. The first pass runs at
+boot, before `/readyz` passes. A poll that fails, by being unreachable, late or unparsable, is
+not drift: the tools stay served and the failure is counted and alerted on. Each replica checks
+for itself, so a change that lasts one interval plus one call deadline, about 305 s at the
+defaults, is withdrawn on every replica. In milestone 3 a withdrawal lives in each replica's
+memory: it lasts until a new approval or until that replica restarts, and a restarted replica
+serves the tool again if the server has gone back to its approved definition. Every withdrawal
+is logged at ERROR and alerted on, so that a person makes it standing by a new approval or a
+registry edit. Persisted withdrawals come with the registry service ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 
 The three calls of step 2 repeat on each poll. A server that starts dispatching any of them
 is recorded as open, and its owner and the owner of [route-exceptions.md](route-exceptions.md)
@@ -980,9 +1023,15 @@ are told. Each environment whose current evidence does not show that server refu
 the governed path until it is closed. Its tools stay listed: withdrawing them would close the
 governed route and leave the open one.
 
-**Where the gateway will connect** is limited to approved destinations, with the server's
-identity verified, redirects refused and internal addresses unreachable through a registered
-URL.
+**Where the gateway will connect** is limited to approved destinations ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). A server's identity is the
+DNS name the connection proves, and must equal its address's host. Every server is reached over
+`https` with a certificate verified against a CA file the deployment names, except an entry
+marked `in_cluster`, which may use plain `http`. The address is checked when the gateway
+connects, and the checked address is the one connected to. Redirects are refused. Loopback,
+unspecified, link-local and multicast addresses are always refused, and private and
+carrier-grade NAT ranges are allowed only for `in_cluster` entries. Loopback is allowed only in
+a development build, for tests.
 
 **Descriptions shown to agents** are the approved ones, never the live ones.
 
@@ -1009,11 +1058,16 @@ server that is down still appears in the list and fails when called.
 ## 15. Sessions
 
 The gateway keeps no client-facing MCP session. It issues no session ID and every request
-carries its own token, so any instance can answer any request. Upstream sessions to proxied
-servers that need one are a per-instance cache that can be rebuilt. Sessions must be isolated
-by server, credential identity and authorization context. Rebuilding a session does not
-authorize replaying a write whose outcome is unknown: the gateway never repeats a tool call on
-its own ([decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md)).
+carries its own token, so any instance can answer any request. The proxy connector keeps no
+upstream session either: it never sends `initialize`, and a server that needs a session is
+refused at registration in milestone 3 ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Each connector entry has its
+own client and connection pool, and the HTTP client's retry of cancelled requests is turned off,
+so a call is never sent twice when a connection breaks. If upstream sessions are added later,
+they are a per-instance cache that can be rebuilt, isolated by server, credential identity and
+authorization context. Rebuilding a session does not authorize replaying a write whose outcome
+is unknown: the gateway never repeats a tool call on its own ([decision
+0009](decisions/0009-audit-completion-receipts-and-recovery.md)).
 
 ## 16. Invariants
 
