@@ -82,8 +82,9 @@ pub const IDENTITY_FAILURE: &str =
 /// The sentence for a call refused because its audit row could not be written.
 pub(crate) const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
 
-/// The longest a value is rendered, in characters after escaping, before it is cut short.
-pub(crate) const MAX_RENDERED: usize = 128;
+/// The longest a value is rendered, in characters after escaping, before it is cut short. The
+/// gateway's telemetry caps a surface at the same length.
+pub const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
