@@ -2368,10 +2368,11 @@ mutate("pg-finish-no-retry", "finish gives up after one failed attempt", PG_STOR
        "                Err(error) if !error.is_transient() => return Err(error),\n                Err(error) => return Err(error),")
 mutate("pg-finish-retries-final-errors", "finish retries a failure that trying again cannot fix", PG_STORE,
        "                Err(error) if !error.is_transient() => return Err(error),", "                Err(error) if false => return Err(error),")
-mutate("pg-finish-no-deadline", "finish keeps trying past its deadline", PG_STORE,
-       "            if Instant::now() >= stop {", "            if false {")
+mutate_all("pg-finish-no-deadline", "finish keeps trying past its deadline",
+           (PG_STORE, "            if now >= self.deadline {", "            if false {"),
+           (PG_STORE, "            if !self.row_may_commit && Instant::now() >= self.deadline {", "            if false {"))
 mutate("pg-finish-pause-past-deadline", "a pause between finish attempts may run past the deadline", PG_STORE,
-       "sleep_until((now + pause).min(stop)).await;", "sleep_until(now + pause).await;")
+       "sleep_until((now + pause).min(self.deadline)).await;", "sleep_until(now + pause).await;")
 mutate("pg-finish-pause-uncapped", "the pause between attempts doubles without a cap", PG_STORE,
        "    (pause * 2).min(LONGEST_PAUSE)\n", "    pause * 2\n")
 mutate("pg-retry-connect-failure-final", "a connection that could not be made is not retried", PG_STORE,
@@ -2412,14 +2413,14 @@ mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not
        "                        || std::error::Error::source(error)\n"
        "                            .is_some_and(|source| source.is::<std::io::Error>())\n", "")
 mutate("pg-retry-attempt-past-deadline", "one attempt may run past the finish deadline", PG_STORE,
-       "let by = (Instant::now() + self.attempt).min(self.deadline);", "let by = Instant::now() + self.attempt;")
+       "            (Instant::now() + self.attempt).min(self.deadline)\n", "            Instant::now() + self.attempt\n")
 mutate("pg-cancel-unbounded", "a cancel the server does not answer is waited for without end", PG_STORE,
        "let _ = tokio::time::timeout(CANCEL_WAIT, token.cancel_query(tls)).await;",
        "let _ = CANCEL_WAIT;\n                let _ = token.cancel_query(tls).await;")
 # Begin retried by identifier, and a lost confirmation's row completed as error (decision 0009).
 mutate("pg-begin-retry-removed", "begin gives up after one failed attempt", PG_STORE,
-       "                Err(error) if !error.is_transient() => break error,",
-       "                Err(error) if true => break error,")
+       "            if !error.is_transient() {\n                break error;",
+       "            if true {\n                break error;")
 mutate_all("pg-begin-retry-new-identifier", "begin is retried under a new identifier",
            (PG_STORE, "    async fn insert(&self, row: Insert) -> Result<(), PgAuditError> {",
             "    async fn insert(&self, mut row: Insert) -> Result<(), PgAuditError> {"),
@@ -2434,8 +2435,9 @@ mutate("pg-lost-confirmation-left-open", "a row whose begin confirmation was los
 mutate("pg-lost-confirmation-for-denial", "a lost confirmation for a denial starts a completion", PG_STORE,
        '            && call.decision == "allow"\n', "            && !call.decision.is_empty()\n")
 mutate("pg-lost-confirmation-after-refusal", "a begin the database refused starts a completion of the row under its identifier", PG_STORE,
-       "        let unanswered =\n            failed.is_transient() || matches!(failed, PgAuditError::BeginBudget { .. });",
-       "        let unanswered = true;")
+       "            may_be_written |= sent && unanswered;", "            may_be_written |= sent;")
+mutate("pg-lost-confirmation-forgotten-on-later-error", "a later attempt's error undoes an earlier lost confirmation", PG_STORE,
+       "            may_be_written |= sent && unanswered;", "            may_be_written = sent && unanswered;")
 mutate("pg-lost-confirmation-not-in-flight", "a lost confirmation's completion is not counted in flight", PG_STORE,
        "            in_flight: InFlight::start(&self.counters),\n            report: Arc::clone(&self.given_up),\n            row: row.clone(),\n            outcome: \"error\",",
        "            in_flight: InFlight::start(&Arc::default()),\n            report: Arc::clone(&self.given_up),\n            row: row.clone(),\n            outcome: \"error\",")
@@ -2445,8 +2447,17 @@ mutate("pg-recovery-no-such-row-final", "a lost confirmation's completion stops 
 mutate("pg-lost-confirmation-before-insert-executed", "a begin whose insert was never executed starts a completion", PG_STORE,
        "        match timeout_at(deadline, insert_on(&client, row, sent)).await {",
        "        *sent = true;\n        match timeout_at(deadline, insert_on(&client, row, sent)).await {")
-mutate("pg-recovery-attempt-cut-by-deadline", "a lost confirmation's completion starts an attempt its deadline may cut", PG_STORE,
-       "        let stop = if self.row_may_commit {", "        let stop = if false {")
+mutate("pg-recovery-attempt-cut-by-deadline", "a lost confirmation's completion has its attempts cut short by its deadline", PG_STORE,
+       "        let by = if self.row_may_commit {", "        let by = if false {")
+mutate("pg-recovery-stops-before-finish-deadline", "a lost confirmation's completion stops one answer budget before its deadline", PG_STORE,
+       "            if !self.row_may_commit && Instant::now() >= self.deadline {",
+       "            if (Instant::now() + if self.row_may_commit { self.attempt } else { Duration::ZERO })\n"
+       "                >= self.deadline\n            {")
+mutate("pg-recovery-no-attempt-at-deadline", "a lost confirmation's completion makes no attempt at its deadline", PG_STORE,
+       "            if !self.row_may_commit && Instant::now() >= self.deadline {",
+       "            if Instant::now() >= self.deadline {")
+mutate("pg-recovery-no-deadline", "a lost confirmation's completion keeps trying past its deadline", PG_STORE,
+       "            if now >= self.deadline {", "            if false {")
 mutate("pg-recovery-missing-row-given-up", "a row that was never written is reported as given up", PG_STORE,
        "                    if matches!(*last, PgAuditError::NoSuchRow { .. }) =>",
        "                    if false =>")
