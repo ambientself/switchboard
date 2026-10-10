@@ -514,8 +514,8 @@ registry file for longer than the maximum age, 60 s by default and never less th
 poll interval, fails `/readyz` and refuses `tools/call` and `tools/list` with a fixed sentence
 and no row. How long a merged change takes to reach the file is the delivery path's own bound,
 stated with it: kubelet's part was measured at up to 88 s in kind, and is stated as at most
-120 s. A change to the registry, an emergency withdrawal or the removal of a team from a surface
-included, takes effect within that bound plus one poll. Group claims are as fresh as their
+120 s. Any change to the registry, including an emergency withdrawal or a team removed from a
+surface, takes effect within that bound plus one poll. Group claims are as fresh as their
 token, at most an hour for a user issuer; a team manifest change takes one rollout; a per-user
 grant is looked up on every call, so deleting it takes effect on the next. A token for a deleted
 pod or ServiceAccount is accepted until it expires ([decision
