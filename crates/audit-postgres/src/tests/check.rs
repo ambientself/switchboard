@@ -1953,4 +1953,24 @@ async fn the_open_row_view_must_be_as_the_migration_makes_it() {
             extra("SELECT WITH GRANT OPTION", view),
         ]
     );
+
+    // A grant option on one column of it can be passed on too.
+    admin
+        .batch_execute(&format!(
+            "REVOKE GRANT OPTION FOR SELECT ON {view} FROM {GATEWAY_ROLE};
+             REVOKE DELETE, UPDATE ON {view} FROM {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+    admin
+        .batch_execute(&format!(
+            "GRANT SELECT (begun_at) ON {view} TO {GATEWAY_ROLE} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![extra("SELECT WITH GRANT OPTION", view)]
+    );
 }

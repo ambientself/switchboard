@@ -3003,6 +3003,11 @@ mutate("pg-check-open-rows-owner-ignored", "an open-row view owned by another ro
        "    if owner != OWNER_ROLE {", "    if false {")
 mutate("pg-check-open-rows-any-privilege", "any privilege on the open-row view passes the check", PG_CHECK,
        "AND NOT (c.relname = $2 AND c.relkind = 'v' AND p = 'SELECT')", "AND NOT (c.relname = $2 AND c.relkind = 'v')")
+mutate("pg-check-open-rows-grant-option-ignored", "a grant option on the open-row view passes the check", PG_CHECK,
+       "    if view.get::<_, bool>(3) {", "    if false {")
+mutate("pg-check-open-rows-column-grant-option", "a grant option on one column of the open-row view passes the check",
+       PG_CHECK, "has_any_column_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')",
+       "has_table_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')")
 
 
 # --- demo-checks ---------------------------------------------------------------------------

@@ -1209,7 +1209,8 @@ async fn other_privileges(
 
 /// The open-row view is there, as a view, owned by [`OWNER_ROLE`], with the migration's
 /// definition. The session's role may select from it, and neither it nor any role it can become
-/// may pass that on. Anything else on it is refused with the rest of the schema.
+/// may pass that on, for the whole view or for any column of it. Anything else on it is refused
+/// with the rest of the schema.
 async fn open_rows(
     client: &ClientWrapper,
     problems: &mut Vec<Problem>,
@@ -1222,7 +1223,7 @@ async fn open_rows(
                  FROM pg_catalog.pg_class c
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname = 'switchboard_audit' AND c.relname = $1 AND c.relkind = 'v'",
-                by_any_role("has_table_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')"),
+                by_any_role("has_any_column_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')"),
             ),
             &[&OPEN_ROWS],
         )
