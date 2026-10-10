@@ -2422,7 +2422,7 @@ mutate("registry-links-testkit", "the registry, and so the gateway, links the te
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
 # pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
 # pg-retry-socket-failure-final, pg-finish-dropped-task-not-reported,
-# pg-finish-pause-past-deadline and pg-finish-pause-uncapped.
+# pg-finish-pause-past-deadline, pg-finish-pause-uncapped and pg-stats-histogram-off-by-one-bucket.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
@@ -2540,8 +2540,8 @@ mutate("pg-finish-same-again-refused", "the same completion written again is an 
        "        Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),",
        "        Some(outcome) if false && finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),")
 mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
-       "        _ => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
-       "        _ => Ok(()),")
+       "        Some(_) => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
+       "        Some(_) => Ok(()),")
 mutate("pg-finish-missing-row-accepted", "finishing a row that is not there succeeds", PG_STORE,
        "        return Err(PgAuditError::NoSuchRow {\n            row: row.to_owned(),\n        });",
        "        return Ok(());")
@@ -2703,7 +2703,7 @@ mutate("pg-retry-slow-attempt-final", "an attempt that ran out of time is not re
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {",
        "            Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) => {")
 mutate("pg-finish-given-up-not-counted", "a finish that gave up is not counted", PG_STORE,
-       "        self.in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);\n", "")
+       "        self.in_flight.0.given_up.count(error);\n", "")
 mutate("pg-finish-given-up-not-reported", "a finish that gave up is not reported", PG_STORE,
        "        (self.report)(GivenUp {\n            row: &self.row,\n            outcome: self.outcome,\n            error,\n        });\n",
        "        let _ = error;\n")
@@ -2740,11 +2740,11 @@ mutate("pg-cancel-unbounded", "a cancel the server does not answer is waited for
        "let _ = CANCEL_WAIT;\n                let _ = token.cancel_query(tls).await;")
 # Begin retried by identifier, and a lost confirmation's row completed as error (decision 0009).
 mutate("pg-begin-retry-removed", "begin gives up after one failed attempt", PG_STORE,
-       "            if !error.is_transient() {\n                break error;",
-       "            if true {\n                break error;")
+       "            if !failed.error.is_transient() {\n                break failed;",
+       "            if true {\n                break failed;")
 mutate_all("pg-begin-retry-new-identifier", "begin is retried under a new identifier",
-           (PG_STORE, "    async fn insert(&self, row: Insert) -> Result<(), PgAuditError> {",
-            "    async fn insert(&self, mut row: Insert) -> Result<(), PgAuditError> {"),
+           (PG_STORE, "    async fn insert(&self, row: Insert) -> Result<(), InsertFailed> {",
+            "    async fn insert(&self, mut row: Insert) -> Result<(), InsertFailed> {"),
            (PG_STORE, "            pause = longer(pause);\n        };",
             "            pause = longer(pause);\n"
             "            if let Insert::Call(call) = &mut row {\n"
@@ -2763,8 +2763,8 @@ mutate("pg-lost-confirmation-not-in-flight", "a lost confirmation's completion i
        "            in_flight: InFlight::start(&self.counters),\n            report: Arc::clone(&self.given_up),\n            row: row.clone(),\n            outcome: \"error\",",
        "            in_flight: InFlight::start(&Arc::default()),\n            report: Arc::clone(&self.given_up),\n            row: row.clone(),\n            outcome: \"error\",")
 mutate("pg-recovery-no-such-row-final", "a lost confirmation's completion stops at the first missing row", PG_STORE,
-       "Err(error @ PgAuditError::NoSuchRow { .. }) if self.row_may_commit => error,",
-       "Err(error @ PgAuditError::NoSuchRow { .. }) if false => error,")
+       "error @ (PgAuditError::NoSuchRow { .. } | PgAuditError::NotCompleted { .. }),",
+       "error @ PgAuditError::NotCompleted { .. },")
 mutate("pg-lost-confirmation-before-insert-executed", "a begin whose insert was never executed starts a completion", PG_STORE,
        "        match timeout_at(deadline, insert_on(&client, row, sent)).await {",
        "        *sent = true;\n        match timeout_at(deadline, insert_on(&client, row, sent)).await {")
@@ -2798,6 +2798,30 @@ mutate("pg-recovery-attempt-before-last-uncut", "a lost confirmation's attempts 
        "                }\n            };")
 mutate("pg-shutdown-wait-finish-deadline-only", "shutdown stops waiting at the finish deadline, before the last attempt to complete a lost confirmation's row has its answer", PG_STORE,
        "        self.finish_deadline + self.answer\n", "        self.finish_deadline\n")
+# #97: an update that missed a late begin's insert, whose select then finds the row open, is
+# tried again, not taken for a different completion.
+mutate("pg-recovery-unseen-row-completed-differently", "a row the update missed and the select found open counts as completed differently", PG_STORE,
+       "        None => Err(PgAuditError::NotCompleted {", "        None => Err(PgAuditError::CompletedDifferently {")
+mutate("pg-recovery-unseen-row-final", "a lost confirmation's completion stops at a row the update missed", PG_STORE,
+       "error @ (PgAuditError::NoSuchRow { .. } | PgAuditError::NotCompleted { .. }),",
+       "error @ PgAuditError::NoSuchRow { .. },")
+# The store's counts (#47): each moves at its cause, and never on success.
+PG_STATS = PG + "src/stats.rs"
+mutate("pg-stats-counted-on-success", "a begin that succeeds counts a begin failure", PG_STORE,
+       "        if let Err(failed) = &begun {\n            self.counters.begin_failures.count(failed.cause());\n        }\n",
+       "        self.counters.begin_failures.count(match &begun {\n"
+       "            Err(failed) => failed.cause(),\n"
+       "            Ok(()) => BeginCause::DatabaseError,\n"
+       "        });\n")
+mutate("pg-stats-histogram-off-by-one-bucket", "a latency at a bucket's bound is counted in the next bucket", PG_STATS,
+       "nanos <= u128::from(*bound)", "nanos < u128::from(*bound)")
+mutate("pg-stats-pool-timeout-as-budget", "a begin that waited past its budget for a connection counts as its insert running out", PG_STORE,
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n", "")
+mutate("pg-stats-late-answer-not-counted", "an answer released at the answer budget is not counted", PG_STORE,
+       "                self.counters\n                    .answers_released\n                    .fetch_add(1, Ordering::SeqCst);\n", "")
+mutate("pg-stats-completed-differently-as-deadline", "a finish refused for a different completion counts as given up at the deadline", PG_STORE,
+       "            PgAuditError::CompletedDifferently { .. } => &self.completed_differently,",
+       "            PgAuditError::CompletedDifferently { .. } => &self.deadline,")
 mutate("pg-migrate-unlocked", "two migrators run at once", PG + "src/migrate.rs",
        'SELECT pg_advisory_xact_lock($1)', 'SELECT $1::bigint')
 mutate("pg-check-durability-ignored", "a server without fsync passes the check", PG_CHECK,
@@ -3023,6 +3047,20 @@ mutate("pg-check-open-rows-grant-option-ignored", "a grant option on the open-ro
 mutate("pg-check-open-rows-column-grant-option", "a grant option on one column of the open-row view passes the check",
        PG_CHECK, "has_any_column_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')",
        "has_table_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')")
+mutate("pg-check-open-rows-grant-option-own-role-only", "a grant option on the open-row view held by a role the session can become passes the check",
+       PG_CHECK, "\"has_any_column_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')\"",
+       "\"r.rolname = current_user AND has_any_column_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')\"")
+# #99: a view option such as security_invoker, and open_rows()'s own guards.
+mutate("pg-check-open-rows-options-ignored", "an open-row view with security_invoker passes the check", PG_CHECK,
+       "    if !options.is_empty() {", "    if false {")
+mutate("pg-open-rows-begin-pool", "the open-row query runs on the begin pool", PG_STORE,
+       "timeout_at(deadline, self.finish.get())", "timeout_at(deadline, self.begin.get())")
+mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time limit", PG_STORE,
+       "        match timeout_at(deadline, query).await {",
+       "        match timeout_at(deadline + Duration::from_secs(3600), query).await {")
+mutate("pg-open-rows-not-cancelled", "an open-row query past its time limit is not cancelled, and its connection goes back to the pool", PG_STORE,
+       "                abandon(client, &self.cancel);\n                Err(PgAuditError::OpenRowsTimedOut { budget })",
+       "                drop(client);\n                Err(PgAuditError::OpenRowsTimedOut { budget })")
 
 
 # --- demo-checks ---------------------------------------------------------------------------
