@@ -2776,15 +2776,15 @@ mutate("probe-connect-count-missing", "curl does not report whether it connected
 mutate("probe-unconnected-timeout-not-refused", "a connect that timed out before it was made, a dropped route, does not count as refused", PROBE,
        "        0) echo refused ;;\n", "        0) echo could-not-probe ;;\n")
 mutate("probe-attempt-status-unsplit", "an attempt's status is read with the connection count after it, so no answer reads as open", PROBE,
-       "  attempt_code=${attempt_out%% *}\n", "  attempt_code=$attempt_out\n")
+       "  attempt_code=$transfer_code ", "  attempt_code=$attempt_out ")
 mutate("probe-gateway-status-unsplit", "the gateway's status is read with the connection count after it, so no answer reads as reached", PROBE,
-       "code=${code%% *}\n", "")
+       "code=$transfer_code\n", "code=$out\n")
 mutate("probe-gateway-reach-skipped", "the routes are tried whether or not the gateway answered", PROBE,
        """  '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;\n""", "  __never__) ;;\n")
 mutate("probe-sends-bearer", "each attempt carries a bearer", PROBE,
        "-H 'Authorization:'", "-H 'Authorization: Bearer probe'")
 mutate("probe-reads-curlrc", "curl reads the caller's .curlrc, which may add a credential", PROBE,
-       "  curl -q -s ", "  curl -s ")
+       "  curl -q -g -s ", "  curl -g -s ")
 mutate("probe-name-not-pinned", "curl resolves the name again, so a slow lookup can time out as refused", PROBE,
        ' --resolve "$host:$port:$pinned"', "")
 mutate("probe-address-literal-unchecked", "an address column of hex letters or bad numbers goes to curl, which looks it up as a name", PROBE,
@@ -2793,6 +2793,22 @@ mutate("probe-octet-unbounded", "an octet over 255 passes as an address literal"
        '      [ "$octet" -le 255 ] || return 1\n', "")
 mutate("probe-octet-leading-zero", "an octet with a leading zero, which curl reads as octal, passes", PROBE,
        "      case $octet in 0) ;; 0* | ????*) return 1 ;; esac\n", "      case $octet in ????*) return 1 ;; esac\n")
+# Round 2: a URL glob made one row several requests, and curl's last status hid the others.
+mutate("probe-globbing-on", "curl expands a URL glob into several requests", PROBE,
+       "  curl -q -g -s ", "  curl -q -s ")
+mutate("probe-url-glob-unchecked", "a URL with a glob character passes the row check", PROBE,
+       """    *'{'* | *'}'* | *'['* | *']'*) broken "$number" "the URL holds a curl glob character: $url"; continue ;;\n""", "")
+mutate("probe-url-glob-after-ipv6-unchecked", "a glob character after an IPv6 host's brackets passes the row check", PROBE,
+       "  case $authority in '['*) glob_rest=${rest#*]} ;; esac\n", "  case $authority in '['*) glob_rest='' ;; esac\n")
+# Caught only where sh is dash (CI's Ubuntu runner, Debian images): bash strips an unquoted [.
+mutate("probe-ipv6-host-bracket-unquoted", "an IPv6 host in a URL fails its row under dash, which reads the bracket as a pattern", PROBE,
+       "    '['*']:'*) host=${authority#'['} ", "    '['*']:'*) host=${authority#[} ")
+mutate("probe-multi-transfer-accepted", "two requests' results from one curl run are read as one", PROBE,
+       "  case $transfer_connects in '' | *[!0-9]*) return 1 ;; esac\n", "")
+mutate("probe-multi-transfer-unrefused", "an attempt whose output is not one request's status is classified anyway", PROBE,
+       "  if ! one_transfer \"$attempt_out\"; then\n", "  if ! one_transfer \"$attempt_out\" && false; then\n")
+mutate("probe-gateway-multi-transfer-accepted", "the gateway check reads two requests' results as one", PROBE,
+       """one_transfer "$out" || stop""", """one_transfer "$out" || true ||  stop""")
 mutate("probe-not-in-image", "the image does not install the probe", "deploy/Dockerfile",
        "COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh\n", "")
 

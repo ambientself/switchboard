@@ -4,7 +4,8 @@
 //! reject_ok, counts as refused; a connection that is made and then gets no answer in time, and
 //! a name that does not resolve, could not be probed; an answer of any kind is open. An
 //! unreachable gateway fails the run before any route is tried, and no attempt carries a
-//! credential.
+//! credential. Each attempt is one request: curl's URL globbing is off, a URL with a glob
+//! character fails its row, and output other than one request's status could not be probed.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -30,6 +31,7 @@ struct Probe {
     expect: Option<&'static str>,
     hosts: String,
     dropped: Vec<String>,
+    doubled: Vec<String>,
     dir: PathBuf,
 }
 
@@ -42,6 +44,7 @@ impl Probe {
             expect: None,
             hosts: String::new(),
             dropped: Vec::new(),
+            doubled: Vec::new(),
             dir: scratch(name),
         }
     }
@@ -61,6 +64,18 @@ impl Probe {
     fn dropping(mut self, url: &str) -> Self {
         self.dropped.push(url.to_owned());
         self
+    }
+
+    /// Requests to `url`'s port print two requests' results, as a URL glob would make: the
+    /// first connected and got no answer in time, the second was refused (curl exit 7).
+    fn doubling(mut self, url: &str) -> Self {
+        self.doubled.push(url.to_owned());
+        self
+    }
+
+    /// Where the fake curl writes the arguments of each run.
+    fn args_file(&self) -> PathBuf {
+        self.dir.join("curl-args")
     }
 
     fn run(&self) -> Run {
@@ -94,7 +109,16 @@ impl Probe {
             .env("XDG_CONFIG_HOME", &home)
             .env("GATEWAY_URL", &self.gateway)
             .env("ROUTES", &self.routes)
-            .env("PROBE_TIMEOUT", "1");
+            .env("PROBE_TIMEOUT", "1")
+            .env("FAKE_CURL_ARGS", self.args_file())
+            .env(
+                "FAKE_DOUBLED",
+                self.doubled
+                    .iter()
+                    .map(|url| common::port_of(url))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
         for proxy in [
             "http_proxy",
             "HTTP_PROXY",
@@ -516,6 +540,145 @@ fn rows_the_probe_cannot_try_fail_the_run() {
     );
     // The gateway was not asked either.
     assert_eq!(gateway.heads().len(), 11);
+}
+
+/// One row is one request to each target. curl expands a URL glob into several requests, prints
+/// each one's result and exits with the last one's status, so a row whose first request
+/// connected and timed out, and whose second was refused, would read as refused under
+/// reject_ok. The probe turns globbing off, fails a row whose URL holds a glob character, and
+/// takes no output but one request's status.
+#[test]
+fn a_url_glob_cannot_hide_a_connection_behind_a_refusal() {
+    let gateway = Recorder::start(401);
+    let server = Recorder::start(200);
+    let base = server.url.trim_end_matches("/mcp").to_owned();
+    // The row from the review: two requests, the first to a server that answers nothing.
+    let glob_row = "dual\thttp://127.0.0.1:8000/{first,second}\t127.0.0.1\treject_ok\n";
+    for (name, routes, url) in [
+        (
+            "braces",
+            glob_row.to_owned(),
+            "http://127.0.0.1:8000/{first,second}".to_owned(),
+        ),
+        (
+            "range",
+            format!("server\t{base}/[1-2]\t127.0.0.1\treject_ok\n"),
+            format!("{base}/[1-2]"),
+        ),
+        (
+            "close-brace",
+            format!("server\t{base}/a}}\t127.0.0.1\n"),
+            format!("{base}/a}}"),
+        ),
+        (
+            "close-bracket",
+            format!("server\t{base}/a]\t127.0.0.1\n"),
+            format!("{base}/a]"),
+        ),
+        (
+            "after-ipv6",
+            "server\thttp://[::1]x]:8000/mcp\t::1\n".to_owned(),
+            "http://[::1]x]:8000/mcp".to_owned(),
+        ),
+    ] {
+        let run = Probe::new(&format!("glob-{name}"), &gateway.url, &routes).run();
+        assert_result(&run, false);
+        assert!(
+            run.stdout.contains(&format!(
+                "FAIL routes line 1: the URL holds a curl glob character: {url}\n"
+            )),
+            "{name}\n{}",
+            run.transcript()
+        );
+        assert!(attempts(&run).is_empty(), "{name}\n{}", run.transcript());
+    }
+    assert!(server.heads().is_empty(), "{:?}", server.heads());
+
+    // The brackets of an IPv6 host are not a glob: the row is tried.
+    let closed = closed_port();
+    let v6 = closed.replace("127.0.0.1", "[::1]");
+    let run = Probe::new(
+        "glob-ipv6-host",
+        &gateway.url,
+        &format!("v6\t{v6}\t::1\treject_ok\n"),
+    )
+    .run();
+    assert!(!run.stdout.contains("glob"), "{}", run.transcript());
+    let lines = attempts(&run);
+    assert_eq!(lines.len(), 1, "{}", run.transcript());
+    assert!(
+        lines[0].starts_with("ROUTE v6 address ::1 "),
+        "{}",
+        run.transcript()
+    );
+
+    // Two requests' results from one curl run, however they came about, are not one attempt.
+    let doubled = closed_port();
+    let run = Probe::new(
+        "two-results",
+        &gateway.url,
+        &format!("dual\t{doubled}\t127.0.0.1\treject_ok\n"),
+    )
+    .doubling(&doubled)
+    .run();
+    assert_result(&run, false);
+    assert_eq!(
+        attempts(&run),
+        ["ROUTE dual address 127.0.0.1 could-not-probe"],
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains(
+            "NOTE dual address 127.0.0.1: curl printed \"000 1000 0\", not one request's status (curl exit 7)\n"
+        ),
+        "{}",
+        run.transcript()
+    );
+
+    // The same for the gateway: it was not reached by one request.
+    let routes = format!("server\t{}\t127.0.0.1\n", server.url);
+    let run = Probe::new("two-results-gateway", &gateway.url, &routes)
+        .doubling(&gateway.url)
+        .run();
+    assert_result(&run, false);
+    assert!(
+        run.stdout.starts_with(
+            "FAIL gateway check: curl printed \"000 1000 0\", not one request's status (curl exit 7)\n"
+        ),
+        "{}",
+        run.transcript()
+    );
+    assert!(attempts(&run).is_empty(), "{}", run.transcript());
+}
+
+/// Every curl run the probe makes, the gateway's and each attempt's, turns URL globbing off.
+#[test]
+fn every_curl_run_turns_globbing_off() {
+    let gateway = Recorder::start(401);
+    let hole = dropped();
+    let by_name = named(&hole, "hole.test");
+    let probe = Probe::new(
+        "globoff",
+        &gateway.url,
+        &format!("dropped\t{by_name}\tresolve\n"),
+    )
+    .host("hole.test", "127.0.0.1")
+    .dropping(&hole);
+    let run = probe.run();
+    assert_result(&run, true);
+    let log = std::fs::read_to_string(probe.args_file()).unwrap();
+    let runs: Vec<&str> = log
+        .split("<end>\n")
+        .filter(|args| !args.is_empty())
+        .collect();
+    assert_eq!(runs.len(), 3, "{log}");
+    for args in runs {
+        assert!(
+            args.lines().any(|arg| arg == "-g" || arg == "--globoff"),
+            "a curl run with globbing on:\n{args}"
+        );
+    }
 }
 
 /// route-check.sh starts `/usr/local/bin/route-probe.sh` from the demo image; the image must

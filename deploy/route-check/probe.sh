@@ -36,7 +36,14 @@
 #                                           is refused by a reset; could-not-probe otherwise, as
 #                                           a stopped server or a wrong port looks the same
 #   a name that does not resolve (or 6)     could-not-probe
+#   curl printed anything but one status    could-not-probe: the attempt was not one request
+#     and one connection count
 #   anything else                           could-not-probe
+#
+# One row is one request to each target: curl runs with globbing off, and a URL that holds a
+# glob character ({, }, [ or ], other than the brackets of an IPv6 host) fails its row. Two
+# requests in one curl run print two results and exit with the last one's status, so a refused
+# second request could hide a first that connected.
 #
 # Needs sh, curl and getent.
 set -u
@@ -82,16 +89,31 @@ case $PROBE_TIMEOUT in '' | *[!0-9]* | 0) stop "PROBE_TIMEOUT is a number of sec
 # post URL [CURL OPTION...]: one POST with no credential. Prints the HTTP status (000 when
 # nothing answered), a space and the number of connections curl made, and returns curl's exit
 # status. Both a connect that times out and an answer that does not come in time are curl exit
-# 28; only the count of connections tells them apart. -q keeps any .curlrc out; the empty
-# Authorization header keeps curl from adding one.
+# 28; only the count of connections tells them apart. -q keeps any .curlrc out; -g turns URL
+# globbing off, so the URL is one request; the empty Authorization header keeps curl from adding
+# one.
 post() {
   post_url=$1
   shift
-  curl -q -s -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
+  curl -q -g -s -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
     -H 'Authorization:' -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     --connect-timeout "$PROBE_TIMEOUT" --max-time "$PROBE_TIMEOUT" \
     --data "$BODY" "$@" "$post_url" </dev/null 2>/dev/null
+}
+
+# one_transfer OUTPUT: whether OUTPUT is what post prints for exactly one request: three digits
+# of HTTP status, a space and a number of connections. Sets transfer_code and transfer_connects.
+# Two requests' results run together ("000 1000 0") are not one.
+one_transfer() {
+  transfer_code='' transfer_connects=''
+  case $1 in
+    [0-9][0-9][0-9]' '*) ;;
+    *) return 1 ;;
+  esac
+  transfer_connects=${1#???' '}
+  case $transfer_connects in '' | *[!0-9]*) return 1 ;; esac
+  transfer_code=${1%%' '*}
 }
 
 # classify EXIT STATUS CONNECTIONS FLAGS: the result of one attempt.
@@ -133,11 +155,12 @@ attempt() {
   shift 5
   attempt_out=$(post "$attempt_url" "$@")
   attempt_exit=$?
-  attempt_code=${attempt_out%% *}
-  case $attempt_out in
-    *' '*) attempt_connects=${attempt_out#* } ;;
-    *) attempt_connects='' ;;
-  esac
+  if ! one_transfer "$attempt_out"; then
+    record "$attempt_row" "$attempt_by" "$attempt_target" could-not-probe \
+      "curl printed \"$attempt_out\", not one request's status (curl exit $attempt_exit)"
+    return
+  fi
+  attempt_code=$transfer_code attempt_connects=$transfer_connects
   attempt_result=$(classify "$attempt_exit" "$attempt_code" "$attempt_connects" "$attempt_flags")
   if [ "$attempt_result" = could-not-probe ]; then
     attempt_why="curl exit $attempt_exit"
@@ -197,9 +220,10 @@ bracketed() {
 
 # --- 1. The gateway ---------------------------------------------------------------------------
 
-code=$(post "$GATEWAY_URL")
+out=$(post "$GATEWAY_URL")
 status=$?
-code=${code%% *}
+one_transfer "$out" || stop "gateway check: curl printed \"$out\", not one request's status (curl exit $status)"
+code=$transfer_code
 case $code in
   '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;
 esac
@@ -233,12 +257,19 @@ while IFS="$TAB" read -r row url addresses flags extra; do
   rest=${url#*://}
   authority=${rest%%[/?#]*}
   path=${rest#"$authority"}
+  # The bracket is quoted: dash takes an unquoted [ as the start of a pattern and strips nothing.
   case $authority in
     *@*) broken "$number" "the URL carries a user name or password"; continue ;;
-    '['*']') host=${authority#[} host=${host%]} ;;
-    '['*']:'*) host=${authority#[} host=${host%%]*} port=${authority##*]:} ;;
+    '['*']') host=${authority#'['} host=${host%]} ;;
+    '['*']:'*) host=${authority#'['} host=${host%%]*} port=${authority##*]:} ;;
     *:*) host=${authority%:*} port=${authority##*:} ;;
     *) host=$authority ;;
+  esac
+  # curl would expand a glob into several requests; the brackets of an IPv6 host are not one.
+  glob_rest=$rest
+  case $authority in '['*) glob_rest=${rest#*]} ;; esac
+  case $glob_rest in
+    *'{'* | *'}'* | *'['* | *']'*) broken "$number" "the URL holds a curl glob character: $url"; continue ;;
   esac
   case $port in '' | *[!0-9]*) broken "$number" "the URL's port is not a number"; continue ;; esac
   case $host in

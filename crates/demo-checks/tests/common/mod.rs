@@ -165,7 +165,16 @@ pub fn fake_getent(bin: &Path) {
 /// address does: it writes out what `-w` asks for with no HTTP status and no connection made,
 /// and exits 28 at once. Every other request goes to the real curl. Loopback cannot drop a
 /// connection on its own: a listener completes the handshake whether or not it accepts.
+///
+/// Two variables change it for one run. With `FAKE_CURL_ARGS` set to a file, each run appends
+/// its arguments there, one per line, then a line `<end>`. A request to a port listed in
+/// `FAKE_DOUBLED` writes out `-w` twice, as two requests in one run would: the first connected
+/// and got no answer, the second made no connection; and it exits 7, the second's status.
 pub const FAKE_CURL: &str = r#"#!/bin/sh
+if [ -n "${FAKE_CURL_ARGS:-}" ]; then
+  for arg do printf '%s\n' "$arg"; done >>"$FAKE_CURL_ARGS"
+  echo '<end>' >>"$FAKE_CURL_ARGS"
+fi
 format='' url='' pinned='' previous=''
 for arg do
   case $previous in
@@ -180,6 +189,15 @@ authority=${rest%%/*}
 host=${authority%:*}
 port=${authority##*:}
 case $host in *[!0-9.]*) [ -n "$pinned" ] || port='' ;; esac
+case " ${FAKE_DOUBLED:-} " in
+  *" $port "*)
+    if [ -n "$port" ]; then
+      printf '%s' "$format" | sed -e 's/%{http_code}/000/g' -e 's/%{num_connects}/1/g'
+      printf '%s' "$format" | sed -e 's/%{http_code}/000/g' -e 's/%{num_connects}/0/g'
+      exit 7
+    fi
+    ;;
+esac
 case " __DROPPED__ " in
   *" $port "*)
     if [ -n "$port" ]; then
