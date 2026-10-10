@@ -14,7 +14,9 @@
 //! from the next request. Each keys URL is fetched again every `keys_refresh_seconds` (see
 //! [`gateway::keys`]). Both stop when the gateway shuts down. Logs go to standard output as JSON lines; a refusal to start goes to standard
 //! error as well, as plain text. Shutting down waits for the answers still running, and for the
-//! audit store to complete the rows it is still writing, up to its finish deadline.
+//! audit store to complete the rows it is still writing, up to its finish deadline. With
+//! `[metrics]`, `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it
+//! stops after the MCP listener, once those rows are done.
 //!
 //! **Migrating.** Connects with the URL in `SWITCHBOARD_MIGRATE_DATABASE_URL`, which must log
 //! in as `switchboard_owner`, applies every audit migration not yet applied, prints one JSON
@@ -28,10 +30,14 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway::{Deployment, serve_with_shutdown, start, telemetry};
+use gateway::{
+    Deployment, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, serve_metrics, serve_with_telemetry,
+    start, telemetry,
+};
 use gateway_identity::SystemClock;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 const USAGE: &str = "usage: switchboard --config=FILE\n       switchboard migrate";
 
@@ -126,13 +132,48 @@ async fn serve(config: PathBuf) -> ExitCode {
         Ok(listener) => listener,
         Err(error) => return refuse(&format!("cannot listen on {listen}: {error}")),
     };
+    let metrics_listener = match prepared.metrics {
+        None => None,
+        Some(address) => match TcpListener::bind(address).await {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                return refuse(&format!("cannot serve metrics on {address}: {error}"));
+            }
+        },
+    };
+    let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+    let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
+    let metrics = metrics_listener.map(|listener| {
+        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone());
+        tokio::spawn(serve_metrics(listener, metrics, async {
+            let _ = metrics_stopped.await;
+        }))
+    });
     let watching = tokio::spawn(prepared.watch.run());
     let refreshing = tokio::spawn(prepared.keys.run());
-    let served = serve_with_shutdown(listener, prepared.gates, shutdown()).await;
+    let served = serve_with_telemetry(
+        listener,
+        prepared.gates,
+        telemetry,
+        drain,
+        shutdown(),
+        Timeouts::default(),
+    )
+    .await;
     watching.abort();
     refreshing.abort();
     if let Some(store) = &prepared.store {
         finish_rows(store).await;
+    }
+    // After the MCP listener, and after the rows it began are done, so the last of them can
+    // still be read.
+    let _ = stop_metrics.send(());
+    if let Some(metrics) = metrics {
+        match metrics.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(%error, "the metrics listener failed"),
+            Err(error) => tracing::error!(%error, "the task serving metrics failed"),
+        }
     }
     match served {
         Ok(()) => ExitCode::SUCCESS,

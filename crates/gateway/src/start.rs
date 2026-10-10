@@ -26,8 +26,13 @@
 //! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
 //! left open and not only by querying for it (decision 0009).
+//!
+//! It logs a boot line for metrics too: the address `GET /metrics` will be served on, or that
+//! none is, since `[metrics]` is optional. [`Prepared::metrics`] carries the address to the
+//! binary, which binds it and serves it with [`crate::metrics::serve_metrics`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,6 +151,8 @@ pub struct Prepared {
     /// What fetches the keys of each issuer with a keys URL again, on its timer. Run it beside
     /// the watch, and stop it when the gateway shuts down.
     pub keys: KeyRefresher,
+    /// Where to serve metrics, or `None` when the deployment file has no `[metrics]`.
+    pub metrics: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -155,6 +162,7 @@ impl std::fmt::Debug for Prepared {
             .field("store", &self.store.is_some())
             .field("watch", &self.watch)
             .field("keys", &self.keys)
+            .field("metrics", &self.metrics)
             .finish()
     }
 }
@@ -211,20 +219,8 @@ pub async fn prepare(
     let registry = Registry::from_toml_str(text)?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
-    let mut wiring = Wiring::new(clock).instance(instance.clone());
-    for server in registry.servers().values() {
-        let mut upstream = Upstream::new(server.name.clone(), server.address.clone());
-        for (tool, route) in registry.routes() {
-            if route.server == server.name {
-                upstream = upstream.tool(tool.clone(), route.upstream_name.clone());
-            }
-        }
-        let deadline = upstream.deadline;
-        let connector = ProxyConnector::new(upstream, credentials.clone())?;
-        wiring = wiring
-            .proxied(server.name.clone(), Arc::new(connector))
-            .call_deadline(server.name.clone(), deadline);
-    }
+    let mut wiring =
+        proxied(&registry, &credentials, Wiring::new(clock))?.instance(instance.clone());
 
     let mut identity = deployment.identity;
     let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;
@@ -292,6 +288,18 @@ pub async fn prepare(
     } else {
         tracing::warn!(event = "boot", audit = "disabled", "audit is disabled");
     }
+    match deployment.metrics {
+        Some(address) => tracing::info!(
+            event = "boot",
+            metrics = %address,
+            "metrics are served in Prometheus text at /metrics, on their own listener"
+        ),
+        None => tracing::info!(
+            event = "boot",
+            metrics = "off",
+            "no metrics listener: the deployment file has no [metrics]"
+        ),
+    }
     tracing::info!(
         event = "boot",
         %instance,
@@ -317,7 +325,32 @@ pub async fn prepare(
             loaded,
         },
         keys,
+        metrics: deployment.metrics,
     })
+}
+
+/// `wiring` with a [`ProxyConnector`] for each of the registry's servers, each given the call
+/// deadline its connector was built with, which every row of its calls includes in its
+/// deadline.
+fn proxied(
+    registry: &Registry,
+    credentials: &Arc<FileCredentials>,
+    mut wiring: Wiring,
+) -> Result<Wiring, StartError> {
+    for server in registry.servers().values() {
+        let mut upstream = Upstream::new(server.name.clone(), server.address.clone());
+        for (tool, route) in registry.routes() {
+            if route.server == server.name {
+                upstream = upstream.tool(tool.clone(), route.upstream_name.clone());
+            }
+        }
+        let deadline = upstream.deadline;
+        let connector = ProxyConnector::new(upstream, credentials.clone())?;
+        wiring = wiring
+            .proxied(server.name.clone(), Arc::new(connector))
+            .call_deadline(server.name.clone(), deadline);
+    }
+    Ok(wiring)
 }
 
 /// An issuer's key source, with how often to fetch again and how many keys its first fetch
@@ -466,6 +499,35 @@ mod tests {
                 .find(|(set, _)| set == name)
                 .map(|(_, value)| value.clone())
         }
+    }
+
+    /// Each proxied server's connector deadline reaches the wiring, which gives it to every row
+    /// of that server's calls. The boot gates' own fallback for a server given none is the same
+    /// value today, so a row's deadline could not tell this wiring from its absence.
+    #[test]
+    fn each_proxied_server_is_wired_with_the_deadline_its_connector_was_built_with() {
+        let registry = crate::boot::tests::registry("read", true);
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential = directory.join("docs-credential");
+        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
+        let credentials = Arc::new(
+            FileCredentials::load([(ConnectorName::new("mock-docs"), &credential)]).unwrap(),
+        );
+        let wiring = proxied(
+            &registry,
+            &credentials,
+            Wiring::new(Arc::new(gateway_identity::SystemClock)),
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(
+            wiring.unwrap().call_deadlines(),
+            &BTreeMap::from([(
+                ConnectorName::new("mock-docs"),
+                connector_proxy::DEFAULT_DEADLINE
+            )])
+        );
     }
 
     #[test]
