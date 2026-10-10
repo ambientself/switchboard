@@ -717,8 +717,9 @@ role (Q12). None of this protects rows against a database superuser.
 
 **Shutdown.** On termination an instance first fails its readiness check, then stops accepting
 calls, and lets running calls and their finishes complete. Its termination grace period is set
-explicitly, longer than the readiness-removal delay plus the begin budget, the call deadline
-and the finish deadline.
+explicitly, longer than the readiness-removal delay plus the begin budget, the call deadline,
+the finish deadline and one answer budget, for the last attempt to complete a failed begin's
+row, which is made at the finish deadline.
 
 **Signals,** counted and exported from milestone 2: begin failures and the audit-failure
 answers they cause; answers released before finish; finishes not written by their deadline;
@@ -1145,11 +1146,14 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   a task on the finish pool completes the row as `error` with a latency of zero until the
   finish deadline, counted in flight so shutdown waits for it. A later attempt's error does
   not undo that, and the error may be an explicit refusal, such as a read-only server's.
-  That task alone waits for a missing row, which may still commit. It keeps trying through
-  the deadline, makes its last attempt at the deadline, and lets the deadline cut no
-  attempt short, so an insert whose cancel failed and that commits before the deadline is
-  completed. A row its last attempt found missing is counted as never written, not given
-  up. A database that stays locked, unreachable or read-only past the deadline leaves the
+  That task alone waits for a missing row, which may still commit. Its attempts before the
+  deadline end by it, and it makes its last attempt at the deadline, with its full answer
+  budget, so an insert whose cancel failed and that commits before the deadline is
+  completed, and the task ends at most one answer budget after the deadline. Only that last
+  attempt's answer ends it: an earlier attempt that found the row missing may have looked
+  just before the insert committed. A row its last attempt found missing is counted as never
+  written, not given up. The gateway's shutdown waits the finish deadline and one answer
+  budget for these tasks and for finishes. A database that stays locked, unreachable or read-only past the deadline leaves the
   store unable to tell, and that row is given up and reported. Denials and list rows need
   nothing. The second half is built in the core: `audit::give_up` consumes a guard, calls no
   connector, and completes its row as `error` with a latency of zero. The gateway does not

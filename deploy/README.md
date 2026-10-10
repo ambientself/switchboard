@@ -93,10 +93,11 @@ no host, origin or identity check, since the kubelet probes it by the pod's IP, 
 one word. Compose has no probe, but the gateway still waits out the removal there.
 
 The termination grace period must be longer than the readiness removal plus the begin budget,
-the call deadline and the finish deadline, or a stop can leave open rows: 8 s + 2 s + 5 s +
-30 s, 45 s. No call starts after the removal: a request on a connection still open whose body
-arrives later is answered 503 and nothing runs. The gateway's 30 s wait for open connections
-after the removal fits inside the same 45 s. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
+the call deadline, the finish deadline and one answer budget (the last attempt to complete a
+failed begin's row is made at the finish deadline), or a stop can leave open rows: 8 s + 2 s +
+5 s + 30 s + 2 s, 47 s. No call starts after the removal: a request on a connection still open
+whose body arrives later is answered 503 and nothing runs. The gateway's 30 s wait for open
+connections after the removal fits inside the same 47 s. Both manifests give the gateway 50 s: `terminationGracePeriodSeconds` in
 `kind/base/gateway.yaml` and `stop_grace_period` in `compose/compose.yaml`, in place of 30 s and
 10 s. `crates/demo-checks` holds both to the code's budgets and the probe to the removal.
 

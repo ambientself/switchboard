@@ -2690,11 +2690,10 @@ mutate("pg-finish-no-retry", "finish gives up after one failed attempt", PG_STOR
        "                Err(error) if !error.is_transient() => return Err(error),\n                Err(error) => return Err(error),")
 mutate("pg-finish-retries-final-errors", "finish retries a failure that trying again cannot fix", PG_STORE,
        "                Err(error) if !error.is_transient() => return Err(error),", "                Err(error) if false => return Err(error),")
-mutate_all("pg-finish-no-deadline", "finish keeps trying past its deadline",
-           (PG_STORE, "            if now >= self.deadline {", "            if false {"),
-           (PG_STORE, "            if !self.row_may_commit && Instant::now() >= self.deadline {", "            if false {"))
+mutate("pg-finish-no-deadline", "finish keeps trying past its deadline", PG_STORE,
+       "            if !self.row_may_commit && Instant::now() >= self.deadline {", "            if false {")
 mutate("pg-finish-pause-past-deadline", "a pause between finish attempts may run past the deadline", PG_STORE,
-       "sleep_until((now + pause).min(self.deadline)).await;", "sleep_until(now + pause).await;")
+       "sleep_until((Instant::now() + pause).min(self.deadline)).await;", "sleep_until(Instant::now() + pause).await;")
 mutate("pg-finish-pause-uncapped", "the pause between attempts doubles without a cap", PG_STORE,
        "    (pause * 2).min(LONGEST_PAUSE)\n", "    pause * 2\n")
 mutate("pg-retry-connect-failure-final", "a connection that could not be made is not retried", PG_STORE,
@@ -2735,7 +2734,7 @@ mutate("pg-retry-socket-failure-final", "a connection whose socket failed is not
        "                        || std::error::Error::source(error)\n"
        "                            .is_some_and(|source| source.is::<std::io::Error>())\n", "")
 mutate("pg-retry-attempt-past-deadline", "one attempt may run past the finish deadline", PG_STORE,
-       "            (Instant::now() + self.attempt).min(self.deadline)\n", "            Instant::now() + self.attempt\n")
+       "                (started + self.attempt).min(self.deadline)\n", "                started + self.attempt\n")
 mutate("pg-cancel-unbounded", "a cancel the server does not answer is waited for without end", PG_STORE,
        "let _ = tokio::time::timeout(CANCEL_WAIT, token.cancel_query(tls)).await;",
        "let _ = CANCEL_WAIT;\n                let _ = token.cancel_query(tls).await;")
@@ -2769,8 +2768,9 @@ mutate("pg-recovery-no-such-row-final", "a lost confirmation's completion stops 
 mutate("pg-lost-confirmation-before-insert-executed", "a begin whose insert was never executed starts a completion", PG_STORE,
        "        match timeout_at(deadline, insert_on(&client, row, sent)).await {",
        "        *sent = true;\n        match timeout_at(deadline, insert_on(&client, row, sent)).await {")
-mutate("pg-recovery-attempt-cut-by-deadline", "a lost confirmation's completion has its attempts cut short by its deadline", PG_STORE,
-       "        let by = if self.row_may_commit {", "        let by = if false {")
+mutate("pg-recovery-attempt-cut-by-deadline", "a lost confirmation's completion has its last attempt cut short by its deadline", PG_STORE,
+       "            let by = if last {\n                started + self.attempt",
+       "            let by = if false {\n                started + self.attempt")
 mutate("pg-recovery-stops-before-finish-deadline", "a lost confirmation's completion stops one answer budget before its deadline", PG_STORE,
        "            if !self.row_may_commit && Instant::now() >= self.deadline {",
        "            if (Instant::now() + if self.row_may_commit { self.attempt } else { Duration::ZERO })\n"
@@ -2779,10 +2779,25 @@ mutate("pg-recovery-no-attempt-at-deadline", "a lost confirmation's completion m
        "            if !self.row_may_commit && Instant::now() >= self.deadline {",
        "            if Instant::now() >= self.deadline {")
 mutate("pg-recovery-no-deadline", "a lost confirmation's completion keeps trying past its deadline", PG_STORE,
-       "            if now >= self.deadline {", "            if false {")
+       "            if last {\n                return Err(deadline_passed());",
+       "            if false {\n                return Err(deadline_passed());")
 mutate("pg-recovery-missing-row-given-up", "a row that was never written is reported as given up", PG_STORE,
        "                    if matches!(*last, PgAuditError::NoSuchRow { .. }) =>",
        "                    if false =>")
+# #77: the last attempt is the one started at the deadline, the ones before it end by the
+# deadline, and shutdown waits for the last one's answer budget.
+mutate("pg-recovery-stale-missing-row-final", "an attempt answered at or past the deadline ends a lost confirmation's completion", PG_STORE,
+       "            if last {\n                return Err(deadline_passed());",
+       "            if last || Instant::now() >= self.deadline {\n                return Err(deadline_passed());")
+mutate("pg-recovery-attempt-before-last-uncut", "a lost confirmation's attempts before its deadline run past it", PG_STORE,
+       "                (started + self.attempt).min(self.deadline)\n            };",
+       "                if self.row_may_commit {\n"
+       "                    started + self.attempt\n"
+       "                } else {\n"
+       "                    (started + self.attempt).min(self.deadline)\n"
+       "                }\n            };")
+mutate("pg-shutdown-wait-finish-deadline-only", "shutdown stops waiting at the finish deadline, before the last attempt to complete a lost confirmation's row has its answer", PG_STORE,
+       "        self.finish_deadline + self.answer\n", "        self.finish_deadline\n")
 mutate("pg-migrate-unlocked", "two migrators run at once", PG + "src/migrate.rs",
        'SELECT pg_advisory_xact_lock($1)', 'SELECT $1::bigint')
 mutate("pg-check-durability-ignored", "a server without fsync passes the check", PG_CHECK,
