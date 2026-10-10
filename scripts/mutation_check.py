@@ -736,6 +736,27 @@ mutate("core-list-fields-public", "a Listed can be made without its row", SRC + 
 mutate("core-list-failure-swallowed", "a list whose row could not be written is answered", SRC + "audit.rs",
        "    store\n        .list(&row, &record)\n        .await\n        .map_err(AuditFailure::from_store)?;",
        "    let _ = store.list(&row, &record).await;")
+mutate("core-list-answer-cut", "a Listed holds only the tools its row names", SRC + "audit.rs",
+       "        tools: tools.into_iter().cloned().collect(),",
+       "        tools: tools.into_iter().take(MAX_RECORDED_TOOLS).cloned().collect(),")
+mutate("core-list-surface-unescaped", "a list row records the caller's surface as given", SRC + "audit.rs",
+       "        surface: SurfaceName::new(sentences::escape(\n            caller.surface.as_str(),\n"
+       "            sentences::MAX_RENDERED,\n        )),\n",
+       "        surface: caller.surface.clone(),\n")
+mutate("core-list-instance-uncapped", "a list row records the instance uncapped", SRC + "audit.rs",
+       "    let record = ListRecord {\n        instance: InstanceName::new(sentences::escape(\n"
+       "            instance.as_str(),\n            sentences::MAX_RENDERED,\n        )),\n",
+       "    let record = ListRecord {\n        instance,\n")
+mutate("core-list-delegation-team-dropped", "a list row leaves out the delegation's proved team", SRC + "audit.rs",
+       "        proved_delegation_team: caller\n            .delegation\n            .as_ref()\n"
+       "            .map(|delegation| delegation.team().into()),\n",
+       "        proved_delegation_team: None,\n")
+mutate("core-list-acting-person-dropped", "a list row leaves out the delegation's acting person", SRC + "audit.rs",
+       "            .map(|delegation| delegation.acting_person()),\n        claimed_team,\n",
+       "            .map(|delegation| delegation.acting_person()).filter(|_| false),\n        claimed_team,\n")
+mutate("core-list-claimed-team-dropped", "a list row leaves out the team the caller claimed", SRC + "audit.rs",
+       "        claimed_team,\n        tools: tools\n",
+       "        claimed_team: None,\n        tools: tools\n")
 
 # --- Sentences -----------------------------------------------------------------------------
 
@@ -1529,13 +1550,20 @@ mutate("gw-instance-unset-starts", "with nothing naming the instance, switchboar
 
 GW_PATH = GW + "path.rs"
 LIST_SURFACE = (
-    "entries(&self.inner.gates.policy(), snapshot.surface(&surface).map(|surface| surface.tools.iter()"
-    ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default())"
+    "entries(&self.inner.gates.policy(), &snapshot.surface(&surface).map(|surface| surface.tools.iter()"
+    ".filter_map(|name| snapshot.tool(name)).cloned().collect::<Vec<_>>()).unwrap_or_default())"
 )
 
 mutate("gw-row-id-fixed", "every call's row has one identifier, not one made per call", GW_PATH,
-       "            row: AuditRowId::new(Uuid::now_v7().to_string()),",
-       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),')
+       "            row: AuditRowId::new(Uuid::now_v7().to_string()),\n            instance: gates.instance().clone(),\n"
+       "            call_deadline_ms: millis(",
+       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),\n            instance: gates.instance().clone(),\n'
+       "            call_deadline_ms: millis(")
+mutate("gw-list-row-id-fixed", "every list's row has one identifier, not one made per list", GW_PATH,
+       "            row: AuditRowId::new(Uuid::now_v7().to_string()),\n            instance: gates.instance().clone(),\n"
+       "            call_deadline_ms: 0,",
+       '            row: AuditRowId::new("01990000-0000-7000-8000-000000000000"),\n            instance: gates.instance().clone(),\n'
+       "            call_deadline_ms: 0,")
 
 mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
        "        let admitted = match self.admit(method, headers) {\n",
@@ -1577,15 +1605,29 @@ mutate("gw-resources-from-requested-not-approved", "the adapter is chosen by the
        "            .registered(&gateway_core::ConnectorName::new(requested.as_str()))\n"
        "            .or(gates.registered(&approved.connector))\n")
 mutate("gw-disabled-identity-lists", "with identity disabled, the surface's tools are listed", GW_PATH,
-       "        let Caller::Proved(principal) = caller else {\n            return Vec::new();\n        };\n",
-       "        let Caller::Proved(principal) = caller else {\n"
+       "            return (Reply::Tools(Vec::new()), None);\n",
        "            let snapshot = self.inner.gates.snapshot();\n"
-       f"            return {LIST_SURFACE};\n        }};\n")
+       f"            return (Reply::Tools({LIST_SURFACE}), None);\n")
 mutate("gw-list-unfiltered", "tools/list returns every tool on the surface, undecided", GW_PATH,
-       "        let caller = self.caller_context(&policy, principal, surface);\n"
-       "        entries(&policy, list_tools(policy.snapshot(), &caller))\n",
-       "        let _ = principal;\n        let snapshot = self.inner.gates.snapshot();\n"
-       f"        {LIST_SURFACE}\n")
+       "        let tools = list_tools(policy.snapshot(), &caller);\n",
+       "        let snapshot = policy.snapshot();\n"
+       "        let tools: Vec<&ApprovedTool> = snapshot.surface(&caller.surface).map(|surface| surface.tools.iter()"
+       ".filter_map(|name| snapshot.tool(name)).collect()).unwrap_or_default();\n")
+# A tools/list row (decision 0009): written before the answer, which comes only from it.
+mutate("gw-list-no-row", "tools/list answers without writing its row", GW_PATH,
+       "            gates.audit_store().as_ref(),\n            start,\n            &caller,\n",
+       "            &crate::audit::DisabledAuditStore::new(),\n            start,\n            &caller,\n")
+mutate("gw-list-answered-when-row-fails", "a list whose row could not be written is answered with the tools", GW_PATH,
+       "                (Reply::Denied(failure.sentence().to_owned()), None)\n",
+       "                let _ = failure;\n"
+       "                let tools: Vec<ApprovedTool> = list_tools(policy.snapshot(), &caller).into_iter().cloned().collect();\n"
+       "                (Reply::Tools(entries(&policy, &tools)), None)\n")
+mutate("gw-list-row-not-in-meta", "a tools/list answer does not name its row", GW_PATH,
+       "                let row = self.quotable(listed.row());\n",
+       "                let row: Option<AuditRowId> = None;\n")
+mutate("gw-list-wrong-revision", "a list row records a revision other than the one served", GW_PATH,
+       "            policy.revision().clone(),\n            tools,\n",
+       "            \"not-the-served-revision\".into(),\n            tools,\n")
 mutate("gw-disabled-identity-unannounced", "initialize does not say identity is disabled", GW_PATH,
        "        notes.push(IDENTITY_DISABLED_NOTE);\n", "")
 mutate("gw-disabled-audit-unannounced", "initialize does not say audit is disabled", GW_PATH,
@@ -2988,7 +3030,22 @@ mutate("mcp-tool-result-legacy-structured-non-object", "a legacy pass-through re
 mutate("demo-driver-unknown-row-as-none", "the row check takes none for the resources of a tool the gateway does not know", DRIVER,
        '        elif .reason == "unknown_tool" then "unknown"\n', '        elif .reason == "unknown_tool" then []\n')
 mutate("demo-driver-row-check-counts-nothing", "the row check passes whatever rows were wrong", DRIVER,
-       '    check "$(count_lines . "$wrong")" 0 "audit: every row', '    check 0 0 "audit: every row')
+       '    check "$(count_lines . "$wrong")" 0 \\\n      "audit: every row', '    check 0 0 \\\n      "audit: every row')
+# List rows (decision 0009): counted apart, one per tools/list, each naming what was shown.
+mutate("demo-driver-list-row-any-resources", "the row check passes a list row whatever resources it names", DRIVER,
+       '        if .kind == "list" then null\n', '        if .kind == "list" then .resources\n')
+mutate("demo-driver-row-any-kind", "the row check judges a row of any kind as a call", DRIVER,
+       '        elif .kind != "call" then "no call of the demo makes this row"\n', "")
+mutate("demo-driver-list-count-unchecked", "the list check passes whatever number of list rows there are", DRIVER,
+       '  check "$lists" "$expected" "audit: one list row', '  check "$expected" "$expected" "audit: one list row')
+mutate("demo-driver-list-check-counts-nothing", "the list check passes whatever list rows were wrong", DRIVER,
+       '  check "$(count_lines . "$wrong")" 0 "audit: each list row', '  check 0 0 "audit: each list row')
+mutate("demo-driver-list-withdrawn-shown", "the list check expects the withdrawn tool after the withdrawal too", DRIVER,
+       '"demo-2": [$list]}', '"demo-2": [$list, $read]}')
+mutate("demo-driver-list-omitted-unchecked", "the list check passes a list row that left tools out", DRIVER,
+       "            and .omitted == 0) | not)\n", "            and true) | not)\n")
+mutate("demo-driver-list-any-team", "the list check passes a list row from any team", DRIVER,
+       '        | select(((.team == "team-a" or .team == "team-b")\n', "        | select(((true)\n")
 mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
        '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
 mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
