@@ -371,6 +371,13 @@ pub enum Problem {
         /// Its definition, with its whitespace collapsed.
         found: String,
     },
+    /// The open-row view has options, which the migration gives it none of. With
+    /// `security_invoker`, it reads `call_rows` with the privileges of the role that queries it,
+    /// and the gateway's role cannot read `begun_at`, so the open-row query fails.
+    OpenRowsOptions {
+        /// Its options, as `pg_class.reloptions` holds them.
+        options: Vec<String>,
+    },
     /// The session logged in as another role than the one it runs as, for example through a
     /// `role` setting in its options or a role default. `SET ROLE NONE` returns it to the role
     /// it logged in as, which the other checks do not look at.
@@ -505,6 +512,13 @@ impl fmt::Display for Problem {
                 "the view switchboard_audit.{OPEN_ROWS} is defined as {found:?}, not as the \
                  migration defines it"
             ),
+            Self::OpenRowsOptions { options } => write!(
+                f,
+                "the view switchboard_audit.{OPEN_ROWS} has the options {}, and the migration \
+                 gives it none: with security_invoker it reads call_rows with the privileges of \
+                 whoever queries it, which the gateway's role does not have",
+                options.join(", ")
+            ),
             Self::LoggedInAs { role } => write!(
                 f,
                 "this session logged in as {role}, and SET ROLE NONE would return it to {role}; \
@@ -581,7 +595,8 @@ impl PgAuditStore {
     ///   `ALTER SYSTEM`, which reaches every session at the next reload.
     /// - The view `switchboard_audit.open_call_rows`, which the open-row query reads, is there,
     ///   owned by `switchboard_owner`, with the definition migration 0005 gives it, whitespace
-    ///   aside. The role may select from it, and may do nothing else with it.
+    ///   aside, and with no options, such as `security_invoker`. The role may select from it,
+    ///   and may do nothing else with it.
     /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule. A
     ///   rule's statements run as the table's owner whenever the gateway writes.
     /// - Neither the role nor any role it can become, PUBLIC included, holds anything on a
@@ -1208,7 +1223,7 @@ async fn other_privileges(
 }
 
 /// The open-row view is there, as a view, owned by [`OWNER_ROLE`], with the migration's
-/// definition. The session's role may select from it, and neither it nor any role it can become
+/// definition and no options. The session's role may select from it, and neither it nor any role it can become
 /// may pass that on, for the whole view or for any column of it. Anything else on it is refused
 /// with the rest of the schema.
 async fn open_rows(
@@ -1219,7 +1234,8 @@ async fn open_rows(
         .query_opt(
             &format!(
                 "SELECT pg_get_userbyid(c.relowner)::text, pg_get_viewdef(c.oid),
-                        has_table_privilege(current_user, c.oid, 'SELECT'), {}
+                        has_table_privilege(current_user, c.oid, 'SELECT'), {},
+                        coalesce(c.reloptions, '{{}}')::text[]
                  FROM pg_catalog.pg_class c
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                  WHERE n.nspname = 'switchboard_audit' AND c.relname = $1 AND c.relkind = 'v'",
@@ -1239,6 +1255,12 @@ async fn open_rows(
     let definition = collapse(view.get(1));
     if definition != OPEN_ROWS_DEFINITION {
         problems.push(Problem::OpenRowsDefinition { found: definition });
+    }
+    // A view's options change how it runs: security_invoker makes it read its table with the
+    // privileges of whoever queries it, not its owner's.
+    let options: Vec<String> = view.get(4);
+    if !options.is_empty() {
+        problems.push(Problem::OpenRowsOptions { options });
     }
     let object = format!("switchboard_audit.{OPEN_ROWS}");
     if !view.get::<_, bool>(2) {

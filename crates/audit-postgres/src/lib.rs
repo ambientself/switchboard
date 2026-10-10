@@ -10,6 +10,9 @@
 //!   budget, under the same identifier. Finish keeps trying, on a task of its own, after its
 //!   answer budget has passed, until a deadline. An allowed row whose begin failed after its
 //!   insert was executed, and so may have been written, is completed as `error` the same way.
+//! - [`PgAuditStore::stats`] reads what the store counts for telemetry, in [`StoreStats`]: why
+//!   begins failed, answers released before their row was complete, why finishes gave up, the
+//!   latency of begin and finish, and each pool's connections in use.
 //! - [`PgAuditStore::open_rows`] counts the open rows, through the view `open_call_rows`:
 //!   allowed calls with no completion past their deadline, by the database's clock.
 //! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
@@ -56,6 +59,7 @@
 mod check;
 mod columns;
 mod migrate;
+mod stats;
 mod store;
 
 #[cfg(test)]
@@ -64,5 +68,9 @@ mod tests;
 pub use check::{BootCheckError, Problem};
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
+};
+pub use stats::{
+    BeginFailures, GivenUpCauses, LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram, PoolStats,
+    StoreStats,
 };
 pub use store::{Budgets, FinishCounts, GivenUp, OpenRows, PgAuditError, PgAuditStore, PoolSizes};

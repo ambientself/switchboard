@@ -12,9 +12,13 @@ use gateway_testkit::{
 use serde_json::json;
 use tokio_postgres::Client;
 
-use super::TestDatabase;
+use tokio::time::Instant;
+
+use super::budgets::{SLACK, count, release, until, within};
 use super::store::completion;
-use crate::{Budgets, OpenRows, PgAuditStore, PoolSizes};
+use super::{GATEWAY_ROLE, TestDatabase};
+use crate::store::OPEN_ROWS_TIMEOUT;
+use crate::{Budgets, OpenRows, PgAuditError, PgAuditStore, PoolSizes};
 
 /// Budgets that give a row begun with no call deadline an allowance of 2 s, so a test waits
 /// that long, not the default 32 s, for a row's deadline to pass.
@@ -227,6 +231,75 @@ async fn a_list_row_is_never_open_past_any_deadline() {
         )
         .await
         .unwrap();
+    assert_eq!(store.open_rows().await.unwrap(), none_open());
+}
+
+/// The open-row query runs on the finish pool, so begins that hold every begin connection do
+/// not hold it up.
+#[tokio::test]
+async fn the_open_row_query_runs_on_the_finish_pool() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db
+        .store(PoolSizes {
+            begin: 1,
+            finish: 1,
+        })
+        .with_budgets(short());
+    let held = store.begin.get().await.unwrap();
+    assert_eq!(store.open_rows().await.unwrap(), none_open());
+    assert_eq!(store.finish.status().size, 1);
+    assert_eq!(store.begin.status().size, 1);
+    drop(held);
+}
+
+/// The open-row query has 2 s from asking for a connection. One held by a lock past that fails,
+/// and the store asks the server to cancel it, so it stops waiting while the lock is still
+/// held, and takes its connection out of the pool, so nothing later waits behind it.
+#[tokio::test]
+async fn an_open_row_query_held_past_its_time_limit_is_cancelled() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = store(&db);
+    let admin = db.admin().await;
+    // The finish connection is open, so the time goes to the query.
+    drop(store.finish.get().await.unwrap());
+    let lock = db.admin().await;
+    lock.batch_execute("BEGIN; LOCK TABLE switchboard_audit.call_rows IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let error = within(OPEN_ROWS_TIMEOUT + SLACK, store.open_rows())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, PgAuditError::OpenRowsTimedOut { budget } if budget == OPEN_ROWS_TIMEOUT),
+        "{error}"
+    );
+    assert!(started.elapsed() >= OPEN_ROWS_TIMEOUT);
+    assert_eq!(store.finish.status().size, 0);
+    until(
+        Duration::from_secs(5),
+        "the open-row query's cancellation",
+        || async {
+            count(
+                &admin,
+                &format!(
+                    "SELECT count(*) FROM pg_stat_activity
+                     WHERE usename = '{GATEWAY_ROLE}' AND datname = '{}' AND state = 'active'
+                         AND query LIKE '%open_call_rows%'",
+                    db.name()
+                ),
+            )
+            .await
+                == 0
+        },
+    )
+    .await;
+    release(&lock).await;
     assert_eq!(store.open_rows().await.unwrap(), none_open());
 }
 

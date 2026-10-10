@@ -16,6 +16,7 @@ use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{CancelToken, Socket};
 
 use crate::columns::{BeginRow, FinishRow, ListRow};
+use crate::stats::{BeginFailures, GivenUpCauses, LatencyCounter, PoolStats, StoreStats};
 
 /// Why a row could not be written. Returned to the core boxed, as its [`StoreError`]; a test
 /// can downcast it.
@@ -70,6 +71,17 @@ pub enum PgAuditError {
     /// completion stands.
     #[error("audit row {row} is already complete, with a different completion")]
     CompletedDifferently {
+        /// The row finish named.
+        row: String,
+    },
+    /// The update that completes the row matched nothing, and the row read just after has no
+    /// completion: the update did not see the row, whose insert committed after it looked. The
+    /// task completing a failed begin's row, whose insert may commit late, tries again; a
+    /// finish, whose row was begun before it, gives up.
+    #[error(
+        "audit row {row} has no completion, and the update that would have written one did not find it"
+    )]
+    NotCompleted {
         /// The row finish named.
         row: String,
     },
@@ -235,11 +247,149 @@ pub struct FinishCounts {
     pub never_written: u64,
 }
 
+/// What the store counts, in atomics, so nothing on the begin or finish path waits to count.
 #[derive(Default)]
 struct Counters {
     in_flight: AtomicUsize,
-    given_up: AtomicU64,
+    given_up: GivenUpCounters,
     never_written: AtomicU64,
+    begin_failures: BeginFailureCounters,
+    answers_released: AtomicU64,
+    begin_latency: LatencyCounter,
+    finish_latency: LatencyCounter,
+}
+
+/// [`GivenUpCauses`], as it is counted.
+#[derive(Default)]
+struct GivenUpCounters {
+    deadline: AtomicU64,
+    completed_differently: AtomicU64,
+    no_such_row: AtomicU64,
+    task_lost: AtomicU64,
+    other: AtomicU64,
+}
+
+impl GivenUpCounters {
+    /// Counts one finish given up because of `error`.
+    fn count(&self, error: &PgAuditError) {
+        let cause = match error {
+            PgAuditError::Deadline { .. } => &self.deadline,
+            PgAuditError::CompletedDifferently { .. } => &self.completed_differently,
+            PgAuditError::NoSuchRow { .. } => &self.no_such_row,
+            PgAuditError::FinishTaskLost { .. } => &self.task_lost,
+            _ => &self.other,
+        };
+        cause.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> GivenUpCauses {
+        GivenUpCauses {
+            deadline: self.deadline.load(Ordering::SeqCst),
+            completed_differently: self.completed_differently.load(Ordering::SeqCst),
+            no_such_row: self.no_such_row.load(Ordering::SeqCst),
+            task_lost: self.task_lost.load(Ordering::SeqCst),
+            other: self.other.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Why a begin failed, as [`BeginFailures`] counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeginCause {
+    BudgetExceeded,
+    PoolTimeout,
+    DatabaseError,
+    ValueRefused,
+}
+
+/// [`BeginFailures`], as it is counted.
+#[derive(Default)]
+struct BeginFailureCounters {
+    budget_exceeded: AtomicU64,
+    pool_timeout: AtomicU64,
+    database_error: AtomicU64,
+    value_refused: AtomicU64,
+}
+
+impl BeginFailureCounters {
+    fn count(&self, cause: BeginCause) {
+        let counter = match cause {
+            BeginCause::BudgetExceeded => &self.budget_exceeded,
+            BeginCause::PoolTimeout => &self.pool_timeout,
+            BeginCause::DatabaseError => &self.database_error,
+            BeginCause::ValueRefused => &self.value_refused,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> BeginFailures {
+        BeginFailures {
+            budget_exceeded: self.budget_exceeded.load(Ordering::SeqCst),
+            pool_timeout: self.pool_timeout.load(Ordering::SeqCst),
+            database_error: self.database_error.load(Ordering::SeqCst),
+            value_refused: self.value_refused.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Counts how long it was alive in a latency histogram when dropped, so a step whose caller
+/// stops waiting for it is counted too.
+struct Timed<'a> {
+    histogram: &'a LatencyCounter,
+    started: Instant,
+}
+
+impl<'a> Timed<'a> {
+    fn start(histogram: &'a LatencyCounter) -> Self {
+        Self {
+            histogram,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Timed<'_> {
+    fn drop(&mut self) {
+        self.histogram.record(self.started.elapsed());
+    }
+}
+
+/// A begin or list that failed, with whether its last attempt had a connection: a budget that
+/// ran out without one ran out waiting for the pool.
+struct InsertFailed {
+    error: PgAuditError,
+    connected: bool,
+}
+
+impl InsertFailed {
+    fn cause(&self) -> BeginCause {
+        begin_cause(&self.error, self.connected)
+    }
+}
+
+/// Why a begin failed with `error`; `connected` tells a budget that ran out waiting for a
+/// connection from one that ran out with one in hand.
+fn begin_cause(error: &PgAuditError, connected: bool) -> BeginCause {
+    match error {
+        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,
+        PgAuditError::BeginBudget { .. } => BeginCause::BudgetExceeded,
+        PgAuditError::Pool(PoolError::Timeout(_)) => BeginCause::PoolTimeout,
+        PgAuditError::Nul { .. } | PgAuditError::Column(_) | PgAuditError::CompleteAtBegin => {
+            BeginCause::ValueRefused
+        }
+        _ => BeginCause::DatabaseError,
+    }
+}
+
+/// How many of a pool's connections are open and in use. Reads the pool's status, which takes
+/// the pool's own lock for a moment.
+fn pool_stats(pool: &Pool) -> PoolStats {
+    let status = pool.status();
+    PoolStats {
+        in_use: status.size.saturating_sub(status.available),
+        size: status.size,
+        max_size: status.max_size,
+    }
 }
 
 /// A finish that stopped without completing its row, which keeps an empty outcome. Decision
@@ -257,7 +407,7 @@ pub struct GivenUp<'a> {
     /// [`PgAuditError::NoSuchRow`] when the row is not there,
     /// [`PgAuditError::FinishTaskLost`] when its task was dropped before it ended, as when the
     /// runtime shuts down, a completion the row cannot hold, or another refusal by the
-    /// database.
+    /// database. [`StoreStats::finishes_given_up`] counts each by the same causes.
     pub error: &'a PgAuditError,
 }
 
@@ -310,7 +460,7 @@ impl Settle {
     }
 
     fn give_up(&self, error: &PgAuditError) {
-        self.in_flight.0.given_up.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.0.given_up.count(error);
         (self.report)(GivenUp {
             row: &self.row,
             outcome: self.outcome,
@@ -527,8 +677,29 @@ impl PgAuditStore {
     pub fn finishes(&self) -> FinishCounts {
         FinishCounts {
             in_flight: self.counters.in_flight.load(Ordering::SeqCst),
-            given_up: self.counters.given_up.load(Ordering::SeqCst),
+            given_up: self.counters.given_up.snapshot().total(),
             never_written: self.counters.never_written.load(Ordering::SeqCst),
+        }
+    }
+
+    /// What the store has counted since it was made, for the gateway's telemetry (decision
+    /// 0009): begin failures by cause, answers released before their row was complete,
+    /// finishes given up by cause, failed begins' rows never written, finishes in flight, the
+    /// latency of begin and of finish, and each pool's connections. The counts are atomics,
+    /// each read on its own; the pools' figures come from their status, which takes each
+    /// pool's lock for a moment. Nothing here waits on the database.
+    pub fn stats(&self) -> StoreStats {
+        let finishes = self.finishes();
+        StoreStats {
+            begin_failures: self.counters.begin_failures.snapshot(),
+            answers_released_before_finish: self.counters.answers_released.load(Ordering::SeqCst),
+            finishes_given_up: self.counters.given_up.snapshot(),
+            begins_never_committed: finishes.never_written,
+            finishes_in_flight: finishes.in_flight,
+            begin_latency: self.counters.begin_latency.snapshot(),
+            finish_latency: self.counters.finish_latency.snapshot(),
+            begin_pool: pool_stats(&self.begin),
+            finish_pool: pool_stats(&self.finish),
         }
     }
 
@@ -565,7 +736,7 @@ impl PgAuditStore {
 
     /// Writes a call row's first half, or a list row, within the begin budget, on the begin
     /// pool, trying again by identifier while the failure is one that trying again could fix.
-    async fn insert(&self, row: Insert) -> Result<(), PgAuditError> {
+    async fn insert(&self, row: Insert) -> Result<(), InsertFailed> {
         let deadline = Instant::now() + self.budgets.begin;
         // Whether an attempt executed its insert and ended without an answer, or with an error
         // trying again could fix, so that the row may exist. That error may be an explicit
@@ -575,22 +746,27 @@ impl PgAuditStore {
         let mut pause = FIRST_PAUSE;
         let failed = loop {
             let mut sent = false;
-            let error = match self.insert_once(&row, deadline, &mut sent).await {
+            let mut connected = false;
+            let error = match self
+                .insert_once(&row, deadline, &mut sent, &mut connected)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
             let unanswered =
                 error.is_transient() || matches!(error, PgAuditError::BeginBudget { .. });
             may_be_written |= sent && unanswered;
-            if !error.is_transient() {
-                break error;
+            let failed = InsertFailed { error, connected };
+            if !failed.error.is_transient() {
+                break failed;
             }
             // The same row again, under the same identifier: if the last attempt committed,
             // the next finds that row rather than write a second.
             let now = Instant::now();
             sleep_until((now + pause).min(deadline)).await;
             if Instant::now() >= deadline {
-                break error;
+                break failed;
             }
             pause = longer(pause);
         };
@@ -605,18 +781,21 @@ impl PgAuditStore {
         Err(failed)
     }
 
-    /// One attempt at [`insert`](Self::insert), ending by `deadline`. Sets `sent` as the insert
-    /// itself goes out, after its statement is prepared: a prepare cannot commit a row.
+    /// One attempt at [`insert`](Self::insert), ending by `deadline`. Sets `connected` once it
+    /// has a connection from the pool, and `sent` as the insert itself goes out, after its
+    /// statement is prepared: a prepare cannot commit a row.
     async fn insert_once(
         &self,
         row: &Insert,
         deadline: Instant,
         sent: &mut bool,
+        connected: &mut bool,
     ) -> Result<(), PgAuditError> {
         let budget = self.budgets.begin;
         let client = timeout_at(deadline, self.begin.get())
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
+        *connected = true;
         match timeout_at(deadline, insert_on(&client, row, sent)).await {
             Ok(Err(error)) if error.is_transient() => {
                 // A failure trying again could fix may be the connection's own: one that found
@@ -691,6 +870,7 @@ impl PgAuditStore {
         row: &AuditRowId,
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
+        let _timed = Timed::start(&self.counters.finish_latency);
         let started = Instant::now();
         let settle = Settle {
             in_flight: InFlight::start(&self.counters),
@@ -729,11 +909,37 @@ impl PgAuditStore {
             Ok(Err(_)) => Err(PgAuditError::FinishTaskLost {
                 row: row.as_str().to_owned(),
             }),
-            Err(_) => Err(PgAuditError::AnswerBudget {
-                row: row.as_str().to_owned(),
-                budget: self.budgets.answer,
-            }),
+            Err(_) => {
+                // The caller has its answer, and the task goes on trying.
+                self.counters
+                    .answers_released
+                    .fetch_add(1, Ordering::SeqCst);
+                Err(PgAuditError::AnswerBudget {
+                    row: row.as_str().to_owned(),
+                    budget: self.budgets.answer,
+                })
+            }
         }
+    }
+
+    /// Begin, counted: its latency, whether it succeeds or fails, and the cause of a failure.
+    async fn begin_counted(
+        &self,
+        row: &AuditRowId,
+        record: &AuditRecord,
+    ) -> Result<(), PgAuditError> {
+        let _timed = Timed::start(&self.counters.begin_latency);
+        let begun = match BeginRow::from_record(row, record, &self.budgets) {
+            Ok(row) => self.insert(Insert::Call(row)).await,
+            Err(error) => Err(InsertFailed {
+                error,
+                connected: false,
+            }),
+        };
+        if let Err(failed) = &begun {
+            self.counters.begin_failures.count(failed.cause());
+        }
+        begun.map_err(|failed| failed.error)
     }
 }
 
@@ -860,7 +1066,12 @@ async fn complete_on(
     let latency_ms: Option<i64> = existing.try_get(2)?;
     match outcome {
         Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),
-        _ => Err(PgAuditError::CompletedDifferently {
+        Some(_) => Err(PgAuditError::CompletedDifferently {
+            row: row.to_owned(),
+        }),
+        // The update and this select each see what had committed when they began, so a row
+        // whose insert committed in between is seen here and was not seen by the update.
+        None => Err(PgAuditError::NotCompleted {
             row: row.to_owned(),
         }),
     }
@@ -909,7 +1120,11 @@ impl Retry {
             };
             let error = match self.once(by).await {
                 Ok(()) => return Ok(()),
-                Err(error @ PgAuditError::NoSuchRow { .. }) if self.row_may_commit => error,
+                // A failed begin's row may commit late: it is missing, or the update did not
+                // see it.
+                Err(
+                    error @ (PgAuditError::NoSuchRow { .. } | PgAuditError::NotCompleted { .. }),
+                ) if self.row_may_commit => error,
                 Err(error) if !error.is_transient() => return Err(error),
                 Err(error) => error,
             };
@@ -962,8 +1177,7 @@ impl AuditStore for PgAuditStore {
         record: &'a AuditRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let row = BeginRow::from_record(row, record, &self.budgets)?;
-            self.insert(Insert::Call(row))
+            self.begin_counted(row, record)
                 .await
                 .map_err(StoreError::from)
         })
@@ -989,7 +1203,7 @@ impl AuditStore for PgAuditStore {
             let row = ListRow::from_record(row, record)?;
             self.insert(Insert::List(row))
                 .await
-                .map_err(StoreError::from)
+                .map_err(|failed| StoreError::from(failed.error))
         })
     }
 }
@@ -1025,6 +1239,7 @@ mod unit {
         for final_error in [
             PgAuditError::NoSuchRow { row: "r".into() },
             PgAuditError::CompletedDifferently { row: "r".into() },
+            PgAuditError::NotCompleted { row: "r".into() },
             PgAuditError::BegunDifferently { row: "r".into() },
             PgAuditError::Pool(PoolError::Closed),
             PgAuditError::Column("x"),
@@ -1219,6 +1434,13 @@ mod unit {
                 in_flight: 0,
                 given_up: 1,
                 never_written: 0
+            }
+        );
+        assert_eq!(
+            store.stats().finishes_given_up,
+            GivenUpCauses {
+                task_lost: 1,
+                ..GivenUpCauses::default()
             }
         );
         let lost = PgAuditError::FinishTaskLost {

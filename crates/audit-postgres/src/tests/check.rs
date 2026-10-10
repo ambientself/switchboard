@@ -1974,3 +1974,87 @@ async fn the_open_row_view_must_be_as_the_migration_makes_it() {
         vec![extra("SELECT WITH GRANT OPTION", view)]
     );
 }
+
+/// A grant option on a column of the open-row view, held by a role the gateway's role can
+/// become but does not inherit from, can be passed on after `SET ROLE` to it.
+#[tokio::test]
+async fn a_grant_option_on_the_open_row_view_held_by_a_role_the_gateway_can_become_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let view = "switchboard_audit.open_call_rows";
+    let holder = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.store_as(&role).check_at_boot().await.unwrap();
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "GRANT SELECT (begun_at) ON {view} TO {holder} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    db.cluster_wide(&format!("GRANT {holder} TO {role} WITH INHERIT FALSE"))
+        .await;
+    assert_eq!(
+        problems(&db.store_as(&role)).await,
+        vec![extra("SELECT WITH GRANT OPTION", view)]
+    );
+}
+
+/// With `security_invoker`, the open-row view reads `call_rows` with the privileges of the role
+/// that queries it. Its owner, grants and definition are as they were, but the gateway's role
+/// cannot read `begun_at`, so the open-row query fails. The check refuses any option on it.
+#[tokio::test]
+async fn an_open_row_view_with_an_option_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default());
+    let view = "switchboard_audit.open_call_rows";
+    admin
+        .batch_execute(&format!("ALTER VIEW {view} SET (security_invoker = true)"))
+        .await
+        .unwrap();
+    let found = problems(&store).await;
+    assert_eq!(
+        found,
+        vec![Problem::OpenRowsOptions {
+            options: vec!["security_invoker=true".into()],
+        }]
+    );
+    assert!(
+        found[0].to_string().contains("security_invoker=true"),
+        "{}",
+        found[0]
+    );
+    // What the check refuses is real: the query through the view is refused.
+    let error = store.open_rows().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("permission denied for table call_rows"),
+        "{error}"
+    );
+
+    // Any other option is refused too, and with none the view passes again.
+    admin
+        .batch_execute(&format!(
+            "ALTER VIEW {view} RESET (security_invoker);
+             ALTER VIEW {view} SET (security_barrier = true);"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![Problem::OpenRowsOptions {
+            options: vec!["security_barrier=true".into()],
+        }]
+    );
+    admin
+        .batch_execute(&format!("ALTER VIEW {view} RESET (security_barrier)"))
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+    store.open_rows().await.unwrap();
+}

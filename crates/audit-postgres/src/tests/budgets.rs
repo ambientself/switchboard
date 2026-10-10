@@ -96,14 +96,17 @@ pub(super) fn decide_read(fixture: &Fixture, call: &Call) -> gateway_core::Decis
 }
 
 /// Begins an allowed read through the core.
-async fn begin_read(store: &PgAuditStore, fixture: &Fixture) -> Result<Begun, AuditFailure> {
+pub(super) async fn begin_read(
+    store: &PgAuditStore,
+    fixture: &Fixture,
+) -> Result<Begun, AuditFailure> {
     let call = Call::new(Caller::TeamA, SURFACE_ALL, READ_TOOL, TEAM_A_DOCUMENT);
     let decision = decide_read(fixture, &call);
     audit::begin(store, row_start(), decision, call.arguments, call.metadata).await
 }
 
 /// Begins and runs `call` through the core, ready to finish.
-async fn ran(store: &PgAuditStore, fixture: &Fixture, call: Call) -> (String, Ran) {
+pub(super) async fn ran(store: &PgAuditStore, fixture: &Fixture, call: Call) -> (String, Ran) {
     let decision = decide_read(fixture, &call);
     let Begun::Allowed(guard) =
         audit::begin(store, row_start(), decision, call.arguments, call.metadata)
