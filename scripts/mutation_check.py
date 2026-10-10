@@ -1722,7 +1722,7 @@ mutate("dev-printer-not-wired", "asking for audit rows to be printed prints noth
        "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
 mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into success, so the call runs with no row", DEV_PRINTER,
        "            begun\n        })", "            begun.or_else(|_| Ok(()))\n        })")
-mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so the listing is answered with no row", DEV_PRINTER,
+mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so audit::listed hands out a Listed with no row stored", DEV_PRINTER,
        "            listed\n        })", "            listed.or_else(|_| Ok(()))\n        })")
 mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
        "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
@@ -2236,15 +2236,16 @@ mutate("pg-check-completion-latency", "an outcome may lack its latency", PG_SQL,
        "        (outcome IS NULL) = (latency_ms IS NULL)\n", "        true\n")
 mutate("pg-check-completion-time", "an outcome may lack its time", PG_SQL,
        "        AND (outcome IS NULL) = (finished_at IS NULL)\n", "")
-# Since 0004, decision_shape refuses a decision that is neither too, so pg-check-decision-any is
-# caught only because the test names the column's own check.
+# Since 0004, decision_shape refuses a decision that is neither allow nor deny as well, so
+# pg-check-decision-any is caught only because the test names the column's own check.
 for column, values in [
     ("classification", "'read', 'propose', 'write', 'destructive'"),
     ("decision", "'allow', 'deny'"),
     ("proved_kind", "'workload', 'user'"),
     ("outcome", "'ok', 'error', 'refused'"),
 ]:
-    mutate(f"pg-check-{column.replace('_', '-')}-any", f"the {column} column takes any text", PG_SQL,
+    what = "the decision column's own check accepts" if column == "decision" else f"the {column} column takes"
+    mutate(f"pg-check-{column.replace('_', '-')}-any", f"{what} any text", PG_SQL,
            f"CHECK ({column} IN ({values}))", "CHECK (true)")
 for column in ["resources_omitted", "latency_ms"]:
     mutate(f"pg-check-{column.replace('_', '-')}-negative", f"the {column} column takes a negative number", PG_SQL,

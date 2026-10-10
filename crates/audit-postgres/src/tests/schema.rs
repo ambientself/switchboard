@@ -1057,8 +1057,9 @@ async fn a_row_the_core_could_not_make_is_refused() {
         let error = owner.query_one(&insert(&changes), &[]).await.unwrap_err();
         assert_eq!(code(&error), Some(CHECK_VIOLATION), "{case}: {error}");
     }
-    // Since 0004, decision_shape refuses a decision that is neither too. The column's own check
-    // still refuses it first: a table's checks run in order of name, and its name comes first.
+    // Since 0004, decision_shape refuses a decision that is neither allow nor deny as well. The
+    // column's own check still refuses it first: a table's checks run in order of name, and its
+    // name comes first.
     let error = owner
         .query_one(&insert(&[("decision", "'maybe'")]), &[])
         .await
