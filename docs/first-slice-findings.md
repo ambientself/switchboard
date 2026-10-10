@@ -37,9 +37,9 @@ cannot show that, and these numbers do not change it.
   checks are now 58, 29 per team.
 - **Run twice in a row** (section 11). From `eb58476`, each demo ran twice without `down` in
   between, and all four runs passed: Compose 90/90 both times and kind 156/156 both times.
-- **The route check in the kind run** (section 13). From `db8f519`, Compose passed 93/93 and
-  kind passed 661/661 twice in a row. The route check found every route to mock-docs open
-  before the policy and refused after it, for both teams.
+- **The route check in the kind run** (section 13). Compose passed 93/93 from `db8f519`, and
+  kind passed 661/661 twice in a row from `5fc485e`. The route check found every route to
+  mock-docs open before the policy and refused after it, for both teams.
 
 ## Where and how
 
@@ -486,14 +486,16 @@ direct calls before the policy, as `wrong_audience`. No run waited for the token
 ## 13. The route check in the kind run
 
 On 2026-10-10 the kind run became the route check's first user (#47, decision 0010). The
-runs are from `db8f519`, on the existing cluster `switchboard-demo`, without `down` in between:
-Compose once, then kind twice in a row.
+runs are on the existing cluster `switchboard-demo`, without `down` in between. Compose ran
+once from `db8f519`. Kind ran twice in a row from `5fc485e`, which changes from `db8f519` only
+how the operator checks ask a row across the cluster (with no namespace, as before they read
+the list), and tests and docs; kind's earlier two runs from `db8f519` also passed 661/661.
 
-| | result | wall clock |
-| --- | --- | --- |
-| `demo.sh compose` | PASS (93/93), exit 0 | 59 s |
-| `demo.sh kind` | PASS (661/661), exit 0 | 189 s |
-| `demo.sh kind`, again | PASS (661/661), exit 0 | 151 s |
+| | commit | result | wall clock |
+| --- | --- | --- | --- |
+| `demo.sh compose` | `db8f519` | PASS (93/93), exit 0 | 59 s |
+| `demo.sh kind` | `5fc485e` | PASS (661/661), exit 0 | 191 s |
+| `demo.sh kind`, again | `5fc485e` | PASS (661/661), exit 0 | 134 s |
 
 What each kind run showed:
 
@@ -513,8 +515,9 @@ What each kind run showed:
   connected and got 401.
 - **The operator checks ask the one list.** 360 checks answered no, 180 per team: every row of
   `deploy/route-check/permissions.tsv` in mock-docs, `switchboard`, the team's own namespace
-  and across the cluster. The route check's step asked the same 51 rows as
-  SubjectAccessReviews for the probed pod's ServiceAccount.
+  and across the cluster. Across the cluster is a can-i with no namespace, which asks in
+  `default` and counts its RoleBindings as well as ClusterRoleBindings. The route check's step
+  asked the same 51 rows as SubjectAccessReviews for the probed pod's ServiceAccount.
 - **The boot lines were read from the gateway's pod of its current ReplicaSet,** not from
   whichever pod `deploy/gateway` named.
 
