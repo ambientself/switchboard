@@ -7,6 +7,7 @@ mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -598,7 +599,9 @@ fn start_idle(name: &str, seconds: Option<&str>) -> (std::process::Child, String
     if let Some(seconds) = seconds {
         command.env("IDLE_SECONDS", seconds);
     }
+    // Its own process group, so finish_within can end a sleep it left behind.
     let mut child = command
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -620,6 +623,12 @@ fn finish_within(mut child: std::process::Child, first: String, limit: Duration)
         }
         thread::sleep(Duration::from_millis(50));
     }
+    // A shell that died by the signal leaves its sleep holding the output open; end it, or
+    // reading the output would wait out the sleep. A shell that ended as it should left none.
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
+        .status();
     let mut run = Run::from(child.wait_with_output().unwrap());
     run.stdout = first + &run.stdout;
     run
