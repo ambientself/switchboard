@@ -1640,3 +1640,129 @@ fn the_kind_run_checks_the_routes_open_before_the_policy_and_refused_after_it() 
     );
     assert_eq!(driver.matches("\n  route_check ").count(), 1);
 }
+
+/// What a gateway answers on `GET /metrics` after a run: the values given, and the rest as a
+/// run with no failures leaves them.
+fn metrics_text(begin_failures: &str, answers: &str, open_rows: Option<&str>) -> String {
+    let mut text = String::from(
+        "# HELP switchboard_telemetry_events_total Telemetry events emitted.\n\
+         # TYPE switchboard_telemetry_events_total counter\n\
+         switchboard_telemetry_events_total{event=\"ping\"} 0\n\
+         # TYPE switchboard_telemetry_dropped_total counter\n\
+         switchboard_telemetry_dropped_total 0\n\
+         # TYPE switchboard_audit_begin_failures_total counter\n",
+    );
+    for (cause, count) in [
+        ("budget_exceeded", "0"),
+        ("pool_timeout", begin_failures),
+        ("database_error", "0"),
+        ("value_refused", "0"),
+    ] {
+        text.push_str(&format!(
+            "switchboard_audit_begin_failures_total{{cause=\"{cause}\"}} {count}\n"
+        ));
+    }
+    text.push_str(&format!(
+        "# TYPE switchboard_audit_failure_answers_total counter\n\
+         switchboard_audit_failure_answers_total {answers}\n\
+         # TYPE switchboard_audit_open_rows gauge\n"
+    ));
+    if let Some(open) = open_rows {
+        text.push_str(&format!("switchboard_audit_open_rows {open}\n"));
+    }
+    text
+}
+
+/// check_metrics run on `text`, with `outage` as its first argument, to its RESULT.
+fn check_metrics(outage: &str, text: &str) -> Run {
+    sourced(&format!(
+        "check_metrics {outage} '{text}'\nFINISHED=1\nresult 0",
+        text = text.replace('\'', "'\\''")
+    ))
+}
+
+#[test]
+fn the_metrics_check_counts_the_outage_and_bounds_the_open_rows() {
+    let passed = check_metrics("outage", &metrics_text("1", "1", Some("1")));
+    assert_eq!(passed.status, Some(0), "{}", passed.transcript());
+    assert_eq!(passed.lines("PASS ").len(), 4, "{}", passed.transcript());
+    assert!(
+        passed
+            .stdout
+            .contains("    switchboard_audit_failure_answers_total 1\n"),
+        "the samples are shown:\n{}",
+        passed.transcript()
+    );
+
+    let uncounted = check_metrics("outage", &metrics_text("0", "1", Some("0")));
+    assert_eq!(uncounted.status, Some(1), "{}", uncounted.transcript());
+    assert!(
+        uncounted.failed("refused call counted as a begin failure (got 0, want at least 1)"),
+        "{}",
+        uncounted.transcript()
+    );
+    let unanswered = check_metrics("outage", &metrics_text("2", "0", Some("0")));
+    assert!(
+        unanswered.failed("counted as an audit-failure answer (got 0, want at least 1)"),
+        "{}",
+        unanswered.transcript()
+    );
+
+    let open = check_metrics("none", &metrics_text("0", "0", Some("2")));
+    assert_eq!(open.status, Some(1), "{}", open.transcript());
+    assert!(
+        open.failed("refused call's row open (got 2, want at most 1)"),
+        "{}",
+        open.transcript()
+    );
+    // A poll that never succeeded leaves no sample, which is not a count.
+    let unpolled = check_metrics("none", &metrics_text("0", "0", None));
+    assert!(
+        unpolled.failed("refused call's row open (got '', want a number of at most 1)"),
+        "{}",
+        unpolled.transcript()
+    );
+
+    // Without the outage, only telemetry dropped and the open rows are checked.
+    let kind = check_metrics("none", &metrics_text("0", "0", Some("0")));
+    assert_eq!(kind.status, Some(0), "{}", kind.transcript());
+    assert_eq!(kind.lines("PASS ").len(), 2, "{}", kind.transcript());
+
+    // A gateway that answered nothing fails every check.
+    let silent = check_metrics("outage", "");
+    assert_eq!(silent.status, Some(1), "{}", silent.transcript());
+    assert_eq!(silent.lines("FAIL ").len(), 4, "{}", silent.transcript());
+    assert!(
+        silent.failed("telemetry dropped is exported (got ''"),
+        "{}",
+        silent.transcript()
+    );
+}
+
+/// The body of the function `name` in demo.sh.
+fn function_body(driver: &str, name: &str) -> String {
+    driver
+        .split_once(&format!("\n{name}() {{\n"))
+        .unwrap_or_else(|| panic!("no function {name}"))
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0
+        .to_owned()
+}
+
+#[test]
+fn each_run_reads_the_metrics_inside_the_gateways_container_after_its_workloads() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let compose = function_body(&driver, "compose_run");
+    let reading = "  check_metrics outage \"$(dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics)\"\n";
+    assert!(compose.contains(reading), "{compose}");
+    // After the outage step, whose refused call it counts.
+    assert!(compose.find("dc unpause postgres").unwrap() < compose.find(reading).unwrap());
+
+    let kind = function_body(&driver, "kind_run");
+    let reading = "  check_metrics none \"$(k -n switchboard exec \"pod/$GATEWAY_POD\" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics)\"\n";
+    assert!(kind.contains(reading), "{kind}");
+    assert!(kind.find("team-a and team-b workloads").unwrap() < kind.find(reading).unwrap());
+    assert_eq!(driver.matches("\n  check_metrics ").count(), 2);
+}
