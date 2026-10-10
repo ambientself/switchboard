@@ -1525,6 +1525,19 @@ mutate("gw-instance-unset-starts", "with nothing naming the instance, switchboar
        "        .ok_or(StartError::NoInstance)", '        .or(Some(InstanceName::new("unnamed")))\n        .ok_or(StartError::NoInstance)')
 
 
+# Telemetry. emit counts every event, then queues it without waiting; a full or closed queue
+# drops it and counts the drop. A surface is escaped and capped when it is made.
+TELEMETRY = GW + "telemetry.rs"
+mutate("telemetry-drop-not-counted", "an event the queue had no room for is dropped without being counted", TELEMETRY,
+       "        if self.sender.try_send(event).is_err() {\n            self.counters.dropped.fetch_add(1, Ordering::Relaxed);\n        }\n",
+       "        let _ = self.sender.try_send(event);\n")
+mutate("telemetry-counter-skipped", "emit queues an event without counting it", TELEMETRY,
+       "        counter.fetch_add(1, Ordering::Relaxed);\n", "        let _ = counter;\n")
+mutate("telemetry-surface-unescaped", "a surface is kept as it arrived in the URL", TELEMETRY,
+       "        Self(escape(raw, MAX_SURFACE))", "        Self(raw.to_owned())")
+mutate("telemetry-emit-awaits", "emit blocks until the queue has room", TELEMETRY,
+       "        if self.sender.try_send(event).is_err() {", "        if self.sender.blocking_send(event).is_err() {")
+
 # --- gateway path --------------------------------------------------------------------------
 
 GW_PATH = GW + "path.rs"
