@@ -380,11 +380,12 @@ fn number_after(text: &str, prefix: &str, suffix: &str) -> u64 {
 }
 
 /// Decision 0009, Shutdown: how long a call that began just before the gateway was told to stop
-/// may take, with its row: the begin budget, the call deadline and the finish deadline. The
-/// demo's deployment files set none of them, so each is the code's default.
+/// may take, with its row: the begin budget, the call deadline, and the finish deadline with one
+/// answer budget more, for the last attempt to complete a failed begin's row. The demo's
+/// deployment files set none of them, so each is the code's default.
 fn begin_call_and_finish() -> Duration {
     let budgets = audit_postgres::Budgets::default();
-    budgets.begin + connector_proxy::DEFAULT_DEADLINE + budgets.finish_deadline
+    budgets.begin + connector_proxy::DEFAULT_DEADLINE + budgets.shutdown_wait()
 }
 
 #[test]

@@ -143,9 +143,10 @@ async fn serve(config: PathBuf) -> ExitCode {
     }
 }
 
-/// Waits, up to the store's finish deadline, for the rows it is still completing.
+/// Waits for the rows the store is still completing, up to its finish deadline and one answer
+/// budget more, the longest any of them can take.
 async fn finish_rows(store: &audit_postgres::PgAuditStore) {
-    let deadline = tokio::time::Instant::now() + store.budgets().finish_deadline;
+    let deadline = tokio::time::Instant::now() + store.budgets().shutdown_wait();
     loop {
         let finishes = store.finishes();
         if finishes.in_flight == 0 {

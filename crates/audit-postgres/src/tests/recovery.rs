@@ -28,6 +28,9 @@ use crate::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
 const PASS: u8 = 0;
 const CUT_ONCE: u8 = 1;
 const CUT_EVERY: u8 = 2;
+const HOLD_EMPTY: u8 = 3;
+/// What [`Cutter`] is in once it holds an answer back.
+const HOLDING: u8 = 4;
 
 /// The code a request to cancel a statement carries where a startup has its protocol version.
 const CANCEL_REQUEST_CODE: u32 = 80_877_102;
@@ -37,6 +40,10 @@ const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 /// that connection, so the client never reads them: once, or on every connection until it is
 /// told to pass again. The server has done the work it answers by then: it answers an insert
 /// after committing it.
+///
+/// Told to hold, it keeps back the next answer from the server that says a `SELECT` found no
+/// rows, on whichever connection, until it is told to pass again, and then sends it on. It
+/// passes everything else meanwhile, on that connection and the others.
 ///
 /// Told to, it also throws away every request to cancel a statement, so the statement runs on
 /// as if the request had failed.
@@ -156,10 +163,22 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>, cuts: 
             Ok(read) => read,
         };
         let cut = match mode.load(Ordering::SeqCst) {
-            PASS => false,
+            PASS | HOLDING => false,
             CUT_ONCE => mode
                 .compare_exchange(CUT_ONCE, PASS, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok(),
+            HOLD_EMPTY => {
+                if finds_no_rows(&buffer[..read])
+                    && mode
+                        .compare_exchange(HOLD_EMPTY, HOLDING, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    while mode.load(Ordering::SeqCst) == HOLDING {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                false
+            }
             _ => true,
         };
         if cut {
@@ -173,6 +192,13 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>, cuts: 
     // Both halves of both sockets are dropped, so the client and the server see the
     // connection close.
     upstream.abort();
+}
+
+/// Whether `answer`, bytes from the server, holds the end of a `SELECT` that found no rows: its
+/// command tag, as a `CommandComplete` message carries it.
+fn finds_no_rows(answer: &[u8]) -> bool {
+    let tag = b"SELECT 0\0";
+    answer.windows(tag.len()).any(|window| window == tag)
 }
 
 fn allowed() -> Call {
@@ -733,6 +759,226 @@ async fn an_insert_whose_cancel_failed_and_that_commits_late_is_completed_as_err
     );
     assert_eq!(store.finishes(), FinishCounts::default());
     assert!(reports_of(&reports).is_empty());
+}
+
+/// An executed insert waits past the begin budget, and the store's request to cancel it is
+/// lost. Less than one answer budget before the finish deadline, an attempt to complete the
+/// row finds it missing, and the answer saying so is held back until after the deadline. The
+/// insert commits in between. That answer is stale, and does not end the completion: the
+/// attempt is cut short at the deadline, and the attempt at the deadline completes the row as
+/// `error`.
+#[tokio::test]
+async fn a_missing_row_answer_held_past_the_deadline_leaves_the_attempt_at_the_deadline() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let cutter = Cutter::start(&db).await;
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(2),
+        finish_deadline: Duration::from_millis(4500),
+    };
+    let (store, reports) = reporting(cutter.store(&db, budgets));
+    let admin = db.admin().await;
+    warm_up(&store, &fixture, allowed()).await;
+    drop(store.finish.get().await.unwrap());
+    let lock = hold_inserts(&db).await;
+    cutter.drop_cancels();
+
+    let row = row_start().row;
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    let failed_at = Instant::now();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    assert_eq!(store.finishes().in_flight, 1);
+
+    // The completion's attempts come about 2.55 s and 3.55 s in. From 3 s, less than one answer
+    // budget before the deadline, the next answer that the row is missing is held back.
+    tokio::time::sleep(
+        (failed_at + Duration::from_secs(3)).saturating_duration_since(Instant::now()),
+    )
+    .await;
+    assert_eq!(rows_under(&admin, &row).await, 0);
+    cutter.set(HOLD_EMPTY);
+    until(
+        Duration::from_millis(1400),
+        "an attempt to find the row missing",
+        || async { cutter.mode() == HOLDING },
+    )
+    .await;
+    // That attempt has looked. The insert commits before the deadline.
+    let_inserts_through(&lock).await;
+    until(SLACK, "the insert to commit", || async {
+        rows_under(&admin, &row).await == 1
+    })
+    .await;
+    let committed_by = failed_at.elapsed();
+    assert!(
+        committed_by < budgets.finish_deadline,
+        "the insert committed {committed_by:?} after the begin failed"
+    );
+    // The held answer goes on after the deadline, within the answer budget of the attempt.
+    let answer_at = failed_at + budgets.finish_deadline + Duration::from_millis(200);
+    tokio::time::sleep(answer_at.saturating_duration_since(Instant::now())).await;
+    cutter.set(PASS);
+    until(budgets.answer + SLACK, "the row's completion", || async {
+        store.finishes().in_flight == 0
+    })
+    .await;
+    assert_eq!(
+        row_of(&admin, &row).await,
+        ("allow".to_owned(), Some("error".to_owned()), Some(0)),
+        "{:?} {:?}",
+        store.finishes(),
+        reports_of(&reports)
+    );
+    assert_eq!(store.finishes(), FinishCounts::default());
+    assert!(reports_of(&reports).is_empty());
+}
+
+/// Begins an allowed call that executes its insert while `call_rows` is locked, so the insert
+/// waits past the begin budget and is cancelled, and the store starts a completion of the row,
+/// whose attempts wait on the lock too. Returns the lock, still held, and when the begin failed.
+async fn begin_waiting_on_a_lock(
+    db: &TestDatabase,
+    admin: &Client,
+    store: &PgAuditStore,
+    fixture: &Fixture,
+    row: &AuditRowId,
+) -> (Client, Instant) {
+    warm_up(store, fixture, allowed()).await;
+    let lock = lock_table(db).await;
+    let failure = within(
+        store.budgets().begin + SLACK,
+        begin_as(store, fixture, row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    let failed_at = Instant::now();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    assert_eq!(store.finishes().in_flight, 1);
+    until_no_insert_runs(db, admin).await;
+    (lock, failed_at)
+}
+
+/// Every attempt to complete a failed begin's row waits on a lock held past the finish
+/// deadline. The attempt at the deadline is still waiting when the deadline passes, and finds
+/// the row missing once the lock is released, half an answer budget later. A gateway shutting
+/// down waits [`Budgets::shutdown_wait`] for nothing to be in flight, and is still waiting
+/// then.
+#[tokio::test]
+async fn shutdown_waits_for_the_attempt_at_the_finish_deadline() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(2),
+        finish_deadline: Duration::from_secs(3),
+    };
+    // One begin connection, which the warm-up leaves with the insert prepared, so the begin
+    // under test executes its insert, which then waits on the lock.
+    let sizes = PoolSizes {
+        begin: 1,
+        ..PoolSizes::default()
+    };
+    let (store, reports) = reporting(db.store(sizes).with_budgets(budgets));
+    let admin = db.admin().await;
+    let row = row_start().row;
+    let (lock, failed_at) = begin_waiting_on_a_lock(&db, &admin, &store, &fixture, &row).await;
+    let shutdown_stops_waiting = failed_at + budgets.shutdown_wait();
+
+    let released_at = failed_at + budgets.finish_deadline + budgets.answer / 2;
+    tokio::time::sleep(released_at.saturating_duration_since(Instant::now())).await;
+    assert_eq!(store.finishes().in_flight, 1);
+    assert!(
+        Instant::now() < shutdown_stops_waiting,
+        "a gateway shutting down has stopped waiting for the row's completion"
+    );
+    release(&lock).await;
+    until(
+        shutdown_stops_waiting.saturating_duration_since(Instant::now()),
+        "the completion to end before shutdown stops waiting",
+        || async { store.finishes().in_flight == 0 },
+    )
+    .await;
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 0,
+            never_written: 1
+        },
+        "{:?}",
+        reports_of(&reports)
+    );
+    assert!(reports_of(&reports).is_empty());
+    assert_eq!(rows_under(&admin, &row).await, 0);
+}
+
+/// Every attempt to complete a failed begin's row waits on a lock held until the test ends, and
+/// is cut short. The attempts before the deadline are cut short by it, however close to it they
+/// start, and the one at the deadline runs its full answer budget: the completion gives up one
+/// answer budget after the deadline, within [`Budgets::shutdown_wait`].
+#[tokio::test]
+async fn a_completion_that_gets_no_answer_gives_up_one_answer_budget_after_its_deadline() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    // The first attempt is cut short 3 s in, and the second starts 50 ms later. Were it not cut
+    // short at the deadline, 3.5 s in, it would run to 6.05 s, and the attempt after it to 9.05 s.
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(3),
+        finish_deadline: Duration::from_millis(3500),
+    };
+    let sizes = PoolSizes {
+        begin: 1,
+        ..PoolSizes::default()
+    };
+    let (store, reports) = reporting(db.store(sizes).with_budgets(budgets));
+    let admin = db.admin().await;
+    let row = row_start().row;
+    let (lock, failed_at) = begin_waiting_on_a_lock(&db, &admin, &store, &fixture, &row).await;
+
+    until(
+        budgets.shutdown_wait() + Duration::from_secs(1),
+        "the completion to give up",
+        || async { store.finishes().in_flight == 0 },
+    )
+    .await;
+    let stopped = failed_at.elapsed();
+    assert!(
+        stopped >= budgets.shutdown_wait() - Duration::from_millis(200),
+        "gave up {stopped:?} after the begin failed"
+    );
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 1,
+            never_written: 0
+        }
+    );
+    assert_eq!(
+        reports_of(&reports),
+        vec![(row.as_str().to_owned(), "error", "deadline".to_owned())]
+    );
+    release(&lock).await;
+    assert_eq!(rows_under(&admin, &row).await, 0);
 }
 
 /// Every insert of the row is refused with SQLSTATE `code`, an explicit refusal that trying
