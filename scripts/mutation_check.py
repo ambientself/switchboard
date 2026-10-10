@@ -1537,6 +1537,9 @@ mutate("telemetry-surface-unescaped", "a surface is kept as it arrived in the UR
        "        Self(escape(raw, MAX_SURFACE))", "        Self(raw.to_owned())")
 mutate("telemetry-emit-awaits", "emit blocks until the queue has room", TELEMETRY,
        "        if self.sender.try_send(event).is_err() {", "        if self.sender.blocking_send(event).is_err() {")
+mutate("telemetry-identity-failed-info", "a refused identity is logged at info, below RUST_LOG=warn", TELEMETRY,
+       '        } => tracing::warn!(\n            event = "identity_failed",',
+       '        } => tracing::info!(\n            event = "identity_failed",')
 
 # --- gateway path --------------------------------------------------------------------------
 

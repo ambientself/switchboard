@@ -239,7 +239,7 @@ fn write(event: &Event) {
             source,
             cause,
             claimed,
-        } => tracing::info!(
+        } => tracing::warn!(
             event = "identity_failed",
             deployment = deployment.as_str(),
             surface = surface(on),
@@ -247,7 +247,7 @@ fn write(event: &Event) {
             cause = %cause,
             claimed_issuer = claimed.issuer().map(|issuer| issuer.get().as_str()),
             claimed_subject = claimed.subject().map(|subject| subject.get().as_str()),
-            "refused a caller's identity"
+            "refused a caller whose identity was not proved"
         ),
         Event::Initialize {
             deployment,
@@ -486,6 +486,13 @@ mod tests {
             assert_eq!(fields["deployment"], json!(DEPLOYMENT));
         }
 
+        let levels: Vec<&Value> = lines.iter().map(|line| &line["level"]).collect();
+        assert_eq!(levels, ["WARN", "INFO", "INFO", "INFO", "INFO"]);
+        assert_eq!(
+            fields[0]["message"],
+            json!("refused a caller whose identity was not proved")
+        );
+
         let failed = fields[0];
         assert_eq!(failed["surface"], json!("read\\r\\nforged: line"));
         assert_eq!(failed["source"], json!("192.0.2.7:4242"));
@@ -504,9 +511,13 @@ mod tests {
         );
 
         assert_eq!(fields[1]["surface"], json!("read"));
+        assert_eq!(fields[1]["source"], json!("192.0.2.7:4242"));
         assert_eq!(fields[2]["surface"], json!("read"));
         assert!(fields[2].get("source").is_none(), "{}", fields[2]);
         assert!(fields[3].get("surface").is_none(), "{}", fields[3]);
+        assert!(fields[3].get("source").is_none(), "{}", fields[3]);
+        assert_eq!(fields[4]["surface"], json!("read"));
+        assert_eq!(fields[4]["source"], json!("192.0.2.7:4242"));
         assert_eq!(fields[4]["rejection"], json!("ParseError"));
     }
 }
