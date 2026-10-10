@@ -46,7 +46,8 @@ spec:
         - port: 5432
           protocol: TCP
 ---
-# The gateway: only the two teams' namespaces may connect.
+# The gateway: only the two teams' namespaces may connect, and only to 8080, the MCP port. Its
+# metrics port, 9090, admits nobody; crates/demo-checks holds this policy to that.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

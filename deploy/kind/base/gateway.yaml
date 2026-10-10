@@ -73,6 +73,10 @@ spec:
           ports:
             - containerPort: 8080
               name: http
+            # GET /metrics, its own listener ([metrics] in gateway.toml). Not on the Service,
+            # and the network policy admits the teams on 8080 only.
+            - containerPort: 9090
+              name: metrics
           readinessProbe:
             httpGet:
               path: /readyz

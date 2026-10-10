@@ -129,6 +129,96 @@ fn the_base_has_no_network_policy() {
     }
 }
 
+/// The `listen` of a deployment file's `[metrics]`, and the MCP listener's, before any table.
+fn listeners(config: &str) -> (&str, &str) {
+    let (top, rest) = config.split_once("\n[http]\n").expect("an [http] table");
+    let metrics = rest
+        .split_once("\n[metrics]\n")
+        .expect("a [metrics] table")
+        .1
+        .split_once("\n[")
+        .expect("a table after [metrics]")
+        .0;
+    (value_after(top, "listen = "), value_after(metrics, "listen = "))
+}
+
+/// In kind the metrics are on a containerPort of their own, which the teams cannot reach: the
+/// gateway-from-teams policy admits them on the MCP port and no other, and the Service does not
+/// expose the metrics port.
+#[test]
+fn the_teams_cannot_reach_the_kind_gateways_metrics_port() {
+    let config = read("deploy/kind/base/config/gateway.toml");
+    let (mcp, metrics) = listeners(&config);
+    assert_eq!(mcp, "0.0.0.0:8080");
+    assert_eq!(metrics, "0.0.0.0:9090");
+
+    let manifest = read("deploy/kind/base/gateway.yaml");
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    let ports = block_after(&gateway, "          ports:");
+    let declared: Vec<&str> = ports
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect();
+    assert_eq!(
+        declared,
+        [
+            "            - containerPort: 8080",
+            "              name: http",
+            "            - containerPort: 9090",
+            "              name: metrics",
+        ]
+    );
+    let service = documents_with(&manifest, "kind: Service\n");
+    assert_eq!(service.len(), 1, "{manifest}");
+    assert!(
+        !service[0].contains("9090") && !service[0].contains("metrics"),
+        "the Service exposes the metrics port:\n{}",
+        service[0]
+    );
+
+    let policies = read("deploy/kind/policy/networkpolicies.yaml");
+    let from_teams = documents_with(&policies, "name: gateway-from-teams");
+    assert_eq!(from_teams.len(), 1, "{policies}");
+    assert!(from_teams[0].contains("namespace: switchboard"));
+    let spec = from_teams[0].split_once("spec:\n").expect("a spec").1;
+    let spec: String = spec
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // One rule, with its ports: a rule without ports would admit every port.
+    assert_eq!(
+        spec.trim_end(),
+        "  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: team-a
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: team-b
+      ports:
+        - port: 8080
+          protocol: TCP",
+        "the gateway-from-teams policy must admit the teams on 8080 alone"
+    );
+}
+
+/// In Compose the metrics listen on the container's loopback, and nothing publishes them.
+#[test]
+fn the_compose_gateways_metrics_are_on_its_loopback_and_unpublished() {
+    let config = read("deploy/compose/config/gateway.toml");
+    let (mcp, metrics) = listeners(&config);
+    assert_eq!(mcp, "0.0.0.0:8080");
+    assert_eq!(metrics, "127.0.0.1:9090");
+    let compose = read("deploy/compose/compose.yaml");
+    assert!(!compose.contains("9090"), "{compose}");
+}
+
 #[test]
 fn each_dummy_credentials_hash_matches_it() {
     // Only Compose has a dummy credential; in kind the gateway presents a projected token.

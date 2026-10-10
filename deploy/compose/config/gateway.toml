@@ -1,7 +1,7 @@
 # The gateway's deployment file for the Compose demo: `switchboard --config=<this file>`.
 # The format is in crates/gateway/src/deployment.rs. Relative paths are read from this file's
 # directory. Keep it in step with deploy/kind/base/config/gateway.toml; only the issuer, its
-# keys, the team manifest, the hosts and the credential's path differ.
+# keys, the team manifest, the hosts, the credential's path and the metrics address differ.
 
 deployment = "compose-demo"
 listen = "0.0.0.0:8080"
@@ -37,6 +37,12 @@ leeway_seconds = 30
 mode = "postgres"
 # The URL, which holds the dummy password, is read from this environment variable.
 url_env = "SWITCHBOARD_DATABASE_URL"
+
+[metrics]
+# GET /metrics, in Prometheus text. Loopback inside the container: compose.yaml does not publish
+# it, and no other container can reach it. demo.sh reads it with `docker compose exec gateway
+# curl`. Never the MCP port.
+listen = "127.0.0.1:9090"
 
 [credentials]
 # A Compose secret holding a dummy value. The proxy sends it upstream; the workload never sees it.
