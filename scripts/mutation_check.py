@@ -3081,7 +3081,7 @@ mutate("route-check-permissions-family-dropped", "the impersonation rows are gon
 mutate("route-check-projected-audience-unchecked", "a projected token for a server's audience passes", ROUTE_CHECK,
        """        if [ "$audience" = "$server" ]; then bad+=("$audience"); fi""", "        :")
 mutate("route-check-probe-wait-unbounded", "the step waits for the probe for ever", ROUTE_CHECK,
-       """    if [ "$SECONDS" -ge "$deadline" ]; then break; fi\n""", "")
+       """    if [ "$left" -le 0 ]; then break; fi\n""", "")
 mutate("route-check-evaluation-error-settled", "a review not allowed with an evaluationError counts as a no", ROUTE_CHECK,
        """\n                     and (.status.allowed or (.status.evaluationError // "") == ""))""", ")")
 mutate("route-check-version-unread-passes", "an unread Kubernetes version fails nothing", ROUTE_CHECK,
@@ -3104,6 +3104,83 @@ mutate("route-check-pods-json-unchecked", "an empty or doubled pod list counts a
        """ || ! json_object "$pods" ||""", " ||")
 mutate("route-check-probe-pod-json-unchecked", "an empty or doubled pod read while waiting counts as the probe still running", ROUTE_CHECK,
        """ && json_object "$pod_now" &&""", " &&")
+# #47: the probe's lines against the routes, and a wait that keeps to --probe-wait.
+mutate("route-check-route-lines-unmatched", "a probe that skipped, added or repeated an attempt passes", ROUTE_CHECK,
+       """  elif [ -n "$mismatch" ]; then\n""", "  elif false; then\n")
+mutate("route-check-probe-read-timeout-full", "each read while waiting for the probe may take 30 s, whatever the wait has left", ROUTE_CHECK,
+       "REQUEST_TIMEOUT=${left}s k get pod", "k get pod")
+mutate("route-check-probe-late-end-accepted", "a probe end first seen after the wait counts", ROUTE_CHECK,
+       """        [ "$SECONDS" -le "$deadline" ] || state=""\n""", "")
+# #64: projected sources, endpoints, and the version and node reads are validated, not skipped.
+mutate("route-check-secret-sources-unchecked", "projected sources that are not a list count as none in the Secret check", ROUTE_CHECK,
+       "any(sources; .secret)", "any(.projected.sources[]?; .secret)")
+mutate("route-check-configmap-sources-unchecked", "projected sources that are not a list count as none in the ConfigMap scan", ROUTE_CHECK,
+       "(sources | .configMap.name // empty)", "(.projected.sources[]? | .configMap.name // empty)")
+mutate("route-check-audience-sources-unchecked", "projected sources that are not a list count as no token", ROUTE_CHECK,
+       ".name as $v | sources\n", ".name as $v | .projected.sources[]?\n")
+mutate("route-check-endpoints-unchecked", "endpoints that are not a list are skipped, leaving the ClusterIP alone", ROUTE_CHECK,
+       """.endpoints | if . == null then empty elif type == "array" then .[] else error("endpoints are not a list") end""", ".endpoints[]?")
+mutate("route-check-endpoints-false-skipped", "endpoints of false read as none, leaving the ClusterIP alone", ROUTE_CHECK,
+       "| .endpoints | if . == null then", "| (.endpoints // []) | if . == null then")
+mutate("route-check-addresses-unchecked", "endpoint addresses given as an object are read as its values", ROUTE_CHECK,
+       """.addresses | if type == "array" then .[] else error("addresses are not a list") end""", ".addresses[]")
+mutate("route-check-slices-unchecked", "EndpointSlices given as an object are read as its values", ROUTE_CHECK,
+       """$slices.items | if type == "array" then .[] else error("items are not a list") end""", "$slices.items[]")
+mutate("route-check-version-json-unchecked", "a version read of two objects is read as the last", ROUTE_CHECK,
+       """ && json_object "$version" &&""", " &&")
+mutate("route-check-node-json-unchecked", "a node read of two objects is read as the last", ROUTE_CHECK,
+       """ && json_object "$node" &&""", " &&")
+
+# The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
+# tests/route_check.rs.
+PROBE = "deploy/route-check/probe.sh"
+mutate("probe-dns-failure-refused", "a name that does not resolve counts as refused", PROBE,
+       'record "$row" name "$url" could-not-probe "$host does not resolve"',
+       'record "$row" name "$url" refused "$host does not resolve"')
+mutate("probe-any-curl-exit-refused", "any failed attempt counts as refused, not only a timeout", PROBE,
+       "    28)\n      # Refused only", "    [0-9]*)\n      # Refused only")
+mutate("probe-connected-timeout-refused", "a connection that was made and then got no answer in time counts as refused", PROBE,
+       "        *) echo could-not-probe ;;\n      esac\n      ;;\n    7)", "        *) echo refused ;;\n      esac\n      ;;\n    7)")
+mutate("probe-connect-count-missing", "curl does not report whether it connected, so no timeout can be told apart", PROBE,
+       "-w '%{http_code} %{num_connects}'", "-w '%{http_code}'")
+mutate("probe-unconnected-timeout-not-refused", "a connect that timed out before it was made, a dropped route, does not count as refused", PROBE,
+       "        0) echo refused ;;\n", "        0) echo could-not-probe ;;\n")
+mutate("probe-attempt-status-unsplit", "an attempt's status is read with the connection count after it, so no answer reads as open", PROBE,
+       "  attempt_code=$transfer_code ", "  attempt_code=$attempt_out ")
+mutate("probe-gateway-status-unsplit", "the gateway's status is read with the connection count after it, so no answer reads as reached", PROBE,
+       "code=$transfer_code\n", "code=$out\n")
+mutate("probe-gateway-reach-skipped", "the routes are tried whether or not the gateway answered", PROBE,
+       """  '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;\n""", "  __never__) ;;\n")
+mutate("probe-sends-bearer", "each attempt carries a bearer", PROBE,
+       "-H 'Authorization:'", "-H 'Authorization: Bearer probe'")
+mutate("probe-reads-curlrc", "curl reads the caller's .curlrc, which may add a credential", PROBE,
+       "  curl -q -g -s ", "  curl -g -s ")
+mutate("probe-name-not-pinned", "curl resolves the name again, so a slow lookup can time out as refused", PROBE,
+       ' --resolve "$host:$port:$pinned"', "")
+mutate("probe-address-literal-unchecked", "an address column of hex letters or bad numbers goes to curl, which looks it up as a name", PROBE,
+       """      literals "$addresses" || { broken "$number" "addresses are not address literals: $addresses"; continue; }\n""", "")
+mutate("probe-octet-unbounded", "an octet over 255 passes as an address literal", PROBE,
+       '      [ "$octet" -le 255 ] || return 1\n', "")
+mutate("probe-octet-leading-zero", "an octet with a leading zero, which curl reads as octal, passes", PROBE,
+       "      case $octet in 0) ;; 0* | ????*) return 1 ;; esac\n", "      case $octet in ????*) return 1 ;; esac\n")
+# Round 2: a URL glob made one row several requests, and curl's last status hid the others.
+mutate("probe-globbing-on", "curl expands a URL glob into several requests", PROBE,
+       "  curl -q -g -s ", "  curl -q -s ")
+mutate("probe-url-glob-unchecked", "a URL with a glob character passes the row check", PROBE,
+       """    *'{'* | *'}'* | *'['* | *']'*) broken "$number" "the URL holds a curl glob character: $url"; continue ;;\n""", "")
+mutate("probe-url-glob-after-ipv6-unchecked", "a glob character after an IPv6 host's brackets passes the row check", PROBE,
+       "  case $authority in '['*) glob_rest=${rest#*]} ;; esac\n", "  case $authority in '['*) glob_rest='' ;; esac\n")
+# Caught only where sh is dash (CI's Ubuntu runner, Debian images): bash strips an unquoted [.
+mutate("probe-ipv6-host-bracket-unquoted", "an IPv6 host in a URL fails its row under dash, which reads the bracket as a pattern", PROBE,
+       "    '['*']:'*) host=${authority#'['} ", "    '['*']:'*) host=${authority#[} ")
+mutate("probe-multi-transfer-accepted", "two requests' results from one curl run are read as one", PROBE,
+       "  case $transfer_connects in '' | *[!0-9]*) return 1 ;; esac\n", "")
+mutate("probe-multi-transfer-unrefused", "an attempt whose output is not one request's status is classified anyway", PROBE,
+       "  if ! one_transfer \"$attempt_out\"; then\n", "  if ! one_transfer \"$attempt_out\" && false; then\n")
+mutate("probe-gateway-multi-transfer-accepted", "the gateway check reads two requests' results as one", PROBE,
+       """one_transfer "$out" || stop""", """one_transfer "$out" || true ||  stop""")
+mutate("probe-not-in-image", "the image does not install the probe", "deploy/Dockerfile",
+       "COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh\n", "")
 
 
 # --- gateway: the first slice from files ---------------------------------------------------

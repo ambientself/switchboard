@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Run, read, repo, require, scratch, write};
+use common::{Recorder, Run, dropped, fake_curl, fake_getent, read, repo, require, scratch, write};
 use serde_json::{Value, json};
 
 const CONTEXT: &str = "kind-switchboard-demo";
@@ -39,9 +39,11 @@ RESULT: PASS\n";
 ///   evaluationError (as when an authorization webhook times out) when one in `sar-error` does,
 ///   and refused if `sar-fails` exists;
 /// - `kubectl debug` by saving the partial container spec to `debug-custom.json` and the
-///   container's name to `probe-container`;
+///   container's name to `probe-container`, and, when `$PROBE_SCRIPT` is set, by running that
+///   script with the spec's variables and saving its output and exit code as the probe's;
 /// - `get pod` with the probe's container terminated (exit code in `probe-exit`), or running if
-///   `probe-running` exists, or with the contents of `probe-pod` if that exists;
+///   `probe-running` exists, or with the contents of `probe-pod` if that exists, after waiting
+///   the seconds in `probe-pod-delay` if that exists;
 /// - every other read from a file named for it; a missing file is NotFound.
 const FAKE_KUBECTL: &str = r#"#!/usr/bin/env bash
 set -u
@@ -90,8 +92,15 @@ case $args in
       esac
       shift
     done
+    if [ -n "${PROBE_SCRIPT:-}" ]; then
+      variable() { jq -r --arg name "$1" '.env[] | select(.name == $name) | .value' "$d/debug-custom.json"; }
+      ROUTES=$(variable ROUTES) GATEWAY_URL=$(variable GATEWAY_URL) EXPECT=$(variable EXPECT) \
+        PROBE_TIMEOUT=1 FAKE_HOSTS="$d/hosts" sh "$PROBE_SCRIPT" >"$d/probe.log" 2>&1
+      echo "$?" >"$d/probe-exit"
+    fi
     ;;
   "get pod "*)
+    if [ -f "$d/probe-pod-delay" ]; then sleep "$(cat "$d/probe-pod-delay")"; fi
     if [ -f "$d/probe-pod" ]; then cat "$d/probe-pod"; exit 0; fi
     if [ -f "$d/probe-running" ]; then
       state='{"running": {"startedAt": "2026-10-08T00:00:00Z"}}'
@@ -125,6 +134,19 @@ struct Cluster {
     unreadable: Vec<&'static str>,
     /// Files the fake serves as given, in place of what the cluster would write.
     raw: Vec<(&'static str, &'static str)>,
+    /// The mock-docs Service's ClusterIP and its EndpointSlice's endpoints.
+    cluster_ip: &'static str,
+    endpoints: Value,
+    /// The routes file and the gateway's URL, in place of `ROUTES` and `GATEWAY_URL`.
+    routes: Option<String>,
+    gateway_url: Option<String>,
+    /// Run deploy/route-check/probe.sh for `kubectl debug`, with these `NAME ADDRESS` lines for
+    /// the fake `getent`, in place of the probe's log and exit code above.
+    run_probe: Option<String>,
+    /// URLs whose ports the probe's curl drops (a fake curl), for `run_probe`.
+    dropped: Vec<String>,
+    /// Seconds the fake waits before answering each `get pod`.
+    probe_pod_delay: Option<u32>,
 }
 
 impl Cluster {
@@ -199,6 +221,13 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
             probe_running: false,
             unreadable: Vec::new(),
             raw: Vec::new(),
+            cluster_ip: "10.96.12.34",
+            endpoints: json!([{"addresses": ["10.244.0.7"]}]),
+            routes: None,
+            gateway_url: None,
+            run_probe: None,
+            dropped: Vec::new(),
+            probe_pod_delay: None,
         }
     }
 
@@ -238,11 +267,11 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
         }
         save(
             "service-mock-docs-mock-docs.json",
-            &json!({"spec": {"clusterIP": "10.96.12.34", "clusterIPs": ["10.96.12.34"]}}),
+            &json!({"spec": {"clusterIP": self.cluster_ip, "clusterIPs": [self.cluster_ip]}}),
         );
         save(
             "endpointslices-mock-docs.json",
-            &json!({"items": [{"endpoints": [{"addresses": ["10.244.0.7"]}]}]}),
+            &json!({"items": [{"endpoints": self.endpoints}]}),
         );
         save("sar-yes", &self.sar_yes);
         save("sar-drop", &self.sar_drop);
@@ -254,6 +283,12 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
         write(dir, "probe-exit", &self.probe_exit.to_string());
         if self.probe_running {
             write(dir, "probe-running", "");
+        }
+        if let Some(delay) = self.probe_pod_delay {
+            write(dir, "probe-pod-delay", &delay.to_string());
+        }
+        if let Some(hosts) = &self.run_probe {
+            write(dir, "hosts", hosts);
         }
         for name in &self.unreadable {
             std::fs::remove_file(dir.join(name)).unwrap();
@@ -328,9 +363,17 @@ fn check_with(name: &str, cluster: &Cluster, probe_wait: u32, limit: Duration) -
     std::fs::create_dir_all(&bin).unwrap();
     let kubectl = write(&bin, "kubectl", FAKE_KUBECTL);
     std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake_getent(&bin);
+    let dropped: Vec<&str> = cluster.dropped.iter().map(String::as_str).collect();
+    fake_curl(&bin, &dropped);
     cluster.write(&dir);
     write(&dir, "probe-container", "");
-    let routes = write(&dir, "routes.tsv", ROUTES);
+    let routes = write(
+        &dir,
+        "routes.tsv",
+        cluster.routes.as_deref().unwrap_or(ROUTES),
+    );
+    let gateway_url = cluster.gateway_url.as_deref().unwrap_or(GATEWAY_URL);
     let report = dir.join("report.json");
     let kubeconfig = dir.join("kubeconfig");
     let path = format!(
@@ -341,7 +384,8 @@ fn check_with(name: &str, cluster: &Cluster, probe_wait: u32, limit: Duration) -
     let stdout = std::fs::File::create(dir.join("stdout")).unwrap();
     let stderr = std::fs::File::create(dir.join("stderr")).unwrap();
     let started = Instant::now();
-    let mut child = Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg(repo().join("deploy/route-check/route-check.sh"))
         .arg(format!("--kubeconfig={}", kubeconfig.display()))
         .args(["--context", CONTEXT, "--as", OPERATOR])
@@ -351,7 +395,7 @@ fn check_with(name: &str, cluster: &Cluster, probe_wait: u32, limit: Duration) -
         .args(["--server-audience", "mock-docs"])
         .arg("--routes")
         .arg(&routes)
-        .args(["--gateway-url", GATEWAY_URL, "--probe-image", PROBE_IMAGE])
+        .args(["--gateway-url", gateway_url, "--probe-image", PROBE_IMAGE])
         .arg("--report")
         .arg(&report)
         .args(["--environment", "kind"])
@@ -359,11 +403,17 @@ fn check_with(name: &str, cluster: &Cluster, probe_wait: u32, limit: Duration) -
         .env("PATH", path)
         .env("FAKE_DIR", &dir)
         .env("KUBECONFIG", "/nonexistent/caller-kubeconfig")
+        .env_remove("PROBE_SCRIPT")
         .stdin(Stdio::null())
         .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .unwrap();
+        .stderr(stderr);
+    if cluster.run_probe.is_some() {
+        command.env("PROBE_SCRIPT", repo().join("deploy/route-check/probe.sh"));
+        for proxy in ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"] {
+            command.env_remove(proxy);
+        }
+    }
+    let mut child = command.spawn().unwrap();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -562,15 +612,23 @@ fn a_clean_pod_passes() {
         );
     }
 
-    // Every call names the kubeconfig, the context and the operator it acts as.
+    // Every call names the kubeconfig, the context and the operator it acts as, and a timeout:
+    // 30 s, or, while waiting for the probe, no more than the wait has left.
     let kubeconfig = checked.dir.join("kubeconfig");
     let prefix = format!(
-        "--kubeconfig {} --context {CONTEXT} --as={OPERATOR} --request-timeout=30s ",
+        "--kubeconfig {} --context {CONTEXT} --as={OPERATOR} --request-timeout=",
         kubeconfig.display()
     );
     assert!(!checked.calls.is_empty());
     for call in &checked.calls {
         assert!(call.starts_with(&prefix), "{call}");
+        let timeout = call[prefix.len()..].split_once(' ').unwrap().0;
+        if call.ends_with(" get pod agent-0 -n team-a -o json") {
+            let seconds: u32 = timeout.strip_suffix('s').unwrap().parse().unwrap();
+            assert!((1..=5).contains(&seconds), "{call}");
+        } else {
+            assert_eq!(timeout, "30s", "{call}");
+        }
         // Never Secret data, never exec, never an impersonated review.
         assert!(!call.contains("secret"), "{call}");
         assert!(!call.contains(" exec "), "{call}");
@@ -1432,6 +1490,252 @@ fn a_probe_that_never_ends_fails_within_the_wait() {
     // It never read a log it had no reason to trust.
     assert!(!checked.calls.iter().any(|call| call.contains("logs pod/")));
     assert_eq!(checked.report()["probe_result"], Value::Null);
+    // Each read while waiting may take only the time the wait has left.
+    let timeouts = wait_timeouts(&checked);
+    assert!(!timeouts.is_empty(), "{:?}", checked.calls);
+    assert!(
+        timeouts.iter().all(|seconds| (1..=2).contains(seconds)),
+        "{timeouts:?}"
+    );
+}
+
+/// The `--request-timeout` of each read of the pod while waiting for the probe, in seconds.
+fn wait_timeouts(checked: &Checked) -> Vec<u32> {
+    checked
+        .calls
+        .iter()
+        .filter(|call| call.ends_with(" get pod agent-0 -n team-a -o json"))
+        .map(|call| {
+            let (_, after) = call.split_once("--request-timeout=").unwrap();
+            after
+                .split_once("s ")
+                .unwrap()
+                .0
+                .parse()
+                .unwrap_or_else(|_| panic!("{call}"))
+        })
+        .collect()
+}
+
+/// A read of the pod that answers only after the wait is over: the probe's end it reports was
+/// not seen within the wait, so it does not count.
+#[test]
+fn a_probe_end_seen_after_the_wait_does_not_count() {
+    let mut cluster = Cluster::clean();
+    cluster.probe_pod_delay = Some(3);
+    let checked = check_with("probe-late", &cluster, 1, Duration::from_secs(30));
+    checked.assert_failed("the probe ended within 1 s: route-probe-");
+    assert!(!checked.passed("the probe ended"));
+    assert!(!checked.calls.iter().any(|call| call.contains("logs pod/")));
+    assert_eq!(wait_timeouts(&checked), [1]);
+}
+
+/// The step requires one ROUTE line for each attempt the routes ask for: a probe that skipped
+/// one, tried one it was not asked to, or reported one twice does not pass, whatever its RESULT.
+#[test]
+fn the_probe_must_report_each_attempt_the_routes_ask_for_once() {
+    let name_line =
+        "ROUTE mock-docs name http://mock-docs.mock-docs.svc.cluster.local:8080/mcp refused\n";
+    let without = |line: &str| PASSING_PROBE.replace(line, "");
+    let with =
+        |line: &str| PASSING_PROBE.replace("RESULT: PASS\n", &format!("{line}RESULT: PASS\n"));
+    for (name, log, text) in [
+        (
+            "missing-address",
+            without("ROUTE mock-docs address 10.96.12.34 refused\n"),
+            "missing mock-docs address 10.96.12.34",
+        ),
+        (
+            "missing-name",
+            without(name_line),
+            "missing mock-docs name http://mock-docs.mock-docs.svc.cluster.local:8080/mcp",
+        ),
+        (
+            "extra-address",
+            with("ROUTE mock-docs address 10.0.0.9 refused\n"),
+            "not asked for mock-docs address 10.0.0.9",
+        ),
+        (
+            "extra-name",
+            with("ROUTE metadata name http://169.254.169.254/latest/meta-data/ refused\n"),
+            "not asked for metadata name http://169.254.169.254/latest/meta-data/",
+        ),
+        (
+            "extra-row",
+            with("ROUTE elsewhere address 10.0.0.9 refused\n"),
+            "not asked for elsewhere address 10.0.0.9",
+        ),
+        (
+            "repeated",
+            with("ROUTE mock-docs address 10.244.0.7 refused\n"),
+            "repeated mock-docs address 10.244.0.7",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.probe_log = log;
+        let checked = check(&format!("route-set-{name}"), &cluster);
+        checked.assert_failed(&format!(
+            "the probe passed: one ROUTE line per attempt the routes ask for: {text}"
+        ));
+        assert!(!checked.passed("the probe passed"), "{name}");
+    }
+
+    // A `resolve` row's addresses are found in the pod: any address lines will do, but there
+    // must be one.
+    let routes = format!("{ROUTES}lookup\thttp://lookup.example/\tresolve\n");
+    let mut cluster = Cluster::clean();
+    cluster.routes = Some(routes.clone());
+    cluster.probe_log = with("ROUTE lookup name http://lookup.example/ refused\n");
+    check("route-set-resolve-missing", &cluster).assert_failed(
+        "the probe passed: one ROUTE line per attempt the routes ask for: missing lookup address (resolved in the pod)",
+    );
+    let mut cluster = Cluster::clean();
+    cluster.routes = Some(routes);
+    cluster.probe_log = with(
+        "ROUTE lookup name http://lookup.example/ refused\n\
+         ROUTE lookup address 10.1.2.3 refused\n\
+         ROUTE lookup address 10.1.2.4 refused\n",
+    );
+    let checked = check("route-set-resolve", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert!(checked.passed("the probe passed: every route refused (7 attempts, EXPECT=refused)"));
+}
+
+/// The probe itself, deploy/route-check/probe.sh, run for `kubectl debug` with the variables the
+/// step gives it: its lines are the ones the step reads, and it reaches the gateway with no
+/// credential.
+#[test]
+fn the_step_reads_the_probes_own_lines() {
+    let gateway = Recorder::start(401);
+    let hole = dropped();
+    let port = hole.rsplit(':').next().unwrap().trim_end_matches("/mcp");
+    let routes = format!(
+        "# the probe's own run\n\
+         mock-docs\thttp://mock-docs.mock-docs.svc.cluster.local:{port}/mcp\t{{{{ADDR}}}}\n\
+         resolved\thttp://hole.test:{port}/mcp\tresolve\n\
+         literal\t{hole}\t127.0.0.1\treject_ok\n"
+    );
+    let mut cluster = Cluster::clean();
+    cluster.cluster_ip = "127.0.0.1";
+    cluster.endpoints = json!([]);
+    cluster.routes = Some(routes.clone());
+    cluster.gateway_url = Some(gateway.url.clone());
+    cluster.run_probe =
+        Some("mock-docs.mock-docs.svc.cluster.local 127.0.0.1\nhole.test 127.0.0.1\n".to_owned());
+    cluster.dropped = vec![hole.clone()];
+    let checked = check("probe-itself", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert!(
+        checked.passed("the probe passed: every route refused (5 attempts, EXPECT=refused)"),
+        "{}",
+        checked.run.transcript()
+    );
+    let lines: Vec<&str> = checked.report()["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|route| route["line"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "ROUTE mock-docs name http://mock-docs.mock-docs.svc.cluster.local:{port}/mcp refused"
+            ),
+            "ROUTE mock-docs address 127.0.0.1 refused".to_owned(),
+            format!("ROUTE resolved name http://hole.test:{port}/mcp refused"),
+            "ROUTE resolved address 127.0.0.1 refused".to_owned(),
+            "ROUTE literal address 127.0.0.1 refused".to_owned(),
+        ]
+    );
+    let heads = gateway.heads();
+    assert_eq!(heads.len(), 1);
+    assert!(!heads[0].to_ascii_lowercase().contains("\nauthorization:"));
+
+    // A route that answers: the probe fails, and so does the step.
+    let server = Recorder::start(200);
+    let mut cluster = Cluster::clean();
+    cluster.routes = Some(format!("server\t{}\t127.0.0.1\n", server.url));
+    cluster.gateway_url = Some(gateway.url.clone());
+    cluster.run_probe = Some(String::new());
+    let checked = check("probe-itself-open", &cluster);
+    checked.assert_failed("the probe passed: RESULT: FAIL (exit 1)");
+    assert_eq!(
+        checked.report()["routes"][0]["line"],
+        "ROUTE server address 127.0.0.1 open"
+    );
+}
+
+/// Projected sources that are not a list of objects, which a real API server does not serve,
+/// fail each check that reads them, never pass as no source (issue #64).
+#[test]
+fn projected_sources_that_cannot_be_read_fail() {
+    for (name, projected) in [
+        ("sources-string", json!({"sources": "mock-docs"})),
+        ("source-string", json!({"sources": ["mock-docs"]})),
+        ("projected-string", json!("mock-docs")),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.pod_spec()["volumes"][0]["projected"] = projected;
+        let checked = check(&format!("projected-unparsed-{name}"), &cluster);
+        for text in [
+            "no Secret volume: could not read the pod's volumes",
+            "no string in a token format: could not read which ConfigMaps the pod reads",
+            "no projected token for a server's audience: could not read the pod's projected volumes",
+        ] {
+            checked.assert_failed(text);
+        }
+        for text in [
+            "no Secret volume",
+            "no string in a token format",
+            "no projected token",
+        ] {
+            assert!(!checked.passed(text), "{name}: {text} passed");
+        }
+    }
+}
+
+/// EndpointSlice endpoints that are not a list of addresses fail the address read, never leave
+/// the ClusterIP alone (issue #64).
+#[test]
+fn endpoints_that_cannot_be_read_fail() {
+    fails_when_unparsed(
+        "endpoints-unparsed",
+        "endpointslices-mock-docs.json",
+        &[
+            r#"{"items": [{"endpoints": "10.244.0.7"}]}"#,
+            r#"{"items": [{"endpoints": {"addresses": ["10.244.0.7"]}}]}"#,
+            r#"{"items": [{"endpoints": [{"addresses": [7]}]}]}"#,
+            // jq's `//` reads false as null, and `.[]` iterates an object's values.
+            r#"{"items": [{"endpoints": false}]}"#,
+            r#"{"items": [{"endpoints": [{"addresses": {"ip": "10.244.0.7"}}]}]}"#,
+            r#"{"items": {"slice": {"endpoints": [{"addresses": ["10.244.0.7"]}]}}}"#,
+        ],
+        "the probe ran: could not read the servers' addresses",
+    );
+}
+
+/// A version or node read of two JSON objects is not read, though jq would take the last
+/// (issue #64).
+#[test]
+fn versions_read_as_more_than_one_object_fail() {
+    fails_when_unparsed(
+        "version-doubled",
+        "version.json",
+        &[
+            "{\"serverVersion\": {\"gitVersion\": \"v1.36.1\"}}\n{\"serverVersion\": {\"gitVersion\": \"v1.36.1\"}}\n",
+        ],
+        "the Kubernetes version is recorded: could not read",
+    );
+    fails_when_unparsed(
+        "node-doubled",
+        "node.json",
+        &[
+            "{\"status\": {\"nodeInfo\": {\"osImage\": \"Debian\", \"kubeletVersion\": \"v1.36.1\", \"containerRuntimeVersion\": \"containerd://2.1.1\"}}}\n\
+           {\"status\": {\"nodeInfo\": {\"osImage\": \"Debian\", \"kubeletVersion\": \"v1.36.1\", \"containerRuntimeVersion\": \"containerd://2.1.1\"}}}\n",
+        ],
+        &format!("the node image of {NODE} is recorded: could not read"),
+    );
 }
 
 #[test]

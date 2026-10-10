@@ -31,7 +31,11 @@
 #       container under the restricted profile. Its routes are --routes with each {{ADDR}}
 #       replaced by the addresses of the --server-service the row's URL names: the Service's
 #       ClusterIP and its endpoint IPs. The step waits at most --probe-wait seconds (default 60)
-#       for the probe to end, then reads its log: one ROUTE line per attempt and a RESULT line.
+#       in all for the probe to end, then reads its log: one ROUTE line per attempt and a RESULT
+#       line. It requires exactly one ROUTE line for each attempt the routes ask for: by name,
+#       unless the URL's host is an address literal, and by each address; a row whose
+#       addresses are `resolve` needs at least one address line. A missing, extra or repeated
+#       line fails the run.
 #
 # Anything it cannot read is a FAIL ("could not read"), never a PASS, and so is anything it read
 # but could not parse: kubectl output that is not one JSON object, or a field of it in a shape jq
@@ -42,10 +46,11 @@
 # reads, create on subjectaccessreviews, and patch on pods/ephemeralcontainers in the workload's
 # namespace. It reads pod specs, never Secret data, and needs no exec.
 #
-# The probe's interface (route-probe.sh): the environment variables ROUTES (the routes file's
-# contents), GATEWAY_URL and EXPECT; the lines `ROUTE <row> <name|address> <target> <result>`,
-# with result refused, open or could-not-probe; and a last line `RESULT: PASS` or `RESULT: FAIL`.
-# The routes file's columns are name, url, addresses and flags, tab-separated.
+# The probe's interface (route-probe.sh, from probe.sh beside this file): the environment
+# variables ROUTES (the routes file's contents), GATEWAY_URL and EXPECT; the lines
+# `ROUTE <row> <name|address> <target> <result>`, with the URL as a name's target and result
+# refused, open or could-not-probe; and a last line `RESULT: PASS` or `RESULT: FAIL`. The routes
+# file's columns are name, url, addresses and flags, tab-separated.
 #
 # Needs bash, kubectl, jq, grep and awk.
 set -euo pipefail
@@ -137,12 +142,14 @@ CLOUD_IDENTITY="{}"
 AUDIENCES="[]"
 PROBE_CONTAINER=""
 PROBE_RESULT=""
+# How long one kubectl call may take. The wait for the probe shrinks it to the time left.
+REQUEST_TIMEOUT=30s
 
 k() {
   if [ -n "$AS" ]; then
-    kubectl --kubeconfig "$KCFG" --context "$CONTEXT" --as="$AS" --request-timeout=30s "$@"
+    kubectl --kubeconfig "$KCFG" --context "$CONTEXT" --as="$AS" --request-timeout="$REQUEST_TIMEOUT" "$@"
   else
-    kubectl --kubeconfig "$KCFG" --context "$CONTEXT" --request-timeout=30s "$@"
+    kubectl --kubeconfig "$KCFG" --context "$CONTEXT" --request-timeout="$REQUEST_TIMEOUT" "$@"
   fi
 }
 
@@ -244,13 +251,13 @@ pick_pod() {
 
 versions() {
   local version node
-  if version=$(k version -o json 2>/dev/null) &&
+  if version=$(k version -o json 2>/dev/null) && json_object "$version" &&
     version=$(jq -er '.serverVersion.gitVersion' <<<"$version"); then
     KUBERNETES_VERSION=$version
   else
     fail "the Kubernetes version is recorded: could not read"
   fi
-  if [ -n "$NODE" ] && node=$(k get node "$NODE" -o json) &&
+  if [ -n "$NODE" ] && node=$(k get node "$NODE" -o json) && json_object "$node" &&
     node=$(jq -er '.status.nodeInfo | select(.osImage != null) | "\(.osImage), kubelet \(.kubeletVersion), \(.containerRuntimeVersion)"' <<<"$node"); then
     NODE_IMAGE=$node
   else
@@ -374,6 +381,13 @@ kindnet_enforcement() {
 
 # The pod's containers of every kind, as jq takes them.
 CONTAINERS='[(.spec.containers // [])[], (.spec.initContainers // [])[], (.spec.ephemeralContainers // [])[]]'
+# A volume's projected sources, as jq takes them: none for a volume that is not projected, and an
+# error, never nothing, when the sources are not a list of objects.
+SOURCES='def sources: if .projected == null then empty
+  elif (.projected | type) != "object" then error("projected is not an object")
+  elif .projected.sources == null then empty
+  elif (.projected.sources | type) != "array" then error("projected sources are not a list")
+  else .projected.sources[] | if type == "object" then . else error("a projected source is not an object") end end;'
 
 credentials() {
   step "(b) no credential in the pod"
@@ -381,8 +395,8 @@ credentials() {
   # Each check fails, never passes, when jq cannot take the pod's spec (pipefail keeps its status).
   local check
   check="no Secret volume"
-  if ! found=$(jq -r '(.spec.volumes // [])[]
-      | select(.secret or any(.projected.sources[]?; .secret) or (.csi.driver == "secrets-store.csi.k8s.io"))
+  if ! found=$(jq -r "$SOURCES"'(.spec.volumes // [])[]
+      | select(.secret or any(sources; .secret) or (.csi.driver == "secrets-store.csi.k8s.io"))
       | .name' <<<"$POD_JSON" | paste -sd, -); then
     fail "$check: could not read the pod's volumes"
   elif [ -n "$found" ]; then fail "$check: $found"; else pass "$check"; fi
@@ -420,7 +434,7 @@ token_scan() {
     n=$((n + 1))
   done
   # Every ConfigMap it mounts, takes variables from, or takes one variable from.
-  if ! configmaps=$(jq -r '[((.spec.volumes // [])[] | .configMap.name // empty, (.projected.sources[]? | .configMap.name // empty)),
+  if ! configmaps=$(jq -r "$SOURCES"'[((.spec.volumes // [])[] | .configMap.name // empty, (sources | .configMap.name // empty)),
       ('"$CONTAINERS"'[] | ((.envFrom // [])[] | .configMapRef.name // empty), ((.env // [])[] | .valueFrom.configMapKeyRef.name // empty))]
       | unique[]' <<<"$POD_JSON"); then
     fail "no string in a token format: could not read which ConfigMaps the pod reads"
@@ -480,7 +494,7 @@ token_scan() {
 # credential for that server.
 token_audiences() {
   local audiences count audience server bad=()
-  if ! AUDIENCES=$(jq -c '[(.spec.volumes // [])[] | .name as $v | .projected.sources[]?
+  if ! AUDIENCES=$(jq -c "$SOURCES"'[(.spec.volumes // [])[] | .name as $v | sources
       | select(.serviceAccountToken) | {volume: $v, audience: (.serviceAccountToken.audience // "")}]' <<<"$POD_JSON") ||
     ! count=$(jq length <<<"$AUDIENCES") || ! audiences=$(jq -r '.[].audience' <<<"$AUDIENCES"); then
     AUDIENCES=null
@@ -600,7 +614,11 @@ server_addresses() {
       ! slices=$(k get endpointslices -n "$ns" -l "kubernetes.io/service-name=$name" -o json) ||
       ! json_object "$slices" ||
       ! addresses=$(jq -rn --argjson svc "$svc" --argjson slices "$slices" '
-        [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[], ($slices.items[] | .endpoints[]? | .addresses[])]
+        [($svc.spec.clusterIPs // [$svc.spec.clusterIP // empty])[],
+         ($slices.items | if type == "array" then .[] else error("items are not a list") end
+          | .endpoints | if . == null then empty elif type == "array" then .[] else error("endpoints are not a list") end
+          | .addresses | if type == "array" then .[] else error("addresses are not a list") end
+          | if type == "string" then . else error("an address is not a string") end)]
         | map(select(. != "None" and . != "")) | unique | join(",")'); then
       echo "could not read Service $service or its EndpointSlices" >&2
       return 1
@@ -615,7 +633,7 @@ server_addresses() {
 
 probe() {
   step "(e) the probe in $POD"
-  local addresses routes custom deadline pod_now state="" unread="" log exit_code last bad
+  local addresses routes wanted mismatch custom deadline left pod_now state="" unread=1 log exit_code last bad
   if ! addresses=$(server_addresses); then
     fail "the probe ran: could not read the servers' addresses"
     return
@@ -645,6 +663,22 @@ probe() {
     fail "the probe ran: {{ADDR}} is left outside the addresses column of $ROUTES_FILE"
     return
   fi
+  # The attempts the routes ask for, each [row, by, target]: by name unless the URL's host is an
+  # address literal, as the probe does, and by each address. A `resolve` row's addresses are
+  # found in the pod, so it asks for at least one address line, whatever its target.
+  if ! wanted=$(jq -R -s -c '
+      split("\n") | map(select(length > 0 and (startswith("#") | not)) | split("\t")
+        | if length >= 3 and (.[0] | length) > 0 and (.[2] | length) > 0 then . else error("bad row") end
+        | .[0] as $row | .[1] as $url | .[2] as $addresses
+        | ($url | sub("^[a-zA-Z][a-zA-Z0-9+.-]*://"; "") | sub("[/?#].*$"; "")) as $authority
+        | ($authority | startswith("[") or (sub(":[0-9]+$"; "") | test("^[0-9.]+$"))) as $literal
+        | {exact: [(if $literal then empty else [$row, "name", $url] end),
+                   (if $addresses == "resolve" then empty else ($addresses | split(",")[] | [$row, "address", .]) end)],
+           resolve: (if $addresses == "resolve" then [$row] else [] end)})
+      | {exact: (map(.exact[]) | unique), resolve: (map(.resolve[]) | unique)}' <<<"$routes"); then
+    fail "the probe ran: could not read the rows of $ROUTES_FILE"
+    return
+  fi
   # kubectl debug's --env splits its value at commas, and the routes hold commas, so the
   # variables go in a partial container spec (--custom).
   custom=$TMP/probe-env.json
@@ -656,20 +690,26 @@ probe() {
     fail "the probe ran: kubectl debug could not start $PROBE_CONTAINER"
     return
   fi
-  # Wait for it to end, at most --probe-wait seconds.
+  # Wait for it to end, at most --probe-wait seconds in all: each read may take only the time
+  # left, and an end seen after the deadline does not count.
   deadline=$((SECONDS + PROBE_WAIT))
-  # A read that fails or cannot be parsed is tried again; if the last one did, the wait fails as
-  # could not read.
+  # A read that fails or cannot be parsed is tried again; if the last one did, or none was made,
+  # the wait fails as could not read.
   while :; do
-    if pod_now=$(k get pod "$POD_NAME" -n "$NAMESPACE" -o json 2>/dev/null) && json_object "$pod_now" &&
+    left=$((deadline - SECONDS))
+    if [ "$left" -le 0 ]; then break; fi
+    [ "$left" -le 30 ] || left=30
+    if pod_now=$(REQUEST_TIMEOUT=${left}s k get pod "$POD_NAME" -n "$NAMESPACE" -o json 2>/dev/null) && json_object "$pod_now" &&
       state=$(jq -c --arg c "$PROBE_CONTAINER" \
         '[(.status.ephemeralContainerStatuses // [])[] | select(.name == $c) | .state.terminated // empty][0] // empty' <<<"$pod_now"); then
       unread=""
-      [ -z "$state" ] || break
+      if [ -n "$state" ]; then
+        [ "$SECONDS" -le "$deadline" ] || state=""
+        break
+      fi
     else
       state="" unread=1
     fi
-    if [ "$SECONDS" -ge "$deadline" ]; then break; fi
     sleep 1
   done
   if [ -n "$unread" ]; then
@@ -712,6 +752,21 @@ probe() {
     fail "the probe passed: $bad ROUTE lines are not in the probe's format"
   elif [ "$(jq -s --arg want "$want" '[.[] | select(.result != $want)] | length' "$ROUTE_LINES")" -ne 0 ]; then
     fail "the probe passed: RESULT: PASS, but not every route was $want"
+  elif ! mismatch=$(jq -s -r --argjson wanted "$wanted" '
+      map([.row, .by, .target]) as $got
+      | ([$wanted.exact[] | . as $w | select(any($got[]; . == $w) | not) | join(" ")]
+         + [$wanted.resolve[] | . as $r | select(any($got[]; .[0] == $r and .[1] == "address") | not)
+            | "\($r) address (resolved in the pod)"]) as $missing
+      | [$got[] | . as $g
+         | select(any($wanted.exact[]; . == $g) or ($g[1] == "address" and any($wanted.resolve[]; . == $g[0])) | not)
+         | join(" ")] as $extra
+      | [$got | group_by(.)[] | select(length > 1) | .[0] | join(" ")] as $repeated
+      | [if $missing == [] then empty else "missing \($missing | join(", "))" end,
+         if $extra == [] then empty else "not asked for \($extra | join(", "))" end,
+         if $repeated == [] then empty else "repeated \($repeated | join(", "))" end] | join("; ")' "$ROUTE_LINES"); then
+    fail "the probe passed: could not compare its ROUTE lines with the routes"
+  elif [ -n "$mismatch" ]; then
+    fail "the probe passed: one ROUTE line per attempt the routes ask for: $mismatch"
   else
     pass "the probe passed: every route $want ($(jq -s length "$ROUTE_LINES") attempts, EXPECT=$EXPECT)"
   fi
