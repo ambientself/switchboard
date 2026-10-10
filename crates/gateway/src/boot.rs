@@ -317,7 +317,8 @@ pub struct Gates {
     deployment: DeploymentName,
     instance: InstanceName,
     clock: Arc<dyn Clock>,
-    identity: Identity,
+    /// Shared with the [`KeyRefresher`](crate::keys::KeyRefresher), which replaces its keys.
+    identity: Arc<Identity>,
     identity_state: GateState,
     audit_store: Arc<dyn AuditStore>,
     audit_state: GateState,
@@ -369,6 +370,11 @@ impl Gates {
     /// The identity gate.
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// The identity gate, for the key refresher to replace keys in while the gates serve.
+    pub(crate) fn shared_identity(&self) -> Arc<Identity> {
+        Arc::clone(&self.identity)
     }
 
     /// Whether identity is enforced or disabled.
@@ -708,7 +714,7 @@ fn warn_disabled(deployment: &DeploymentName, identity: GateState, audit: GateSt
 fn identity_gate(
     section: IdentitySection,
     clock: Arc<dyn Clock>,
-) -> Result<(Identity, GateState), BootError> {
+) -> Result<(Arc<Identity>, GateState), BootError> {
     let (config, state) = match (section.enforce, section.disabled) {
         (Some(entries), false) => {
             let mut issuers = Vec::with_capacity(entries.len());
@@ -725,7 +731,7 @@ fn identity_gate(
         (None, false) => return Err(BootError::IdentityUnconfigured),
         (Some(_), true) => return Err(BootError::IdentityContradiction),
     };
-    Ok((Identity::new(config, clock)?, state))
+    Ok((Arc::new(Identity::new(config, clock)?), state))
 }
 
 fn audit_gate(

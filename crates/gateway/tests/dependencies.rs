@@ -14,7 +14,7 @@
 
 use serde_json::{Value, json};
 
-const ALLOWED: [&str; 20] = [
+const ALLOWED: [&str; 21] = [
     "audit-postgres",
     "axum",
     "connector-proxy",
@@ -26,6 +26,7 @@ const ALLOWED: [&str; 20] = [
     "http-body-util",
     "hyper",
     "hyper-util",
+    "issuer-keys",
     "serde",
     "serde_json",
     "thiserror",

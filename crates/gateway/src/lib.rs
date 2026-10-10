@@ -37,8 +37,10 @@
 //!   argument adapters. The [`Gates`] serve the current version, and [`boot::check_registry`]
 //!   hands back a [`Reloader`] that replaces it when the registry file changes.
 //! - [`start::prepare`] builds the gateway: a `ProxyConnector` per registry server, behind the
-//!   registry's argument check; the Postgres audit store after its boot checks, or audit
-//!   explicitly disabled; and the boot gates.
+//!   registry's argument check; each keys URL's first fetch; the Postgres audit store after its
+//!   boot checks, or audit explicitly disabled; and the boot gates.
+//! - [`KeyRefresher`] fetches the keys of each issuer configured with a keys URL again on a
+//!   timer, from the issuer's own origin, and keeps the keys in use when a fetch fails.
 //!
 //! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves, and
 //! `switchboard migrate` brings the audit schema up to date. Nothing in it comes from the
@@ -51,6 +53,7 @@ pub mod boot;
 mod catalog;
 mod config;
 pub mod deployment;
+pub mod keys;
 pub mod path;
 mod policy;
 mod proxied;
@@ -67,7 +70,11 @@ pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
-pub use deployment::{AuditChoice, Deployment, DeploymentError};
+pub use deployment::{AuditChoice, Deployment, DeploymentError, KeysUrl};
+pub use keys::{
+    DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,
+    RefreshError,
+};
 pub use path::{
     AUDIT_DISABLED_NOTE, Admitted, DISCONNECTED_BEFORE_RUN, Disconnect, DisconnectOnDrop,
     IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, RequestPath, SERVER_NAME, Source,

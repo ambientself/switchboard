@@ -1594,6 +1594,37 @@ mutate("telemetry-identity-failed-info", "a refused identity is logged at info, 
        '        } => tracing::warn!(\n            event = "identity_failed",',
        '        } => tracing::info!(\n            event = "identity_failed",')
 
+# Issuer keys. An issuer takes a keys file or a keys URL, never both. A keys URL is fetched at
+# boot, and a failed first fetch refuses to start; then it is fetched on a timer, and a failed
+# refresh keeps the keys in use. The stale key below is a P-256 public key nothing signs with.
+KEYS = GW + "keys.rs"
+STALE_KEY = ('{"keys": [{"kty": "EC", "crv": "P-256", "kid": "stale", '
+             '"x": "S8cWydNibCrzVUwFcMpa8CorM1ZTnJmxVTZWONUI_-o", '
+             '"y": "0ziqidx7IOWX78hzezpoVuoCwdilEjtBLXKRwcxVbeo"}]}')
+mutate("gw-keys-refresh-never-runs", "the refresh timer ticks and fetches nothing", KEYS,
+       "        let _ = refresh(&identity, &refreshed.source, &mut last_failure).await;\n",
+       "        let _ = (&identity, &refreshed.source, &mut last_failure);\n")
+mutate("gw-keys-refresh-failure-clears-keys", "a failed refresh drops the keys in use for a key the issuer does not sign with", KEYS,
+       "        Err(error) => Err(RefreshError::from(error)),\n",
+       "        Err(error) => {\n"
+       f"            let stale = serde_json::from_str(r#\"{STALE_KEY}\"#).unwrap_or_default();\n"
+       "            let _ = identity.replace_keys(issuer, stale);\n"
+       "            Err(RefreshError::from(error))\n        }\n")
+mutate("gw-keys-first-fetch-failure-starts", "the gateway starts without an issuer whose keys it could not fetch at boot", GW + "start.rs",
+       "        let keys = source\n            .fetch()\n            .await\n"
+       "            .map_err(|cause| StartError::KeysFetch {\n                issuer: issuer.clone(),\n"
+       "                cause,\n            })?;\n",
+       "        let Ok(keys) = source.fetch().await else {\n"
+       "            if let Some(issuers) = identity.enforce.as_mut() {\n"
+       "                issuers.retain(|entry| entry.issuer != issuer);\n            }\n"
+       "            continue;\n        };\n")
+mutate("gw-keys-url-and-file-both-accepted", "an issuer with both a keys file and a keys URL loads, reading the file", GW_DEPLOY,
+       "        (Some(_), Some(_)) => return Err(DeploymentError::KeysTwice(issuer.issuer)),\n"
+       "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
+       "        (Some(file), None) => {\n",
+       "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
+       "        (Some(file), _) => {\n")
+
 # --- gateway path --------------------------------------------------------------------------
 
 GW_PATH = GW + "path.rs"

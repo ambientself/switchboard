@@ -675,6 +675,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "issuer-keys",
  "mock-docs-server",
  "serde",
  "serde_json",
