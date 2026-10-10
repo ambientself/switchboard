@@ -1171,7 +1171,11 @@ off only in a development build, with CI's check of the release artifact; and th
   told apart only by its cause, and is not counted apart.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled.
   Today the spawned task always runs to completion.
-- The row's identifier in the result's `_meta`, or in `error.data`.
+- The row's identifier in the result's `_meta`, or in `error.data`: built for `tools/call`
+  (#40). A result names it under `switchboard/auditRow` in `_meta`, in both eras, beside the
+  server's name under 2026-07-28; a denial or an internal error names it as `auditRow` in
+  `error.data`. A refusal because begin failed names none, and with audit disabled nothing is
+  named. `tools/list` names its row once it writes one.
 - The receipt-store gate at boot and at snapshot swap, with the `test-support` feature the
   harness enables and CI's check of the release artifact: built (#40). Both boot paths and
   every registry reload refuse a snapshot serving a tool not classified `read`, since no

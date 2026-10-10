@@ -9,7 +9,8 @@
 //! - [`parse`] turns a method, headers and body into an [`Inbound`] request or notification, or
 //!   a [`Rejection`]. Every POST is classified into an [`Era`] on its own; nothing is kept
 //!   between requests.
-//! - [`render`] turns a [`Reply`] into the [`HttpResponse`] for that era.
+//! - [`render`] turns a [`Reply`] into the [`HttpResponse`] for that era, and
+//!   [`render_with_row`] also names the audit row the gateway wrote for it.
 //! - [`Rejection`] also builds the envelopes the HTTP layer sends itself: 401 for an identity
 //!   failure, 403 for a host or origin, 413 for a body that is too large.
 //!
@@ -26,13 +27,13 @@ mod rejection;
 mod reply;
 
 pub use constants::{
-    CHALLENGE, CLIENT_CAPABILITIES_META, DENIAL_CODE, HEADER_MISMATCH, INTERNAL_ERROR,
-    INVALID_PARAMS, INVALID_REQUEST, LAST_EVENT_ID_HEADER, LEGACY, LIST_TTL_MS, METHOD_HEADER,
-    METHOD_NOT_FOUND, MODERN, NAME_HEADER, PARSE_ERROR, PROTOCOL_VERSION_HEADER,
-    PROTOCOL_VERSION_META, SERVER_INFO_META, SESSION_ID_HEADER, TOOL_USE_ID_META,
-    UNSUPPORTED_VERSION,
+    AUDIT_ROW_DATA, AUDIT_ROW_META, CHALLENGE, CLIENT_CAPABILITIES_META, DENIAL_CODE,
+    HEADER_MISMATCH, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, LAST_EVENT_ID_HEADER, LEGACY,
+    LIST_TTL_MS, METHOD_HEADER, METHOD_NOT_FOUND, MODERN, NAME_HEADER, PARSE_ERROR,
+    PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_META, SERVER_INFO_META, SESSION_ID_HEADER,
+    TOOL_USE_ID_META, UNSUPPORTED_VERSION,
 };
 pub use message::{Call, Era, Inbound, Request, RequestId, ToolCall};
 pub use parse::{check_transport, parse};
 pub use rejection::{Rejection, RejectionKind};
-pub use reply::{HttpResponse, Reply, ServerInfo, ToolEntry, render};
+pub use reply::{HttpResponse, Reply, ServerInfo, ToolEntry, render, render_with_row};

@@ -67,3 +67,12 @@ pub const SERVER_INFO_META: &str = "io.modelcontextprotocol/serverInfo";
 
 /// The `_meta` key Claude Code puts its tool-use identifier under on a `tools/call`.
 pub const TOOL_USE_ID_META: &str = "claudecode/toolUseId";
+
+/// The `_meta` key a `tools/call` result names its audit row under, in both eras, so a person
+/// reporting a problem can quote the row (decision 0009, "Row identifiers"). Decision 0009 names
+/// no key; this one follows [`TOOL_USE_ID_META`]'s form, a prefix naming who set it. Results
+/// may carry `_meta` under 2025-06-18 as well as 2026-07-28.
+pub const AUDIT_ROW_META: &str = "switchboard/auditRow";
+
+/// The `error.data` field a JSON-RPC error names its audit row under, when it has one.
+pub const AUDIT_ROW_DATA: &str = "auditRow";
