@@ -8,6 +8,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -293,6 +294,10 @@ fn a_disabled_gate_refuses_keys_and_stays_disabled() {
 /// While one thread swaps the EC issuer's keys back and forth between one set and a larger one,
 /// checks on other threads only ever see one set or the other. The key in both sets is never
 /// missing, and the key in one set is either in force or unknown, never anything else.
+///
+/// Each swap is in force when it returns, and the checking threads see both sets: the swaps go
+/// on, up to a deadline, until each thread's checks have found the extra key both in force and
+/// unknown. So a replacement that was ignored fails here, not only one that was half applied.
 #[test]
 fn checks_during_replacement_see_the_old_set_or_the_new() {
     let gate = gate();
@@ -301,15 +306,30 @@ fn checks_during_replacement_see_the_old_set_or_the_new() {
     let (kept, rotated) = (token(ec()), token(&ROTATED));
     let stop = AtomicBool::new(false);
     let checks = AtomicUsize::new(0);
+    // For each checking thread: whether it found the extra key in force, and unknown.
+    let saw = [
+        [AtomicBool::new(false), AtomicBool::new(false)],
+        [AtomicBool::new(false), AtomicBool::new(false)],
+    ];
+    let saw_both = || {
+        saw.iter()
+            .flatten()
+            .all(|seen| seen.load(Ordering::Relaxed))
+    };
 
     std::thread::scope(|scope| {
-        let checking: Vec<_> = (0..2)
-            .map(|_| {
-                scope.spawn(|| {
+        let checking: Vec<_> = saw
+            .iter()
+            .map(|[in_force, unknown]| {
+                let (gate, kept, rotated, stop, checks) = (&gate, &kept, &rotated, &stop, &checks);
+                scope.spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        assert_eq!(outcome(&gate, &kept), Ok(()));
-                        match outcome(&gate, &rotated) {
-                            Ok(()) | Err(VerifyError::UnknownKeyId) => {}
+                        assert_eq!(outcome(gate, kept), Ok(()));
+                        match outcome(gate, rotated) {
+                            Ok(()) => in_force.store(true, Ordering::Relaxed),
+                            Err(VerifyError::UnknownKeyId) => {
+                                unknown.store(true, Ordering::Relaxed)
+                            }
                             Err(other) => panic!("a check during replacement gave {other:?}"),
                         }
                         checks.fetch_add(1, Ordering::Relaxed);
@@ -322,10 +342,30 @@ fn checks_during_replacement_see_the_old_set_or_the_new() {
         while checks.load(Ordering::Relaxed) == 0 && !checking.iter().any(|t| t.is_finished()) {
             std::thread::yield_now();
         }
-        let swapped = (0..200).try_for_each(|_| {
-            gate.replace_keys(&name(ec()), both.clone())?;
-            gate.replace_keys(&name(ec()), one.clone()).map(drop)
-        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut swaps = 0;
+        let swapped = loop {
+            if swaps >= 200 && saw_both() {
+                break Ok(());
+            }
+            if Instant::now() > deadline || checking.iter().any(|t| t.is_finished()) {
+                break Err(format!("after {swaps} swaps, the checks saw {saw:?}"));
+            }
+            if let Err(error) = gate.replace_keys(&name(ec()), both.clone()) {
+                break Err(error.to_string());
+            }
+            if outcome(&gate, &rotated) != Ok(()) {
+                break Err("the larger set was not in force once it replaced the smaller".into());
+            }
+            if let Err(error) = gate.replace_keys(&name(ec()), one.clone()) {
+                break Err(error.to_string());
+            }
+            if outcome(&gate, &rotated) != Err(VerifyError::UnknownKeyId) {
+                break Err("the smaller set was not in force once it replaced the larger".into());
+            }
+            swaps += 1;
+        };
+        // Stopped before anything is unwrapped, so a failure ends the checking threads too.
         stop.store(true, Ordering::Relaxed);
         swapped.unwrap();
     });
