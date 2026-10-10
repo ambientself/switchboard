@@ -235,6 +235,8 @@ a route, supports no claim.
 
 | Date | Environment | Check | Result | Claim supported |
 | --- | --- | --- | --- | --- |
+| 2026-10-10 | first slice, kind | `demo.sh kind` + route-check `db8f519` | Passed twice in a row, 661/661 each. Before the policy, from a new team-a pod, the route check's probe found all 3 routes to mock-docs open (by name, by ClusterIP, by pod IP), and each team's direct call connected and was refused by the server. After it, from a new pod of each team, all 3 were refused, both teams' direct calls timed out before they connected, and the gateway's calls still succeeded. kindnet enforced the policy (default-on, kindnetd v20260528-9350166c, kind v0.32.0). The operator step ran as `route-check/operator`; each team's workload holds no Secret, no token in a listed format, no token for mock-docs' audience, and none of the permissions in `deploy/route-check/permissions.tsv`. | the only path, to the mock server |
 
-No results yet. The first is the kind run of milestone 2 (issue 14). Until it passes, no
-environment has the only path.
+The kind run's evidence is current until 2026-10-17. After that, or after a change that could
+open a route, the first slice in kind has the governed path until a new passing run is logged.
+No other environment has a result, so none has the only path.

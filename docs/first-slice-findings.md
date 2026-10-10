@@ -37,6 +37,9 @@ cannot show that, and these numbers do not change it.
   checks are now 58, 29 per team.
 - **Run twice in a row** (section 11). From `eb58476`, each demo ran twice without `down` in
   between, and all four runs passed: Compose 90/90 both times and kind 156/156 both times.
+- **The route check in the kind run** (section 13). From `db8f519`, Compose passed 93/93 and
+  kind passed 661/661 twice in a row. The route check found every route to mock-docs open
+  before the policy and refused after it, for both teams.
 
 ## Where and how
 
@@ -479,3 +482,43 @@ projected token of its own ServiceAccount to mock-docs, for audience `mock-docs`
 own dummy credential, since it has no cluster issuer. The kind run passed (360/360): mock-docs
 accepted 8 requests, every one from the gateway's ServiceAccount, and refused only the two
 direct calls before the policy, as `wrong_audience`. No run waited for the token to rotate.
+
+## 13. The route check in the kind run
+
+On 2026-10-10 the kind run became the route check's first user (#47, decision 0010). The
+runs are from `db8f519`, on the existing cluster `switchboard-demo`, without `down` in between:
+Compose once, then kind twice in a row.
+
+| | result | wall clock |
+| --- | --- | --- |
+| `demo.sh compose` | PASS (93/93), exit 0 | 59 s |
+| `demo.sh kind` | PASS (661/661), exit 0 | 189 s |
+| `demo.sh kind`, again | PASS (661/661), exit 0 | 151 s |
+
+What each kind run showed:
+
+- **The route check before the policy, its positive control.** `route-check.sh` ran as
+  `route-check/operator` against a new idle team-a pod and passed 60/60. Its probe found all
+  3 routes to mock-docs open: by name, by the Service's ClusterIP and by the pod's IP. mock-docs
+  refused each of those 3 requests as `no_bearer`, and the server check counted them.
+- **The route check after the policy.** From a new idle pod of each team, 10 s after it
+  started, it passed 60/60 for each team, and all 3 routes were refused: curl timed out with no
+  connection made. Each report records kindnet, enforcement `default-on (kindnetd
+  v20260528-9350166c, kind v0.32.0)`, and kind v0.32.0.
+- **The operator's own access.** Before the step, can-i answered no for the operator on
+  `mock-docs`' Secrets, exec and pod creation in `team-a`, and an ephemeral container in
+  `mock-docs`.
+- **The workload's own direct calls.** Both teams' direct calls after the policy timed out
+  before they connected (#83: curl exit 28 with no connection made), and both before it
+  connected and got 401.
+- **The operator checks ask the one list.** 360 checks answered no, 180 per team: every row of
+  `deploy/route-check/permissions.tsv` in mock-docs, `switchboard`, the team's own namespace
+  and across the cluster. The route check's step asked the same 51 rows as
+  SubjectAccessReviews for the probed pod's ServiceAccount.
+- **The boot lines were read from the gateway's pod of its current ReplicaSet,** not from
+  whichever pod `deploy/gateway` named.
+
+The first slice in kind has the only path, to the mock server, while this evidence is current:
+until 2026-10-17, or until a change that could open a route ([route-exceptions.md](route-exceptions.md),
+evidence log). No run was made against a cluster that does not enforce policy; the route
+check's own tests cover that case with a fake cluster.
