@@ -1110,8 +1110,11 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   the insert carried, for every role. The Postgres store's allowance is its begin budget, the
   call deadline and its finish deadline. The deadline column is not `NOT NULL`, because a row
   of kind `list` has none; the constraint `deadline_shape` requires one exactly when the kind
-  is `call`. The in-memory store sets the same times from its own clock. Nothing reads the
-  deadline yet: the open-row query is #47.
+  is `call`. The in-memory store sets the same times from its own clock. The open-row query
+  reads the deadline: the view `open_call_rows` (migration 0005) shows the allowed rows of
+  kind `call` with no completion past their deadline, by the database's clock, and
+  `PgAuditStore::open_rows` counts them. The boot check requires the view as the migration
+  makes it. The in-memory store has no open-row query.
 - Columns for the instance, the kind and the deadline: built. The gateway names its instance
   from `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, and refuses to start with neither. Rows
   written before the migration read as calls by the instance `before-0003`, due when they were
@@ -1188,7 +1191,7 @@ and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-r
 that removes the exception-list check.
 
 **#47, what the first slice (#14) still lacks.** The route-check program, its operator step
-and its probe (decision 0010); the signals of section 11 exported; and the open-row query.
+and its probe (decision 0010); and the signals of section 11 exported.
 
 **#22, the Otto adapter.** The Ed25519 turn-grant verifier with strict encoding; a delegation in
 the call context that is present and unverified, carrying the failure kind and an optional
