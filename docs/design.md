@@ -1194,8 +1194,10 @@ decision-table case for each comment tool, a case showing them denied in every o
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
 
-**#47, what the first slice (#14) still lacks.** The route-check program, its operator step
-and its probe (decision 0010); and the signals of section 11 exported.
+**#47, what the first slice (#14) still lacks.** The signals of section 11 exported. The route
+check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
+before and after the network policy; the kind claim holds only while the evidence log in
+[route-exceptions.md](route-exceptions.md) has a passing run from the last seven days.
 
 **#22, the Otto adapter.** The Ed25519 turn-grant verifier with strict encoding; a delegation in
 the call context that is present and unverified, carrying the failure kind and an optional

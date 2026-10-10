@@ -42,7 +42,9 @@ ServiceAccount.
 | `kind/cluster.yaml` | One node, kindnet, the node image kind v0.32.0 uses. |
 | `kind/base/` | Namespaces `switchboard`, `mock-docs`, `team-a`, `team-b`; ServiceAccounts; Postgres; the migration Job; mock-docs, which accepts only the gateway's ServiceAccount; the gateway, with a projected token for audience `mock-docs`; suspended CronJobs holding each workload's Job template. No network policy. |
 | `kind/policy/` | The network policies: mock-docs admits only the gateway, Postgres only the gateway and the migration, the gateway only the two teams. |
-| `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn`. |
+| `kind/route-check/rbac.yaml` | The route check's operator: ServiceAccount `route-check/operator`, `get` and `list` on what it reads, `create` on SubjectAccessReviews, and `patch` on `pods/ephemeralcontainers` in `team-a` and `team-b` only. Not part of the base; the kind run applies it. |
+| `route-check/` | The route check (decision 0010): `route-check.sh`, its operator step; `probe.sh`, its probe, which the image installs as `route-probe.sh`; `permissions.tsv`, the one list of control 1's permissions; `token-patterns.txt`; and `routes/kind.tsv`, the routes the probe tries in kind. |
+| `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn`, and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
 | `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, runs `switchboard migrate` as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
 | `demo/demo.sh` | The driver. |
 
@@ -63,24 +65,62 @@ ingress policy. No Calico was needed.
 The demo still checks this every run, for each team: before the policy, a new pod's direct call
 must connect and get 401 from the server, and the same pod must get an allowed read through the
 gateway, whose call to the server succeeds; after it, a new pod's direct call must time out
-(curl exit 28), and the same pod must still reach the gateway and get an allowed read through
-it.
+before it connects (curl exit 28 with no connection made), and the same pod must still reach
+the gateway and get an allowed read through it. curl also exits 28 when it connected and no
+answer came in time, from a stalled server or a tarpit; that is not a dropped route, and it
+fails the check (#83).
 
 Network policy does not see what reaches a pod through the API server: exec, attach,
 port-forward, ephemeral containers, and the pod, Service and node proxy routes. The operator
-checks ask `kubectl auth can-i` about each team's workload and require `no` (decision 0010,
-control 1). In `mock-docs`, `switchboard` and the team's own namespace, they ask about each
-route (`create` and `get` on exec, attach, port-forward and the pod and Service proxies;
-`patch` and `update` on ephemeral containers), creating pods, minting a ServiceAccount's token,
-impersonating a ServiceAccount, `bind` and `escalate` on roles, creating role bindings, and
-`create`, `update` and `patch` on Deployments, ReplicaSets, StatefulSets, DaemonSets, Jobs and
-CronJobs: 36 checks each. Across the cluster they ask about the node proxy (`create` and
-`get`), impersonating users, groups, UIDs and extras (`userextras/scopes`), `bind` and
-`escalate` on cluster roles, and creating cluster role bindings: 9 checks. can-i cannot name
-UIDs and extras, which the API server checks in `authentication.k8s.io` though it serves no
-such resource, so those two are asked as SubjectAccessReviews. Last, neither workload may get,
-list or watch the two namespaces' secrets or the gateway's configuration (list and watch return a
-Secret's data too): 9 checks. That is 126 checks per team.
+checks ask about each team's workload and require `no` (decision 0010, control 1). They ask
+every row of `route-check/permissions.tsv`, the list the route check's operator step asks too,
+so there is one list. A `namespaced` row is asked in `mock-docs`, `switchboard`, the team's own
+namespace and across the cluster (`--all-namespaces`); a `cluster` row across the cluster
+only. The list covers reading Secrets and ConfigMaps (`get`, `list` and `watch`, since list and
+watch return the data too); creating pods and `create`, `update` and `patch` on Deployments,
+ReplicaSets, StatefulSets, DaemonSets, Jobs and CronJobs; `create` and `get` on exec, attach,
+port-forward and the pod, Service and node proxies; `patch` and `update` on ephemeral
+containers; minting a ServiceAccount's token; impersonating users, groups, ServiceAccounts,
+UIDs and extras (`userextras/scopes`); `bind` and `escalate` on roles and cluster roles; and
+creating role and cluster role bindings. That is 43 namespaced rows and 8 cluster rows, 180
+checks per team. They are asked with `kubectl auth can-i --as`, except UIDs and extras, which
+the API server checks in `authentication.k8s.io` though it serves no such resource: can-i
+cannot name them, so those are asked as SubjectAccessReviews. A query kubectl cannot answer is
+a FAIL with kubectl's message, and the run goes on.
+
+## The route check in kind
+
+`demo.sh kind` is the route check's first user (decision 0010, "The kind run"). It applies
+`kind/route-check/rbac.yaml` and runs `route-check/route-check.sh` as
+`system:serviceaccount:route-check:operator`, through kubectl's `--as`, so the step has that
+ServiceAccount's access and no more. Before it, four checks ask that the operator may not get
+`mock-docs`' Secrets, exec into or create a pod in `team-a`, or add an ephemeral container in
+`mock-docs`.
+
+- **Before the policy,** a new idle Job in `team-a` (`workload.sh idle`: the workload's
+  labels and ServiceAccount, and no call) gives the step a running pod. The step runs with
+  `--expect open`: every route in `routes/kind.tsv` must be open, by name and by each address
+  (mock-docs' ClusterIP and its pod's IP). This is the positive control: the probe can reach
+  the server, and the server answers. Each open attempt carries no credential, and mock-docs
+  refuses it as `no_bearer`; the server check counts them.
+- **After the policy** and its 10 s settle, a new idle pod of each team gets 10 s more, since
+  a new pod is briefly outside its policy. The step then runs with `--expect refused` for each
+  team: every route must be refused, which for the probe means curl timed out with no
+  connection made.
+
+Each step deletes its idle Jobs. The step's PASS and FAIL lines count as the run's, so any FAIL
+fails the run. Its reports go to `.demo/route-check-<team>-<UTC time>.json` (and
+`route-check-team-a-open-<UTC time>.json` for the control), with the network plugin, how its
+enforcement was read, and the kind version; the run checks that each report after the policy
+names kindnet and a kind release. The step reads kindnet's enforcement from its flags, or from
+the default of the pinned kindnetd when it sets none. kindnet's log is only the fallback, since
+the kubelet rotates it: on `switchboard-demo` the line of its policy controller starting is
+gone after about a week.
+
+A pass shows that the routes on the list were refused, not that no route exists. There is no
+schedule and no alert: decision 0010 leaves both to the first real cluster. The kind claim
+holds only while the evidence log in `docs/route-exceptions.md` has a passing run from the last
+seven days.
 
 ## Stopping the gateway
 
@@ -125,7 +165,7 @@ check that the deployment files load.
 | Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-1`; `compose/config/registry-withdrawn.toml` is revision `demo-2` without `docs__read_document`. A new version that changes a server or a tool's route is refused until a restart. |
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
-| mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECT` (`system:serviceaccount:switchboard:gateway`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). The kind run checks that it accepted exactly the gateway's 8 allowed calls, all from the gateway's ServiceAccount, and refused only the two direct calls before the policy, as `wrong_audience`. |
+| mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECT` (`system:serviceaccount:switchboard:gateway`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). The kind run checks that it accepted exactly the gateway's 8 allowed calls, all from the gateway's ServiceAccount, and refused only the two direct calls before the policy, as `wrong_audience`, and the route check's open attempts before the policy, as `no_bearer`. |
 | Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `kind`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms`, `policy_revision`, `listed_tools` and `listed_omitted`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row of kind `call` to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. A row of kind `list` records one workload's `tools/list`, with no tool or resources; the listing shows the tools it listed. The driver counts these apart, 3 in Compose and 2 in kind, and checks that each names the tools its caller was shown under its policy revision, with none left out. It reads the open rows through the view `switchboard_audit.open_call_rows` (migration 0005). |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
@@ -145,7 +185,8 @@ check that the deployment files load.
   the view that no row outside the outage is open, and at most that one row inside it.
 - **Decisions 0009 and 0010 ask more of the slice than it has.** In kind the gateway presents
   a projected token of its own ServiceAccount to mock-docs, which accepts only that identity.
-  There is no route-check program and no section 11 signals yet (#47). Compose has no cluster
+  The route check runs in every kind run (above). The signals of section 11 are not exported
+  yet (#47). Compose has no cluster
   issuer, so there mock-docs still recognises the gateway by a static dummy credential checked
   into this repository, compared by its SHA-256.
 
