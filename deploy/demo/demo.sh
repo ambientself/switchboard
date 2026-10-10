@@ -52,6 +52,8 @@ KIND_ISSUER=https://kubernetes.default.svc.cluster.local
 # The gateway's ServiceAccount: the one caller mock-docs accepts in kind (deploy/kind/base).
 KIND_GATEWAY_SUBJECT=system:serviceaccount:switchboard:gateway
 AUDIT_TABLE=switchboard_audit.call_rows
+# The open-row query's view (crates/audit-postgres, sql/migrations/0005_open_rows.sql).
+OPEN_ROWS_VIEW=switchboard_audit.open_call_rows
 READ_TOOL=docs__read_document
 LIST_TOOL=docs__list_documents
 
@@ -156,6 +158,8 @@ psql_superuser() {
   esac
 }
 audit_count() { psql_reader -Atc "select count(*) from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE) and $1"; }
+# open_count CONDITION: how many of this run's rows the open-row view shows that meet CONDITION.
+open_count() { psql_reader -Atc "select count(*) from $OPEN_ROWS_VIEW where begun_at >= to_timestamp($SINCE) and $1"; }
 
 mark_start() {
   local mark
@@ -299,16 +303,32 @@ audit_rows() {
   rows=$(row_resources_json)
   check_row_resources "$rows"
   check_list_rows "$rows" "$lists"
+  # The open-row view shows an allowed call row with no outcome only once its deadline has
+  # passed, by the database's clock: before then it may still be completed. So wait for the
+  # deadline of this run's last allowed call row, at most a minute, and the view then sees
+  # every row of the run.
+  local wait
+  wait=$(psql_reader -Atc "select ceil(greatest(0, extract(epoch from max(deadline) - clock_timestamp())))::int
+    from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE) and kind = 'call' and decision = 'allow'")
+  check_at_most "$wait" 60 "audit: this run's last allowed call row is due within a minute"
+  case "$wait" in
+    '' | *[!0-9]*) ;;
+    *) if [ "$wait" -le 60 ]; then
+      echo "    waiting ${wait}s for this run's last allowed call row to reach its deadline"
+      sleep $((wait + 1))
+    fi ;;
+  esac
   # A begin that ran past its budget may still commit: the store asks the server to cancel the
-  # insert, but a paused server cannot act on that before it commits. Nothing completes such a
-  # row yet (decision 0009), so the outage step's one refused call may leave its row open. No
-  # other allowed row may. A list row has no decision and is written complete, so it is never
-  # open and these counts never include one; the outage step makes no list.
+  # insert, but a paused server cannot act on that before it commits. The store then tries to
+  # complete such a row as error until its finish deadline, and one it could not complete by
+  # then stays open (decision 0009), so the outage step's one refused call may leave its row
+  # open. No other allowed row may. The view never shows a denial or a list row, which are
+  # never completed; the outage step makes no list.
   local outage="begun_at between to_timestamp($OUTAGE_FROM) and to_timestamp($OUTAGE_TO)"
-  check "$(audit_count "decision = 'allow' and outcome is null and not ($outage)")" 0 \
-    "audit: no allowed row outside the database outage is left without an outcome"
-  check_at_most "$(audit_count "decision = 'allow' and outcome is null and $outage")" 1 \
-    "audit: the database outage left at most its refused call's row without an outcome"
+  check "$(open_count "not ($outage)")" 0 \
+    "audit: the open-row query finds no row outside the database outage"
+  check_at_most "$(open_count "$outage")" 1 \
+    "audit: the open-row query finds at most the database outage's refused call's row"
   check "$(audit_count "proved_subject like '%stranger%'")" 0 "audit: no row for the ServiceAccount outside the manifest"
 }
 
