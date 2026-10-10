@@ -1010,6 +1010,21 @@ mutate("identity-config-leeway-whole-seconds", "a leeway is compared in whole se
        "        if config.leeway.as_secs() > MAX_LEEWAY.as_secs() {")
 mutate("identity-config-second-user-issuer-allowed", "two user issuers can be configured", V,
        "                return Err(ConfigError::SecondUserIssuer { first, second });", "                let _ = (first, second);")
+# Replacing an issuer's keys while the gate runs: the new set goes through the boot checks by
+# rebuilding the whole verifier, and is stored only if that succeeds.
+REPLACE_SWAP = ("        *self\n            .verifier\n            .write()\n"
+                "            .unwrap_or_else(PoisonError::into_inner) = Arc::new(verifier);\n")
+REPLACE_BUILD = "        let verifier = TokenVerifier::new(next.clone(), Arc::clone(&self.clock))?;\n"
+mutate("identity-replace-keys-ignored", "a replacement reports success and leaves the old keys in force", IDENTITY_SRC + "identity.rs",
+       REPLACE_SWAP, "        drop(verifier);\n")
+mutate("identity-replace-keys-swaps-before-check", "a refused set is stored as the configuration later replacements build on", IDENTITY_SRC + "identity.rs",
+       REPLACE_BUILD, "        *issuers = next.clone();\n" + REPLACE_BUILD)
+mutate("identity-replace-keys-any-issuer", "keys for an issuer that is not configured replace the first issuer's", IDENTITY_SRC + "identity.rs",
+       "            .ok_or_else(|| ConfigError::UnknownIssuerForKeys(issuer.clone()))?;", "            .unwrap_or(0);")
+mutate("identity-replace-keys-drops-other-issuers", "a replacement rebuilds the verifier with only the replaced issuer", IDENTITY_SRC + "identity.rs",
+       REPLACE_BUILD, "        let verifier = TokenVerifier::new(vec![next[index].clone()], Arc::clone(&self.clock))?;\n")
+mutate("identity-replace-keys-while-disabled", "keys supplied to a disabled gate are accepted", IDENTITY_SRC + "identity.rs",
+       "            return Err(ConfigError::KeysWhileDisabled(issuer.clone()));", "            return Ok(KeysReplaced::default());")
 
 # --- The identity gate and the opaque failure ----------------------------------------------
 
@@ -1018,7 +1033,7 @@ mutate("identity-missing-token-is-disabled", "no token reads as checking being o
 mutate("identity-failure-is-disabled", "a refused token reads as checking being off", IDENTITY_SRC + "identity.rs",
        "            Err(failure) => Verification::Failed(failure),", "            Err(_) => Verification::Disabled,")
 mutate("identity-enforcing-is-disabled", "configured checking is not applied", IDENTITY_SRC + "identity.rs",
-       "            IdentityConfig::Enforce(issuers) => Some(TokenVerifier::new(issuers, clock)?),", "            IdentityConfig::Enforce(issuers) => TokenVerifier::new(issuers, clock).ok().filter(|_| false),")
+       "            IdentityConfig::Enforce(issuers) => Some(Enforcing::new(issuers, clock)?),", "            IdentityConfig::Enforce(issuers) => Enforcing::new(issuers, clock).ok().filter(|_| false),")
 mutate("identity-failure-display-names-the-cause", "the failure displays as its cause", IDENTITY_SRC + "error.rs",
        "        f.write_str(IDENTITY_FAILURE)\n    }\n}\n\nimpl std::error::Error",
        "        write!(f, \"{}\", self.detail)\n    }\n}\n\nimpl std::error::Error")
