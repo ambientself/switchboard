@@ -3,7 +3,7 @@
 //! finish pool.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gateway_core::audit::{self, AuditFailure, AuditRowId, Begun};
@@ -17,10 +17,11 @@ use tokio_postgres::config::Host;
 use tokio_postgres::{Client, Config, NoTls};
 
 use super::budgets::{
-    SLACK, cause, count, decide_read, lock_table, release, reporting, reports_of, until, within,
+    SLACK, cause, count, decide_read, lock_table, release, reporting, reports_of,
+    set_for_new_sessions, until, within,
 };
 use super::store::Call;
-use super::{DUMMY_PASSWORD, GATEWAY_ROLE, TestDatabase};
+use super::{DUMMY_PASSWORD, GATEWAY_ROLE, TestDatabase, code};
 use crate::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
 
 /// What [`Cutter`] does with what the server sends.
@@ -28,15 +29,23 @@ const PASS: u8 = 0;
 const CUT_ONCE: u8 = 1;
 const CUT_EVERY: u8 = 2;
 
+/// The code a request to cancel a statement carries where a startup has its protocol version.
+const CANCEL_REQUEST_CODE: u32 = 80_877_102;
+
 /// A proxy in front of the test server. It passes everything through until it is told to cut.
 /// Then it throws away the next bytes the server sends, on whichever connection, and closes
 /// that connection, so the client never reads them: once, or on every connection until it is
 /// told to pass again. The server has done the work it answers by then: it answers an insert
 /// after committing it.
+///
+/// Told to, it also throws away every request to cancel a statement, so the statement runs on
+/// as if the request had failed.
 struct Cutter {
     port: u16,
     mode: Arc<AtomicU8>,
     cuts: Arc<AtomicUsize>,
+    drop_cancels: Arc<AtomicBool>,
+    dropped_cancels: Arc<AtomicUsize>,
 }
 
 impl Cutter {
@@ -49,21 +58,53 @@ impl Cutter {
         let port = listener.local_addr().unwrap().port();
         let mode = Arc::new(AtomicU8::new(PASS));
         let cuts = Arc::new(AtomicUsize::new(0));
+        let drop_cancels = Arc::new(AtomicBool::new(false));
+        let dropped_cancels = Arc::new(AtomicUsize::new(0));
         let (kept_mode, kept_cuts) = (Arc::clone(&mode), Arc::clone(&cuts));
+        let (kept_drop, kept_dropped) = (Arc::clone(&drop_cancels), Arc::clone(&dropped_cancels));
         tokio::spawn(async move {
-            while let Ok((client, _)) = listener.accept().await {
-                let Ok(server) = TcpStream::connect(upstream.clone()).await else {
-                    continue;
-                };
-                tokio::spawn(relay(
-                    client,
-                    server,
-                    Arc::clone(&kept_mode),
-                    Arc::clone(&kept_cuts),
-                ));
+            while let Ok((mut client, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                let (mode, cuts) = (Arc::clone(&kept_mode), Arc::clone(&kept_cuts));
+                let (drop_cancels, dropped) = (Arc::clone(&kept_drop), Arc::clone(&kept_dropped));
+                tokio::spawn(async move {
+                    // A startup or a cancel request: its length, then its code.
+                    let mut first = [0; 8];
+                    if client.read_exact(&mut first).await.is_err() {
+                        return;
+                    }
+                    if first[4..] == CANCEL_REQUEST_CODE.to_be_bytes()
+                        && drop_cancels.load(Ordering::SeqCst)
+                    {
+                        dropped.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    let Ok(mut server) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    if server.write_all(&first).await.is_err() {
+                        return;
+                    }
+                    relay(client, server, mode, cuts).await;
+                });
             }
         });
-        Self { port, mode, cuts }
+        Self {
+            port,
+            mode,
+            cuts,
+            drop_cancels,
+            dropped_cancels,
+        }
+    }
+
+    /// Throws away every request to cancel a statement from now on.
+    fn drop_cancels(&self) {
+        self.drop_cancels.store(true, Ordering::SeqCst);
+    }
+
+    fn dropped_cancels(&self) -> usize {
+        self.dropped_cancels.load(Ordering::SeqCst)
     }
 
     fn set(&self, mode: u8) {
@@ -384,8 +425,8 @@ async fn a_begin_whose_insert_was_never_executed_starts_no_completion() {
 /// An insert executed and still waiting on a lock when the begin budget runs out is
 /// cancelled, so it never commits. The store cannot know that, so it starts a completion,
 /// which finds no row. That is counted as never written, not given up, and nothing is
-/// reported. The completion starts no attempt that its deadline could cut short, so it stops
-/// one answer budget before the deadline, with its last attempt's answer.
+/// reported. The completion keeps trying until its deadline, and its last attempt, made at the
+/// deadline, is not cut short by it, so it ends with that attempt's answer.
 #[tokio::test]
 async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
     let Some(db) = TestDatabase::create().await else {
@@ -426,15 +467,18 @@ async fn a_begin_that_never_committed_leaves_nothing_and_reports_nothing() {
     until_no_insert_runs(&db, &admin).await;
     release(&lock).await;
 
-    // It stops by the deadline less one answer budget, not at the deadline: a second
-    // between the two either way.
-    let stops_by = failed_at + budgets.finish_deadline - budgets.answer + Duration::from_secs(1);
+    // It stops at the deadline, after its last attempt there, which is quick.
     until(
-        stops_by.saturating_duration_since(Instant::now()),
-        "the completion to stop before its last answer budget",
+        budgets.finish_deadline + SLACK,
+        "the completion to stop at its deadline",
         || async { store.finishes().in_flight == 0 },
     )
     .await;
+    let stopped = failed_at.elapsed();
+    assert!(
+        stopped >= budgets.finish_deadline - Duration::from_millis(100),
+        "stopped {stopped:?} after the begin failed"
+    );
     assert_eq!(
         store.finishes(),
         FinishCounts {
@@ -491,4 +535,324 @@ async fn shutdown_waits_for_a_lost_begins_completion() {
     );
     assert_eq!(store.finishes(), FinishCounts::default());
     assert!(reports_of(&reports).is_empty());
+}
+
+/// Makes an insert into `call_rows` fail with SQLSTATE `code` whenever `condition`, SQL over
+/// the row being inserted, `NEW`, holds. A trigger that fires before the table's own does it,
+/// so an insert of a row already stored is refused too, before its conflict is found.
+async fn refuse_inserts_when(db: &TestDatabase, condition: &str, code: &str) {
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE FUNCTION public.refuse_an_insert() RETURNS trigger
+                 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+             AS $$
+             BEGIN
+                 IF {condition} THEN
+                     RAISE EXCEPTION 'the test refuses this insert' USING ERRCODE = '{code}';
+                 END IF;
+                 RETURN NEW;
+             END
+             $$;
+             CREATE TRIGGER a_refuse_an_insert
+                 BEFORE INSERT ON switchboard_audit.call_rows
+                 FOR EACH ROW EXECUTE FUNCTION public.refuse_an_insert();"
+        ))
+        .await
+        .unwrap();
+}
+
+/// SQLSTATE `P0001`, what `RAISE EXCEPTION` gives by default: not a failure trying again
+/// could fix.
+const RAISE_EXCEPTION: &str = "P0001";
+
+/// The first attempt's insert commits and its answer is lost. The retry finds the row stored,
+/// and its insert is refused before it gets there, with an error trying again cannot fix, so
+/// begin fails with that error at once. The first attempt may have written the row, and did:
+/// a later attempt's error does not undo that, and the store completes the row as `error`.
+#[tokio::test]
+async fn a_lost_confirmation_is_completed_whatever_a_later_attempt_finds() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let cutter = Cutter::start(&db).await;
+    let budgets = Budgets {
+        begin: Duration::from_secs(5),
+        ..Budgets::default()
+    };
+    let (store, reports) = reporting(cutter.store(&db, budgets));
+    let admin = db.admin().await;
+    warm_up(&store, &fixture, allowed()).await;
+    refuse_inserts_when(
+        &db,
+        "EXISTS (SELECT FROM switchboard_audit.call_rows WHERE id = NEW.id)",
+        RAISE_EXCEPTION,
+    )
+    .await;
+
+    cutter.set(CUT_ONCE);
+    let row = row_start().row;
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    match cause(&failure) {
+        PgAuditError::Database(error) => assert_eq!(code(error), Some(RAISE_EXCEPTION)),
+        other => panic!("{other}"),
+    }
+    assert!(!cause(&failure).is_transient());
+    // The first attempt lost its answer, after its insert committed.
+    assert_eq!((cutter.mode(), cutter.cuts()), (PASS, 1));
+    until(budgets.finish_deadline, "the row's completion", || async {
+        store.finishes().in_flight == 0
+    })
+    .await;
+    assert_eq!(
+        row_of(&admin, &row).await,
+        ("allow".to_owned(), Some("error".to_owned()), Some(0))
+    );
+    assert_eq!(store.finishes(), FinishCounts::default());
+    assert!(reports_of(&reports).is_empty());
+}
+
+/// The key of the advisory lock that [`hold_inserts`] takes.
+const INSERT_LOCK: i64 = 4_201_009;
+
+/// Makes every insert into `call_rows` wait, before it writes anything, until
+/// [`let_inserts_through`]: a trigger that fires before the table's own waits for an advisory
+/// lock, which the session returned holds. An update does not wait, so an attempt to complete
+/// a row that is not there yet finds it missing at once.
+async fn hold_inserts(db: &TestDatabase) -> Client {
+    let lock = db.admin().await;
+    lock.batch_execute(&format!(
+        "CREATE FUNCTION public.wait_for_the_test() RETURNS trigger
+             LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+         AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock({INSERT_LOCK});
+             RETURN NEW;
+         END
+         $$;
+         CREATE TRIGGER a_wait_for_the_test
+             BEFORE INSERT ON switchboard_audit.call_rows
+             FOR EACH ROW EXECUTE FUNCTION public.wait_for_the_test();
+         SELECT pg_advisory_lock({INSERT_LOCK});"
+    ))
+    .await
+    .unwrap();
+    lock
+}
+
+async fn let_inserts_through(lock: &Client) {
+    lock.batch_execute(&format!("SELECT pg_advisory_unlock({INSERT_LOCK})"))
+        .await
+        .unwrap();
+}
+
+/// An executed insert waits past the begin budget, and the store's request to cancel it is
+/// lost, so it runs on. It commits after the answer budget and before the finish deadline,
+/// while every attempt to complete the row until then has found it missing at once. The
+/// completion is still trying at the deadline, and completes the row as `error`.
+#[tokio::test]
+async fn an_insert_whose_cancel_failed_and_that_commits_late_is_completed_as_error() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let cutter = Cutter::start(&db).await;
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(2),
+        finish_deadline: Duration::from_millis(4500),
+    };
+    let (store, reports) = reporting(cutter.store(&db, budgets));
+    let admin = db.admin().await;
+    // The begin connection has its insert prepared, so the begin under test executes it, and
+    // the finish connection is open, so the completion's first attempt is quick too.
+    warm_up(&store, &fixture, allowed()).await;
+    drop(store.finish.get().await.unwrap());
+    let lock = hold_inserts(&db).await;
+    cutter.drop_cancels();
+
+    let row = row_start().row;
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    let failed_at = Instant::now();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    assert_eq!(store.finishes().in_flight, 1);
+    // The store asked to cancel the insert, the request was lost, and the insert still waits.
+    until(SLACK, "the request to cancel the insert", || async {
+        cutter.dropped_cancels() >= 1
+    })
+    .await;
+    assert_eq!(
+        count(
+            &admin,
+            &format!(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE usename = '{GATEWAY_ROLE}' AND datname = '{}' AND state = 'active'
+                     AND query LIKE '%INSERT INTO switchboard_audit.call_rows%'",
+                db.name()
+            ),
+        )
+        .await,
+        1
+    );
+
+    // The insert commits 4 s after the begin failed: past the answer budget; past 2.5 s, where
+    // a completion that stopped one answer budget before its deadline would have stopped; and
+    // past the completion's last attempt before its deadline, about 3.55 s in, whose next
+    // pause reaches the deadline at 4.5 s. Only an attempt at the deadline finds the row.
+    let commit_at = failed_at + Duration::from_secs(4);
+    tokio::time::sleep(commit_at.saturating_duration_since(Instant::now())).await;
+    assert_eq!(store.finishes().in_flight, 1);
+    assert_eq!(rows_under(&admin, &row).await, 0);
+    let_inserts_through(&lock).await;
+    until(
+        budgets.finish_deadline + budgets.answer + SLACK,
+        "the row's completion",
+        || async { store.finishes().in_flight == 0 },
+    )
+    .await;
+    assert_eq!(
+        row_of(&admin, &row).await,
+        ("allow".to_owned(), Some("error".to_owned()), Some(0)),
+        "{:?} {:?}",
+        store.finishes(),
+        reports_of(&reports)
+    );
+    assert_eq!(store.finishes(), FinishCounts::default());
+    assert!(reports_of(&reports).is_empty());
+}
+
+/// Every insert of the row is refused with SQLSTATE `code`, an explicit refusal that trying
+/// again could fix, until the begin budget runs out. The row may exist, as far as the store
+/// can tell, so it starts a completion. Here it does not, and the refusals do not touch the
+/// completion's updates: it finds no row through its deadline, and ends counted as never
+/// written, with nothing reported.
+async fn a_begin_refused_with(code: &str) {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_secs(1),
+        answer: Duration::from_secs(1),
+        finish_deadline: Duration::from_secs(2),
+    };
+    let (store, reports) = reporting(db.store(PoolSizes::default()).with_budgets(budgets));
+    let admin = db.admin().await;
+    let row = row_start().row;
+    refuse_inserts_when(&db, &format!("NEW.id = '{}'::uuid", row.as_str()), code).await;
+
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    let failed_at = Instant::now();
+    match cause(&failure) {
+        PgAuditError::Database(error) => assert_eq!(super::code(error), Some(code)),
+        // On a loaded machine the last retry's new connection can outlast the budget.
+        PgAuditError::BeginBudget { .. } => {}
+        other => panic!("{code}: {other}"),
+    }
+    assert_eq!(store.finishes().in_flight, 1, "{code}");
+    until(
+        budgets.finish_deadline + budgets.answer + SLACK,
+        "the completion",
+        || async { store.finishes().in_flight == 0 },
+    )
+    .await;
+    assert!(failed_at.elapsed() >= budgets.finish_deadline - Duration::from_millis(100));
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 0,
+            never_written: 1
+        },
+        "{code}: {:?}",
+        reports_of(&reports)
+    );
+    assert!(reports_of(&reports).is_empty(), "{code}");
+    assert_eq!(rows_under(&admin, &row).await, 0, "{code}");
+}
+
+/// Class 40, a serialization failure.
+#[tokio::test]
+async fn a_begin_refused_as_a_serialization_failure_starts_a_completion_that_finds_no_row() {
+    a_begin_refused_with("40001").await;
+}
+
+/// Class 57, a statement cancelled, as by a `statement_timeout` a database or role sets.
+#[tokio::test]
+async fn a_begin_refused_as_cancelled_starts_a_completion_that_finds_no_row() {
+    a_begin_refused_with("57014").await;
+}
+
+/// A server that stays read-only past the finish deadline refuses the begin and every attempt
+/// to complete the row. The store cannot tell whether an earlier insert committed, so it gives
+/// the row up and reports it, with the outcome `error`, though none was written.
+#[tokio::test]
+async fn a_refusal_that_outlasts_the_finish_deadline_is_reported() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let budgets = Budgets {
+        begin: Duration::from_secs(1),
+        answer: Duration::from_secs(1),
+        finish_deadline: Duration::from_secs(2),
+    };
+    let (store, reports) = reporting(db.store(PoolSizes::default()).with_budgets(budgets));
+    let admin = db.admin().await;
+    let read_only = "default_transaction_read_only";
+    set_for_new_sessions(&db.server, db.name(), read_only, Some("on")).await;
+
+    let row = row_start().row;
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_as(&store, &fixture, &row, allowed()),
+    )
+    .await
+    .unwrap_err();
+    match cause(&failure) {
+        PgAuditError::Database(error) => assert_eq!(code(error), Some("25006")),
+        // On a loaded machine the last retry's new connection can outlast the budget.
+        PgAuditError::BeginBudget { .. } => {}
+        other => panic!("{other}"),
+    }
+    assert_eq!(store.finishes().in_flight, 1);
+    until(
+        budgets.finish_deadline + budgets.answer + SLACK,
+        "the completion",
+        || async { store.finishes().in_flight == 0 },
+    )
+    .await;
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 1,
+            never_written: 0
+        }
+    );
+    assert_eq!(
+        reports_of(&reports),
+        vec![(row.as_str().to_owned(), "error", "deadline".to_owned())]
+    );
+    set_for_new_sessions(&db.server, db.name(), read_only, None).await;
+    assert_eq!(rows_under(&admin, &row).await, 0);
 }

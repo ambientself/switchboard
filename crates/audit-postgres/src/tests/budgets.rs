@@ -452,7 +452,12 @@ async fn finish_tries_again_until_the_database_takes_connections() {
 }
 
 /// Sets `setting` for new sessions on the test database, or resets it with `None`.
-async fn set_for_new_sessions(server: &Config, name: &str, setting: &str, value: Option<&str>) {
+pub(super) async fn set_for_new_sessions(
+    server: &Config,
+    name: &str,
+    setting: &str,
+    value: Option<&str>,
+) {
     let change = match value {
         Some(value) => format!("SET {setting} = '{value}'"),
         None => format!("RESET {setting}"),
