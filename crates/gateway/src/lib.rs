@@ -26,6 +26,8 @@
 //! - [`telemetry::init`] sends logs to standard output as JSON lines. [`Telemetry`] is
 //!   decision 0009's telemetry: structured events and counters, off the request path, through
 //!   a bounded queue that a [`Drain`] writes to the log. Drops are counted.
+//! - [`serve_metrics`] exports the counters, and the audit store's, in Prometheus text at
+//!   `GET /metrics` on a listener of its own, never the MCP listener ([`metrics`]).
 //!
 //! The first slice (decision 0008) runs from files:
 //!
@@ -54,6 +56,7 @@ mod catalog;
 mod config;
 pub mod deployment;
 pub mod keys;
+pub mod metrics;
 pub mod path;
 mod policy;
 mod proxied;
@@ -70,11 +73,12 @@ pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
-pub use deployment::{AuditChoice, Deployment, DeploymentError, KeysUrl};
+pub use deployment::{AuditChoice, Deployment, DeploymentError, KeysUrl, MetricsSection};
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,
     RefreshError,
 };
+pub use metrics::{METRICS_CONTENT_TYPE, Metrics, OPEN_ROWS_POLL, serve_metrics};
 pub use path::{
     AUDIT_DISABLED_NOTE, Admitted, DISCONNECTED_BEFORE_RUN, Disconnect, DisconnectOnDrop,
     IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, RequestPath, SERVER_NAME, Source,
