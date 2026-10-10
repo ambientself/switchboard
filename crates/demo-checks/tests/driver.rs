@@ -1152,9 +1152,10 @@ fn listed_asks(team: &str) -> (Vec<String>, Vec<Value>) {
             if subresource != "-" {
                 ask.push_str(&format!(" --subresource={subresource}"));
             }
+            // Across the cluster is a can-i with no namespace, which asks in the kubeconfig's
+            // namespace and counts its RoleBindings as well as ClusterRoleBindings.
             match *place {
-                "" => {}
-                "all" => ask.push_str(" --all-namespaces"),
+                "" | "all" => {}
                 namespace => ask.push_str(&format!(" -n {namespace}")),
             }
             asks.push(ask);
@@ -1182,15 +1183,9 @@ fn the_operator_checks_ask_every_row_of_the_route_checks_list_for_both_teams() {
                 "k auth can-i {ask} --as=system:serviceaccount:{team}:mock-workload"
             ));
         }
-        // Every ask the operator checks made before they read the list is still made. The
-        // cluster roles' bind was asked in the kubeconfig's namespace; the list has it as
-        // namespaced, so it is asked in each namespace and across the cluster.
+        // Every ask the operator checks made before they read the list is still made, as it
+        // was made.
         for ask in operator_asks(team) {
-            let ask = if ask == "bind clusterroles.rbac.authorization.k8s.io" {
-                format!("{ask} --all-namespaces")
-            } else {
-                ask
-            };
             assert!(team_asks.contains(&ask), "{team}: no longer asked: {ask}");
         }
         // Impersonating a UID or an extra, which can-i cannot name, by SubjectAccessReview: the

@@ -702,11 +702,13 @@ sar_no() {
 # through it can use, and an ephemeral container with both that add one.
 #
 # A row's scope means what it means to route-check.sh. A `namespaced` row is asked in mock-docs,
-# in the gateway's namespace, in the team's own and across the cluster (--all-namespaces, which
-# counts only ClusterRoleBindings). A `cluster` row is asked across the cluster only: can-i
-# then asks in the kubeconfig's namespace, `default`, and warns, and RBAC counts that
+# in the gateway's namespace, in the team's own and across the cluster; a `cluster` row is asked
+# across the cluster only. Across the cluster is a can-i with no namespace, as the checks asked
+# it before they read the list (binding ClusterRoles among them). can-i then asks in the
+# kubeconfig's namespace, `default`, and warns for a resource that has none. RBAC counts that
 # namespace's RoleBindings as well as ClusterRoleBindings, so a no there holds across the
-# cluster too. A list that cannot be read fails the step; nothing is asked from a list of its own.
+# cluster too, and covers more than --all-namespaces, which counts only ClusterRoleBindings.
+# A list that cannot be read fails the step; nothing is asked from a list of its own.
 operator_checks() {
   local rows team verb resource subresource scope ns
   if ! rows=$(awk -F'\t' '/^#/ || NF == 0 { next }
@@ -730,7 +732,7 @@ operator_checks() {
 }
 
 # operator_ask TEAM VERB RESOURCE SUBRESOURCE WHERE: one row of permissions.tsv for TEAM's
-# workload. WHERE is a namespace, `all` for every namespace, or empty for a `cluster` row.
+# workload. WHERE is a namespace, or `all` or empty for across the cluster (see operator_checks).
 # RESOURCE is written as can-i takes it, `name.group` outside the core group, and SUBRESOURCE is
 # `-` for none. Impersonating a UID or an extra is asked by SubjectAccessReview (see sar_no).
 operator_ask() {
@@ -744,8 +746,7 @@ operator_ask() {
   args=("$verb" "$resource")
   [ "$subresource" = - ] || args+=("--subresource=$subresource")
   case "$where" in
-    '') ;;
-    all) args+=(--all-namespaces) ;;
+    '' | all) ;;
     *) args+=(-n "$where") ;;
   esac
   can_i_no "$team" "${args[@]}"

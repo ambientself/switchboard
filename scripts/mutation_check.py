@@ -3122,6 +3122,8 @@ mutate("demo-route-check-new-pods-unsettled", "after the policy the route check 
        "  sleep 10\n  for team in team-a team-b; do\n    route_check", "  for team in team-a team-b; do\n    route_check")
 mutate("demo-operator-checks-own-list", "the operator checks ask a list of their own, not permissions.tsv", DRIVER,
        """      END { exit bad }' "$PERMISSIONS")""", """      END { exit bad }' <(printf 'get\\tsecrets\\t-\\tnamespaced\\n'))""")
+mutate("demo-operator-checks-across-cluster-all-namespaces", "across the cluster is asked with --all-namespaces, which skips the RoleBindings in default that the earlier unscoped asks counted", DRIVER,
+       "    '' | all) ;;\n", "    '') ;;\n    all) args+=(--all-namespaces) ;;\n")
 mutate("demo-operator-checks-uid-by-can-i", "impersonating a UID or an extra is asked by can-i, which cannot name it", DRIVER,
        '  if [ "$verb" = impersonate ] && [ "${resource#*.}" = authentication.k8s.io ]; then\n', "  if false; then\n")
 mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kubectl cannot create stops the run", DRIVER,

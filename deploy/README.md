@@ -75,18 +75,20 @@ port-forward, ephemeral containers, and the pod, Service and node proxy routes. 
 checks ask about each team's workload and require `no` (decision 0010, control 1). They ask
 every row of `route-check/permissions.tsv`, the list the route check's operator step asks too,
 so there is one list. A `namespaced` row is asked in `mock-docs`, `switchboard`, the team's own
-namespace and across the cluster (`--all-namespaces`); a `cluster` row across the cluster
-only. The list covers reading Secrets and ConfigMaps (`get`, `list` and `watch`, since list and
-watch return the data too); creating pods and `create`, `update` and `patch` on Deployments,
-ReplicaSets, StatefulSets, DaemonSets, Jobs and CronJobs; `create` and `get` on exec, attach,
-port-forward and the pod, Service and node proxies; `patch` and `update` on ephemeral
-containers; minting a ServiceAccount's token; impersonating users, groups, ServiceAccounts,
-UIDs and extras (`userextras/scopes`); `bind` and `escalate` on roles and cluster roles; and
-creating role and cluster role bindings. That is 43 namespaced rows and 8 cluster rows, 180
-checks per team. They are asked with `kubectl auth can-i --as`, except UIDs and extras, which
-the API server checks in `authentication.k8s.io` though it serves no such resource: can-i
-cannot name them, so those are asked as SubjectAccessReviews. A query kubectl cannot answer is
-a FAIL with kubectl's message, and the run goes on.
+namespace and across the cluster; a `cluster` row across the cluster only. Across the cluster
+is a can-i with no namespace: it asks in the kubeconfig's namespace, `default`, so RBAC counts
+that namespace's RoleBindings as well as ClusterRoleBindings. The list covers reading Secrets
+and ConfigMaps (`get`, `list` and `watch`, since list and watch return the data too); creating
+pods and `create`, `update` and `patch` on Deployments, ReplicaSets, StatefulSets, DaemonSets,
+Jobs and CronJobs; `create` and `get` on exec, attach, port-forward and the pod, Service and
+node proxies; `patch` and `update` on ephemeral containers; minting a ServiceAccount's token;
+impersonating users, groups, ServiceAccounts, UIDs and extras (`userextras/scopes`); `bind` and
+`escalate` on roles and cluster roles; and creating role and cluster role bindings. That is 43
+namespaced rows and 8 cluster rows, 180 checks per team. They are asked with `kubectl auth
+can-i --as`, except UIDs and extras, which the API server checks in `authentication.k8s.io`
+though it serves no such resource: can-i cannot name them, so those are asked as
+SubjectAccessReviews. A query kubectl cannot answer is a FAIL with kubectl's message, and the
+run goes on.
 
 ## The route check in kind
 
