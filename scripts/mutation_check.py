@@ -3155,6 +3155,59 @@ mutate("demo-migrate-gateway-reads-everything", "the demo grants the gateway rol
        'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader;',
        'GRANT SELECT ON ALL TABLES IN SCHEMA :"schema" TO switchboard_reader, switchboard_gateway;')
 
+# --- issuer-keys ---------------------------------------------------------------------------
+# The key fetcher reaches the issuer's own origin and nothing else, and each fetch is bounded.
+
+IK = "crates/issuer-keys/src/source.rs"
+# Only the issuer's origin.
+mutate("issuer-keys-other-host-allowed", "a keys URL on another host is accepted", IK,
+       "        if url.host() != origin.host() {", "        if false {")
+mutate("issuer-keys-other-port-allowed", "a keys URL on another port is accepted", IK,
+       "        if found != expected {", "        if false {")
+mutate("issuer-keys-http-for-https-issuer", "an http keys URL is accepted for an https issuer", IK,
+       "        if url.scheme() != origin.scheme() {", "        if false {")
+mutate("issuer-keys-userinfo-allowed", "a keys URL with a user name or password is accepted", IK,
+       "        if !url.username().is_empty() || url.password().is_some() {", "        if false {")
+mutate("issuer-keys-fragment-allowed", "a keys URL with a fragment is accepted", IK,
+       "        if url.fragment().is_some() {", "        if false {")
+mutate("issuer-keys-https-accepted", "an https source is accepted with no TLS client to fetch it", IK,
+       '        if url.scheme() != "http" {', "        if false {")
+mutate("issuer-keys-zero-deadline-allowed", "a zero deadline is accepted", IK,
+       "        if options.deadline.is_zero() {", "        if false {")
+mutate("issuer-keys-zero-cap-allowed", "a zero body cap is accepted", IK,
+       "        if options.max_body_bytes == 0 {", "        if false {")
+mutate("issuer-keys-redirect-followed", "a redirect is followed once, wherever it points", IK,
+       "        let response = self.send(self.uri.clone()).await?;\n",
+       "        let mut response = self.send(self.uri.clone()).await?;\n"
+       "        if response.status().is_redirection() {\n"
+       "            let next = response\n"
+       "                .headers()\n"
+       "                .get(hyper::header::LOCATION)\n"
+       "                .and_then(|location| location.to_str().ok())\n"
+       "                .and_then(|location| Url::parse(&self.uri.to_string()).ok()?.join(location).ok())\n"
+       "                .and_then(|next| next.as_str().parse::<Uri>().ok());\n"
+       "            if let Some(next) = next {\n"
+       "                response = self.send(next).await?;\n"
+       "            }\n"
+       "        }\n")
+mutate("issuer-keys-status-unchecked", "only a server error status is refused", IK,
+       "        if status != StatusCode::OK {", "        if status.is_server_error() {")
+# The bounds.
+mutate("issuer-keys-no-deadline", "a fetch is never abandoned", IK,
+       "        let body = match tokio::time::timeout(self.deadline, self.exchange()).await {",
+       "        let body = match Ok::<_, ()>(self.exchange().await) {")
+mutate("issuer-keys-default-deadline-longer", "the default deadline is 30 s", IK,
+       "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
+mutate("issuer-keys-body-uncapped", "a streamed body is read whatever its size", IK,
+       "                if received.len() + data.len() > self.max_body_bytes {", "                if false {")
+mutate("issuer-keys-cap-off-by-one", "a body of exactly the cap is refused", IK,
+       "                if received.len() + data.len() > self.max_body_bytes {",
+       "                if received.len() + data.len() >= self.max_body_bytes {")
+mutate("issuer-keys-declared-length-ignored", "a declared length over the cap is not refused before reading", IK,
+       "            .is_some_and(|length| length > self.max_body_bytes as u64)", "            .is_some_and(|_| false)")
+mutate("issuer-keys-default-cap-larger", "the default body cap is 1 MiB", IK,
+       "usize = 256 * 1024;", "usize = 1024 * 1024;")
+
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
 # A mutation runs the tests of the packages that can see its edits: the package that holds each
