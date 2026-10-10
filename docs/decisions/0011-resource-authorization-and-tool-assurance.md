@@ -252,6 +252,14 @@ sits with a maximum snapshot age, are Q11's.
 | Result size and duration | The gateway, above any bound of the connector's own. | While and after the tool runs. | No. | `error` for a `read` tool; `unknown` for any other tool (decision 0009). |
 | Whether a reach still holds | The registry's scheduled check, run as gateway calls. | Outside the calls it protects. | No. It withdraws. | Its own rows, and the withdrawal. |
 
+Noted on 2026-10-10 ([decision 0014](0014-rollout-safeguards-and-audit-operations.md)): the
+credential identity on the row is the configured entry identity, recorded at begin: the entry's
+stated mode and principal, never the secret. The gateway records what the entry says, not what
+the credential layer reports while the call runs. An entry has one credential and no fallback,
+so the two cannot differ until per-user grants arrive in milestone 5, when this is revisited.
+The per-server and per-team concurrency caps are a further part that can only refuse: taken
+after begin and before the vendor, and recorded as `refused` with a capacity sentence.
+
 The design no longer claims that one function decides everything. It claims that one function
 is the only place that can allow a call, that every later part can only refuse or fail, and
 that one audit record holds the whole decision for a call. The first holds by construction: a
@@ -562,6 +570,8 @@ workflow that runs with the repository's secrets; and, on laptops, other routes 
   `gateway_audit` table has none of these columns, so they stay in this gateway's own record
   unless Otto adds them. Whether it gains them is part of the question pull request #30 put
   in Q12, whether that table gains a general column and who adds it. That is its one home.
+  Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) moves
+  that question to the one list of Otto requests (Q18, #21), which is now its one home.
 - Built-in `checks_own_scope` tools report the resources they reached when they finish, the
   follow-up the resources column of pull request #30 left. This is required before milestone 4
   brings Otto's code search over.
@@ -694,6 +704,8 @@ while they are open: each says what holds until it is answered.
 - **Whether a per-user rate limit is a prerequisite** for employee proposals. No
   recommendation was made. Tracked in Q12, for the owner. It is answered before the first
   employee proposal tool is approved.
+  Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) leaves
+  it open for the owner until milestone 5, and tracks it in #15.
 - **How often the reach check runs,** which bounds how long a widened service account goes
   unnoticed. No recommendation was made. Tracked in Q11, for the owner. A proxied entry is not
   exposed outside development and test deployments until it is set.
@@ -712,3 +724,5 @@ while they are open: each says what holds until it is answered.
   raised by whoever the owner names. Until then this gateway serves none of Otto's tools.
   Whether `gateway_audit` gains columns for resources, the credential identity and the error
   kind is not asked here: it is the question about Otto's audit table in Q12.
+  Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) moves
+  that question into the one list of Otto requests (Q18, #21).
