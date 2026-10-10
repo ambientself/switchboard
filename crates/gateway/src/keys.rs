@@ -15,8 +15,10 @@
 //!   changes. There is no maximum age: keys that cannot be refreshed stay in force until one
 //!   can be. Whether a gateway should stop accepting tokens once its keys are too old to trust
 //!   is a freshness bound, and open question Q11 owns it.
-//! - **A refresh that changes the set** is logged as [`REFRESHED_EVENT`] at `INFO`, with the
-//!   `kid`s added and removed. A refresh that adds and removes none logs nothing.
+//! - **A refresh that adds or removes a `kid`** is logged as [`REFRESHED_EVENT`] at `INFO`,
+//!   with the `kid`s added and removed. A refresh that adds and removes none logs nothing. That
+//!   includes a key replaced under a `kid` that stays: the new key is put in force, but no line
+//!   is logged for it.
 //! - **Tokens never cause a fetch.** Only the timer does. Nothing a token carries (`iss`,
 //!   `jku`, `x5u`, `kid`) is read here; a token naming an unknown `kid` is refused until the
 //!   next scheduled refresh brings its key.
@@ -41,8 +43,9 @@ pub const DEFAULT_KEYS_REFRESH: Duration = Duration::from_secs(300);
 /// The least time between two fetches of one issuer's keys that the deployment file accepts.
 pub const MIN_KEYS_REFRESH: Duration = Duration::from_secs(30);
 
-/// The `event` field of the line logged when a refresh changes an issuer's keys. It names the
-/// `issuer`, and the `kid`s `added` and `removed`.
+/// The `event` field of the line logged when a refresh adds or removes one of an issuer's
+/// `kid`s. It names the `issuer`, and the `kid`s `added` and `removed`. A key replaced under a
+/// `kid` that stays is put in force without this line.
 pub const REFRESHED_EVENT: &str = "issuer_keys_refreshed";
 
 /// The `event` field of the warning logged when a refresh fails and the keys in use stay. It
@@ -147,7 +150,7 @@ async fn refresh_every(identity: Arc<Identity>, refreshed: Refreshed) {
 }
 
 /// Fetches one issuer's keys and puts them in force, or leaves the keys in use. Logs a failure
-/// unless `last_failure` already holds its cause, and a change of keys.
+/// unless `last_failure` already holds its cause, and any `kid` added or removed.
 async fn refresh(
     identity: &Identity,
     source: &KeySource,
