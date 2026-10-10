@@ -1,12 +1,12 @@
 # 0009: What an audit row guarantees, recovery, and receipts for side effects
 
-Date: 2026-10-06, accepted 2026-10-07. Status: accepted. The owner accepted both parts on
-2026-10-07, taking the recommendation on every question that was the owner's to answer (see The
-owner's answers). Settles Q10, except what compliance requires of read auditing, which stays
-open (Still open 1); Q10 is narrowed to it. Other details need someone other than the owner,
-alone or with the owner. They are listed under Still open, with who decides and what holds
-until then. Fencing is not decided here; it is [decision
-0012](0012-what-a-turn-grant-binds.md). Written against [decision
+Date: 2026-10-06, accepted 2026-10-07, amended 2026-10-10 (the amendment is at the end).
+Status: accepted. The owner accepted both parts on 2026-10-07, taking the recommendation on
+every question that was the owner's to answer (see The owner's answers). Settles Q10, except
+what compliance requires of read auditing, which stays open (Still open 1); Q10 is narrowed to
+it. Other details need someone other than the owner, alone or with the owner. They are listed
+under Still open, with who decides and what holds until then. Fencing is not decided here; it
+is [decision 0012](0012-what-a-turn-grant-binds.md). Written against [decision
 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04 (`propose`, and `write`
 and `destructive` denied in every profile), and against the resources column on the audit
 record that pull request #30 added, merged on 2026-10-07.
@@ -118,8 +118,8 @@ quote it.
   times from the database's clock and the supplied allowance, overwriting anything the insert
   carried, and the gateway's role cannot write them. A generated column cannot do this, because
   Postgres requires its expression to be immutable, and a default cannot read the allowance.
-  The deadline is `NOT NULL`, so a row without one cannot be stored and drop out of the
-  open-row query.
+  A row of kind `call` cannot be stored without a deadline, so none drops out of the open-row
+  query. A row of kind `list` has none (see the amendment at the end).
 - No tool runs, and no decision is returned, before begin succeeds. This is unchanged.
 - Begin has a budget, which includes waiting for a connection. Within it, begin is retried by
   identifier. A retry that finds its own row returns what the first attempt decided, receipt
@@ -713,3 +713,20 @@ for 8.
     with the security team, before part 2 reaches a real system. Until then no resolution is
     recorded, open rows stay in the open-row query, and part 2 does not reach a real system,
     so no receipt there can be `unknown`. (Proposal 11.)
+
+## Amended 2026-10-10: the deadline column
+
+Until this amendment, part 1 said the deadline is `NOT NULL`. As built, the column may be
+empty, and a constraint does that work instead.
+
+- **The deadline column is nullable.** The constraint `deadline_shape` (migration 0003)
+  requires a deadline exactly when the kind is `call`. It holds even with the `set_times`
+  trigger off, so a call row cannot be stored without a deadline, and a list row cannot be
+  stored with one. A row of kind `list` has no deadline (migration 0004).
+- **Why:** a `tools/list` row is written complete, has no deadline and is never open, as
+  "`tools/list` is an audit row of its own kind" above says. A `NOT NULL` column would force it
+  to carry one.
+- **The open-row query does not change.** It reads only rows of kind `call`, and every one of
+  them has a deadline.
+
+The owner accepted this on 2026-10-10, in #10. Design section 17 already says the same.
