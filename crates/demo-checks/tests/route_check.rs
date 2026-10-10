@@ -1341,16 +1341,86 @@ fn kindnet_with_network_policy_off_fails() {
 }
 
 #[test]
-fn enforcement_that_cannot_be_read_fails() {
-    let mut cases: Vec<(&str, Cluster, &str)> = Vec::new();
+fn the_flag_or_the_pinned_default_settles_enforcement_and_the_log_is_only_a_fallback() {
+    // The kubelet rotates kindnet's log, on switchboard-demo after about a week, and its start
+    // lines go with it. The flag or the pinned kindnetd's default still settles it.
+    let rotated = "I1008 01:35:29.003313       1 main.go:320] Handling node\n";
+    let default_on = "default-on (kindnetd v20260528-9350166c, kind v0.32.0)";
+    let mut cluster = Cluster::clean();
+    cluster.kindnet_log = rotated.to_owned();
+    let checked = check("enforcement-default-log-rotated", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert!(
+        checked.passed(&format!("network policy is enforced: kindnet, {default_on}")),
+        "{}",
+        checked.run.transcript()
+    );
+    assert_eq!(checked.report()["enforcement"], default_on);
+    assert_eq!(checked.report()["kind_version"], "kind v0.32.0");
 
+    let mut cluster = Cluster::clean();
+    cluster.unreadable.push("kindnet.log");
+    let checked = check("enforcement-default-log-unread", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert_eq!(
+        checked.report()["enforcement"],
+        format!("{default_on}; its log could not be read, and is only a fallback")
+    );
+
+    let mut cluster = Cluster::clean();
+    cluster.kindnet_pod["spec"]["containers"][0]["args"] = json!(["--network-policy=true"]);
+    cluster.kindnet_log = rotated.to_owned();
+    let checked = check("enforcement-flag-log-rotated", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert_eq!(
+        checked.report()["enforcement"],
+        "on by flag (--network-policy=true)"
+    );
+
+    // Neither settles it: the log does, and the report says it was the fallback.
     let mut cluster = Cluster::clean();
     cluster.kindnet_pod["spec"]["containers"][0]["image"] =
         json!("docker.io/kindest/kindnetd:v20990101-0123abcd");
+    let checked = check("enforcement-log-fallback", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    assert_eq!(
+        checked.report()["enforcement"],
+        "on by its log (the fallback: no flag, and the default of kindnetd v20990101-0123abcd is not known; kindnet-9qv4m logged its network policy controller starting)"
+    );
+    assert_eq!(checked.report()["kind_version"], "unknown");
+    cluster.kindnet_log.push_str(
+        "I1008 01:34:19.1 1 main.go:261] Error creating network policy controller: no nftables, skipping network policies\n",
+    );
+    check("enforcement-log-fallback-skipped", &cluster).assert_failed(
+        "network policy is not enforced: kindnet, off by its log (the fallback: no flag, and the default of kindnetd v20990101-0123abcd is not known), but kindnet-9qv4m logged that it skipped network policies",
+    );
+}
+
+#[test]
+fn enforcement_that_cannot_be_read_fails() {
+    let mut cases: Vec<(&str, Cluster, &str)> = Vec::new();
+
+    // With no flag and a kindnetd whose default is not known, the log is the fallback, and it
+    // settles nothing when its start lines are gone or it cannot be read.
+    let unknown = || {
+        let mut cluster = Cluster::clean();
+        cluster.kindnet_pod["spec"]["containers"][0]["image"] =
+            json!("docker.io/kindest/kindnetd:v20990101-0123abcd");
+        cluster
+    };
+    let mut cluster = unknown();
+    cluster.kindnet_log = "I1008 01:35:29.003313       1 main.go:320] Handling node\n".to_owned();
     cases.push((
-        "unknown-tag",
+        "unknown-tag-log-rotated",
         cluster,
-        "network policy enforcement: could not read (pod kindnet-9qv4m sets no network-policy flag, and the default of kindnetd v20990101-0123abcd is not known)",
+        "network policy enforcement: could not read (pod kindnet-9qv4m sets no network-policy flag, and the default of kindnetd v20990101-0123abcd is not known, and the log of kindnet-9qv4m, the fallback, does not show its network policy controller starting)",
+    ));
+    let mut cluster = unknown();
+    cluster.unreadable.push("kindnet.log");
+    cases.push((
+        "unknown-tag-log-unread",
+        cluster,
+        "network policy enforcement: could not read (pod kindnet-9qv4m sets no network-policy flag, and the default of kindnetd v20990101-0123abcd is not known, and the log of kindnet-9qv4m, the fallback, could not be read)",
     ));
 
     let mut cluster = Cluster::clean();
@@ -1370,14 +1440,6 @@ fn enforcement_that_cannot_be_read_fails() {
         "flag-from-elsewhere",
         cluster,
         "network policy enforcement: could not read (pod kindnet-9qv4m sets NETWORK_POLICY=<from elsewhere>)",
-    ));
-
-    let mut cluster = Cluster::clean();
-    cluster.kindnet_log = "I1008 01:35:29.003313       1 main.go:320] Handling node\n".to_owned();
-    cases.push((
-        "log-rotated",
-        cluster,
-        "network policy enforcement: could not read (the log of kindnet-9qv4m does not show its network policy controller starting)",
     ));
 
     let mut cluster = Cluster::clean();

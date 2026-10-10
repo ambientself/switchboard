@@ -15,9 +15,10 @@
 #
 # It checks, and prints PASS or FAIL for each:
 #   (a) the network plugin, from the DaemonSets in kube-system, and for kindnet that it enforces
-#       network policy, as read from the kindnet pod on the probed pod's node: its flags, the
-#       default of its kindnetd image when no flag is set, and its log. Any other plugin is not
-#       read, so it fails;
+#       network policy, as read from the kindnet pod on the probed pod's node: its flags, or the
+#       default of its kindnetd image when no flag is set. Its log is the fallback when neither
+#       settles it (the kubelet rotates the log), and a log that says it skipped network
+#       policies fails it whatever settled it. Any other plugin is not read, so it fails;
 #   (b) that the pod mounts no Secret and takes no variable from one, that no literal variable
 #       and no ConfigMap it reads holds a string in a format in token-patterns.txt, and that no
 #       projected ServiceAccount token in it is for a server's audience (--server-audience);
@@ -307,7 +308,7 @@ network_plugin() {
 # kindnet_enforcement DAEMONSETS: reads the kindnet pod on the probed pod's node.
 kindnet_enforcement() {
   local daemonsets=$1 selector agents agent agent_name container image tag flags line value
-  local state="" why="" release
+  local state="" why="" release fallback=""
   if ! selector=$(jq -r '[.items[] | select(.metadata.name | startswith("kindnet"))][0].spec.selector.matchLabels // {}
     | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$daemonsets"); then
     why="could not read the kindnet DaemonSet"
@@ -357,19 +358,36 @@ kindnet_enforcement() {
         KIND_VERSION=$release
         ENFORCEMENT="default-on (kindnetd $tag, $release)"
       else
+        fallback=1
         why="pod $agent_name sets no network-policy flag, and the default of kindnetd ${tag:-with no tag} is not known"
       fi
     fi
   fi
-  # The agent's own log: it must have started its policy controller and not skipped it.
-  if [ "$state" = on ]; then
+  # The agent's own log. The flag, or the default of the pinned kindnetd, is the evidence: the
+  # kubelet rotates the log (on switchboard-demo after about a week), and the lines of the
+  # agent's start go with it. So the log decides only as a fallback, when neither does: then it
+  # must show the policy controller starting. Whatever decided, a log that says the agent
+  # skipped its policy controller turns enforcement off, and the report says what decided.
+  if [ "$state" = on ] || [ -n "$fallback" ]; then
     local log
     if ! log=$(k logs -n kube-system "pod/$agent_name" -c "$(jq -r .name <<<"$container")"); then
-      state="" why="could not read the log of $agent_name"
+      if [ -n "$fallback" ]; then
+        why="$why, and the log of $agent_name, the fallback, could not be read"
+      else
+        ENFORCEMENT="$ENFORCEMENT; its log could not be read, and is only a fallback"
+      fi
     elif grep -q 'skipping network policies' <<<"$log"; then
+      if [ -n "$fallback" ]; then
+        ENFORCEMENT="off by its log (the fallback: no flag, and the default of kindnetd ${tag:-with no tag} is not known)"
+      fi
       state=off ENFORCEMENT="$ENFORCEMENT, but $agent_name logged that it skipped network policies"
-    elif ! grep -q '"Starting controller" name="kube-network-policies"' <<<"$log"; then
-      state="" why="the log of $agent_name does not show its network policy controller starting"
+    elif [ -n "$fallback" ]; then
+      if grep -q '"Starting controller" name="kube-network-policies"' <<<"$log"; then
+        state=on why=""
+        ENFORCEMENT="on by its log (the fallback: no flag, and the default of kindnetd ${tag:-with no tag} is not known; $agent_name logged its network policy controller starting)"
+      else
+        why="$why, and the log of $agent_name, the fallback, does not show its network policy controller starting"
+      fi
     fi
   fi
   [ -n "$state" ] || ENFORCEMENT="could not read"
