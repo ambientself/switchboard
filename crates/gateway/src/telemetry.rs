@@ -6,7 +6,9 @@
 //! and the drop is counted. [`Drain`] is the receiving side, a task that writes each event as
 //! one `tracing` event, so it reaches the same JSON lines as the rest of the logs.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,7 +45,7 @@ pub const TELEMETRY_QUEUE: usize = 1024;
 
 /// The longest a surface is kept, in characters after escaping, before it is cut short and
 /// marked with `…`. The same cap the core puts on a surface in sentences and audit rows.
-pub const MAX_SURFACE: usize = 128;
+pub const MAX_SURFACE: usize = gateway_core::MAX_RENDERED;
 
 /// A surface as an event records it. It comes from the request's URL, so it is escaped by
 /// [`gateway_core::escape`] and capped at [`MAX_SURFACE`] when it is made. Its field is
@@ -225,6 +227,27 @@ impl Drain {
             write(&event);
         }
     }
+
+    /// [`run`](Self::run), until `stop` completes or every [`Telemetry`] is gone. Once `stop`
+    /// completes the queue is closed, so an event emitted after that is dropped and counted,
+    /// and the events already queued are written before it returns. For a caller that keeps a
+    /// [`Telemetry`] after the events it waits for, such as one that reads the counters.
+    pub async fn run_until(mut self, stop: impl Future<Output = ()>) {
+        let mut stop = pin!(stop);
+        loop {
+            tokio::select! {
+                received = self.receiver.recv() => match received {
+                    Some(event) => write(&event),
+                    None => return,
+                },
+                () = &mut stop => break,
+            }
+        }
+        self.receiver.close();
+        while let Some(event) = self.receiver.recv().await {
+            write(&event);
+        }
+    }
 }
 
 /// One event, as one `tracing` event.
@@ -354,6 +377,27 @@ mod tests {
                 ..TelemetryCounts::default()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_drain_writes_what_was_queued_and_closes_the_queue() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        let (telemetry, drain) = Telemetry::bounded(8);
+        for _ in 0..3 {
+            telemetry.emit(ping("read"));
+        }
+        // A sender is still held, and the stop has already come.
+        drain.run_until(async {}).await;
+        assert_eq!(captured.lines().len(), 3);
+        telemetry.emit(ping("read"));
+        assert_eq!(telemetry.counts().dropped, 1, "the queue is closed");
     }
 
     #[test]

@@ -33,8 +33,13 @@
 //! service before anything is refused. Then it stops taking connections, and waits up to
 //! [`SHUTDOWN_GRACE`] for those still open, such as one whose client stopped part way through a
 //! request. It then closes any still open, so a request on them that has not started its answer
-//! never will. Last, it waits for the answer tasks, however long they take: a call whose client
+//! never will. Then it waits for the answer tasks, however long they take: a call whose client
 //! has gone is still running, and a process that exited under it would leave its row open.
+//! Last, it closes the telemetry queue and writes the events still in it.
+//!
+//! The request path's telemetry events name the surface and the connection's remote address.
+//! The surface is read from the URL before identity runs, so a refused caller's event names
+//! it too; one that does not decode to text is recorded as none.
 //!
 //! Every request is logged once it is answered, with its status and how long it took. A
 //! disabled gate is logged at boot, and again every [`DISABLED_GATE_REMINDER`] while the
@@ -42,16 +47,17 @@
 
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::response::Response;
 use axum::routing::any;
+use axum::{Extension, Router};
 use gateway_mcp::{HttpResponse, INTERNAL_ERROR, Rejection};
 use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
 use http::request::Parts;
@@ -62,12 +68,13 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::boot::{GateState, Gates};
-use crate::path::RequestPath;
+use crate::path::{RequestPath, Source};
+use crate::telemetry::{Drain, TELEMETRY_QUEUE, Telemetry};
 
 /// The largest request body read, in bytes: 1 MiB.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -139,9 +146,34 @@ where
 /// waits for the connections still open to close, up to `timeouts.shutdown_grace`, and then
 /// closes those that have not, so no tool call starts after it returns. It returns once every
 /// tool call started has completed its audit row, including calls whose clients have gone.
+///
+/// Its telemetry goes through a queue of [`TELEMETRY_QUEUE`] events; see
+/// [`serve_with_telemetry`].
 pub async fn serve_with_timeouts<F>(
     listener: TcpListener,
     gates: Gates,
+    shutdown: F,
+    timeouts: Timeouts,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+    serve_with_telemetry(listener, gates, telemetry, drain, shutdown, timeouts).await
+}
+
+/// [`serve_with_timeouts`], emitting the request path's events to `telemetry`, whose queue
+/// `drain` empties. The caller can keep a clone of `telemetry` to read its counters.
+///
+/// The drain runs on its own task while the gateway serves. Once every answer has finished,
+/// the queue is closed and the events in it are written before this returns; an event emitted
+/// after that is dropped and counted. Writing them comes after the readiness removal and the
+/// grace, and lengthens neither.
+pub async fn serve_with_telemetry<F>(
+    listener: TcpListener,
+    gates: Gates,
+    telemetry: Telemetry,
+    drain: Drain,
     shutdown: F,
     timeouts: Timeouts,
 ) -> io::Result<()>
@@ -157,16 +189,21 @@ where
         audit = ?gates.audit_state(),
         "listening"
     );
-    let path = RequestPath::new(gates);
+    // Dropping `stop_draining`, or sending on it, closes the queue.
+    let (stop_draining, draining_stopped) = oneshot::channel::<()>();
+    let draining = tokio::spawn(drain.run_until(async {
+        let _ = draining_stopped.await;
+    }));
+    let path = RequestPath::with_telemetry(gates, telemetry);
     let reminder = tokio::spawn(remind(path.clone()));
     let answers = Answers::default();
     let ready = Arc::new(AtomicBool::new(true));
-    let service = TowerToHyperService::new(router(Endpoint {
+    let router = router(Endpoint {
         path,
         answers: answers.clone(),
         body_read: timeouts.body_read,
         ready: ready.clone(),
-    }));
+    });
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(timeouts.header_read);
@@ -176,7 +213,7 @@ where
     let accepting = Accepting {
         listener: &listener,
         http: &http,
-        service: &service,
+        router: &router,
         connections: &connections,
     };
     accepting.until(&mut tasks, shutdown).await;
@@ -217,14 +254,24 @@ where
         );
     }
     answers.finished().await;
+    // Every answer has emitted its events. Close the queue and write what is in it.
+    drop(stop_draining);
+    if let Err(error) = draining.await {
+        tracing::error!(%error, "the task writing telemetry failed");
+    }
     Ok(())
 }
+
+/// The peer a request came from: its connection's remote address. Each connection's router
+/// puts it in the request's extensions.
+#[derive(Clone, Copy, Debug)]
+struct Peer(SocketAddr);
 
 /// What taking connections needs: the listener, and how each connection is served and watched.
 struct Accepting<'a> {
     listener: &'a TcpListener,
     http: &'a http1::Builder,
-    service: &'a TowerToHyperService<Router>,
+    router: &'a Router,
     connections: &'a GracefulShutdown,
 }
 
@@ -235,9 +282,9 @@ impl Accepting<'_> {
         loop {
             // Forget the connections that have closed, so the set holds only those still open.
             while tasks.try_join_next().is_some() {}
-            let stream = tokio::select! {
+            let (stream, peer) = tokio::select! {
                 accepted = self.listener.accept() => match accepted {
-                    Ok((stream, _)) => stream,
+                    Ok(accepted) => accepted,
                     Err(error) => {
                         accept_failed(&error).await;
                         continue;
@@ -245,10 +292,11 @@ impl Accepting<'_> {
                 },
                 () = &mut stop => return,
             };
-            let connection = self.connections.watch(
-                self.http
-                    .serve_connection(TokioIo::new(stream), self.service.clone()),
-            );
+            let service =
+                TowerToHyperService::new(self.router.clone().layer(Extension(Peer(peer))));
+            let connection = self
+                .connections
+                .watch(self.http.serve_connection(TokioIo::new(stream), service));
             tasks.spawn(async move {
                 if let Err(error) = connection.await {
                     tracing::debug!(%error, "a connection ended with an error");
@@ -416,12 +464,19 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
     if declared_length(&parts.headers).is_some_and(|length| length > MAX_BODY_BYTES) {
         return refused(&Rejection::payload_too_large());
     }
-    let admitted = match path.admit(&parts.method, &parts.headers) {
+    // Read now for the events identity may emit. One that does not decode to text names no
+    // surface, which is answered 404 once identity has passed.
+    let surface = Path::<String>::from_request_parts(parts, &())
+        .await
+        .ok()
+        .map(|Path(surface)| surface);
+    let address = parts.extensions.get::<Peer>().map(|peer| peer.0);
+    let source = Source::new(surface.as_deref(), address);
+    let admitted = match path.admit(&parts.method, &parts.headers, &source) {
         Ok(admitted) => admitted,
         Err(response) => return response,
     };
-    let Ok(Path(surface)) = Path::<String>::from_request_parts(parts, &()).await else {
-        // The surface in the URL does not decode to text, so it names no surface.
+    let Some(surface) = surface else {
         return not_found();
     };
     let reading = axum::body::to_bytes(body, MAX_BODY_BYTES);

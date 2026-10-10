@@ -1077,7 +1077,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   (decision 0012). Today neither the verifier nor the principal has it.
 - Already built: the claimed issuer and subject are available beside a verification error,
   escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
-  itself still carries nothing from the token. The event does not record them yet (#26).
+  itself still carries nothing from the token. The `identity_failed` event records them (#26).
 - With #10 and #26: a principal state for identity checking turned off, which a row can record
   as `disabled`.
 
@@ -1174,7 +1174,12 @@ off only in a development build, with CI's check of the release artifact; and th
   written.
 - Telemetry events that carry the surface and the source address, counters, and a bounded
   queue, with events for `initialize`, `ping`, `server/discover` and bodies that cannot be
-  parsed. Today an identity failure is logged with the deployment and the cause only.
+  parsed: built (#40). Each event names the deployment, the surface from the URL (escaped and
+  capped) and the connection's remote address. An identity failure adds the cause and the
+  claimed issuer and subject; a refused body adds the protocol rejection's kind, for every
+  protocol rejection, not only bodies that are not JSON. Emitting never waits: a full queue
+  drops the event and counts the drop. At shutdown, once every answer has finished, the queue
+  is closed and what is in it is written. The counters are not exported yet.
 - The telemetry event for each finish given up, made from the audit store's report of it,
   naming the row and the outcome's kind, with a different second completion logged and counted
   apart from a finish that ran out of time (decision 0009). Today the Postgres store reports

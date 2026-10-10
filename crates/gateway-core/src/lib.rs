@@ -51,4 +51,4 @@ pub use policy::{
 };
 pub use principal::{Delegation, Principal, PrincipalId, PrincipalKind};
 pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
-pub use sentences::{IDENTITY_FAILURE, escape};
+pub use sentences::{IDENTITY_FAILURE, MAX_RENDERED, escape};

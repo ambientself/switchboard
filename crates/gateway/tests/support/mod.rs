@@ -7,7 +7,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gateway::{Config, ResourceAdapter, Timeouts, Wiring, boot, serve_with_timeouts};
+use gateway::{
+    Config, ResourceAdapter, TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot,
+    serve_with_telemetry,
+};
 use gateway_core::{ApprovedTool, IDENTITY_FAILURE, Resources};
 use gateway_mcp::{CHALLENGE, DENIAL_CODE};
 use gateway_testkit::{
@@ -43,6 +46,8 @@ pub struct Server {
     pub credentials: Arc<FakeCredentialSource>,
     pub connector: Arc<FixtureConnector>,
     pub address: SocketAddr,
+    /// The server's telemetry, for its counters.
+    pub telemetry: Telemetry,
     pub stop: Option<oneshot::Sender<()>>,
     pub serving: JoinHandle<std::io::Result<()>>,
 }
@@ -66,9 +71,12 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
-        let serving = tokio::spawn(serve_with_timeouts(
+        let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+        let serving = tokio::spawn(serve_with_telemetry(
             listener,
             gates,
+            telemetry.clone(),
+            drain,
             async {
                 let _ = stopped.await;
             },
@@ -80,6 +88,7 @@ impl Server {
             credentials,
             connector,
             address,
+            telemetry,
             stop: Some(stop),
             serving,
         }

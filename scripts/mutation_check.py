@@ -1597,10 +1597,10 @@ mutate("gw-list-row-id-fixed", "every list's row has one identifier, not one mad
        "            call_deadline_ms: 0,")
 
 mutate("gw-body-parsed-before-identity", "the body is parsed before identity is checked", GW_PATH,
-       "        let admitted = match self.admit(method, headers) {\n",
+       "        let admitted = match self.admit(method, headers, &source) {\n",
        "        if let Err(rejection) = gateway_mcp::parse(method, headers, body) {\n"
        "            return rejection.response();\n        }\n"
-       "        let admitted = match self.admit(method, headers) {\n")
+       "        let admitted = match self.admit(method, headers, &source) {\n")
 mutate("gw-transport-after-identity", "identity is checked before the transport checks", GW_PATH,
        "        gateway_mcp::check_transport(method, headers).map_err(|rejection| rejection.response())?;\n"
        "        let gates = &self.inner.gates;\n",
@@ -1700,6 +1700,37 @@ mutate("gw-row-not-in-error-data", "a denial does not name its row in error.data
 mutate("gw-disabled-row-leaked", "with audit disabled, the answer names a row nothing wrote", GW_PATH,
        "        (self.inner.gates.audit_state() == GateState::On).then(|| row.clone())",
        "        Some(row.clone())")
+# Telemetry events (decision 0009): one identity_failed per refusal, naming where it came from
+# and nothing from the token but the claimed issuer and subject the identity crate escaped.
+mutate("gw-identity-event-no-surface", "an identity failure's event does not name the surface", GW_PATH,
+       "                    surface: source.surface.clone(),\n", "                    surface: None,\n")
+mutate("gw-identity-event-no-source", "an identity failure's event does not name the peer", GW_PATH,
+       "                    source: source.address,\n                    cause:",
+       "                    source: None,\n                    cause:")
+# ClaimedCaller's constructor is private to the identity crate, so the path cannot record the
+# token, or anything from it, as the claimed caller: this must not compile.
+mutate("gw-identity-event-carries-token", "the raw token is recorded as the claimed subject", GW_PATH,
+       "                    claimed: failure.claimed().clone(),\n",
+       "                    claimed: gateway_identity::ClaimedCaller::new(None, bearer_token(headers)),\n",
+       breaks_build=True)
+mutate("gw-ping-no-event", "a ping is answered with no event", GW_PATH,
+       "            Call::Ping => {\n"
+       "                self.emit(Event::Ping {\n"
+       "                    deployment: deployment(),\n"
+       "                    surface: source.surface,\n"
+       "                    source: source.address,\n"
+       "                });\n"
+       "                (Reply::Pong, None)\n"
+       "            }\n",
+       "            Call::Ping => (Reply::Pong, None),\n")
+mutate("gw-unparsable-no-event", "a body refused at the protocol layer gives no event", GW_PATH,
+       "                    path.emit(Event::Unparsable {\n"
+       "                        deployment: path.inner.gates.deployment().clone(),\n"
+       "                        surface: source.surface,\n"
+       "                        source: source.address,\n"
+       "                        rejection: rejection.kind(),\n"
+       "                    });\n",
+       "")
 
 
 # --- gateway server ------------------------------------------------------------------------
@@ -1709,14 +1740,14 @@ HOST_CHECK = (
     "    if let Err(rejection) = check_host(gates, parts) {\n"
     "        return refused(&rejection);\n    }\n"
 )
-ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers) {\n"
+ADMIT = "    let admitted = match path.admit(&parts.method, &parts.headers, &source) {\n"
 
 mutate("gw-host-check-skipped", "a request for any Host is served", GW_SERVER, HOST_CHECK, "")
 mutate_all(
     "gw-host-after-identity",
     "the Host is checked after identity",
     (GW_SERVER, HOST_CHECK, ""),
-    (GW_SERVER, "    let Ok(Path(surface)) =", HOST_CHECK + "    let Ok(Path(surface)) ="),
+    (GW_SERVER, "    let Some(surface) = surface else {", HOST_CHECK + "    let Some(surface) = surface else {"),
 )
 mutate("gw-host-port-compared", "the Host is compared with its port", GW_SERVER,
        "let allowed = host.map(without_port).is_some_and(", "let allowed = host.is_some_and(")
@@ -1772,6 +1803,17 @@ mutate("gw-stops-before-unready", "the gateway stops taking connections before t
        "    accepting\n        .until(&mut tasks, tokio::time::sleep(timeouts.readiness_removal))\n        .await;\n"
        "    drop(listener);\n",
        "    drop(listener);\n    tokio::time::sleep(timeouts.readiness_removal).await;\n")
+# Telemetry at shutdown (decision 0009): the queue is closed and emptied before serving returns.
+mutate("gw-drain-not-awaited-on-shutdown", "serving returns without waiting for the queued events to be written", GW_SERVER,
+       "    if let Err(error) = draining.await {\n"
+       "        tracing::error!(%error, \"the task writing telemetry failed\");\n    }\n",
+       "    let _ = draining;\n")
+mutate("gw-event-source-not-peer", "events name the gateway's own address, not the peer's", GW_SERVER,
+       "                    Ok(accepted) => accepted,\n",
+       "                    Ok((stream, _)) => match self.listener.local_addr() {\n"
+       "                        Ok(local) => (stream, local),\n"
+       "                        Err(_) => continue,\n"
+       "                    },\n")
 
 
 # --- gateway-dev ---------------------------------------------------------------------------
@@ -2974,8 +3016,8 @@ mutate("gw-reload-never-reads-again", "the watcher never serves a new file", REL
 
 mutate("gw-policy-no-rule-gets-a-profile", "a caller no registry rule covers gets the demo's profile", POLICY_RS,
        "                    ProfileName::new(NO_PROFILE)\n", "                    ProfileName::new(\"workload-read\")\n")
-mutate("gw-path-identity-failure-unnamed", "an identity failure's log line has no event name", GW + "path.rs",
-       "                    event = \"identity_failed\",\n", "")
+mutate("gw-path-identity-failure-unnamed", "an identity failure's log line has no event name", GW + "telemetry.rs",
+       "            event = \"identity_failed\",\n", "")
 
 mutate("mock-digest-file-beside-token", "a digest file and a token file may both be set", MOCK_CONFIG,
        "            (None, None, Some(path)) => read_digest_file(Path::new(&path))?,",
@@ -3308,7 +3350,7 @@ def verdict(mutation: Mutation, code: int | None, output: str) -> tuple[str, str
     trybuild = sorted(set(re.findall(r"^test (tests/compile-fail/\S+) \.\.\. (?:error|mismatch)$", output, re.M)))
     if failed:
         return "CAUGHT", ", ".join(failed + trybuild)
-    broken = re.findall(r"could not compile `gateway-[a-z]+` \(([^)]*)\)", output)
+    broken = re.findall(r"could not compile `gateway(?:-[a-z]+)?` \(([^)]*)\)", output)
     if mutation.breaks_build and "lib" in broken:
         return "CAUGHT", "the library does not compile, as intended"
     if broken:
