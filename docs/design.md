@@ -265,13 +265,25 @@ a verified token to a principal, which is identified by issuer and subject toget
 keys fetched only from the issuer's own host, expiry and not-before checked with leeway,
 audience membership required, and a ceiling on token lifetime.
 
-**Keys can change without a restart.** At boot each issuer's keys are read once, from the file
-the deployment names. The identity gate can also replace one configured issuer's keys while it
-runs: it builds a whole new verifier with the new set, which gets every check a set gets at
-boot, and puts it in force only if that succeeds. A refused set leaves the keys in use. The
-caller names the issuer; nothing in a token chooses whose keys are replaced, and keys for an
-issuer that is not configured are refused. Nothing in the gateway fetches keys or calls the
-replacement yet.
+**Keys can change without a restart.** Each issuer's keys come from one of two places the
+deployment names. A keys file is read once, at boot. A keys URL, on the issuer's own origin
+(the same scheme, host and port), is fetched at boot and again on a timer: every 300 seconds
+unless the deployment says otherwise, and never more often than every 30. Each fetch is one
+bounded request that follows no redirect. A first fetch that fails refuses to start. The URL is
+configured, never discovered: nothing a token carries (`iss`, `jku`, `x5u`, an embedded `jwk`,
+or `kid`) causes a fetch, and a token naming an unknown `kid` is refused until a scheduled
+refresh brings its key.
+
+Each refresh goes through the identity gate's replacement of one configured issuer's keys: it
+builds a whole new verifier with the new set, which gets every check a set gets at boot, and
+puts it in force only if that succeeds. A refused set, or a fetch that fails, leaves the keys in
+use. The refresher names the issuer; nothing in a token chooses whose keys are replaced, and
+keys for an issuer that is not configured are refused. There is no maximum age: keys that
+cannot be refreshed stay in force until a refresh succeeds. A bound on how old they may get
+before tokens are refused is a freshness bound, and Q11 owns it.
+
+This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
+is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
