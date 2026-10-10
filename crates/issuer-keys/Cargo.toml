@@ -1,0 +1,32 @@
+[package]
+name = "issuer-keys"
+version = "0.1.0"
+description = "Fetches one issuer's JWK set from the issuer's own origin, under a deadline and a cap on the body's size, following no redirect."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The gateway uses this crate to fetch keys; the identity crate never does, and stays offline.
+# Keep this list to the allowlist in tests/dependencies.rs.
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# The set is the identity crate's own type, so `Identity::replace_keys` takes what this crate
+# returns. The same features as there: exactly one crypto backend, the pure-Rust one, because
+# `jsonwebtoken` panics on first use if both are enabled anywhere in the build.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+# Already in the build. Parses the issuer and the keys URL the way a browser would, so their
+# origins are compared host to host and port to port, not as text.
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }
+
+[lints]
+workspace = true
