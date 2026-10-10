@@ -138,7 +138,8 @@ async fn refresh_every(identity: Arc<Identity>, refreshed: Refreshed) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick is immediate, and boot has just fetched the keys.
     interval.tick().await;
-    let mut last_failure = None;
+    // The cause of the last failure logged, until a refresh succeeds.
+    let mut last_failure: Option<String> = None;
     loop {
         interval.tick().await;
         let _ = refresh(&identity, &refreshed.source, &mut last_failure).await;
