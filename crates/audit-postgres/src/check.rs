@@ -7,6 +7,7 @@ use std::fmt;
 use deadpool_postgres::ClientWrapper;
 use thiserror::Error;
 
+use crate::OWNER_ROLE;
 use crate::store::{PgAuditStore, SESSION_SETTINGS, describe};
 
 /// Every column of `call_rows` the store writes or reads, with its type as Postgres's
@@ -112,6 +113,22 @@ pub(crate) const TRIGGERS: &[Trigger] = &[
         tgtype: 1 | 2 | 16,
     },
 ];
+
+/// The view the open-row query reads (decision 0009, "Open rows"): allowed rows of kind `call`
+/// with no completion past their deadline, by the database's clock. Migration 0005 creates it.
+pub(crate) const OPEN_ROWS: &str = "open_call_rows";
+
+/// The view's definition as PostgreSQL gives it back (`pg_get_viewdef`) to a session whose
+/// search path is the store's, with its whitespace collapsed to single spaces.
+pub(crate) const OPEN_ROWS_DEFINITION: &str = "SELECT id, deadline, begun_at \
+    FROM switchboard_audit.call_rows \
+    WHERE ((kind = 'call'::text) AND (decision = 'allow'::text) AND (outcome IS NULL) \
+    AND (deadline < clock_timestamp()));";
+
+/// `definition` with every run of whitespace made one space, and none at either end.
+fn collapse(definition: &str) -> String {
+    definition.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// A trigger the table must have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +357,20 @@ pub enum Problem {
         /// What it is needed on.
         object: String,
     },
+    /// The view `switchboard_audit.open_call_rows`, which the open-row query reads, is not there.
+    OpenRowsMissing,
+    /// The open-row view is owned by another role than `switchboard_owner`. A view reads its
+    /// table with its owner's privileges, so its owner decides what it can show.
+    OpenRowsOwner {
+        /// The role that owns it.
+        owner: String,
+    },
+    /// The open-row view has another definition than the migration gives it, so it may count
+    /// rows that are not open, miss rows that are, or show who called.
+    OpenRowsDefinition {
+        /// Its definition, with its whitespace collapsed.
+        found: String,
+    },
     /// The session logged in as another role than the one it runs as, for example through a
     /// `role` setting in its options or a role default. `SET ROLE NONE` returns it to the role
     /// it logged in as, which the other checks do not look at.
@@ -460,6 +491,20 @@ impl fmt::Display for Problem {
                 f,
                 "this session's role lacks {privilege} on {object}, which the store needs"
             ),
+            Self::OpenRowsMissing => write!(
+                f,
+                "the view switchboard_audit.{OPEN_ROWS}, which the open-row query reads, does \
+                 not exist"
+            ),
+            Self::OpenRowsOwner { owner } => write!(
+                f,
+                "the view switchboard_audit.{OPEN_ROWS} is owned by {owner}, not {OWNER_ROLE}"
+            ),
+            Self::OpenRowsDefinition { found } => write!(
+                f,
+                "the view switchboard_audit.{OPEN_ROWS} is defined as {found:?}, not as the \
+                 migration defines it"
+            ),
             Self::LoggedInAs { role } => write!(
                 f,
                 "this session logged in as {role}, and SET ROLE NONE would return it to {role}; \
@@ -529,10 +574,14 @@ impl PgAuditStore {
     ///   whether or not it is inherited, since `SET ROLE` reaches a role that is not. So none
     ///   holds the store's privileges with grant option; none holds anything on the table as a
     ///   whole, so none can DELETE, TRUNCATE or add a trigger; none can CREATE in the schema or
-    ///   the database; none holds anything on any other table, view or sequence in the schema;
+    ///   the database; none holds anything on any other table, view or sequence in the schema
+    ///   but SELECT on the open-row view;
     ///   none can set a setting only a superuser may set, such as `session_replication_role`,
     ///   which would silence both triggers; and none can change any setting with
     ///   `ALTER SYSTEM`, which reaches every session at the next reload.
+    /// - The view `switchboard_audit.open_call_rows`, which the open-row query reads, is there,
+    ///   owned by `switchboard_owner`, with the definition migration 0005 gives it, whitespace
+    ///   aside. The role may select from it, and may do nothing else with it.
     /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule. A
     ///   rule's statements run as the table's owner whenever the gateway writes.
     /// - Neither the role nor any role it can become, PUBLIC included, holds anything on a
@@ -660,6 +709,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
         }
     }
     other_privileges(client, version, &mut problems).await?;
+    open_rows(client, &mut problems).await?;
     if let Some((table, _)) = table {
         reaching_privileges(client, table, version, &mut problems).await?;
         definers(client, table, version, &mut problems).await?;
@@ -1035,7 +1085,8 @@ async fn other_privileges(
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     // Nothing on any table, view or foreign table in the schema as a whole, and nothing at all
-    // on any but call_rows, for the session's role or any role it can become.
+    // on any but call_rows, for the session's role or any role it can become. SELECT on the
+    // open-row view is the exception, which `open_rows` checks.
     let privileges = table_privileges(version);
     let held = client
         .query(
@@ -1045,6 +1096,7 @@ async fn other_privileges(
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
                      unnest($1::text[]) AS p
                  WHERE n.nspname = 'switchboard_audit' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                     AND NOT (c.relname = $2 AND c.relkind = 'v' AND p = 'SELECT')
                      AND ({}
                          OR (c.relname <> 'call_rows'
                              AND p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
@@ -1061,7 +1113,7 @@ async fn other_privileges(
                 by_any_role("has_any_column_privilege(r.oid, c.oid, p)"),
                 by_any_role("has_sequence_privilege(r.oid, c.oid, p)"),
             ),
-            &[&privileges],
+            &[&privileges, &OPEN_ROWS],
         )
         .await?;
     for row in held {
@@ -1151,6 +1203,54 @@ async fn other_privileges(
                 object: format!("the setting {}", row.get::<_, String>(0)),
             });
         }
+    }
+    Ok(())
+}
+
+/// The open-row view is there, as a view, owned by [`OWNER_ROLE`], with the migration's
+/// definition. The session's role may select from it, and neither it nor any role it can become
+/// may pass that on. Anything else on it is refused with the rest of the schema.
+async fn open_rows(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query_opt(
+            &format!(
+                "SELECT pg_get_userbyid(c.relowner)::text, pg_get_viewdef(c.oid),
+                        has_table_privilege(current_user, c.oid, 'SELECT'), {}
+                 FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'switchboard_audit' AND c.relname = $1 AND c.relkind = 'v'",
+                by_any_role("has_table_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')"),
+            ),
+            &[&OPEN_ROWS],
+        )
+        .await?;
+    let Some(view) = found else {
+        problems.push(Problem::OpenRowsMissing);
+        return Ok(());
+    };
+    let owner: String = view.get(0);
+    if owner != OWNER_ROLE {
+        problems.push(Problem::OpenRowsOwner { owner });
+    }
+    let definition = collapse(view.get(1));
+    if definition != OPEN_ROWS_DEFINITION {
+        problems.push(Problem::OpenRowsDefinition { found: definition });
+    }
+    let object = format!("switchboard_audit.{OPEN_ROWS}");
+    if !view.get::<_, bool>(2) {
+        problems.push(Problem::Missing {
+            privilege: "SELECT".into(),
+            object: object.clone(),
+        });
+    }
+    if view.get::<_, bool>(3) {
+        problems.push(Problem::Extra {
+            privilege: "SELECT WITH GRANT OPTION".into(),
+            object,
+        });
     }
     Ok(())
 }

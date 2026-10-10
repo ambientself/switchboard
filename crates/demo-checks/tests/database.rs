@@ -166,5 +166,11 @@ async fn set_up_and_check(server: &Config, admin: &Client) -> Result<(), String>
     as_reader.user("switchboard_reader");
     let reader = connect(&as_reader).await;
     values(&reader, &format!("SELECT count(*) FROM {SCHEMA}.call_rows")).await;
+    // And its open-row check reads the view of open rows.
+    values(
+        &reader,
+        &format!("SELECT count(*) FROM {SCHEMA}.open_call_rows"),
+    )
+    .await;
     Ok(())
 }

@@ -126,7 +126,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4]);
+    assert_eq!(recorded, vec![1, 2, 3, 4, 5]);
 }
 
 #[tokio::test]
@@ -165,7 +165,11 @@ async fn two_migrators_at_once_take_turns() {
         let mut applied = first.unwrap();
         applied.extend(second.unwrap());
         applied.sort_unstable();
-        assert_eq!(applied, vec![1, 2, 3, 4], "each migration is applied once");
+        assert_eq!(
+            applied,
+            vec![1, 2, 3, 4, 5],
+            "each migration is applied once"
+        );
     }
 }
 
@@ -290,6 +294,7 @@ async fn the_gateway_holds_exactly_its_column_grants() {
             "SELECT privilege_type::text, column_name::text
              FROM information_schema.column_privileges
              WHERE grantee = 'switchboard_gateway' AND table_schema = 'switchboard_audit'
+                 AND table_name = 'call_rows'
              ORDER BY 1, 2",
             &[],
         )
@@ -357,6 +362,26 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         .map(|row| row.get(0))
         .collect();
     assert_eq!(table_wide, Vec::<String>::new());
+
+    // On anything else in the schema, the gateway's role holds SELECT on the open-row view,
+    // and nothing more.
+    let elsewhere: Vec<(String, String)> = admin
+        .query(
+            "SELECT table_name::text, privilege_type::text
+             FROM information_schema.table_privileges
+             WHERE grantee = 'switchboard_gateway' AND table_schema = 'switchboard_audit'
+             ORDER BY 1, 2",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        elsewhere,
+        vec![("open_call_rows".to_owned(), "SELECT".to_owned())]
+    );
 }
 
 #[tokio::test]
@@ -820,7 +845,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
     assert_eq!(complete(&owner, &completed, "ok").await.unwrap(), 1);
     let refused = insert_row(&owner, &before_0003(denied())).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5]);
     for (id, due) in [
         (&open, "begun_at"),
         (&completed, "finished_at"),
