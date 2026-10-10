@@ -265,6 +265,14 @@ a verified token to a principal, which is identified by issuer and subject toget
 keys fetched only from the issuer's own host, expiry and not-before checked with leeway,
 audience membership required, and a ceiling on token lifetime.
 
+**Keys can change without a restart.** At boot each issuer's keys are read once, from the file
+the deployment names. The identity gate can also replace one configured issuer's keys while it
+runs: it builds a whole new verifier with the new set, which gets every check a set gets at
+boot, and puts it in force only if that succeeds. A refused set leaves the keys in use. The
+caller names the issuer; nothing in a token chooses whose keys are replaced, and keys for an
+issuer that is not configured are refused. Nothing in the gateway fetches keys or calls the
+replacement yet.
+
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
 was refused". "We were not checking" is a row with identity `disabled`. For identity, "someone
