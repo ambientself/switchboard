@@ -2773,6 +2773,12 @@ mutate("probe-connected-timeout-refused", "a connection that was made and then g
        "        *) echo could-not-probe ;;\n      esac\n      ;;\n    7)", "        *) echo refused ;;\n      esac\n      ;;\n    7)")
 mutate("probe-connect-count-missing", "curl does not report whether it connected, so no timeout can be told apart", PROBE,
        "-w '%{http_code} %{num_connects}'", "-w '%{http_code}'")
+mutate("probe-unconnected-timeout-not-refused", "a connect that timed out before it was made, a dropped route, does not count as refused", PROBE,
+       "        0) echo refused ;;\n", "        0) echo could-not-probe ;;\n")
+mutate("probe-attempt-status-unsplit", "an attempt's status is read with the connection count after it, so no answer reads as open", PROBE,
+       "  attempt_code=${attempt_out%% *}\n", "  attempt_code=$attempt_out\n")
+mutate("probe-gateway-status-unsplit", "the gateway's status is read with the connection count after it, so no answer reads as reached", PROBE,
+       "code=${code%% *}\n", "")
 mutate("probe-gateway-reach-skipped", "the routes are tried whether or not the gateway answered", PROBE,
        """  '' | 000) stop "gateway unreachable: $GATEWAY_URL (curl exit $status)" ;;\n""", "  __never__) ;;\n")
 mutate("probe-sends-bearer", "each attempt carries a bearer", PROBE,
