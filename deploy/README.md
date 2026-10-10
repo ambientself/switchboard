@@ -124,6 +124,31 @@ schedule and no alert: decision 0010 leaves both to the first real cluster. The 
 holds only while the evidence log in `docs/route-exceptions.md` has a passing run from the last
 seven days.
 
+## Metrics
+
+Decision 0009 leaves where telemetry goes to whoever runs logging (Still open 3); until then it
+is the gateway's structured events and counters. The default, until a sink is chosen, is
+Prometheus text on a listener of the gateway's own: `[metrics] listen` in the deployment file
+serves `GET /metrics` there, and nothing else. Left out, nothing listens. It may not take the
+MCP port, and it runs no host, origin or identity check, so it belongs where only a scraper
+reaches it. In Compose it listens on the container's loopback, `127.0.0.1:9090`, and is not
+published. In kind it is the pod's `metrics` port, 9090: the Service does not expose it, and
+the `gateway-from-teams` policy admits the teams on 8080 only. Both runs read it with curl
+inside the gateway's container.
+
+The signals of design section 11, all from the gateway's own counters: begin failures by cause
+(`switchboard_audit_begin_failures_total{cause}`; `pool_timeout` is any begin that got no
+connection within its budget, waiting for the pool or opening a connection, until #105 tells
+them apart), the audit-failure answers they cause (`switchboard_audit_failure_answers_total`,
+for `tools/call` and `tools/list`), answers released before finish, finishes given up by cause,
+failed begins never committed, finishes in flight, open rows and the oldest open row's deadline
+(polled every 15 s through the open-row view; a failed poll is counted and keeps the last
+count), begin and finish latency histograms, each pool's connections in use, open and maximum,
+and telemetry events and drops. Receipts in `unknown` arrive with receipts (#10 stage 2). The
+Compose run checks that its database outage counted a begin failure and an audit-failure
+answer; both runs check that telemetry dropped is exported and that at most one row is open.
+No alert thresholds or paging: those wait for the first production deployment (Still open 9).
+
 ## Stopping the gateway
 
 Decision 0009 says an instance that is told to stop first fails its readiness check, then stops
@@ -162,8 +187,8 @@ check that the deployment files load.
 | Piece | How it runs |
 | --- | --- |
 | Binaries | `switchboard` (crates/gateway), `switchboard-dev` (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server). `Dockerfile` builds `switchboard` on its own with `cargo build --release --locked -p gateway --bin switchboard`, then the other two with `cargo build --release --locked -p gateway-dev -p mock-docs-server --bins`. Build `switchboard` for deployment the same way: a workspace build turns on gateway-dev's `test-support` feature, which exempts the gateway from the receipt-store gate (decision 0009). `switchboard` links nothing from the testkit. |
-| Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with its keys file and team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server. Missing, partial or unknown fields refuse to start, except `listen`, which is `127.0.0.1:8080` (loopback only) if left out. |
-| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. One `"event":"audit_row_given_up"` line at `ERROR` for each audit row whose completion the store stopped trying to write, with the `row`, the `outcome` not written and the `cause`. |
+| Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with its keys file and team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server, and `[metrics] listen`, where `GET /metrics` is served (above). Missing, partial or unknown fields refuse to start, except `listen`, which is `127.0.0.1:8080` (loopback only) if left out, and `[metrics]`, which serves nothing if left out. |
+| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); `"metrics"`, the address `GET /metrics` is served on, or `"off"`; and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. One `"event":"audit_row_given_up"` line at `ERROR` for each audit row whose completion the store stopped trying to write, with the `row`, the `outcome` not written and the `cause`. |
 | Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-1`; `compose/config/registry-withdrawn.toml` is revision `demo-2` without `docs__read_document`. A new version that changes a server or a tool's route is refused until a restart. |
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
@@ -187,8 +212,8 @@ check that the deployment files load.
   the view that no row outside the outage is open, and at most that one row inside it.
 - **Decisions 0009 and 0010 ask more of the slice than it has.** In kind the gateway presents
   a projected token of its own ServiceAccount to mock-docs, which accepts only that identity.
-  The route check runs in every kind run (above). The signals of section 11 are not exported
-  yet (#47). Compose has no cluster
+  The route check runs in every kind run (above). The signals of section 11 are exported
+  (above), but no sink is chosen, and receipts in `unknown` wait for #10. Compose has no cluster
   issuer, so there mock-docs still recognises the gateway by a static dummy credential checked
   into this repository, compared by its SHA-256.
 
