@@ -10,6 +10,8 @@
 //!   budget, under the same identifier. Finish keeps trying, on a task of its own, after its
 //!   answer budget has passed, until a deadline. An allowed row whose begin failed after its
 //!   insert was executed, and so may have been written, is completed as `error` the same way.
+//! - [`PgAuditStore::open_rows`] counts the open rows, through the view `open_call_rows`:
+//!   allowed calls with no completion past their deadline, by the database's clock.
 //! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
 //!   is as the store expects and the role it connects as can do no more than the store needs.
 //!
@@ -22,6 +24,8 @@
 //! - It updates only the completion columns: outcome, its sentence, and latency.
 //! - It selects only the identifier, the decision, the completion, the kind and the deadline.
 //!   It cannot read who called what, and it cannot delete.
+//! - It selects from the view `open_call_rows`, which shows each open row's identifier,
+//!   deadline and time at begin, and nothing else.
 //!
 //! Those are the migration's grants on the table. Other objects can give a role more: a grant
 //! on a view over the table, a rule, a `SECURITY DEFINER` function, or a function that reaches
@@ -61,4 +65,4 @@ pub use check::{BootCheckError, Problem};
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
-pub use store::{Budgets, FinishCounts, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
+pub use store::{Budgets, FinishCounts, GivenUp, OpenRows, PgAuditError, PgAuditStore, PoolSizes};
