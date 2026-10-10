@@ -35,7 +35,9 @@
 #       line. It requires exactly one ROUTE line for each attempt the routes ask for: by name,
 #       unless the URL's host is an address literal, and by each address; a row whose
 #       addresses are `resolve` needs at least one address line. A missing, extra or repeated
-#       line fails the run.
+#       line fails the run. A row the probe would fail for its host fails here, and the probe
+#       is not started: a bracketed host that is not an IPv6 literal, or an address-literal host
+#       that is not one of the row's addresses.
 #
 # Anything it cannot read is a FAIL ("could not read"), never a PASS, and so is anything it read
 # but could not parse: kubectl output that is not one JSON object, or a field of it in a shape jq
@@ -633,7 +635,7 @@ server_addresses() {
 
 probe() {
   step "(e) the probe in $POD"
-  local addresses routes wanted mismatch custom deadline left pod_now state="" unread=1 log exit_code last bad
+  local addresses routes wanted broken mismatch custom deadline left pod_now state="" unread=1 log exit_code last bad
   if ! addresses=$(server_addresses); then
     fail "the probe ran: could not read the servers' addresses"
     return
@@ -666,17 +668,34 @@ probe() {
   # The attempts the routes ask for, each [row, by, target]: by name unless the URL's host is an
   # address literal, as the probe does, and by each address. A `resolve` row's addresses are
   # found in the pod, so it asks for at least one address line, whatever its target.
+  # The rows the probe fails as broken because of their host are broken here too, and the probe
+  # is not started: a bracketed host that is not an IPv6 literal, and an address-literal host
+  # that is not one of the row's addresses, which the probe would never try.
   if ! wanted=$(jq -R -s -c '
       split("\n") | map(select(length > 0 and (startswith("#") | not)) | split("\t")
         | if length >= 3 and (.[0] | length) > 0 and (.[2] | length) > 0 then . else error("bad row") end
         | .[0] as $row | .[1] as $url | .[2] as $addresses
         | ($url | sub("^[a-zA-Z][a-zA-Z0-9+.-]*://"; "") | sub("[/?#].*$"; "")) as $authority
         | ($authority | startswith("[") or (sub(":[0-9]+$"; "") | test("^[0-9.]+$"))) as $literal
+        | ($authority | if startswith("[") then ltrimstr("[") | sub("\\].*$"; "") else sub(":[0-9]+$"; "") end) as $host
         | {exact: [(if $literal then empty else [$row, "name", $url] end),
                    (if $addresses == "resolve" then empty else ($addresses | split(",")[] | [$row, "address", .]) end)],
-           resolve: (if $addresses == "resolve" then [$row] else [] end)})
-      | {exact: (map(.exact[]) | unique), resolve: (map(.resolve[]) | unique)}' <<<"$routes"); then
+           resolve: (if $addresses == "resolve" then [$row] else [] end),
+           broken: [if ($authority | startswith("[")) and ($host | test("^[0-9a-fA-F.:]*:[0-9a-fA-F.:]*$") | not) then
+                      "\($row)\tthe URL has a bracketed host that is not an IPv6 address: \($url)"
+                    elif $literal and $addresses != "resolve" and (any($addresses | split(",")[]; . == $host) | not) then
+                      "\($row)\tthe host \($host) of the URL is not one of its addresses: \($addresses)"
+                    else empty end]})
+      | {exact: (map(.exact[]) | unique), resolve: (map(.resolve[]) | unique), broken: map(.broken[])}' <<<"$routes") ||
+    ! broken=$(jq -r '.broken[]' <<<"$wanted"); then
     fail "the probe ran: could not read the rows of $ROUTES_FILE"
+    return
+  fi
+  if [ -n "$broken" ]; then
+    local row why
+    while IFS=$'\t' read -r row why; do
+      fail "the probe ran: row $row of $ROUTES_FILE: $why"
+    done <<<"$broken"
     return
   fi
   # kubectl debug's --env splits its value at commas, and the routes hold commas, so the

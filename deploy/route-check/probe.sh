@@ -9,12 +9,15 @@
 # if it was not, the probe fails before it tries any route. Then it tries each route in ROUTES:
 # by name, unless the URL's host is an address literal, and by each address the row gives. The
 # name is resolved with getent first, so a name that does not resolve, or whose lookup times
-# out, is "could-not-probe", never "refused" at the server's address.
+# out, is "could-not-probe", never "refused" at the server's address. A URL whose host is an
+# address literal is tried only at that host, so the row's addresses must include it, or the
+# row fails: a refusal at some other address would say nothing about the host.
 #
 # Environment:
 #   ROUTES         the routes file's contents, with {{ADDR}} already replaced. Tab-separated
 #                  columns: name, url, addresses, flags. addresses is a comma list of address
-#                  literals, or `resolve` for the addresses the name resolves to in the pod. flags
+#                  literals, or `resolve` for the addresses the name resolves to in the pod (for
+#                  a URL whose host is an address literal, that host). flags
 #                  is empty or a comma list; reject_ok counts a refused connection as refused. A
 #                  line starting with # is a comment.
 #   GATEWAY_URL    the gateway's endpoint
@@ -287,10 +290,17 @@ while IFS="$TAB" read -r row url addresses flags extra; do
   case $host in
     '' | *[!0-9a-zA-Z.:_-]*) broken "$number" "the URL's host is not a name or an address"; continue ;;
   esac
-  # An address literal in the URL is tried by address only.
+  # An address literal in the URL is tried by address only. curl takes a bracketed host only as
+  # an IPv6 literal.
   literal=""
   case $authority in
-    '['*) literal=1 ;;
+    '['*)
+      case $host in
+        *[!0-9a-fA-F.:]*) ;;
+        *:*) literal=1 ;;
+      esac
+      [ -n "$literal" ] || { broken "$number" "the URL has a bracketed host that is not an IPv6 address: $url"; continue; }
+      ;;
     *) case $host in *[!0-9.]*) ;; *) literal=1 ;; esac ;;
   esac
   case $addresses in
@@ -301,11 +311,20 @@ while IFS="$TAB" read -r row url addresses flags extra; do
         *[!0-9a-fA-F.:,]* | ,* | *, | *,,*) broken "$number" "addresses are not address literals: $addresses"; continue ;;
       esac
       literals "$addresses" || { broken "$number" "addresses are not address literals: $addresses"; continue; }
+      # The host of a URL with an address literal is tried only by address, so it must be one.
+      if [ -n "$literal" ]; then
+        case ,$addresses, in
+          *,"$host",*) ;;
+          *) broken "$number" "the host $host of the URL is not one of its addresses: $addresses"; continue ;;
+        esac
+      fi
       ;;
   esac
 
-  found=""
-  if [ -z "$literal" ] || [ "$addresses" = resolve ]; then
+  if [ -n "$literal" ]; then
+    # An address literal stands for itself: `resolve` tries the URL's own host.
+    found=$host
+  else
     found=$(resolve "$host")
   fi
   if [ -z "$literal" ]; then
