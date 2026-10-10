@@ -44,6 +44,9 @@
 //! mode = "postgres"           # or "disabled", with nothing else in the table
 //! url_env = "SWITCHBOARD_DATABASE_URL"
 //!
+//! [metrics]                   # optional; left out, nothing serves metrics
+//! listen = "0.0.0.0:9090"
+//!
 //! [credentials]
 //! docs-credential = "/run/secrets/docs-credential"
 //! ```
@@ -71,6 +74,10 @@
 //!   is written in the file.
 //! - **Credentials** map each registry server's credential reference to the file holding it.
 //!   Every server's reference must be here, and nothing else may be.
+//! - **Metrics** are served in Prometheus text at `GET /metrics` on a listener of their own
+//!   (see [`crate::metrics`]), and only when `[metrics]` is given. Its `listen` may not take
+//!   the MCP listener's port on the same or an overlapping address: the two are never one
+//!   listener.
 //!
 //! Every table refuses fields it does not know. Only `listen` has a default, [`DEFAULT_LISTEN`],
 //! so a gateway not told where to listen is reachable from its own machine only. Any other
@@ -112,8 +119,19 @@ pub struct DeploymentFile {
     pub identity: IdentityFile,
     /// Where audit rows go.
     pub audit: AuditFile,
+    /// Where metrics are served, if anywhere.
+    #[serde(default)]
+    pub metrics: Option<MetricsSection>,
     /// Each credential reference the registry's servers name, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
+}
+
+/// The metrics listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// The address `GET /metrics` is served on. Never the MCP listener's.
+    pub listen: SocketAddr,
 }
 
 fn default_listen() -> SocketAddr {
@@ -284,6 +302,17 @@ pub enum DeploymentError {
     /// The database URL's environment variable is not set.
     #[error("the environment variable `{0}`, which `audit.url_env` names, is not set")]
     NoDatabaseUrl(String),
+    /// The metrics listener would take the MCP listener's port.
+    #[error(
+        "`metrics.listen` ({metrics}) takes the port the gateway listens on for MCP ({listen}); \
+         metrics are served on a listener of their own"
+    )]
+    MetricsOnMcpListener {
+        /// The metrics address.
+        metrics: SocketAddr,
+        /// The MCP address.
+        listen: SocketAddr,
+    },
 }
 
 /// A deployment file with the files it names read: what [`start`](crate::start) builds the
@@ -308,6 +337,8 @@ pub struct Deployment {
     pub keys_urls: Vec<KeysUrl>,
     /// The audit store.
     pub audit: AuditChoice,
+    /// Where metrics are served, or `None` for nowhere.
+    pub metrics: Option<SocketAddr>,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -319,6 +350,7 @@ impl std::fmt::Debug for Deployment {
             .field("listen", &self.listen)
             .field("registry_file", &self.registry_file)
             .field("audit", &self.audit)
+            .field("metrics", &self.metrics)
             .finish_non_exhaustive()
     }
 }
@@ -401,6 +433,14 @@ impl Deployment {
         if file.registry.poll_seconds == 0 {
             return Err(DeploymentError::PollTooFast);
         }
+        if let Some(metrics) = &file.metrics
+            && takes_port(metrics.listen, file.listen)
+        {
+            return Err(DeploymentError::MetricsOnMcpListener {
+                metrics: metrics.listen,
+                listen: file.listen,
+            });
+        }
         let mut keys_urls = Vec::new();
         let identity = match file.identity {
             IdentityFile::Disabled {} => IdentitySection {
@@ -433,6 +473,7 @@ impl Deployment {
             identity,
             keys_urls,
             audit,
+            metrics: file.metrics.map(|metrics| metrics.listen),
             credentials: file
                 .credentials
                 .into_iter()
@@ -440,6 +481,16 @@ impl Deployment {
                 .collect(),
         })
     }
+}
+
+/// Whether a listener on `metrics` would take the MCP listener's port: the same port, other than
+/// 0 (any free port), on the same address, or where either is every address.
+fn takes_port(metrics: SocketAddr, listen: SocketAddr) -> bool {
+    metrics.port() == listen.port()
+        && metrics.port() != 0
+        && (metrics.ip() == listen.ip()
+            || metrics.ip().is_unspecified()
+            || listen.ip().is_unspecified())
 }
 
 /// One issuer, with its team manifest read, and its keys read from their file or its keys URL

@@ -431,6 +431,8 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
     assert_eq!(field("audit"), [json!("disabled")]);
     assert_eq!(field("revision"), [json!("demo-1")]);
     assert_eq!(field("instance"), [json!(INSTANCE)]);
+    // No `[metrics]`, no metrics listener.
+    assert_eq!(field("metrics"), [json!("off")]);
 
     let team_a = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
     let read = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -457,4 +459,81 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
         .filter_map(|line| line.get("bearer_sha256").cloned())
         .collect();
     assert_eq!(bearers.len(), 1, "{bearers:?}");
+    assert!(
+        !running
+            .seen
+            .iter()
+            .any(|line| line["fields"]["message"] == json!(SERVING_METRICS)),
+        "{:#?}",
+        running.seen
+    );
+}
+
+/// What the metrics listener logs when it starts serving.
+const SERVING_METRICS: &str = "serving metrics at /metrics";
+
+/// `GET target` at `address`: the status and the body.
+fn get(address: SocketAddr, target: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    let mut received = String::new();
+    stream.read_to_string(&mut received).unwrap();
+    let (head, body) = received.split_once("\r\n\r\n").unwrap();
+    (
+        head.split(' ').nth(1).unwrap().parse().unwrap(),
+        body.to_owned(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_metrics_configured_it_serves_them_on_their_own_listener_only() {
+    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+        .await
+        .unwrap();
+    let files = Files::new("binary-metrics", &issuer().jwks_document(), &mock.url());
+    files.write(
+        "gateway.toml",
+        &files::deployment_file(
+            "[audit]\nmode = \"disabled\"\n\n[metrics]\nlisten = \"127.0.0.1:0\"\n",
+        ),
+    );
+    let mut running = tokio::task::block_in_place(|| Running::start(&files));
+    let boot: Vec<Value> = running
+        .boot_lines()
+        .iter()
+        .filter_map(|line| line["fields"].get("metrics").cloned())
+        .collect();
+    assert_eq!(boot, [json!("127.0.0.1:0")]);
+    let logged = running
+        .seen
+        .iter()
+        .find(|line| line["fields"]["message"] == json!(SERVING_METRICS))
+        .cloned();
+    let serving =
+        logged.unwrap_or_else(|| tokio::task::block_in_place(|| running.event(SERVING_METRICS)));
+    let metrics: SocketAddr = serving["fields"]["address"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(metrics, running.address);
+
+    let (status, text) = tokio::task::block_in_place(|| get(metrics, "/metrics"));
+    assert_eq!(status, 200, "{text}");
+    assert!(
+        text.contains("# TYPE switchboard_telemetry_dropped_total counter\n"),
+        "{text}"
+    );
+    // Audit is disabled: there is no store to count.
+    assert!(!text.contains("switchboard_audit_"), "{text}");
+
+    // The MCP listener does not serve them.
+    let (status, _) = tokio::task::block_in_place(|| get(running.address, "/metrics"));
+    assert_eq!(status, 404);
 }

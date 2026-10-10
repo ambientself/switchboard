@@ -1,7 +1,7 @@
 # The gateway's deployment file for the kind demo: `switchboard --config=<this file>`. The format
 # is in crates/gateway/src/deployment.rs. Relative paths are read from this file's directory.
 # Keep it in step with deploy/compose/config/gateway.toml; only the issuer, its keys, the team
-# manifest, the hosts and the credential's path differ.
+# manifest, the hosts, the credential's path and the metrics address differ.
 
 deployment = "kind-demo"
 listen = "0.0.0.0:8080"
@@ -34,6 +34,12 @@ leeway_seconds = 30
 [audit]
 mode = "postgres"
 url_env = "SWITCHBOARD_DATABASE_URL"
+
+[metrics]
+# GET /metrics, in Prometheus text, on the pod's containerPort `metrics` (gateway.yaml), for a
+# scraper in the cluster. The Service does not expose it, and the network policy admits the
+# teams on 8080 only. demo.sh reads it with `kubectl exec ... curl`. Never the MCP port.
+listen = "0.0.0.0:9090"
 
 [credentials]
 # The gateway's own projected ServiceAccount token, for audience mock-docs (gateway.yaml). The

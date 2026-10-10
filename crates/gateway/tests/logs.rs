@@ -274,6 +274,7 @@ async fn each_telemetry_event_names_the_surface_and_the_peer() {
             discover: 1,
             unparsable: 1,
             dropped: 0,
+            audit_failure_answers: 0,
         }
     );
 }

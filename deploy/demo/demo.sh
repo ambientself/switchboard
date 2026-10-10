@@ -32,7 +32,10 @@
 #     the server runs in its JWT mode, and each line also has `caller`, the verified subject of
 #     an accepted token, and `refusal`, why a token was refused;
 #   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
-#     switchboard_reader.
+#     switchboard_reader;
+#   - the gateway's GET /metrics, Prometheus text on its own listener (crates/gateway,
+#     metrics.rs), read with curl inside the gateway's container: port 9090, on loopback in
+#     Compose and on the pod's `metrics` port in kind.
 set -euo pipefail
 unset KUBECONFIG
 
@@ -355,6 +358,39 @@ check_boot() {
   check "$(count_lines '"identity":"disabled"|"audit":"disabled"' "$1")" 0 "the gateway disabled neither identity nor audit"
 }
 
+# metric SERIES TEXT: the value of the one sample of TEXT, Prometheus text, written exactly as
+# SERIES, its name and any labels; nothing if there is none.
+metric() { printf '%s\n' "$2" | awk -v series="$1" '$1 == series { print $2; exit }'; }
+
+# metric_total NAME TEXT: the sum of every sample of the family NAME, whatever its labels, as a
+# whole number; nothing if there is none.
+metric_total() {
+  printf '%s\n' "$2" | awk -v name="$1" '
+    $1 == name || index($1, name "{") == 1 { sum += $2; found = 1 }
+    END { if (found) printf "%d\n", sum }'
+}
+
+# check_metrics OUTAGE TEXT: what the gateway's GET /metrics answered (crates/gateway, metrics.rs).
+# Telemetry dropped is exported, and the last open-row poll found at most the outage's one row
+# open. With OUTAGE=outage, the database outage's refused call is counted as a begin failure and
+# as an answer with the audit-failure sentence.
+check_metrics() {
+  local outage=$1 text=$2
+  printf '%s\n' "$text" \
+    | grep -E '^switchboard_(audit_(begin_failures_total|failure_answers_total|open_rows|open_rows_poll_failures_total|finishes_in_flight)|telemetry_dropped_total)' \
+    | sed 's/^/    /' || echo "    (no samples)"
+  check_at_least "$(metric switchboard_telemetry_dropped_total "$text")" 0 \
+    "metrics: telemetry dropped is exported"
+  check_at_most "$(metric switchboard_audit_open_rows "$text")" 1 \
+    "metrics: the last open-row poll found at most the database outage's refused call's row open"
+  if [ "$outage" = outage ]; then
+    check_at_least "$(metric_total switchboard_audit_begin_failures_total "$text")" 1 \
+      "metrics: the database outage's refused call counted as a begin failure"
+    check_at_least "$(metric switchboard_audit_failure_answers_total "$text")" 1 \
+      "metrics: the database outage's refused call counted as an audit-failure answer"
+  fi
+}
+
 # check_server_bearers LOGS SHA256 CALLS SCOPE: what mock-docs received this run. Every request it
 # accepted carried the gateway's credential, which is SHA256; with SCOPE=all, so did every request
 # carrying any bearer. CALLS is exactly how many calls the gateway allowed so far: one more means
@@ -494,6 +530,9 @@ compose_run() {
     "audit: the call to the withdrawn tool is a deny row under revision demo-2, its resources unknown"
   # Let the gateway load the restored registry before anything else runs against it.
   sleep 4
+
+  step "the gateway's metrics (GET /metrics on its own listener, loopback in the container, unpublished)"
+  check_metrics outage "$(dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics)"
 
   # Three lists: each team's full run, and the run after the withdrawal.
   audit_rows 3
@@ -953,6 +992,11 @@ kind_run() {
   # Two teams refused three ways each (no token, not a token, the default API token), and the
   # stranger once.
   check_at_least "$(count_lines '"event":"identity_failed"' "$gateway_logs")" 7 "the gateway logged every identity failure"
+
+  step "the gateway's metrics (GET /metrics on its own port, which the teams cannot reach)"
+  # The kind run has no database outage.
+  check_metrics none "$(k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \
+    curl -sS --fail http://localhost:9090/metrics)"
 
   # Two lists: each team's full run. The probes before the policy make none, and the
   # stranger's is refused for identity, which writes no row.

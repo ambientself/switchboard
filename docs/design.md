@@ -1195,8 +1195,11 @@ decision-table case for each comment tool, a case showing them denied in every o
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
 
-**#47, what the first slice (#14) still lacks.** The signals of section 11 exported. The route
-check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
+**#47, what the first slice (#14) still lacks.** Receipts in `unknown` and the age of the
+oldest, the two signals of section 11 not exported: they wait for receipts (#10 stage 2), and
+nothing exports a constant in their place. The rest are exported in Prometheus text at
+`GET /metrics`, on a listener of the gateway's own, the default until a sink is chosen
+(decision 0009, Still open 3). The route check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
 before and after the network policy; the kind claim holds only while the evidence log in
 [route-exceptions.md](route-exceptions.md) has a passing run from the last seven days.
 
@@ -1223,7 +1226,7 @@ off only in a development build, with CI's check of the release artifact; and th
   claimed issuer and subject; a refused body adds the protocol rejection's kind, for every
   protocol rejection, not only bodies that are not JSON. Emitting never waits: a full queue
   drops the event and counts the drop. At shutdown, once every answer has finished, the queue
-  is closed and what is in it is written. The counters are not exported yet.
+  is closed and what is in it is written. The counters are exported at `GET /metrics` (#47).
 - The telemetry event for each finish given up, made from the audit store's report of it,
   naming the row and the outcome's kind, with a different second completion logged and counted
   apart from a finish that ran out of time (decision 0009). Today the Postgres store reports

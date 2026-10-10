@@ -329,7 +329,7 @@ impl Accepting<'_> {
 /// A connection that could not be accepted. One the client reset or aborted is its own
 /// problem; anything else, such as running out of file descriptors, is logged and waited out
 /// for a second, so the loop does not spin.
-async fn accept_failed(error: &io::Error) {
+pub(crate) async fn accept_failed(error: &io::Error) {
     if matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused

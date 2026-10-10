@@ -5,6 +5,11 @@
 //! it on the queue if there is room. It never waits: a full or closed queue drops the event,
 //! and the drop is counted. [`Drain`] is the receiving side, a task that writes each event as
 //! one `tracing` event, so it reaches the same JSON lines as the rest of the logs.
+//!
+//! It also counts one thing that is not an event:
+//! [`audit_failure_answered`](Telemetry::audit_failure_answered), each answer that was the
+//! audit-failure sentence. Its log line is the request path's own. [`crate::metrics`] exports
+//! every counter.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -143,6 +148,9 @@ pub struct TelemetryCounts {
     pub unparsable: u64,
     /// Events dropped because the queue was full or closed.
     pub dropped: u64,
+    /// Answers that were the audit-failure sentence: a `tools/call` or `tools/list` refused
+    /// because its row could not be written or completed. Not an event, and never dropped.
+    pub audit_failure_answers: u64,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +161,7 @@ struct Counters {
     discover: AtomicU64,
     unparsable: AtomicU64,
     dropped: AtomicU64,
+    audit_failure_answers: AtomicU64,
 }
 
 /// The sending side of the telemetry queue. Cloning it is cheap: every clone sends to the same
@@ -198,6 +207,13 @@ impl Telemetry {
         }
     }
 
+    /// Counts one answer that was the audit-failure sentence. Never waits.
+    pub fn audit_failure_answered(&self) {
+        self.counters
+            .audit_failure_answers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The counters as they stand.
     pub fn counts(&self) -> TelemetryCounts {
         let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -209,6 +225,7 @@ impl Telemetry {
             discover: read(&counters.discover),
             unparsable: read(&counters.unparsable),
             dropped: read(&counters.dropped),
+            audit_failure_answers: read(&counters.audit_failure_answers),
         }
     }
 }

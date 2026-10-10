@@ -416,6 +416,13 @@ impl RequestPath {
         self.inner.telemetry.emit(event);
     }
 
+    /// The refusal that answers with the audit-failure `sentence`, counted. Every such answer,
+    /// for `tools/call` and `tools/list`, is made here.
+    fn audit_failed(&self, sentence: &str) -> Reply {
+        self.inner.telemetry.audit_failure_answered();
+        Reply::Denied(sentence.to_owned())
+    }
+
     async fn answer(
         self,
         caller: Caller,
@@ -496,7 +503,7 @@ impl RequestPath {
                     list_us,
                     "refused a tool list: its audit row could not be written"
                 );
-                (Reply::Denied(failure.sentence().to_owned()), None)
+                (self.audit_failed(failure.sentence()), None)
             }
             Ok(listed) => {
                 tracing::info!(
@@ -604,7 +611,7 @@ impl RequestPath {
                 // No row is named. The row may not exist, or may exist and later be completed
                 // as an error by recovery, so its identifier would point the caller at a row
                 // that says something other than this refusal, or at nothing.
-                return (Reply::Denied(failure.sentence().to_owned()), None);
+                return (self.audit_failed(failure.sentence()), None);
             }
             Ok(Begun::Denied(refusal)) => {
                 tracing::info!(
@@ -707,7 +714,7 @@ impl RequestPath {
             Answer::Ok(value) => Reply::ToolOk(value),
             Answer::Error(message) => Reply::ToolError(message),
             Answer::Refused(sentence) => Reply::Denied(sentence),
-            Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),
+            Answer::AuditFailed { sentence } => self.audit_failed(sentence),
         };
         (reply, named)
     }

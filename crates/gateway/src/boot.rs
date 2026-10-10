@@ -228,6 +228,12 @@ impl Wiring {
         self
     }
 
+    /// The call deadline each name was given with [`call_deadline`](Self::call_deadline).
+    #[cfg(test)]
+    pub(crate) fn call_deadlines(&self) -> &BTreeMap<ConnectorName, Duration> {
+        &self.call_deadlines
+    }
+
     /// Registers the connector for the registry's server `name`. [`check_registry`] wraps it
     /// in the registry's argument check, and reads its tools' resources with the adapters the
     /// registry approved; [`check`] refuses it.
