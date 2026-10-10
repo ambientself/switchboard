@@ -1,9 +1,10 @@
 # Open questions
 
-Q1–Q8, Q14–Q16 and Q19 are settled below, and so is most of Q9, Q10, Q17 and Q18. Open are
-what remains of Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance
-requires of read auditing; Q11–Q13; and what remains of Q17 and Q18, which decisions 0010 and
-0012 leave to others. When resolved, move their requirements into [design.md](design.md) and
+Q1–Q8, Q14–Q16 and Q19 are settled below, and so is most of Q9, Q10, Q12, Q17 and Q18. Open
+are what remains of Q9, which decision 0011 leaves to others; Q10, narrowed to what compliance
+requires of read auditing; Q11; what remains of Q12, which decision 0014 leaves to the owner
+and others; Q13; and what remains of Q17 and Q18, which decisions 0010 and 0012 leave to
+others. When resolved, move their requirements into [design.md](design.md) and
 remove the open question. Vendor research remains in [systems.md](systems.md).
 
 ## Settled
@@ -118,6 +119,21 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   asked to make the changes this needs; none has been agreed with Otto's owners yet, and what
   waits on them is listed in the decision and under Q18 below. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
+- **2026-10-10 (most of Q12):** A 1 MiB request body; proxied results of 64 KiB and calls of
+  5 s by default, set per server in the deployment file up to 1 MiB and 60 s. No queue and no
+  circuit breaker: 256 requests in flight per instance, refused at admission with no row; 32
+  calls in flight per proxied server and 8 per team per server, refused after begin as
+  `refused` with a capacity sentence. Quotas wait for milestone 4. The identity and audit
+  opt-outs are refused by the release binary; with identity disabled nothing is served and no
+  row is written, and #69 is not planned. Audit pools of 16 and 4, with `max_connections` sized
+  to them. Provisional targets: gateway overhead p95 at most 25 ms and audit begin p95 at most
+  10 ms in-cluster, awaiting a networked Postgres. The 2 s, 2 s and 30 s budgets are final for
+  milestone 3. A row is at most 512 KiB as the store counts it, and records the configured
+  entry identity at begin. The schema stays in this repository; rows, receipts and resolution
+  records are kept 400 days until compliance answers. Metrics and alert conditions are
+  written, with no paging until a rotation exists. Otto's `gateway_audit` question moves to
+  Q18. What the owner and others still decide is under Q12 below. See
+  [decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -182,7 +198,8 @@ compliance requires it for reads.
   - The security team and the storage owners: tamper evidence for rows and receipts, and who
     holds the superuser login.
   - Whoever runs Postgres, probably IT: what "committed" means.
-  - The owner with whoever will own the audit database: who owns the schema (Q12).
+  - Whoever runs Postgres, named with IT: who runs the audit database. The schema stays in
+    this repository ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
   - Whoever runs the on-call rotation: who is paged, and who settles a receipt by hand.
 - **Blocks:** closing #3. The first side effect reaching a real system waits for decision
   0009's Still open 9 (who settles by hand) and 10 (how a resolution is recorded); Otto's
@@ -220,41 +237,25 @@ A definition hash detects interface changes, not a changed implementation behind
 
 ## Q12. Which operational controls belong before broad rollout?
 
-Limits and isolation of a failing server now arrive in milestone 3, before Otto and
-employee access. Explicit identity/audit opt-outs also lack a production deployment restriction.
+Settled by [decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md), except
+the parts below. The record says what holds until each is answered. When they are answered,
+retire Q12.
 
-- **Recommendation:** add request/result size limits, execution deadlines, bounded concurrency,
-  per-team/vendor quotas and isolation of failing upstreams with the first real connectors.
-  Restrict insecure opt-outs to local development and test deployments. Keep registry API/UI
-  work later, driven by onboarding needs.
-- **Before employee proposals:** whether a per-user rate limit must be in place before the
-  first employee proposal tool is approved
-  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). For the
-  owner; no recommendation was made. It is answered before that tool is approved. Policy
-  snapshots are kept as long as the audit rows they explain, so that retention covers both.
-- **Audit operations:** assign storage/migration ownership, retention, access controls and
-  redaction rules before company-wide rollout; avoid storing credentials or unrestricted tool
-  payloads. Define availability and latency targets and measure audit overhead against them.
-  A row's recorded resources alone can reach 147,648 escaped characters, which serialize to
-  298,059 bytes as JSON ([design.md](design.md), section 11). Set size limits in the units the
-  store counts.
-- **Otto's audit table:** Otto's `gateway_audit` table has no column for the resources an
-  allowed call names. A denial's or refusal's sentence names the one resource that caused it,
-  as prose capped at 1,024 characters. `github_skill_body` records its skill ref, repository
-  and commit, but only on an allowed call, on the best-effort finish write. Decide whether the
-  table gains a general column, and who adds it.
-  [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md) makes the table's contract a
-  compatibility requirement, so adding a column changes it. Otto's rule for this table, stated
-  in its migration 0036, is typed columns and not one JSONB bag, so a new column must be
-  typed. Otto's writer bounds each text column in bytes.
-- **Deferred here by decision 0009:** the begin budget, the answer budget and the finish
-  deadline (two, two and thirty seconds until then), call deadlines, pool sizes and alert
-  thresholds; how long rows, receipts and resolution records are kept; and who owns the audit
-  and receipt schema, its grants, triggers and migrations. How long telemetry is kept is for
-  whoever runs logging (decision 0009, Still open 3). An authentication flood no longer
-  writes to the audit store, so the overload question is reduced to begins from proved
-  callers.
-- **Blocks:** rollout sequencing and production readiness.
+- **The owner:** whether a per-user rate limit must be in place before the first employee
+  proposal tool is approved, and if so what limit
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). The
+  recommendation is to leave it open until milestone 5 and track it in #15. Until it is
+  answered no employee proposal tool is approved.
+- **Compliance:** how long rows, receipts and resolution records are kept, with Q10. Until
+  then 400 days, and nothing is deleted before the retention role exists.
+- **Whoever runs Postgres, named with IT:** who runs the audit database, its backups,
+  failover, `max_connections` and superuser login; and what "committed" means (decision 0009,
+  Still open 5). Until then no production deployment is made.
+- **Whoever runs the on-call rotation:** who is paged for the alert conditions in decision
+  0014 (decision 0009, Still open 9). Until then nothing pages.
+- **The security team:** who may read the audit store through the read-only reviewer role,
+  which is created before the first production deployment.
+- **Blocks:** the first production deployment, and the first employee proposal tool.
 
 ## Q13. Which employee clients and access infrastructure are the acceptance targets?
 
@@ -318,8 +319,11 @@ Settled by [decision 0012](decisions/0012-what-a-turn-grant-binds.md), except th
   availability target; any blue/green swap or local execution during milestone 4, and the two
   departures from Otto's control-plane document; whether lease-holding control-plane
   components send their epoch; who in Otto may mark a turn revoked; key custody and rotation;
-  reading the new row fields back in Otto; minting a renamed deployment first; and the
-  audience of the sandbox's identity token for stage 1 copies.
+  reading the new row fields back in Otto; minting a renamed deployment first; the
+  audience of the sandbox's identity token for stage 1 copies; and whether Otto's
+  `gateway_audit` table gains columns for the resources a call names, the credential identity
+  and the error kind, which moved here from Q12
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 - **The on-call rotation, with whoever runs logging:** how audience and pod failures and the
   lifetime-failure rate reach a person, and the rate that alerts. Until then nothing pages and
   the counts are reviewed at each stage's go/no-go.
@@ -331,11 +335,6 @@ Settled by [decision 0012](decisions/0012-what-a-turn-grant-binds.md), except th
 
 From the independent review of 2026-10-01. Accepted in principle, not yet designed:
 
-- Overload behavior for the audit store: admission control and bounded pools (Q12). An
-  authentication flood no longer reaches the database (decision 0009).
 - Freshness and revocation bounds for group claims and team manifests (Q11).
-- Identity and audit opt-outs unavailable outside development builds (Q12). For turn-grant
-  checking this is decided: it can be turned off only in a development build, enforced at boot
-  ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 - A table tracing each invariant to its decision and its test. One now exists for audit and
   receipts (design section 18).
