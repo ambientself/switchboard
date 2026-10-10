@@ -33,8 +33,11 @@
 #   connected, then timed out with no       could-not-probe: something took the connection, so
 #     answer (curl exit 28)                 the route was not refused, but nothing answered
 #   connection refused (curl exit 7)        refused for a row flagged reject_ok, where the route
-#                                           is refused by a reset; could-not-probe otherwise, as
-#                                           a stopped server or a wrong port looks the same
+#                                           is refused by a reset, if no connection was made;
+#                                           could-not-probe otherwise, as a stopped server or a
+#                                           wrong port looks the same, and a refusal after a
+#                                           connection (curl retries on its own, as after an
+#                                           HTTP/2 REFUSED_STREAM) means something was reached
 #   a name that does not resolve (or 6)     could-not-probe
 #   curl printed anything but one status    could-not-probe: the attempt was not one request
 #     and one connection count
@@ -132,8 +135,11 @@ classify() {
       esac
       ;;
     7)
-      case ,$4, in
-        *,reject_ok,*) echo refused ;;
+      # Refused only on a row flagged reject_ok, and only when no connection was made. curl
+      # retries on its own (after an HTTP/2 REFUSED_STREAM, for one), so a refused retry can
+      # follow a connection to a server that was reached.
+      case ,$4,:$3 in
+        *,reject_ok,*:0) echo refused ;;
         *) echo could-not-probe ;;
       esac
       ;;
@@ -166,6 +172,8 @@ attempt() {
     attempt_why="curl exit $attempt_exit"
     if [ "$attempt_exit" -eq 28 ] && [ -n "$attempt_connects" ] && [ "$attempt_connects" != 0 ]; then
       attempt_why="connected, but nothing answered in ${PROBE_TIMEOUT}s (curl exit 28)"
+    elif [ "$attempt_exit" -eq 7 ] && [ -n "$attempt_connects" ] && [ "$attempt_connects" != 0 ]; then
+      attempt_why="connected, then a connection was refused (curl exit 7)"
     fi
     record "$attempt_row" "$attempt_by" "$attempt_target" "$attempt_result" "$attempt_why"
   else
