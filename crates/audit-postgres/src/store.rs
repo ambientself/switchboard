@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use deadpool_postgres::{
     ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod,
@@ -109,6 +109,13 @@ pub enum PgAuditError {
     FinishTaskLost {
         /// The row finish named.
         row: String,
+    },
+    /// The open rows were not counted within their time limit. The store asked the server to
+    /// cancel the query.
+    #[error("the open audit rows were not counted within {budget:?}")]
+    OpenRowsTimedOut {
+        /// The time limit that ran out.
+        budget: Duration,
     },
 }
 
@@ -354,6 +361,19 @@ fn longer(pause: Duration) -> Duration {
 /// How long a request to cancel a statement may take before the store stops asking.
 pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
+/// How long [`PgAuditStore::open_rows`] has, from asking for a connection to its answer.
+pub(crate) const OPEN_ROWS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The open rows (decision 0009, "Open rows"): allowed rows of kind `call` with no completion
+/// past their deadline, by the database's clock. A denial and a list row are never open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenRows {
+    /// How many rows are open.
+    pub count: u64,
+    /// The earliest deadline among them, or `None` when none is open.
+    pub oldest_deadline: Option<SystemTime>,
+}
+
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
 /// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE), and call
@@ -509,6 +529,37 @@ impl PgAuditStore {
             in_flight: self.counters.in_flight.load(Ordering::SeqCst),
             given_up: self.counters.given_up.load(Ordering::SeqCst),
             never_written: self.counters.never_written.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Counts the open rows, and finds the earliest deadline among them, through the view
+    /// `switchboard_audit.open_call_rows`. Runs on the finish pool, within 2 s from asking for a
+    /// connection; past that, it asks the server to cancel the query and fails. Reads only:
+    /// nothing marks a row abandoned or writes its outcome.
+    pub async fn open_rows(&self) -> Result<OpenRows, PgAuditError> {
+        let budget = OPEN_ROWS_TIMEOUT;
+        let deadline = Instant::now() + budget;
+        let client = timeout_at(deadline, self.finish.get())
+            .await
+            .map_err(|_| PgAuditError::OpenRowsTimedOut { budget })??;
+        let query = client.query_one(
+            "SELECT count(*), min(deadline) FROM switchboard_audit.open_call_rows",
+            &[],
+        );
+        match timeout_at(deadline, query).await {
+            Ok(row) => {
+                let row = row?;
+                let count: i64 = row.get(0);
+                Ok(OpenRows {
+                    // count(*) is never negative.
+                    count: u64::try_from(count).unwrap_or_default(),
+                    oldest_deadline: row.get(1),
+                })
+            }
+            Err(_) => {
+                abandon(client, &self.cancel);
+                Err(PgAuditError::OpenRowsTimedOut { budget })
+            }
         }
     }
 

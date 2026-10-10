@@ -2996,6 +2996,33 @@ mutate("pg-check-server-functions-ignored", "a role that can run a function reac
 for server_function in ["lo_export", "lo_import", "pg_ls_dir", "pg_read_binary_file", "pg_read_file", "pg_stat_file"]:
     mutate(f"pg-check-{server_function.replace('_', '-')}-ignored", f"a role that can run {server_function} passes the check", PG_CHECK,
            f'    "{server_function}",\n', "")
+# Open rows. The boot check compares the view with the definition it expects, so each change to
+# the view changes that definition as well, and the open-row tests must catch it themselves.
+PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"
+OPEN_ROWS_WHERE = "    WHERE kind = 'call' AND decision = 'allow' AND outcome IS NULL\n"
+OPEN_ROWS_EXPECTED = "    WHERE ((kind = 'call'::text) AND (decision = 'allow'::text) AND (outcome IS NULL) \\\n"
+mutate_all("pg-open-rows-no-kind-filter", "the open-row query counts a row of any kind",
+           (PG_OPEN_ROWS, OPEN_ROWS_WHERE, "    WHERE decision = 'allow' AND outcome IS NULL\n"),
+           (PG_CHECK, OPEN_ROWS_EXPECTED, "    WHERE ((decision = 'allow'::text) AND (outcome IS NULL) \\\n"))
+mutate_all("pg-open-rows-deadline-vs-begun-at", "the open-row query counts a row from its begin, not its deadline",
+           (PG_OPEN_ROWS, "        AND deadline < clock_timestamp();", "        AND begun_at < clock_timestamp();"),
+           (PG_CHECK, "    AND (deadline < clock_timestamp()));\";", "    AND (begun_at < clock_timestamp()));\";"))
+mutate_all("pg-open-rows-no-decision-filter", "the open-row query counts denials",
+           (PG_OPEN_ROWS, OPEN_ROWS_WHERE, "    WHERE kind = 'call' AND outcome IS NULL\n"),
+           (PG_CHECK, OPEN_ROWS_EXPECTED, "    WHERE ((kind = 'call'::text) AND (outcome IS NULL) \\\n"))
+mutate("pg-check-open-rows-missing-ignored", "a database without the open-row view passes the check", PG_CHECK,
+       "        problems.push(Problem::OpenRowsMissing);\n", "")
+mutate("pg-check-open-rows-definition-ignored", "an open-row view with another definition passes the check", PG_CHECK,
+       "    if definition != OPEN_ROWS_DEFINITION {", "    if false {")
+mutate("pg-check-open-rows-owner-ignored", "an open-row view owned by another role passes the check", PG_CHECK,
+       "    if owner != OWNER_ROLE {", "    if false {")
+mutate("pg-check-open-rows-any-privilege", "any privilege on the open-row view passes the check", PG_CHECK,
+       "AND NOT (c.relname = $2 AND c.relkind = 'v' AND p = 'SELECT')", "AND NOT (c.relname = $2 AND c.relkind = 'v')")
+mutate("pg-check-open-rows-grant-option-ignored", "a grant option on the open-row view passes the check", PG_CHECK,
+       "    if view.get::<_, bool>(3) {", "    if false {")
+mutate("pg-check-open-rows-column-grant-option", "a grant option on one column of the open-row view passes the check",
+       PG_CHECK, "has_any_column_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')",
+       "has_table_privilege(r.oid, c.oid, 'SELECT WITH GRANT OPTION')")
 
 
 # --- demo-checks ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 mod budgets;
 mod check;
 mod latency;
+mod open_rows;
 mod recovery;
 mod schema;
 mod store;
@@ -93,7 +94,7 @@ impl TestDatabase {
             }
         }
         let mut owner = database.connect_as(OWNER_ROLE).await;
-        assert_eq!(migrate(&mut owner).await.unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(migrate(&mut owner).await.unwrap(), vec![1, 2, 3, 4, 5]);
         Some(database)
     }
 

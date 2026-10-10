@@ -6,8 +6,8 @@ use tokio_postgres::NoTls;
 use std::collections::BTreeSet;
 
 use super::{DUMMY_PASSWORD, GATEWAY_ROLE, OWNER_ROLE, TestDatabase, connect};
-use crate::check::{INSERTED, SELECTED, UPDATED};
-use crate::{BootCheckError, PgAuditStore, PoolSizes, Problem};
+use crate::check::{INSERTED, OPEN_ROWS_DEFINITION, SELECTED, UPDATED};
+use crate::{BootCheckError, MIGRATIONS, PgAuditStore, PoolSizes, Problem};
 
 /// The problems the check found, which must be some.
 async fn problems(store: &PgAuditStore) -> Vec<Problem> {
@@ -22,6 +22,13 @@ fn extra(privilege: &str, object: &str) -> Problem {
         privilege: privilege.into(),
         object: object.into(),
     }
+}
+
+/// Makes the open-row view again, as migration 0005 does, as the owner: for a test that put
+/// another table in place of `call_rows`, which took the view with the old one.
+fn open_rows_again() -> String {
+    let migration = MIGRATIONS.iter().find(|m| m.name == "open_rows").unwrap();
+    format!("SET ROLE {OWNER_ROLE}; {} RESET ROLE;", migration.sql)
 }
 
 fn attribute(role: &str, attribute: &'static str) -> Problem {
@@ -544,7 +551,8 @@ async fn grant_the_gateways_own(db: &TestDatabase, role: &str, option: &str) {
             "GRANT USAGE ON SCHEMA switchboard_audit TO {role}{option};
              GRANT INSERT ({}) ON switchboard_audit.call_rows TO {role}{option};
              GRANT UPDATE ({}) ON switchboard_audit.call_rows TO {role}{option};
-             GRANT SELECT ({}) ON switchboard_audit.call_rows TO {role}{option};",
+             GRANT SELECT ({}) ON switchboard_audit.call_rows TO {role}{option};
+             GRANT SELECT ON switchboard_audit.open_call_rows TO {role}{option};",
             INSERTED.join(", "),
             UPDATED.join(", "),
             SELECTED.join(", "),
@@ -655,9 +663,10 @@ async fn a_role_that_does_not_inherit_the_gateways_privileges_is_refused() {
             .all(|problem| matches!(problem, Problem::Missing { .. })),
         "{found:?}"
     );
+    // Each column privilege, USAGE on the schema, and SELECT on the open-row view.
     assert_eq!(
         found.len(),
-        INSERTED.len() + UPDATED.len() + SELECTED.len() + 1,
+        INSERTED.len() + UPDATED.len() + SELECTED.len() + 2,
         "{found:?}"
     );
 }
@@ -689,6 +698,10 @@ async fn the_gateways_own_privileges_with_grant_option_are_refused() {
     expected.push(extra(
         "USAGE WITH GRANT OPTION",
         "the schema switchboard_audit",
+    ));
+    expected.push(extra(
+        "SELECT WITH GRANT OPTION",
+        "switchboard_audit.open_call_rows",
     ));
     assert_eq!(problems(&db.store_as(&role)).await, expected);
 }
@@ -745,7 +758,7 @@ async fn a_missing_column_or_one_of_another_type_is_refused() {
         .await
         .batch_execute(
             "ALTER TABLE switchboard_audit.call_rows DROP COLUMN claimed_team;
-             ALTER TABLE switchboard_audit.call_rows DROP COLUMN deadline;
+             ALTER TABLE switchboard_audit.call_rows DROP COLUMN deadline CASCADE;
              ALTER TABLE switchboard_audit.call_rows ALTER COLUMN latency_ms TYPE integer;",
         )
         .await
@@ -779,12 +792,13 @@ async fn a_missing_table_is_refused() {
     };
     db.admin()
         .await
-        .batch_execute("DROP TABLE switchboard_audit.call_rows")
+        .batch_execute("DROP TABLE switchboard_audit.call_rows CASCADE")
         .await
         .unwrap();
+    // The open-row view goes with the table it reads.
     assert_eq!(
         problems(&db.store(PoolSizes::default())).await,
-        vec![Problem::TableMissing]
+        vec![Problem::TableMissing, Problem::OpenRowsMissing]
     );
 }
 
@@ -802,7 +816,7 @@ async fn a_relation_named_call_rows_that_is_not_a_table_is_refused() {
     db.admin()
         .await
         .batch_execute(&format!(
-            "DROP TABLE switchboard_audit.call_rows;
+            "DROP TABLE switchboard_audit.call_rows CASCADE;
              CREATE FOREIGN DATA WRAPPER switchboard_test_wrapper;
              CREATE SERVER switchboard_test_server FOREIGN DATA WRAPPER switchboard_test_wrapper;
              CREATE FOREIGN TABLE switchboard_audit.call_rows ({columns})
@@ -814,11 +828,13 @@ async fn a_relation_named_call_rows_that_is_not_a_table_is_refused() {
                  FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();
              GRANT INSERT ({inserted}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
              GRANT UPDATE ({updated}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
-             GRANT SELECT ({selected}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};",
+             GRANT SELECT ({selected}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
+             {open_rows}",
             columns = columns.join(", "),
             inserted = INSERTED.join(", "),
             updated = UPDATED.join(", "),
             selected = SELECTED.join(", "),
+            open_rows = open_rows_again(),
         ))
         .await
         .unwrap();
@@ -901,7 +917,7 @@ async fn a_partitioned_table_is_refused() {
              CREATE TABLE switchboard_audit.call_rows
                  (LIKE switchboard_audit.old_rows INCLUDING DEFAULTS INCLUDING CONSTRAINTS)
                  PARTITION BY LIST (decision);
-             DROP TABLE switchboard_audit.old_rows;
+             DROP TABLE switchboard_audit.old_rows CASCADE;
              ALTER TABLE switchboard_audit.call_rows OWNER TO {OWNER_ROLE};
              CREATE TRIGGER complete_once BEFORE UPDATE ON switchboard_audit.call_rows
                  FOR EACH ROW EXECUTE FUNCTION switchboard_audit.complete_once();
@@ -909,10 +925,12 @@ async fn a_partitioned_table_is_refused() {
                  FOR EACH ROW EXECUTE FUNCTION switchboard_audit.set_times();
              GRANT INSERT ({inserted}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
              GRANT UPDATE ({updated}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
-             GRANT SELECT ({selected}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};",
+             GRANT SELECT ({selected}) ON switchboard_audit.call_rows TO {GATEWAY_ROLE};
+             {open_rows}",
             inserted = INSERTED.join(", "),
             updated = UPDATED.join(", "),
             selected = SELECTED.join(", "),
+            open_rows = open_rows_again(),
         ))
         .await
         .unwrap();
@@ -1790,4 +1808,169 @@ async fn a_role_that_can_run_a_function_that_reaches_the_servers_files_is_refuse
         })
         .collect();
     assert_eq!(problems(&store).await, expected);
+}
+
+/// The open-row view must be there, as migration 0005 makes it: a view, owned by the owner,
+/// with that definition, which the gateway's role may select from and do nothing else with.
+/// A view runs with its owner's privileges, so one with another definition could count rows
+/// that are not open, miss rows that are, or show the gateway who called.
+#[tokio::test]
+async fn the_open_row_view_must_be_as_the_migration_makes_it() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    let store = db.store(PoolSizes::default());
+    let view = "switchboard_audit.open_call_rows";
+    let replace = |definition: &str| {
+        format!(
+            "DROP VIEW {view};
+             SET ROLE {OWNER_ROLE};
+             CREATE VIEW {view} AS {definition};
+             GRANT SELECT ON {view} TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        )
+    };
+
+    admin
+        .batch_execute(&format!("DROP VIEW {view}"))
+        .await
+        .unwrap();
+    assert_eq!(problems(&store).await, vec![Problem::OpenRowsMissing]);
+    assert_eq!(
+        Problem::OpenRowsMissing.to_string(),
+        "the view switchboard_audit.open_call_rows, which the open-row query reads, does not exist"
+    );
+    // Nor is a table of that name the view.
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE TABLE {view} (id uuid, deadline timestamptz, begun_at timestamptz);
+             GRANT SELECT ON {view} TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![extra("SELECT", view), Problem::OpenRowsMissing]
+    );
+    admin
+        .batch_execute(&format!("DROP TABLE {view}; {}", open_rows_again()))
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+
+    // Another definition: one that counts list rows, or deny rows, or rows whose deadline has
+    // not passed, or shows who called.
+    let open = "kind = 'call' AND decision = 'allow' AND outcome IS NULL \
+                AND deadline < clock_timestamp()";
+    for (definition, shows) in [
+        (
+            "SELECT id, deadline, begun_at FROM switchboard_audit.call_rows \
+             WHERE decision = 'allow' AND outcome IS NULL AND deadline < clock_timestamp()"
+                .to_owned(),
+            "WHERE ((decision = 'allow'::text) AND",
+        ),
+        (
+            "SELECT id, deadline, begun_at FROM switchboard_audit.call_rows \
+             WHERE kind = 'call' AND outcome IS NULL AND deadline < clock_timestamp()"
+                .to_owned(),
+            "WHERE ((kind = 'call'::text) AND (outcome IS NULL)",
+        ),
+        (
+            "SELECT id, deadline, begun_at FROM switchboard_audit.call_rows \
+             WHERE kind = 'call' AND decision = 'allow' AND outcome IS NULL \
+             AND begun_at < clock_timestamp()"
+                .to_owned(),
+            "(begun_at < clock_timestamp())",
+        ),
+        (
+            format!(
+                "SELECT id, deadline, begun_at, proved_subject \
+                 FROM switchboard_audit.call_rows WHERE {open}"
+            ),
+            "begun_at, proved_subject FROM",
+        ),
+    ] {
+        admin.batch_execute(&replace(&definition)).await.unwrap();
+        let found = problems(&store).await;
+        let [Problem::OpenRowsDefinition { found: rendered }] = found.as_slice() else {
+            panic!("{definition}: {found:?}");
+        };
+        assert!(rendered.contains(shows), "{rendered}");
+        assert_ne!(rendered, OPEN_ROWS_DEFINITION);
+    }
+
+    // The definition the migration gives, written another way, is the same view.
+    admin
+        .batch_execute(&replace(&format!(
+            "SELECT id,\n\tdeadline,  begun_at\n FROM switchboard_audit.call_rows\n WHERE {open}"
+        )))
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+
+    // Owned by another role, here the server's superuser, which can read anything.
+    let superuser = db.admin_config().get_user().unwrap().to_owned();
+    admin
+        .batch_execute(&format!("ALTER VIEW {view} OWNER TO {superuser}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![Problem::OpenRowsOwner { owner: superuser }]
+    );
+    admin
+        .batch_execute(&format!("ALTER VIEW {view} OWNER TO {OWNER_ROLE}"))
+        .await
+        .unwrap();
+
+    // The gateway's role must select from it, and may not pass that on or write through it.
+    admin
+        .batch_execute(&format!("REVOKE SELECT ON {view} FROM {GATEWAY_ROLE}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![Problem::Missing {
+            privilege: "SELECT".into(),
+            object: view.into(),
+        }]
+    );
+    admin
+        .batch_execute(&format!(
+            "GRANT SELECT ON {view} TO {GATEWAY_ROLE} WITH GRANT OPTION;
+             GRANT DELETE, UPDATE (deadline) ON {view} TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![
+            extra("DELETE", view),
+            extra("UPDATE", view),
+            extra("SELECT WITH GRANT OPTION", view),
+        ]
+    );
+
+    // A grant option on one column of it can be passed on too.
+    admin
+        .batch_execute(&format!(
+            "REVOKE GRANT OPTION FOR SELECT ON {view} FROM {GATEWAY_ROLE};
+             REVOKE DELETE, UPDATE ON {view} FROM {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+    admin
+        .batch_execute(&format!(
+            "GRANT SELECT (begun_at) ON {view} TO {GATEWAY_ROLE} WITH GRANT OPTION"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![extra("SELECT WITH GRANT OPTION", view)]
+    );
 }

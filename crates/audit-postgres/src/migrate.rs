@@ -52,6 +52,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "list_rows",
         sql: include_str!("../sql/migrations/0004_list_rows.sql"),
     },
+    Migration {
+        version: 5,
+        name: "open_rows",
+        sql: include_str!("../sql/migrations/0005_open_rows.sql"),
+    },
 ];
 
 /// Any number, the same in every gateway: two migrators on one database take turns.
