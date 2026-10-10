@@ -1141,7 +1141,14 @@ mutate("testkit-nul-accepted", "the in-memory store writes a value with U+0000, 
 mutate("testkit-past-bigint-accepted", "the in-memory store writes a count, latency or allowance past a Postgres bigint", A,
        "    if i64::try_from(value).is_err() {", "    if false {")
 mutate("testkit-list-unchecked", "the in-memory store writes any list record", A,
-       "            refused_at_list(record)?;\n", "")
+       "            refused_at_list(row, record)?;\n", "")
+mutate("testkit-non-uuid-accepted", "the in-memory store writes a row under an identifier that is not a lowercase hyphenated UUID", A,
+       "    if !uuid {\n", "    if false {\n")
+mutate("testkit-complete-at-begin-accepted", "the in-memory store's begin writes a record that is already complete", A,
+       "    if record.completion.is_some() {\n", "    if false {\n")
+mutate("testkit-unknown-resources-omitted-accepted", "the in-memory store writes unknown resources with a count left out", A,
+       "    if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {",
+       "    if false {")
 mutate("testkit-completion-unchecked", "the in-memory store writes any completion", A,
        "            refused_at_finish(completion.completion())?;\n", "")
 mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round to a short deadline", A,

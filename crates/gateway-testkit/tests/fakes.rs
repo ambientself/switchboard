@@ -8,7 +8,7 @@ use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, Begun, Completion, DecisionKind, ListRecord, Outcome,
+    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ListRecord, Outcome,
     RecordedResource, RecordedResources, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
@@ -1117,6 +1117,67 @@ fn a_count_or_a_latency_past_a_postgres_bigint_is_refused_and_writes_nothing() {
             .map(|completion| completion.latency_ms),
         Some(longest)
     );
+}
+
+/// The Postgres store refuses an identifier that is not a UUID in the lowercase hyphenated
+/// form, a record handed to begin already complete, and unknown resources with a count left
+/// out. The fake refuses the same, and writes no row.
+#[test]
+fn an_identifier_a_completion_or_a_shape_postgres_refuses_writes_no_row() {
+    let fixture = fixture();
+    let (allowed, _) = records(&fixture);
+    let listed = list_record(&fixture);
+    let store = InMemoryAuditStore::new();
+    let uuid = row_start().row;
+    let spellings = [
+        "not-a-uuid".to_owned(),
+        "ROW-1".to_owned(),
+        uuid.as_str().to_uppercase(),
+        uuid.as_str().replace('-', ""),
+        format!("{{{}}}", uuid.as_str()),
+    ];
+    for id in &spellings {
+        let id = AuditRowId::new(id.clone());
+        assert!(
+            block_on(store.begin(&id, &allowed)).is_err(),
+            "begin wrote the row {}",
+            id.as_str()
+        );
+        assert!(
+            block_on(store.list(&id, &listed)).is_err(),
+            "list wrote the row {}",
+            id.as_str()
+        );
+    }
+
+    let complete = AuditRecord {
+        completion: Some(Completion {
+            outcome: Outcome::Ok,
+            latency_ms: u64::MAX,
+        }),
+        ..allowed.clone()
+    };
+    assert!(block_on(store.begin(&row_start().row, &complete)).is_err());
+    let unknown_with_omitted = AuditRecord {
+        resources: RecordedResources::Unknown,
+        resources_omitted: 3,
+        ..allowed.clone()
+    };
+    assert!(block_on(store.begin(&row_start().row, &unknown_with_omitted)).is_err());
+    assert!(store.rows().is_empty() && store.list_rows().is_empty());
+
+    // The same records, with a lowercase hyphenated identifier, no completion and no count
+    // left out of unknown resources, are written.
+    assert!(block_on(store.begin(&uuid, &allowed)).is_ok());
+    assert!(block_on(store.list(&row_start().row, &listed)).is_ok());
+    let unknown = AuditRecord {
+        resources: RecordedResources::Unknown,
+        resources_omitted: 0,
+        ..allowed
+    };
+    assert!(block_on(store.begin(&row_start().row, &unknown)).is_ok());
+    assert_eq!(store.rows().len(), 2);
+    assert_eq!(store.list_rows().len(), 1);
 }
 
 /// The deadline is worked out as the Postgres store does: the begin budget and the finish

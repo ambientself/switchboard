@@ -1132,9 +1132,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   modes are built in the harness's store: a lost confirmation writes the row and fails, and
   an allowed row is then completed as `error` with a latency of zero; a finish past the answer
   budget fails at once and writes when a gate opens; and forgotten finishes leave a row open
-  for a new gateway over the same store. It also refuses the records the Postgres store
-  cannot hold, and works out a deadline in whole milliseconds without wrapping, as that store
-  does. The contract suite itself is not built.
+  for a new gateway over the same store. It also refuses what the Postgres store's column
+  mapping refuses: an identifier that is not a lowercase hyphenated UUID, a record already
+  complete at begin, U+0000 in a text value, and a count, latency or allowance past a
+  `bigint`. Of the table's own constraints it checks only that unknown resources have no
+  count left out; the others are not checked in the fake yet. It works out a deadline in whole
+  milliseconds without wrapping, as that store does. The contract suite itself is not built.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped, but no outcome carries a vendor reference yet.
@@ -1319,7 +1322,9 @@ that can do what Postgres cannot tests nothing.
 1. `begin` returns `Ok` only once the row is stored, and is idempotent by identifier.
 2. The stored row is exactly the record given, including the resources. A record the store
    cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
-   leaves no row. The fake must refuse the same records.
+   leaves no row. The fake must refuse the same records. It refuses what the Postgres store's
+   column mapping refuses; of the table's own constraints, it checks only the shape of
+   unknown resources so far.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the

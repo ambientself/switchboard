@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use gateway_core::audit::{
-    AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RowCompletion, RowKind, RowStart,
-    StoreError,
+    AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RecordedResources, RowCompletion,
+    RowKind, RowStart, StoreError,
 };
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, InstanceName};
 use gateway_identity::Clock;
@@ -122,21 +122,53 @@ fn as_u64(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
-/// The allowance for `record`'s deadline, or why the Postgres store would refuse to write it:
-/// a text value with U+0000, or a count or an allowance past a `bigint`.
-fn refused_at_begin(record: &AuditRecord, budgets: &StoreBudgets) -> Result<u64, StoreError> {
+/// Refuses an identifier that is not a UUID in the lowercase hyphenated form: 8, 4, 4, 4 and
+/// 12 hex digits. The Postgres store refuses other spellings, so that one row has one.
+fn refuse_non_uuid(id: &AuditRowId) -> Result<(), StoreError> {
+    let id = id.as_str();
+    let uuid = id.len() == 36
+        && id.char_indices().all(|(at, c)| match at {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => matches!(c, '0'..='9' | 'a'..='f'),
+        });
+    if !uuid {
+        return Err(format!(
+            "audit row identifier {id:?} is not a UUID in the lowercase hyphenated form"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The allowance for `record`'s deadline, or why the Postgres store would refuse to write it
+/// as the row `id`: an identifier that is not a lowercase hyphenated UUID, a record already
+/// complete, a text value with U+0000, a count or an allowance past a `bigint`, or unknown
+/// resources with a count left out.
+fn refused_at_begin(
+    id: &AuditRowId,
+    record: &AuditRecord,
+    budgets: &StoreBudgets,
+) -> Result<u64, StoreError> {
+    if record.completion.is_some() {
+        return Err("begin was handed a record that is already complete".into());
+    }
+    refuse_non_uuid(id)?;
     refuse_nul(serde_json::to_value(record))?;
     refuse_past_bigint(
         "the count of resources left out",
         as_u64(record.resources_omitted),
     )?;
+    if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {
+        return Err("unknown resources cannot have a count left out".into());
+    }
     let allowance = allowance_ms(budgets, record.call_deadline_ms);
     refuse_past_bigint("the row's allowance", allowance)?;
     Ok(allowance)
 }
 
-/// Why the Postgres store would refuse to write `record`, if it would.
-fn refused_at_list(record: &ListRecord) -> Result<(), StoreError> {
+/// Why the Postgres store would refuse to write `record` as the row `id`, if it would.
+fn refused_at_list(id: &AuditRowId, record: &ListRecord) -> Result<(), StoreError> {
+    refuse_non_uuid(id)?;
     refuse_nul(serde_json::to_value(record))?;
     refuse_past_bigint("the count of tools left out", as_u64(record.tools_omitted))
 }
@@ -247,9 +279,12 @@ impl State {
 /// succeeds if it is identical to the completion the row has, and otherwise fails and leaves
 /// the first completion standing.
 ///
-/// It refuses what the Postgres store cannot write exactly, and writes nothing: a record, list
-/// record or completion with U+0000 in a text value, a count of resources or tools left out
-/// or a latency past a Postgres `bigint`, and a call row whose allowance is past one.
+/// It refuses what the Postgres store's column mapping refuses, and writes nothing: an
+/// identifier that is not a UUID in the lowercase hyphenated form, a record handed to begin
+/// already complete, a record, list record or completion with U+0000 in a text value, a count
+/// of resources or tools left out or a latency past a Postgres `bigint`, and a call row whose
+/// allowance is past one. Of the table's own constraints it checks only one: unknown resources
+/// with a count left out.
 ///
 /// It fails the ways decision 0009 says the fake must, each until told otherwise or once:
 ///
@@ -511,7 +546,7 @@ impl AuditStore for InMemoryAuditStore {
             state.begin_gate.clone()
         };
         Box::pin(async move {
-            let allowance_ms = refused_at_begin(record, &self.budgets)?;
+            let allowance_ms = refused_at_begin(row, record, &self.budgets)?;
             if let Some(gate) = gate {
                 gate.wait().await;
             }
@@ -597,7 +632,7 @@ impl AuditStore for InMemoryAuditStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let gate = self.state().begin_gate.clone();
         Box::pin(async move {
-            refused_at_list(record)?;
+            refused_at_list(row, record)?;
             if let Some(gate) = gate {
                 gate.wait().await;
             }
