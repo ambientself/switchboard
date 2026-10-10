@@ -10,6 +10,9 @@ is [decision 0012](0012-what-a-turn-grant-binds.md). Written against [decision
 0006](0006-what-the-decision-function-sees.md) as amended on 2026-10-04 (`propose`, and `write`
 and `destructive` denied in every profile), and against the resources column on the audit
 record that pull request #30 added, merged on 2026-10-07.
+Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) sets the
+values Q12 owned, keeps identity disabled refusing everything, and records a capacity refusal as
+`refused`. Each change is a dated note at the passage it concerns.
 
 Part 1 covers every audit row and is needed before milestone 2. Part 2 covers receipts and is
 needed before the first tool not classified `read` reaches a real system. Both are accepted.
@@ -73,6 +76,12 @@ is a telemetry event. The cost is that failed authentication is kept less durabl
 audit, can be dropped under load, and an incident review joins two sources. Whether that loss is
 acceptable is the security team's call (Still open 4), and where telemetry goes is for whoever
 runs logging (Still open 3).
+
+Noted on 2026-10-10 ([decision 0014](0014-rollout-safeguards-and-audit-operations.md)): no row
+is written with identity `disabled`, so the table's "with identity checking explicitly disabled"
+and the sentence above on "We were not checking" describe a mode that is not built. Identity can
+be turned off only in a development build, and there nothing is listed and every `tools/call` is
+refused, with no row. #69, which would have built such rows, is not planned.
 
 **A delegation that cannot be verified is an audit row.** A forged or expired turn grant
 presented under a proved workload identity is one of the most security-relevant events the
@@ -199,6 +208,11 @@ For a side effect, the outcome settles the receipt (part 2): `ok` as `completed`
 as `refused` or `duplicate`, reserves no receipt of its own and leaves the earlier one as it
 is.
 
+Noted on 2026-10-10 ([decision 0014](0014-rollout-safeguards-and-audit-operations.md)):
+`refused` also covers a call refused by the per-server or per-team concurrency cap, which is
+taken after begin. Its row keeps a fixed capacity sentence. Nothing was sent, so a side effect's
+receipt is `not_performed`.
+
 ### Open rows
 
 Nothing writes to an audit row except begin and finish, and nothing marks it afterwards. What
@@ -251,6 +265,11 @@ Two seconds for the begin budget. Two seconds for the answer budget, as in Otto.
 seconds for the finish deadline, counted from when the tool returns. Call deadlines are set per
 tool. The owner accepted these as defaults on 2026-10-07. Q12 owns all of them, and sets the
 final values from the first slice's measurements.
+
+Noted on 2026-10-10 ([decision 0014](0014-rollout-safeguards-and-audit-operations.md)): the 2 s,
+2 s and 30 s are final for milestone 3. Call deadlines are set per proxied server, not per tool,
+in the deployment file: 5 s by default and at most 60 s. A connector in the gateway's own
+process gets its bound with milestone 4's built-in connectors.
 
 ### Signals
 
@@ -351,6 +370,11 @@ exist"). Reads are served, each with a row whose identity is `disabled`. The bui
 less, and stricter: with identity disabled it refuses every `tools/call` and lists nothing, with
 no row. It keeps doing so until the core and store can record a row with identity `disabled`
 (design section 17).
+
+Noted on 2026-10-10 ([decision 0014](0014-rollout-safeguards-and-audit-operations.md)): the
+built path is kept. With identity disabled nothing is listed and every `tools/call` is refused,
+with no row, and only a development build may disable identity. Reads are not served with rows
+whose identity is `disabled`; #69 is not planned.
 
 ### The argument digest
 
@@ -616,6 +640,10 @@ this table are also in section 18 of the design.
 - Q12 owns the provisional values, pool sizes, alert thresholds, and how long rows, receipts
   and resolution records are kept. How long telemetry is kept is Still open 3. A key is honored
   only while its receipt is kept.
+  Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) sets
+  them. The values are final for milestone 3, the pools stay 16 and 4, the alert conditions are
+  written there, and rows, receipts and resolution records are kept 400 days until compliance
+  answers.
 - Deployments set their termination grace period and readiness delay explicitly.
 - The resources a self-scoping tool actually reached belong in finish when they are added.
 - Code already built does not yet do what this record requires. The Postgres store built for
@@ -688,6 +716,10 @@ for 8.
    proposal made no recommendation. The owner decides with whoever will own the audit
    database, under Q12. Until then the schema and its migrations live in this repository.
    (Proposal 7.)
+   Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) splits
+   it. The schema, grants, triggers and migrations stay in this repository under its code
+   owners. The Postgres instance belongs to whoever runs Postgres, to be named with IT, which
+   stays open in that record.
 7. **Tamper evidence beyond grants and triggers,** such as an append-only copy or a hash chain,
    and who holds the database superuser login. This covers receipts as well as rows, including
    whether the gateway's role should see less of a receipt than the principal, tool and
