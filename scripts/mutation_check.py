@@ -710,7 +710,8 @@ mutate("finish-ignores-outcome", "finish writes ok whatever happened", SRC + "au
 mutate("finish-ignores-latency", "finish writes a latency of zero", SRC + "audit.rs",
        "            outcome: recorded,\n            latency_ms,", "            outcome: recorded,\n            latency_ms: { let _ = latency_ms; 0 },")
 mutate("finish-wrong-row", "finish completes row 0 whatever ran", SRC + "audit.rs",
-       "    let completion = RowCompletion {\n        row,", '    let completion = RowCompletion {\n        row: { let _ = row; AuditRowId::new("0") },')
+       "    let completion = RowCompletion {\n        row,\n        completion: Completion {\n            outcome: recorded,",
+       '    let completion = RowCompletion {\n        row: { let _ = row; AuditRowId::new("0") },\n        completion: Completion {\n            outcome: recorded,')
 mutate("finish-error-swallowed", "a store error on finish is not reported", SRC + "audit.rs",
        "            failure: Some(AuditFailure::from_store(error)),", "            failure: { let _ = error; None },")
 mutate("finish-refusal-unrecorded-answered", "a refusal that could not be recorded is still answered with its sentence", SRC + "audit.rs",
@@ -718,6 +719,12 @@ mutate("finish-refusal-unrecorded-answered", "a refusal that could not be record
        "")
 mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not the one recorded", SRC + "audit.rs",
        "            Answer::Refused(sentence),", "            Answer::Refused(sentence.to_uppercase()),")
+# A guard given up (decision 0009): its row is completed as error, never ok, through the store.
+mutate("core-give-up-completes-ok", "a guard given up records its call as ok", SRC + "audit.rs",
+       "            outcome: Outcome::Error,\n            latency_ms: 0,", "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+mutate("core-give-up-skips-finish", "a guard given up leaves its row open and reports no failure", SRC + "audit.rs",
+       "    let failure = store\n        .finish(&completion)\n        .await\n        .err()\n        .map(AuditFailure::from_store);",
+       "    let failure: Option<AuditFailure> = None;")
 # A list row (decision 0009): the tools it names, its count, and the value only it can make.
 mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
        "            .take(MAX_RECORDED_TOOLS)\n", "")

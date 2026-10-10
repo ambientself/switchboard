@@ -32,7 +32,7 @@ mod principal;
 pub mod proof;
 mod sentences;
 
-pub use audit::{AuditGuard, AuditRecord, AuditStore};
+pub use audit::{AuditGuard, AuditRecord, AuditStore, GaveUp, give_up};
 pub use classification::{Classification, UnrecognizedClassification};
 pub use connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
 pub use credential::{CredentialError, CredentialHandle, CredentialSource};
