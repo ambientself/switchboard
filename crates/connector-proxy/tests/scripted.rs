@@ -148,25 +148,26 @@ async fn a_403_is_the_servers_refusal() {
     })
     .await;
 
-    assert_eq!(
-        answer,
-        Answer::Refused(outcome::UPSTREAM_REFUSED.to_owned())
-    );
+    assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
 }
 
 #[tokio::test]
-async fn a_403_is_recorded_as_refused() {
-    let (_, outcome) = recorded(READ_TOOL, |_| {
-        vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
-    })
-    .await;
+async fn a_403_is_recorded_as_a_vendor_refusal() {
+    for tool in [READ_TOOL, DRAFT_TOOL] {
+        let (answer, outcome) = recorded(tool, |_| {
+            vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
+        })
+        .await;
 
-    assert_eq!(
-        outcome,
-        Outcome::Refused {
-            sentence: outcome::UPSTREAM_REFUSED.to_owned()
-        }
-    );
+        assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
+        assert_eq!(
+            outcome,
+            Outcome::Error {
+                error_kind: ErrorKind::VendorRefusal
+            },
+            "{tool}"
+        );
+    }
 }
 
 #[tokio::test]

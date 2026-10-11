@@ -112,9 +112,10 @@ pub enum UpstreamError {
 /// of the kind [`ErrorKind::OversizedOrLateRead`] for a tool classified `read` and
 /// [`ErrorKind::Other`] for any other. So is any failure of the server or of the exchange, of
 /// the kind `Other`, and so are arguments that are not an object, which are never sent, of the
-/// kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its refusal of the call's
-/// scope and becomes [`ToolOutcome::Refused`], as does a call this connector does not serve or
-/// has no credential for; see [`outcome`](crate::outcome) for every sentence.
+/// kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its refusal of the call, an
+/// error of the kind [`ErrorKind::VendorRefusal`]. A call this connector does not serve or has
+/// no credential for becomes [`ToolOutcome::Refused`]. See [`outcome`](crate::outcome) for
+/// every sentence.
 ///
 /// Running a call needs a Tokio runtime.
 pub struct ProxyConnector {
@@ -298,7 +299,10 @@ impl ProxyConnector {
             ));
         }
         if status == StatusCode::FORBIDDEN {
-            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));
+            return Err(ToolOutcome::error(
+                ErrorKind::VendorRefusal,
+                outcome::UPSTREAM_REFUSED,
+            ));
         }
         if status != StatusCode::OK {
             return Err(ToolOutcome::error(

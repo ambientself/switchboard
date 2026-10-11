@@ -3,11 +3,12 @@
 //! The outcome follows the core's meaning of each [`ToolOutcome`]:
 //!
 //! - [`ToolOutcome::Refused`] when the connector would not send the call because of what it
-//!   names ([`NOT_SERVED`], [`NO_CREDENTIAL`]), and when the server answered `403`, its
-//!   refusal of the call's scope ([`UPSTREAM_REFUSED`]).
+//!   names ([`NOT_SERVED`], [`NO_CREDENTIAL`]).
 //! - [`ToolOutcome::Error`], with its [`ErrorKind`]:
 //!   - `InvalidArguments` for arguments that are not an object, which are never sent
 //!     ([`ARGUMENTS_NOT_AN_OBJECT`]);
+//!   - `VendorRefusal` when the server answered `403`, its refusal of the call
+//!     ([`UPSTREAM_REFUSED`]);
 //!   - `OversizedOrLateRead` for the deadline, the size cap or an answer broken off, from a
 //!     tool classified `read`, and `Other` for the same from any other tool;
 //!   - `Other` for everything else that went wrong on the gateway's side or the server's: a
@@ -63,7 +64,8 @@ pub const BROKEN_OFF: &str = "This tool's server stopped answering before its an
 pub const CREDENTIAL_REJECTED: &str = "This tool's server did not accept the gateway's credential.";
 
 /// The server answered `403`: it refused the call as outside what the gateway's credential
-/// may do.
+/// may do. The outcome is an error of the kind `VendorRefusal`, which the row records in
+/// place of this sentence.
 pub const UPSTREAM_REFUSED: &str =
     "This tool's server refused the call as outside what the gateway's credential may do.";
 
