@@ -13,8 +13,8 @@
 //!   [`REFRESH_FAILED_EVENT`] at `WARN`, naming the issuer and the cause, once for each cause in
 //!   a row: the same cause again is not logged again until a refresh succeeds or the cause
 //!   changes. There is no maximum age: keys that cannot be refreshed stay in force until one
-//!   can be. Whether a gateway should stop accepting tokens once its keys are too old to trust
-//!   is a freshness bound, and open question Q11 owns it.
+//!   can be. Decision 0013 settles that keys are never refused for their age: refusing every
+//!   token because a refresh failed would turn an issuer's outage into the gateway's.
 //! - **A refresh that adds or removes a `kid`** is logged as [`REFRESHED_EVENT`] at `INFO`,
 //!   with the `kid`s added and removed. A refresh that adds and removes none logs nothing. That
 //!   includes a key replaced under a `kid` that stays: the new key is put in force, but no line
