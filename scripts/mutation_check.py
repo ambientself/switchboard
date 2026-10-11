@@ -2177,8 +2177,9 @@ mutate("gw-unknown-server-limits-accepted", "bounds for a server the registry do
 # Decision 0013, section 8: past the maximum age since the registry file was last read, /readyz
 # fails and tools/call and tools/list are refused with the stale-policy sentence and no row.
 # Every read counts, changed or not, and the age counts from boot's own read of the file, not
-# from when the gates pass. tests/stale.rs watches each; tests/deployment.rs the floor; and
-# tests/logs.rs the stale-policy event's line.
+# from when the gates pass. The reloader reads the file as soon as it starts, so a slow boot is
+# not stale a poll longer than it must be. tests/stale.rs watches each; tests/deployment.rs the
+# floor; and tests/logs.rs the stale-policy event's line.
 mutate("gw-stale-never", "the policy is never stale, however long since the file was read", GW + "reload.rs",
        "        self.0.max_age.is_some_and(|max_age| self.age() > max_age)", "        false")
 mutate("gw-stale-age-from-gates", "the policy's age counts from when the boot gates pass, not from boot's read of the registry file, so a slow boot starts fresh", BOOT,
@@ -2192,6 +2193,13 @@ mutate_all("gw-stale-event-age-dropped", "the stale-policy event's line leaves o
 mutate_all("gw-stale-read-time-only-on-change", "only a read whose bytes changed counts as a read",
            (GW + "reload.rs", "            self.freshness.read_now();\n            if bytes == seen {\n                continue;\n            }\n",
             "            if bytes == seen {\n                continue;\n            }\n            self.freshness.read_now();\n"))
+mutate_all("gw-stale-read-at-after-keys", "start::prepare takes boot's read time after the keys are fetched, so a slow boot starts fresh",
+           (GW_START, "    let read_at = Instant::now();\n", ""),
+           (GW_START, "    let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;\n",
+            "    let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;\n    let read_at = Instant::now();\n"))
+mutate("gw-stale-first-read-a-poll-late", "the reloader skips its first, immediate read, so a slow boot stays stale a poll though the file reads", GW + "reload.rs",
+       "        // once rather than a poll later. Unchanged bytes are not loaded again.\n        loop {\n",
+       "        // once rather than a poll later. Unchanged bytes are not loaded again.\n        interval.tick().await;\n        loop {\n")
 mutate("gw-stale-readyz-ignored", "a stale gateway stays ready", GW_SERVER,
        "    } else if endpoint.ready.load(Ordering::SeqCst) && !endpoint.path.gates().freshness().is_stale()\n    {\n",
        "    } else if endpoint.ready.load(Ordering::SeqCst) {\n")
