@@ -37,6 +37,11 @@
 //!   it wrote, in the result's `_meta` or in `error.data` (decision 0009), so a person can
 //!   quote it; see [`gateway_mcp::render_with_row`]. It names none when begin failed or audit
 //!   is disabled, because then no row was written under that identifier.
+//! - While the policy is stale, `tools/list` and `tools/call` from a proved caller are refused
+//!   with [`POLICY_STALE`] before anything is decided, and no row is written: decision 0009
+//!   makes a request that reaches no decision telemetry, and each emits a `policy_stale` event.
+//!   The policy is stale when the registry file has not been read within the deployment's
+//!   maximum age (decision 0013, section 8; [`crate::reload`]).
 //! - An allowed call whose connector is not registered is given up: its row is completed as
 //!   `error` and it is answered 500. The boot gates and every reload refuse such a policy, so
 //!   this is a fault in the gateway.
@@ -110,6 +115,10 @@ pub const IDENTITY_DISABLED_NOTE: &str = "Identity checking is turned off on thi
 /// What `initialize` and `server/discover` say while audit is disabled.
 pub const AUDIT_DISABLED_NOTE: &str =
     "Audit is turned off on this gateway: tool calls run with no record of them.";
+
+/// The sentence `tools/call` and `tools/list` are refused with while the policy is stale. Nothing
+/// was decided, so no row is written.
+pub const POLICY_STALE: &str = "This gateway's policy is stale: it has not been able to read its registry file within the maximum age, so it refuses to list or call tools until it can. Nothing ran.";
 
 /// The name the gateway gives itself in `serverInfo`.
 pub const SERVER_NAME: &str = "switchboard";
@@ -416,6 +425,23 @@ impl RequestPath {
         self.inner.telemetry.emit(event);
     }
 
+    /// Whether the policy is stale, which refuses `method`. Each refusal emits a `policy_stale`
+    /// event naming `source`.
+    fn policy_stale(&self, source: Source, method: &'static str) -> bool {
+        let freshness = self.inner.gates.freshness();
+        if !freshness.is_stale() {
+            return false;
+        }
+        self.emit(Event::PolicyStale {
+            deployment: self.inner.gates.deployment().clone(),
+            surface: source.surface,
+            source: source.address,
+            method,
+            age_seconds: freshness.age().as_secs(),
+        });
+        true
+    }
+
     /// The refusal that answers with the audit-failure `sentence`, counted. Every such answer,
     /// for `tools/call` and `tools/list`, is made here.
     fn audit_failed(&self, sentence: &str) -> Reply {
@@ -458,8 +484,8 @@ impl RequestPath {
                 });
                 (Reply::Discovered, None)
             }
-            Call::ToolsList => self.list(caller, surface).await,
-            Call::ToolsCall(call) => self.call(caller, surface, call, disconnect).await,
+            Call::ToolsList => self.list(caller, source, surface).await,
+            Call::ToolsCall(call) => self.call(caller, source, surface, call, disconnect).await,
         };
         let row = row.as_ref().map(AuditRowId::as_str);
         gateway_mcp::render_with_row(&self.inner.server, era, &id, reply, row)
@@ -471,10 +497,18 @@ impl RequestPath {
     ///
     /// The answer is built from what [`audit::listed`] returns once the row is written, never
     /// from the list handed to it, so nothing is listed without its row.
-    async fn list(&self, caller: Caller, surface: SurfaceName) -> (Reply, Option<AuditRowId>) {
+    async fn list(
+        &self,
+        caller: Caller,
+        source: Source,
+        surface: SurfaceName,
+    ) -> (Reply, Option<AuditRowId>) {
         let Caller::Proved(principal) = caller else {
             return (Reply::Tools(Vec::new()), None);
         };
+        if self.policy_stale(source, "tools/list") {
+            return (Reply::Denied(POLICY_STALE.to_owned()), None);
+        }
         let gates = &self.inner.gates;
         let policy = gates.policy();
         let caller = self.caller_context(&policy, principal, surface);
@@ -522,6 +556,7 @@ impl RequestPath {
     async fn call(
         &self,
         caller: Caller,
+        source: Source,
         surface: SurfaceName,
         call: ToolCall,
         disconnect: Disconnect,
@@ -534,6 +569,9 @@ impl RequestPath {
             );
             return (Reply::Denied(IDENTITY_DISABLED.to_owned()), None);
         };
+        if self.policy_stale(source, "tools/call") {
+            return (Reply::Denied(POLICY_STALE.to_owned()), None);
+        }
         let policy = gates.policy();
         self.decide_and_run(&policy, principal, surface, call, disconnect)
             .await

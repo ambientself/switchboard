@@ -4,9 +4,10 @@
 //! reason the gateway must not start. In order:
 //!
 //! 1. **Identity** is enforced against configured issuers, or explicitly disabled. Neither, or
-//!    both, is refused, and so is an issuer the identity crate refuses.
+//!    both, is refused, and so is an issuer the identity crate refuses. Only a development
+//!    build, one with the `test-support` feature, may disable it (decision 0014).
 //! 2. **Audit** has a store supplied by the wiring, or is explicitly disabled. Neither, or
-//!    both, is refused.
+//!    both, is refused. Only a development build may disable it.
 //! 3. **HTTP** names at least one allowed host.
 //! 4. **Policy** becomes a snapshot through the core's own checks, and passes the
 //!    receipt-store gate (decision 0009): until receipts exist, a tool not classified `read`
@@ -28,13 +29,17 @@
 //! Every approved tool's server must have a connector. The receipt-store gate runs there too,
 //! at boot and on every reload.
 //!
-//! A disabled gate starts with a warning logged here; the HTTP layer repeats it while the
-//! gateway runs.
+//! A disabled gate starts, in a development build, with a warning logged here; the HTTP layer
+//! repeats it while the gateway runs. The release build refuses both opt-outs.
+//! [`start::prepare`](crate::start::prepare) runs the opt-out refusals and the receipt-store
+//! gate as soon as the registry loads, before it connects to anything; [`check_registry`] runs
+//! them again, as [`check`] does for the JSON configuration's path, and every reload runs the
+//! receipt-store gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
@@ -49,7 +54,7 @@ use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection};
 use crate::policy::{LivePolicy, ServedPolicy};
-use crate::reload::Reloader;
+use crate::reload::{Freshness, Reloader};
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
 
@@ -104,6 +109,18 @@ pub enum BootError {
     /// An audit store is supplied and audit is also disabled.
     #[error("an audit store is supplied but `audit.disabled` is true; choose one")]
     AuditContradiction,
+    /// Identity is disabled in a release build (decision 0014, section 4).
+    #[error(
+        "identity is disabled, which only a development build allows: the release build checks \
+         every caller, so configure the trusted issuers"
+    )]
+    IdentityOptOut,
+    /// Audit is disabled in a release build (decision 0014, section 4).
+    #[error(
+        "audit is disabled, which only a development build allows: the release build records \
+         every call, so configure an audit store"
+    )]
+    AuditOptOut,
     /// No host is allowed, so every request would be refused.
     #[error("`http.allowed_hosts` is empty")]
     NoAllowedHosts,
@@ -185,6 +202,13 @@ pub struct Settings {
     pub audit: AuditSection,
     /// What the HTTP endpoint accepts.
     pub http: HttpSection,
+    /// How long after the registry file was last read the policy is stale (decision 0013,
+    /// section 8), or `None` for never.
+    pub max_age: Option<Duration>,
+    /// When the registry file the policy comes from was read. The policy's age counts from
+    /// this read, not from when the gates pass, so a slow boot (keys fetched, the database
+    /// checked) cannot start a replica whose policy is already stale as if it were fresh.
+    pub read_at: Instant,
 }
 
 /// What code supplies to the gateway, beside its configuration: the clock, the instance, the
@@ -331,6 +355,7 @@ pub struct Gates {
     http: HttpSection,
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
+    freshness: Freshness,
 }
 
 /// What the gateway was started with that a policy reload cannot change: the issuers, which
@@ -408,6 +433,11 @@ impl Gates {
         &self.http.allowed_origins
     }
 
+    /// When the registry file was last read, and whether the policy is stale for it.
+    pub fn freshness(&self) -> &Freshness {
+        &self.freshness
+    }
+
     /// The policy served now: its snapshot, definitions and profile rules, taken together.
     pub fn policy(&self) -> Arc<ServedPolicy> {
         self.policy.current()
@@ -462,9 +492,10 @@ pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
     check_with(config, wiring, cfg!(feature = "test-support"))
 }
 
-/// [`check`], with the receipt-store gate's exemption given, so a test in a development build
-/// can run the gate as the release build does.
-fn check_with(config: Config, wiring: Wiring, receipt_exempt: bool) -> Result<Gates, BootError> {
+/// [`check`], with the exemption of a development build given: from the receipt-store gate
+/// and from the refusal of the identity and audit opt-outs. A test in a development build
+/// passes false to run the gates as the release build does.
+fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates, BootError> {
     let Wiring {
         clock,
         instance,
@@ -477,8 +508,8 @@ fn check_with(config: Config, wiring: Wiring, receipt_exempt: bool) -> Result<Ga
         return Err(BootError::ProxiedWithoutRegistry(name));
     }
     let issuers = configured_issuers(&config.identity);
-    let (identity, identity_state) = identity_gate(config.identity, clock.clone())?;
-    let (audit_store, audit_state) = audit_gate(&config.audit, audit_store)?;
+    let (identity, identity_state) = identity_gate(config.identity, clock.clone(), development)?;
+    let (audit_store, audit_state) = audit_gate(&config.audit, audit_store, development)?;
     if config.http.allowed_hosts.is_empty() {
         return Err(BootError::NoAllowedHosts);
     }
@@ -496,7 +527,7 @@ fn check_with(config: Config, wiring: Wiring, receipt_exempt: bool) -> Result<Ga
         .flat_map(|surface| surface.tools.iter().cloned())
         .collect();
     let snapshot = PolicySnapshot::new(config.policy)?;
-    receipt_gate(&snapshot, receipt_exempt)?;
+    receipt_gate(&snapshot, development)?;
 
     let catalog = ToolCatalog::new(config.catalog)?;
     catalog.check(&approved)?;
@@ -548,6 +579,8 @@ fn check_with(config: Config, wiring: Wiring, receipt_exempt: bool) -> Result<Ga
             snapshot, catalog, selector,
         ))),
         connectors,
+        // No file is read again, so the policy never goes stale.
+        freshness: Freshness::new(None, Instant::now()),
     })
 }
 
@@ -558,6 +591,38 @@ pub fn check_registry(
     settings: Settings,
     registry: Registry,
     wiring: Wiring,
+) -> Result<(Gates, Reloader), BootError> {
+    check_registry_with(settings, registry, wiring, cfg!(feature = "test-support"))
+}
+
+/// [`check`] and [`check_registry`] as the release build runs them, with no exemption from the
+/// receipt-store gate or the refusal of the opt-outs. Only a development build has them, so
+/// that its tests can run the gates as the release build does.
+#[cfg(feature = "test-support")]
+pub mod as_release {
+    use super::*;
+
+    /// [`check`](super::check) as the release build runs it.
+    pub fn check(config: Config, wiring: Wiring) -> Result<Gates, BootError> {
+        check_with(config, wiring, false)
+    }
+
+    /// [`check_registry`](super::check_registry) as the release build runs it.
+    pub fn check_registry(
+        settings: Settings,
+        registry: Registry,
+        wiring: Wiring,
+    ) -> Result<(Gates, Reloader), BootError> {
+        check_registry_with(settings, registry, wiring, false)
+    }
+}
+
+/// [`check_registry`], with the exemption of a development build given, as [`check_with`].
+pub(crate) fn check_registry_with(
+    settings: Settings,
+    registry: Registry,
+    wiring: Wiring,
+    development: bool,
 ) -> Result<(Gates, Reloader), BootError> {
     let Wiring {
         clock,
@@ -571,8 +636,8 @@ pub fn check_registry(
         return Err(BootError::AdapterBesideRegistry(name));
     }
     let issuers = configured_issuers(&settings.identity);
-    let (identity, identity_state) = identity_gate(settings.identity, clock.clone())?;
-    let (audit_store, audit_state) = audit_gate(&settings.audit, audit_store)?;
+    let (identity, identity_state) = identity_gate(settings.identity, clock.clone(), development)?;
+    let (audit_store, audit_state) = audit_gate(&settings.audit, audit_store, development)?;
     if settings.http.allowed_hosts.is_empty() {
         return Err(BootError::NoAllowedHosts);
     }
@@ -598,12 +663,13 @@ pub fn check_registry(
         issuers,
         registry,
         connectors: connectors.keys().cloned().collect(),
-        receipt_exempt: cfg!(feature = "test-support"),
+        receipt_exempt: development,
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
 
     warn_disabled(&settings.deployment, identity_state, audit_state);
-    let reloader = Reloader::new(live.clone(), basis);
+    let freshness = Freshness::new(settings.max_age, settings.read_at);
+    let reloader = Reloader::new(live.clone(), basis, freshness.clone());
     let gates = Gates {
         deployment: settings.deployment,
         instance,
@@ -615,6 +681,7 @@ pub fn check_registry(
         http: settings.http,
         policy: live,
         connectors,
+        freshness,
     };
     Ok((gates, reloader))
 }
@@ -717,9 +784,37 @@ fn warn_disabled(deployment: &DeploymentName, identity: GateState, audit: GateSt
     }
 }
 
+/// The refusals that need only the configuration and the registry's snapshot, which
+/// [`start::prepare`](crate::start::prepare) runs as soon as the registry loads, before it
+/// reads a credential, fetches a key or connects to the audit store: the identity and audit
+/// opt-outs outside a development build (decision 0014, section 4), then the
+/// [receipt-store gate](receipt_gate). The boot gates run each again.
+pub(crate) fn before_connecting(
+    identity: &IdentitySection,
+    audit: &AuditSection,
+    snapshot: &PolicySnapshot,
+    development: bool,
+) -> Result<(), BootError> {
+    if identity.disabled {
+        opt_out(BootError::IdentityOptOut, development)?;
+    }
+    if audit.disabled {
+        opt_out(BootError::AuditOptOut, development)?;
+    }
+    receipt_gate(snapshot, development)
+}
+
+/// An opt-out of the identity or audit gate: refused with `refusal` unless this is a
+/// development build. The callers pass `cfg!(feature = "test-support")`, as for the
+/// receipt-store gate.
+fn opt_out(refusal: BootError, development: bool) -> Result<(), BootError> {
+    if development { Ok(()) } else { Err(refusal) }
+}
+
 fn identity_gate(
     section: IdentitySection,
     clock: Arc<dyn Clock>,
+    development: bool,
 ) -> Result<(Arc<Identity>, GateState), BootError> {
     let (config, state) = match (section.enforce, section.disabled) {
         (Some(entries), false) => {
@@ -733,7 +828,10 @@ fn identity_gate(
             }
             (IdentityConfig::Enforce(issuers), GateState::On)
         }
-        (None, true) => (IdentityConfig::Disabled, GateState::Disabled),
+        (None, true) => {
+            opt_out(BootError::IdentityOptOut, development)?;
+            (IdentityConfig::Disabled, GateState::Disabled)
+        }
         (None, false) => return Err(BootError::IdentityUnconfigured),
         (Some(_), true) => return Err(BootError::IdentityContradiction),
     };
@@ -743,10 +841,14 @@ fn identity_gate(
 fn audit_gate(
     section: &AuditSection,
     store: Option<Arc<dyn AuditStore>>,
+    development: bool,
 ) -> Result<(Arc<dyn AuditStore>, GateState), BootError> {
     match (store, section.disabled) {
         (Some(store), false) => Ok((store, GateState::On)),
-        (None, true) => Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled)),
+        (None, true) => {
+            opt_out(BootError::AuditOptOut, development)?;
+            Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled))
+        }
         (None, false) => Err(BootError::AuditUnconfigured),
         (Some(_), true) => Err(BootError::AuditContradiction),
     }
@@ -942,11 +1044,25 @@ principals = "any_in_teams_and_groups"
 
     #[test]
     fn the_json_configuration_path_runs_the_receipt_gate() {
+        // The release build refuses the identity and audit opt-outs, so both gates are on.
+        let issuer = gateway_testkit::LocalIssuer::new(
+            "https://issuer.example.test",
+            gateway_identity::SigningAlgorithm::Es256,
+        )
+        .unwrap();
         let config = Config::from_json(
             &json!({
                 "deployment": "receipt-gate",
-                "identity": {"disabled": true},
-                "audit": {"disabled": true},
+                "identity": {"enforce": [{
+                    "issuer": issuer.issuer(),
+                    "audiences": ["switchboard"],
+                    "kind": {"user": {}},
+                    "algorithm": "ES256",
+                    "keys": serde_json::to_value(issuer.jwk_set()).unwrap(),
+                    "max_lifetime_secs": 3600,
+                    "leeway_secs": 30,
+                }]},
+                "audit": {},
                 "http": {"allowed_hosts": ["localhost"]},
                 "policy": {
                     "revision": "r1",
@@ -974,7 +1090,9 @@ principals = "any_in_teams_and_groups"
             .to_string(),
         )
         .unwrap();
-        let refused = check_with(config, Wiring::new(Arc::new(SystemClock)), false);
+        let wiring = Wiring::new(Arc::new(SystemClock))
+            .audit_store(Arc::new(gateway_testkit::InMemoryAuditStore::new()));
+        let refused = check_with(config, wiring, false);
         assert!(
             matches!(refused, Err(BootError::NoReceiptStore { .. })),
             "{refused:?}"

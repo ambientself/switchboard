@@ -11,7 +11,10 @@
 //! with a keys URL, connects the audit store and runs its checks, runs the boot gates, and
 //! serves `POST /mcp/{surface}` on the address the file gives until interrupted. The registry
 //! file is read again every `registry.poll_seconds`, and a new version that passes is served
-//! from the next request. Each keys URL is fetched again every `keys_refresh_seconds` (see
+//! from the next request; with no successful read for `registry.max_age_seconds`, the policy is
+//! stale, readiness fails and tools are refused (see [`gateway::reload`]). The release build
+//! refuses the identity and audit opt-outs before it connects to anything (see
+//! [`gateway::start`]). Each keys URL is fetched again every `keys_refresh_seconds` (see
 //! [`gateway::keys`]). Both stop when the gateway shuts down. Logs go to standard output as JSON lines; a refusal to start goes to standard
 //! error as well, as plain text. Shutting down waits for the answers still running, and for the
 //! audit store to complete the rows it is still writing, up to its finish deadline. With
@@ -143,9 +146,11 @@ async fn serve(config: PathBuf) -> ExitCode {
     };
     let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
+    let freshness = prepared.gates.freshness().clone();
     let metrics = metrics_listener.map(|listener| {
         let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
             .with_issuer_keys(prepared.keys.ages());
+        let metrics = metrics.with_policy(freshness);
         tokio::spawn(serve_metrics(listener, metrics, async {
             let _ = metrics_stopped.await;
         }))

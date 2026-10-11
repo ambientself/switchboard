@@ -9,6 +9,7 @@ mod files;
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
 use files::{
@@ -44,6 +45,8 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
         identity: deployment.identity,
         audit: AuditSection { disabled },
         http: deployment.http,
+        max_age: None,
+        read_at: Instant::now(),
     };
     (settings, Registry::load(&deployment.registry_file).unwrap())
 }
@@ -135,6 +138,59 @@ fn a_registry_that_defines_the_reserved_profile_is_refused() {
         matches!(refused, Some(BootError::ReservedProfile)),
         "{refused:?}"
     );
+}
+
+/// The registry's path refuses the identity and audit opt-outs in a release build too
+/// (decision 0014, section 4), and a development build starts with them.
+#[test]
+fn the_registry_path_refuses_the_opt_outs_in_a_release_build() {
+    let files = Files::new(
+        "opt-outs",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
+    let identity_off = |settings: &mut Settings| {
+        settings.identity = gateway::IdentitySection {
+            enforce: None,
+            disabled: true,
+        };
+    };
+
+    let (settings, registry) = parts(&files, true);
+    let refused = boot::as_release::check_registry(
+        settings,
+        registry,
+        wiring().proxied("mock-docs", connector.clone()),
+    )
+    .err();
+    assert!(
+        matches!(refused, Some(BootError::AuditOptOut)),
+        "{refused:?}"
+    );
+
+    let (mut settings, registry) = parts(&files, false);
+    identity_off(&mut settings);
+    let store = Arc::new(InMemoryAuditStore::new());
+    let refused = boot::as_release::check_registry(
+        settings,
+        registry,
+        wiring()
+            .audit_store(store)
+            .proxied("mock-docs", connector.clone()),
+    )
+    .err();
+    assert!(
+        matches!(refused, Some(BootError::IdentityOptOut)),
+        "{refused:?}"
+    );
+
+    let (mut settings, registry) = parts(&files, true);
+    identity_off(&mut settings);
+    let (gates, _) =
+        boot::check_registry(settings, registry, wiring().proxied("mock-docs", connector)).unwrap();
+    assert_eq!(gates.identity_state(), gateway::GateState::Disabled);
+    assert_eq!(gates.audit_state(), gateway::GateState::Disabled);
 }
 
 #[test]

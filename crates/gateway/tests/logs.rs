@@ -149,7 +149,9 @@ impl Captured {
 
 /// Decision 0009's telemetry, over loopback: a refused caller, `initialize`, `ping`,
 /// `server/discover` and a body that cannot be parsed each give one event naming the surface
-/// and the peer, and the counters agree.
+/// and the peer, and the counters agree. A stale-policy refusal (decision 0013, section 8),
+/// which this fixture's policy never meets, is emitted as the request path emits one, and its
+/// line names the surface, the peer, the method and the policy's age too.
 #[tokio::test]
 async fn each_telemetry_event_names_the_surface_and_the_peer() {
     let captured = Captured::default();
@@ -210,6 +212,14 @@ async fn each_telemetry_event_names_the_surface_and_the_peer() {
         .send(&server)
         .await;
     assert_eq!(answer.status, 400, "{answer:?}");
+    let peer = SocketAddr::new(server.address.ip(), server.address.port().wrapping_add(1));
+    server.telemetry.emit(Event::PolicyStale {
+        deployment: DeploymentName::new("server-test"),
+        surface: Some(Surface::new(SURFACE_READ)),
+        source: Some(peer),
+        method: "tools/call",
+        age_seconds: 61,
+    });
 
     // Shutting down writes every queued event before serving returns.
     server.stop.take().unwrap().send(()).unwrap();
@@ -264,6 +274,16 @@ async fn each_telemetry_event_names_the_surface_and_the_peer() {
         captured.named("unparsable_body")[0]["fields"]["rejection"],
         json!("ParseError")
     );
+    let stale = captured.named("policy_stale");
+    assert_eq!(stale.len(), 1, "{stale:?}");
+    assert_eq!(stale[0]["level"], json!("ERROR"));
+    let fields = &stale[0]["fields"];
+    assert_eq!(fields["event"], json!("policy_stale"));
+    assert_eq!(fields["deployment"], json!("server-test"));
+    assert_eq!(fields["surface"], json!(SURFACE_READ));
+    assert_eq!(fields["source"], json!(peer.to_string()));
+    assert_eq!(fields["method"], json!("tools/call"));
+    assert_eq!(fields["age_seconds"], json!(61));
 
     assert_eq!(
         server.telemetry.counts(),
@@ -273,6 +293,7 @@ async fn each_telemetry_event_names_the_surface_and_the_peer() {
             ping: 1,
             discover: 1,
             unparsable: 1,
+            policy_stale: 1,
             dropped: 0,
             audit_failure_answers: 0,
         }

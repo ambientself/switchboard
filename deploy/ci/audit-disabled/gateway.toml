@@ -1,0 +1,36 @@
+# CI's check of the release artifact: `switchboard --config=deploy/ci/audit-disabled/gateway.toml`
+# must exit 1, refusing `[audit] mode = "disabled"`, which only a development build accepts
+# (decision 0014, section 4). Everything else would start: identity is enforced against a
+# checked-in public key, and the registry serves nothing. The format is in
+# crates/gateway/src/deployment.rs. Every value here is a dummy.
+
+deployment = "ci-audit-disabled"
+listen = "127.0.0.1:0"
+
+[http]
+allowed_hosts = ["localhost"]
+allowed_origins = []
+
+[registry]
+file = "registry/registry.toml"
+poll_seconds = 2
+
+[identity]
+mode = "enforce"
+
+# A key set holding one public key only, the same as deploy/ci/receipt-gate's. Nobody holds its
+# private key.
+[[identity.issuers]]
+issuer = "https://ci-issuer.switchboard.test"
+kind = "workload"
+audiences = ["switchboard"]
+algorithm = "ES256"
+keys_file = "jwks.json"
+subjects_file = "teams.toml"
+max_lifetime_seconds = 3600
+leeway_seconds = 30
+
+[audit]
+mode = "disabled"
+
+[credentials]

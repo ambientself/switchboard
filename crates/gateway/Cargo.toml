@@ -50,8 +50,10 @@ uuid = { version = "1", features = ["v7"] }
 
 # `test-support` makes a development build (design section 12): it exempts the gateway from the
 # receipt-store gate (decision 0009), so the harness can serve its `propose` and `write` fixture
-# tools with no receipt store. The release build never enables it: deploy/Dockerfile builds
-# `switchboard` with `-p gateway` alone, and CI checks that binary refuses a `propose` tool.
+# tools with no receipt store, and it alone accepts the identity and audit opt-outs (decision
+# 0014): only test-support builds start with either disabled. The release build never enables
+# it: deploy/Dockerfile builds `switchboard` with `-p gateway` alone, and CI checks three
+# refusals of that binary: a `propose` tool, identity disabled and audit disabled.
 [features]
 test-support = []
 

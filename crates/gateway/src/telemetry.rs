@@ -119,6 +119,20 @@ pub enum Event {
         /// The peer's address.
         source: Option<SocketAddr>,
     },
+    /// A `tools/call` or `tools/list` was refused because the policy is stale: the registry
+    /// file has not been read within the maximum age (decision 0013, section 8).
+    PolicyStale {
+        /// The deployment that refused it.
+        deployment: DeploymentName,
+        /// The surface the request was for.
+        surface: Option<Surface>,
+        /// The peer's address.
+        source: Option<SocketAddr>,
+        /// `tools/call` or `tools/list`.
+        method: &'static str,
+        /// How long ago the registry file was last read, in whole seconds.
+        age_seconds: u64,
+    },
     /// A body was refused before it reached the gateway's logic.
     Unparsable {
         /// The deployment that refused it.
@@ -146,6 +160,8 @@ pub struct TelemetryCounts {
     pub discover: u64,
     /// Bodies refused as unparsable.
     pub unparsable: u64,
+    /// Requests refused because the policy is stale.
+    pub policy_stale: u64,
     /// Events dropped because the queue was full or closed.
     pub dropped: u64,
     /// Answers that were the audit-failure sentence: a `tools/call` or `tools/list` refused
@@ -160,6 +176,7 @@ struct Counters {
     ping: AtomicU64,
     discover: AtomicU64,
     unparsable: AtomicU64,
+    policy_stale: AtomicU64,
     dropped: AtomicU64,
     audit_failure_answers: AtomicU64,
 }
@@ -200,6 +217,7 @@ impl Telemetry {
             Event::Ping { .. } => &self.counters.ping,
             Event::Discover { .. } => &self.counters.discover,
             Event::Unparsable { .. } => &self.counters.unparsable,
+            Event::PolicyStale { .. } => &self.counters.policy_stale,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         if self.sender.try_send(event).is_err() {
@@ -224,6 +242,7 @@ impl Telemetry {
             ping: read(&counters.ping),
             discover: read(&counters.discover),
             unparsable: read(&counters.unparsable),
+            policy_stale: read(&counters.policy_stale),
             dropped: read(&counters.dropped),
             audit_failure_answers: read(&counters.audit_failure_answers),
         }
@@ -334,6 +353,21 @@ fn write(event: &Event) {
             source = source.map(tracing::field::display),
             rejection = ?rejection,
             "refused an unparsable body"
+        ),
+        Event::PolicyStale {
+            deployment,
+            surface: on,
+            source,
+            method,
+            age_seconds,
+        } => tracing::error!(
+            event = "policy_stale",
+            deployment = deployment.as_str(),
+            surface = surface(on),
+            source = source.map(tracing::field::display),
+            method,
+            age_seconds,
+            "refused a request: the registry file has not been read within the maximum age"
         ),
     }
 }

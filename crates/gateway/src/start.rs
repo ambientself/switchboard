@@ -6,11 +6,14 @@
 //! name and Docker to the container's. With neither, the gateway refuses to start. Every audit
 //! row records the instance that began it.
 //!
-//! [`prepare`] reads the registry file, loads each proxied server's credential, builds a
-//! [`ProxyConnector`] per server, fetches the keys of each issuer configured with a keys URL,
-//! connects the Postgres audit store and runs its boot checks (or takes audit as explicitly
-//! disabled), and then runs the boot gates ([`boot::check_registry`]). Any failure refuses to
-//! start, naming the reason, before anything is served.
+//! [`prepare`] reads the registry file. Before anything else, it refuses the identity and audit
+//! opt-outs outside a development build, and runs the receipt-store gate (decision 0014,
+//! section 4), so that a refusal of either comes before any connection is made. Then it loads
+//! each proxied server's credential, builds a [`ProxyConnector`] per server, fetches the keys
+//! of each issuer configured with a keys URL, connects the Postgres audit store and runs its
+//! boot checks (or, in a development build, takes audit as explicitly disabled), and then runs
+//! the boot gates ([`boot::check_registry`]). Any failure refuses to start, naming the reason,
+//! before anything is served.
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
 //! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
@@ -35,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
 use connector_proxy::{
@@ -202,15 +205,35 @@ pub async fn prepare(
     instance: InstanceName,
     clock: Arc<dyn Clock>,
 ) -> Result<Prepared, StartError> {
+    prepare_with(deployment, instance, clock, cfg!(feature = "test-support")).await
+}
+
+/// [`prepare`], with a development build's exemptions given, so a test in one can start the
+/// gateway as the release build does.
+async fn prepare_with(
+    deployment: Deployment,
+    instance: InstanceName,
+    clock: Arc<dyn Clock>,
+    development: bool,
+) -> Result<Prepared, StartError> {
     let loaded = std::fs::read(&deployment.registry_file).map_err(|error| RegistryError::Read {
         path: deployment.registry_file.display().to_string(),
         message: error.to_string(),
     })?;
+    // The policy's age counts from this read (decision 0013, section 8), not from when the
+    // gates pass after the keys are fetched and the database checked.
+    let read_at = Instant::now();
     let text = std::str::from_utf8(&loaded).map_err(|error| RegistryError::Read {
         path: deployment.registry_file.display().to_string(),
         message: error.to_string(),
     })?;
     let registry = Registry::from_toml_str(text)?;
+    boot::before_connecting(
+        &deployment.identity,
+        &deployment.audit.section(),
+        registry.snapshot(),
+        development,
+    )?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let mut wiring =
@@ -234,11 +257,13 @@ pub async fn prepare(
         identity,
         audit: deployment.audit.section(),
         http: deployment.http,
+        max_age: Some(deployment.max_age),
+        read_at,
     };
     let revision = registry.snapshot().revision().clone();
     let tools = registry.routes().len();
     let servers = registry.servers().len();
-    let (gates, reloader) = boot::check_registry(settings, registry, wiring)?;
+    let (gates, reloader) = boot::check_registry_with(settings, registry, wiring, development)?;
     let mut keys = KeyRefresher::new(gates.shared_identity());
     for Fetched {
         source,
@@ -306,6 +331,7 @@ pub async fn prepare(
         tools,
         servers,
         poll_seconds = deployment.poll.as_secs(),
+        max_age_seconds = deployment.max_age.as_secs(),
         "serving the registry file's policy"
     );
 
@@ -528,6 +554,171 @@ mod tests {
                 connector_proxy::DEFAULT_DEADLINE
             )])
         );
+    }
+
+    /// A listener that counts the connections made to it and closes each at once: the audit
+    /// database and the issuer's keys URL, which a refusal before connecting never reaches.
+    struct Counted {
+        address: std::net::SocketAddr,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Counted {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counting = accepted.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            Self { address, accepted }
+        }
+
+        fn connections(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A deployment of `registry_text`, written to `directory`, whose audit database and
+    /// issuer's keys URL are both `counted`, with identity and audit disabled as given.
+    fn deployment(
+        directory: &std::path::Path,
+        registry_text: &str,
+        counted: &Counted,
+        identity_disabled: bool,
+        audit_disabled: bool,
+    ) -> Deployment {
+        std::fs::create_dir_all(directory).unwrap();
+        let registry_file = directory.join("registry.toml");
+        std::fs::write(&registry_file, registry_text).unwrap();
+        let credential = directory.join("docs-credential");
+        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
+        let issuer = format!("http://{}", counted.address);
+        let identity = if identity_disabled {
+            IdentitySection {
+                enforce: None,
+                disabled: true,
+            }
+        } else {
+            IdentitySection {
+                enforce: Some(vec![crate::config::IssuerEntry {
+                    issuer: Issuer::new(issuer.as_str()),
+                    audiences: ["switchboard".to_owned()].into(),
+                    kind: IssuerKindEntry::User {
+                        groups_claim: "groups".to_owned(),
+                    },
+                    algorithm: crate::config::Algorithm::Es256,
+                    keys: serde_json::Value::Null,
+                    max_lifetime_secs: 3600,
+                    leeway_secs: 30,
+                }]),
+                disabled: false,
+            }
+        };
+        let keys_urls = if identity_disabled {
+            Vec::new()
+        } else {
+            vec![KeysUrl {
+                issuer: Issuer::new(issuer.as_str()),
+                url: format!("{issuer}/keys"),
+                refresh: Duration::from_secs(300),
+                ca_file: None,
+                token_file: None,
+            }]
+        };
+        let audit = if audit_disabled {
+            AuditChoice::Disabled
+        } else {
+            AuditChoice::Postgres {
+                url: format!(
+                    "postgres://switchboard_gateway:dummy@{}/switchboard?connect_timeout=2",
+                    counted.address
+                ),
+            }
+        };
+        Deployment {
+            deployment: "start-test".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            http: crate::config::HttpSection {
+                allowed_hosts: ["localhost".to_owned()].into(),
+                allowed_origins: BTreeSet::new(),
+            },
+            registry_file,
+            poll: Duration::from_secs(2),
+            max_age: Duration::from_secs(60),
+            identity,
+            keys_urls,
+            audit,
+            metrics: None,
+            credentials: BTreeMap::from([("docs-credential".to_owned(), credential)]),
+        }
+    }
+
+    /// What `deployment` refuses with, started as the release build starts.
+    async fn refused_as_release(deployment: Deployment) -> StartError {
+        prepare_with(
+            deployment,
+            InstanceName::new("start-test"),
+            Arc::new(gateway_identity::SystemClock),
+            false,
+        )
+        .await
+        .unwrap_err()
+    }
+
+    /// Decision 0014, section 4: a release build refuses a registry serving a `propose` tool at
+    /// the receipt-store gate as soon as the registry loads, before it fetches a key or
+    /// connects to the audit database.
+    #[tokio::test]
+    async fn the_receipt_gate_refuses_before_anything_is_connected() {
+        let counted = Counted::start().await;
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-receipt-{}", std::process::id()));
+        let text = crate::boot::tests::registry_text("propose", true, "r1");
+        let refused =
+            refused_as_release(deployment(&directory, &text, &counted, false, false)).await;
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            matches!(refused, StartError::Boot(BootError::NoReceiptStore { .. })),
+            "{refused}"
+        );
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+    }
+
+    /// Decision 0014, section 4: a release build refuses each opt-out before it connects to
+    /// anything.
+    #[tokio::test]
+    async fn the_opt_outs_are_refused_before_anything_is_connected() {
+        let counted = Counted::start().await;
+        let text = crate::boot::tests::registry_text("read", true, "r1");
+        for (name, identity_disabled, audit_disabled) in
+            [("identity", true, false), ("audit", false, true)]
+        {
+            let directory = std::env::temp_dir().join(format!(
+                "switchboard-start-opt-out-{name}-{}",
+                std::process::id()
+            ));
+            let refused = refused_as_release(deployment(
+                &directory,
+                &text,
+                &counted,
+                identity_disabled,
+                audit_disabled,
+            ))
+            .await;
+            std::fs::remove_dir_all(&directory).unwrap();
+            let expected = if identity_disabled {
+                matches!(refused, StartError::Boot(BootError::IdentityOptOut))
+            } else {
+                matches!(refused, StartError::Boot(BootError::AuditOptOut))
+            };
+            assert!(expected, "{name}: {refused}");
+        }
+        assert_eq!(counted.connections(), 0, "something was connected to first");
     }
 
     #[test]

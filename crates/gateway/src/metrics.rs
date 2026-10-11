@@ -12,7 +12,13 @@
 //! [`Metrics::render`] writes, by hand and with no Prometheus crate:
 //!
 //! - Always, from [`Telemetry::counts`]: `switchboard_telemetry_events_total{event}`, each
-//!   event counted when it is emitted, and `switchboard_telemetry_dropped_total`.
+//!   event counted when it is emitted, and `switchboard_telemetry_dropped_total`. Event
+//!   `policy_stale` counts each `tools/call` and `tools/list` refused because the policy is
+//!   stale; there is no separate counter for them.
+//! - With the registry's policy, from its [`Freshness`]: `switchboard_policy_age_seconds`, the
+//!   seconds since the registry file was last read successfully, and
+//!   `switchboard_policy_max_age_seconds`, the age past which the policy is stale (decision
+//!   0013, section 8).
 //! - With audit in Postgres, from [`PgAuditStore::stats`] and the request path:
 //!   - `switchboard_audit_begin_failures_total{cause}`, `cause` one of `budget_exceeded`,
 //!     `pool_timeout`, `database_error` and `value_refused`;
@@ -81,6 +87,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::keys::KeyAges;
+use crate::reload::Freshness;
 use crate::server::{HEADER_READ_TIMEOUT, accept_failed};
 use crate::telemetry::{Telemetry, TelemetryCounts};
 
@@ -100,6 +107,7 @@ pub struct Metrics {
     telemetry: Telemetry,
     audit: Option<Arc<AuditSource>>,
     issuer_keys: KeyAges,
+    policy: Option<Freshness>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -108,6 +116,7 @@ impl std::fmt::Debug for Metrics {
             .field("telemetry", &self.telemetry)
             .field("audit", &self.audit.is_some())
             .field("issuer_keys", &self.issuer_keys)
+            .field("policy", &self.policy)
             .finish()
     }
 }
@@ -133,6 +142,7 @@ impl Metrics {
                 })
             }),
             issuer_keys: KeyAges::default(),
+            policy: None,
         }
     }
 
@@ -143,10 +153,20 @@ impl Metrics {
         self
     }
 
+    /// The same metrics, with the age of the policy from `freshness`, which
+    /// [`Gates::freshness`](crate::Gates::freshness) gives.
+    pub fn with_policy(mut self, freshness: Freshness) -> Self {
+        self.policy = Some(freshness);
+        self
+    }
+
     /// Every signal as it stands, in Prometheus text. See the [module documentation](self).
     pub fn render(&self) -> String {
         let mut text = Text::default();
         telemetry_signals(&mut text, &self.telemetry.counts());
+        if let Some(freshness) = &self.policy {
+            policy_signals(&mut text, freshness);
+        }
         issuer_key_signals(&mut text, &self.issuer_keys.ages());
         if let Some(audit) = &self.audit {
             let open = *audit.open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -278,6 +298,7 @@ fn telemetry_signals(text: &mut Text, counts: &TelemetryCounts) {
         ("ping", counts.ping),
         ("discover", counts.discover),
         ("unparsable_body", counts.unparsable),
+        ("policy_stale", counts.policy_stale),
     ] {
         text.sample(
             "switchboard_telemetry_events_total",
@@ -291,6 +312,24 @@ fn telemetry_signals(text: &mut Text, counts: &TelemetryCounts) {
         "Telemetry events dropped because the queue was full or closed.",
         counts.dropped,
     );
+}
+
+fn policy_signals(text: &mut Text, freshness: &Freshness) {
+    text.single(
+        "switchboard_policy_age_seconds",
+        "gauge",
+        "Seconds since the registry file was last read successfully, whether or not that \
+         version loaded. Past the maximum age the policy is stale.",
+        freshness.age().as_secs_f64(),
+    );
+    if let Some(max_age) = freshness.max_age() {
+        text.single(
+            "switchboard_policy_max_age_seconds",
+            "gauge",
+            "The policy's age past which /readyz fails and tools/call and tools/list are refused.",
+            max_age.as_secs_f64(),
+        );
+    }
 }
 
 fn issuer_key_signals(text: &mut Text, ages: &[(Issuer, Duration)]) {

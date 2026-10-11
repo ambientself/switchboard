@@ -312,8 +312,8 @@ planned: with identity disabled the path lists nothing and refuses every `tools/
 row. Reads are not served with rows whose identity is `disabled`, and #69, which would have
 built them, is not planned
 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). Decision 0014
-also makes identity disabled development-only: the release build refuses it once #11's
-fail-closed work lands (section 12), and until then starts with a warning.
+also makes identity disabled development-only: the release build refuses to start with it,
+before it connects to anything (section 12).
 
 **A wrong guess costs the same as a right one.** An unknown subject pays for the signature
 check before it is refused, so response time does not reveal which subjects exist.
@@ -624,8 +624,8 @@ list names what others must still decide.
 
 | Record | Covers | Written | If it cannot be written |
 | --- | --- | --- | --- |
-| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
-| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, nothing is listed and every `tools/call` is refused, with no row (section 7). Decision 0014 makes identity disabled development-only; the release build refuses it once #11's fail-closed work lands (section 12). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
+| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`, and a `tools/call` or `tools/list` refused because the policy is stale (section 8). Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
+| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, nothing is listed and every `tools/call` is refused, with no row (section 7). Decision 0014 makes identity disabled development-only; the release build refuses to start with it (section 12). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect: a call to any tool not classified `read`. | Postgres, in the same transaction as the call's begin. | The call is refused. |
 
 The exceptions to invariant 5 are the requests telemetry covers, which reach no decision, and
@@ -881,8 +881,8 @@ Checked before a socket is bound. Identity and audit each have four states:
 
 | | Configured | Explicit opt-out only | Neither | Both |
 | --- | --- | --- | --- | --- |
-| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
-| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
+| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start, before it connects to anything (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
+| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start, before it connects to anything (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
 
 A partly configured gate is refused. A connector that is partly configured refuses to start. A
 connector that is not configured must be absent from every surface: a snapshot that puts one of
@@ -970,9 +970,12 @@ destination when it connects. `#[cfg(test)]` cannot provide them, because the ha
 gateway from integration tests and other crates. Since a feature can be turned on in any
 build, CI checks the release artifact itself: started with a `propose` snapshot and no receipt
 store, with grant checking off, with identity disabled and with audit disabled, it must refuse
-each, and it must refuse a loopback destination. The identity, audit and loopback refusals,
-and CI's steps for them, arrive in milestone 3 (#11). With identity disabled a development
-build lists nothing and refuses every `tools/call`, with no row.
+each, and it must refuse a loopback destination. The identity and audit refusals, and CI's
+steps for them, are built (#11): the binary refuses each opt-out, and runs the receipt-store
+gate, as soon as the registry loads, before it reads a credential, fetches a key or connects
+to the audit database. The loopback refusal and its step arrive in milestone 3 (#11). With
+identity disabled a development build lists nothing and refuses every `tools/call`, with no
+row.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
@@ -1217,9 +1220,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - Not planned: a principal state for identity checking turned off, which a row could record
   as `disabled`. With identity disabled, nothing is listed and every `tools/call` is refused,
   with no row ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69
-  closes as not planned). Decision 0014 makes identity disabled development-only; the release
-  build refuses it once #11's fail-closed work lands (section 12), and until then starts with
-  a warning.
+  closes as not planned). Decision 0014 makes identity disabled development-only, and the
+  release build refuses it (#11, section 12).
 
 **#10, audit and receipts** (the core, the Postgres store built for #10, and the test stores).
 
@@ -1337,6 +1339,28 @@ schema `false` admits nothing. A call that fails is outcome `error` of kind
 `gateway-registry`. `pattern`, `$ref` and the composition keywords are refused at load, not
 checked; a schema that needs them cannot be approved yet.
 
+**#11, the opt-outs and the policy's maximum age.**
+
+- The identity and audit opt-outs are development-only: built. The release binary refuses
+  `[identity] mode = "disabled"` and `[audit] mode = "disabled"` at boot, on both the
+  registry's path and the JSON configuration's
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). It refuses each,
+  and runs the receipt-store gate, as soon as the registry loads, before it reads a credential,
+  fetches a key or connects to the audit database. A development build starts with either,
+  with the loud warning. CI starts the release artifact with each opt-out, and checks it exits
+  1 naming it.
+- The policy's maximum age: built
+  ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 8).
+  `registry.max_age_seconds` is 60 unless given, and is refused below twice `poll_seconds`.
+  Every successful read of the registry file counts, whether or not its bytes changed and
+  whether or not it loads, and the age counts from boot's own read of the file, so a boot
+  slower than the maximum age starts stale. Past the maximum age, `/readyz` answers 503 and `tools/call` and
+  `tools/list` are refused with a fixed stale-policy sentence before anything is decided, with
+  no row; each refusal is a `policy_stale` telemetry event, counted under
+  `switchboard_telemetry_events_total`. `switchboard_policy_age_seconds` and
+  `switchboard_policy_max_age_seconds` are exported. A file that reads but does not load keeps
+  the last good policy and is not stale.
+
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
 refusal of that list on a profile that does not require currency; the restated property; a
@@ -1401,8 +1425,11 @@ off only in a development build, with CI's check of the release artifact; and th
   every registry reload refuse a snapshot serving a tool not classified `read`, since no
   receipt store can be configured yet; a tool approved but on no surface passes. The harness's
   crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
-  and CI builds it with the same command and checks it refuses a `propose` tool. The receipt
-  store, audit and identity condition arrives with receipts (#10).
+  and CI builds it with the same command and checks it for three refusals: a `propose` tool,
+  identity disabled and audit disabled (#11). The `propose` check now runs with identity
+  enforced and audit on, as the release build requires, and is refused before the gateway
+  connects to its database. The receipt store, audit and identity condition arrives with
+  receipts (#10).
 - An allowed call whose connector is not registered completes its row as `error`: built
   (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
@@ -1411,13 +1438,14 @@ off only in a development build, with CI's check of the release artifact; and th
 - Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
   The path keeps refusing every `tools/call` and listing nothing, with no row
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
-  not planned). Disabling identity becomes development-only when #11's fail-closed work lands
-  (section 12).
+  not planned). Disabling identity is development-only, and the release build refuses it (#11,
+  section 12).
 - Already built and matching: identity failures write no row and keep the opaque sentence
   during an audit outage; begin, run and finish still run on a spawned task the client cannot
   cancel, though a read is now cancelled through the disconnect signal; shutdown waits for
   running answers; and `GET /readyz` fails first on shutdown, while the gateway serves on for
-  its readiness removal before it stops accepting calls (#40). Once it stops taking
+  its readiness removal before it stops accepting calls (#40). It also fails while the policy
+  is stale (#11). Once it stops taking
   connections no answer starts: a request whose body arrives during the shutdown grace is
   answered 503 and nothing runs, so the grace period the deployments give covers the removal
   plus one call (#40).

@@ -1,0 +1,5 @@
+# The team manifest for CI's release-artifact checks: subject to team. Nothing signs a token for
+# this subject; the gateway refuses to start before any caller could present one.
+
+[subjects]
+"system:serviceaccount:team-a:ci-workload" = "team-a"
