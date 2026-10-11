@@ -1743,6 +1743,11 @@ mutate("gw-deploy-keys-ca-beside-file-accepted", "keys_ca_file beside a keys fil
 mutate("gw-deploy-keys-token-relative-to-cwd", "a relative keys_token_file is read from the working directory", GW_DEPLOY,
        "                token_file: issuer.keys_token_file.map(|path| base.join(path)),\n",
        "                token_file: issuer.keys_token_file,\n")
+# Issue #120: boot hands the key source both files. Caught by tests/issuer_keys.rs's https boot.
+mutate("gw-start-keys-ca-file-dropped", "boot builds an https key source without its CA file", GW + "start.rs",
+       "            ca_file: keys_url.ca_file.clone(),\n", "            ca_file: None,\n")
+mutate("gw-start-keys-token-file-dropped", "boot builds a key source without its token file, so no token is sent", GW + "start.rs",
+       "            token_file: keys_url.token_file.clone(),\n", "            token_file: None,\n")
 # Issue #91: the 30 s floor and the refusal of an interval beside a keys file; a key replaced
 # under a kept kid is reported and logged; boot's and each refresh's fetch time is exported; and
 # the binary starts both the key refresher and the registry watcher.
@@ -4291,6 +4296,20 @@ mutate("issuer-keys-token-without-config", "a bearer is sent with every fetch, a
        '            None => Some(HeaderValue::from_static("Bearer dummy-unconfigured")),\n')
 mutate("issuer-keys-status-unchecked", "only a server error status is refused", IK,
        "        if status != StatusCode::OK {", "        if status.is_server_error() {")
+# Issue #120: the token file's checks, as connector-proxy's credential file has them.
+mutate("issuer-keys-token-size-off-by-one", "a token file of exactly the limit is refused", IK,
+       "    if bytes.len() as u64 > MAX_TOKEN_BYTES {", "    if bytes.len() as u64 >= MAX_TOKEN_BYTES {")
+mutate("issuer-keys-token-size-unbounded", "a token file of any size is sent", IK,
+       "    if bytes.len() as u64 > MAX_TOKEN_BYTES {", "    if false {")
+mutate("issuer-keys-token-read-unbounded", "the whole token file is read before its size is checked", IK,
+       ".and_then(|file| file.take(MAX_TOKEN_BYTES + 1).read_to_end(&mut bytes))",
+       ".and_then(|mut file| file.read_to_end(&mut bytes))")
+mutate("issuer-keys-token-not-trimmed", "the token file's surrounding whitespace is part of the token", IK,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("issuer-keys-token-empty-accepted", "a token file of only whitespace is sent as an empty bearer", IK,
+       "    if token.is_empty() {", "    if false {")
+mutate("issuer-keys-token-any-bytes", "a token with a space inside is sent", IK,
+       "    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {", "    if false {")
 # The bounds.
 mutate("issuer-keys-no-deadline", "a fetch is never abandoned", IK,
        "        let body = match tokio::time::timeout(self.deadline, self.exchange()).await {",
@@ -4306,6 +4325,30 @@ mutate("issuer-keys-declared-length-ignored", "a declared length over the cap is
        "            .is_some_and(|length| length > self.max_body_bytes as u64)", "            .is_some_and(|_| false)")
 mutate("issuer-keys-default-cap-larger", "the default body cap is 1 MiB", IK,
        "usize = 256 * 1024;", "usize = 1024 * 1024;")
+# Issue #120: the CA file's checks beyond #88's list, and ring never installed process-wide.
+# issuer-keys-provider-installed is caught only by tests/process_provider.rs, its own binary.
+mutate("issuer-keys-ca-file-for-http", "a CA file beside an http keys URL is accepted and ignored", IK,
+       "            if files.ca_file.is_some() {", "            if false {")
+mutate("issuer-keys-ca-no-sections-accepted", "a CA file with no PEM section is taken as holding no certificate", IK,
+       "    if sections == 0 {", "    if false {")
+mutate("issuer-keys-ca-broken-section-skipped", "a CA file is read up to its first broken section and the rest ignored", IK,
+       "        let (kind, der) = section.map_err(|_| not_pem())?;",
+       "        let Ok((kind, der)) = section else { break };")
+mutate("issuer-keys-ca-no-certificate-accepted", "a CA file with no certificate is taken, trusting nothing", IK,
+       "    if roots.is_empty() {", "    if false {")
+mutate("issuer-keys-ca-bad-certificate-skipped", "a certificate that does not parse is skipped", IK,
+       "            roots\n"
+       "                .add(CertificateDer::from(der))\n"
+       "                .map_err(|_| SourceError::CaBadCertificate {\n"
+       "                    issuer: issuer.clone(),\n"
+       "                    path: path.to_owned(),\n"
+       "                })?;\n",
+       "            let _ = roots.add(CertificateDer::from(der));\n")
+mutate("issuer-keys-provider-installed", "the TLS client reads the process default provider, installing ring when none is set", IK,
+       "    let mut config = ClientConfig::builder_with_provider(provider)\n"
+       "        .with_safe_default_protocol_versions()\n"
+       "        .map_err(|_| SourceError::Tls(issuer.clone()))?\n",
+       "    let _ = provider;\n    let mut config = ClientConfig::builder()\n")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
