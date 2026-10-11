@@ -98,47 +98,35 @@ pub struct StoredRow {
     pub deadline_after_begin: Option<Duration>,
 }
 
-impl ContractStore for InMemoryAuditStore {
-    fn store(&self) -> &dyn AuditStore {
-        self
-    }
-
-    async fn stored(&self, row: &AuditRowId) -> Option<StoredRow> {
-        let mut found = self.stored_under(row);
-        assert!(
-            found.len() <= 1,
-            "the store holds {} rows under {}, where Postgres's primary key allows one",
-            found.len(),
-            row.as_str()
-        );
-        let (record, begun_at, deadline) = found.pop()?;
-        let (kind, completion) = match &record {
-            StoredRecord::Call(call) => (call.kind, call.completion.clone()),
-            StoredRecord::List(_) => (RowKind::List, None),
-        };
-        Some(StoredRow {
-            record,
-            kind,
-            completion,
-            begun_at: Some(begun_at),
-            deadline_set: deadline.is_some(),
-            deadline_after_begin: deadline.map(|deadline| {
-                deadline
-                    .duration_since(begun_at)
-                    .expect("the row's deadline is before its time at begin")
-            }),
-        })
-    }
-
-    /// The budgets the store holds. A runner that gave it budgets answers with those instead,
-    /// as `tests/contract.rs` does, or a store that ignored them would pass.
-    fn budgets(&self) -> StoreBudgets {
-        self.store_budgets()
-    }
-
-    async fn now(&self) -> SystemTime {
-        self.store_now()
-    }
+/// The row `store` holds under `row`, for a runner's [`ContractStore::stored`] over the
+/// in-memory store. The runner answers [`ContractStore::budgets`] and [`ContractStore::now`]
+/// with the budgets and the clock it gave the store, not with any the store holds, so a store
+/// that ignores them is caught.
+pub fn stored_in_memory(store: &InMemoryAuditStore, row: &AuditRowId) -> Option<StoredRow> {
+    let mut found = store.stored_under(row);
+    assert!(
+        found.len() <= 1,
+        "the store holds {} rows under {}, where Postgres's primary key allows one",
+        found.len(),
+        row.as_str()
+    );
+    let (record, begun_at, deadline) = found.pop()?;
+    let (kind, completion) = match &record {
+        StoredRecord::Call(call) => (call.kind, call.completion.clone()),
+        StoredRecord::List(_) => (RowKind::List, None),
+    };
+    Some(StoredRow {
+        record,
+        kind,
+        completion,
+        begun_at: Some(begun_at),
+        deadline_set: deadline.is_some(),
+        deadline_after_begin: deadline.map(|deadline| {
+            deadline
+                .duration_since(begun_at)
+                .expect("the row's deadline is before its time at begin")
+        }),
+    })
 }
 
 // --- Calls a function makes through the core ----------------------------------------------------
