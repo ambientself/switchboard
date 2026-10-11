@@ -1708,6 +1708,13 @@ mutate("gw-keys-url-and-file-both-accepted", "an issuer with both a keys file an
        "        (Some(file), None) => {\n",
        "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
        "        (Some(file), _) => {\n")
+# Issue #88: a CA file and a token file belong to a keys URL, and are read from the deployment
+# file's directory.
+mutate("gw-deploy-keys-ca-beside-file-accepted", "keys_ca_file beside a keys file is accepted and ignored", GW_DEPLOY,
+       "            if issuer.keys_ca_file.is_some() {\n", "            if false {\n")
+mutate("gw-deploy-keys-token-relative-to-cwd", "a relative keys_token_file is read from the working directory", GW_DEPLOY,
+       "                token_file: issuer.keys_token_file.map(|path| base.join(path)),\n",
+       "                token_file: issuer.keys_token_file,\n")
 # Issue #91: the 30 s floor and the refusal of an interval beside a keys file; a key replaced
 # under a kept kid is reported and logged; boot's and each refresh's fetch time is exported; and
 # the binary starts both the key refresher and the registry watcher.
@@ -3774,26 +3781,113 @@ mutate("issuer-keys-userinfo-allowed", "a keys URL with a user name or password 
        "        if !url.username().is_empty() || url.password().is_some() {", "        if false {")
 mutate("issuer-keys-fragment-allowed", "a keys URL with a fragment is accepted", IK,
        "        if url.fragment().is_some() {", "        if false {")
-mutate("issuer-keys-https-accepted", "an https source is accepted with no TLS client to fetch it", IK,
-       '        if url.scheme() != "http" {', "        if false {")
 mutate("issuer-keys-zero-deadline-allowed", "a zero deadline is accepted", IK,
        "        if options.deadline.is_zero() {", "        if false {")
 mutate("issuer-keys-zero-cap-allowed", "a zero body cap is accepted", IK,
        "        if options.max_body_bytes == 0 {", "        if false {")
-mutate("issuer-keys-redirect-followed", "a redirect is followed once, wherever it points", IK,
-       "        let response = self.send(self.uri.clone()).await?;\n",
-       "        let mut response = self.send(self.uri.clone()).await?;\n"
+# Only a redirect to another host or port is followed, so only the tests whose redirect changes
+# the host (plain and over TLS) or the port can catch it.
+mutate("issuer-keys-redirect-followed", "a redirect to another host or port is followed once", IK,
+       "        let response = self.send(self.uri.clone(), authorization).await?;\n",
+       "        let mut response = self.send(self.uri.clone(), authorization).await?;\n"
        "        if response.status().is_redirection() {\n"
+       "            let here = Url::parse(&self.uri.to_string()).ok();\n"
        "            let next = response\n"
        "                .headers()\n"
        "                .get(hyper::header::LOCATION)\n"
        "                .and_then(|location| location.to_str().ok())\n"
-       "                .and_then(|location| Url::parse(&self.uri.to_string()).ok()?.join(location).ok())\n"
+       "                .and_then(|location| here.as_ref()?.join(location).ok())\n"
+       "                .filter(|next| here.as_ref().is_some_and(|here| {\n"
+       "                    (here.host(), here.port_or_known_default())\n"
+       "                        != (next.host(), next.port_or_known_default())\n"
+       "                }))\n"
        "                .and_then(|next| next.as_str().parse::<Uri>().ok());\n"
        "            if let Some(next) = next {\n"
-       "                response = self.send(next).await?;\n"
+       "                response = self.send(next, None).await?;\n"
        "            }\n"
        "        }\n")
+# Over TLS: only the configured CAs, for the keys URL's own name. Each mutation below installs a
+# verifier around the one rustls builds from the CA bundle, and lets through what it should not.
+IK_TLS_CONFIG = '    config.alpn_protocols = vec![b"http/1.1".to_vec()];\n'
+IK_LAST_FN = "fn parse(body: &[u8]) -> Result<JwkSet, FetchError> {\n"
+
+
+def ik_weakened_verifier(id: str, description: str, verify_server_cert: str) -> None:
+    install = (
+        IK_TLS_CONFIG
+        + "    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(\n"
+        "        Arc::new(trusted(issuer, ca_file)?),\n"
+        "        Arc::new(rustls::crypto::ring::default_provider()),\n"
+        "    )\n"
+        "    .build()\n"
+        "    .map_err(|_| SourceError::Tls(issuer.clone()))?;\n"
+        "    config.dangerous().set_certificate_verifier(Arc::new(Weakened(inner)));\n"
+    )
+    verifier = (
+        "#[derive(Debug)]\n"
+        "struct Weakened(Arc<rustls::client::WebPkiServerVerifier>);\n\n"
+        "impl rustls::client::danger::ServerCertVerifier for Weakened {\n"
+        "    fn verify_server_cert(\n"
+        "        &self,\n"
+        "        end_entity: &CertificateDer<'_>,\n"
+        "        intermediates: &[CertificateDer<'_>],\n"
+        "        server_name: &rustls::pki_types::ServerName<'_>,\n"
+        "        ocsp: &[u8],\n"
+        "        now: rustls::pki_types::UnixTime,\n"
+        "    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {\n"
+        + verify_server_cert
+        + "    }\n\n"
+        "    fn verify_tls12_signature(\n"
+        "        &self,\n"
+        "        message: &[u8],\n"
+        "        cert: &CertificateDer<'_>,\n"
+        "        dss: &rustls::DigitallySignedStruct,\n"
+        "    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {\n"
+        "        self.0.verify_tls12_signature(message, cert, dss)\n"
+        "    }\n\n"
+        "    fn verify_tls13_signature(\n"
+        "        &self,\n"
+        "        message: &[u8],\n"
+        "        cert: &CertificateDer<'_>,\n"
+        "        dss: &rustls::DigitallySignedStruct,\n"
+        "    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {\n"
+        "        self.0.verify_tls13_signature(message, cert, dss)\n"
+        "    }\n\n"
+        "    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {\n"
+        "        self.0.supported_verify_schemes()\n"
+        "    }\n"
+        "}\n\n"
+    )
+    mutate_all(id, description, (IK, IK_TLS_CONFIG, install), (IK, IK_LAST_FN, verifier + IK_LAST_FN))
+
+
+ik_weakened_verifier(
+    "issuer-keys-ca-ignored", "any certificate is accepted, whoever signed it and whatever it names",
+    "        let _ = (end_entity, intermediates, server_name, ocsp, now);\n"
+    "        Ok(rustls::client::danger::ServerCertVerified::assertion())\n")
+ik_weakened_verifier(
+    "issuer-keys-name-unchecked", "a certificate from the configured CA is accepted for any name",
+    "        match self.0.verify_server_cert(end_entity, intermediates, server_name, ocsp, now) {\n"
+    "            Err(rustls::Error::InvalidCertificate(\n"
+    "                rustls::CertificateError::NotValidForName\n"
+    "                | rustls::CertificateError::NotValidForNameContext { .. },\n"
+    "            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),\n"
+    "            other => other,\n"
+    "        }\n")
+# The token: refused beside http, read on every fetch, and sent only when configured.
+mutate("issuer-keys-token-over-http", "a token file beside an http keys URL is accepted, and its token sent in the clear", IK,
+       "            if files.token_file.is_some() {", "            if false {")
+mutate("issuer-keys-token-read-once", "the token is read on the first fetch and that one is sent ever after", IK,
+       "            Some(path) => Some(bearer(path)?),\n",
+       "            Some(path) => {\n"
+       "                static FIRST: std::sync::OnceLock<Result<HeaderValue, FetchError>> =\n"
+       "                    std::sync::OnceLock::new();\n"
+       "                Some(FIRST.get_or_init(|| bearer(path)).clone()?)\n"
+       "            }\n")
+mutate("issuer-keys-token-without-config", "a bearer is sent with every fetch, a token file given or not", IK,
+       "            Some(path) => Some(bearer(path)?),\n            None => None,\n",
+       "            Some(path) => Some(bearer(path)?),\n"
+       '            None => Some(HeaderValue::from_static("Bearer dummy-unconfigured")),\n')
 mutate("issuer-keys-status-unchecked", "only a server error status is refused", IK,
        "        if status != StatusCode::OK {", "        if status.is_server_error() {")
 # The bounds.
