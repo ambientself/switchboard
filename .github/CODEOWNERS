@@ -1,0 +1,30 @@
+# Code owners of the policy files (decision 0011, #48).
+#
+# A change to a registry, team or profile file is a change to what the gateway serves and to
+# whom, so it needs review by a code owner. The branch rule on main that requires that review
+# is set in the repository's settings, not here. GitHub reads this file from the pull
+# request's base branch, and the last pattern that matches a path decides its owners.
+#
+# The directories that hold registries are named, which covers any file added to them later.
+# The name patterns cover every registry, team or profile file under deploy/ or crates/,
+# wherever it is added.
+
+# Registries: the registry crate's demo file, and those the demos and CI load.
+/crates/gateway-registry/demo/            @ambientself
+/deploy/compose/config/registry/          @ambientself
+/deploy/kind/base/config/registry/        @ambientself
+/deploy/ci/**/registry/                   @ambientself
+/deploy/**/registry*.toml                 @ambientself
+/crates/**/registry*.toml                 @ambientself
+
+# Team manifests: which subject belongs to which team.
+/deploy/**/teams*.toml                    @ambientself
+/crates/**/teams*.toml                    @ambientself
+
+# Profiles. Today they are sections of the registry files above; a separate profile file
+# would be owned too.
+/deploy/**/profile*.toml                  @ambientself
+/crates/**/profile*.toml                  @ambientself
+
+# This file, so the list of owners cannot change without their review.
+/.github/CODEOWNERS                       @ambientself
