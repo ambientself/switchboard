@@ -3375,7 +3375,7 @@ mutate("pg-check-definer-chain-not-followed", "a definer function that reaches t
        "                 JOIN pg_catalog.pg_proc p ON p.prosecdef\n",
        "                 JOIN pg_catalog.pg_proc p ON false AND p.prosecdef\n")
 mutate("pg-check-definer-chain-execute-not-followed", "a definer function that runs another passes the check", PG_CHECK,
-       "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
+       "\"(has_function_privilege({owner}, d.oid, 'EXECUTE')", "\"(false AND has_function_privilege({owner}, d.oid, 'EXECUTE')")
 mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
 # #43: ownership counts wherever a privilege does, a definer's owner that can silence the
@@ -3432,30 +3432,42 @@ mutate("pg-check-definer-server-roles-ignored", "a definer function whose owner 
        "                      OR EXISTS (SELECT FROM pg_catalog.pg_roles s\n",
        "                      OR false AND EXISTS (SELECT FROM pg_catalog.pg_roles s\n")
 mutate("pg-check-definer-server-roles-direct-only", "a definer function whose owner inherits pg_execute_server_program through another role passes the check", PG_CHECK,
-       "AND pg_has_role({owner}, s.oid, 'MEMBER'))",
-       "AND s.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = {owner}))")
-# #138: a definer's owner that is a member of a server role without inheriting it, or may run a
-# server function or a function in an untrusted language, is able; and a trigger on a table
-# whose foreign key's action writes it, which runs as that table's owner, is refused when the
-# owner is able.
-mutate("pg-check-definer-server-roles-inherited-only", "a definer function whose owner is a member of pg_execute_server_program without inheriting it passes the check", PG_CHECK,
-       "AND pg_has_role({owner}, s.oid, 'MEMBER'))", "AND pg_has_role({owner}, s.oid, 'USAGE'))")
+       "WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})",
+       "WHERE (mo.oid = {owner} OR mo.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = {owner})) AND {})")
+# #138: a definer's owner, or a cascading table's, is able when any role it is a member of is,
+# inherited or not, as a member can give a function it makes to that role; a definer's owner
+# that may run a server function or a function in an untrusted language is able; and a foreign
+# key on another table whose action writes that table, as its owner, is refused when the owner
+# is able, whatever the table has, judged on a partitioned table by the partitioned table's
+# owner.
+mutate("pg-check-definer-server-roles-inherited-only", "a definer function whose owner is a member of pg_execute_server_program, or of the owner of call_rows, without inheriting it passes the check", PG_CHECK,
+       "WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})", "WHERE pg_has_role({owner}, mo.oid, 'USAGE') AND {})")
 mutate("pg-check-definer-owner-server-functions-ignored", "a definer function whose owner may run lo_export passes the check", PG_CHECK,
        "AND f.proname::text = ANY($4::text[]))", "AND f.proname::text = ANY($4::text[]) AND false)")
 mutate("pg-check-definer-owner-untrusted-ignored", "a definer function whose owner may run a function in an untrusted language passes the check", PG_CHECK,
        "OR (l.lanispl AND NOT l.lanpltrusted))", "OR false)")
-mutate("pg-check-cascade-trigger-ignored", "a trigger on a table whose foreign key cascades, owned by a role that can write the table, passes the check", PG_CHECK,
-       "    problems.extend(found.into_iter().map(|row| Problem::CascadeTrigger {",
-       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::CascadeTrigger {")
-mutate("pg-check-cascade-update-ignored", "a trigger on a table whose foreign key acts only on update passes the check", PG_CHECK,
+mutate("pg-check-cascade-action-ignored", "a foreign key whose action cascades, on a table owned by a role that can write call_rows, passes the check", PG_CHECK,
+       "    problems.extend(found.into_iter().map(|row| Problem::CascadeAction {",
+       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::CascadeAction {")
+mutate("pg-check-cascade-update-ignored", "a foreign key that acts only on update passes the check", PG_CHECK,
        "OR k.confupdtype NOT IN ('a', 'r'))", "OR false)")
-mutate("pg-check-cascade-restrict-refused", "a trigger on a table whose foreign key is ON DELETE RESTRICT is refused", PG_CHECK,
+mutate("pg-check-cascade-restrict-refused", "a foreign key that is ON DELETE RESTRICT is refused", PG_CHECK,
        "AND (k.confdeltype NOT IN ('a', 'r')", "AND (k.confdeltype NOT IN ('a')")
-mutate("pg-check-cascade-any-owner", "a trigger on a table whose foreign key cascades is refused whoever owns the table", PG_CHECK,
-       "                     AND ({}\n                          OR EXISTS (SELECT FROM definers d",
-       "                     AND (true OR {}\n                          OR EXISTS (SELECT FROM definers d")
-mutate("pg-check-cascade-definer-runner-ignored", "a trigger on a table whose foreign key cascades, owned by a role that can run a refused definer function, passes the check", PG_CHECK,
-       "OR EXISTS (SELECT FROM definers d", "OR false AND EXISTS (SELECT FROM definers d")
+mutate("pg-check-cascade-any-owner", "a foreign key whose action cascades is refused whoever owns its table", PG_CHECK,
+       "                     AND ({}\n                          OR {})",
+       "                     AND (true OR {}\n                          OR {})")
+mutate("pg-check-cascade-definer-runner-ignored", "a cascading foreign key on a table owned by a role that can run a refused definer function passes the check", PG_CHECK,
+       "\"EXISTS (SELECT FROM definers d", "\"false AND EXISTS (SELECT FROM definers d")
+mutate("pg-check-cascade-triggers-only", "a cascading foreign key whose table has a rule, a check or a default but no trigger passes the check", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n",
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n                     AND EXISTS (SELECT FROM pg_catalog.pg_trigger t WHERE t.tgrelid = tbl.oid AND NOT t.tgisinternal)\n")
+mutate("pg-check-cascade-partition-copy-judged", "a partitioned table's foreign key is judged by its partitions' owners, so a partition owned by a role that can reach nothing passes the check", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n",
+       "WHERE k.contype = 'f' AND (k.conparentid <> 0 OR NOT EXISTS (SELECT FROM pg_catalog.pg_inherits i WHERE i.inhparent = k.conrelid))\n")
+mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a foreign key is refused for the partition's owner, which the action does not run as", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
+mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
+       "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
 # Open rows. The boot check compares the view with the definition it expects, so each change to
 # the view changes that definition as well, and the open-row tests must catch it themselves.
 PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"

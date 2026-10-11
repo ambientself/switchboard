@@ -198,10 +198,11 @@ const REACHING: &str = "reaching(oid) AS (
     )";
 
 /// A condition that the role `{owner}` is able: it can read or change `call_rows`, given as `$1`,
-/// or turn off its triggers. [`definers`] and [`cascade_triggers`] say what counts. It reads
+/// or turn off its triggers. [`definers`] and [`cascade_actions`] say what counts. It reads
 /// [`REACHING`], and the parameters [`AbleParameters`] gives: `$2` the table-level privileges,
 /// `$3` the names of [`SERVER_ROLES`] and `$4` those of [`SERVER_FUNCTIONS`]. `{replication}` is
-/// [`replication_condition`]'s.
+/// [`replication_condition`]'s. It asks about `{owner}` with what it inherits; [`able`] asks it
+/// of every role a role is a member of.
 const ABLE: &str = "(EXISTS (SELECT FROM reaching x
                                   JOIN pg_catalog.pg_class c ON c.oid = x.oid
                               WHERE has_table_privilege({owner}, x.oid, $2)
@@ -216,8 +217,7 @@ const ABLE: &str = "(EXISTS (SELECT FROM reaching x
                                  WHERE g.tgrelid = $1::oid
                                      AND pg_has_role({owner}, f.proowner, 'USAGE'))
                       OR EXISTS (SELECT FROM pg_catalog.pg_roles s
-                                 WHERE s.rolname = ANY($3::text[])
-                                     AND pg_has_role({owner}, s.oid, 'MEMBER'))
+                                 WHERE s.rolname = ANY($3::text[]) AND s.oid = {owner})
                       OR EXISTS (SELECT FROM pg_catalog.pg_proc f
                                      JOIN pg_catalog.pg_namespace fs ON fs.oid = f.pronamespace
                                      JOIN pg_catalog.pg_language l ON l.oid = f.prolang
@@ -227,10 +227,26 @@ const ABLE: &str = "(EXISTS (SELECT FROM reaching x
                                      AND has_function_privilege({owner}, f.oid, 'EXECUTE'))
                       {replication})";
 
-/// [`ABLE`] for the role `owner`, an expression naming one.
+/// [`ABLE`] for the role `owner`, an expression naming one, or for any role it is a member of.
 fn able(owner: &str, version: i32) -> String {
-    ABLE.replace("{replication}", &replication_condition(version))
-        .replace("{owner}", owner)
+    by_any_member(
+        owner,
+        &ABLE.replace("{replication}", &replication_condition(version)),
+    )
+}
+
+/// `test`, a condition on the role `{owner}`, for the role `owner`, an expression naming one, or
+/// for any role it is a member of, whether or not it inherits that role. A member that does not
+/// inherit a role can still give an object it makes to that role, since `ALTER ... OWNER TO`
+/// asks only that it may `SET ROLE` to it, not that it does; and a definer function or a
+/// foreign key's action can do that though it cannot `SET ROLE` itself. So every membership
+/// counts here, as it does for the session's role.
+fn by_any_member(owner: &str, test: &str) -> String {
+    format!(
+        "EXISTS (SELECT FROM pg_catalog.pg_roles mo
+                 WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})",
+        test.replace("{owner}", "mo.oid")
+    )
 }
 
 /// From version 15 a role can be granted SET on a setting only a superuser may set, so being
@@ -269,9 +285,9 @@ impl AbleParameters {
     }
 }
 
-/// `definers(oid)`, every `SECURITY DEFINER` function whose owner is able ([`ABLE`]), or can run
-/// another such function, itself or through a trigger on a table it can write. It follows
-/// [`REACHING`] in a `WITH RECURSIVE`.
+/// `definers(oid)`, every `SECURITY DEFINER` function whose owner is able ([`able`]), or can
+/// run another such function, itself or through a trigger on a table it can write, or is a
+/// member of a role that can. It follows [`REACHING`] in a `WITH RECURSIVE`.
 fn definers_cte(version: i32) -> String {
     format!(
         "definers(oid) AS (
@@ -282,17 +298,18 @@ fn definers_cte(version: i32) -> String {
              SELECT p.oid
              FROM definers d
                  JOIN pg_catalog.pg_proc p ON p.prosecdef
-                     AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')
-                          OR EXISTS (SELECT FROM pg_catalog.pg_trigger t
-                                     WHERE t.tgfoid = d.oid
-                                         AND (has_any_column_privilege(
-                                                  p.proowner, t.tgrelid,
-                                                  'INSERT, UPDATE')
-                                              OR has_table_privilege(
-                                                  p.proowner, t.tgrelid,
-                                                  'DELETE, TRUNCATE'))))
+                     AND {}
          )",
-        able("p.proowner", version)
+        able("p.proowner", version),
+        by_any_member(
+            "p.proowner",
+            "(has_function_privilege({owner}, d.oid, 'EXECUTE')
+              OR EXISTS (SELECT FROM pg_catalog.pg_trigger t
+                         WHERE t.tgfoid = d.oid
+                             AND (has_any_column_privilege({owner}, t.tgrelid, 'INSERT, UPDATE')
+                                  OR has_table_privilege({owner}, t.tgrelid,
+                                                         'DELETE, TRUNCATE'))))"
+        ),
     )
 }
 
@@ -478,17 +495,17 @@ pub enum Problem {
         /// The table the trigger is on.
         table: String,
     },
-    /// A trigger is on a table that holds a foreign key whose action, on a delete or an update
-    /// of the row it references, writes that table, and the table's owner can read or change
-    /// `call_rows` or turn off its triggers, as [`Problem::Definer`] counts it. Postgres runs
-    /// the action, and the triggers it fires, as that owner, for any role that may delete or
-    /// update the referenced row.
-    CascadeTrigger {
-        /// The trigger.
-        trigger: String,
-        /// The table it is on.
+    /// A table other than `call_rows` holds a foreign key whose action, on a delete or an
+    /// update of the row it references, writes that table, and the table's owner can read or
+    /// change `call_rows` or turn off its triggers, as [`Problem::Definer`] counts it. Postgres
+    /// runs the action as that owner, for any role that may delete or update the referenced
+    /// row, and with it whatever the write sets off on the table: its triggers, its rules, its
+    /// checks and its defaults. For a partitioned table, that is the partitioned table's owner,
+    /// on every partition.
+    CascadeAction {
+        /// The table that holds the foreign key.
         table: String,
-        /// The table's owner, which the trigger runs as.
+        /// The table's owner, which the action runs as.
         owner: String,
         /// The foreign key.
         constraint: String,
@@ -709,18 +726,18 @@ impl fmt::Display for Problem {
                  its triggers; a trigger asks for no EXECUTE, and any write that reaches \
                  {table}, through a view, a rule or a foreign key, fires it"
             ),
-            Self::CascadeTrigger {
-                trigger,
+            Self::CascadeAction {
                 table,
                 owner,
                 constraint,
                 referenced,
             } => write!(
                 f,
-                "the trigger {trigger} on {table} runs as the table's owner {owner}, which can \
-                 read or change switchboard_audit.call_rows or turn off its triggers, whenever \
-                 the foreign key {constraint}'s action writes {table}: each delete or update on \
-                 {referenced}, by any role that may make one, can fire it"
+                "the table {table} has the foreign key {constraint}, whose action writes {table} \
+                 as its owner {owner}, which can read or change switchboard_audit.call_rows or \
+                 turn off its triggers: each delete or update on {referenced}, by any role that \
+                 may make one, runs that action, and the triggers, rules, checks and defaults it \
+                 sets off, as {owner}"
             ),
             Self::DefinerEventTrigger {
                 function,
@@ -842,7 +859,8 @@ impl PgAuditStore {
     /// next two found (#126, #138), are each closed or ruled out of scope:
     ///
     /// - A definer function whose owner owns the table, a relation that reaches it, or a
-    ///   trigger function, without holding a privilege: closed. Ownership counts.
+    ///   trigger function, without holding a privilege: closed. Ownership counts, and so does
+    ///   every role the owner is a member of, inherited or not.
     /// - A view or rule outside the schema owned by the session's role, or a role it can
     ///   become, after revoking its own grants: closed. Ownership is refused.
     /// - A definer function whose owner can set `session_replication_role`: closed.
@@ -857,9 +875,10 @@ impl PgAuditStore {
     /// - A foreign key on `call_rows` whose action writes it: closed. A `CASCADE`, `SET NULL`
     ///   or `SET DEFAULT` action, on a delete or an update of the row it references, runs as
     ///   the table's owner, as a rule does, and is refused.
-    /// - A foreign key on another table whose action writes that table, which fires its plain
-    ///   triggers as its owner: closed. Every trigger on such a table is refused when its
-    ///   owner is able, as a definer function's owner is counted.
+    /// - A foreign key on another table whose action writes that table as its owner, firing its
+    ///   plain triggers, rules, checks and defaults: closed. Such a foreign key is refused when
+    ///   that owner is able, as a definer function's owner is counted; for a partitioned
+    ///   table, the partitioned table's owner, which the action runs as on every partition.
     /// - Functions in untrusted languages: EXECUTE on one is refused, and so is a trigger on
     ///   any table, or an enabled event trigger, that runs one, and a definer function whose
     ///   owner may run one.
@@ -920,24 +939,29 @@ impl PgAuditStore {
     ///   owner can read or change `call_rows` or turn off its triggers: one that holds a
     ///   privilege on it, or on a view or rule that reaches it; or can act as the owner of the
     ///   table, of such a view or rule, of the schema, or of the functions the table's
-    ///   triggers run; or can set `session_replication_role`; or is a member, inherited or
-    ///   not, of `pg_read_server_files`, `pg_write_server_files` or
-    ///   `pg_execute_server_program`, which reach the server's files and programs as a
-    ///   superuser does; or can run one of the catalog's functions that reach those files,
-    ///   listed below, or a function in an untrusted language; or can run another such
-    ///   function. PUBLIC holds EXECUTE on every new function unless it is revoked.
+    ///   triggers run; or can set `session_replication_role`; or is `pg_read_server_files`,
+    ///   `pg_write_server_files` or `pg_execute_server_program`, which reach the server's
+    ///   files and programs as a superuser does; or can run one of the catalog's functions
+    ///   that reach those files, listed below, or a function in an untrusted language; or can
+    ///   run another such function. An owner counts when it, or any role it is a member of,
+    ///   inherited or not, is so: a member can give a function it makes to the role.
+    ///   PUBLIC holds EXECUTE on every new function unless it is revoked.
     /// - No trigger on any table, and no enabled event trigger, runs such a function, whoever
     ///   can write the table. A trigger does not ask for EXECUTE, and a write through a view,
     ///   a rule or a foreign key's cascade fires it as a direct one does. An event trigger
     ///   fires on statements any role may run, such as `CREATE TEMP TABLE`. The migrations'
     ///   trigger functions are not `SECURITY DEFINER`.
-    /// - No table other than `call_rows` that holds a foreign key with a `CASCADE`, `SET NULL`
-    ///   or `SET DEFAULT` action, on delete or on update, has any trigger, on any event,
-    ///   enabled or not, when the table's owner can read or change `call_rows` or turn off its
-    ///   triggers as a definer function's owner is counted above. Postgres runs the action,
-    ///   and the triggers it fires, as that owner, for any role that may delete or update a
-    ///   referenced row. The catalog cannot say what a trigger function writes, so each such
-    ///   trigger is refused. The migrations make no foreign key.
+    /// - No table other than `call_rows` holds a foreign key with a `CASCADE`, `SET NULL` or
+    ///   `SET DEFAULT` action, on delete or on update, when the table's owner can read or
+    ///   change `call_rows` or turn off its triggers, as a definer function's owner is counted
+    ///   above, or can run such a function. Postgres runs the action as that owner, for any
+    ///   role that may delete or update a referenced row, and with it the table's triggers,
+    ///   rules, checks and defaults. For a partitioned table it runs as the partitioned
+    ///   table's owner on every partition, whoever owns the partition. The catalog cannot say
+    ///   what each of those writes, so the foreign key itself is refused. A foreign key that
+    ///   references `call_rows` passes: its action runs only when an audit row is deleted or
+    ///   its key changes, which the gateway's role may not do. The migrations make no foreign
+    ///   key.
     /// - Neither can run the catalog's functions that read or write the server's own files:
     ///   `lo_export`, `lo_import`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
     ///   `pg_stat_file`, and adminpack's `pg_file_*` where the server has them.
@@ -1063,7 +1087,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     if let Some((table, _)) = table {
         reaching_privileges(client, table, version, &mut problems).await?;
         definers(client, table, version, &mut problems).await?;
-        cascade_triggers(client, table, version, &mut problems).await?;
+        cascade_actions(client, table, version, &mut problems).await?;
     }
     server_functions(client, &mut problems).await?;
     untrusted_functions(client, &mut problems).await?;
@@ -1356,8 +1380,8 @@ async fn rules(
 /// completion's columns, and only on a row whose `outcome` is NULL, and `completion_shape` and
 /// `error_kind_shape` keep every completion column NULL until then. So a referenced key holds
 /// none of those columns and never changes, or its old value has a NULL and Postgres takes no
-/// action. The triggers on such a table, which run as its owner during the action, are
-/// [`cascade_triggers`]'s.
+/// action. A foreign key on another table, whose action runs as that table's owner, is
+/// [`cascade_actions`]'.
 async fn referential_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
@@ -1732,11 +1756,12 @@ async fn reaching_privileges(
 /// which may drop the table, or of a function the table's triggers run (`set_times` and
 /// `complete_once`), which may drop the trigger with it; when it can set
 /// `session_replication_role`, under which neither trigger fires; or when it can run another
-/// such function, itself or through a trigger on a table it can write. An owner that is a member
-/// of one of [`SERVER_ROLES`] is able too, whether or not it inherits the role: it reaches the
-/// server's files and programs, and through them every setting and every row, as a superuser
-/// does. So is an owner that may run one of [`SERVER_FUNCTIONS`], such as `lo_export`, or a
-/// function in an untrusted language, both of which the session's own role is refused.
+/// such function, itself or through a trigger on a table it can write. An owner that is one of
+/// [`SERVER_ROLES`] is able too: it reaches the server's files and programs, and through them
+/// every setting and every row, as a superuser does. So is an owner that may run one of
+/// [`SERVER_FUNCTIONS`], such as `lo_export`, or a function in an untrusted language, both of
+/// which the session's own role is refused. An owner is able when any role it is a member of,
+/// inherited or not, is able: it can give a function it makes to that role ([`by_any_member`]).
 ///
 /// A trigger runs its function without asking for EXECUTE, for whoever writes its table by
 /// whatever route: directly, through a view or a rule, or by a foreign key's cascade. Rather
@@ -1840,20 +1865,29 @@ async fn definers(
     Ok(())
 }
 
-/// No trigger may be on a table, other than `call_rows`, that holds a foreign key whose action
-/// on a delete or an update of the row it references writes that table (`CASCADE`, `SET NULL`
-/// or `SET DEFAULT`), when the table's owner is able ([`ABLE`]) or can run a definer function
-/// [`definers`] refuses.
+/// No table other than `call_rows` may hold a foreign key whose action on a delete or an
+/// update of the row it references writes that table (`CASCADE`, `SET NULL` or `SET DEFAULT`),
+/// when the table's owner is able ([`able`]) or can run a definer function [`definers`]
+/// refuses.
 ///
-/// Postgres runs a foreign key's action as the owner of the table that holds the key, and the
-/// triggers the action fires run as that owner too, whether or not they are `SECURITY
-/// DEFINER`. So any role that may delete or update a referenced row, the gateway's role among
-/// them, runs that table's triggers as its owner. The catalog cannot say what a trigger
-/// function's body writes, so every trigger on such a table is refused, on any event, enabled
-/// or not, whoever can write the referenced table. A foreign key with only `NO ACTION` or
-/// `RESTRICT` writes nothing, and its table's triggers pass. A foreign key on `call_rows`
-/// itself is [`referential_actions`]'s.
-async fn cascade_triggers(
+/// Postgres runs a foreign key's action as the owner of the table that holds the key, whether
+/// or not anything it sets off is `SECURITY DEFINER`, for any role that may delete or update a
+/// referenced row, the gateway's role among them. The write runs that table's triggers, goes
+/// through its rules, and evaluates its checks and, for `SET DEFAULT`, its defaults, all as
+/// that owner. The catalog cannot say what each of those writes, so the foreign key itself is
+/// refused, whoever can write the referenced table. A foreign key with only `NO ACTION` or
+/// `RESTRICT` writes nothing, and passes.
+///
+/// A partitioned table's foreign key is copied to each partition, but its action writes the
+/// partitioned table, as that table's owner, and reaches each partition's triggers from
+/// there. So only a foreign key that is not a partition's copy is judged, by the owner of the
+/// table that holds it.
+///
+/// A foreign key on `call_rows` itself is [`referential_actions`]'. One that references
+/// `call_rows` acts only when an audit row is deleted, which the gateway's role may not do, or
+/// when its referenced key changes, which an update of the completion cannot do, as
+/// [`referential_actions`] says; it passes.
+async fn cascade_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
     version: i32,
@@ -1863,34 +1897,36 @@ async fn cascade_triggers(
         .query(
             &format!(
                 "WITH RECURSIVE {REACHING}, {}
-                 SELECT DISTINCT t.tgname::text, tn.nspname || '.' || tbl.relname,
-                        o.rolname::text, k.conname::text, rn.nspname || '.' || r.relname
+                 SELECT tn.nspname || '.' || tbl.relname, o.rolname::text, k.conname::text,
+                        rn.nspname || '.' || r.relname
                  FROM pg_catalog.pg_constraint k
                      JOIN pg_catalog.pg_class tbl ON tbl.oid = k.conrelid
                      JOIN pg_catalog.pg_namespace tn ON tn.oid = tbl.relnamespace
                      JOIN pg_catalog.pg_roles o ON o.oid = tbl.relowner
                      JOIN pg_catalog.pg_class r ON r.oid = k.confrelid
                      JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace
-                     JOIN pg_catalog.pg_trigger t ON t.tgrelid = tbl.oid AND NOT t.tgisinternal
-                 WHERE k.contype = 'f' AND k.conrelid <> $1::oid
+                 WHERE k.contype = 'f' AND k.conparentid = 0
+                     AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid
                      AND (k.confdeltype NOT IN ('a', 'r') OR k.confupdtype NOT IN ('a', 'r'))
                      AND ({}
-                          OR EXISTS (SELECT FROM definers d
-                                     WHERE has_function_privilege(tbl.relowner, d.oid,
-                                                                  'EXECUTE')))
-                 ORDER BY 2, 1, 4",
+                          OR {})
+                 ORDER BY 1, 3",
                 definers_cte(version),
                 able("tbl.relowner", version),
+                by_any_member(
+                    "tbl.relowner",
+                    "EXISTS (SELECT FROM definers d
+                             WHERE has_function_privilege({owner}, d.oid, 'EXECUTE'))"
+                ),
             ),
             &able_parameters(table, version).as_params(),
         )
         .await?;
-    problems.extend(found.into_iter().map(|row| Problem::CascadeTrigger {
-        trigger: row.get(0),
-        table: row.get(1),
-        owner: row.get(2),
-        constraint: row.get(3),
-        referenced: row.get(4),
+    problems.extend(found.into_iter().map(|row| Problem::CascadeAction {
+        table: row.get(0),
+        owner: row.get(1),
+        constraint: row.get(2),
+        referenced: row.get(3),
     }));
     Ok(())
 }
