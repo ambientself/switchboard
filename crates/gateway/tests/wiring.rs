@@ -19,11 +19,14 @@ use gateway::start::{Prepared, StartError, prepare};
 use gateway::{ReloadError, invalid_argument, undeclared_argument};
 use gateway_core::IDENTITY_FAILURE;
 use gateway_identity::SystemClock;
-use gateway_registry::Registry;
+use gateway_registry::{Registry, RegistryError};
 use gateway_testkit::LocalIssuer;
 use mock_docs_server::{AcceptedCredential, Config};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// The list tool's approved `definition_sha256` in the kind registry.
+const LIST_TOOL_SHA256: &str = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a";
 
 fn issuer() -> &'static LocalIssuer {
     static ISSUER: OnceLock<LocalIssuer> = OnceLock::new();
@@ -387,8 +390,16 @@ async fn a_new_registry_file_is_served_once_it_passes_and_refused_otherwise() {
         .unwrap();
     assert_eq!(listed(&path, &team_a).await, [LIST_TOOL, READ_TOOL]);
 
-    // A changed server needs a restart.
-    let moved = original.replace(&world.mock.url(), "http://127.0.0.1:9/mcp");
+    // A server entry changed without its tools approved again does not load, so no reload
+    // serves it.
+    let unapproved = original.replace(&world.mock.url(), "http://127.0.0.1:9/mcp");
+    let refused = Registry::from_toml_str(&unapproved).unwrap_err();
+    assert!(
+        matches!(&refused, RegistryError::BindingChanged { server, .. } if server.as_str() == "mock-docs"),
+        "{refused}"
+    );
+    // Approved again, a changed server still needs a restart.
+    let moved = files::rebind(&original, "http://127.0.0.1:9/mcp");
     let refused = reloader
         .apply(&Registry::from_toml_str(&moved).unwrap())
         .unwrap_err();
@@ -399,13 +410,13 @@ async fn a_new_registry_file_is_served_once_it_passes_and_refused_otherwise() {
         "upstream_name = \"search_documents\"",
     );
     let rerouted = rerouted.replace(
-        "453ea692bdf92bc95d262085a1f6b3a54c25ac3d132e844029a49ff5ffaf536d",
+        LIST_TOOL_SHA256,
         &gateway_registry::definition_sha256(
             "search_documents",
-            Some("List documents"),
-            "Lists the documents in one project.",
+            None,
+            "List the names of the documents in one project.",
             &json!({"type": "object", "required": ["project"], "additionalProperties": false,
-                    "properties": {"project": {"type": "string", "description": "The project, such as `atlas`."}}}),
+                    "properties": {"project": {"type": "string"}}}),
         ),
     );
     let refused = reloader
@@ -590,6 +601,19 @@ async fn the_wiring_refuses_to_start_on_what_it_cannot_serve() {
     );
     let said = refused(&world).await;
     assert!(said.contains("must be http://"), "{said}");
+    // A server entry changed without its tools approved again.
+    world.files.write(
+        "registry/registry.toml",
+        &registry(&world.mock.url()).replace(
+            "reference = \"docs-credential\"",
+            "reference = \"other-credential\"",
+        ),
+    );
+    let said = refused(&world).await;
+    assert!(
+        said.contains("binding to server `mock-docs`") && said.contains("approve it again"),
+        "{said}"
+    );
     // A registry that does not load.
     world
         .files

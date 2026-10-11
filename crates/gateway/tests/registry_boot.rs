@@ -315,15 +315,15 @@ fn widened(original: &str, revision: &str) -> String {
         "required": ["project", "document"],
         "additionalProperties": false,
         "properties": {
-            "project": {"type": "string", "description": "The project, such as `atlas`."},
-            "document": {"type": "string", "description": "The document's name within the project."},
+            "project": {"type": "string"},
+            "document": {"type": "string"},
             "other_project": {"type": "string", "description": "Another project."},
         },
     });
     let hash = gateway_registry::definition_sha256(
         "read_document",
-        Some("Read a document"),
-        "Reads one document from one project.",
+        None,
+        "Read one document of one project.",
         &schema,
     );
     let tool = original[start..end]
@@ -335,7 +335,7 @@ fn widened(original: &str, revision: &str) -> String {
             ),
         )
         .replace(
-            "933716f7c43f229c6a246bfa2114812f8c24855b9d38afe28e9c90a04b743cb9",
+            "88523168357c2c86447effa74bcc7b2224d52b9eef69fc4b4f314e169bf2e28a",
             &hash,
         )
         + "[tools.input_schema.properties.other_project]\ntype = \"string\"\ndescription = \"Another project.\"\n\n";

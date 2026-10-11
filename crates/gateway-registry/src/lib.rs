@@ -35,6 +35,8 @@ mod registry;
 mod selection;
 
 pub use adapter::{ArgumentAdapter, ArgumentError, JsonPointer, ResourceSource};
-pub use definition::{Approval, Route, ToolDefinition, definition_sha256};
-pub use registry::{Credential, Registry, RegistryError, Server};
+pub use definition::{
+    Approval, Route, SCHEMA_DIALECT, ToolDefinition, binding_sha256, definition_sha256,
+};
+pub use registry::{Credential, Registry, RegistryError, Server, address_host};
 pub use selection::{NoProfile, ProfileRule, ProfileRules, RulePrincipal};

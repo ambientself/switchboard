@@ -12,8 +12,8 @@ profile_rules = []
 name = "mock-docs"
 system = "docs"
 owner = "platform"
-identity = "mock-docs"
-# Port 9 (discard) on loopback. Never connected to.
+# Port 9 (discard) on loopback. Never connected to. The identity is the address's host.
+identity = "127.0.0.1"
 address = "http://127.0.0.1:9/mcp"
 credential = { mode = "bearer", reference = "docs-credential" }
 
@@ -25,8 +25,9 @@ classification = "propose"
 title = "Propose a document"
 description = "Opens a draft document in one project for a person to review."
 approved_by = "ci-approver@example.test"
-approved_at = 2026-10-09T00:00:00Z
+approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "9b55679f29a51538416c9ef29344343ce59c87690cfe9fa34c46e0f11c252489"
+binding_sha256 = "1c0b6546ad84e87188b9dd5926e7a09c4f24d06d90d309fb207e7f026524a39c"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]

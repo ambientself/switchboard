@@ -12,7 +12,7 @@ use gateway_core::{
     CallContext, CallerContext, Classification, ReasonKind, Resource, ResourceDeclaration,
     ResourceProblem, Resources, ToolName, Verdict, decide, list_tools,
 };
-use gateway_registry::{Credential, Registry};
+use gateway_registry::{Credential, Registry, binding_sha256};
 use gateway_testkit::{Caller, DEPLOYMENT, Fixture, WORKLOAD_ISSUER};
 use serde_json::{Map, Value, json};
 
@@ -67,6 +67,14 @@ fn the_demo_registry_loads_from_its_file() {
             reference: "docs-credential".into()
         }
     );
+    // The identity is the mock server's Service name, and every approval binds that server.
+    assert_eq!(server.identity, "mock-docs.mock-docs.svc.cluster.local");
+    for name in &expected {
+        assert_eq!(
+            registry.approvals()[name].binding_sha256,
+            binding_sha256(server)
+        );
+    }
 
     let limits = snapshot.limits();
     assert_eq!(

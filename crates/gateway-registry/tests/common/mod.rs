@@ -1,8 +1,11 @@
 //! Helpers shared by the table tests: a registry file held as a TOML table, edited in place,
-//! with each tool's approval hash recomputed so that an edit tests one rule and not the hash.
+//! with each tool's approval hashes recomputed so that an edit tests one rule and not the
+//! hashes.
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
-use gateway_registry::{Registry, RegistryError, definition_sha256};
+use gateway_registry::{
+    Credential, Registry, RegistryError, Server, binding_sha256, definition_sha256,
+};
 use toml::{Table, Value};
 
 /// A registry file that loads: two servers, three tools (one per kind of resource
@@ -15,7 +18,7 @@ revision = "r1"
 name = "docs-server"
 system = "docs"
 owner = "team-docs"
-identity = "docs-server"
+identity = "docs.internal.example.test"
 address = "https://docs.internal.example.test/mcp"
 credential = { mode = "bearer", reference = "docs-credential" }
 
@@ -23,7 +26,7 @@ credential = { mode = "bearer", reference = "docs-credential" }
 name = "wiki-server"
 system = "wiki"
 owner = "team-wiki"
-identity = "wiki-server"
+identity = "wiki.internal.example.test"
 address = "http://wiki.internal.example.test:8080/mcp"
 credential = { mode = "bearer", reference = "wiki-credential" }
 
@@ -37,6 +40,7 @@ description = "Reads a document."
 approved_by = "approver@example.test"
 approved_at = 2026-10-01T12:00:00+01:00
 definition_sha256 = ""
+binding_sha256 = ""
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -58,6 +62,7 @@ description = "Searches public pages."
 approved_by = "approver@example.test"
 approved_at = 2026-10-01T12:00:00Z
 definition_sha256 = ""
+binding_sha256 = ""
 resources = "no_resources"
 
 [tools.input_schema]
@@ -75,6 +80,7 @@ description = "Edits a page."
 approved_by = "approver@example.test"
 approved_at = 2026-10-01T12:00:00Z
 definition_sha256 = ""
+binding_sha256 = ""
 resources = { from_arguments = [{ from_argument = "space", system = "wiki", kind = "space" }] }
 
 [tools.input_schema]
@@ -136,8 +142,14 @@ pub fn base() -> Table {
     table
 }
 
-/// Sets every tool's `definition_sha256` to the hash of its definition as it now stands.
+/// Sets every tool's `definition_sha256` to the hash of its definition as it now stands, and
+/// its `binding_sha256` to the hash of its server's entry as it now stands. A tool whose server
+/// is not registered keeps its binding hash.
 pub fn rehash(table: &mut Table) {
+    let servers: Vec<Server> = match table.get("servers") {
+        Some(Value::Array(servers)) => servers.iter().filter_map(server).collect(),
+        _ => Vec::new(),
+    };
     let Some(Value::Array(tools)) = table.get_mut("tools") else {
         return;
     };
@@ -157,7 +169,32 @@ pub fn rehash(table: &mut Table) {
             &schema,
         );
         tool.insert("definition_sha256".into(), Value::String(hash));
+        let named = tool.get("server").and_then(Value::as_str);
+        if let Some(server) = servers
+            .iter()
+            .find(|server| Some(server.name.as_str()) == named)
+        {
+            let hash = binding_sha256(server);
+            tool.insert("binding_sha256".into(), Value::String(hash));
+        }
     }
+}
+
+/// A server entry of the file as the loader would read it, if it has the fields the binding
+/// needs.
+fn server(entry: &Value) -> Option<Server> {
+    let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+    let credential = entry.get("credential")?;
+    Some(Server {
+        name: text("name")?.as_str().into(),
+        system: text("system").unwrap_or_default(),
+        owner: text("owner").unwrap_or_default(),
+        identity: text("identity").unwrap_or_default(),
+        address: text("address").unwrap_or_default(),
+        credential: Credential::Bearer {
+            reference: credential.get("reference")?.as_str()?.to_owned(),
+        },
+    })
 }
 
 /// Loads `table` as a registry file.

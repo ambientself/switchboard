@@ -820,6 +820,16 @@ pub(crate) mod tests {
             "Lists the documents.",
             &json!({"type": "object"}),
         );
+        let binding = gateway_registry::binding_sha256(&gateway_registry::Server {
+            name: "mock-docs".into(),
+            system: "docs".into(),
+            owner: "platform".into(),
+            identity: "127.0.0.1".into(),
+            address: "http://127.0.0.1:9/mcp".into(),
+            credential: gateway_registry::Credential::Bearer {
+                reference: "docs-credential".into(),
+            },
+        });
         let served = if on_surface {
             "\"docs__list_documents\""
         } else {
@@ -834,7 +844,7 @@ profile_rules = []
 name = "mock-docs"
 system = "docs"
 owner = "platform"
-identity = "mock-docs"
+identity = "127.0.0.1"
 address = "http://127.0.0.1:9/mcp"
 credential = {{ mode = "bearer", reference = "docs-credential" }}
 
@@ -847,6 +857,7 @@ description = "Lists the documents."
 approved_by = "approver@example.test"
 approved_at = 2026-10-06T00:00:00Z
 definition_sha256 = "{sha}"
+binding_sha256 = "{binding}"
 resources = "no_resources"
 
 [tools.input_schema]

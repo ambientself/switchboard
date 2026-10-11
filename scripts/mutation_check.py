@@ -2470,9 +2470,11 @@ mutate("registry-credential-reference-empty", "a credential may have no referenc
        '                require(&reference, "credential.reference", place)?;\n', "")
 mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
        "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
-mutate("registry-address-unchecked", "any address is accepted", RR, "        if !http {", "        if false {")
+mutate("registry-address-unchecked", "any address is accepted", RR,
+       "        let Some(host) = address_host(&server.address) else {",
+       "        let Some(host) = address_host(&server.address).or(Some(server.identity.as_str())) else {")
 mutate("registry-address-host-unchecked", "an address with no host is accepted", RR,
-       ".is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))", ".is_some()")
+       "    (!host.is_empty()).then_some(host)", "    Some(host)")
 mutate("registry-duplicate-tool-left-to-core", "a tool approved twice is not refused by the loader", RR,
        "        if definitions.contains_key(&checked.definition.name) {", "        if false {")
 mutate("registry-duplicate-upstream", "one upstream tool may be approved under two names", RR,
@@ -2487,6 +2489,28 @@ mutate("registry-hash-unchecked", "a definition changed after approval loads", R
        "    if computed != tool.definition_sha256 {", "    if false {")
 mutate("registry-hash-ignores-title", "the approval hash does not cover the title", RD,
        '        definition.insert("title".into(), Value::String(title.into()));', "        let _ = title;")
+# The binding (#11, #51, decision 0013): recomputed from the tool's server entry and compared,
+# over the dialect, identity, address and credential, with the identity the address's host and
+# the derived-revision form reserved.
+mutate("registry-binding-unchecked", "a server entry changed after approval loads", RR,
+       "    if computed != tool.binding_sha256 {", "    if false {")
+mutate("registry-binding-ignores-address", "the binding does not cover the address", RD,
+       '    binding.insert("address".into(), Value::String(server.address.clone()));\n', "")
+mutate("registry-binding-ignores-identity", "the binding does not cover the identity", RD,
+       '    binding.insert("identity".into(), Value::String(server.identity.clone()));\n', "")
+mutate("registry-binding-ignores-credential-reference", "the binding does not cover the credential reference", RD,
+       '    binding.insert(\n        "credential_reference".into(),\n        Value::String(reference.clone()),\n    );\n',
+       "    let _ = reference;\n")
+mutate("registry-binding-ignores-credential-mode", "the binding does not cover the credential mode", RD,
+       '    binding.insert("credential_mode".into(), Value::String(mode.into()));\n', "    let _ = mode;\n")
+mutate("registry-binding-ignores-dialect", "the binding does not cover the schema dialect", RD,
+       '    binding.insert("dialect".into(), Value::String(SCHEMA_DIALECT.into()));\n', "")
+mutate("registry-identity-not-host-accepted", "a server's identity need not be its address's host", RR,
+       "        if server.identity != host {", "        if false {")
+mutate("registry-identity-host-keeps-port", "the host compared with the identity keeps the address's port", RR,
+       "        host_and_port.split(':').next().unwrap_or_default()", "        host_and_port")
+mutate("registry-revision-plus-accepted", "a registry revision may take a withdrawal's derived form", RR,
+       "    if file.revision.contains('+') {", "    if false {")
 mutate("registry-schema-type-unchecked", "an input schema need not be an object schema", RR,
        '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
 mutate("registry-schema-keywords-unchecked", "a schema may use keywords the argument check does not follow", RA,
