@@ -1,17 +1,22 @@
-//! The HTTP endpoints: `POST /mcp`, and the admin endpoint that changes the tool list.
+//! The HTTP endpoints: `POST /mcp`, and the admin endpoint that changes the tool list, the
+//! served definitions and each caller's projects.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{Map, Value, json};
 
-use crate::config::{Config, Credential, logged_prefix, sha256};
+use crate::config::{
+    AcceptedCredential, Config, Credential, Projects, logged_prefix, named_projects, sha256,
+};
 use crate::documents::{Content, Documents, FAIL_CODE, FAIL_DOC, HUGE_BYTES, SLOW_DOC};
 use crate::jwt::{JwtVerifier, Refusal};
 use crate::tools::ToolName;
@@ -76,7 +81,8 @@ impl Log {
     }
 }
 
-/// The server. Cheap to clone; every clone serves the same documents and tool list.
+/// The server. Cheap to clone; every clone serves the same documents, tool list, definitions and
+/// callers.
 #[derive(Clone, Debug)]
 pub struct MockDocs {
     inner: Arc<Inner>,
@@ -88,6 +94,11 @@ struct Inner {
     slow: std::time::Duration,
     documents: Documents,
     tools: RwLock<Vec<ToolName>>,
+    /// The descriptions served in place of [`ToolName::definition`]'s, set through the admin
+    /// endpoint.
+    descriptions: RwLock<BTreeMap<ToolName, String>>,
+    /// Each accepted caller's name and the projects it may name now.
+    callers: RwLock<BTreeMap<String, Projects>>,
     log: Log,
 }
 
@@ -96,6 +107,9 @@ struct Caller {
     /// The logged prefix of the bearer's SHA-256, or `None` if no bearer came.
     bearer_sha256: Option<String>,
     accepted: bool,
+    /// An accepted caller's name, which the limits on its projects are kept under: its subject
+    /// in the JWT mode, its digest's logged prefix in the static mode. `None` if not accepted.
+    name: Option<String>,
     /// In the JWT mode, what verification found. `None` in the static mode, whose log lines
     /// carry no more than they did before the JWT mode existed.
     jwt: Option<JwtOutcome>,
@@ -127,12 +141,15 @@ impl RpcError {
 impl MockDocs {
     /// A server with the seeded documents, configured by `config`, logging to `log`.
     pub fn new(config: Config, log: Log) -> Self {
+        let callers = config.accepted.callers();
         Self {
             inner: Arc::new(Inner {
                 accepted: config.accepted,
                 slow: config.slow,
                 documents: Documents::seeded(),
                 tools: RwLock::new(config.tools),
+                descriptions: RwLock::default(),
+                callers: RwLock::new(callers),
                 log,
             }),
         }
@@ -146,12 +163,29 @@ impl MockDocs {
             .with_state(self.clone())
     }
 
-    /// The admin endpoint: `GET /admin/tools` and `PUT /admin/tools` with
-    /// `{"tools": ["list_documents", …]}`. It also answers only the accepted credential. Serve
-    /// it on its own listener, so a network policy can keep it apart from the MCP endpoint.
+    /// The admin endpoint. It also answers only an accepted credential, and logs each request.
+    /// Serve it on its own listener, so a network policy can keep it apart from the MCP
+    /// endpoint.
+    ///
+    /// - `GET /admin/tools`, and `PUT /admin/tools` with `{"tools": ["list_documents", …]}`:
+    ///   the tools offered.
+    /// - `PUT /admin/definitions/{tool}` with `{"description": "…"}` serves that description in
+    ///   the tool's definition; `DELETE` serves [`ToolName::definition`]'s again.
+    /// - `PUT /admin/callers/{caller}` with `{"projects": ["atlas", …]}` replaces the projects
+    ///   one accepted caller may name, by its subject or its digest's logged prefix.
     pub fn admin_router(&self) -> Router {
         Router::new()
             .route("/admin/tools", get(admin_get_tools).put(admin_put_tools))
+            .route(
+                "/admin/definitions/{tool}",
+                put(admin_put_definition)
+                    .delete(admin_delete_definition)
+                    .fallback(other_request),
+            )
+            .route(
+                "/admin/callers/{caller}",
+                put(admin_put_caller).fallback(other_request),
+            )
             .fallback(other_request)
             .with_state(self.clone())
     }
@@ -174,9 +208,81 @@ impl MockDocs {
             .unwrap_or_else(PoisonError::into_inner) = tools;
     }
 
+    /// Serves `description` in `tool`'s definition from the next request on, or, with `None`,
+    /// [`ToolName::definition`]'s own again.
+    pub fn set_description(&self, tool: ToolName, description: Option<String>) {
+        let mut descriptions = self
+            .inner
+            .descriptions
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        match description {
+            Some(description) => descriptions.insert(tool, description),
+            None => descriptions.remove(&tool),
+        };
+    }
+
+    /// The definition `tools/list` serves for `tool`: [`ToolName::definition`], with the
+    /// description set through the admin endpoint in place of its own, if one is set.
+    pub fn definition(&self, tool: ToolName) -> Value {
+        let mut definition = tool.definition();
+        if let Some(description) = self
+            .inner
+            .descriptions
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tool)
+        {
+            definition["description"] = json!(description);
+        }
+        definition
+    }
+
+    /// The projects the caller named `caller` may name now, if there is such a caller: its
+    /// subject in the JWT mode, its digest's logged prefix in the static mode.
+    pub fn projects(&self, caller: &str) -> Option<Projects> {
+        self.inner
+            .callers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(caller)
+            .cloned()
+    }
+
+    /// Replaces the projects the caller named `caller` may name, from the next request on.
+    /// False, and nothing changes, if there is no such caller.
+    pub fn set_projects(&self, caller: &str, projects: Projects) -> bool {
+        match self
+            .inner
+            .callers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(caller)
+        {
+            Some(slot) => {
+                *slot = projects;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The server's log.
     pub fn log(&self) -> &Log {
         &self.inner.log
+    }
+
+    /// Whether an accepted caller may name `project`. A call naming no project as a string
+    /// names none to limit; the tool refuses it.
+    fn allows(&self, caller: &Caller, project: Option<&str>) -> bool {
+        let Some(project) = project else {
+            return true;
+        };
+        caller
+            .name
+            .as_deref()
+            .and_then(|name| self.projects(name))
+            .is_some_and(|projects| projects.allows(project))
     }
 
     fn offers(&self, tool: ToolName) -> bool {
@@ -197,14 +303,19 @@ impl MockDocs {
             Credential::Jwt(verifier) => return jwt_caller(verifier, token),
         };
         match token {
-            Some(token) => Caller {
-                bearer_sha256: Some(logged_prefix(&sha256(token))),
-                accepted: accepted.accepts(token),
-                jwt: None,
-            },
+            Some(token) => {
+                let found = accepted.iter().find(|accepted| accepted.accepts(token));
+                Caller {
+                    bearer_sha256: Some(logged_prefix(&sha256(token))),
+                    accepted: found.is_some(),
+                    name: found.map(AcceptedCredential::logged_prefix),
+                    jwt: None,
+                }
+            }
             None => Caller {
                 bearer_sha256: None,
                 accepted: false,
+                name: None,
                 jwt: None,
             },
         }
@@ -219,8 +330,11 @@ impl MockDocs {
             })),
             "ping" => Ok(json!({})),
             "tools/list" => {
-                let tools: Vec<Value> =
-                    self.tools().into_iter().map(ToolName::definition).collect();
+                let tools: Vec<Value> = self
+                    .tools()
+                    .into_iter()
+                    .map(|tool| self.definition(tool))
+                    .collect();
                 Ok(json!({ "tools": tools }))
             }
             "tools/call" => self.call_tool(params).await,
@@ -308,6 +422,7 @@ fn jwt_caller(verifier: &JwtVerifier, token: Option<&str>) -> Caller {
     Caller {
         bearer_sha256: token.map(|token| logged_prefix(&sha256(token))),
         accepted,
+        name: caller.clone(),
         jwt: Some(JwtOutcome { caller, refusal }),
     }
 }
@@ -496,14 +611,21 @@ async fn mcp_post(State(server): State<MockDocs>, request: Request) -> Response 
                 .and_then(|arguments| arguments.get(name))
                 .cloned()
         };
-        log(
-            line,
-            json!({
-                "tool": call.and_then(|call| call.get("name")),
-                "project": argument("project"),
-                "document": argument("document"),
-            }),
-        );
+        let project = argument("project");
+        let allowed = server.allows(&caller, project.as_ref().and_then(Value::as_str));
+        let mut fields = json!({
+            "tool": call.and_then(|call| call.get("name")),
+            "project": project,
+            "document": argument("document"),
+        });
+        if !allowed {
+            fields["refused"] = json!("project");
+        }
+        log(line, fields);
+        if !allowed {
+            // A vendor's refusal of the call: a bare 403, with no JSON-RPC answer in it.
+            return StatusCode::FORBIDDEN.into_response();
+        }
     } else {
         server.log().write(line);
     }
@@ -614,4 +736,143 @@ async fn admin_put_tools(State(server): State<MockDocs>, request: Request) -> Re
             (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
         }
     }
+}
+
+/// Checks an admin request's caller from its headers alone. A refused caller is logged here,
+/// and gets `None`, for a 401; an accepted one's log line comes back for the handler to finish.
+fn admin_accepted(server: &MockDocs, parts: &Parts) -> Option<Value> {
+    let caller = server.authenticate(&parts.headers);
+    let line = request_line("admin", &parts.method, &parts.uri, &caller);
+    if caller.accepted {
+        Some(line)
+    } else {
+        server.log().write(line);
+        None
+    }
+}
+
+/// Writes `line` with `fields` added.
+fn write_with(server: &MockDocs, mut line: Value, fields: Value) {
+    if let (Some(line), Value::Object(fields)) = (line.as_object_mut(), fields) {
+        line.extend(fields);
+    }
+    server.log().write(line);
+}
+
+/// The body of an accepted admin request, as JSON.
+async fn admin_body(body: Body) -> Option<Value> {
+    let body = read_body(body).await.ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+fn not_found(what: String) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": what}))).into_response()
+}
+
+fn bad_request(reason: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+}
+
+/// `PUT /admin/definitions/{tool}` with `{"description": "…"}`.
+async fn admin_put_definition(
+    State(server): State<MockDocs>,
+    tool: Result<Path<String>, PathRejection>,
+    request: Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let Some(line) = admin_accepted(&server, &parts) else {
+        return unauthorized();
+    };
+    let Some(tool) = tool.ok().and_then(|Path(name)| ToolName::parse(&name)) else {
+        write_with(&server, line, json!({"refused": "unknown_tool"}));
+        return not_found("no such tool".to_owned());
+    };
+    let description = admin_body(body).await.and_then(|body| {
+        body.get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let Some(description) = description else {
+        write_with(&server, line, json!({"refused": "bad_body"}));
+        return bad_request("send {\"description\": \"…\"}");
+    };
+    server.set_description(tool, Some(description.clone()));
+    write_with(
+        &server,
+        line,
+        json!({"tool": tool.as_str(), "description": description}),
+    );
+    Json(server.definition(tool)).into_response()
+}
+
+/// `DELETE /admin/definitions/{tool}`: the tool's own description is served again.
+async fn admin_delete_definition(
+    State(server): State<MockDocs>,
+    tool: Result<Path<String>, PathRejection>,
+    request: Request,
+) -> Response {
+    let (parts, _) = request.into_parts();
+    let Some(line) = admin_accepted(&server, &parts) else {
+        return unauthorized();
+    };
+    let Some(tool) = tool.ok().and_then(|Path(name)| ToolName::parse(&name)) else {
+        write_with(&server, line, json!({"refused": "unknown_tool"}));
+        return not_found("no such tool".to_owned());
+    };
+    server.set_description(tool, None);
+    write_with(
+        &server,
+        line,
+        json!({"tool": tool.as_str(), "description": null}),
+    );
+    Json(server.definition(tool)).into_response()
+}
+
+/// `PUT /admin/callers/{caller}` with `{"projects": ["atlas", …]}`.
+async fn admin_put_caller(
+    State(server): State<MockDocs>,
+    target: Result<Path<String>, PathRejection>,
+    request: Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let Some(line) = admin_accepted(&server, &parts) else {
+        return unauthorized();
+    };
+    let Ok(Path(target)) = target else {
+        write_with(&server, line, json!({"refused": "unknown_caller"}));
+        return not_found("no such caller".to_owned());
+    };
+    let projects = admin_body(body)
+        .await
+        .and_then(|body| body.get("projects").and_then(Value::as_array).cloned())
+        .ok_or_else(|| "send {\"projects\": [\"atlas\", …]}".to_owned())
+        .and_then(|names| {
+            let names: Option<Vec<&str>> = names.iter().map(Value::as_str).collect();
+            named_projects(names.ok_or("each project is a string")?)
+        });
+    let projects = match projects {
+        Ok(projects) => projects,
+        Err(reason) => {
+            write_with(
+                &server,
+                line,
+                json!({"target": target, "refused": "bad_body"}),
+            );
+            return bad_request(&reason);
+        }
+    };
+    if !server.set_projects(&target, projects.clone()) {
+        write_with(
+            &server,
+            line,
+            json!({"target": target, "refused": "unknown_caller"}),
+        );
+        return not_found(format!("no caller {target}"));
+    }
+    write_with(
+        &server,
+        line,
+        json!({"target": target, "projects": projects.to_json()}),
+    );
+    Json(json!({"caller": target, "projects": projects.to_json()})).into_response()
 }
