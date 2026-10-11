@@ -1,20 +1,29 @@
 //! Fetching an issuer's keys from a local server that counts what it is asked.
 //!
 //! The server speaks just enough HTTP/1.1 to answer one request per connection, written out by
-//! hand so a test can send a body without its end, or nothing at all. It records the request
-//! line of every request it reads, so a test can say no request reached it.
+//! hand so a test can send a body without its end, or nothing at all. It records the head of
+//! every request it reads, so a test can say no request reached it and which headers one had.
+//! Over TLS it presents a certificate made when the test runs, signed by a CA made the same way:
+//! no key is checked in.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gateway_core::Issuer;
 use issuer_keys::{
     DEFAULT_DEADLINE, DEFAULT_MAX_BODY_BYTES, FetchError, FetchOptions, KeySource, SourceError,
+    SourceFiles, TokenFault,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 /// The path a Kubernetes API server publishes its keys at.
 const KEYS_PATH: &str = "/openid/v1/jwks";
@@ -98,32 +107,74 @@ impl Reply {
     }
 }
 
-/// A local server answering every request with what `answer` gives for its path.
+/// What the server has seen: the head of every request it read, and the protocol each TLS
+/// handshake agreed.
+#[derive(Default)]
+struct Seen {
+    heads: Mutex<Vec<String>>,
+    alpn: Mutex<Vec<Option<Vec<u8>>>>,
+}
+
+/// A local server answering every request with what `answer` gives for its path, over plain
+/// HTTP or, given an acceptor, over TLS.
 struct Server {
     address: SocketAddr,
-    requests: Arc<Mutex<Vec<String>>>,
+    tls: bool,
+    seen: Arc<Seen>,
 }
 
 impl Server {
     async fn start(answer: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Self {
+        Self::listen(None, answer).await
+    }
+
+    async fn start_tls(
+        acceptor: TlsAcceptor,
+        answer: impl Fn(&str) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        Self::listen(Some(acceptor), answer).await
+    }
+
+    async fn listen(
+        acceptor: Option<TlsAcceptor>,
+        answer: impl Fn(&str) -> Reply + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
+        let tls = acceptor.is_some();
+        let seen = Arc::new(Seen::default());
         let answer = Arc::new(answer);
-        let seen = Arc::clone(&requests);
+        let recorder = Arc::clone(&seen);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                tokio::spawn(serve(stream, Arc::clone(&answer), Arc::clone(&seen)));
+                let (answer, seen) = (Arc::clone(&answer), Arc::clone(&recorder));
+                match acceptor.clone() {
+                    None => {
+                        tokio::spawn(serve(stream, answer, seen));
+                    }
+                    Some(acceptor) => {
+                        tokio::spawn(async move {
+                            // A handshake the client abandons is no request.
+                            let Ok(stream) = acceptor.accept(stream).await else {
+                                return;
+                            };
+                            let agreed = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                            seen.alpn.lock().unwrap().push(agreed);
+                            serve(stream, answer, seen).await;
+                        });
+                    }
+                }
             }
         });
-        Self { address, requests }
+        Self { address, tls, seen }
     }
 
     fn origin(&self) -> String {
-        format!("http://{}", self.address)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://{}", self.address)
     }
 
     fn url(&self, path: &str) -> String {
@@ -132,14 +183,41 @@ impl Server {
 
     /// The request line of every request read so far.
     fn requests(&self) -> Vec<String> {
-        self.requests.lock().unwrap().clone()
+        self.heads()
+            .iter()
+            .map(|head| head.lines().next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// The whole head of every request read so far.
+    fn heads(&self) -> Vec<String> {
+        self.seen.heads.lock().unwrap().clone()
+    }
+
+    /// The `Authorization` header of every request read so far, if it had one.
+    fn authorizations(&self) -> Vec<Option<String>> {
+        self.heads()
+            .iter()
+            .map(|head| {
+                head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_owned())
+                })
+            })
+            .collect()
+    }
+
+    /// The protocol each completed TLS handshake agreed by ALPN.
+    fn alpn(&self) -> Vec<Option<Vec<u8>>> {
+        self.seen.alpn.lock().unwrap().clone()
     }
 }
 
 async fn serve(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     answer: Arc<impl Fn(&str) -> Reply>,
-    seen: Arc<Mutex<Vec<String>>>,
+    seen: Arc<Seen>,
 ) {
     let mut head = Vec::new();
     let mut buffer = [0_u8; 1024];
@@ -152,7 +230,7 @@ async fn serve(
     let head = String::from_utf8_lossy(&head).into_owned();
     let line = head.lines().next().unwrap_or_default().to_owned();
     let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
-    seen.lock().unwrap().push(line);
+    seen.heads.lock().unwrap().push(head);
     let reply = answer(&path);
     if stream.write_all(&reply.bytes).await.is_err() {
         return;
@@ -178,6 +256,135 @@ async fn closed_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// A directory of its own for one test's files, removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "issuer-keys-fetch-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        Self(directory)
+    }
+
+    /// Writes `contents` to the file `name` and gives its path.
+    fn write(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A certificate chain and its key, for a test server to present.
+struct Presented {
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+impl Presented {
+    /// A TLS acceptor presenting this chain, offering HTTP/2 before HTTP/1.1, so a client
+    /// that offered HTTP/2 would agree it.
+    fn acceptor(&self) -> TlsAcceptor {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(self.chain.clone(), self.key.clone_key())
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        TlsAcceptor::from(Arc::new(config))
+    }
+}
+
+/// A CA made for one test.
+struct TestCa {
+    pem: String,
+    issuer: rcgen::Issuer<'static, KeyPair>,
+}
+
+impl TestCa {
+    fn new() -> Self {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let key = KeyPair::generate().unwrap();
+        let pem = params.self_signed(&key).unwrap().pem();
+        Self {
+            pem,
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    /// A leaf for `names`, each a DNS name or an IP address, signed by this CA.
+    fn leaf(&self, names: &[&str]) -> Presented {
+        let params = leaf_params(names);
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &self.issuer).unwrap();
+        Presented {
+            chain: vec![certificate.der().clone()],
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        }
+    }
+
+    /// Writes this CA's certificate, as PEM, into `scratch`.
+    fn file(&self, scratch: &Scratch) -> PathBuf {
+        scratch.write("ca.pem", &self.pem)
+    }
+}
+
+fn leaf_params(names: &[&str]) -> CertificateParams {
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    CertificateParams::new(names).unwrap()
+}
+
+/// A leaf for `names` signed by its own key, with no CA.
+fn self_signed(names: &[&str]) -> Presented {
+    let key = KeyPair::generate().unwrap();
+    let certificate = leaf_params(names).self_signed(&key).unwrap();
+    Presented {
+        chain: vec![certificate.der().clone()],
+        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+    }
+}
+
+/// The source for `server`'s keys URL, trusting the CA in `ca_file`, with `token_file` if
+/// given.
+fn tls_source(server: &Server, ca_file: &Path, token_file: Option<&Path>) -> KeySource {
+    tls_source_at(&server.origin(), server, ca_file, token_file)
+}
+
+/// The same, with the issuer and keys URL at `origin`, which names `server`'s port.
+fn tls_source_at(
+    origin: &str,
+    server: &Server,
+    ca_file: &Path,
+    token_file: Option<&Path>,
+) -> KeySource {
+    assert!(origin.ends_with(&format!(":{}", server.address.port())));
+    let files = SourceFiles {
+        ca_file: Some(ca_file.to_owned()),
+        token_file: token_file.map(Path::to_owned),
+    };
+    KeySource::with_files(
+        &issuer(origin),
+        &format!("{origin}{KEYS_PATH}"),
+        &files,
+        FetchOptions::default(),
+    )
+    .unwrap()
+}
+
 // --- The happy path -------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -190,6 +397,8 @@ async fn a_fetch_is_one_get_to_the_keys_url_and_returns_the_set() {
     assert_eq!(keys.keys.len(), 1);
     assert_eq!(keys.keys[0].common.key_id.as_deref(), Some("test-key-1"));
     assert_eq!(server.requests(), vec![format!("GET {KEYS_PATH} HTTP/1.1")]);
+    // No token file, no token.
+    assert_eq!(server.authorizations(), vec![None]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -311,16 +520,112 @@ async fn an_https_keys_url_for_an_http_issuer_is_refused() {
 }
 
 #[test]
-fn an_https_source_is_refused_while_there_is_no_tls_client() {
+fn an_https_source_needs_a_ca_file() {
     let refused = KeySource::new(
         &issuer("https://kubernetes.default.svc"),
         "https://kubernetes.default.svc/openid/v1/jwks",
         FetchOptions::default(),
     )
     .unwrap_err();
+    assert!(matches!(refused, SourceError::NoCaFile(_)), "{refused:?}");
+}
+
+#[test]
+fn an_http_source_takes_no_ca_file_and_no_token_file() {
+    let scratch = Scratch::new("http-files");
+    let ca_file = TestCa::new().file(&scratch);
+    let token_file = scratch.write("token", "dummy-token-for-test\n");
+    let issuer = issuer("http://keys.example");
+    let with = |files: SourceFiles| {
+        KeySource::with_files(
+            &issuer,
+            "http://keys.example/jwks",
+            &files,
+            FetchOptions::default(),
+        )
+    };
+    let refused = with(SourceFiles {
+        ca_file: Some(ca_file),
+        token_file: None,
+    })
+    .unwrap_err();
     assert!(
-        matches!(refused, SourceError::TlsUnavailable(_)),
+        matches!(refused, SourceError::CaFileForHttp(_)),
         "{refused:?}"
+    );
+    let refused = with(SourceFiles {
+        ca_file: None,
+        token_file: Some(token_file),
+    })
+    .unwrap_err();
+    assert!(
+        matches!(refused, SourceError::TokenForHttp(_)),
+        "{refused:?}"
+    );
+    assert!(!refused.to_string().contains("dummy-token"), "{refused}");
+}
+
+#[test]
+fn a_ca_file_that_cannot_be_read_is_not_pem_or_holds_no_certificate_is_refused() {
+    let scratch = Scratch::new("ca-files");
+    let issuer = issuer("https://keys.example");
+    let with_ca = |ca_file: PathBuf| {
+        KeySource::with_files(
+            &issuer,
+            "https://keys.example/jwks",
+            &SourceFiles {
+                ca_file: Some(ca_file),
+                token_file: None,
+            },
+            FetchOptions::default(),
+        )
+        .unwrap_err()
+    };
+    let refused = with_ca(scratch.0.join("missing.pem"));
+    assert!(
+        matches!(&refused, SourceError::CaUnreadable { path, .. } if path.ends_with("missing.pem")),
+        "{refused:?}"
+    );
+    for (name, contents) in [
+        ("empty", ""),
+        ("text", "not a certificate bundle\n"),
+        ("unterminated", "-----BEGIN CERTIFICATE-----\nZHVtbXk=\n"),
+    ] {
+        let refused = with_ca(scratch.write(name, contents));
+        assert!(
+            matches!(refused, SourceError::CaNotPem { .. }),
+            "{name}: {refused:?}"
+        );
+    }
+    let refused = with_ca(scratch.write(
+        "public-key",
+        "-----BEGIN PUBLIC KEY-----\nZHVtbXk=\n-----END PUBLIC KEY-----\n",
+    ));
+    assert!(
+        matches!(refused, SourceError::CaNoCertificate { .. }),
+        "{refused:?}"
+    );
+    let refused = with_ca(scratch.write(
+        "bad-certificate",
+        "-----BEGIN CERTIFICATE-----\nZHVtbXk=\n-----END CERTIFICATE-----\n",
+    ));
+    assert!(
+        matches!(refused, SourceError::CaBadCertificate { .. }),
+        "{refused:?}"
+    );
+    // A bundle with a certificate is taken.
+    let ca_file = TestCa::new().file(&scratch);
+    assert!(
+        KeySource::with_files(
+            &issuer,
+            "https://keys.example/jwks",
+            &SourceFiles {
+                ca_file: Some(ca_file),
+                token_file: None,
+            },
+            FetchOptions::default(),
+        )
+        .is_ok()
     );
 }
 
@@ -424,7 +729,8 @@ async fn a_redirect_to_the_same_host_is_not_followed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_redirect_to_another_host_is_not_followed() {
     let elsewhere = Server::start(|_| Reply::ok(KEYS)).await;
-    let location = elsewhere.url(KEYS_PATH);
+    // Another host name, as well as another port.
+    let location = format!("http://localhost:{}{KEYS_PATH}", elsewhere.address.port());
     let server = Server::start(move |_| Reply::redirect(&location)).await;
     let failed = source(&server, FetchOptions::default())
         .fetch()
@@ -618,4 +924,241 @@ async fn a_server_that_is_not_there_is_unreachable() {
     )
     .unwrap();
     assert_eq!(source.fetch().await.unwrap_err(), FetchError::Unreachable);
+}
+
+// --- Over TLS: only the configured CA, for the keys URL's own name ----------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_https_fetch_trusting_the_servers_ca_returns_the_set_over_http_1_1() {
+    let scratch = Scratch::new("right-ca");
+    let ca = TestCa::new();
+    // The keys URL names an IP address, which the certificate must name as one.
+    let server = Server::start_tls(ca.leaf(&["127.0.0.1"]).acceptor(), |_| Reply::ok(KEYS)).await;
+    let keys = tls_source(&server, &ca.file(&scratch), None)
+        .fetch()
+        .await
+        .unwrap();
+    assert_eq!(keys.keys[0].common.key_id.as_deref(), Some("test-key-1"));
+    assert_eq!(server.requests(), vec![format!("GET {KEYS_PATH} HTTP/1.1")]);
+    assert_eq!(server.authorizations(), vec![None]);
+    // The server prefers HTTP/2; the client offered only HTTP/1.1.
+    assert_eq!(server.alpn(), vec![Some(b"http/1.1".to_vec())]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_https_fetch_by_dns_name_returns_the_set() {
+    let scratch = Scratch::new("dns-name");
+    let ca = TestCa::new();
+    let server = Server::start_tls(ca.leaf(&["localhost"]).acceptor(), |_| Reply::ok(KEYS)).await;
+    let origin = format!("https://localhost:{}", server.address.port());
+    let source = tls_source_at(&origin, &server, &ca.file(&scratch), None);
+    assert!(source.fetch().await.is_ok());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_certificate_from_another_ca_or_self_signed_fails_with_no_request_read() {
+    let scratch = Scratch::new("wrong-ca");
+    let trusted = TestCa::new();
+    let other = TestCa::new();
+    for presented in [other.leaf(&["127.0.0.1"]), self_signed(&["127.0.0.1"])] {
+        let server = Server::start_tls(presented.acceptor(), |_| Reply::ok(KEYS)).await;
+        let failed = tls_source(&server, &trusted.file(&scratch), None)
+            .fetch()
+            .await
+            .unwrap_err();
+        assert_eq!(failed, FetchError::Unreachable);
+        assert!(server.requests().is_empty(), "{:?}", server.requests());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_certificate_for_another_name_fails_with_no_request_read() {
+    let scratch = Scratch::new("other-name");
+    let ca = TestCa::new();
+    let ca_file = ca.file(&scratch);
+    // Fetched by IP address: a DNS name, or another address, is not that address.
+    for names in [&["localhost"][..], &["127.0.0.2"]] {
+        let server = Server::start_tls(ca.leaf(names).acceptor(), |_| Reply::ok(KEYS)).await;
+        let failed = tls_source(&server, &ca_file, None)
+            .fetch()
+            .await
+            .unwrap_err();
+        assert_eq!(failed, FetchError::Unreachable, "{names:?}");
+        assert!(server.requests().is_empty(), "{names:?}");
+    }
+    // Fetched by DNS name: an address, or another name, is not that name.
+    let server = Server::start_tls(ca.leaf(&["127.0.0.1", "keys.example"]).acceptor(), |_| {
+        Reply::ok(KEYS)
+    })
+    .await;
+    let origin = format!("https://localhost:{}", server.address.port());
+    let failed = tls_source_at(&origin, &server, &ca_file, None)
+        .fetch()
+        .await
+        .unwrap_err();
+    assert_eq!(failed, FetchError::Unreachable);
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_http_server_behind_an_https_url_fails() {
+    let scratch = Scratch::new("plain-behind-https");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            // Answers in plain HTTP at once, whatever the client sent.
+            let reply = Reply::ok(KEYS);
+            let _ = stream.write_all(&reply.bytes).await;
+        }
+    });
+    let origin = format!("https://{address}");
+    let source = KeySource::with_files(
+        &issuer(&origin),
+        &format!("{origin}{KEYS_PATH}"),
+        &SourceFiles {
+            ca_file: Some(TestCa::new().file(&scratch)),
+            token_file: None,
+        },
+        FetchOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(source.fetch().await.unwrap_err(), FetchError::Unreachable);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handshake_that_stalls_fails_at_the_default_deadline() {
+    let scratch = Scratch::new("stalled-handshake");
+    // Accepts the connection and never answers the client's hello.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let origin = format!("https://{address}");
+    let source = KeySource::with_files(
+        &issuer(&origin),
+        &format!("{origin}{KEYS_PATH}"),
+        &SourceFiles {
+            ca_file: Some(TestCa::new().file(&scratch)),
+            token_file: None,
+        },
+        FetchOptions::default(),
+    )
+    .unwrap();
+    let started = tokio::time::Instant::now();
+    let failed = tokio::time::timeout(Duration::from_secs(60), source.fetch())
+        .await
+        .expect("the fetch was not abandoned at its deadline")
+        .unwrap_err();
+    assert_eq!(failed, FetchError::Deadline(DEFAULT_DEADLINE));
+    assert_eq!(started.elapsed(), DEFAULT_DEADLINE);
+}
+
+// --- The token ----------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_token_is_sent_to_the_keys_url_and_read_again_on_every_fetch() {
+    let scratch = Scratch::new("token");
+    let ca = TestCa::new();
+    let server = Server::start_tls(ca.leaf(&["127.0.0.1"]).acceptor(), |_| Reply::ok(KEYS)).await;
+    let token_file = scratch.write("token", "  dummy-token-first\n");
+    let source = tls_source(&server, &ca.file(&scratch), Some(&token_file));
+    source.fetch().await.unwrap();
+    // Rotated in place, as the kubelet rotates a projected token.
+    scratch.write("token", "dummy-token-second\n");
+    source.fetch().await.unwrap();
+    assert_eq!(
+        server.authorizations(),
+        vec![
+            Some("Bearer dummy-token-first".to_owned()),
+            Some("Bearer dummy-token-second".to_owned()),
+        ]
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|line| line.contains(KEYS_PATH))
+    );
+    assert!(!format!("{source:?}").contains("dummy-token"), "{source:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_file_that_holds_no_token_sends_no_request() {
+    let scratch = Scratch::new("bad-token");
+    let ca = TestCa::new();
+    let server = Server::start_tls(ca.leaf(&["127.0.0.1"]).acceptor(), |_| Reply::ok(KEYS)).await;
+    let ca_file = ca.file(&scratch);
+    let too_large = "x".repeat(8 * 1024 + 1);
+    for (name, contents, fault) in [
+        ("empty", Some(" \n"), TokenFault::Empty),
+        (
+            "two-words",
+            Some("dummy-token one\n"),
+            TokenFault::NotAToken,
+        ),
+        ("too-large", Some(too_large.as_str()), TokenFault::TooLarge),
+        ("missing", None, TokenFault::Unreadable),
+    ] {
+        let token_file = match contents {
+            Some(contents) => scratch.write(name, contents),
+            None => scratch.0.join(name),
+        };
+        let failed = tls_source(&server, &ca_file, Some(&token_file))
+            .fetch()
+            .await
+            .unwrap_err();
+        assert_eq!(failed, FetchError::Token(fault), "{name}");
+        assert!(!failed.to_string().contains("dummy-token"), "{failed}");
+    }
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+// --- Over TLS, redirects are still never followed -----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_tls_a_redirect_to_another_host_is_not_followed() {
+    let scratch = Scratch::new("tls-redirect-host");
+    let ca = TestCa::new();
+    // The certificate names both hosts, so a client that followed would be let in.
+    let leaf = ca.leaf(&["127.0.0.1", "localhost"]);
+    let port = Arc::new(Mutex::new(0_u16));
+    let at = Arc::clone(&port);
+    let server = Server::start_tls(leaf.acceptor(), move |path| {
+        if path == KEYS_PATH {
+            Reply::redirect(&format!("https://localhost:{}/moved", at.lock().unwrap()))
+        } else {
+            Reply::ok(KEYS)
+        }
+    })
+    .await;
+    *port.lock().unwrap() = server.address.port();
+    let failed = tls_source(&server, &ca.file(&scratch), None)
+        .fetch()
+        .await
+        .unwrap_err();
+    assert_eq!(failed, FetchError::Status(302));
+    assert_eq!(server.requests(), vec![format!("GET {KEYS_PATH} HTTP/1.1")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_tls_a_redirect_to_another_port_is_not_followed() {
+    let scratch = Scratch::new("tls-redirect-port");
+    let ca = TestCa::new();
+    let leaf = ca.leaf(&["127.0.0.1", "localhost"]);
+    let elsewhere = Server::start_tls(leaf.acceptor(), |_| Reply::ok(KEYS)).await;
+    let location = elsewhere.url(KEYS_PATH);
+    let server = Server::start_tls(leaf.acceptor(), move |_| Reply::redirect(&location)).await;
+    let failed = tls_source(&server, &ca.file(&scratch), None)
+        .fetch()
+        .await
+        .unwrap_err();
+    assert_eq!(failed, FetchError::Status(302));
+    assert_eq!(server.requests().len(), 1);
+    assert!(elsewhere.requests().is_empty());
 }
