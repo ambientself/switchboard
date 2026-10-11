@@ -1371,6 +1371,41 @@ checked; a schema that needs them cannot be approved yet.
   `switchboard_policy_max_age_seconds` are exported. A file that reads but does not load keeps
   the last good policy and is not stale.
 
+**#11, limits, caps and the isolation of a failing server.**
+
+- Per-server limits: built
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md), section 1). A
+  proxied server's entry in the deployment file, `[servers.<name>]`, sets `deadline_seconds`, 1
+  to 60 and 5 unless given, and `max_result_bytes`, 1 to 1 MiB and 64 KiB unless given. A value
+  outside those bounds is refused when the file loads, and an entry for a server the registry
+  does not name refuses the start. The deadline reaches both the server's connector and each
+  of its rows' deadlines. Limits are per server, not per tool. demo-checks holds each demo's
+  termination grace to 8 + 2 + D + 30 + 2 seconds, D the longest deadline its deployment file
+  sets.
+- The three caps: built (section 2). `[limits]` sets `max_in_flight`, 256 unless given,
+  `per_server_in_flight`, 32, and `per_team_per_server_in_flight`, 8, each at least 1 and each
+  in one instance. A request to `POST /mcp/{surface}` over the instance's cap is answered 503
+  with `Retry-After: 1` and a fixed sentence, after identity and before its body is read, with
+  a `call_shed` telemetry event and no row; its slot is held by the answer's task until it
+  ends. Each proxied server's connector is wrapped in a bulkhead, inside the argument check, so
+  a call that fails the check takes no slot. A call over the server's cap, or over its team's
+  cap on calls to the server, is completed as `refused` with a fixed capacity sentence naming
+  the scope, the server and the tool, and nothing is sent. The slots are held until the
+  server's connector returns or the call is dropped. A caller with no team is held by the
+  server's cap alone. There is no queue, circuit breaker or rate quota, and a connector in the
+  gateway's own process is not bounded until milestone 4.
+- Isolation: a server that hangs holds at most its server's cap of slots in an instance until
+  its calls' deadline, and one team at most its own cap of those. Calls from other teams to it,
+  and calls to other servers, are not held up. `tests/limits.rs` shows it.
+- The metrics of section 9 that these give: built. `switchboard_calls_shed_total{scope}`, with
+  `scope` one of `instance`, `server` and `team`; and, labelled by the server's name in the
+  registry only, `switchboard_proxied_calls_total{server,outcome}`,
+  `switchboard_proxied_call_seconds{server}` and
+  `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
+  `oversized_or_late_read`, so a tool not classified `read` is not counted there until
+  `unknown` is built. Not built yet in #11: a demo of overload and a hanging server,
+  configurable audit pools, and the row's size bound.
+
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
 refusal of that list on a profile that does not require currency; the restated property; a

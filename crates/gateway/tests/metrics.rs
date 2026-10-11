@@ -40,7 +40,7 @@ use support::{FixtureResources, PATIENCE};
 const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
 
 /// Every family the endpoint writes with audit in Postgres.
-const AUDIT_FAMILIES: [(&str, &str); 16] = [
+const AUDIT_FAMILIES: [(&str, &str); 17] = [
     ("switchboard_audit_begin_failures_total", "counter"),
     ("switchboard_audit_failure_answers_total", "counter"),
     (
@@ -63,12 +63,14 @@ const AUDIT_FAMILIES: [(&str, &str); 16] = [
     ("switchboard_audit_pool_connections_max", "gauge"),
     ("switchboard_telemetry_events_total", "counter"),
     ("switchboard_telemetry_dropped_total", "counter"),
+    ("switchboard_calls_shed_total", "counter"),
 ];
 
 /// The families written whatever the audit store.
-const TELEMETRY_FAMILIES: [&str; 2] = [
+const TELEMETRY_FAMILIES: [&str; 3] = [
     "switchboard_telemetry_events_total",
     "switchboard_telemetry_dropped_total",
+    "switchboard_calls_shed_total",
 ];
 
 /// A Postgres store on a port nothing listens on, with a begin budget of half a second.
@@ -220,6 +222,14 @@ async fn with_audit_disabled_only_the_telemetry_counters_are_exported() {
         sample(&text, "switchboard_telemetry_events_total{event=\"ping\"}"),
         Some(0.0)
     );
+    for scope in ["instance", "server", "team"] {
+        let series = format!("switchboard_calls_shed_total{{scope=\"{scope}\"}}");
+        assert_eq!(sample(&text, &series), Some(0.0), "{series}\n{text}");
+    }
+    // A shed request is counted by scope, not again among the events.
+    assert!(!text.contains("event=\"call_shed\""), "{text}");
+    // With no proxied server, there is no series for one.
+    assert!(!text.contains("switchboard_proxied_"), "{text}");
 }
 
 /// The poller starts with the listener, and its first poll runs at once. Against a database

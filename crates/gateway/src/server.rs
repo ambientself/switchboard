@@ -16,10 +16,15 @@
 //!    that excludes JSON is 406.
 //! 4. **Declared size**: a `Content-Length` over [`MAX_BODY_BYTES`] is 413.
 //! 5. **Identity**, from the headers alone ([`RequestPath::admit`]). The body has not been read.
-//! 6. **The body** is read, up to [`MAX_BODY_BYTES`]; a body that grows past it is 413, and one
+//! 6. **Capacity**: the request takes one of the instance's slots for requests in flight,
+//!    without waiting. With none free it is 503 with `Retry-After: 1` and [`AT_CAPACITY`], a
+//!    `call_shed` telemetry event and no row, and its body is never read (decision 0014,
+//!    section 2). The slot is held while the body is read and then by the answer's task, and
+//!    freed when that task ends, however it ends.
+//! 7. **The body** is read, up to [`MAX_BODY_BYTES`]; a body that grows past it is 413, and one
 //!    that has not arrived within [`BODY_READ_TIMEOUT`] is 408, with a sentence saying nothing
 //!    ran, and the connection is closed.
-//! 7. **The answer** ([`RequestPath::respond`]) runs on its own task, which the handler waits
+//! 8. **The answer** ([`RequestPath::respond`]) runs on its own task, which the handler waits
 //!    for. A client that disconnects drops the handler, but not that task, so a tool call that
 //!    started still completes its audit row. Dropping the handler fires the answer's
 //!    [`Disconnect`]: a call whose connector has not been called is given up, and a read that
@@ -71,7 +76,7 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::{Extension, Router};
 use gateway_mcp::{HttpResponse, INTERNAL_ERROR, Rejection};
-use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN};
+use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, HOST, ORIGIN, RETRY_AFTER};
 use http::request::Parts;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::LengthLimitError;
@@ -80,13 +85,14 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::boot::{GateState, Gates};
+use crate::deployment::DEFAULT_MAX_IN_FLIGHT;
 use crate::path::{Disconnect, RequestPath, Source};
-use crate::telemetry::{Drain, TELEMETRY_QUEUE, Telemetry};
+use crate::telemetry::{Drain, Event, TELEMETRY_QUEUE, Telemetry};
 
 /// The largest request body read, in bytes: 1 MiB.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -104,6 +110,11 @@ pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Answer tasks already running are waited for however long they take. No answer starts in
 /// it: a request that reaches its answer then is refused with [`SHUTTING_DOWN`].
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// What a request over the instance's cap on requests in flight is refused with, 503, before
+/// its body is read.
+pub const AT_CAPACITY: &str = "Service unavailable: the gateway has as many requests in flight as \
+                               it allows, so nothing ran. Try again shortly.";
 
 /// What a request that reaches its answer once the gateway has stopped taking connections is
 /// refused with, 503.
@@ -176,11 +187,21 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
-    serve_with_telemetry(listener, gates, telemetry, drain, shutdown, timeouts).await
+    serve_with_telemetry(
+        listener,
+        gates,
+        telemetry,
+        drain,
+        shutdown,
+        timeouts,
+        DEFAULT_MAX_IN_FLIGHT,
+    )
+    .await
 }
 
 /// [`serve_with_timeouts`], emitting the request path's events to `telemetry`, whose queue
-/// `drain` empties. The caller can keep a clone of `telemetry` to read its counters.
+/// `drain` empties, with at most `max_in_flight` requests to `POST /mcp/{surface}` in flight
+/// (at least one). The caller can keep a clone of `telemetry` to read its counters.
 ///
 /// The drain runs on its own task while the gateway serves. Once every answer has finished,
 /// the queue is closed and the events in it are written before this returns; an event emitted
@@ -193,6 +214,7 @@ pub async fn serve_with_telemetry<F>(
     drain: Drain,
     shutdown: F,
     timeouts: Timeouts,
+    max_in_flight: usize,
 ) -> io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
@@ -222,6 +244,9 @@ where
         body_read: timeouts.body_read,
         ready: ready.clone(),
         starting: starting.clone(),
+        in_flight: Arc::new(Semaphore::new(
+            max_in_flight.clamp(1, Semaphore::MAX_PERMITS),
+        )),
     });
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
@@ -354,6 +379,8 @@ struct Endpoint {
     ready: Arc<AtomicBool>,
     /// True until the gateway stops taking connections.
     starting: Arc<AtomicBool>,
+    /// The instance's slots for requests in flight.
+    in_flight: Arc<Semaphore>,
 }
 
 /// Counts the answer tasks that are running, whether or not anyone is still waiting for them.
@@ -503,6 +530,16 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
     let Some(surface) = surface else {
         return not_found();
     };
+    // Taken before the body is read, so overload is refused before it costs a read, a decision
+    // or a row. Dropped with the handler until it moves into the answer's task.
+    let Ok(in_flight) = endpoint.in_flight.clone().try_acquire_owned() else {
+        path.telemetry().emit(Event::CallShed {
+            deployment: gates.deployment().clone(),
+            surface: source.surface,
+            source: source.address,
+        });
+        return at_capacity();
+    };
     let reading = axum::body::to_bytes(body, MAX_BODY_BYTES);
     let Ok(read) = tokio::time::timeout(endpoint.body_read, reading).await else {
         return refused(&Rejection::request_timeout());
@@ -535,6 +572,7 @@ async fn answer(endpoint: &Endpoint, parts: &mut Parts, body: Body) -> HttpRespo
     let running = endpoint.answers.start();
     let answering = async move {
         let _running = running;
+        let _in_flight = in_flight;
         answering.await
     };
     let answered = tokio::spawn(answering.instrument(span)).await;
@@ -664,6 +702,27 @@ fn shutting_down() -> HttpResponse {
     });
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    HttpResponse {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        body: body.to_string().into_bytes(),
+    }
+}
+
+/// A request over the instance's cap on requests in flight: 503, with a sentence saying nothing
+/// ran, and `Retry-After: 1`.
+fn at_capacity() -> HttpResponse {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {
+            "code": INTERNAL_ERROR,
+            "message": AT_CAPACITY,
+        },
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
     HttpResponse {
         status: StatusCode::SERVICE_UNAVAILABLE,
         headers,
