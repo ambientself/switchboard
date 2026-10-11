@@ -338,6 +338,22 @@ pub enum Problem {
         /// The rule.
         rule: String,
     },
+    /// `switchboard_audit.call_rows` has a foreign key whose action, on a delete or an update
+    /// of the row it references, is `CASCADE`, `SET NULL` or `SET DEFAULT`. The action deletes
+    /// or changes rows of `call_rows`, as the table's owner, whenever a role that can write the
+    /// referenced table deletes or updates a row of it, so it is a write path as a rule is. The
+    /// migrations make no foreign key; one with `NO ACTION` or `RESTRICT` only refuses a write
+    /// and passes.
+    ReferentialAction {
+        /// The foreign key.
+        constraint: String,
+        /// The table it references.
+        referenced: String,
+        /// `DELETE` or `UPDATE`.
+        event: String,
+        /// The action, as `CREATE TABLE` spells it.
+        action: String,
+    },
     /// A `SECURITY DEFINER` function runs as a role that can read or change `call_rows` or turn
     /// off its triggers, itself or through another such function, and the session's role, or a
     /// role it can become, can run it with EXECUTE.
@@ -382,6 +398,30 @@ pub enum Problem {
         function: String,
         /// The language.
         language: String,
+    },
+    /// A trigger, on any table, runs a function in an untrusted language. A trigger runs its
+    /// function without asking for EXECUTE, for whoever writes to its table by whatever route,
+    /// so the trigger is refused whoever can write the table.
+    UntrustedTrigger {
+        /// The function, with its schema and argument types.
+        function: String,
+        /// The language.
+        language: String,
+        /// The trigger.
+        trigger: String,
+        /// The table the trigger is on.
+        table: String,
+    },
+    /// An enabled event trigger runs a function in an untrusted language. An event trigger
+    /// fires on statements any role may run, such as `CREATE TEMP TABLE`, without asking for
+    /// EXECUTE.
+    UntrustedEventTrigger {
+        /// The function, with its schema and argument types.
+        function: String,
+        /// The language.
+        language: String,
+        /// The event trigger.
+        event_trigger: String,
     },
     /// The session's role, or a role it can become, can run a catalog function that reads or
     /// writes the server's own files, such as `lo_export`, which writes any file the server's
@@ -519,6 +559,18 @@ impl fmt::Display for Problem {
                 "the table switchboard_audit.call_rows has the rule {rule}, whose statements run \
                  as the table's owner when the gateway writes"
             ),
+            Self::ReferentialAction {
+                constraint,
+                referenced,
+                event,
+                action,
+            } => write!(
+                f,
+                "the table switchboard_audit.call_rows has the foreign key {constraint}, which \
+                 references {referenced} with ON {event} {action}, so each {event} on \
+                 {referenced}, by any role that may make one, writes audit rows as the table's \
+                 owner"
+            ),
             Self::Definer {
                 function,
                 owner,
@@ -556,6 +608,27 @@ impl fmt::Display for Problem {
                 "this session's role, or a role it can become, can run {function}, in the \
                  untrusted language {language}, which reaches the database server's own files \
                  and programs"
+            ),
+            Self::UntrustedTrigger {
+                function,
+                language,
+                trigger,
+                table,
+            } => write!(
+                f,
+                "the trigger {trigger} on {table} runs {function}, in the untrusted language \
+                 {language}, which reaches the database server's own files and programs; a \
+                 trigger asks for no EXECUTE, and any write that reaches {table} fires it"
+            ),
+            Self::UntrustedEventTrigger {
+                function,
+                language,
+                event_trigger,
+            } => write!(
+                f,
+                "the enabled event trigger {event_trigger} runs {function}, in the untrusted \
+                 language {language}, which reaches the database server's own files and \
+                 programs, on statements any role may run"
             ),
             Self::ServerFunction { function } => write!(
                 f,
@@ -636,17 +709,25 @@ impl PgAuditStore {
     /// defence against a hostile superuser or table owner, who can defeat any check run from
     /// inside the database.
     ///
-    /// The routes the review of the first check left open (#43) are each closed or ruled out
-    /// of scope:
+    /// The routes the review of the first check left open (#43), and those its gate found
+    /// (#126), are each closed or ruled out of scope:
     ///
     /// - A definer function whose owner owns the table, a relation that reaches it, or a
     ///   trigger function, without holding a privilege: closed. Ownership counts.
     /// - A view or rule outside the schema owned by the session's role, or a role it can
     ///   become, after revoking its own grants: closed. Ownership is refused.
     /// - A definer function whose owner can set `session_replication_role`: closed.
+    /// - A definer function whose owner can act as `pg_read_server_files`,
+    ///   `pg_write_server_files` or `pg_execute_server_program`: closed. Its owner counts as
+    ///   able to turn off the triggers, as a superuser's does.
     /// - A view, rule or foreign key's cascade running a definer trigger: closed, with event
     ///   triggers, by refusing every trigger and enabled event trigger that runs a definer.
-    /// - Functions in untrusted languages: closed. EXECUTE on any is refused.
+    /// - A foreign key on `call_rows` whose action writes it: closed. A `CASCADE`, `SET NULL`
+    ///   or `SET DEFAULT` action, on a delete or an update of the row it references, runs as
+    ///   the table's owner, as a rule does, and is refused.
+    /// - Functions in untrusted languages: EXECUTE on one is refused, and so is a trigger on
+    ///   any table, or an enabled event trigger, that runs one. Nothing else about them is
+    ///   looked at: a definer function whose owner can run one is not refused for that.
     /// - Changes after boot, C functions from extensions, and connections back in through
     ///   `postgres_fdw` or `dblink`: out of scope, as the last section says.
     ///
@@ -691,6 +772,10 @@ impl PgAuditStore {
     ///   and may do nothing else with it.
     /// - `call_rows` is a table, not a view or foreign table of that name, and has no rule. A
     ///   rule's statements run as the table's owner whenever the gateway writes.
+    /// - No foreign key on `call_rows` has a `CASCADE`, `SET NULL` or `SET DEFAULT` action on
+    ///   delete or on update. Such an action writes `call_rows`, as its owner, whenever a row of
+    ///   the table it references is deleted or updated, by any role that may. `NO ACTION` and
+    ///   `RESTRICT` only refuse a write. The migrations make no foreign key.
     /// - Neither the role nor any role it can become, PUBLIC included, holds anything on a
     ///   view, materialized view or table with a rule, in any schema, that reaches `call_rows`
     ///   directly or through other views and rules. A view runs with its owner's privileges,
@@ -700,7 +785,9 @@ impl PgAuditStore {
     ///   owner can read or change `call_rows` or turn off its triggers: one that holds a
     ///   privilege on it, or on a view or rule that reaches it; or can act as the owner of the
     ///   table, of such a view or rule, of the schema, or of the functions the table's
-    ///   triggers run; or can set `session_replication_role`; or can run another such
+    ///   triggers run; or can set `session_replication_role`; or can act as
+    ///   `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, which
+    ///   reach the server's files and programs as a superuser does; or can run another such
     ///   function. PUBLIC holds EXECUTE on every new function unless it is revoked.
     /// - No trigger on any table, and no enabled event trigger, runs such a function, whoever
     ///   can write the table. A trigger does not ask for EXECUTE, and a write through a view,
@@ -712,6 +799,8 @@ impl PgAuditStore {
     ///   `pg_stat_file`, and adminpack's `pg_file_*` where the server has them.
     /// - Neither can run a function in an untrusted language, such as `plpython3u` or
     ///   `plperlu`, which runs with the server's operating-system user's access to its files.
+    ///   No trigger on any table, and no enabled event trigger, runs one either, whoever can
+    ///   write the table: a trigger asks for no EXECUTE.
     ///
     /// # What it does not look for
     ///
@@ -821,6 +910,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
             columns(client, table, &mut problems).await?;
             triggers(client, table, &mut problems).await?;
             rules(client, table, &mut problems).await?;
+            referential_actions(client, table, &mut problems).await?;
             column_privileges(client, table, &mut problems).await?;
         }
     }
@@ -1104,6 +1194,53 @@ async fn rules(
             .into_iter()
             .map(|row| Problem::Rule { rule: row.get(0) }),
     );
+    Ok(())
+}
+
+/// Every foreign key on `table` whose action on a delete or an update of the row it references
+/// writes `table`: `CASCADE` ('c'), `SET NULL` ('n') or `SET DEFAULT` ('d'). `NO ACTION` ('a')
+/// and `RESTRICT` ('r') only refuse the write. Postgres runs the action as the owner of the
+/// table that holds the key, whoever deleted or updated the referenced row, so one is a write
+/// path into `call_rows` as a rule on it is.
+///
+/// A foreign key on another table that references `call_rows` passes. Its action writes that
+/// other table, not `call_rows`, and the gateway's role cannot set it off. The action fires only
+/// when a referenced row is deleted or its referenced key changes from a value with no NULL in
+/// it. The role holds no DELETE, which [`other_privileges`] refuses, and its only UPDATE is the
+/// completion, which [`column_privileges`] holds it to. `complete_once` lets that write only the
+/// completion's columns, and only on a row whose `outcome` is NULL, and `completion_shape` and
+/// `error_kind_shape` keep every completion column NULL until then. So a referenced key holds
+/// none of those columns and never changes, or its old value has a NULL and Postgres takes no
+/// action. This is not because that table's triggers are checked: a plain `BEFORE` trigger on
+/// it, which [`definers`] and [`untrusted_functions`] do not refuse, runs as that table's owner
+/// during the action.
+async fn referential_actions(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query(
+            "SELECT k.conname::text, rn.nspname || '.' || r.relname, a.event,
+                    CASE a.action WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
+                                  ELSE 'SET DEFAULT' END
+             FROM pg_catalog.pg_constraint k
+                 JOIN pg_catalog.pg_class r ON r.oid = k.confrelid
+                 JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace,
+                 LATERAL (VALUES ('DELETE', k.confdeltype::text),
+                                 ('UPDATE', k.confupdtype::text)) AS a(event, action)
+             WHERE k.contype = 'f' AND k.conrelid = $1::oid
+                 AND a.action NOT IN ('a', 'r')
+             ORDER BY 1, 3",
+            &[&table],
+        )
+        .await?;
+    problems.extend(found.into_iter().map(|row| Problem::ReferentialAction {
+        constraint: row.get(0),
+        referenced: row.get(1),
+        event: row.get(2),
+        action: row.get(3),
+    }));
     Ok(())
 }
 
@@ -1451,7 +1588,9 @@ async fn reaching_privileges(
 /// which may drop the table, or of a function the table's triggers run (`set_times` and
 /// `complete_once`), which may drop the trigger with it; when it can set
 /// `session_replication_role`, under which neither trigger fires; or when it can run another
-/// such function, itself or through a trigger on a table it can write.
+/// such function, itself or through a trigger on a table it can write. An owner that can act as
+/// one of [`SERVER_ROLES`] is able too: it reaches the server's files and programs, and through
+/// them every setting and every row, as a superuser does.
 ///
 /// A trigger runs its function without asking for EXECUTE, for whoever writes its table by
 /// whatever route: directly, through a view or a rule, or by a foreign key's cascade. Rather
@@ -1469,6 +1608,7 @@ async fn definers(
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let privileges = table_privileges(version).join(", ");
+    let server_roles: Vec<&str> = SERVER_ROLES.iter().map(|(role, _)| *role).collect();
     // From version 15 a role can be granted SET on a setting only a superuser may set.
     let replication = if version >= 150_000 {
         "OR has_parameter_privilege(p.proowner, 'session_replication_role', 'SET')"
@@ -1495,6 +1635,9 @@ async fn definers(
                                              JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid
                                          WHERE g.tgrelid = $1::oid
                                              AND pg_has_role(p.proowner, f.proowner, 'USAGE'))
+                              OR EXISTS (SELECT FROM pg_catalog.pg_roles s
+                                         WHERE s.rolname = ANY($3::text[])
+                                             AND pg_has_role(p.proowner, s.oid, 'USAGE'))
                               {replication})
                      UNION
                      SELECT p.oid
@@ -1514,7 +1657,7 @@ async fn definers(
                      JOIN pg_catalog.pg_proc p ON p.oid = d.oid
                  WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')"
             ),
-            &[&table, &privileges],
+            &[&table, &privileges, &server_roles],
         )
         .await?
         .into_iter()
@@ -1597,6 +1740,12 @@ async fn definers(
 /// PUBLIC included. Only a superuser makes one, and it runs with the access of the server's
 /// operating-system user to its files and programs. C and internal functions are not
 /// procedural and are not looked at.
+///
+/// A trigger runs its function without asking for EXECUTE, for whoever writes its table by
+/// whatever route, so a trigger on any table that runs such a function is refused, whoever can
+/// write the table; and so is an enabled event trigger that runs one, since an event trigger
+/// fires on statements any role may run. The migrations' trigger functions are in `plpgsql`,
+/// which is trusted.
 async fn untrusted_functions(
     client: &ClientWrapper,
     problems: &mut Vec<Problem>,
@@ -1619,6 +1768,57 @@ async fn untrusted_functions(
     problems.extend(found.into_iter().map(|row| Problem::UntrustedLanguage {
         function: row.get(0),
         language: row.get(1),
+    }));
+
+    let untrusted_triggered = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}, l.lanname::text, t.tgname::text,
+                        n.nspname || '.' || c.relname
+                 FROM pg_catalog.pg_trigger t
+                     JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+                         AND l.lanispl AND NOT l.lanpltrusted
+                     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 ORDER BY 4, 3"
+            ),
+            &[],
+        )
+        .await?;
+    problems.extend(
+        untrusted_triggered
+            .into_iter()
+            .map(|row| Problem::UntrustedTrigger {
+                function: row.get(0),
+                language: row.get(1),
+                trigger: row.get(2),
+                table: row.get(3),
+            }),
+    );
+
+    let untrusted_event_triggered = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}, l.lanname::text, e.evtname::text
+                 FROM pg_catalog.pg_event_trigger e
+                     JOIN pg_catalog.pg_proc p ON p.oid = e.evtfoid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+                         AND l.lanispl AND NOT l.lanpltrusted
+                 WHERE e.evtenabled <> 'D'
+                 ORDER BY 3"
+            ),
+            &[],
+        )
+        .await?;
+    problems.extend(untrusted_event_triggered.into_iter().map(|row| {
+        Problem::UntrustedEventTrigger {
+            function: row.get(0),
+            language: row.get(1),
+            event_trigger: row.get(2),
+        }
     }));
     Ok(())
 }
@@ -1801,6 +2001,40 @@ mod tests {
                 "this session's role, or a role it can become, can run reports.outside(), in \
                  the untrusted language plpython3u, which reaches the database server's own \
                  files and programs",
+            ),
+            (
+                Problem::UntrustedTrigger {
+                    function: "reports.outside()".into(),
+                    language: "plpython3u".into(),
+                    trigger: "outside".into(),
+                    table: "reports.notes".into(),
+                },
+                "the trigger outside on reports.notes runs reports.outside(), in the untrusted \
+                 language plpython3u, which reaches the database server's own files and \
+                 programs; a trigger asks for no EXECUTE, and any write that reaches \
+                 reports.notes fires it",
+            ),
+            (
+                Problem::UntrustedEventTrigger {
+                    function: "reports.outside_ddl()".into(),
+                    language: "plperlu".into(),
+                    event_trigger: "outside_ddl".into(),
+                },
+                "the enabled event trigger outside_ddl runs reports.outside_ddl(), in the \
+                 untrusted language plperlu, which reaches the database server's own files and \
+                 programs, on statements any role may run",
+            ),
+            (
+                Problem::ReferentialAction {
+                    constraint: "purge".into(),
+                    referenced: "reports.parents".into(),
+                    event: "UPDATE".into(),
+                    action: "SET DEFAULT".into(),
+                },
+                "the table switchboard_audit.call_rows has the foreign key purge, which \
+                 references reports.parents with ON UPDATE SET DEFAULT, so each UPDATE on \
+                 reports.parents, by any role that may make one, writes audit rows as the \
+                 table's owner",
             ),
         ];
         for (problem, expected) in cases {
