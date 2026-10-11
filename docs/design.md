@@ -895,13 +895,17 @@ whose roles, schema and grants come from the store's role script (`sql/roles.sql
 migrations: a grant, membership, setting or object that gives the gateway's role a way to read
 or change audit rows beyond its own. It is not a defence against a hostile superuser or table
 owner, who can defeat any check run from inside the database. Against that scope, the routes
-the first check's review left open (#43), and those its gate found (#126), are each closed or
-ruled out: ownership now counts wherever a privilege does; a definer function whose owner can
-set `session_replication_role`, or can act as `pg_read_server_files`, `pg_write_server_files`
-or `pg_execute_server_program`, is refused; every trigger and enabled event trigger that runs
-a definer function, or a function in an untrusted language, is refused, whoever can fire it;
-EXECUTE on a function in an untrusted language is refused; a foreign key on the audit table
-whose action writes it is refused; and the three below are out of scope.
+the first check's review left open (#43), and those the next two gates found (#126, #138), are
+each closed or ruled out: ownership now counts wherever a privilege does; a definer function
+whose owner can set `session_replication_role`, is a member of `pg_read_server_files`,
+`pg_write_server_files` or `pg_execute_server_program`, inherited or not, or may run
+`lo_export`, the catalog's other functions that reach the server's files, or a function in an
+untrusted language, is refused; every trigger and enabled event trigger that runs a definer
+function, or a function in an untrusted language, is refused, whoever can fire it; EXECUTE on
+a function in an untrusted language is refused; a foreign key on the audit table whose action
+writes it is refused, and so is every trigger on another table whose foreign key's action
+writes that table, when the table's owner could reach the audit table; and the three below
+are out of scope.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
@@ -925,28 +929,34 @@ for the gateway's role and every role it can become, PUBLIC included: an audit t
 view or foreign table, or has a rule; an audit table with a foreign key whose action on delete
 or on update is `CASCADE`, `SET NULL` or `SET DEFAULT`, which writes the audit table as its
 owner, as a rule does, whenever any role deletes or updates the row it references (`NO ACTION`
-and `RESTRICT` only refuse a write, and pass); any privilege on a view, materialized view or table with
-a rule, in any schema, that reaches the audit table directly or through other views and rules,
-or owning one outside the audit schema, since an owner that revoked its own grants can grant
-them back; being able to run, by EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
-owner can read or change the audit table or turn off its triggers; EXECUTE on the catalog's
-functions that read or write the server's files (`lo_export`, `lo_import`, `pg_read_file`,
-`pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's `pg_file_*`); and EXECUTE
-on any function in an untrusted language, such as `plpython3u`, which runs with the access of
-the server's operating-system user. A definer function's owner counts as able when it holds a
-privilege on the audit table or on a view or rule that reaches it, can act as the owner of any
-of those, of the schema, or of the functions the table's triggers run, can set
-`session_replication_role`, can act as `pg_read_server_files`, `pg_write_server_files` or
-`pg_execute_server_program`, which reach the server's files and programs as a superuser does,
-or can run another such function. A trigger runs its function
-without EXECUTE, for any write that reaches its table, through a view, a rule or a foreign
-key's cascade as well as directly, and an event trigger fires on statements any role may run,
-such as `CREATE TEMP TABLE`. So rather than follow each route, the check refuses every trigger
-on any table, and every enabled event trigger, that runs such a function, or a function in an
-untrusted language, whoever can fire it. Untrusted languages are refused for EXECUTE and for
-triggers only: a definer function whose owner can run one is not refused for that. The
-migrations' trigger functions are in `plpgsql`, which is trusted, and are not `SECURITY
-DEFINER`, and the migrations make no foreign key, so a database they built passes.
+and `RESTRICT` only refuse a write, and pass); any privilege on a view, materialized view or
+table with a rule, in any schema, that reaches the audit table directly or through other views
+and rules, or owning one outside the audit schema, since an owner that revoked its own grants
+can grant them back; being able to run, by EXECUTE, a `SECURITY DEFINER` function, in any
+schema, whose owner can read or change the audit table or turn off its triggers; EXECUTE on the
+catalog's functions that read or write the server's files (`lo_export`, `lo_import`,
+`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's
+`pg_file_*`); and EXECUTE on any function in an untrusted language, such as `plpython3u`, which
+runs with the access of the server's operating-system user. A definer function's owner counts
+as able when it holds a privilege on the audit table or on a view or rule that reaches it; can
+act as the owner of any of those, of the schema, or of the functions the table's triggers run;
+can set `session_replication_role`; is a member, inherited or not, of `pg_read_server_files`,
+`pg_write_server_files` or `pg_execute_server_program`, which reach the server's files and
+programs as a superuser does; may run one of the catalog's functions above, or a function in
+an untrusted language; or can run another such function. A trigger runs its function without
+EXECUTE, for any write that reaches its table, through a view, a rule or a foreign key's
+cascade as well as directly, and an event trigger fires on statements any role may run, such
+as `CREATE TEMP TABLE`. So rather than follow each route, the check refuses every trigger on
+any table, and every enabled event trigger, that runs such a function, or a function in an
+untrusted language, whoever can fire it. A foreign key's action, and the triggers it fires,
+run as the owner of the table that holds the key, whoever deleted or updated the row it
+references, so a plain trigger there runs as that owner too. The catalog cannot say what a
+trigger function writes, so the check refuses every trigger, on any event, enabled or not, on
+a table other than the audit table that holds a foreign key with a `CASCADE`, `SET NULL` or
+`SET DEFAULT` action, when that table's owner counts as able as a definer function's owner
+does, or can run such a function. The migrations' trigger functions are in `plpgsql`, which
+is trusted, and are not `SECURITY DEFINER`, and the migrations make no foreign key, so a
+database they built passes.
 
 What the Postgres check does not look for, each out of scope because it needs an
 administrator's act rather than a misconfiguration of what the role script and the migrations
