@@ -42,8 +42,8 @@ ServiceAccount.
 | `kind/cluster.yaml` | One node, kindnet, the node image kind v0.32.0 uses. |
 | `kind/base/` | Namespaces `switchboard`, `mock-docs`, `team-a`, `team-b`; ServiceAccounts; Postgres; the migration Job; mock-docs, which accepts only the gateway's ServiceAccount; the gateway, with a projected token for audience `mock-docs`; suspended CronJobs holding each workload's Job template. No network policy. |
 | `kind/policy/` | The network policies: mock-docs admits only the gateway, Postgres only the gateway and the migration, the gateway only the two teams. |
-| `kind/route-check/rbac.yaml` | The route check's operator: ServiceAccount `route-check/operator`, `get` and `list` on what it reads, `create` on SubjectAccessReviews, and `patch` on `pods/ephemeralcontainers` in `team-a` and `team-b` only. Not part of the base; the kind run applies it. |
-| `route-check/` | The route check (decision 0010): `route-check.sh`, its operator step; `probe.sh`, its probe, which the image installs as `route-probe.sh`; `permissions.tsv`, the one list of control 1's permissions; `token-patterns.txt`; and `routes/kind.tsv`, the routes the probe tries in kind. |
+| `kind/route-check/rbac.yaml` | The route check's operator: ServiceAccount `route-check/operator`, `get` and `list` on what it reads, Roles, ClusterRoles, RoleBindings and ClusterRoleBindings among them, `create` on SubjectAccessReviews, and `patch` on `pods/ephemeralcontainers` in `team-a` and `team-b` only. Not part of the base; the kind run applies it. |
+| `route-check/` | The route check (decision 0010): `route-check.sh`, its operator step; `probe.sh`, its probe, which the image installs as `route-probe.sh`; `permissions.tsv`, the one list of control 1's permissions; `rbac-match.jq`, which finds the RBAC rules bound to a ServiceAccount that grant a row of that list; `token-patterns.txt`; and `routes/kind.tsv`, the routes the probe tries in kind. |
 | `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn`, and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
 | `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, runs `switchboard migrate` as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
 | `demo/demo.sh` | The driver. |
@@ -83,12 +83,26 @@ pods and `create`, `update` and `patch` on Deployments, ReplicaSets, StatefulSet
 Jobs and CronJobs; `create` and `get` on exec, attach, port-forward and the pod, Service and
 node proxies; `patch` and `update` on ephemeral containers; minting a ServiceAccount's token;
 impersonating users, groups, ServiceAccounts, UIDs and extras (`userextras/scopes`); `bind` and
-`escalate` on roles and cluster roles; and creating role and cluster role bindings. That is 43
-namespaced rows and 8 cluster rows, 180 checks per team. They are asked with `kubectl auth
-can-i --as`, except UIDs and extras, which the API server checks in `authentication.k8s.io`
-though it serves no such resource: can-i cannot name them, so those are asked as
-SubjectAccessReviews. A query kubectl cannot answer is a FAIL with kubectl's message, and the
-run goes on.
+`escalate` on roles and cluster roles; and `create`, `update` and `patch` on role and cluster
+role bindings. That is 45 namespaced rows and 10 cluster rows, 190 checks per team. They are
+asked with `kubectl auth can-i --as`, except UIDs and extras, which the API server checks in
+`authentication.k8s.io` though it serves no such resource: can-i cannot name them, so those are
+asked as SubjectAccessReviews. A query kubectl cannot answer is a FAIL with kubectl's message,
+and the run goes on.
+
+can-i and a SubjectAccessReview name no resource, so neither sees a rule limited by
+`resourceNames`: a workload able to mint tokens for one named ServiceAccount answers no (#60).
+So the checks also read the RBAC objects, with `route-check/rbac-match.jq`, the matcher the
+route check's operator step runs too. They read the ClusterRoles, the ClusterRoleBindings, and
+the Roles and RoleBindings in `mock-docs`, `switchboard` and each team's namespace. A binding
+counts when a subject is the team's ServiceAccount, as a ServiceAccount or as the user
+`system:serviceaccount:<team>:mock-workload`, or one of its groups (`system:serviceaccounts`,
+`system:serviceaccounts:<team>`, `system:authenticated`). A RoleBinding counts the Role or
+ClusterRole it binds. A rule grants a row when its verbs, API groups and resources match the
+row's, `*` matching anything and `*/<sub>` any resource's subresource, whatever its
+`resourceNames`. A `namespaced` row counts the RoleBindings and the ClusterRoleBindings; a
+`cluster` row only the ClusterRoleBindings. That is one more check per row, 55 per team. A list
+that cannot be read or parsed fails, and nothing is matched. No grant is allowed in code.
 
 ## The route check in kind
 
