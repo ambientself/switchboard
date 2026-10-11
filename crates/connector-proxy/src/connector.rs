@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gateway_core::{
-    BoxFuture, Connector, ConnectorName, CredentialError, ToolCall, ToolName, ToolOutcome,
+    BoxFuture, Classification, Connector, ConnectorName, CredentialError, ErrorKind, ToolCall,
+    ToolName, ToolOutcome,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
@@ -107,12 +108,13 @@ pub enum UpstreamError {
 /// JSON answer, not an event stream. It follows no redirect and uses no proxy.
 ///
 /// Each call is bounded inside the connector: it is abandoned at the deadline, and an answer
-/// larger than the cap is discarded unread. Either way the outcome is
-/// [`ToolOutcome::Error`]. So is any failure of the server or of the exchange, and so are
-/// arguments that are not an object, which are never sent. A `403` from the server is its
-/// refusal of the call's scope and becomes [`ToolOutcome::Refused`], as does a call this
-/// connector does not serve or has no credential for; see [`outcome`](crate::outcome) for
-/// every sentence.
+/// larger than the cap is discarded unread. Either way the outcome is [`ToolOutcome::Error`],
+/// of the kind [`ErrorKind::OversizedOrLateRead`] for a tool classified `read` and
+/// [`ErrorKind::Other`] for any other. So is any failure of the server or of the exchange, of
+/// the kind `Other`, and so are arguments that are not an object, which are never sent, of the
+/// kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its refusal of the call's
+/// scope and becomes [`ToolOutcome::Refused`], as does a call this connector does not serve or
+/// has no credential for; see [`outcome`](crate::outcome) for every sentence.
 ///
 /// Running a call needs a Tokio runtime.
 pub struct ProxyConnector {
@@ -203,7 +205,10 @@ impl ProxyConnector {
             return ToolOutcome::Refused(outcome::NOT_SERVED.to_owned());
         };
         let Value::Object(arguments) = call.arguments() else {
-            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());
+            return ToolOutcome::error(
+                ErrorKind::InvalidArguments,
+                outcome::ARGUMENTS_NOT_AN_OBJECT,
+            );
         };
         let secret = match self
             .credentials
@@ -223,15 +228,23 @@ impl ProxyConnector {
                 return ToolOutcome::Refused(outcome::NO_CREDENTIAL.to_owned());
             }
             Err(CredentialError::Unavailable(_)) => {
-                return ToolOutcome::Error(outcome::CREDENTIAL_UNAVAILABLE.to_owned());
+                return ToolOutcome::error(ErrorKind::Other, outcome::CREDENTIAL_UNAVAILABLE);
             }
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let Some(request) = self.request(id, upstream_name, arguments, &secret) else {
-            return ToolOutcome::Error(outcome::NOT_SENT.to_owned());
+            return ToolOutcome::error(ErrorKind::Other, outcome::NOT_SENT);
         };
-        match tokio::time::timeout(self.deadline, self.exchange(request)).await {
-            Err(_elapsed) => ToolOutcome::Error(outcome::TIMED_OUT.to_owned()),
+        // An answer too large or too late is a kind of its own from a read. From any other
+        // tool, decision 0011 records it as `unknown`, which is not built yet, so until then it
+        // is an error like any other.
+        let late = if tool.classification == Classification::Read {
+            ErrorKind::OversizedOrLateRead
+        } else {
+            ErrorKind::Other
+        };
+        match tokio::time::timeout(self.deadline, self.exchange(request, late)).await {
+            Err(_elapsed) => ToolOutcome::error(late, outcome::TIMED_OUT),
             Ok(Err(failed)) => failed,
             Ok(Ok(received)) => {
                 outcome::interpret(received.content_type.as_deref(), &received.body, id)
@@ -265,30 +278,46 @@ impl ProxyConnector {
     }
 
     /// Sends the request and reads a `200` answer's body, up to the cap. Any other status, and
-    /// any failure, is the call's outcome.
-    async fn exchange(&self, request: Request<Full<Bytes>>) -> Result<Received, ToolOutcome> {
+    /// any failure, is the call's outcome. `late` is the kind of an answer too large or broken
+    /// off.
+    async fn exchange(
+        &self,
+        request: Request<Full<Bytes>>,
+        late: ErrorKind,
+    ) -> Result<Received, ToolOutcome> {
         let response = self
             .client
             .request(request)
             .await
-            .map_err(|_| ToolOutcome::Error(outcome::UNREACHABLE.to_owned()))?;
+            .map_err(|_| ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE))?;
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED {
-            return Err(ToolOutcome::Error(outcome::CREDENTIAL_REJECTED.to_owned()));
+            return Err(ToolOutcome::error(
+                ErrorKind::Other,
+                outcome::CREDENTIAL_REJECTED,
+            ));
         }
         if status == StatusCode::FORBIDDEN {
             return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));
         }
         if status != StatusCode::OK {
-            return Err(ToolOutcome::Error(outcome::status(status.as_u16())));
+            return Err(ToolOutcome::error(
+                ErrorKind::Other,
+                outcome::status(status.as_u16()),
+            ));
         }
-        self.read(response).await
+        self.read(response, late).await
     }
 
     /// Reads the body, refusing as soon as it is known to be larger than the cap: from its
-    /// declared length if it has one, and otherwise as it arrives.
-    async fn read(&self, response: Response<Incoming>) -> Result<Received, ToolOutcome> {
-        let too_large = || ToolOutcome::Error(outcome::TOO_LARGE.to_owned());
+    /// declared length if it has one, and otherwise as it arrives. `late` is the kind of an
+    /// answer too large or broken off.
+    async fn read(
+        &self,
+        response: Response<Incoming>,
+        late: ErrorKind,
+    ) -> Result<Received, ToolOutcome> {
+        let too_large = || ToolOutcome::error(late, outcome::TOO_LARGE);
         if declared_length(response.headers())
             .is_some_and(|length| length > self.max_response_bytes as u64)
         {
@@ -302,7 +331,7 @@ impl ProxyConnector {
         let mut body = response.into_body();
         let mut received = Vec::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| ToolOutcome::Error(outcome::BROKEN_OFF.to_owned()))?;
+            let frame = frame.map_err(|_| ToolOutcome::error(late, outcome::BROKEN_OFF))?;
             if let Ok(data) = frame.into_data() {
                 if received.len() + data.len() > self.max_response_bytes {
                     return Err(too_large());

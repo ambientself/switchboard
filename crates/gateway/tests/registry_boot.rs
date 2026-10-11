@@ -18,7 +18,7 @@ use gateway::path::RequestPath;
 use gateway::{
     AuditSection, NO_PROFILE, ResourceAdapter, undeclared_argument, withdrawn_while_deciding,
 };
-use gateway_core::audit::{AuditRowId, ListRecord, Outcome, RowCompletion, StoreError};
+use gateway_core::audit::{AuditRowId, ErrorKind, ListRecord, Outcome, RowCompletion, StoreError};
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, Principal, PrincipalId, PrincipalKind,
     Resources,
@@ -408,7 +408,12 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
         .completion
         .as_ref()
         .map(|completion| completion.outcome.clone());
-    assert_eq!(outcome, Some(Outcome::Error));
+    assert_eq!(
+        outcome,
+        Some(Outcome::Error {
+            error_kind: ErrorKind::InvalidArguments
+        })
+    );
 
     // Under demo-2 the same call is decided with other_project read as a resource, and
     // team-a's limit does not hold borealis.

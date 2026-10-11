@@ -31,12 +31,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ListRecord,
+    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
     MAX_RECORDED_RESOURCES, Outcome, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
-    AuditGuard, AuditRecord, AuditStore, CallContext, Claimed, Decision, RequestedTool, Resource,
-    Resources, TeamId, ToolUseId, decide,
+    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, Claimed, Connector, Decision,
+    RequestedTool, Resource, Resources, TeamId, ToolCall, ToolOutcome, ToolUseId, decide,
 };
 use serde_json::{Value, json};
 
@@ -672,7 +672,10 @@ async fn finish_touches_only_its_completion(
     assert!(finished.failure().is_none(), "{:?}", finished.failure());
     let outcome = match finished.answer() {
         Answer::Ok(_) => Outcome::Ok,
-        Answer::Error(_) => Outcome::Error,
+        // The fixture connector fails with no other kind.
+        Answer::Error(_) => Outcome::Error {
+            error_kind: ErrorKind::Other,
+        },
         Answer::Refused(sentence) => Outcome::Refused {
             sentence: sentence.clone(),
         },
@@ -694,6 +697,89 @@ async fn finish_touches_only_its_completion(
         ..before
     };
     assert_eq!(stored(contract, &row).await, expected);
+}
+
+/// A connector that fails every call with one kind of error.
+struct FailsWith(ErrorKind);
+
+impl Connector for FailsWith {
+    fn run(&self, _call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        Box::pin(std::future::ready(ToolOutcome::error(
+            self.0,
+            "the contract's connector fails on purpose",
+        )))
+    }
+}
+
+/// Every kind of error is stored with its outcome and read back as it was written. A repeat of
+/// the same error is accepted; an error of another kind, with the same latency, is refused with
+/// a returned error, and the first completion stands.
+pub async fn an_error_is_stored_with_its_kind_and_a_repeat_must_match_it(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let kinds = [
+        ErrorKind::InvalidArguments,
+        ErrorKind::OversizedOrLateRead,
+        ErrorKind::CustodianRefusal,
+        ErrorKind::VendorRefusal,
+        ErrorKind::Other,
+    ];
+    for kind in kinds {
+        let start = row_start();
+        let ran = audit::run(
+            &FailsWith(kind),
+            guard(store, &fixture, &start, &ALLOWED).await,
+        )
+        .await;
+        let finished = audit::finish(store, ran, 7).await;
+        assert!(
+            finished.failure().is_none(),
+            "{kind:?}: {:?}",
+            finished.failure()
+        );
+        let completion = Some(Completion {
+            outcome: Outcome::Error { error_kind: kind },
+            latency_ms: 7,
+        });
+        let row = stored(contract, &start.row).await;
+        assert_eq!(row.completion, completion, "{kind:?}");
+        let StoredRecord::Call(record) = row.record else {
+            panic!("a call was not stored as one");
+        };
+        assert_eq!(record.completion, completion, "{kind:?}");
+    }
+
+    let start = row_start();
+    let refusal = FailsWith(ErrorKind::VendorRefusal);
+    let ran = audit::run(&refusal, guard(store, &fixture, &start, &ALLOWED).await).await;
+    assert!(audit::finish(store, ran, 7).await.failure().is_none());
+    let first = stored(contract, &start.row).await;
+    let ran = audit::run(&refusal, guard(store, &fixture, &start, &ALLOWED).await).await;
+    let finished = audit::finish(store, ran, 7).await;
+    assert!(
+        finished.failure().is_none(),
+        "an identical repeat was refused: {:?}",
+        finished.failure()
+    );
+    assert_eq!(stored(contract, &start.row).await, first);
+    for kind in kinds
+        .into_iter()
+        .filter(|kind| *kind != ErrorKind::VendorRefusal)
+    {
+        let ran = audit::run(
+            &FailsWith(kind),
+            guard(store, &fixture, &start, &ALLOWED).await,
+        )
+        .await;
+        let finished = audit::finish(store, ran, 7).await;
+        assert!(
+            finished.failure().is_some(),
+            "an error of the kind {kind:?} completed a vendor refusal's row again"
+        );
+        assert_eq!(stored(contract, &start.row).await, first);
+    }
 }
 
 // --- Item 4: the deadline -----------------------------------------------------------------------

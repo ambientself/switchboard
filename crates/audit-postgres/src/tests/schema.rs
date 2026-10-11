@@ -97,12 +97,24 @@ async fn insert_row(client: &Client, sql: &str) -> String {
     client.query_one(sql, &[]).await.unwrap().get(0)
 }
 
+/// Completes `id` with `outcome` and a latency of 1, and an `error` with the kind `other`, as
+/// an error must have since 0006. Any other outcome is given no kind, so a row can be completed
+/// this way before 0006 too.
 async fn complete(client: &Client, id: &str, outcome: &str) -> Result<u64, tokio_postgres::Error> {
+    let kind = if outcome == "error" {
+        ", error_kind = 'other'"
+    } else {
+        ""
+    };
+    complete_with(client, id, &format!("outcome = '{outcome}'{kind}")).await
+}
+
+/// Completes `id` with the assignments in `set` and a latency of 1.
+async fn complete_with(client: &Client, id: &str, set: &str) -> Result<u64, tokio_postgres::Error> {
     client
         .execute(
             &format!(
-                "UPDATE switchboard_audit.call_rows SET outcome = '{outcome}', latency_ms = 1
-                 WHERE id = '{id}'"
+                "UPDATE switchboard_audit.call_rows SET {set}, latency_ms = 1 WHERE id = '{id}'"
             ),
             &[],
         )
@@ -126,7 +138,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4, 5]);
+    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6]);
 }
 
 #[tokio::test]
@@ -167,7 +179,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5],
+            vec![1, 2, 3, 4, 5, 6],
             "each migration is applied once"
         );
     }
@@ -333,11 +345,13 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "tool_use_id"),
         ("SELECT", "deadline"),
         ("SELECT", "decision"),
+        ("SELECT", "error_kind"),
         ("SELECT", "id"),
         ("SELECT", "kind"),
         ("SELECT", "latency_ms"),
         ("SELECT", "outcome"),
         ("SELECT", "outcome_sentence"),
+        ("UPDATE", "error_kind"),
         ("UPDATE", "latency_ms"),
         ("UPDATE", "outcome"),
         ("UPDATE", "outcome_sentence"),
@@ -412,6 +426,7 @@ async fn the_gateway_writes_the_identifier_but_not_the_times_or_a_completion_at_
         ("finished_at", "now()"),
         ("deadline", "now() + interval '1 day'"),
         ("outcome", "'ok'"),
+        ("error_kind", "'other'"),
         ("latency_ms", "1"),
     ] {
         let error = gateway
@@ -462,7 +477,8 @@ async fn the_gateway_cannot_read_who_called_or_delete() {
     gateway
         .query_one(
             &format!(
-                "SELECT id, decision, outcome, outcome_sentence, latency_ms, kind, deadline
+                "SELECT id, decision, outcome, outcome_sentence, error_kind, latency_ms, kind,
+                        deadline
                  FROM switchboard_audit.call_rows WHERE id = '{id}'"
             ),
             &[],
@@ -845,7 +861,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
     assert_eq!(complete(&owner, &completed, "ok").await.unwrap(), 1);
     let refused = insert_row(&owner, &before_0003(denied())).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5, 6]);
     for (id, due) in [
         (&open, "begun_at"),
         (&completed, "finished_at"),
@@ -1312,4 +1328,194 @@ async fn the_gateway_cannot_insert_a_list_row_with_a_completion() {
         .unwrap_err();
     assert_eq!(code(&error), Some(CHECK_VIOLATION), "{error}");
     assert!(message(&error).contains("kind_shape"), "{error}");
+}
+
+/// Whether `error` is the check `constraint` refusing a row.
+fn refused_by(error: &tokio_postgres::Error, constraint: &str) -> bool {
+    code(error) == Some(CHECK_VIOLATION) && message(error).contains(&format!("\"{constraint}\""))
+}
+
+/// An error's kind is one of the five the core names, or `before-0006` for an error completed
+/// before the column was added, and nothing else, whoever writes it.
+#[tokio::test]
+async fn an_error_kind_is_one_the_core_names_or_before_0006() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    for kind in [
+        "invalid_arguments",
+        "oversized_or_late_read",
+        "custodian_refusal",
+        "vendor_refusal",
+        "other",
+        "before-0006",
+    ] {
+        let id = insert_row(&gateway, &insert(&[])).await;
+        let set = format!("outcome = 'error', error_kind = '{kind}'");
+        assert_eq!(complete_with(&owner, &id, &set).await.unwrap(), 1, "{kind}");
+    }
+    for kind in ["unknown", "Other", "vendor-refusal", ""] {
+        let id = insert_row(&gateway, &insert(&[])).await;
+        let set = format!("outcome = 'error', error_kind = '{kind}'");
+        for client in [&gateway, &owner] {
+            let error = complete_with(client, &id, &set).await.unwrap_err();
+            assert!(refused_by(&error, "error_kind_known"), "{kind}: {error}");
+        }
+    }
+}
+
+/// A row has an error kind exactly when its outcome is `error`: an error without one is
+/// refused, and so is another outcome with one, or a row with no outcome yet.
+#[tokio::test]
+async fn only_an_error_has_a_kind() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    for set in [
+        "outcome = 'error'",
+        "outcome = 'ok', error_kind = 'other'",
+        "outcome = 'refused', outcome_sentence = 'No.', error_kind = 'vendor_refusal'",
+    ] {
+        let id = insert_row(&gateway, &insert(&[])).await;
+        for client in [&gateway, &owner] {
+            let error = complete_with(client, &id, set).await.unwrap_err();
+            assert!(refused_by(&error, "error_kind_shape"), "{set}: {error}");
+        }
+    }
+    // Only the owner can insert a kind at all, and even it cannot give one to a row with no
+    // outcome.
+    let error = owner
+        .query_one(&insert(&[("error_kind", "'other'")]), &[])
+        .await
+        .unwrap_err();
+    assert!(refused_by(&error, "error_kind_shape"), "{error}");
+}
+
+/// The error kind is written with the rest of the completion, by the gateway's role too, and
+/// never after it or without it, by any role.
+#[tokio::test]
+async fn the_error_kind_is_written_with_the_completion_and_never_after() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let id = insert_row(&gateway, &insert(&[])).await;
+    let set = "outcome = 'error', error_kind = 'vendor_refusal'";
+    assert_eq!(complete_with(&gateway, &id, set).await.unwrap(), 1);
+    let open = insert_row(&gateway, &insert(&[])).await;
+    for client in [&gateway, &owner] {
+        for (row, refusal) in [(&id, "is already complete"), (&open, "has no outcome")] {
+            let error = client
+                .execute(
+                    &format!(
+                        "UPDATE switchboard_audit.call_rows SET error_kind = 'other'
+                         WHERE id = '{row}'"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap_err();
+            assert!(message(&error).contains(refusal), "{error}");
+        }
+    }
+    let kind: String = owner
+        .query_one(
+            &format!("SELECT error_kind FROM switchboard_audit.call_rows WHERE id = '{id}'"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(kind, "vendor_refusal");
+}
+
+/// Every row as JSON, without its error kind, by identifier.
+async fn rows_without_error_kind(client: &Client) -> Vec<(String, serde_json::Value)> {
+    client
+        .query(
+            "SELECT id::text, to_jsonb(r) - 'error_kind'
+             FROM switchboard_audit.call_rows AS r ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// The migration that adds the error kind applies to a table that already has rows: each
+/// error is given the kind `before-0006`, every other row none, and nothing else changes, not
+/// even a completion's time.
+#[tokio::test]
+async fn the_error_kind_migration_marks_the_errors_already_written() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let mut owner = db.connect_as(OWNER_ROLE).await;
+    owner
+        .batch_execute("DROP SCHEMA switchboard_audit CASCADE")
+        .await
+        .unwrap();
+    owner
+        .batch_execute(
+            "CREATE SCHEMA switchboard_audit;
+             CREATE TABLE switchboard_audit.migrations (
+                 version    integer     PRIMARY KEY,
+                 name       text        NOT NULL,
+                 applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+             );",
+        )
+        .await
+        .unwrap();
+    for migration in &MIGRATIONS[..5] {
+        owner.batch_execute(migration.sql).await.unwrap();
+        owner
+            .execute(
+                "INSERT INTO switchboard_audit.migrations (version, name) VALUES ($1, $2)",
+                &[&migration.version, &migration.name],
+            )
+            .await
+            .unwrap();
+    }
+    let failed = insert_row(&owner, &insert(&[])).await;
+    let set = "outcome = 'error'";
+    assert_eq!(complete_with(&owner, &failed, set).await.unwrap(), 1);
+    let succeeded = insert_row(&owner, &insert(&[])).await;
+    assert_eq!(complete(&owner, &succeeded, "ok").await.unwrap(), 1);
+    let refused = insert_row(&owner, &insert(&[])).await;
+    let set = "outcome = 'refused', outcome_sentence = 'No.'";
+    assert_eq!(complete_with(&owner, &refused, set).await.unwrap(), 1);
+    let open = insert_row(&owner, &insert(&[])).await;
+    let denial = insert_row(&owner, &denied()).await;
+    let before = rows_without_error_kind(&owner).await;
+
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6]);
+    assert_eq!(rows_without_error_kind(&owner).await, before);
+    for (id, kind) in [
+        (&failed, Some("before-0006")),
+        (&succeeded, None),
+        (&refused, None),
+        (&open, None),
+        (&denial, None),
+    ] {
+        let stored: Option<String> = owner
+            .query_one(
+                &format!("SELECT error_kind FROM switchboard_audit.call_rows WHERE id = '{id}'"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stored.as_deref(), kind, "{id}");
+    }
+    // The trigger that completes a row once is back on.
+    let error = complete(&owner, &failed, "error").await.unwrap_err();
+    assert!(message(&error).contains("is already complete"), "{error}");
+    assert_eq!(complete(&owner, &open, "error").await.unwrap(), 1);
 }

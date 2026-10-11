@@ -11,8 +11,8 @@
 use std::time::Duration;
 
 use gateway_core::audit::{
-    AuditRecord, AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RecordedResources,
-    RowKind,
+    AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome,
+    RecordedResources, RowKind,
 };
 use gateway_core::{Principal, PrincipalKind};
 use serde_json::{Value, json};
@@ -406,6 +406,7 @@ fn name_of<T: serde::Serialize>(value: &T) -> Result<String, PgAuditError> {
 pub(crate) struct FinishRow {
     pub outcome: &'static str,
     pub outcome_sentence: Option<String>,
+    pub error_kind: Option<&'static str>,
     pub latency_ms: i64,
 }
 
@@ -413,26 +414,28 @@ impl FinishRow {
     /// Completes a row that has no completion yet. Matches nothing when the row is missing or
     /// already complete; [`SELECT`](Self::SELECT) then says which.
     pub const UPDATE: &'static str = "UPDATE switchboard_audit.call_rows
-        SET outcome = $2, outcome_sentence = $3, latency_ms = $4
+        SET outcome = $2, outcome_sentence = $3, error_kind = $4, latency_ms = $5
         WHERE id = ($1::text)::uuid AND outcome IS NULL";
 
     /// The completion a row already has, read back with only the columns the gateway's role
     /// may select.
-    pub const SELECT: &'static str = "SELECT outcome, outcome_sentence, latency_ms
+    pub const SELECT: &'static str = "SELECT outcome, outcome_sentence, error_kind, latency_ms
         FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
 
     /// The columns for `completion`. Refuses a sentence holding U+0000, and a latency past the
     /// column's range, rather than write another value than the completion's.
     pub fn from_completion(completion: &Completion) -> Result<Self, PgAuditError> {
-        let outcome_sentence = match &completion.outcome {
-            Outcome::Refused { sentence } => Some(stored("outcome_sentence", sentence)?),
-            Outcome::Ok | Outcome::Error => None,
+        let (outcome_sentence, error_kind) = match &completion.outcome {
+            Outcome::Refused { sentence } => (Some(stored("outcome_sentence", sentence)?), None),
+            Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),
+            Outcome::Ok => (None, None),
         };
         let latency_ms = i64::try_from(completion.latency_ms)
             .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;
         Ok(Self {
             outcome: Self::outcome_of(completion),
             outcome_sentence,
+            error_kind,
             latency_ms,
         })
     }
@@ -441,20 +444,34 @@ impl FinishRow {
     pub fn outcome_of(completion: &Completion) -> &'static str {
         match completion.outcome {
             Outcome::Ok => "ok",
-            Outcome::Error => "error",
+            Outcome::Error { .. } => "error",
             Outcome::Refused { .. } => "refused",
         }
     }
 
-    /// Whether a completion read back from the row is this one.
+    /// The name the row gives an error's kind: the core's name for it.
+    pub fn error_kind_name(kind: ErrorKind) -> &'static str {
+        match kind {
+            ErrorKind::InvalidArguments => "invalid_arguments",
+            ErrorKind::OversizedOrLateRead => "oversized_or_late_read",
+            ErrorKind::CustodianRefusal => "custodian_refusal",
+            ErrorKind::VendorRefusal => "vendor_refusal",
+            ErrorKind::Other => "other",
+        }
+    }
+
+    /// Whether a completion read back from the row is this one: the same outcome, sentence,
+    /// error kind and latency.
     pub fn is(
         &self,
         outcome: &str,
         outcome_sentence: Option<&str>,
+        error_kind: Option<&str>,
         latency_ms: Option<i64>,
     ) -> bool {
         self.outcome == outcome
             && self.outcome_sentence.as_deref() == outcome_sentence
+            && self.error_kind == error_kind
             && Some(self.latency_ms) == latency_ms
     }
 }
@@ -936,10 +953,21 @@ mod tests {
             FinishRow {
                 outcome: "ok",
                 outcome_sentence: None,
+                error_kind: None,
                 latency_ms: 7
             }
         );
-        assert_eq!(finish(Outcome::Error).outcome, "error");
+        assert_eq!(
+            finish(Outcome::Error {
+                error_kind: ErrorKind::VendorRefusal
+            }),
+            FinishRow {
+                outcome: "error",
+                outcome_sentence: None,
+                error_kind: Some("vendor_refusal"),
+                latency_ms: 7
+            }
+        );
         assert_eq!(
             finish(Outcome::Refused {
                 sentence: "Not that one.".into()
@@ -947,9 +975,27 @@ mod tests {
             FinishRow {
                 outcome: "refused",
                 outcome_sentence: Some("Not that one.".into()),
+                error_kind: None,
                 latency_ms: 7
             }
         );
+    }
+
+    #[test]
+    fn each_error_kind_is_named_as_the_core_names_it() {
+        for kind in [
+            ErrorKind::InvalidArguments,
+            ErrorKind::OversizedOrLateRead,
+            ErrorKind::CustodianRefusal,
+            ErrorKind::VendorRefusal,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                FinishRow::error_kind_name(kind),
+                name_of(&kind).unwrap(),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -977,13 +1023,26 @@ mod tests {
         let row = FinishRow {
             outcome: "refused",
             outcome_sentence: Some("No.".into()),
+            error_kind: None,
             latency_ms: 4,
         };
-        assert!(row.is("refused", Some("No."), Some(4)));
-        assert!(!row.is("error", Some("No."), Some(4)));
-        assert!(!row.is("refused", Some("Other."), Some(4)));
-        assert!(!row.is("refused", None, Some(4)));
-        assert!(!row.is("refused", Some("No."), Some(5)));
-        assert!(!row.is("refused", Some("No."), None));
+        assert!(row.is("refused", Some("No."), None, Some(4)));
+        assert!(!row.is("error", Some("No."), None, Some(4)));
+        assert!(!row.is("refused", Some("Other."), None, Some(4)));
+        assert!(!row.is("refused", None, None, Some(4)));
+        assert!(!row.is("refused", Some("No."), Some("other"), Some(4)));
+        assert!(!row.is("refused", Some("No."), None, Some(5)));
+        assert!(!row.is("refused", Some("No."), None, None));
+
+        let error = FinishRow {
+            outcome: "error",
+            outcome_sentence: None,
+            error_kind: Some("vendor_refusal"),
+            latency_ms: 4,
+        };
+        assert!(error.is("error", None, Some("vendor_refusal"), Some(4)));
+        assert!(!error.is("error", None, Some("other"), Some(4)));
+        assert!(!error.is("error", None, Some("before-0006"), Some(4)));
+        assert!(!error.is("error", None, None, Some(4)));
     }
 }

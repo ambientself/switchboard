@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    AuditRowId, Completion, DecisionKind, ListRecord, Outcome, RecordedResources, RowCompletion,
-    RowKind, RowStart, StoreError,
+    AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome, RecordedResources,
+    RowCompletion, RowKind, RowStart, StoreError,
 };
 use gateway_core::{AuditRecord, AuditStore, BoxFuture, InstanceName};
 use gateway_identity::Clock;
@@ -349,8 +349,8 @@ impl State {
 /// Rows are kept under the identifier begin was given. A second begin with a known identifier
 /// writes nothing: it succeeds if the stored decision is the same, and fails if it differs. It
 /// compares the decision and nothing more, as the Postgres store can. A second finish
-/// succeeds if it is identical to the completion the row has, and otherwise fails and leaves
-/// the first completion standing.
+/// succeeds if it is identical to the completion the row has, an error's kind included, and
+/// otherwise fails and leaves the first completion standing.
 ///
 /// It refuses what the Postgres store's column mapping refuses, and writes nothing: an
 /// identifier that is not a UUID in the lowercase hyphenated form, a record handed to begin
@@ -695,8 +695,12 @@ impl AuditStore for InMemoryAuditStore {
                 }
             }
             if state.confirmation_lost.take() {
+                // As the Postgres store completes a lost begin's row, and the core gives up a
+                // guard: an error of the kind `other`.
                 let error = Completion {
-                    outcome: Outcome::Error,
+                    outcome: Outcome::Error {
+                        error_kind: ErrorKind::Other,
+                    },
                     latency_ms: 0,
                 };
                 // Only an allowed row is completed. A denial is refused, and a row completed

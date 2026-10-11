@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use gateway_core::{
-    BoxFuture, Connector, ConnectorName, CredentialSource, GroupId, PrincipalId, PrincipalKind,
-    Resource, Resources, TeamId, ToolCall, ToolOutcome,
+    BoxFuture, Connector, ConnectorName, CredentialSource, ErrorKind, GroupId, PrincipalId,
+    PrincipalKind, Resource, Resources, TeamId, ToolCall, ToolOutcome,
 };
 use serde_json::{Value, json};
 
@@ -308,13 +308,17 @@ impl Connector for FixtureConnector {
                 gate.wait().await;
             }
             if fail {
-                return ToolOutcome::Error("the fixture connector was told to fail".into());
+                return ToolOutcome::error(
+                    ErrorKind::Other,
+                    "the fixture connector was told to fail",
+                );
             }
             let credential = match self.credentials.credential_for(&connector, &caller).await {
                 Ok(handle) => handle.label().to_owned(),
                 Err(_) => {
-                    return ToolOutcome::Error(
-                        "the fixture connector could not get a credential".into(),
+                    return ToolOutcome::error(
+                        ErrorKind::Other,
+                        "the fixture connector could not get a credential",
                     );
                 }
             };
@@ -351,7 +355,10 @@ impl Connector for FixtureConnector {
                         None => ToolOutcome::Ok(echo(&tool, &arguments, &credential)),
                     }
                 }
-                _ => ToolOutcome::Error(format!("the fixture connector has no tool `{tool}`")),
+                _ => ToolOutcome::error(
+                    ErrorKind::Other,
+                    format!("the fixture connector has no tool `{tool}`"),
+                ),
             }
         })
     }

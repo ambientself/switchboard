@@ -250,12 +250,13 @@ async fn rows_under(admin: &Client, row: &AuditRowId) -> i64 {
     .await
 }
 
-/// The decision, outcome and latency of `row`, which must be stored.
+/// The decision, outcome and latency of `row`, which must be stored. An error's outcome is
+/// written with its kind, as `error:other`.
 async fn row_of(admin: &Client, row: &AuditRowId) -> (String, Option<String>, Option<i64>) {
     let stored = admin
         .query_one(
-            "SELECT decision, outcome, latency_ms FROM switchboard_audit.call_rows
-             WHERE id = ($1::text)::uuid",
+            "SELECT decision, outcome || coalesce(':' || error_kind, '') AS outcome, latency_ms
+             FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
             &[&row.as_str()],
         )
         .await
@@ -355,7 +356,7 @@ async fn a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_comp
     .await;
     assert_eq!(
         row_of(&admin, &row).await,
-        ("allow".to_owned(), Some("error".to_owned()), Some(0))
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0))
     );
     assert_eq!(rows_under(&admin, &row).await, 1);
     assert_eq!(store.finishes(), FinishCounts::default());
@@ -569,7 +570,7 @@ async fn shutdown_waits_for_a_lost_begins_completion() {
     .await;
     assert_eq!(
         row_of(&admin, &row).await,
-        ("allow".to_owned(), Some("error".to_owned()), Some(0))
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0))
     );
     assert_eq!(store.finishes(), FinishCounts::default());
     assert!(reports_of(&reports).is_empty());
@@ -650,7 +651,7 @@ async fn a_lost_confirmation_is_completed_whatever_a_later_attempt_finds() {
     .await;
     assert_eq!(
         row_of(&admin, &row).await,
-        ("allow".to_owned(), Some("error".to_owned()), Some(0))
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0))
     );
     assert_eq!(store.finishes(), FinishCounts::default());
     assert!(reports_of(&reports).is_empty());
@@ -764,7 +765,7 @@ async fn an_insert_whose_cancel_failed_and_that_commits_late_is_completed_as_err
     .await;
     assert_eq!(
         row_of(&admin, &row).await,
-        ("allow".to_owned(), Some("error".to_owned()), Some(0)),
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0)),
         "{:?} {:?}",
         store.finishes(),
         reports_of(&reports)
@@ -847,7 +848,7 @@ async fn a_missing_row_answer_held_past_the_deadline_leaves_the_attempt_at_the_d
     .await;
     assert_eq!(
         row_of(&admin, &row).await,
-        ("allow".to_owned(), Some("error".to_owned()), Some(0)),
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0)),
         "{:?} {:?}",
         store.finishes(),
         reports_of(&reports)
@@ -913,7 +914,7 @@ async fn an_insert_that_commits_between_an_attempts_update_and_its_select_is_com
     .await;
     assert_eq!(
         row_of(&admin, &row).await,
-        ("allow".to_owned(), Some("error".to_owned()), Some(0)),
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0)),
         "{:?} {:?}",
         store.stats(),
         reports_of(&reports)

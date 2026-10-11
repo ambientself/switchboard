@@ -12,8 +12,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use gateway_core::audit::{
-    self, Answer, Begun, Completion, DecisionKind, Outcome, RecordedResource, RecordedResources,
-    RequestMetadata,
+    self, Answer, Begun, Completion, DecisionKind, ErrorKind, Outcome, RecordedResource,
+    RecordedResources, RequestMetadata,
 };
 use gateway_core::{
     CallContext, Classification, IDENTITY_FAILURE, ReasonKind, RequestedTool, decide,
@@ -607,7 +607,9 @@ fn a_connector_error_and_a_refused_credential_are_recorded_as_errors() {
     );
     assert_eq!(
         gateway.store.row(0).unwrap().completion.map(|c| c.outcome),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
 
     gateway.credentials.refuse_next();
@@ -624,7 +626,9 @@ fn a_connector_error_and_a_refused_credential_are_recorded_as_errors() {
     );
     assert_eq!(
         gateway.store.row(1).unwrap().completion.map(|c| c.outcome),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
     assert!(
         gateway.connector.writes().is_empty(),
