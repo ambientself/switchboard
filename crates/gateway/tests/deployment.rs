@@ -325,15 +325,57 @@ fn an_issuer_takes_exactly_one_place_for_its_keys() {
     );
     assert!(said.contains("not a valid deployment file"), "{said}");
 
-    // A token or CA file for fetching the keys is not taken yet (issue #88).
-    for field in ["keys_token_file", "keys_ca_file"] {
+    // A CA file and a token file belong to a keys URL too.
+    for field in ["keys_ca_file", "keys_token_file"] {
         let said = refused(
-            &format!("keys-{field}"),
+            &format!("keys-file-{field}"),
             KEYS_FILE,
-            &format!("{url}{field} = \"token\"\n"),
+            &format!("{KEYS_FILE}{field} = \"issuer-file\"\n"),
         );
-        assert!(said.contains(&format!("unknown field `{field}`")), "{said}");
+        assert_eq!(
+            said,
+            format!(
+                "issuer `{CLUSTER_ISSUER}` has `{field}`, which only an issuer with `keys_url` \
+                 takes"
+            )
+        );
     }
+}
+
+#[test]
+fn a_keys_url_takes_a_ca_file_and_a_token_file_read_from_the_deployment_files_directory() {
+    let url = "keys_url = \"https://kubernetes.default.svc.cluster.local/openid/v1/jwks\"\n";
+    let files = files("keys-fetch-files");
+    let text = deployment_file("[audit]\nmode = \"disabled\"\n").replace(
+        KEYS_FILE,
+        &format!("{url}keys_ca_file = \"issuer/ca.pem\"\nkeys_token_file = \"issuer/token\"\n"),
+    );
+    files.write("gateway.toml", &text);
+    let loaded = files.load();
+    let keys_url = &loaded.keys_urls[0];
+    assert_eq!(keys_url.ca_file, Some(files.path("issuer/ca.pem")));
+    assert_eq!(keys_url.token_file, Some(files.path("issuer/token")));
+    // Neither file is read until the gateway starts, and the token not until it fetches.
+    assert!(!files.path("issuer").exists());
+
+    // Absolute paths are kept as they are.
+    let text = deployment_file("[audit]\nmode = \"disabled\"\n").replace(
+        KEYS_FILE,
+        &format!(
+            "{url}keys_ca_file = \"/etc/switchboard/ca.pem\"\nkeys_token_file = \"/run/secrets/token\"\n"
+        ),
+    );
+    files.write("gateway.toml", &text);
+    let loaded = files.load();
+    let keys_url = &loaded.keys_urls[0];
+    assert_eq!(keys_url.ca_file, Some("/etc/switchboard/ca.pem".into()));
+    assert_eq!(keys_url.token_file, Some("/run/secrets/token".into()));
+
+    // Both are optional here; the gateway refuses an https keys URL with no CA file when it
+    // starts.
+    let loaded = load_edited("keys-no-fetch-files", KEYS_FILE, url).unwrap();
+    assert_eq!(loaded.keys_urls[0].ca_file, None);
+    assert_eq!(loaded.keys_urls[0].token_file, None);
 }
 
 #[test]
