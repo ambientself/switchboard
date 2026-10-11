@@ -9,11 +9,14 @@
 //! [`prepare`] reads the registry file. Before anything else, it refuses the identity and audit
 //! opt-outs outside a development build, and runs the receipt-store gate (decision 0014,
 //! section 4), so that a refusal of either comes before any connection is made. Then it loads
-//! each proxied server's credential, builds a [`ProxyConnector`] per server, fetches the keys
-//! of each issuer configured with a keys URL, connects the Postgres audit store and runs its
+//! each proxied server's credential, builds a [`ProxyConnector`] per server with the deadline
+//! and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each in a
+//! [`Bulkhead`] holding it to the caps of `[limits]`, fetches the keys of each issuer
+//! configured with a keys URL, connects the Postgres audit store and runs its
 //! boot checks (or, in a development build, takes audit as explicitly disabled), and then runs
 //! the boot gates ([`boot::check_registry`]). Any failure refuses to start, naming the reason,
-//! before anything is served.
+//! before anything is served. A `[servers.<name>]` for a server the registry does not name is
+//! refused: a bound meant for a server that is not there would be one nobody holds.
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
 //! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
@@ -29,6 +32,8 @@
 //! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
 //! left open and not only by querying for it (decision 0009).
+//!
+//! It logs a boot line for the caps on calls in flight, and one for each server's bounds.
 //!
 //! It logs a boot line for metrics too: the address `GET /metrics` will be served on, or that
 //! none is, since `[metrics]` is optional. [`Prepared::metrics`] carries the address to the
@@ -51,8 +56,9 @@ use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles}
 use thiserror::Error;
 
 use crate::boot::{self, BootError, Gates, Settings, Wiring};
+use crate::bulkhead::{Bulkhead, ProxiedSignals};
 use crate::config::{IdentitySection, IssuerKindEntry};
-use crate::deployment::{AuditChoice, Deployment, KeysUrl};
+use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
 use crate::keys::KeyRefresher;
 use crate::reload::Reloader;
 
@@ -96,6 +102,12 @@ pub enum StartError {
         /// Its credential reference.
         reference: String,
     },
+    /// The deployment file sets bounds for a server the registry does not name.
+    #[error(
+        "`[servers.{0}]` sets bounds for a server the registry does not name; remove it, or \
+         name a server the registry has"
+    )]
+    UnknownServerLimits(ConnectorName),
     /// A credential file is given that no server uses.
     #[error("credential `{0}` is given a file in `[credentials]` but no server uses it")]
     UnusedCredential(String),
@@ -150,6 +162,10 @@ pub struct Prepared {
     pub keys: KeyRefresher,
     /// Where to serve metrics, or `None` when the deployment file has no `[metrics]`.
     pub metrics: Option<SocketAddr>,
+    /// How many requests may be in flight in this instance, which the HTTP server holds it to.
+    pub max_in_flight: usize,
+    /// What each proxied server's bulkhead counts, for the metrics.
+    pub proxied: ProxiedSignals,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -160,7 +176,8 @@ impl std::fmt::Debug for Prepared {
             .field("watch", &self.watch)
             .field("keys", &self.keys)
             .field("metrics", &self.metrics)
-            .finish()
+            .field("max_in_flight", &self.max_in_flight)
+            .finish_non_exhaustive()
     }
 }
 
@@ -236,8 +253,14 @@ async fn prepare_with(
     )?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
-    let mut wiring =
-        proxied(&registry, &credentials, Wiring::new(clock))?.instance(instance.clone());
+    let (wiring, proxied_signals) = proxied(
+        &registry,
+        &credentials,
+        &deployment.limits,
+        &deployment.servers,
+        Wiring::new(clock),
+    )?;
+    let mut wiring = wiring.instance(instance.clone());
 
     let mut identity = deployment.identity;
     let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;
@@ -307,6 +330,23 @@ async fn prepare_with(
     } else {
         tracing::warn!(event = "boot", audit = "disabled", "audit is disabled");
     }
+    let limits = deployment.limits;
+    tracing::info!(
+        event = "boot",
+        max_in_flight = limits.max_in_flight,
+        per_server_in_flight = limits.per_server_in_flight,
+        per_team_per_server_in_flight = limits.per_team_per_server_in_flight,
+        "calls in flight are capped in this instance, per server and per team per server"
+    );
+    for (server, bounds) in &deployment.servers {
+        tracing::info!(
+            event = "boot",
+            server = server.as_str(),
+            deadline_seconds = bounds.deadline.as_secs(),
+            max_result_bytes = bounds.max_result_bytes,
+            "the server's calls have the bounds the deployment file sets"
+        );
+    }
     match deployment.metrics {
         Some(address) => tracing::info!(
             event = "boot",
@@ -346,19 +386,34 @@ async fn prepare_with(
         },
         keys,
         metrics: deployment.metrics,
+        max_in_flight: limits.max_in_flight,
+        proxied: proxied_signals,
     })
 }
 
-/// `wiring` with a [`ProxyConnector`] for each of the registry's servers, each given the call
-/// deadline its connector was built with, which every row of its calls includes in its
-/// deadline.
+/// `wiring` with a [`ProxyConnector`] for each of the registry's servers, built with the bounds
+/// `servers` sets for it or the defaults, in a [`Bulkhead`] holding it to `limits`. Each is
+/// given the call deadline its connector was built with, which every row of its calls
+/// includes in its deadline. Refuses bounds for a server the registry does not name.
 fn proxied(
     registry: &Registry,
     credentials: &Arc<FileCredentials>,
+    limits: &Limits,
+    servers: &BTreeMap<ConnectorName, ServerLimits>,
     mut wiring: Wiring,
-) -> Result<Wiring, StartError> {
+) -> Result<(Wiring, ProxiedSignals), StartError> {
+    if let Some(unknown) = servers
+        .keys()
+        .find(|name| !registry.servers().contains_key(*name))
+    {
+        return Err(StartError::UnknownServerLimits(unknown.clone()));
+    }
+    let mut signals = BTreeMap::new();
     for server in registry.servers().values() {
+        let bounds = servers.get(&server.name).copied().unwrap_or_default();
         let mut upstream = Upstream::new(server.name.clone(), server.address.clone());
+        upstream.deadline = bounds.deadline;
+        upstream.max_response_bytes = bounds.max_result_bytes;
         for (tool, route) in registry.routes() {
             if route.server == server.name {
                 upstream = upstream.tool(tool.clone(), route.upstream_name.clone());
@@ -366,11 +421,18 @@ fn proxied(
         }
         let deadline = upstream.deadline;
         let connector = ProxyConnector::new(upstream, credentials.clone())?;
+        let bulkhead = Bulkhead::new(
+            server.name.clone(),
+            Arc::new(connector),
+            limits.per_server_in_flight,
+            limits.per_team_per_server_in_flight,
+        );
+        signals.insert(server.name.clone(), bulkhead.signals());
         wiring = wiring
-            .proxied(server.name.clone(), Arc::new(connector))
+            .proxied(server.name.clone(), Arc::new(bulkhead))
             .call_deadline(server.name.clone(), deadline);
     }
-    Ok(wiring)
+    Ok((wiring, ProxiedSignals::new(signals)))
 }
 
 /// An issuer's key source, with how often to fetch again and how many keys its first fetch
@@ -527,14 +589,17 @@ mod tests {
         }
     }
 
-    /// Each proxied server's connector deadline reaches the wiring, which gives it to every row
-    /// of that server's calls. The boot gates' own fallback for a server given none is the same
-    /// value today, so a row's deadline could not tell this wiring from its absence.
-    #[test]
-    fn each_proxied_server_is_wired_with_the_deadline_its_connector_was_built_with() {
+    /// The wiring of the boot test registry's one server, `mock-docs`, with `servers` as the
+    /// deployment file's bounds.
+    fn wired(
+        name: &str,
+        servers: &BTreeMap<ConnectorName, ServerLimits>,
+    ) -> Result<Wiring, StartError> {
         let registry = crate::boot::tests::registry("read", true);
-        let directory =
-            std::env::temp_dir().join(format!("switchboard-start-deadline-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "switchboard-start-deadline-{name}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&directory).unwrap();
         let credential = directory.join("docs-credential");
         std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
@@ -544,15 +609,56 @@ mod tests {
         let wiring = proxied(
             &registry,
             &credentials,
+            &Limits::default(),
+            servers,
             Wiring::new(Arc::new(gateway_identity::SystemClock)),
         );
         std::fs::remove_dir_all(&directory).unwrap();
+        wiring.map(|(wiring, _)| wiring)
+    }
+
+    /// Each proxied server's connector deadline reaches the wiring, which gives it to every row
+    /// of that server's calls: the default, or the one its entry in the deployment file sets.
+    /// The boot gates' own fallback for a server given none is the default, so only a deadline
+    /// set in the file tells this wiring from its absence.
+    #[test]
+    fn each_proxied_server_is_wired_with_the_deadline_its_connector_was_built_with() {
         assert_eq!(
-            wiring.unwrap().call_deadlines(),
+            wired("default", &BTreeMap::new()).unwrap().call_deadlines(),
             &BTreeMap::from([(
                 ConnectorName::new("mock-docs"),
                 connector_proxy::DEFAULT_DEADLINE
             )])
+        );
+        let set = BTreeMap::from([(
+            ConnectorName::new("mock-docs"),
+            ServerLimits {
+                deadline: Duration::from_secs(17),
+                max_result_bytes: 1000,
+            },
+        )]);
+        assert_eq!(
+            wired("set", &set).unwrap().call_deadlines(),
+            &BTreeMap::from([(ConnectorName::new("mock-docs"), Duration::from_secs(17))])
+        );
+    }
+
+    /// Bounds for a server the registry does not name refuse the start, naming it.
+    #[test]
+    fn bounds_for_a_server_the_registry_lacks_are_refused() {
+        let servers = BTreeMap::from([
+            (ConnectorName::new("mock-docs"), ServerLimits::default()),
+            (ConnectorName::new("mock-dcos"), ServerLimits::default()),
+        ]);
+        let refused = wired("unknown", &servers).unwrap_err();
+        assert!(
+            matches!(&refused, StartError::UnknownServerLimits(name) if name.as_str() == "mock-dcos"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "`[servers.mock-dcos]` sets bounds for a server the registry does not name; remove \
+             it, or name a server the registry has"
         );
     }
 
@@ -654,6 +760,8 @@ mod tests {
             keys_urls,
             audit,
             metrics: None,
+            limits: Limits::default(),
+            servers: BTreeMap::new(),
             credentials: BTreeMap::from([("docs-credential".to_owned(), credential)]),
         }
     }
