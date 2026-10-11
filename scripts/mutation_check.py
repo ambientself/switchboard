@@ -3457,6 +3457,9 @@ mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kub
        """    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)\n""")
 mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
        "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
+# #60: the operator checks read the RBAC rules bound to each team's workload too.
+mutate("demo-operator-rbac-unchecked", "the operator checks ask can-i and reviews alone, which cannot see a rule limited by resourceNames", DRIVER,
+       "  done\n  operator_rbac\n}\n", "  done\n}\n")
 mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whichever pod the Deployment's log picks", DRIVER,
        ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
@@ -3532,6 +3535,31 @@ mutate("route-check-version-json-unchecked", "a version read of two objects is r
        """ && json_object "$version" &&""", " &&")
 mutate("route-check-node-json-unchecked", "a node read of two objects is read as the last", ROUTE_CHECK,
        """ && json_object "$node" &&""", " &&")
+# #60: the RBAC rules bound to the workload, whatever their resourceNames (rbac-match.jq, which
+# demo.sh's operator checks run too).
+RBAC_MATCH = "deploy/route-check/rbac-match.jq"
+mutate("route-check-resource-names-ignored", "a rule limited by resourceNames grants nothing, as a review sees it", RBAC_MATCH,
+       "def grants($row):\n  .resources != []\n", "def grants($row):\n  .resources != [] and .resourceNames == []\n")
+mutate("route-check-group-subjects-ignored", "a binding to the ServiceAccount's groups does not count", RBAC_MATCH,
+       """      or (.kind == "Group" and (.name as $group | any($groups[]; . == $group))))\n""", "      or false)\n")
+mutate("route-check-wildcards-ignored", "a verb, group or resource of * matches nothing", RBAC_MATCH,
+       """def named($want): . == $want or . == "*";""", "def named($want): . == $want;")
+mutate("route-check-clusterrole-via-rolebinding-ignored", "a RoleBinding to a ClusterRole grants nothing", RBAC_MATCH,
+       """rules: (if $ref.kind == "ClusterRole" then""", """rules: (if $ref.kind == "ClusterRole" and $kind == "ClusterRoleBinding" then""")
+mutate_all("route-check-binding-rows-dropped", "updating and patching a binding are gone from the permissions list",
+           ("deploy/route-check/permissions.tsv",
+            "update\trolebindings.rbac.authorization.k8s.io\t-\tnamespaced\npatch\trolebindings.rbac.authorization.k8s.io\t-\tnamespaced\n", ""),
+           ("deploy/route-check/permissions.tsv",
+            "update\tclusterrolebindings.rbac.authorization.k8s.io\t-\tcluster\npatch\tclusterrolebindings.rbac.authorization.k8s.io\t-\tcluster\n", ""))
+mutate_all("route-check-rbac-unread-list-skipped", "an RBAC list the step cannot read counts as empty",
+           (ROUTE_CHECK,
+            """        fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what in $ns"\n        return\n""",
+            """        continue\n"""),
+           (ROUTE_CHECK,
+            """      fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what"\n      return\n""",
+            """      continue\n"""),
+           (RBAC_MATCH,
+            """    | if length == 0 then unreadable(""", """    | if length == 0 then [] elif false then unreadable("""))
 
 # The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
 # tests/route_check.rs.
