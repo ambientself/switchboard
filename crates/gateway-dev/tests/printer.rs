@@ -6,9 +6,12 @@ mod support;
 
 use gateway_dev::{Options, start_fixture_gateway_with};
 use gateway_mcp::DENIAL_CODE;
-use gateway_testkit::{Caller, READ_TOOL, SURFACE_READ, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT};
+use gateway_testkit::{
+    Caller, FORBIDDEN_DOCUMENT, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_READ,
+    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
+};
 use serde_json::{Value, json};
-use support::{Lines, legacy, post};
+use support::{AUDIT_FAILURE, Lines, legacy, post};
 
 /// Whether `id` is a UUIDv7 as the gateway writes one: lowercase and hyphenated, with version
 /// 7 and the RFC 9562 variant.
@@ -22,11 +25,15 @@ fn is_uuid_v7(id: &str) -> bool {
         && groups[3].starts_with(['8', '9', 'a', 'b'])
 }
 
-fn read(document: &str) -> Value {
+fn call(tool: &str, document: &str) -> Value {
     legacy(
         "tools/call",
-        json!({"name": READ_TOOL, "arguments": {"document": document}}),
+        json!({"name": tool, "arguments": {"document": document}}),
     )
+}
+
+fn read(document: &str) -> Value {
+    call(READ_TOOL, document)
 }
 
 #[tokio::test]
@@ -130,6 +137,39 @@ async fn a_finish_that_fails_is_printed_and_the_answer_stands() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["result"]["isError"], json!(false), "{body}");
     assert_eq!(gateway.store().rows()[0].completion, None);
+    let printed = lines.json();
+    let events: Vec<&Value> = printed.iter().map(|line| &line["audit"]).collect();
+    assert_eq!(events, [&json!("begun"), &json!("finish_failed")]);
+    assert_eq!(
+        printed[1]["row"], printed[0]["row"],
+        "the failed finish names the row begin wrote"
+    );
+}
+
+/// A refusal whose finish fails gets the audit sentence, so the store's failure must reach the
+/// gateway through the printer. A read that succeeds answers the same either way.
+#[tokio::test]
+async fn a_finish_that_fails_is_passed_on_as_a_failure() {
+    let lines = Lines::default();
+    let gateway =
+        start_fixture_gateway_with(Options::new().print_audit_to(Box::new(lines.clone())))
+            .await
+            .unwrap();
+    gateway.store().fail_next_finish();
+    let token = gateway.token(Caller::TeamA);
+    let (status, body) = post(
+        &gateway.url(SURFACE_READ),
+        Some(&token),
+        &call(SCOPED_READ_TOOL, FORBIDDEN_DOCUMENT),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["error"]["code"], json!(DENIAL_CODE), "{body}");
+    assert_eq!(body["error"]["message"], json!(AUDIT_FAILURE), "{body}");
+    assert_ne!(body["error"]["message"], json!(SCOPE_REFUSAL), "{body}");
+    assert_eq!(gateway.store().rows()[0].completion, None);
+    assert_eq!(gateway.connector().received().len(), 1);
     let printed = lines.json();
     let events: Vec<&Value> = printed.iter().map(|line| &line["audit"]).collect();
     assert_eq!(events, [&json!("begun"), &json!("finish_failed")]);
