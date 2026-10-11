@@ -6,13 +6,14 @@
 # SubjectAccessReviews, which cover authorizers other than RBAC.
 #
 #   jq -n -r --rawfile permissions permissions.tsv --arg namespace NS --arg name NAME \
-#     --argjson namespaces '["NS", ...]' -f rbac-match.jq <LISTS
+#     -f rbac-match.jq <LISTS
 #
-# LISTS is a stream of objects {what, namespace, list}: `list` is what `kubectl get WHAT -o json`
-# printed, `what` is clusterroles, clusterrolebindings, roles or rolebindings, and `namespace` is
-# the namespace a Role or RoleBinding list was read in ("" for the cluster's). It needs exactly
-# one ClusterRole list, one ClusterRoleBinding list, and one Role and one RoleBinding list for
-# each of $namespaces. Lists for other namespaces are not counted.
+# LISTS is a stream of objects {what, list}: `what` is clusterroles, clusterrolebindings, roles
+# or rolebindings, and `list` is what `kubectl get WHAT -o json` printed, with `-A` for roles and
+# rolebindings: the Roles and RoleBindings of every namespace, each item naming its own. It needs
+# exactly one list of each. A RoleBinding in any namespace can bind the ServiceAccount or its
+# groups, in kube-system, in default or in another team's namespace as well as in its own, and a
+# SubjectAccessReview asked across the cluster counts none of them, so none is left unread.
 #
 # A binding counts when a subject is the ServiceAccount NAME in NS (kind ServiceAccount, or User
 # system:serviceaccount:NS:NAME) or one of its groups (system:serviceaccounts,
@@ -24,8 +25,8 @@
 # `*`, and its resources `res` (for a row with no subresource), `res/sub`, `*` or `*/sub` (for a
 # row with one), as the API server matches them. Its resourceNames are not read: a rule limited
 # to one name still grants the row. A rule of nonResourceURLs names no resource and grants no
-# row. A `namespaced` row counts the RoleBindings in $namespaces and the ClusterRoleBindings; a
-# `cluster` row counts only the ClusterRoleBindings.
+# row. A `namespaced` row counts the RoleBindings in every namespace, each for the rows it grants
+# in its own, and the ClusterRoleBindings; a `cluster` row counts only the ClusterRoleBindings.
 #
 # It prints one line per row, tab-separated: `PASS`, the row and what was read; or `FAIL`, the
 # row and each binding and rule that grants it. A list that is missing, repeated, or not a list
@@ -48,6 +49,12 @@ def items_of($what):
 def name_of($what):
   if (.metadata | type) == "object" and (.metadata.name | type) == "string" then .metadata.name
   else unreadable("the \($what): an item has no name") end;
+
+# A Role's or RoleBinding's namespace, which a list of every namespace gives each item.
+def namespace_of($what):
+  if (.metadata | type) == "object" and (.metadata.namespace | type) == "string" and .metadata.namespace != ""
+  then .metadata.namespace
+  else unreadable("the \($what): an item has no namespace") end;
 
 # A role's rules, each with its lists read.
 def rules_of($what):
@@ -108,21 +115,19 @@ def subject_for($bns):
   // null;
 
 [inputs] as $read
-| (if ($namespaces | type) == "array" and ($namespaces | length) > 0 and all($namespaces[]; type == "string")
-   then $namespaces else error("no namespaces to read") end) as $asked
-# The one list read for WHAT in NS.
-| def list($what; $ns):
-    [$read[] | select(.what == $what and (.namespace // "") == $ns)]
-    | if length == 0 then unreadable("the \($what)\(if $ns == "" then "" else " in \($ns)" end): not given")
-      elif length > 1 then unreadable("the \($what)\(if $ns == "" then "" else " in \($ns)" end): given twice")
-      else .[0].list | items_of("\($what)\(if $ns == "" then "" else " in \($ns)" end)") end;
-  (list("clusterroles"; "") | map({key: name_of("ClusterRoles"), value: rules_of("ClusterRole \(.metadata.name)")}) | from_entries) as $clusterroles
-| ([$asked[] as $ns | {key: $ns, value: (list("roles"; $ns)
-      | map({key: name_of("Roles in \($ns)"), value: rules_of("Role \($ns)/\(.metadata.name)")}) | from_entries)}]
-   | from_entries) as $roles
+# The one list read for WHAT.
+| def list($what):
+    [$read[] | select(.what == $what)]
+    | if length == 0 then unreadable("the \($what): not given")
+      elif length > 1 then unreadable("the \($what): given twice")
+      else .[0].list | items_of($what) end;
+  (list("clusterroles") | map({key: name_of("ClusterRoles"), value: rules_of("ClusterRole \(.metadata.name)")}) | from_entries) as $clusterroles
+# The Roles by namespace, then by name.
+| (reduce (list("roles")[] | {ns: namespace_of("Roles"), name: name_of("Roles"), role: .}) as $r
+     ({}; .[$r.ns][$r.name] = ($r.role | rules_of("Role \($r.ns)/\($r.name)")))) as $roles
 # Every binding to the ServiceAccount or its groups, with the rules of the role it binds.
-| ([(list("clusterrolebindings"; "")[] | {kind: "ClusterRoleBinding", namespace: "", item: .}),
-    ($asked[] as $ns | list("rolebindings"; $ns)[] | {kind: "RoleBinding", namespace: $ns, item: .})]
+| ([(list("clusterrolebindings")[] | {kind: "ClusterRoleBinding", namespace: "", item: .}),
+    (list("rolebindings")[] | {kind: "RoleBinding", namespace: namespace_of("RoleBindings"), item: .})]
    | map(.kind as $kind | .namespace as $bns
        | (.item | name_of("\($kind)s")) as $bname
        | (if $bns == "" then $bname else "\($bns)/\($bname)" end) as $where
@@ -132,7 +137,7 @@ def subject_for($bns):
        | {binding: "\($kind) \($where)", subject: $subject, cluster: ($kind == "ClusterRoleBinding"),
           role: "\($ref.kind) \($ref.name)",
           rules: (if $ref.kind == "ClusterRole" then $clusterroles[$ref.name] // []
-                  elif $ref.kind == "Role" and $bns != "" then $roles[$bns][$ref.name] // []
+                  elif $ref.kind == "Role" and $bns != "" then ($roles[$bns] // {})[$ref.name] // []
                   else [] end)})) as $bindings
 | rows[] as $row
 | [$bindings[] | select($row.namespaced or .cluster) | . as $b
@@ -141,7 +146,7 @@ def subject_for($bns):
      + (if .resourceNames == [] then "" else ", for resourceNames \(.resourceNames | join(","))" end)]
   | unique as $granted
 | if $granted == [] then
-    "PASS\t\($row.label)\t" + (if $row.namespaced then "RoleBindings in \($asked | join(",")), and ClusterRoleBindings" else "ClusterRoleBindings" end)
+    "PASS\t\($row.label)\t" + (if $row.namespaced then "RoleBindings in every namespace, and ClusterRoleBindings" else "ClusterRoleBindings" end)
   else
     "FAIL\t\($row.label)\t\($granted | join("; "))"
   end

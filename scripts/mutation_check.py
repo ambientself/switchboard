@@ -3460,6 +3460,8 @@ mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot a
 # #60: the operator checks read the RBAC rules bound to each team's workload too.
 mutate("demo-operator-rbac-unchecked", "the operator checks ask can-i and reviews alone, which cannot see a rule limited by resourceNames", DRIVER,
        "  done\n  operator_rbac\n}\n", "  done\n}\n")
+mutate("demo-operator-rbac-other-namespaces-unread", "the operator checks read the Roles and RoleBindings in the gateway's namespace only, not in every namespace", DRIVER,
+       """    if ! list=$(k get "$what" -A -o json) ||\n""", """    if ! list=$(k get "$what" -n switchboard -o json) ||\n""")
 mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whichever pod the Deployment's log picks", DRIVER,
        ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
@@ -3553,13 +3555,20 @@ mutate_all("route-check-binding-rows-dropped", "updating and patching a binding 
             "update\tclusterrolebindings.rbac.authorization.k8s.io\t-\tcluster\npatch\tclusterrolebindings.rbac.authorization.k8s.io\t-\tcluster\n", ""))
 mutate_all("route-check-rbac-unread-list-skipped", "an RBAC list the step cannot read counts as empty",
            (ROUTE_CHECK,
-            """        fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what in $ns"\n        return\n""",
-            """        continue\n"""),
+            """      fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what in every namespace"\n      return\n""",
+            """      continue\n"""),
            (ROUTE_CHECK,
             """      fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what"\n      return\n""",
             """      continue\n"""),
            (RBAC_MATCH,
             """    | if length == 0 then unreadable(""", """    | if length == 0 then [] elif false then unreadable("""))
+# A RoleBinding outside the workload's, the gateway's and the servers' namespaces binds the
+# ServiceAccount too, and no review counts it.
+mutate("route-check-rbac-other-namespaces-unread", "the Roles and RoleBindings are read in the workload's namespace only, not in every namespace", ROUTE_CHECK,
+       """    if ! list=$(k get "$what" -A -o json) || ! json_object "$list" ||\n""",
+       """    if ! list=$(k get "$what" -n "$NAMESPACE" -o json) || ! json_object "$list" ||\n""")
+mutate("route-check-rbac-role-any-namespace", "a RoleBinding binds a Role of that name in any namespace, not only its own", RBAC_MATCH,
+       """then ($roles[$bns] // {})[$ref.name] // []""", """then ([$roles[]] | add // {})[$ref.name] // []""")
 
 # The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
 # tests/route_check.rs.

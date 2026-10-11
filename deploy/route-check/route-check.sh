@@ -26,9 +26,10 @@
 #       permissions.tsv, in the workload's, the gateway's and each server's namespace, and across
 #       the cluster. The reviews are SubjectAccessReview objects created with `kubectl create`,
 #       so the step needs no impersonation. Then, from the ClusterRoles, the ClusterRoleBindings,
-#       and the Roles and RoleBindings in those namespaces, that no RBAC rule bound to the
+#       and the Roles and RoleBindings in every namespace, that no RBAC rule bound to the
 #       ServiceAccount or its groups grants a row, whatever its resourceNames (rbac-match.jq,
-#       #60). A review names no resource, so it cannot see a rule limited to one name;
+#       #60). A review names no resource, so it cannot see a rule limited to one name, and one
+#       asked across the cluster counts no RoleBinding in any namespace;
 #   (d) the cloud identity annotations on the ServiceAccount. They are recorded for the owner to
 #       check and never fail the run;
 #   (e) the probe: route-probe.sh in --probe-image, started with `kubectl debug` as an ephemeral
@@ -616,32 +617,32 @@ permissions() {
 
 # rbac_rules: the RBAC rules bound to the ServiceAccount or its groups, read from the objects
 # themselves, against every row of permissions.tsv, whatever their resourceNames. The matcher is
-# rbac-match.jq, which demo.sh's operator checks run too. A list it cannot read or parse fails
-# the step, and nothing is matched against the rest.
+# rbac-match.jq, which demo.sh's operator checks run too. The Roles and RoleBindings are read in
+# every namespace, not only in the three the reviews ask about: a RoleBinding in kube-system, in
+# default or in another team's namespace can bind the ServiceAccount or its groups too, and a
+# review asked across the cluster counts none. A list it cannot read or parse fails the step,
+# and nothing is matched against the rest.
 rbac_rules() {
   step "(c) the RBAC rules bound to $SA, whatever their resourceNames (permissions.tsv)"
-  local namespaces lists=$TMP/rbac-lists.jsonl what ns list verdicts verdict row detail why
-  namespaces=$(asked_namespaces)
+  local lists=$TMP/rbac-lists.jsonl what list verdicts verdict row detail why
   : >"$lists"
   # Each read is one JSON object, or the step fails as could not read.
   for what in clusterroles clusterrolebindings; do
     if ! list=$(k get "$what" -o json) || ! json_object "$list" ||
-      ! jq -c --arg what "$what" '{what: $what, namespace: "", list: .}' <<<"$list" >>"$lists"; then
+      ! jq -c --arg what "$what" '{what: $what, list: .}' <<<"$list" >>"$lists"; then
       fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what"
       return
     fi
   done
-  for ns in $(jq -r '.[]' <<<"$namespaces"); do
-    for what in roles rolebindings; do
-      if ! list=$(k get "$what" -n "$ns" -o json) || ! json_object "$list" ||
-        ! jq -c --arg what "$what" --arg ns "$ns" '{what: $what, namespace: $ns, list: .}' <<<"$list" >>"$lists"; then
-        fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what in $ns"
-        return
-      fi
-    done
+  for what in roles rolebindings; do
+    if ! list=$(k get "$what" -A -o json) || ! json_object "$list" ||
+      ! jq -c --arg what "$what" '{what: $what, list: .}' <<<"$list" >>"$lists"; then
+      fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what in every namespace"
+      return
+    fi
   done
   if ! verdicts=$(jq -n -r --rawfile permissions "$PERMISSIONS" --arg namespace "$NAMESPACE" \
-    --arg name "$SA_NAME" --argjson namespaces "$namespaces" -f "$RBAC_MATCH" <"$lists" 2>"$TMP/rbac-match.err"); then
+    --arg name "$SA_NAME" -f "$RBAC_MATCH" <"$lists" 2>"$TMP/rbac-match.err"); then
     why=$(head -n 1 "$TMP/rbac-match.err" | sed 's/^jq: error ([^)]*): //')
     fail "$SA is bound to no RBAC rule for a row of control 1: ${why:-rbac-match.jq failed}"
     return

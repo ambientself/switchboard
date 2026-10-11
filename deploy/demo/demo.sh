@@ -800,8 +800,8 @@ sar_no() {
 #
 # A can-i names no resource, so it cannot see a rule limited by resourceNames: a workload able
 # to mint tokens for one named ServiceAccount answers no. So the checks also read the RBAC rules
-# bound to each team's workload with deploy/route-check/rbac-match.jq, the matcher the route
-# check's operator step runs (operator_rbac).
+# bound to each team's workload, in every namespace, with deploy/route-check/rbac-match.jq,
+# the matcher the route check's operator step runs (operator_rbac).
 operator_checks() {
   local rows team verb resource subresource scope ns
   if ! rows=$(awk -F'\t' '/^#/ || NF == 0 { next }
@@ -827,36 +827,35 @@ operator_checks() {
 
 # operator_rbac: for each team's workload, that no RBAC rule bound to its ServiceAccount or its
 # groups grants a row of permissions.tsv, whatever its resourceNames. It reads the ClusterRoles,
-# the ClusterRoleBindings, and the Roles and RoleBindings in mock-docs, the gateway's namespace
-# and each team's, and runs rbac-match.jq for each team over its own three. A list that cannot
-# be read or parsed fails the step, and nothing is matched.
+# the ClusterRoleBindings, and the Roles and RoleBindings in every namespace, and runs
+# rbac-match.jq for each team. Every namespace, not only mock-docs, the gateway's and the team's:
+# a RoleBinding in kube-system, in default or in the other team's namespace can bind the
+# workload or its groups too, and no can-i or review across the cluster counts it. A list that
+# cannot be read or parsed fails the step, and nothing is matched.
 operator_rbac() {
-  local lists what ns list team verdicts verdict row detail status
+  local lists what list team verdicts verdict row detail status
   lists=$(mktemp)
   status=0
   for what in clusterroles clusterrolebindings; do
     if ! list=$(k get "$what" -o json) ||
-      ! jq -ce --arg what "$what" 'if type == "object" then {what: $what, namespace: "", list: .} else error end' <<<"$list" >>"$lists"; then
+      ! jq -ce --arg what "$what" 'if type == "object" then {what: $what, list: .} else error end' <<<"$list" >>"$lists"; then
       fail "operator checks: the RBAC rules bound to each team's workload (could not read the $what)"
       status=1
       break
     fi
   done
-  for ns in mock-docs switchboard team-a team-b; do
+  for what in roles rolebindings; do
     [ "$status" -eq 0 ] || break
-    for what in roles rolebindings; do
-      if ! list=$(k get "$what" -n "$ns" -o json) ||
-        ! jq -ce --arg what "$what" --arg ns "$ns" 'if type == "object" then {what: $what, namespace: $ns, list: .} else error end' <<<"$list" >>"$lists"; then
-        fail "operator checks: the RBAC rules bound to each team's workload (could not read the $what in $ns)"
-        status=1
-        break
-      fi
-    done
+    if ! list=$(k get "$what" -A -o json) ||
+      ! jq -ce --arg what "$what" 'if type == "object" then {what: $what, list: .} else error end' <<<"$list" >>"$lists"; then
+      fail "operator checks: the RBAC rules bound to each team's workload (could not read the $what in every namespace)"
+      status=1
+    fi
   done
   if [ "$status" -eq 0 ]; then
     for team in team-a team-b; do
       if ! verdicts=$(jq -n -r --rawfile permissions "$PERMISSIONS" --arg namespace "$team" --arg name mock-workload \
-        --argjson namespaces "[\"mock-docs\",\"switchboard\",\"$team\"]" -f "$RBAC_MATCH" <"$lists" 2>&1); then
+        -f "$RBAC_MATCH" <"$lists" 2>&1); then
         fail "$team's workload is bound to no RBAC rule for a row of $PERMISSIONS (${verdicts%%$'\n'*})"
         continue
       fi

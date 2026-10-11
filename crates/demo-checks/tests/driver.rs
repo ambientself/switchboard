@@ -1303,23 +1303,19 @@ fn with_can_i(
     (run, asks, reviews)
 }
 
-/// The RBAC lists `k` serves, by the file name `with_rbac` reads them from.
-const RBAC_LISTS: [&str; 10] = [
+/// The RBAC lists `k` serves, by the file name `with_rbac` reads them from: the Roles and
+/// RoleBindings are those of every namespace.
+const RBAC_LISTS: [&str; 4] = [
     "clusterroles",
     "clusterrolebindings",
-    "roles-mock-docs",
-    "rolebindings-mock-docs",
-    "roles-switchboard",
-    "rolebindings-switchboard",
-    "roles-team-a",
-    "rolebindings-team-a",
-    "roles-team-b",
-    "rolebindings-team-b",
+    "roles",
+    "rolebindings",
 ];
 
 /// As `with_can_i`, with `k get` serving each RBAC list from `rbac` by name (see `RBAC_LISTS`),
-/// or an empty list; a name given as None is not served, so its read fails. Returns the RBAC
-/// reads too, as `get ...`.
+/// or an empty list; a name given as None is not served, so its read fails. `get roles -A` and
+/// `get rolebindings -A` are served the whole list, and `-n NS` its items in NS. Returns the
+/// RBAC reads too, as `get ...`.
 fn with_rbac(
     name: &str,
     answer: &str,
@@ -1349,7 +1345,11 @@ fn with_rbac(
     let run = sourced(&format!(
         "k() {{ case \"$1\" in\n  \
            create) printf 'review %s\\n' \"$(cat)\" >> '{log}'; echo {allowed} ;;\n  \
-           get) echo \"$*\" >> '{log}'; f=$2; [ \"$3\" != -n ] || f=$2-$4; cat '{dir}'/\"$f.json\" ;;\n  \
+           get) echo \"$*\" >> '{log}'; case \"$2 $3\" in\n    \
+             'clusterroles -o' | 'clusterrolebindings -o' | 'roles -A' | 'rolebindings -A') cat '{dir}'/\"$2.json\" ;;\n    \
+             'roles -n' | 'rolebindings -n') jq --arg ns \"$4\" '.items |= map(select(.metadata.namespace == $ns))' '{dir}'/\"$2.json\" ;;\n    \
+             *) return 1 ;;\n  \
+           esac ;;\n  \
            *) echo \"k $*\" >> '{log}'; echo {answer} ;;\n\
          esac; }}\n{body}\nFINISHED=1\nresult 0",
         log = log.display(),
@@ -1611,7 +1611,7 @@ fn permission_rows() -> Vec<String> {
 fn the_operator_checks_read_the_rbac_rules_bound_to_each_team() {
     let (run, _, _, mut reads) = with_rbac("rbac-clean", "no", "false", "operator_checks", &[]);
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    // One check per row and team, with rbac-match.jq, over the team's own three namespaces.
+    // One check per row and team, with rbac-match.jq, over the RoleBindings of every namespace.
     for team in ["team-a", "team-b"] {
         for row in permission_rows() {
             let check = format!(
@@ -1625,7 +1625,7 @@ fn the_operator_checks_read_the_rbac_rules_bound_to_each_team() {
         }
         assert!(
             run.stdout.contains(&format!(
-                "PASS {team}'s workload is bound to no RBAC rule for: get secrets, whatever its resourceNames (RoleBindings in mock-docs,switchboard,{team}, and ClusterRoleBindings)\n"
+                "PASS {team}'s workload is bound to no RBAC rule for: get secrets, whatever its resourceNames (RoleBindings in every namespace, and ClusterRoleBindings)\n"
             )),
             "{}",
             run.transcript()
@@ -1633,16 +1633,15 @@ fn the_operator_checks_read_the_rbac_rules_bound_to_each_team() {
     }
     // Each list is read once, with the demo's own access.
     reads.sort();
-    let mut want = vec![
-        "get clusterrolebindings -o json".to_owned(),
-        "get clusterroles -o json".to_owned(),
-    ];
-    for ns in ["mock-docs", "switchboard", "team-a", "team-b"] {
-        want.push(format!("get rolebindings -n {ns} -o json"));
-        want.push(format!("get roles -n {ns} -o json"));
-    }
-    want.sort();
-    assert_eq!(reads, want);
+    assert_eq!(
+        reads,
+        [
+            "get clusterrolebindings -o json",
+            "get clusterroles -o json",
+            "get rolebindings -A -o json",
+            "get roles -A -o json",
+        ]
+    );
     // demo.sh and route-check.sh run the one matcher.
     let driver = common::read("deploy/demo/demo.sh");
     assert!(driver.contains("RBAC_MATCH=$ROOT/deploy/route-check/rbac-match.jq\n"));
@@ -1660,7 +1659,7 @@ fn a_grant_limited_by_resource_names_fails_the_operator_checks_for_its_team() {
     let clusterroles = r#"{"items": [{"metadata": {"name": "mint"}, "rules": [
         {"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"], "resourceNames": ["gateway"]}
     ]}]}"#;
-    let bindings = r#"{"items": [{"metadata": {"name": "mint"},
+    let bindings = r#"{"items": [{"metadata": {"name": "mint", "namespace": "switchboard"},
         "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "mint"},
         "subjects": [{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-b"}]}]}"#;
     let (run, _, _, _) = with_rbac(
@@ -1670,7 +1669,7 @@ fn a_grant_limited_by_resource_names_fails_the_operator_checks_for_its_team() {
         "operator_checks",
         &[
             ("clusterroles", Some(clusterroles)),
-            ("rolebindings-switchboard", Some(bindings)),
+            ("rolebindings", Some(bindings)),
         ],
     );
     assert_eq!(run.status, Some(1), "{}", run.transcript());
@@ -1701,7 +1700,7 @@ fn a_grant_limited_by_resource_names_fails_the_operator_checks_for_its_team() {
         "operator_checks",
         &[
             ("clusterroles", Some(clusterroles)),
-            ("rolebindings-switchboard", Some(&everyone)),
+            ("rolebindings", Some(&everyone)),
         ],
     );
     assert_eq!(run.status, Some(1), "{}", run.transcript());
@@ -1715,13 +1714,55 @@ fn a_grant_limited_by_resource_names_fails_the_operator_checks_for_its_team() {
 }
 
 #[test]
+fn a_grant_outside_a_teams_three_namespaces_fails_the_operator_checks() {
+    // can-i and the reviews ask in mock-docs, switchboard and the team's own namespace, and
+    // across the cluster, where only ClusterRoleBindings (and default's RoleBindings, for can-i)
+    // count. A RoleBinding in kube-system, or in the other team's namespace, is seen by none.
+    let roles = r#"{"items": [
+        {"metadata": {"name": "mint", "namespace": "kube-system"}, "rules": [
+            {"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"], "resourceNames": ["clusterrole-aggregation-controller"]}
+        ]},
+        {"metadata": {"name": "read-credential", "namespace": "team-b"}, "rules": [
+            {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"], "resourceNames": ["team-b-credential"]}
+        ]}
+    ]}"#;
+    for (name, bindings, want) in [
+        (
+            "kube-system",
+            r#"{"items": [{"metadata": {"name": "mint", "namespace": "kube-system"},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "mint"},
+                "subjects": [{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]}]}"#,
+            "FAIL team-a's workload is bound to no RBAC rule for: create serviceaccounts/token, whatever its resourceNames (RoleBinding kube-system/mint binds Role mint to ServiceAccount team-a/mock-workload, for resourceNames clusterrole-aggregation-controller)",
+        ),
+        (
+            "other-team",
+            r#"{"items": [{"metadata": {"name": "read-credential", "namespace": "team-b"},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "read-credential"},
+                "subjects": [{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]}]}"#,
+            "FAIL team-a's workload is bound to no RBAC rule for: get secrets, whatever its resourceNames (RoleBinding team-b/read-credential binds Role read-credential to ServiceAccount team-a/mock-workload, for resourceNames team-b-credential)",
+        ),
+    ] {
+        let (run, _, _, _) = with_rbac(
+            &format!("rbac-elsewhere-{name}"),
+            "no",
+            "false",
+            "operator_checks",
+            &[("roles", Some(roles)), ("rolebindings", Some(bindings))],
+        );
+        assert_eq!(run.status, Some(1), "{name}: {}", run.transcript());
+        // team-a's alone; every can-i and review answered no.
+        assert_eq!(run.lines("FAIL "), [want], "{name}: {}", run.transcript());
+    }
+}
+
+#[test]
 fn rbac_lists_the_operator_checks_cannot_read_fail() {
     for (name, rbac, want) in [
         (
             "unread",
-            vec![("rolebindings-team-b", None)],
+            vec![("rolebindings", None)],
             vec![
-                "operator checks: the RBAC rules bound to each team's workload (could not read the rolebindings in team-b)",
+                "operator checks: the RBAC rules bound to each team's workload (could not read the rolebindings in every namespace)",
             ],
         ),
         (
