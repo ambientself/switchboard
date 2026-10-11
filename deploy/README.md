@@ -179,6 +179,14 @@ taken from its own ID (`switchboard-demo:<12 hex digits>`) and checks that the g
 mock-docs run that tag. With one fixed tag, a run on an existing cluster would leave the
 previous build's pods running, because `kubectl apply` sees no change.
 
+Postgres is pinned by tag and digest: `postgres:17.11-alpine@sha256:...` in
+`compose/compose.yaml` and in the driver's `POSTGRES_IMAGE`. The archive holds this platform's
+manifest, not the tag's multi-arch index, so a pod naming the index digest does not find the
+loaded image and pulls it from Docker Hub instead (checked on kind v0.32.0: with
+`imagePullPolicy: Never`, such a pod stops at `ErrImageNeverPull`). So `kind/base/postgres.yaml`
+names the tag alone, and the driver pulls the pinned digest, tags it with that tag and loads it.
+`crates/demo-checks/tests/driver.rs` holds the three places to one tag and digest.
+
 ## What runs
 
 Every command and file below is the real one; `crates/demo-checks` and the gateway's own tests
