@@ -1515,7 +1515,7 @@ mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Hos
 # The receipt-store gate (decision 0009): a tool not classified `read` on a surface is refused
 # outside a development build, at boot on both paths and on every registry reload. The tests
 # are in a development build, so the unit tests in boot.rs and reload.rs pass the exemption.
-RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, receipt_exempt)?;\n"
+RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, development)?;\n"
 RECEIPT_REGISTRY_PATH = "    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;\n"
 REGISTRY_BOOT_POLICY = "    check_registry_policy(&basis.registry, &live.current(), &basis)?;\n"
 mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate",
@@ -1533,6 +1533,32 @@ mutate("gw-receipt-store-always-configured", "a receipt store counts as configur
 mutate("gw-receipt-gate-propose-passes", "the receipt-store gate refuses `write` but lets `propose` through", BOOT,
        "            if tool.classification != Classification::Read {",
        "            if !matches!(tool.classification, Classification::Read | Classification::Propose) {")
+
+# The identity and audit opt-outs (decision 0014, section 4): only a development build accepts
+# them. The release build refuses each in the gates, on both paths, and start::prepare refuses
+# each, and runs the receipt-store gate, as soon as the registry loads, before it connects to
+# anything. tests/boot.rs and tests/registry_boot.rs run the gates as the release build does;
+# start.rs's unit tests start as it does, against a listener that counts connections.
+mutate("gw-identity-opt-out-allowed-in-release", "the identity gate accepts `disabled` in a release build", BOOT,
+       "            opt_out(BootError::IdentityOptOut, development)?;\n            (IdentityConfig::Disabled, GateState::Disabled)\n",
+       "            (IdentityConfig::Disabled, GateState::Disabled)\n")
+mutate("gw-audit-opt-out-allowed-in-release", "the audit gate accepts `disabled` in a release build", BOOT,
+       "            opt_out(BootError::AuditOptOut, development)?;\n            Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled))\n",
+       "            Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled))\n")
+mutate("gw-opt-out-exempt-always", "every build is exempt from the refusal of the opt-outs", BOOT,
+       "    if development { Ok(()) } else { Err(refusal) }", "    if true || development { Ok(()) } else { Err(refusal) }")
+mutate("gw-opt-outs-not-before-connecting", "start::prepare leaves the opt-outs to the gates, after it has connected", BOOT,
+       "    if identity.disabled {\n        opt_out(BootError::IdentityOptOut, development)?;\n    }\n"
+       "    if audit.disabled {\n        opt_out(BootError::AuditOptOut, development)?;\n    }\n", "")
+BEFORE_CONNECTING = (
+    "    boot::before_connecting(\n        &deployment.identity,\n        &deployment.audit.section(),\n"
+    "        registry.snapshot(),\n        development,\n    )?;\n"
+)
+mutate_all("gw-receipt-gate-after-database", "start::prepare runs the receipt-store gate and the opt-outs after it connects to the database",
+           (GW + "start.rs", BEFORE_CONNECTING, ""),
+           (GW + "start.rs", "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n",
+            "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n"
+            + BEFORE_CONNECTING.replace("&deployment.identity", "&identity")))
 
 # Tool definitions.
 mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
@@ -2048,6 +2074,38 @@ mutate("gw-event-source-not-peer", "events name the gateway's own address, not t
        "                        Ok(local) => (stream, local),\n"
        "                        Err(_) => continue,\n"
        "                    },\n")
+
+
+# --- gateway: stale policy -----------------------------------------------------------------
+
+# Decision 0013, section 8: past the maximum age since the registry file was last read, /readyz
+# fails and tools/call and tools/list are refused with the stale-policy sentence and no row.
+# Every read counts, changed or not. tests/stale.rs watches each; tests/deployment.rs the floor.
+mutate("gw-stale-never", "the policy is never stale, however long since the file was read", GW + "reload.rs",
+       "        self.0.max_age.is_some_and(|max_age| self.age() > max_age)", "        false")
+mutate_all("gw-stale-read-time-only-on-change", "only a read whose bytes changed counts as a read",
+           (GW + "reload.rs", "            self.freshness.read_now();\n            if bytes == seen {\n                continue;\n            }\n",
+            "            if bytes == seen {\n                continue;\n            }\n            self.freshness.read_now();\n"))
+mutate("gw-stale-readyz-ignored", "a stale gateway stays ready", GW_SERVER,
+       "    } else if endpoint.ready.load(Ordering::SeqCst) && !endpoint.path.gates().freshness().is_stale()\n    {\n",
+       "    } else if endpoint.ready.load(Ordering::SeqCst) {\n")
+mutate("gw-stale-list-served", "a stale gateway still lists tools", GW_PATH,
+       "        if self.policy_stale(source, \"tools/list\") {\n            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n",
+       "        let _ = source;\n")
+mutate("gw-stale-call-served", "a stale gateway still decides and runs calls", GW_PATH,
+       "        if self.policy_stale(source, \"tools/call\") {\n            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n",
+       "        let _ = source;\n")
+mutate("gw-stale-row-written", "a stale call is decided and its row written, though the answer is the stale sentence", GW_PATH,
+       "        if self.policy_stale(source, \"tools/call\") {\n            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n",
+       "        if self.policy_stale(source, \"tools/call\") {\n"
+       "            let policy = gates.policy();\n"
+       "            let _ = self.decide_and_run(&policy, principal, surface, call, disconnect).await;\n"
+       "            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n")
+mutate("gw-max-age-floor-unchecked", "a maximum age under two polls loads", GW_DEPLOY,
+       "        if max_age < least {\n            return Err(DeploymentError::MaxAgeTooShort { max_age, least });\n        }\n",
+       "        let _ = least;\n")
+mutate("gw-bin-policy-age-not-exported", "switchboard's metrics leave out the policy's age", GW_BIN,
+       "        let metrics = metrics.with_policy(freshness);\n", "        let _ = freshness;\n")
 
 
 # --- gateway-dev ---------------------------------------------------------------------------
