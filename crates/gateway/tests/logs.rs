@@ -294,6 +294,7 @@ async fn each_telemetry_event_names_the_surface_and_the_peer() {
             discover: 1,
             unparsable: 1,
             policy_stale: 1,
+            calls_shed: 0,
             dropped: 0,
             audit_failure_answers: 0,
         }
@@ -339,6 +340,7 @@ async fn serving_returns_once_the_queued_events_are_written() {
         drain,
         async {},
         timeouts,
+        gateway::DEFAULT_MAX_IN_FLIGHT,
     )
     .await
     .unwrap();

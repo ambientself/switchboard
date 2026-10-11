@@ -81,6 +81,7 @@ impl Server {
                 let _ = stopped.await;
             },
             timeouts,
+            gateway::DEFAULT_MAX_IN_FLIGHT,
         ));
         Self {
             fixture,

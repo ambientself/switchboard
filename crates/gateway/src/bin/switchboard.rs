@@ -15,7 +15,9 @@
 //! stale, readiness fails and tools are refused (see [`gateway::reload`]). The release build
 //! refuses the identity and audit opt-outs before it connects to anything (see
 //! [`gateway::start`]). Each keys URL is fetched again every `keys_refresh_seconds` (see
-//! [`gateway::keys`]). Both stop when the gateway shuts down. Logs go to standard output as JSON lines; a refusal to start goes to standard
+//! [`gateway::keys`]). Both stop when the gateway shuts down. Requests in flight, and calls in
+//! flight to each proxied server and from each team, are capped as `[limits]` says (see
+//! [`gateway::deployment`] and [`gateway::bulkhead`]). Logs go to standard output as JSON lines; a refusal to start goes to standard
 //! error as well, as plain text. Shutting down waits for the answers still running, and for the
 //! audit store to complete the rows it is still writing, up to its finish deadline. With
 //! `[metrics]`, `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it
@@ -147,10 +149,12 @@ async fn serve(config: PathBuf) -> ExitCode {
     let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let freshness = prepared.gates.freshness().clone();
+    let proxied = prepared.proxied.clone();
     let metrics = metrics_listener.map(|listener| {
         let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
             .with_issuer_keys(prepared.keys.ages());
         let metrics = metrics.with_policy(freshness);
+        let metrics = metrics.with_proxied(proxied);
         tokio::spawn(serve_metrics(listener, metrics, async {
             let _ = metrics_stopped.await;
         }))
@@ -164,6 +168,7 @@ async fn serve(config: PathBuf) -> ExitCode {
         drain,
         shutdown(),
         Timeouts::default(),
+        prepared.max_in_flight,
     )
     .await;
     watching.abort();

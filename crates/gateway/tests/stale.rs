@@ -103,6 +103,7 @@ impl Stale {
             drain,
             std::future::pending(),
             Timeouts::default(),
+            gateway::DEFAULT_MAX_IN_FLIGHT,
         ));
         Self {
             address,
@@ -370,6 +371,7 @@ async fn a_boot_slower_than_the_maximum_age_starts_stale() {
         drain,
         std::future::pending(),
         Timeouts::default(),
+        gateway::DEFAULT_MAX_IN_FLIGHT,
     ));
     let token = files::kubernetes_token(&cluster, TEAM_A_SA, &[AUDIENCE]);
 

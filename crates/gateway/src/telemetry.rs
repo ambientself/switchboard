@@ -133,6 +133,17 @@ pub enum Event {
         /// How long ago the registry file was last read, in whole seconds.
         age_seconds: u64,
     },
+    /// A request was refused at admission because the instance has as many requests in
+    /// flight as its cap allows (decision 0014, section 2). Its body was not read, and nothing
+    /// ran.
+    CallShed {
+        /// The deployment that refused it.
+        deployment: DeploymentName,
+        /// The surface the request was for.
+        surface: Option<Surface>,
+        /// The peer's address.
+        source: Option<SocketAddr>,
+    },
     /// A body was refused before it reached the gateway's logic.
     Unparsable {
         /// The deployment that refused it.
@@ -162,6 +173,8 @@ pub struct TelemetryCounts {
     pub unparsable: u64,
     /// Requests refused because the policy is stale.
     pub policy_stale: u64,
+    /// Requests refused at admission because the instance had as many in flight as it allows.
+    pub calls_shed: u64,
     /// Events dropped because the queue was full or closed.
     pub dropped: u64,
     /// Answers that were the audit-failure sentence: a `tools/call` or `tools/list` refused
@@ -177,6 +190,7 @@ struct Counters {
     discover: AtomicU64,
     unparsable: AtomicU64,
     policy_stale: AtomicU64,
+    calls_shed: AtomicU64,
     dropped: AtomicU64,
     audit_failure_answers: AtomicU64,
 }
@@ -218,6 +232,7 @@ impl Telemetry {
             Event::Discover { .. } => &self.counters.discover,
             Event::Unparsable { .. } => &self.counters.unparsable,
             Event::PolicyStale { .. } => &self.counters.policy_stale,
+            Event::CallShed { .. } => &self.counters.calls_shed,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         if self.sender.try_send(event).is_err() {
@@ -243,6 +258,7 @@ impl Telemetry {
             discover: read(&counters.discover),
             unparsable: read(&counters.unparsable),
             policy_stale: read(&counters.policy_stale),
+            calls_shed: read(&counters.calls_shed),
             dropped: read(&counters.dropped),
             audit_failure_answers: read(&counters.audit_failure_answers),
         }
@@ -353,6 +369,18 @@ fn write(event: &Event) {
             source = source.map(tracing::field::display),
             rejection = ?rejection,
             "refused an unparsable body"
+        ),
+        Event::CallShed {
+            deployment,
+            surface: on,
+            source,
+        } => tracing::warn!(
+            event = "call_shed",
+            scope = "instance",
+            deployment = deployment.as_str(),
+            surface = surface(on),
+            source = source.map(tracing::field::display),
+            "refused a request: the gateway has as many requests in flight as it allows"
         ),
         Event::PolicyStale {
             deployment,
