@@ -8,6 +8,7 @@ mod common;
 use std::time::Duration;
 
 use common::read;
+use gateway::deployment::DeploymentFile;
 use gateway::{READINESS_REMOVAL, SHUTDOWN_GRACE};
 use sha2::{Digest, Sha256};
 
@@ -474,11 +475,35 @@ fn number_after(text: &str, prefix: &str, suffix: &str) -> u64 {
 
 /// Decision 0009, Shutdown: how long a call that began just before the gateway was told to stop
 /// may take, with its row: the begin budget, the call deadline, and the finish deadline with one
-/// answer budget more, for the last attempt to complete a failed begin's row. The demo's
-/// deployment files set none of them, so each is the code's default.
-fn begin_call_and_finish() -> Duration {
+/// answer budget more, for the last attempt to complete a failed begin's row. The call deadline
+/// is the longest the deployment file at `path` sets for any server, or the default (decision
+/// 0014, section 1); the budgets are not configurable, so each is the code's default.
+fn begin_call_and_finish(path: &str) -> Duration {
+    let file: DeploymentFile =
+        toml::from_str(&read(path)).unwrap_or_else(|error| panic!("{path}: {error}"));
     let budgets = audit_postgres::Budgets::default();
-    budgets.begin + connector_proxy::DEFAULT_DEADLINE + budgets.shutdown_wait()
+    budgets.begin + file.longest_deadline() + budgets.shutdown_wait()
+}
+
+#[test]
+fn the_longest_deadline_is_the_longest_any_server_sets_or_the_default() {
+    let longest = |text: &str| {
+        toml::from_str::<DeploymentFile>(&format!(
+            "{}{text}",
+            read("deploy/kind/base/config/gateway.toml")
+        ))
+        .unwrap()
+        .longest_deadline()
+    };
+    assert_eq!(longest(""), connector_proxy::DEFAULT_DEADLINE);
+    assert_eq!(
+        longest("\n[servers.a]\ndeadline_seconds = 2\n"),
+        connector_proxy::DEFAULT_DEADLINE
+    );
+    assert_eq!(
+        longest("\n[servers.a]\ndeadline_seconds = 2\n\n[servers.b]\ndeadline_seconds = 60\n"),
+        Duration::from_secs(60)
+    );
 }
 
 #[test]
@@ -516,8 +541,10 @@ fn the_gateway_is_given_time_to_complete_its_rows_when_it_stops() {
     );
     // No call starts once the gateway stops taking connections, so the last starts within the
     // readiness removal. After the removal the gateway waits up to its shutdown grace for the
-    // connections still open, and for the calls running however long they take.
-    let needed = READINESS_REMOVAL + begin_call_and_finish().max(SHUTDOWN_GRACE);
+    // connections still open, and for the calls running however long they take: 8 + 2 + D +
+    // 30 + 2 seconds, where D is the longest call deadline the deployment file sets.
+    let needed = READINESS_REMOVAL
+        + begin_call_and_finish("deploy/kind/base/config/gateway.toml").max(SHUTDOWN_GRACE);
     assert!(
         Duration::from_secs(grace) > needed,
         "kind: a grace period of {grace} s is not longer than {needed:?}"
@@ -528,6 +555,8 @@ fn the_gateway_is_given_time_to_complete_its_rows_when_it_stops() {
     let compose = read("deploy/compose/compose.yaml");
     let service = compose_service(&compose, "gateway");
     let grace = number_after(&service, "    stop_grace_period: ", "s");
+    let needed = READINESS_REMOVAL
+        + begin_call_and_finish("deploy/compose/config/gateway.toml").max(SHUTDOWN_GRACE);
     assert!(
         Duration::from_secs(grace) > needed,
         "Compose: a grace period of {grace} s is not longer than {needed:?}"

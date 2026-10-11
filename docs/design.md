@@ -312,8 +312,8 @@ planned: with identity disabled the path lists nothing and refuses every `tools/
 row. Reads are not served with rows whose identity is `disabled`, and #69, which would have
 built them, is not planned
 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). Decision 0014
-also makes identity disabled development-only: the release build refuses it once #11's
-fail-closed work lands (section 12), and until then starts with a warning.
+also makes identity disabled development-only: the release build refuses to start with it,
+before it connects to anything (section 12).
 
 **A wrong guess costs the same as a right one.** An unknown subject pays for the signature
 check before it is refused, so response time does not reveal which subjects exist.
@@ -624,8 +624,8 @@ list names what others must still decide.
 
 | Record | Covers | Written | If it cannot be written |
 | --- | --- | --- | --- |
-| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
-| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, nothing is listed and every `tools/call` is refused, with no row (section 7). Decision 0014 makes identity disabled development-only; the release build refuses it once #11's fail-closed work lands (section 12). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
+| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`, and a `tools/call` or `tools/list` refused because the policy is stale (section 8). Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
+| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, nothing is listed and every `tools/call` is refused, with no row (section 7). Decision 0014 makes identity disabled development-only; the release build refuses to start with it (section 12). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect: a call to any tool not classified `read`. | Postgres, in the same transaction as the call's begin. | The call is refused. |
 
 The exceptions to invariant 5 are the requests telemetry covers, which reach no decision, and
@@ -881,8 +881,8 @@ Checked before a socket is bound. Identity and audit each have four states:
 
 | | Configured | Explicit opt-out only | Neither | Both |
 | --- | --- | --- | --- | --- |
-| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
-| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
+| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start, before it connects to anything (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
+| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start, before it connects to anything (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
 
 A partly configured gate is refused. A connector that is partly configured refuses to start. A
 connector that is not configured must be absent from every surface: a snapshot that puts one of
@@ -895,11 +895,13 @@ whose roles, schema and grants come from the store's role script (`sql/roles.sql
 migrations: a grant, membership, setting or object that gives the gateway's role a way to read
 or change audit rows beyond its own. It is not a defence against a hostile superuser or table
 owner, who can defeat any check run from inside the database. Against that scope, the routes
-the first check's review left open (#43) are each closed or ruled out: ownership now counts
-wherever a privilege does; a definer function whose owner can set `session_replication_role`
-is refused; every trigger and enabled event trigger that runs a definer function is refused,
-whoever can fire it; functions in untrusted languages are refused; and the three below are out
-of scope.
+the first check's review left open (#43), and those its gate found (#126), are each closed or
+ruled out: ownership now counts wherever a privilege does; a definer function whose owner can
+set `session_replication_role`, or can act as `pg_read_server_files`, `pg_write_server_files`
+or `pg_execute_server_program`, is refused; every trigger and enabled event trigger that runs
+a definer function, or a function in an untrusted language, is refused, whoever can fire it;
+EXECUTE on a function in an untrusted language is refused; a foreign key on the audit table
+whose action writes it is refused; and the three below are out of scope.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
@@ -920,7 +922,10 @@ pooler may drop, so the check reads them back and refuses a session without them
 
 The grants on the audit table are not the only way to it, so the Postgres check also refuses,
 for the gateway's role and every role it can become, PUBLIC included: an audit table that is a
-view or foreign table, or has a rule; any privilege on a view, materialized view or table with
+view or foreign table, or has a rule; an audit table with a foreign key whose action on delete
+or on update is `CASCADE`, `SET NULL` or `SET DEFAULT`, which writes the audit table as its
+owner, as a rule does, whenever any role deletes or updates the row it references (`NO ACTION`
+and `RESTRICT` only refuse a write, and pass); any privilege on a view, materialized view or table with
 a rule, in any schema, that reaches the audit table directly or through other views and rules,
 or owning one outside the audit schema, since an owner that revoked its own grants can grant
 them back; being able to run, by EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
@@ -931,12 +936,17 @@ on any function in an untrusted language, such as `plpython3u`, which runs with 
 the server's operating-system user. A definer function's owner counts as able when it holds a
 privilege on the audit table or on a view or rule that reaches it, can act as the owner of any
 of those, of the schema, or of the functions the table's triggers run, can set
-`session_replication_role`, or can run another such function. A trigger runs its function
+`session_replication_role`, can act as `pg_read_server_files`, `pg_write_server_files` or
+`pg_execute_server_program`, which reach the server's files and programs as a superuser does,
+or can run another such function. A trigger runs its function
 without EXECUTE, for any write that reaches its table, through a view, a rule or a foreign
 key's cascade as well as directly, and an event trigger fires on statements any role may run,
 such as `CREATE TEMP TABLE`. So rather than follow each route, the check refuses every trigger
-on any table, and every enabled event trigger, that runs such a function, whoever can fire it.
-The migrations' trigger functions are not `SECURITY DEFINER`, so a database they built passes.
+on any table, and every enabled event trigger, that runs such a function, or a function in an
+untrusted language, whoever can fire it. Untrusted languages are refused for EXECUTE and for
+triggers only: a definer function whose owner can run one is not refused for that. The
+migrations' trigger functions are in `plpgsql`, which is trusted, and are not `SECURITY
+DEFINER`, and the migrations make no foreign key, so a database they built passes.
 
 What the Postgres check does not look for, each out of scope because it needs an
 administrator's act rather than a misconfiguration of what the role script and the migrations
@@ -970,9 +980,12 @@ destination when it connects. `#[cfg(test)]` cannot provide them, because the ha
 gateway from integration tests and other crates. Since a feature can be turned on in any
 build, CI checks the release artifact itself: started with a `propose` snapshot and no receipt
 store, with grant checking off, with identity disabled and with audit disabled, it must refuse
-each, and it must refuse a loopback destination. The identity, audit and loopback refusals,
-and CI's steps for them, arrive in milestone 3 (#11). With identity disabled a development
-build lists nothing and refuses every `tools/call`, with no row.
+each, and it must refuse a loopback destination. The identity and audit refusals, and CI's
+steps for them, are built (#11): the binary refuses each opt-out, and runs the receipt-store
+gate, as soon as the registry loads, before it reads a credential, fetches a key or connects
+to the audit database. The loopback refusal and its step arrive in milestone 3 (#11). With
+identity disabled a development build lists nothing and refuses every `tools/call`, with no
+row.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
@@ -1217,9 +1230,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - Not planned: a principal state for identity checking turned off, which a row could record
   as `disabled`. With identity disabled, nothing is listed and every `tools/call` is refused,
   with no row ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69
-  closes as not planned). Decision 0014 makes identity disabled development-only; the release
-  build refuses it once #11's fail-closed work lands (section 12), and until then starts with
-  a warning.
+  closes as not planned). Decision 0014 makes identity disabled development-only, and the
+  release build refuses it (#11, section 12).
 
 **#10, audit and receipts** (the core, the Postgres store built for #10, and the test stores).
 
@@ -1323,45 +1335,66 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   own task until the deadline, an identical repeat finish accepted, column grants, and the
   report of each finish given up.
 
-**#11, proxy hardening.** One bullet per box of the issue, each saying what is built. The
-argument check is described in the next entry.
+**#11, proxy hardening.** One bullet per box of the issue, each saying what is built and in
+which pull request. The three entries after this one describe the argument check (#122), the
+opt-outs and the policy's maximum age (#132), and the limits, caps and isolation (#139).
 
-- Approval binding (the first box): built (#51). Each approval records `binding_sha256` beside
-  `definition_sha256`. It covers the constant dialect `"2020-12"` and the server's identity,
-  address, credential mode and credential reference, in the canonical JSON
-  `gateway_registry::binding_sha256` documents. The loader recomputes both hashes from the file
-  at boot and on every reload and refuses a registry in which either differs, so a changed
-  server entry needs its tools approved again. A server's identity must equal its address's
-  host. The demo approvals hash what the mock server serves, and the demos' identity is its
-  Service name ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
-  The destination class and connector entries' fields join the binding when they exist.
+- Approval binding (the first box): built (#131, for #51). Each approval records
+  `binding_sha256` beside `definition_sha256`. It covers the constant dialect `"2020-12"` and
+  the server's identity, address, credential mode and credential reference, in the canonical
+  JSON `gateway_registry::binding_sha256` documents. The loader recomputes both hashes from the
+  file at boot and on every reload and refuses a registry in which either differs, so a
+  changed server entry needs its tools approved again. A server's identity must equal its
+  address's host. The demo approvals hash what the mock server serves, and the demos' identity
+  is its Service name
+  ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). The
+  destination class and connector entries' fields join the binding when they exist.
 - Drift detection and withdrawal: not built.
 - Destination limits, the server's identity verified and redirects refused: not built.
-- Size limits, deadlines, bounded concurrency and per-team and per-server limits: not built.
-- Isolating a failing server: not built.
+- Size limits, deadlines, bounded concurrency and per-team and per-server limits: built
+  (#139). Each server's deadline and result size, and the caps on calls in flight in the
+  instance, to each server and from each team to each server, are in the limits entry below.
+  The request's size was already bounded: the transport answers 413 to a body over 1 MiB
+  (`MAX_BODY_BYTES`).
+- Isolating a failing server: built (#139). A hanging server holds at most its own caps of
+  slots until its calls' deadline (the limits entry below).
 - Upstream sessions isolated by server, credential identity and authorization context: not
   built.
-- Identity and audit opt-outs unavailable outside development builds: not built.
-- The agreed metrics and alerts: not built, beyond each issuer's key age (#115).
-- The overload, hanging-server and drift demonstrations: not built.
-- Decision 0011, sections 1 to 5: schema validation before forwarding is built (next entry);
-  connector entries, the snapshot loader's rules and the scheduled reach check are not built.
+- Identity and audit opt-outs unavailable outside development builds: built (#132), in the
+  opt-outs entry below.
+- The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
+  issuer's key age (#115), the policy's age and maximum age (#132), and the calls shed and
+  each proxied server's calls, latency and late or oversized answers (#139). The drift, probe
+  and reach-check signals wait for what they count. Decision 0014 writes the alert conditions
+  down, and there are no rules until a metrics sink exists.
+- The overload, hanging-server and drift demonstrations: not built. `tests/limits.rs` shows
+  overload and a hanging server in a test (#139), not in a demo.
+- Decision 0011, sections 1 to 5: schema validation before forwarding is built (#122, in the
+  argument check entry below); connector entries, the snapshot loader's rules and the
+  scheduled reach check are not built.
 - The kind slice extended to show them: not built.
-- The registration and drift probe and the gateway's per-team identities: not built.
+- The registration and drift probe and the gateway's per-team identities: not built. The route
+  check now sees RBAC grants limited by `resourceNames` (#133), which decision 0013 lands
+  before the per-team TokenRequest grants.
 - Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the
-  address's host, the dialect and no `+` in the registry's revision are built (#51, and #94 for
-  the dialect). The destination rules and the probe record are not built.
+  address's host, the dialect and no `+` in the registry's revision are built (#131, and #122
+  for the dialect). The destination rules and the probe record are not built.
 - The drift pass, its derived revisions and standing withdrawals: not built.
-- The maximum policy age and the stale-policy refusal: not built.
+- The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
+  below.
 - The 3600 s cap on user issuers' token lifetime: not built.
 - `switchboard probe` and the token writer: not built.
 - Decision 0013 section 11's acceptance scenarios: not built.
-- The identity and audit opt-outs refused by the release binary, with CI checks: not built.
+- The identity and audit opt-outs refused by the release binary, with CI checks: built (#132),
+  in the opt-outs entry below.
 - Configurable audit pools and the `max_connections` sizing rule: not built.
 - The 512 KiB row bound and its test: not built.
-- The decision 0014 signals other than each issuer's key age: not built.
+- The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
+  each proxied server's calls, latency and late or oversized answers (#139), and the policy's
+  age (#132), are exported. Each server's drift polls and withdrawals, probe results and
+  reach-check results are not built.
 
-**#11, the argument check against the approved schema.** Built (#94): the loader accepts a
+**#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
 another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
 refuses another dialect rather than converting it. An enforced keyword must have the JSON type
@@ -1374,6 +1407,63 @@ schema `false` admits nothing. A call that fails is outcome `error` of kind
 `invalid_arguments`, and nothing is sent. The exact rules are in the `adapter` module of
 `gateway-registry`. `pattern`, `$ref` and the composition keywords are refused at load, not
 checked; a schema that needs them cannot be approved yet.
+
+**#11, the opt-outs and the policy's maximum age.**
+
+- The identity and audit opt-outs are development-only: built. The release binary refuses
+  `[identity] mode = "disabled"` and `[audit] mode = "disabled"` at boot, on both the
+  registry's path and the JSON configuration's
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). It refuses each,
+  and runs the receipt-store gate, as soon as the registry loads, before it reads a credential,
+  fetches a key or connects to the audit database. A development build starts with either,
+  with the loud warning. CI starts the release artifact with each opt-out, and checks it exits
+  1 naming it.
+- The policy's maximum age: built
+  ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 8).
+  `registry.max_age_seconds` is 60 unless given, and is refused below twice `poll_seconds`.
+  Every successful read of the registry file counts, whether or not its bytes changed and
+  whether or not it loads, and the age counts from boot's own read of the file, so a boot
+  slower than the maximum age starts stale. Past the maximum age, `/readyz` answers 503 and `tools/call` and
+  `tools/list` are refused with a fixed stale-policy sentence before anything is decided, with
+  no row; each refusal is a `policy_stale` telemetry event, counted under
+  `switchboard_telemetry_events_total`. `switchboard_policy_age_seconds` and
+  `switchboard_policy_max_age_seconds` are exported. A file that reads but does not load keeps
+  the last good policy and is not stale.
+
+**#11, limits, caps and the isolation of a failing server.**
+
+- Per-server limits: built
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md), section 1). A
+  proxied server's entry in the deployment file, `[servers.<name>]`, sets `deadline_seconds`, 1
+  to 60 and 5 unless given, and `max_result_bytes`, 1 to 1 MiB and 64 KiB unless given. A value
+  outside those bounds is refused when the file loads, and an entry for a server the registry
+  does not name refuses the start. The deadline reaches both the server's connector and each
+  of its rows' deadlines. Limits are per server, not per tool. demo-checks holds each demo's
+  termination grace to 8 + 2 + D + 30 + 2 seconds, D the longest deadline its deployment file
+  sets.
+- The three caps: built (section 2). `[limits]` sets `max_in_flight`, 256 unless given,
+  `per_server_in_flight`, 32, and `per_team_per_server_in_flight`, 8, each at least 1 and each
+  in one instance. A request to `POST /mcp/{surface}` over the instance's cap is answered 503
+  with `Retry-After: 1` and a fixed sentence, after identity and before its body is read, with
+  a `call_shed` telemetry event and no row; its slot is held by the answer's task until it
+  ends. Each proxied server's connector is wrapped in a bulkhead, inside the argument check, so
+  a call that fails the check takes no slot. A call over the server's cap, or over its team's
+  cap on calls to the server, is completed as `refused` with a fixed capacity sentence naming
+  the scope, the server and the tool, and nothing is sent. The slots are held until the
+  server's connector returns or the call is dropped. A caller with no team is held by the
+  server's cap alone. There is no queue, circuit breaker or rate quota, and a connector in the
+  gateway's own process is not bounded until milestone 4.
+- Isolation: a server that hangs holds at most its server's cap of slots in an instance until
+  its calls' deadline, and one team at most its own cap of those. Calls from other teams to it,
+  and calls to other servers, are not held up. `tests/limits.rs` shows it.
+- The metrics of section 9 that these give: built. `switchboard_calls_shed_total{scope}`, with
+  `scope` one of `instance`, `server` and `team`; and, labelled by the server's name in the
+  registry only, `switchboard_proxied_calls_total{server,outcome}`,
+  `switchboard_proxied_call_seconds{server}` and
+  `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
+  `oversized_or_late_read`, so a tool not classified `read` is not counted there until
+  `unknown` is built. Not built yet in #11: a demo of overload and a hanging server,
+  configurable audit pools, and the row's size bound.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1439,8 +1529,11 @@ off only in a development build, with CI's check of the release artifact; and th
   every registry reload refuse a snapshot serving a tool not classified `read`, since no
   receipt store can be configured yet; a tool approved but on no surface passes. The harness's
   crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
-  and CI builds it with the same command and checks it refuses a `propose` tool. The receipt
-  store, audit and identity condition arrives with receipts (#10).
+  and CI builds it with the same command and checks it for three refusals: a `propose` tool,
+  identity disabled and audit disabled (#11). The `propose` check now runs with identity
+  enforced and audit on, as the release build requires, and is refused before the gateway
+  connects to its database. The receipt store, audit and identity condition arrives with
+  receipts (#10).
 - An allowed call whose connector is not registered completes its row as `error`: built
   (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
@@ -1449,13 +1542,14 @@ off only in a development build, with CI's check of the release artifact; and th
 - Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
   The path keeps refusing every `tools/call` and listing nothing, with no row
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
-  not planned). Disabling identity becomes development-only when #11's fail-closed work lands
-  (section 12).
+  not planned). Disabling identity is development-only, and the release build refuses it (#11,
+  section 12).
 - Already built and matching: identity failures write no row and keep the opaque sentence
   during an audit outage; begin, run and finish still run on a spawned task the client cannot
   cancel, though a read is now cancelled through the disconnect signal; shutdown waits for
   running answers; and `GET /readyz` fails first on shutdown, while the gateway serves on for
-  its readiness removal before it stops accepting calls (#40). Once it stops taking
+  its readiness removal before it stops accepting calls (#40). It also fails while the policy
+  is stale (#11). Once it stops taking
   connections no answer starts: a request whose body arrives during the shutdown grace is
   answered 503 and nothing runs, so the grace period the deployments give covers the removal
   plus one call (#40).

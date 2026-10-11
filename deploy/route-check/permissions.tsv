@@ -4,7 +4,10 @@
 #
 # route-check.sh asks a SubjectAccessReview for every row, as the workload's ServiceAccount, and
 # every answer must be no. deploy/demo/demo.sh's operator checks ask every row too, for each
-# team's workload, so this is the one list. Columns, tab-separated:
+# team's workload, so this is the one list. Both also read the RBAC rules bound to the
+# ServiceAccount with rbac-match.jq, beside this file: no rule may grant a row, whatever its
+# resourceNames, since a review names no resource and cannot see a rule limited to one name
+# (#60). Columns, tab-separated:
 #
 #   verb  resource  subresource  scope
 #
@@ -62,13 +65,18 @@ impersonate	serviceaccounts	-	namespaced
 impersonate	uids.authentication.k8s.io	-	cluster
 impersonate	userextras.authentication.k8s.io	scopes	cluster
 # Granting itself more. A RoleBinding in a namespace can bind a ClusterRole, so binding
-# ClusterRoles is asked in each namespace too.
+# ClusterRoles is asked in each namespace too. A binding it may update or patch it may add itself
+# to, which is as good as creating one.
 bind	roles.rbac.authorization.k8s.io	-	namespaced
 escalate	roles.rbac.authorization.k8s.io	-	namespaced
 bind	clusterroles.rbac.authorization.k8s.io	-	namespaced
 escalate	clusterroles.rbac.authorization.k8s.io	-	cluster
 create	rolebindings.rbac.authorization.k8s.io	-	namespaced
+update	rolebindings.rbac.authorization.k8s.io	-	namespaced
+patch	rolebindings.rbac.authorization.k8s.io	-	namespaced
 create	clusterrolebindings.rbac.authorization.k8s.io	-	cluster
+update	clusterrolebindings.rbac.authorization.k8s.io	-	cluster
+patch	clusterrolebindings.rbac.authorization.k8s.io	-	cluster
 # The API server's proxy to a node, a pod or a Service, with both verbs a request through it can
 # use. Like exec, its traffic comes from the API server.
 get	nodes	proxy	cluster

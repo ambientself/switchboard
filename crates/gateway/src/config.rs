@@ -52,8 +52,9 @@ pub struct IdentitySection {
     /// Verify every caller against these issuers.
     #[serde(default)]
     pub enforce: Option<Vec<IssuerEntry>>,
-    /// Do not verify callers. The gateway starts with a loud warning, lists no tools and
-    /// refuses every call, because nothing can be decided without a proved principal.
+    /// Do not verify callers. Only a development build accepts it (decision 0014): it starts
+    /// with a loud warning, lists no tools and refuses every call, because nothing can be
+    /// decided without a proved principal. The release build refuses to start.
     #[serde(default)]
     pub disabled: bool,
 }
@@ -63,7 +64,8 @@ pub struct IdentitySection {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditSection {
-    /// Record nothing. The gateway starts with a loud warning. Refused if a store is also
+    /// Record nothing. Only a development build accepts it, and starts with a loud warning;
+    /// the release build refuses to start (decision 0014). Refused if a store is also
     /// supplied.
     #[serde(default)]
     pub disabled: bool,

@@ -542,6 +542,65 @@ async fn the_admin_endpoint_changes_a_subjects_projects() {
     );
 }
 
+/// With an admin credential set, a subject's valid token cannot widen its own projects.
+#[tokio::test]
+async fn with_an_admin_credential_a_subject_cannot_widen_its_projects() {
+    const ADMIN_TOKEN: &str = "dummy-mock-docs-admin-token-for-tests";
+    let jwks_file = file("teams-admin-credential", "jwks.json", &jwks());
+    let mut vars = jwt_vars(jwks_file.to_str().unwrap());
+    vars.remove("MOCK_DOCS_JWT_SUBJECT");
+    vars.insert(
+        "MOCK_DOCS_JWT_SUBJECTS".to_owned(),
+        format!("{ATLAS_SUBJECT}=atlas;{BOREALIS_SUBJECT}=borealis"),
+    );
+    let digest: String = Sha256::digest(ADMIN_TOKEN.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let admin_file = file("teams-admin-credential", "admin-sha256", &digest);
+    vars.insert(
+        "MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE".to_owned(),
+        admin_file.to_str().unwrap().to_owned(),
+    );
+    vars.insert("MOCK_DOCS_ADMIN_LISTEN".to_owned(), "0.0.0.0:0".to_owned());
+    let settings = Settings::from_vars(|name| vars.get(name).cloned()).unwrap();
+    let server = start(settings.config).await.unwrap();
+    let url = format!(
+        "http://{}/admin/callers/{ATLAS_SUBJECT}",
+        server.admin_address()
+    );
+
+    let refused = client()
+        .put(&url)
+        .bearer_auth(token(&claims_with(json!({"sub": ATLAS_SUBJECT}))))
+        .json(&json!({"projects": ["atlas", "borealis"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        list_project(&server, ATLAS_SUBJECT, "borealis")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let changed = client()
+        .put(&url)
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&json!({"projects": ["atlas", "borealis"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_eq!(
+        list_project(&server, ATLAS_SUBJECT, "borealis")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
 // --- The binary ----------------------------------------------------------------------------
 
 struct Killed(Child);

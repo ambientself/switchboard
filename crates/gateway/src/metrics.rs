@@ -12,7 +12,28 @@
 //! [`Metrics::render`] writes, by hand and with no Prometheus crate:
 //!
 //! - Always, from [`Telemetry::counts`]: `switchboard_telemetry_events_total{event}`, each
-//!   event counted when it is emitted, and `switchboard_telemetry_dropped_total`.
+//!   event counted when it is emitted, and `switchboard_telemetry_dropped_total`. Event
+//!   `policy_stale` counts each `tools/call` and `tools/list` refused because the policy is
+//!   stale; there is no separate counter for them.
+//! - Always: `switchboard_calls_shed_total{scope}`, the calls refused by a cap on calls in
+//!   flight (decision 0014, section 2). `scope` is `instance` for requests answered 503 at
+//!   admission, each a `call_shed` telemetry event, counted here and not among the events
+//!   above; and `server` and `team` for calls completed as `refused` by a proxied server's cap
+//!   or a team's cap on calls to it, summed over the servers.
+//! - With proxied servers, from each one's [`Bulkhead`](crate::bulkhead::Bulkhead), labelled
+//!   `server` with the server's name in the registry, so there is one series per server and
+//!   nothing a caller chooses:
+//!   - `switchboard_proxied_calls_total{server,outcome}`, the calls the server's connector
+//!     completed, `outcome` one of `ok`, `error` and `refused`. A call refused by a cap is not
+//!     sent, and is counted under `switchboard_calls_shed_total` instead;
+//!   - `switchboard_proxied_call_seconds{server}`, a histogram of how long each took, with the
+//!     audit store's buckets;
+//!   - `switchboard_proxied_late_or_oversized_total{server}`, the calls that were an error of
+//!     the kind `oversized_or_late_read`: a `read` tool's answer too large or not in time.
+//! - With the registry's policy, from its [`Freshness`]: `switchboard_policy_age_seconds`, the
+//!   seconds since the registry file was last read successfully, and
+//!   `switchboard_policy_max_age_seconds`, the age past which the policy is stale (decision
+//!   0013, section 8).
 //! - With audit in Postgres, from [`PgAuditStore::stats`] and the request path:
 //!   - `switchboard_audit_begin_failures_total{cause}`, `cause` one of `budget_exceeded`,
 //!     `pool_timeout`, `database_error` and `value_refused`;
@@ -70,7 +91,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
-use gateway_core::Issuer;
+use gateway_core::{ConnectorName, Issuer};
 use http::HeaderValue;
 use http::header::CONTENT_TYPE;
 use hyper::server::conn::http1;
@@ -80,7 +101,9 @@ use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+use crate::bulkhead::{ProxiedSignals, ServerCounts};
 use crate::keys::KeyAges;
+use crate::reload::Freshness;
 use crate::server::{HEADER_READ_TIMEOUT, accept_failed};
 use crate::telemetry::{Telemetry, TelemetryCounts};
 
@@ -100,6 +123,8 @@ pub struct Metrics {
     telemetry: Telemetry,
     audit: Option<Arc<AuditSource>>,
     issuer_keys: KeyAges,
+    policy: Option<Freshness>,
+    proxied: ProxiedSignals,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -108,6 +133,8 @@ impl std::fmt::Debug for Metrics {
             .field("telemetry", &self.telemetry)
             .field("audit", &self.audit.is_some())
             .field("issuer_keys", &self.issuer_keys)
+            .field("policy", &self.policy)
+            .field("proxied", &self.proxied)
             .finish()
     }
 }
@@ -133,7 +160,16 @@ impl Metrics {
                 })
             }),
             issuer_keys: KeyAges::default(),
+            policy: None,
+            proxied: ProxiedSignals::default(),
         }
+    }
+
+    /// The same metrics, with what each proxied server's bulkhead counts, which
+    /// [`Prepared::proxied`](crate::start::Prepared::proxied) gives.
+    pub fn with_proxied(mut self, proxied: ProxiedSignals) -> Self {
+        self.proxied = proxied;
+        self
     }
 
     /// The same metrics, with the age of each issuer's keys from `ages`, which
@@ -143,10 +179,22 @@ impl Metrics {
         self
     }
 
+    /// The same metrics, with the age of the policy from `freshness`, which
+    /// [`Gates::freshness`](crate::Gates::freshness) gives.
+    pub fn with_policy(mut self, freshness: Freshness) -> Self {
+        self.policy = Some(freshness);
+        self
+    }
+
     /// Every signal as it stands, in Prometheus text. See the [module documentation](self).
     pub fn render(&self) -> String {
         let mut text = Text::default();
-        telemetry_signals(&mut text, &self.telemetry.counts());
+        let counts = self.telemetry.counts();
+        telemetry_signals(&mut text, &counts);
+        proxied_signals(&mut text, counts.calls_shed, &self.proxied.counts());
+        if let Some(freshness) = &self.policy {
+            policy_signals(&mut text, freshness);
+        }
         issuer_key_signals(&mut text, &self.issuer_keys.ages());
         if let Some(audit) = &self.audit {
             let open = *audit.open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -278,6 +326,7 @@ fn telemetry_signals(text: &mut Text, counts: &TelemetryCounts) {
         ("ping", counts.ping),
         ("discover", counts.discover),
         ("unparsable_body", counts.unparsable),
+        ("policy_stale", counts.policy_stale),
     ] {
         text.sample(
             "switchboard_telemetry_events_total",
@@ -291,6 +340,94 @@ fn telemetry_signals(text: &mut Text, counts: &TelemetryCounts) {
         "Telemetry events dropped because the queue was full or closed.",
         counts.dropped,
     );
+}
+
+fn proxied_signals(text: &mut Text, instance_shed: u64, servers: &[(ConnectorName, ServerCounts)]) {
+    text.family(
+        "switchboard_calls_shed_total",
+        "counter",
+        "Calls refused by a cap on calls in flight, by scope. instance: answered 503 before the \
+         body was read, with no row. server and team: completed as refused, not sent.",
+    );
+    let shed_server = servers
+        .iter()
+        .map(|(_, counts)| counts.shed_server)
+        .sum::<u64>();
+    let shed_team = servers
+        .iter()
+        .map(|(_, counts)| counts.shed_team)
+        .sum::<u64>();
+    for (scope, count) in [
+        ("instance", instance_shed),
+        ("server", shed_server),
+        ("team", shed_team),
+    ] {
+        text.sample("switchboard_calls_shed_total", &[("scope", scope)], count);
+    }
+    if servers.is_empty() {
+        return;
+    }
+    text.family(
+        "switchboard_proxied_calls_total",
+        "counter",
+        "Calls each proxied server's connector completed, by outcome. A call a cap refused is \
+         not sent and not counted here.",
+    );
+    for (server, counts) in servers {
+        for (outcome, count) in [
+            ("ok", counts.ok),
+            ("error", counts.error),
+            ("refused", counts.refused),
+        ] {
+            text.sample(
+                "switchboard_proxied_calls_total",
+                &[("server", server.as_str()), ("outcome", outcome)],
+                count,
+            );
+        }
+    }
+    text.family(
+        "switchboard_proxied_call_seconds",
+        "histogram",
+        "How long each call each proxied server's connector completed took.",
+    );
+    for (server, counts) in servers {
+        text.histogram_samples(
+            "switchboard_proxied_call_seconds",
+            &[("server", server.as_str())],
+            &counts.latency,
+        );
+    }
+    text.family(
+        "switchboard_proxied_late_or_oversized_total",
+        "counter",
+        "Calls to each proxied server whose read answer was too large or not in time.",
+    );
+    for (server, counts) in servers {
+        text.sample(
+            "switchboard_proxied_late_or_oversized_total",
+            &[("server", server.as_str())],
+            counts.late_or_oversized,
+        );
+    }
+}
+
+fn policy_signals(text: &mut Text, freshness: &Freshness) {
+    text.single(
+        "switchboard_policy_age_seconds",
+        "gauge",
+        "Seconds since the registry file was last read successfully, whether or not that \
+         version loaded. Past the maximum age the policy is stale.",
+        freshness.age().as_secs_f64(),
+    );
+    if let Some(max_age) = freshness.max_age() {
+        text.single(
+            "switchboard_policy_max_age_seconds",
+            "gauge",
+            "The policy's age past which /readyz fails and tools/call and tools/list are refused.",
+            max_age.as_secs_f64(),
+        );
+    }
 }
 
 fn issuer_key_signals(text: &mut Text, ages: &[(Issuer, Duration)]) {
@@ -487,15 +624,30 @@ impl Text {
     /// `_count`.
     fn histogram(&mut self, name: &str, help: &str, histogram: &LatencyHistogram) {
         self.family(name, "histogram", help);
+        self.histogram_samples(name, &[], histogram);
+    }
+
+    /// One histogram's samples, each with `labels` before its `le`.
+    fn histogram_samples(
+        &mut self,
+        name: &str,
+        labels: &[(&str, &str)],
+        histogram: &LatencyHistogram,
+    ) {
         let bucket = format!("{name}_bucket");
         let cumulative = histogram.cumulative();
-        for (bound, count) in LATENCY_BOUNDS_MS.iter().zip(cumulative) {
-            let le = Duration::from_millis(*bound).as_secs_f64().to_string();
-            self.sample(&bucket, &[("le", &le)], count);
+        let bounds = LATENCY_BOUNDS_MS
+            .iter()
+            .map(|bound| Duration::from_millis(*bound).as_secs_f64().to_string())
+            .zip(cumulative)
+            .chain(std::iter::once(("+Inf".to_owned(), histogram.count)));
+        for (le, count) in bounds {
+            let mut with_le = labels.to_vec();
+            with_le.push(("le", &le));
+            self.sample(&bucket, &with_le, count);
         }
-        self.sample(&bucket, &[("le", "+Inf")], histogram.count);
-        self.sample(&format!("{name}_sum"), &[], histogram.sum.as_secs_f64());
-        self.sample(&format!("{name}_count"), &[], histogram.count);
+        self.sample(&format!("{name}_sum"), labels, histogram.sum.as_secs_f64());
+        self.sample(&format!("{name}_count"), labels, histogram.count);
     }
 }
 

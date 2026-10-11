@@ -1,7 +1,10 @@
 # CI's check of the release artifact: `switchboard --config=deploy/ci/receipt-gate/gateway.toml`
 # must exit 1, refusing the registry's `propose` tool because no receipt store is configured
-# (decision 0009). Identity and audit are disabled so nothing else is needed: no issuer, no
-# database. The format is in crates/gateway/src/deployment.rs. Every value here is a dummy.
+# (decision 0009). Identity and audit are both on, as the release build requires (decision 0014):
+# identity is enforced against a checked-in public key, and audit names a database CI never
+# reaches. The receipt-store gate runs as soon as the registry loads, before any connection, so
+# the refusal comes first. The format is in crates/gateway/src/deployment.rs. Every value here is
+# a dummy.
 
 deployment = "ci-receipt-gate"
 listen = "127.0.0.1:0"
@@ -15,10 +18,24 @@ file = "registry/registry.toml"
 poll_seconds = 2
 
 [identity]
-mode = "disabled"
+mode = "enforce"
+
+# A key set holding one public key only. Nobody holds its private key: it was generated, its
+# public half written here, and the rest thrown away. No token can be signed for it.
+[[identity.issuers]]
+issuer = "https://ci-issuer.switchboard.test"
+kind = "workload"
+audiences = ["switchboard"]
+algorithm = "ES256"
+keys_file = "jwks.json"
+subjects_file = "teams.toml"
+max_lifetime_seconds = 3600
+leeway_seconds = 30
 
 [audit]
-mode = "disabled"
+mode = "postgres"
+# CI sets this to a database URL on a port nothing listens on. It is never connected to.
+url_env = "SWITCHBOARD_CI_DATABASE_URL"
 
 [credentials]
 docs-credential = "dummy-credential"

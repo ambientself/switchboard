@@ -58,11 +58,31 @@ pub const STATIC_VARS: [&str; 3] = [TOKEN_FILE_VAR, TOKEN_SHA256_VAR, TOKEN_SHA2
 /// The variable holding the MCP endpoint's listen address.
 pub const LISTEN_VAR: &str = "MOCK_DOCS_LISTEN";
 /// The variable holding the admin endpoint's listen address. Unset, there is no admin endpoint.
+/// An address other than loopback needs [`ADMIN_TOKEN_SHA256_FILE_VAR`] too.
 pub const ADMIN_LISTEN_VAR: &str = "MOCK_DOCS_ADMIN_LISTEN";
+/// The variable naming a file that holds the hex SHA-256 of the admin credential: the one bearer
+/// the admin endpoint accepts, in place of every caller's. It must differ from each caller's.
+pub const ADMIN_TOKEN_SHA256_FILE_VAR: &str = "MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE";
 /// The variable holding the comma-separated tools offered at start.
 pub const TOOLS_VAR: &str = "MOCK_DOCS_TOOLS";
 /// The variable holding `slow-doc`'s delay in milliseconds.
 pub const SLOW_MS_VAR: &str = "MOCK_DOCS_SLOW_MS";
+/// The variables that need a value when set: each is refused if it holds only whitespace,
+/// rather than read as unset. [`TOOLS_VAR`] is not one of them: empty, it offers no tools.
+pub const VALUED_VARS: [&str; 12] = [
+    TOKEN_FILE_VAR,
+    TOKEN_SHA256_VAR,
+    TOKEN_SHA256_FILE_VAR,
+    JWT_ISSUER_VAR,
+    JWT_AUDIENCE_VAR,
+    JWT_SUBJECT_VAR,
+    JWT_SUBJECTS_VAR,
+    JWKS_FILE_VAR,
+    LISTEN_VAR,
+    ADMIN_LISTEN_VAR,
+    ADMIN_TOKEN_SHA256_FILE_VAR,
+    SLOW_MS_VAR,
+];
 
 /// The projects a caller may name in a tool call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +193,11 @@ impl AcceptedCredential {
             == 0
     }
 
+    /// Whether `other` accepts the same token, whatever projects each may name.
+    pub fn same_token(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+
     /// The logged prefix of the accepted credential's SHA-256, for comparing with request logs.
     /// It also names the credential on the admin endpoint.
     pub fn logged_prefix(&self) -> String {
@@ -257,6 +282,10 @@ pub struct Config {
     pub tools: Vec<ToolName>,
     /// How long `slow-doc` takes to answer.
     pub slow: Duration,
+    /// The one credential the admin endpoint accepts, in place of every caller's; its projects
+    /// mean nothing. `None`: the admin endpoint accepts the callers, as `POST /mcp` does, and
+    /// the binary serves it only on loopback, where no caller can reach it.
+    pub admin: Option<AcceptedCredential>,
 }
 
 impl Config {
@@ -266,6 +295,7 @@ impl Config {
             accepted: accepted.into(),
             tools: DEFAULT_TOOLS.to_vec(),
             slow: DEFAULT_SLOW,
+            admin: None,
         }
     }
 }
@@ -286,9 +316,17 @@ impl Settings {
     /// unset. The server runs in one of two modes. In the static mode exactly one of
     /// [`TOKEN_FILE_VAR`], [`TOKEN_SHA256_VAR`] and [`TOKEN_SHA256_FILE_VAR`] is set. In the
     /// JWT mode all four of [`JWT_VARS`] are set, or [`JWT_SUBJECTS_VAR`] in place of
-    /// [`JWT_SUBJECT_VAR`], and none of the static ones. Anything missing, contradictory or
-    /// unreadable is an error, and the server does not start.
+    /// [`JWT_SUBJECT_VAR`], and none of the static ones. Anything missing, blank, contradictory
+    /// or unreadable is an error, and the server does not start. So is an admin endpoint on an
+    /// address other than loopback without an admin credential, since the callers could reach
+    /// it and widen their own projects.
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        if let Some(blank) = VALUED_VARS
+            .into_iter()
+            .find(|name| var(name).is_some_and(|value| value.trim().is_empty()))
+        {
+            return Err(ConfigError::Blank(blank));
+        }
         let jwt_set = JWT_VARS
             .iter()
             .chain([&JWT_SUBJECTS_VAR])
@@ -306,6 +344,21 @@ impl Settings {
         let admin_listen = var(ADMIN_LISTEN_VAR)
             .map(|value| address(ADMIN_LISTEN_VAR, &value))
             .transpose()?;
+        let admin = var(ADMIN_TOKEN_SHA256_FILE_VAR)
+            .map(|path| read_admin_digest(Path::new(&path)))
+            .transpose()?;
+        match (admin_listen, &admin) {
+            (None, Some(_)) => return Err(ConfigError::AdminCredentialUnused),
+            (Some(address), None) if !address.ip().is_loopback() => {
+                return Err(ConfigError::AdminNotLoopback(address));
+            }
+            _ => {}
+        }
+        if let (Some(admin), Credential::Static(callers)) = (&admin, &accepted)
+            && callers.iter().any(|caller| caller.same_token(admin))
+        {
+            return Err(ConfigError::AdminIsACaller);
+        }
         let tools = match var(TOOLS_VAR) {
             Some(list) => parse_tool_list(&list).map_err(ConfigError::Tools)?,
             None => DEFAULT_TOOLS.to_vec(),
@@ -326,6 +379,7 @@ impl Settings {
                 accepted,
                 tools,
                 slow,
+                admin,
             },
         })
     }
@@ -352,7 +406,7 @@ pub enum ConfigError {
     Tools(String),
     /// A static credential variable and a JWT variable are both set.
     StaticAndJwt,
-    /// Some of the JWT variables are set but not this one, or it is empty.
+    /// Some of the JWT variables are set but not this one.
     JwtIncomplete(&'static str),
     /// The JWK set file could not be read, or does not hold a set of RS256 keys.
     Jwks(String),
@@ -362,6 +416,16 @@ pub enum ConfigError {
     JwtSubjects(String),
     /// A line of the digest file is malformed, repeats a digest or names an unknown project.
     DigestFile(String),
+    /// A variable that needs a value is set, but holds only whitespace.
+    Blank(&'static str),
+    /// The admin credential's file cannot be read or does not hold one SHA-256.
+    AdminCredential(String),
+    /// The admin credential is set, but there is no admin endpoint to use it.
+    AdminCredentialUnused,
+    /// The admin endpoint listens on an address other than loopback with no admin credential.
+    AdminNotLoopback(SocketAddr),
+    /// The admin credential is also a caller's.
+    AdminIsACaller,
 }
 
 impl fmt::Display for ConfigError {
@@ -396,7 +460,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::JwtIncomplete(var) => write!(
                 formatter,
-                "{var} is missing or empty: the JWT mode needs all of {}, \
+                "{var} is missing: the JWT mode needs all of {}, \
                  or {JWT_SUBJECTS_VAR} in place of {JWT_SUBJECT_VAR}",
                 JWT_VARS.join(", ")
             ),
@@ -407,6 +471,28 @@ impl fmt::Display for ConfigError {
             ),
             Self::JwtSubjects(reason) => write!(formatter, "{JWT_SUBJECTS_VAR}: {reason}"),
             Self::DigestFile(reason) => write!(formatter, "{TOKEN_SHA256_FILE_VAR}: {reason}"),
+            Self::Blank(var) => write!(
+                formatter,
+                "{var} is set but blank: give it a value, or leave it unset"
+            ),
+            Self::AdminCredential(reason) => {
+                write!(formatter, "{ADMIN_TOKEN_SHA256_FILE_VAR}: {reason}")
+            }
+            Self::AdminCredentialUnused => write!(
+                formatter,
+                "{ADMIN_TOKEN_SHA256_FILE_VAR} is set without {ADMIN_LISTEN_VAR}: \
+                 there is no admin endpoint to use it"
+            ),
+            Self::AdminNotLoopback(address) => write!(
+                formatter,
+                "{ADMIN_LISTEN_VAR} is {address}, which callers could reach: \
+                 set {ADMIN_TOKEN_SHA256_FILE_VAR} too, or listen on loopback"
+            ),
+            Self::AdminIsACaller => write!(
+                formatter,
+                "the admin credential in {ADMIN_TOKEN_SHA256_FILE_VAR} is also a caller's: \
+                 give the admin endpoint a credential of its own"
+            ),
         }
     }
 }
@@ -414,11 +500,8 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn read_jwt(var: &impl Fn(&str) -> Option<String>) -> Result<JwtVerifier, ConfigError> {
-    let set = |name| {
-        var(name)
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    };
+    // A blank variable was refused before this, so each here is set or unset.
+    let set = |name| var(name).map(|value| value.trim().to_owned());
     let [issuer, audience, subject, jwks_file] =
         JWT_VARS.map(|name| set(name).ok_or(ConfigError::JwtIncomplete(name)));
     let (issuer, audience) = (issuer?, audience?);
@@ -497,6 +580,17 @@ fn read_digest_file(path: &Path) -> Result<Vec<AcceptedCredential>, ConfigError>
         return Err(ConfigError::BadDigest);
     }
     Ok(accepted)
+}
+
+/// Reads the admin credential's file: one SHA-256 in hex, and nothing else.
+fn read_admin_digest(path: &Path) -> Result<AcceptedCredential, ConfigError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| ConfigError::AdminCredential(format!("cannot read it: {error}")))?;
+    AcceptedCredential::sha256_hex(&text).map_err(|_| {
+        ConfigError::AdminCredential(
+            "the file must hold 64 hex digits, the SHA-256 of the admin token".to_owned(),
+        )
+    })
 }
 
 fn address(var: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {

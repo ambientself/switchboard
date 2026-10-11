@@ -16,9 +16,10 @@
 //! [registry]
 //! file = "/etc/switchboard/registry/registry.toml"
 //! poll_seconds = 2
+//! max_age_seconds = 60        # 60 if left out; at least twice poll_seconds
 //!
 //! [identity]
-//! mode = "enforce"            # or "disabled", with nothing else in the table
+//! mode = "enforce"            # or "disabled" (test-support builds only), alone in the table
 //!
 //! [[identity.issuers]]
 //! issuer = "https://dev-issuer.switchboard.test"
@@ -43,11 +44,20 @@
 //! leeway_seconds = 30
 //!
 //! [audit]
-//! mode = "postgres"           # or "disabled", with nothing else in the table
+//! mode = "postgres"           # or "disabled" (test-support builds only), alone in the table
 //! url_env = "SWITCHBOARD_DATABASE_URL"
 //!
 //! [metrics]                   # optional; left out, nothing serves metrics
 //! listen = "0.0.0.0:9090"
+//!
+//! [limits]                    # optional; these are the defaults
+//! max_in_flight = 256         # requests in flight in this instance
+//! per_server_in_flight = 32   # calls in flight to each proxied server
+//! per_team_per_server_in_flight = 8  # from each team to each proxied server
+//!
+//! [servers.mock-docs]         # optional, for a server the registry names
+//! deadline_seconds = 5        # 5 if left out; 1 to 60
+//! max_result_bytes = 65536    # 64 KiB if left out; 1 to 1 MiB
 //!
 //! [credentials]
 //! docs-credential = "/run/secrets/docs-credential"
@@ -77,6 +87,11 @@
 //!   "system:serviceaccount:team-a:mock-workload" = "team-a"
 //!   ```
 //!
+//! - **The maximum age** of the policy is `registry.max_age_seconds` since the registry file
+//!   was last read successfully, whether or not that version loaded (decision 0013, section 8):
+//!   [`DEFAULT_MAX_AGE`] if it is not given, and refused below twice `poll_seconds`, so one
+//!   slow or failed read never makes the policy stale. Past it, `/readyz` fails and
+//!   `tools/call` and `tools/list` are refused until a read succeeds.
 //! - **The database URL** is read from the environment variable `url_env` names, so no password
 //!   is written in the file.
 //! - **Credentials** map each registry server's credential reference to the file holding it.
@@ -85,10 +100,23 @@
 //!   (see [`crate::metrics`]), and only when `[metrics]` is given. Its `listen` may not take
 //!   the MCP listener's port on the same or an overlapping address: the two are never one
 //!   listener.
+//! - **Limits** are decision 0014's caps, each at least 1, and hold in each instance, not across
+//!   replicas. `max_in_flight` bounds the requests to `POST /mcp/{surface}` in flight: one over
+//!   it is answered 503 before its body is read, with no row. `per_server_in_flight` bounds the
+//!   calls in flight to each proxied server, and `per_team_per_server_in_flight` those from
+//!   each team to each server, by the caller's proved team; a caller with no team is held by
+//!   the server's cap alone. A call over either is completed as `refused`, with a capacity
+//!   sentence, and nothing is sent (see [`crate::bulkhead`]).
+//! - **Each server's bounds** are set under `[servers.<name>]`, for a server the registry names;
+//!   the gateway refuses to start with any other (see [`crate::start`]). `deadline_seconds`
+//!   bounds a call from sending it to the last byte of its answer, and `max_result_bytes` the
+//!   answer's HTTP body. Zero, or a value past [`MAX_SERVER_DEADLINE`] or
+//!   [`MAX_SERVER_RESULT_BYTES`], is refused. The deployment's termination grace must cover
+//!   the longest deadline set (decision 0014, section 1).
 //!
-//! Every table refuses fields it does not know. Only `listen` has a default, [`DEFAULT_LISTEN`],
-//! so a gateway not told where to listen is reachable from its own machine only. Any other
-//! missing field is an error, and so is a field that does not belong to the chosen mode or kind,
+//! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
+//! limits and each server's bounds have defaults, so a gateway not told where to listen is
+//! reachable from its own machine only. Any other missing field is an error, and so is a field that does not belong to the chosen mode or kind,
 //! such as `subjects_file` on a user issuer.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,7 +124,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gateway_core::{DeploymentName, Issuer, Subject, TeamId};
+use connector_proxy::{DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES};
+use gateway_core::{ConnectorName, DeploymentName, Issuer, Subject, TeamId};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -108,6 +137,28 @@ use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
 /// Where the gateway listens when the deployment file does not say: loopback only, never every
 /// interface.
 pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+
+/// How long after the registry file was last read the policy is stale, when the deployment file
+/// does not say (decision 0013, section 8).
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// How many requests to `POST /mcp/{surface}` may be in flight in one instance, unless
+/// `[limits]` says otherwise (decision 0014, section 2).
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
+
+/// How many calls may be in flight to one proxied server in one instance, unless `[limits]`
+/// says otherwise.
+pub const DEFAULT_PER_SERVER_IN_FLIGHT: usize = 32;
+
+/// How many calls may be in flight from one team to one proxied server in one instance, unless
+/// `[limits]` says otherwise.
+pub const DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT: usize = 8;
+
+/// The longest deadline a server's entry may set (decision 0014, section 1).
+pub const MAX_SERVER_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The largest answer a server's entry may allow, in bytes: 1 MiB.
+pub const MAX_SERVER_RESULT_BYTES: usize = 1024 * 1024;
 
 /// The deployment file as written.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -129,8 +180,94 @@ pub struct DeploymentFile {
     /// Where metrics are served, if anywhere.
     #[serde(default)]
     pub metrics: Option<MetricsSection>,
+    /// The caps on calls in flight, where they differ from the defaults.
+    #[serde(default)]
+    pub limits: Option<LimitsSection>,
+    /// Each proxied server's bounds, where they differ from the defaults.
+    #[serde(default)]
+    pub servers: BTreeMap<ConnectorName, ServerSection>,
     /// Each credential reference the registry's servers name, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
+}
+
+impl DeploymentFile {
+    /// The longest call deadline the file sets for any server, or [`DEFAULT_DEADLINE`] if it
+    /// sets none longer. The deployment's termination grace must cover it.
+    pub fn longest_deadline(&self) -> Duration {
+        self.servers
+            .values()
+            .filter_map(|server| server.deadline_seconds)
+            .map(Duration::from_secs)
+            .fold(DEFAULT_DEADLINE, Duration::max)
+    }
+}
+
+/// The caps on calls in flight, as written. Each field left out has its default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Requests in flight in the instance; [`DEFAULT_MAX_IN_FLIGHT`] if left out.
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
+    /// Calls in flight to each proxied server; [`DEFAULT_PER_SERVER_IN_FLIGHT`] if left out.
+    #[serde(default)]
+    pub per_server_in_flight: Option<usize>,
+    /// Calls in flight from each team to each proxied server;
+    /// [`DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT`] if left out.
+    #[serde(default)]
+    pub per_team_per_server_in_flight: Option<usize>,
+}
+
+/// One proxied server's bounds, as written. Each field left out has its default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSection {
+    /// How long a call may take, in seconds: 1 to 60, and [`DEFAULT_DEADLINE`] if left out.
+    #[serde(default)]
+    pub deadline_seconds: Option<u64>,
+    /// The largest answer accepted, in bytes: 1 to [`MAX_SERVER_RESULT_BYTES`], and
+    /// [`DEFAULT_MAX_RESPONSE_BYTES`] if left out.
+    #[serde(default)]
+    pub max_result_bytes: Option<usize>,
+}
+
+/// The caps on calls in flight in one instance (decision 0014, section 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Requests to `POST /mcp/{surface}` in flight.
+    pub max_in_flight: usize,
+    /// Calls in flight to each proxied server.
+    pub per_server_in_flight: usize,
+    /// Calls in flight from each team to each proxied server.
+    pub per_team_per_server_in_flight: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            per_server_in_flight: DEFAULT_PER_SERVER_IN_FLIGHT,
+            per_team_per_server_in_flight: DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT,
+        }
+    }
+}
+
+/// One proxied server's bounds on each call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerLimits {
+    /// How long a call may take, from sending it to the last byte of its answer.
+    pub deadline: Duration,
+    /// The largest answer accepted, in bytes of HTTP body.
+    pub max_result_bytes: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            deadline: DEFAULT_DEADLINE,
+            max_result_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        }
+    }
 }
 
 /// The metrics listener.
@@ -153,6 +290,10 @@ pub struct RegistrySection {
     pub file: PathBuf,
     /// How often, in seconds, the file is read again for a new version. At least 1.
     pub poll_seconds: u64,
+    /// How long, in seconds, after the last successful read the policy is stale.
+    /// [`DEFAULT_MAX_AGE`] if it is not given, and at least twice `poll_seconds`.
+    #[serde(default)]
+    pub max_age_seconds: Option<u64>,
 }
 
 /// The identity gate.
@@ -269,6 +410,17 @@ pub enum DeploymentError {
     /// The registry is polled less than once a second, or never.
     #[error("`registry.poll_seconds` must be at least 1")]
     PollTooFast,
+    /// The maximum age is under two polls, so one late read would make the policy stale.
+    #[error(
+        "`registry.max_age_seconds` is {max_age}, and must be at least twice \
+         `registry.poll_seconds`, {least}"
+    )]
+    MaxAgeTooShort {
+        /// The maximum age, given or the default, in seconds.
+        max_age: u64,
+        /// Twice the poll interval, in seconds.
+        least: u64,
+    },
     /// A workload issuer has no team manifest.
     #[error("workload issuer `{0}` needs `subjects_file`, its team manifest")]
     NoManifest(Issuer),
@@ -325,6 +477,31 @@ pub enum DeploymentError {
     /// The database URL's environment variable is not set.
     #[error("the environment variable `{0}`, which `audit.url_env` names, is not set")]
     NoDatabaseUrl(String),
+    /// A cap in `[limits]` is zero.
+    #[error("`limits.{0}` must be at least 1")]
+    LimitZero(&'static str),
+    /// A server's deadline is zero or past [`MAX_SERVER_DEADLINE`].
+    #[error(
+        "`servers.{server}.deadline_seconds` is {seconds}; it must be from 1 to {}",
+        MAX_SERVER_DEADLINE.as_secs()
+    )]
+    DeadlineOutOfRange {
+        /// The server.
+        server: ConnectorName,
+        /// The deadline given, in seconds.
+        seconds: u64,
+    },
+    /// A server's answer cap is zero or past [`MAX_SERVER_RESULT_BYTES`].
+    #[error(
+        "`servers.{server}.max_result_bytes` is {bytes}; it must be from 1 to \
+         {MAX_SERVER_RESULT_BYTES}"
+    )]
+    ResultBytesOutOfRange {
+        /// The server.
+        server: ConnectorName,
+        /// The cap given, in bytes.
+        bytes: usize,
+    },
     /// The metrics listener would take the MCP listener's port.
     #[error(
         "`metrics.listen` ({metrics}) takes the port the gateway listens on for MCP ({listen}); \
@@ -352,6 +529,8 @@ pub struct Deployment {
     pub registry_file: PathBuf,
     /// How often the registry file is read again.
     pub poll: Duration,
+    /// How long after the registry file was last read successfully the policy is stale.
+    pub max_age: Duration,
     /// The identity gate, with every team manifest read and the keys of every issuer with a
     /// keys file. An issuer with a keys URL has `null` keys here until
     /// [`start::prepare`](crate::start::prepare) fetches them; it is listed in `keys_urls`.
@@ -362,6 +541,11 @@ pub struct Deployment {
     pub audit: AuditChoice,
     /// Where metrics are served, or `None` for nowhere.
     pub metrics: Option<SocketAddr>,
+    /// The caps on calls in flight.
+    pub limits: Limits,
+    /// The bounds of each server the file gives an entry, within their ceilings. Every other
+    /// server has [`ServerLimits::default`].
+    pub servers: BTreeMap<ConnectorName, ServerLimits>,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -374,6 +558,8 @@ impl std::fmt::Debug for Deployment {
             .field("registry_file", &self.registry_file)
             .field("audit", &self.audit)
             .field("metrics", &self.metrics)
+            .field("limits", &self.limits)
+            .field("servers", &self.servers)
             .finish_non_exhaustive()
     }
 }
@@ -463,6 +649,14 @@ impl Deployment {
         if file.registry.poll_seconds == 0 {
             return Err(DeploymentError::PollTooFast);
         }
+        let max_age = file
+            .registry
+            .max_age_seconds
+            .unwrap_or(DEFAULT_MAX_AGE.as_secs());
+        let least = file.registry.poll_seconds.saturating_mul(2);
+        if max_age < least {
+            return Err(DeploymentError::MaxAgeTooShort { max_age, least });
+        }
         if let Some(metrics) = &file.metrics
             && takes_port(metrics.listen, file.listen)
         {
@@ -471,6 +665,15 @@ impl Deployment {
                 listen: file.listen,
             });
         }
+        let limits = limits(file.limits.unwrap_or_default())?;
+        let servers = file
+            .servers
+            .into_iter()
+            .map(|(server, section)| {
+                let bounds = server_limits(&server, section)?;
+                Ok((server, bounds))
+            })
+            .collect::<Result<_, DeploymentError>>()?;
         let mut keys_urls = Vec::new();
         let identity = match file.identity {
             IdentityFile::Disabled {} => IdentitySection {
@@ -500,10 +703,13 @@ impl Deployment {
             http: file.http,
             registry_file: base.join(file.registry.file),
             poll: Duration::from_secs(file.registry.poll_seconds),
+            max_age: Duration::from_secs(max_age),
             identity,
             keys_urls,
             audit,
             metrics: file.metrics.map(|metrics| metrics.listen),
+            limits,
+            servers,
             credentials: file
                 .credentials
                 .into_iter()
@@ -511,6 +717,65 @@ impl Deployment {
                 .collect(),
         })
     }
+}
+
+/// The caps `section` sets, each defaulted, and refused if zero.
+fn limits(section: LimitsSection) -> Result<Limits, DeploymentError> {
+    let defaults = Limits::default();
+    let cap = |given: Option<usize>, default: usize, field: &'static str| match given {
+        Some(0) => Err(DeploymentError::LimitZero(field)),
+        given => Ok(given.unwrap_or(default)),
+    };
+    Ok(Limits {
+        max_in_flight: cap(
+            section.max_in_flight,
+            defaults.max_in_flight,
+            "max_in_flight",
+        )?,
+        per_server_in_flight: cap(
+            section.per_server_in_flight,
+            defaults.per_server_in_flight,
+            "per_server_in_flight",
+        )?,
+        per_team_per_server_in_flight: cap(
+            section.per_team_per_server_in_flight,
+            defaults.per_team_per_server_in_flight,
+            "per_team_per_server_in_flight",
+        )?,
+    })
+}
+
+/// The bounds `section` sets for `server`, each defaulted, and refused if zero or past its
+/// ceiling.
+fn server_limits(
+    server: &ConnectorName,
+    section: ServerSection,
+) -> Result<ServerLimits, DeploymentError> {
+    let defaults = ServerLimits::default();
+    let deadline = match section.deadline_seconds {
+        None => defaults.deadline,
+        Some(seconds) if seconds == 0 || seconds > MAX_SERVER_DEADLINE.as_secs() => {
+            return Err(DeploymentError::DeadlineOutOfRange {
+                server: server.clone(),
+                seconds,
+            });
+        }
+        Some(seconds) => Duration::from_secs(seconds),
+    };
+    let max_result_bytes = match section.max_result_bytes {
+        None => defaults.max_result_bytes,
+        Some(bytes) if bytes == 0 || bytes > MAX_SERVER_RESULT_BYTES => {
+            return Err(DeploymentError::ResultBytesOutOfRange {
+                server: server.clone(),
+                bytes,
+            });
+        }
+        Some(bytes) => bytes,
+    };
+    Ok(ServerLimits {
+        deadline,
+        max_result_bytes,
+    })
 }
 
 /// Whether a listener on `metrics` would take the MCP listener's port: the same port, other than

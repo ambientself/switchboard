@@ -23,6 +23,8 @@ sha2 = "0.10"
 # Sets up the demo's database from its scripts on a throwaway server, when one is given.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
+# Reads the demo's deployment files for the longest call deadline they set.
+toml = "1"
 
 [lints]
 workspace = true

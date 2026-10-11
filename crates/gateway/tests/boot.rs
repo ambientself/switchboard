@@ -243,6 +243,118 @@ fn identity_and_audit_each_start_configured_or_disabled_and_refuse_neither_or_bo
     }
 }
 
+/// Decision 0014, section 4: the release build refuses each opt-out, whatever else the
+/// configuration holds. These tests are a development build, so they run the gates as the
+/// release build does through `boot::as_release`.
+#[test]
+fn the_release_build_refuses_the_identity_and_audit_opt_outs() {
+    let world = World::new();
+    let release = |config: Value, wiring| {
+        let config: Config = serde_json::from_value(config).unwrap();
+        boot::as_release::check(config, wiring)
+    };
+
+    let mut identity_off = world.config();
+    identity_off["identity"] = json!({"disabled": true});
+    let refused = release(identity_off.clone(), world.wiring());
+    assert!(
+        matches!(refused, Err(BootError::IdentityOptOut)),
+        "{refused:?}"
+    );
+    identity_off["audit"] = json!({"disabled": true});
+    let refused = release(identity_off, world.wiring_without_store());
+    assert!(
+        matches!(refused, Err(BootError::IdentityOptOut)),
+        "{refused:?}"
+    );
+
+    let mut audit_off = world.config();
+    audit_off["audit"] = json!({"disabled": true});
+    let refused = release(audit_off, world.wiring_without_store());
+    assert!(
+        matches!(refused, Err(BootError::AuditOptOut)),
+        "{refused:?}"
+    );
+
+    // With both gates on, the release build goes on to the receipt-store gate, which the
+    // world's `propose` and `write` tools fail: the opt-outs were the only refusals above.
+    let refused = release(world.config(), world.wiring());
+    assert!(
+        matches!(refused, Err(BootError::NoReceiptStore { .. })),
+        "{refused:?}"
+    );
+
+    assert_eq!(
+        BootError::IdentityOptOut.to_string(),
+        "identity is disabled, which only a development build allows: the release build checks \
+         every caller, so configure the trusted issuers"
+    );
+    assert_eq!(
+        BootError::AuditOptOut.to_string(),
+        "audit is disabled, which only a development build allows: the release build records \
+         every call, so configure an audit store"
+    );
+}
+
+/// A log writer the test reads back.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A development build, with the `test-support` feature these tests have, still starts with
+/// either opt-out, and says so loudly.
+#[test]
+fn a_development_build_starts_with_both_opt_outs_and_warns() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+
+    let world = World::new();
+    let mut config = world.config();
+    config["identity"] = json!({"disabled": true});
+    config["audit"] = json!({"disabled": true});
+    let gates = world.boot(config, world.wiring_without_store()).unwrap();
+    assert_eq!(gates.identity_state(), GateState::Disabled);
+    assert_eq!(gates.audit_state(), GateState::Disabled);
+
+    let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let warnings: Vec<Value> = logged
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["level"] == json!("WARN"))
+        .collect();
+    let messages: Vec<&str> = warnings
+        .iter()
+        .filter_map(|line| line["fields"]["message"].as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.starts_with("identity is disabled")),
+        "{logged}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.starts_with("audit is disabled")),
+        "{logged}"
+    );
+}
+
 #[test]
 fn a_gate_written_out_as_off_is_still_unconfigured() {
     let world = World::new();

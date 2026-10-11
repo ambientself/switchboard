@@ -28,6 +28,9 @@
 //!   a bounded queue that a [`Drain`] writes to the log. Drops are counted.
 //! - [`serve_metrics`] exports the counters, and the audit store's, in Prometheus text at
 //!   `GET /metrics` on a listener of its own, never the MCP listener ([`metrics`]).
+//! - [`Bulkhead`] holds each proxied server to its cap on calls in flight, and each team to its
+//!   cap on calls to the server, and counts each server's calls ([`bulkhead`]). [`serve`] holds
+//!   the instance to its cap on requests in flight.
 //!
 //! The first slice (decision 0008) runs from files:
 //!
@@ -38,8 +41,9 @@
 //!   registry file (`gateway-registry`): snapshot, approved definitions, profile rules and
 //!   argument adapters. The [`Gates`] serve the current version, and [`boot::check_registry`]
 //!   hands back a [`Reloader`] that replaces it when the registry file changes.
-//! - [`start::prepare`] builds the gateway: a `ProxyConnector` per registry server, behind the
-//!   registry's argument check; each keys URL's first fetch; the Postgres audit store after its
+//! - [`start::prepare`] builds the gateway: a `ProxyConnector` per registry server, with the
+//!   bounds the deployment file sets for it, in a [`Bulkhead`], behind the registry's argument
+//!   check; each keys URL's first fetch; the Postgres audit store after its
 //!   boot checks, or audit explicitly disabled; and the boot gates.
 //! - [`KeyRefresher`] fetches the keys of each issuer configured with a keys URL again on a
 //!   timer, from the issuer's own origin, and keeps the keys in use when a fetch fails.
@@ -52,6 +56,7 @@
 
 mod audit;
 pub mod boot;
+pub mod bulkhead;
 mod catalog;
 mod config;
 pub mod deployment;
@@ -69,11 +74,18 @@ pub mod telemetry;
 
 pub use audit::DisabledAuditStore;
 pub use boot::{BootError, GateState, Gates, Settings, Wiring};
+pub use bulkhead::{
+    Bulkhead, ProxiedSignals, ServerCounts, ServerSignals, server_at_capacity, team_at_capacity,
+};
 pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
-pub use deployment::{AuditChoice, Deployment, DeploymentError, KeysUrl, MetricsSection};
+pub use deployment::{
+    AuditChoice, DEFAULT_MAX_AGE, DEFAULT_MAX_IN_FLIGHT, DEFAULT_PER_SERVER_IN_FLIGHT,
+    DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT, Deployment, DeploymentError, KeysUrl, Limits,
+    MAX_SERVER_DEADLINE, MAX_SERVER_RESULT_BYTES, MetricsSection, ServerLimits,
+};
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,
     RefreshError,
@@ -81,17 +93,18 @@ pub use keys::{
 pub use metrics::{METRICS_CONTENT_TYPE, Metrics, OPEN_ROWS_POLL, serve_metrics};
 pub use path::{
     AUDIT_DISABLED_NOTE, Admitted, DISCONNECTED_BEFORE_RUN, Disconnect, DisconnectOnDrop,
-    IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, RequestPath, SERVER_NAME, Source,
+    IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, POLICY_STALE, RequestPath,
+    SERVER_NAME, Source,
 };
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{invalid_argument, undeclared_argument, withdrawn_while_deciding};
-pub use reload::{ReloadError, Reloader};
+pub use reload::{Freshness, ReloadError, Reloader};
 pub use resources::ResourceAdapter;
 pub use selector::{
     NO_PROFILE, ProfileSelector, SelectorError, SelectorRules, UserRule, WorkloadRule,
 };
 pub use server::{
-    BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
+    AT_CAPACITY, BODY_READ_TIMEOUT, DISABLED_GATE_REMINDER, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
     READINESS_REMOVAL, SHUTDOWN_GRACE, SHUTTING_DOWN, Timeouts, serve, serve_with_shutdown,
     serve_with_telemetry, serve_with_timeouts,
 };

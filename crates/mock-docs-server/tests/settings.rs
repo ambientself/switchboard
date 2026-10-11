@@ -107,7 +107,6 @@ fn the_digest_must_be_64_hex_digits_in_either_case() {
         &digest[..62],
         &format!("{digest}00"),
         &format!("{}zz", &digest[..62]),
-        "",
         TOKEN,
     ] {
         assert_eq!(
@@ -479,7 +478,7 @@ fn the_jwt_settings_must_all_be_set_and_not_empty() {
             .collect();
         assert_eq!(
             settings(&empty).unwrap_err(),
-            ConfigError::JwtIncomplete(missing),
+            ConfigError::Blank(missing),
             "{missing} empty"
         );
     }
@@ -524,6 +523,200 @@ fn the_jwk_set_must_hold_rs256_signing_keys_each_with_its_own_kid() {
         ("MOCK_DOCS_JWKS_FILE", "/nonexistent/jwks.json"),
     ]);
     assert!(matches!(missing, Err(ConfigError::Jwks(_))));
+}
+
+// --- Blank settings ------------------------------------------------------------------------
+
+/// Every variable that needs a value, written out here so that one left off the server's list
+/// fails this test.
+const VALUED: [&str; 12] = [
+    "MOCK_DOCS_TOKEN_FILE",
+    "MOCK_DOCS_TOKEN_SHA256",
+    "MOCK_DOCS_TOKEN_SHA256_FILE",
+    "MOCK_DOCS_JWT_ISSUER",
+    "MOCK_DOCS_JWT_AUDIENCE",
+    "MOCK_DOCS_JWT_SUBJECT",
+    "MOCK_DOCS_JWT_SUBJECTS",
+    "MOCK_DOCS_JWKS_FILE",
+    "MOCK_DOCS_LISTEN",
+    "MOCK_DOCS_ADMIN_LISTEN",
+    "MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE",
+    "MOCK_DOCS_SLOW_MS",
+];
+
+/// A variable set but empty, or holding only whitespace, is refused by name, beside settings
+/// that would otherwise start: it is not read as unset, nor as a value.
+#[test]
+fn a_setting_that_is_set_but_blank_is_refused() {
+    let digest = sha256_hex(TOKEN);
+    for name in VALUED {
+        for blank in ["", " ", "\t\n"] {
+            let mut vars = vec![(name, blank)];
+            if name != "MOCK_DOCS_TOKEN_SHA256" {
+                vars.push(("MOCK_DOCS_TOKEN_SHA256", &digest));
+            }
+            assert_eq!(
+                settings(&vars).unwrap_err(),
+                ConfigError::Blank(name),
+                "{name}={blank:?}"
+            );
+        }
+    }
+    // MOCK_DOCS_TOOLS empty offers no tools, so it may be blank.
+    let none = settings(&[
+        ("MOCK_DOCS_TOKEN_SHA256", &digest),
+        ("MOCK_DOCS_TOOLS", " "),
+    ])
+    .unwrap();
+    assert!(none.config.tools.is_empty());
+}
+
+/// A blank subjects map beside one subject is refused, rather than letting that subject name
+/// every project; and so is a blank subject beside a map.
+#[test]
+fn a_blank_subjects_map_does_not_fall_back_to_every_project() {
+    let jwks = json!({"keys": [jwk(json!({}))]}).to_string();
+    let path = token_file("jwks-blank-subjects", &jwks);
+    let path = path.to_str().unwrap();
+    let base = [
+        ("MOCK_DOCS_JWT_ISSUER", ISSUER),
+        ("MOCK_DOCS_JWT_AUDIENCE", "mock-docs"),
+        ("MOCK_DOCS_JWKS_FILE", path),
+    ];
+    for (subject, subjects, blank) in [
+        (ATLAS, "", "MOCK_DOCS_JWT_SUBJECTS"),
+        (ATLAS, "  ", "MOCK_DOCS_JWT_SUBJECTS"),
+        ("", "x=atlas", "MOCK_DOCS_JWT_SUBJECT"),
+        (" ", "x=atlas", "MOCK_DOCS_JWT_SUBJECT"),
+    ] {
+        let mut vars = base.to_vec();
+        vars.extend([
+            ("MOCK_DOCS_JWT_SUBJECT", subject),
+            ("MOCK_DOCS_JWT_SUBJECTS", subjects),
+        ]);
+        assert_eq!(
+            settings(&vars).unwrap_err(),
+            ConfigError::Blank(blank),
+            "{subject:?} and {subjects:?}"
+        );
+    }
+    // The same settings without the blank one start, so the refusal above is for the blank.
+    let mut vars = base.to_vec();
+    vars.push(("MOCK_DOCS_JWT_SUBJECT", ATLAS));
+    assert!(settings(&vars).is_ok());
+}
+
+// --- The admin endpoint's reach ------------------------------------------------------------
+
+/// A dummy admin credential, made up for these tests. It is not a secret anywhere.
+const ADMIN_TOKEN: &str = "dummy-mock-docs-admin-token-for-tests";
+
+/// Without an admin credential, the admin endpoint answers the callers, so it may listen only
+/// on loopback, where none of them can reach it.
+#[test]
+fn an_admin_endpoint_beyond_loopback_needs_an_admin_credential() {
+    let digest = sha256_hex(TOKEN);
+    for address in [
+        "0.0.0.0:18082",
+        "[::]:18082",
+        "10.0.0.5:18082",
+        "[fd00::5]:18082",
+    ] {
+        assert_eq!(
+            settings(&[
+                ("MOCK_DOCS_TOKEN_SHA256", &digest),
+                ("MOCK_DOCS_ADMIN_LISTEN", address),
+            ])
+            .unwrap_err(),
+            ConfigError::AdminNotLoopback(address.parse().unwrap()),
+            "{address}"
+        );
+    }
+    for address in ["127.0.0.1:18082", "127.0.0.2:18082", "[::1]:18082"] {
+        let read = settings(&[
+            ("MOCK_DOCS_TOKEN_SHA256", &digest),
+            ("MOCK_DOCS_ADMIN_LISTEN", address),
+        ])
+        .unwrap();
+        assert_eq!(read.admin_listen, Some(address.parse().unwrap()));
+        assert_eq!(read.config.admin, None);
+    }
+
+    let admin_file = token_file("admin-digest", &format!("{}\n", sha256_hex(ADMIN_TOKEN)));
+    let admin_file = admin_file.to_str().unwrap();
+    let read = settings(&[
+        ("MOCK_DOCS_TOKEN_SHA256", &digest),
+        ("MOCK_DOCS_ADMIN_LISTEN", "0.0.0.0:18082"),
+        ("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE", admin_file),
+    ])
+    .unwrap();
+    assert_eq!(read.admin_listen.unwrap().to_string(), "0.0.0.0:18082");
+    let admin = read.config.admin.unwrap();
+    assert!(admin.accepts(ADMIN_TOKEN));
+    assert!(!admin.accepts(TOKEN));
+}
+
+#[test]
+fn the_admin_credential_must_be_its_own_and_have_an_endpoint() {
+    let digest = sha256_hex(TOKEN);
+    let admin_file = token_file("admin-unused", &sha256_hex(ADMIN_TOKEN));
+    let admin_file = admin_file.to_str().unwrap();
+    assert_eq!(
+        settings(&[
+            ("MOCK_DOCS_TOKEN_SHA256", &digest),
+            ("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE", admin_file),
+        ])
+        .unwrap_err(),
+        ConfigError::AdminCredentialUnused
+    );
+
+    // The admin credential may not be a caller's, whichever line of a digest file holds it.
+    let caller_file = token_file("admin-is-a-caller", &format!("{digest}\n"));
+    let digests = token_file(
+        "admin-in-digests",
+        &format!("{} atlas\n{digest} borealis\n", sha256_hex(ADMIN_TOKEN)),
+    );
+    for (credential, admin) in [
+        (
+            ("MOCK_DOCS_TOKEN_SHA256", digest.as_str()),
+            caller_file.to_str().unwrap(),
+        ),
+        (
+            ("MOCK_DOCS_TOKEN_SHA256_FILE", digests.to_str().unwrap()),
+            admin_file,
+        ),
+    ] {
+        assert_eq!(
+            settings(&[
+                credential,
+                ("MOCK_DOCS_ADMIN_LISTEN", "0.0.0.0:18082"),
+                ("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE", admin),
+            ])
+            .unwrap_err(),
+            ConfigError::AdminIsACaller,
+            "{credential:?}"
+        );
+    }
+
+    // The file holds a digest, not the token, and nothing else.
+    for (name, contents) in [
+        ("admin-token-not-digest", ADMIN_TOKEN.to_owned()),
+        ("admin-two-digests", format!("{digest}\n{digest}\n")),
+        ("admin-empty", String::new()),
+    ] {
+        let path = token_file(name, &contents);
+        assert!(
+            matches!(
+                settings(&[
+                    ("MOCK_DOCS_TOKEN_SHA256", &digest),
+                    ("MOCK_DOCS_ADMIN_LISTEN", "127.0.0.1:18082"),
+                    ("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE", path.to_str().unwrap()),
+                ]),
+                Err(ConfigError::AdminCredential(_))
+            ),
+            "{name}"
+        );
+    }
 }
 
 // --- The binary ----------------------------------------------------------------------------
@@ -580,6 +773,7 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
         json!({ &sha256_hex(TOKEN)[..12]: "every" })
     );
     assert_eq!(boot["admin_listen"], Value::Null);
+    assert_eq!(boot["admin_credential"], Value::Null);
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
 
     let client = reqwest::Client::new();
@@ -631,4 +825,71 @@ fn the_binary_refuses_to_start_with_a_static_credential_and_jwt_settings() {
     let line: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(line["event"], "boot_refused");
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn the_binary_refuses_an_admin_endpoint_beyond_loopback_without_an_admin_credential() {
+    let mut child = binary()
+        .env("MOCK_DOCS_TOKEN_SHA256", sha256_hex(TOKEN))
+        .env("MOCK_DOCS_LISTEN", "127.0.0.1:0")
+        .env("MOCK_DOCS_ADMIN_LISTEN", "0.0.0.0:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A binary that starts instead serves until killed, so it is not waited for without end.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the binary started with its admin endpoint on 0.0.0.0");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let line: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(line["event"], "boot_refused");
+    assert!(
+        line["reason"]
+            .as_str()
+            .unwrap()
+            .contains("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE"),
+        "{line}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+/// With an admin credential, the binary's admin endpoint answers that bearer and no caller's.
+#[tokio::test]
+async fn the_binary_admin_endpoint_answers_only_the_admin_credential() {
+    let admin_file = token_file("binary-admin", &sha256_hex(ADMIN_TOKEN));
+    let mut child = Killed(
+        binary()
+            .env("MOCK_DOCS_TOKEN_SHA256", sha256_hex(TOKEN))
+            .env("MOCK_DOCS_LISTEN", "127.0.0.1:0")
+            .env("MOCK_DOCS_ADMIN_LISTEN", "127.0.0.1:0")
+            .env("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE", &admin_file)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
+    let boot: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert_eq!(boot["admin_credential"], sha256_hex(ADMIN_TOKEN)[..12]);
+    let url = format!(
+        "http://{}/admin/tools",
+        boot["admin_listen"].as_str().unwrap()
+    );
+    let client = reqwest::Client::new();
+    let refused = client.get(&url).bearer_auth(TOKEN).send().await.unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let answer = client
+        .get(&url)
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), reqwest::StatusCode::OK);
 }

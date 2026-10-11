@@ -1515,11 +1515,13 @@ mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Hos
 # The receipt-store gate (decision 0009): a tool not classified `read` on a surface is refused
 # outside a development build, at boot on both paths and on every registry reload. The tests
 # are in a development build, so the unit tests in boot.rs and reload.rs pass the exemption.
-RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, receipt_exempt)?;\n"
+RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, development)?;\n"
 RECEIPT_REGISTRY_PATH = "    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;\n"
 REGISTRY_BOOT_POLICY = "    check_registry_policy(&basis.registry, &live.current(), &basis)?;\n"
-mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate",
-           (BOOT, RECEIPT_CONFIG_PATH, ""), (BOOT, RECEIPT_REGISTRY_PATH, ""))
+RECEIPT_BEFORE_CONNECTING = "    receipt_gate(snapshot, development)\n}\n"
+mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate: not the boot gates, not a reload, not start::prepare before it connects",
+           (BOOT, RECEIPT_CONFIG_PATH, ""), (BOOT, RECEIPT_REGISTRY_PATH, ""),
+           (BOOT, RECEIPT_BEFORE_CONNECTING, "    let _ = snapshot;\n    Ok(())\n}\n"))
 mutate("gw-receipt-gate-config-path-skipped", "the JSON configuration's boot does not run the receipt-store gate", BOOT,
        RECEIPT_CONFIG_PATH, "")
 mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
@@ -1533,6 +1535,32 @@ mutate("gw-receipt-store-always-configured", "a receipt store counts as configur
 mutate("gw-receipt-gate-propose-passes", "the receipt-store gate refuses `write` but lets `propose` through", BOOT,
        "            if tool.classification != Classification::Read {",
        "            if !matches!(tool.classification, Classification::Read | Classification::Propose) {")
+
+# The identity and audit opt-outs (decision 0014, section 4): only a development build accepts
+# them. The release build refuses each in the gates, on both paths, and start::prepare refuses
+# each, and runs the receipt-store gate, as soon as the registry loads, before it connects to
+# anything. tests/boot.rs and tests/registry_boot.rs run the gates as the release build does;
+# start.rs's unit tests start as it does, against a listener that counts connections.
+mutate("gw-identity-opt-out-allowed-in-release", "the identity gate accepts `disabled` in a release build", BOOT,
+       "            opt_out(BootError::IdentityOptOut, development)?;\n            (IdentityConfig::Disabled, GateState::Disabled)\n",
+       "            (IdentityConfig::Disabled, GateState::Disabled)\n")
+mutate("gw-audit-opt-out-allowed-in-release", "the audit gate accepts `disabled` in a release build", BOOT,
+       "            opt_out(BootError::AuditOptOut, development)?;\n            Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled))\n",
+       "            Ok((Arc::new(DisabledAuditStore::new()), GateState::Disabled))\n")
+mutate("gw-opt-out-exempt-always", "every build is exempt from the refusal of the opt-outs", BOOT,
+       "    if development { Ok(()) } else { Err(refusal) }", "    if true || development { Ok(()) } else { Err(refusal) }")
+mutate("gw-opt-outs-not-before-connecting", "start::prepare leaves the opt-outs to the gates, after it has connected", BOOT,
+       "    if identity.disabled {\n        opt_out(BootError::IdentityOptOut, development)?;\n    }\n"
+       "    if audit.disabled {\n        opt_out(BootError::AuditOptOut, development)?;\n    }\n", "")
+BEFORE_CONNECTING = (
+    "    boot::before_connecting(\n        &deployment.identity,\n        &deployment.audit.section(),\n"
+    "        registry.snapshot(),\n        development,\n    )?;\n"
+)
+mutate_all("gw-receipt-gate-after-database", "start::prepare runs the receipt-store gate and the opt-outs after it connects to the database",
+           (GW + "start.rs", BEFORE_CONNECTING, ""),
+           (GW + "start.rs", "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n",
+            "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n"
+            + BEFORE_CONNECTING.replace("&deployment.identity", "&identity")))
 
 # Tool definitions.
 mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
@@ -1754,9 +1782,9 @@ mutate("gw-metrics-on-mcp-listener", "a [metrics] listener on the MCP listener's
        "            && takes_port(metrics.listen, file.listen)\n",
        "            && false\n            && takes_port(metrics.listen, file.listen)\n")
 mutate("gw-start-call-deadline-not-wired", "a proxied server's connector deadline does not reach the wiring", GW + "start.rs",
-       "            .proxied(server.name.clone(), Arc::new(connector))\n"
+       "            .proxied(server.name.clone(), Arc::new(bulkhead))\n"
        "            .call_deadline(server.name.clone(), deadline);\n",
-       "            .proxied(server.name.clone(), Arc::new(connector));\n"
+       "            .proxied(server.name.clone(), Arc::new(bulkhead));\n"
        "        let _ = deadline;\n")
 mutate("gw-metrics-port-open-to-teams", "the gateway-from-teams policy admits the teams on the metrics port too",
        "deploy/kind/policy/networkpolicies.yaml",
@@ -2050,6 +2078,119 @@ mutate("gw-event-source-not-peer", "events name the gateway's own address, not t
        "                    },\n")
 
 
+# --- gateway: limits and capacity ----------------------------------------------------------
+
+# Decision 0014, sections 1 and 2: the instance's cap on requests in flight, refused 503 before
+# the body with no row; each server's and each team's cap on calls in flight, refused with a
+# row and nothing sent, inside the argument check, held until the call ends; and the caps and
+# each server's deadline and answer cap from the deployment file, within their ceilings.
+# tests/limits.rs watches each; start.rs's own tests the wiring of the deadline.
+GW_BULKHEAD = GW + "bulkhead.rs"
+GW_START = GW + "start.rs"
+
+mutate("gw-instance-cap-ignored", "a request over the instance's cap on requests in flight is served", GW_SERVER,
+       "    let Ok(in_flight) = endpoint.in_flight.clone().try_acquire_owned() else {\n",
+       "    let Ok(in_flight) = Arc::new(Semaphore::new(1)).try_acquire_owned() else {\n")
+mutate_all("gw-instance-permit-dropped-early", "the instance's slot is freed once the body is read, not when the answer ends",
+           (GW_SERVER, "        let _in_flight = in_flight;\n", ""),
+           (GW_SERVER, "    let running = endpoint.answers.start();\n",
+            "    drop(in_flight);\n    let running = endpoint.answers.start();\n"))
+mutate("gw-instance-shed-event-missing", "a request shed at the instance's cap emits no call_shed event, so it is not counted", GW_SERVER,
+       "        path.telemetry().emit(Event::CallShed {\n"
+       "            deployment: gates.deployment().clone(),\n"
+       "            surface: source.surface,\n"
+       "            source: source.address,\n"
+       "        });\n",
+       "        let _ = (source, Event::Ping { deployment: gates.deployment().clone(), surface: None, source: None });\n")
+mutate("gw-server-cap-ignored", "a call over its server's cap on calls in flight is sent", GW_BULKHEAD,
+       "        let Ok(server) = self.per_server.clone().try_acquire_owned() else {\n",
+       "        let Ok(server) = Arc::new(semaphore(usize::MAX)).try_acquire_owned() else {\n")
+mutate("gw-team-cap-ignored", "a call over its team's cap on calls to a server is sent", GW_BULKHEAD,
+       "            Some(team) => match self.team(team).try_acquire_owned() {\n",
+       "            Some(_team) => match Arc::new(semaphore(usize::MAX)).try_acquire_owned() {\n")
+mutate("gw-team-cap-keyed-by-server-only", "every team shares one team-sized cap per server, so one team's calls hold up another's", GW_BULKHEAD,
+       "            .entry(team.clone())\n",
+       "            .entry(TeamId::new(\"every-team\"))\n")
+mutate("gw-team-slot-leaked-on-server-shed", "a call the server's cap refuses keeps the team slot it took, so its team's cap shrinks", GW_BULKHEAD,
+       "            return self.shed(Scope::Server, tool.as_str());\n",
+       "            std::mem::forget(team);\n            return self.shed(Scope::Server, tool.as_str());\n")
+mutate("gw-bulkhead-permit-released-early", "a call's slots are freed before its server's connector returns", GW_BULKHEAD,
+       "            let _slots = (server, team);\n",
+       "            drop((server, team));\n")
+mutate("gw-bulkhead-before-argument-check", "the caps are taken before the argument check, so a call that fails it takes a slot or is shed", GW + "proxied.rs",
+       "            Err(outcome) => Box::pin(std::future::ready(outcome)),\n",
+       "            Err(outcome) => {\n"
+       "                drop(self.inner.run(call));\n"
+       "                Box::pin(std::future::ready(outcome))\n"
+       "            }\n")
+mutate("gw-shed-not-counted", "a call a server's or a team's cap refused is not counted as shed", GW_BULKHEAD,
+       "        counter.fetch_add(1, Ordering::Relaxed);\n        tracing::warn!(\n            event = \"call_shed\",\n",
+       "        let _ = counter;\n        tracing::warn!(\n            event = \"call_shed\",\n")
+mutate("gw-server-deadline-override-ignored", "a server's deadline from the deployment file does not reach its connector or its rows", GW_START,
+       "        upstream.deadline = bounds.deadline;\n", "")
+mutate("gw-server-result-cap-override-ignored", "a server's answer cap from the deployment file does not reach its connector", GW_START,
+       "        upstream.max_response_bytes = bounds.max_result_bytes;\n", "")
+mutate("gw-server-limits-ceiling-unchecked", "a server's deadline past 60 s loads", GW_DEPLOY,
+       "        Some(seconds) if seconds == 0 || seconds > MAX_SERVER_DEADLINE.as_secs() => {\n",
+       "        Some(seconds) if seconds == 0 => {\n")
+mutate("gw-server-result-ceiling-unchecked", "a server's answer cap past 1 MiB loads", GW_DEPLOY,
+       "        Some(bytes) if bytes == 0 || bytes > MAX_SERVER_RESULT_BYTES => {\n",
+       "        Some(bytes) if bytes == 0 => {\n")
+mutate("gw-limit-zero-accepted", "a cap of zero in [limits] loads", GW_DEPLOY,
+       "        Some(0) => Err(DeploymentError::LimitZero(field)),\n", "        Some(0) if false => Err(DeploymentError::LimitZero(field)),\n")
+mutate("gw-max-in-flight-not-from-file", "the deployment file's max_in_flight does not reach the HTTP server, which holds the instance to the default", GW_START,
+       "        max_in_flight: limits.max_in_flight,\n",
+       "        max_in_flight: crate::deployment::DEFAULT_MAX_IN_FLIGHT,\n")
+mutate("gw-per-server-in-flight-not-from-file", "the deployment file's per_server_in_flight does not reach the bulkheads, which hold each server to the default", GW_START,
+       "            limits.per_server_in_flight,\n",
+       "            crate::deployment::DEFAULT_PER_SERVER_IN_FLIGHT,\n")
+mutate("gw-unknown-server-limits-accepted", "bounds for a server the registry does not name are ignored", GW_START,
+       "        return Err(StartError::UnknownServerLimits(unknown.clone()));\n",
+       "        let _ = unknown;\n")
+
+
+# --- gateway: stale policy -----------------------------------------------------------------
+
+# Decision 0013, section 8: past the maximum age since the registry file was last read, /readyz
+# fails and tools/call and tools/list are refused with the stale-policy sentence and no row.
+# Every read counts, changed or not, and the age counts from boot's own read of the file, not
+# from when the gates pass. tests/stale.rs watches each; tests/deployment.rs the floor; and
+# tests/logs.rs the stale-policy event's line.
+mutate("gw-stale-never", "the policy is never stale, however long since the file was read", GW + "reload.rs",
+       "        self.0.max_age.is_some_and(|max_age| self.age() > max_age)", "        false")
+mutate("gw-stale-age-from-gates", "the policy's age counts from when the boot gates pass, not from boot's read of the registry file, so a slow boot starts fresh", BOOT,
+       "    let freshness = Freshness::new(settings.max_age, settings.read_at);\n",
+       "    let freshness = Freshness::new(settings.max_age, Instant::now());\n")
+mutate_all("gw-stale-event-age-dropped", "the stale-policy event's line leaves out the policy's age",
+           (TELEMETRY, "            method,\n            age_seconds,\n        } => tracing::error!(",
+            "            method,\n            age_seconds: _,\n        } => tracing::error!("),
+           (TELEMETRY, "            method,\n            age_seconds,\n            \"refused a request: the registry file",
+            "            method,\n            \"refused a request: the registry file"))
+mutate_all("gw-stale-read-time-only-on-change", "only a read whose bytes changed counts as a read",
+           (GW + "reload.rs", "            self.freshness.read_now();\n            if bytes == seen {\n                continue;\n            }\n",
+            "            if bytes == seen {\n                continue;\n            }\n            self.freshness.read_now();\n"))
+mutate("gw-stale-readyz-ignored", "a stale gateway stays ready", GW_SERVER,
+       "    } else if endpoint.ready.load(Ordering::SeqCst) && !endpoint.path.gates().freshness().is_stale()\n    {\n",
+       "    } else if endpoint.ready.load(Ordering::SeqCst) {\n")
+mutate("gw-stale-list-served", "a stale gateway still lists tools", GW_PATH,
+       "        if self.policy_stale(source, \"tools/list\") {\n            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n",
+       "        let _ = source;\n")
+mutate("gw-stale-call-served", "a stale gateway still decides and runs calls", GW_PATH,
+       "        if self.policy_stale(source, \"tools/call\") {\n            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n",
+       "        let _ = source;\n")
+mutate("gw-stale-row-written", "a stale call is decided and its row written, though the answer is the stale sentence", GW_PATH,
+       "        if self.policy_stale(source, \"tools/call\") {\n            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n",
+       "        if self.policy_stale(source, \"tools/call\") {\n"
+       "            let policy = gates.policy();\n"
+       "            let _ = self.decide_and_run(&policy, principal, surface, call, disconnect).await;\n"
+       "            return (Reply::Denied(POLICY_STALE.to_owned()), None);\n        }\n")
+mutate("gw-max-age-floor-unchecked", "a maximum age under two polls loads", GW_DEPLOY,
+       "        if max_age < least {\n            return Err(DeploymentError::MaxAgeTooShort { max_age, least });\n        }\n",
+       "        let _ = least;\n")
+mutate("gw-bin-policy-age-not-exported", "switchboard's metrics leave out the policy's age", GW_BIN,
+       "        let metrics = metrics.with_policy(freshness);\n", "        let _ = freshness;\n")
+
+
 # --- gateway-dev ---------------------------------------------------------------------------
 
 DEV = "crates/gateway-dev/src/"
@@ -2200,9 +2341,9 @@ mutate("mock-docs-mcp-body-read-before-auth", "POST /mcp waits for the whole bod
        '    let body = Body::from(read_body(body).await.unwrap_or_default());\n'
        '    let caller = server.authenticate(&headers);\n    let mut line = request_line("request", &method, &uri, &caller);\n')
 mutate("mock-docs-admin-body-read-before-auth", "PUT /admin/tools waits for the whole body before checking the caller", MS,
-       '    let caller = server.authenticate(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n',
+       '    let caller = server.authenticate_admin(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n',
        '    let body = Body::from(read_body(body).await.unwrap_or_default());\n'
-       '    let caller = server.authenticate(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n')
+       '    let caller = server.authenticate_admin(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n')
 mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
        "                if tools.contains(&tool) {", "                if false {")
 # The JWT mode (decision 0010).
@@ -2250,7 +2391,8 @@ mutate("mock-docs-jwt-static-and-jwt-takes-jwt", "with a static credential and J
        "            (true, false) => Credential::Jwt(read_jwt(&var)?),",
        "            (true, _) => Credential::Jwt(read_jwt(&var)?),")
 mutate("mock-docs-jwt-empty-setting-accepted", "a JWT setting of only whitespace counts as set", MC,
-       "            .filter(|value| !value.is_empty())\n", "")
+       "            .find(|name| var(name).is_some_and(|value| value.trim().is_empty()))",
+       "            .find(|name| var(name).is_some_and(|value| value.is_empty()))")
 mutate("mock-docs-jwt-non-rsa-key-accepted", "a JWK set may hold an EC or symmetric key", MJ,
        "            if !matches!(jwk.algorithm, AlgorithmParameters::RSA(_)) {", "            if false {")
 mutate("mock-docs-jwt-key-alg-unchecked", "a key declared for another algorithm is accepted", MJ,
@@ -2284,6 +2426,31 @@ mutate("mock-docs-admin-projects-ignored", "the admin endpoint answers a change 
        "    if !server.set_projects(&target, projects.clone()) {", "    if server.projects(&target).is_none() {")
 mutate("mock-docs-admin-change-refusal-skipped", "the admin changes to definitions and callers answer a caller they did not accept", MS,
        "    if caller.accepted {\n        Some(line)", "    if true {\n        Some(line)")
+# Blank settings and the admin endpoint's reach (#121).
+mutate("mock-docs-blank-setting-accepted", "a setting that is set but empty is read as unset or as its value", MC,
+       "            return Err(ConfigError::Blank(blank));", "            let _ = blank;")
+mutate_all(
+    "mock-docs-blank-subjects-unchecked",
+    "MOCK_DOCS_JWT_SUBJECTS set but blank is not refused as blank",
+    (MC, "pub const VALUED_VARS: [&str; 12] = [", "pub const VALUED_VARS: [&str; 11] = ["),
+    (MC, "    JWT_SUBJECT_VAR,\n    JWT_SUBJECTS_VAR,\n    JWKS_FILE_VAR,\n    LISTEN_VAR,",
+     "    JWT_SUBJECT_VAR,\n    JWKS_FILE_VAR,\n    LISTEN_VAR,"),
+)
+mutate("mock-docs-admin-beyond-loopback-accepted", "the admin endpoint may listen beyond loopback without an admin credential", MC,
+       "            (Some(address), None) if !address.ip().is_loopback() => {",
+       "            (Some(address), None) if address.ip().is_multicast() => {")
+mutate("mock-docs-admin-credential-unused-accepted", "an admin credential without an admin endpoint is accepted", MC,
+       "            (None, Some(_)) => return Err(ConfigError::AdminCredentialUnused),", "            (None, Some(_)) => {}")
+mutate("mock-docs-admin-credential-is-a-caller", "the admin credential may also be a caller's", MC,
+       "            && callers.iter().any(|caller| caller.same_token(admin))", "            && callers.is_empty()")
+mutate("mock-docs-admin-callers-accepted", "with an admin credential, the admin endpoint still answers the callers", MS,
+       "            accepted: token.is_some_and(|token| admin.accepts(token)),",
+       "            accepted: token.is_some_and(|token| admin.accepts(token))\n                || self.authenticate(headers).accepted,")
+mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the callers and ignores the admin credential", MS,
+       "        let Some(admin) = &self.inner.admin else {", "        let Some(admin) = None::<&AcceptedCredential> else {")
+mutate("mock-docs-admin-fallback-takes-callers", "an unknown path on the admin endpoint accepts the callers' bearers", MS,
+       "            .fallback(admin_other_request)\n            .with_state(self.clone())",
+       "            .fallback(other_request)\n            .with_state(self.clone())")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
@@ -3263,6 +3430,34 @@ mutate("pg-check-server-functions-ignored", "a role that can run a function reac
 for server_function in ["lo_export", "lo_import", "pg_ls_dir", "pg_read_binary_file", "pg_read_file", "pg_stat_file"]:
     mutate(f"pg-check-{server_function.replace('_', '-')}-ignored", f"a role that can run {server_function} passes the check", PG_CHECK,
            f'    "{server_function}",\n', "")
+# #126: a foreign key on the table whose action writes it, a trigger or enabled event trigger
+# that runs a function in an untrusted language, and a definer function whose owner can act as
+# a predefined role that reaches the server's files or programs.
+mutate("pg-check-referential-action-ignored", "a foreign key on the table with ON DELETE CASCADE passes the check", PG_CHECK,
+       "    problems.extend(found.into_iter().map(|row| Problem::ReferentialAction {",
+       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::ReferentialAction {")
+mutate("pg-check-referential-update-ignored", "a foreign key on the table with an action only on update passes the check", PG_CHECK,
+       "('UPDATE', k.confupdtype::text)", "('UPDATE', 'a')")
+mutate("pg-check-referential-restrict-refused", "a foreign key on the table with ON DELETE RESTRICT is refused", PG_CHECK,
+       "AND a.action NOT IN ('a', 'r')", "AND a.action NOT IN ('a')")
+mutate("pg-check-referential-referenced-side-refused", "a foreign key on another table that references the table with an action is refused", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conrelid = $1::oid", "WHERE k.contype = 'f' AND (k.conrelid = $1::oid OR k.confrelid = $1::oid)")
+mutate("pg-check-untrusted-trigger-allowed", "a trigger that runs a function in an untrusted language passes the check", PG_CHECK,
+       "            .map(|row| Problem::UntrustedTrigger {",
+       "            .filter(|_| false)\n            .map(|row| Problem::UntrustedTrigger {")
+mutate("pg-check-untrusted-trigger-any-language", "a trigger that runs a function in a trusted language is refused", PG_CHECK,
+       "                         AND l.lanispl AND NOT l.lanpltrusted\n                     JOIN pg_catalog.pg_class c",
+       "                         AND l.lanispl\n                     JOIN pg_catalog.pg_class c")
+mutate("pg-check-untrusted-event-trigger-allowed", "an enabled event trigger that runs a function in an untrusted language passes the check", PG_CHECK,
+       "                 WHERE e.evtenabled <> 'D'\n", "                 WHERE false\n")
+mutate("pg-check-disabled-untrusted-event-trigger-refused", "a disabled event trigger that runs a function in an untrusted language is refused", PG_CHECK,
+       "                 WHERE e.evtenabled <> 'D'\n", "                 WHERE true\n")
+mutate("pg-check-definer-server-roles-ignored", "a definer function whose owner is a member of pg_read_server_files passes the check", PG_CHECK,
+       "                              OR EXISTS (SELECT FROM pg_catalog.pg_roles s\n",
+       "                              OR false AND EXISTS (SELECT FROM pg_catalog.pg_roles s\n")
+mutate("pg-check-definer-server-roles-direct-only", "a definer function whose owner inherits pg_execute_server_program through another role passes the check", PG_CHECK,
+       "AND pg_has_role(p.proowner, s.oid, 'USAGE'))",
+       "AND s.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = p.proowner))")
 # Open rows. The boot check compares the view with the definition it expects, so each change to
 # the view changes that definition as well, and the open-row tests must catch it themselves.
 PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"
@@ -3481,6 +3676,11 @@ mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kub
        """    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)\n""")
 mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
        "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
+# #60: the operator checks read the RBAC rules bound to each team's workload too.
+mutate("demo-operator-rbac-unchecked", "the operator checks ask can-i and reviews alone, which cannot see a rule limited by resourceNames", DRIVER,
+       "  done\n  operator_rbac\n}\n", "  done\n}\n")
+mutate("demo-operator-rbac-other-namespaces-unread", "the operator checks read the Roles and RoleBindings in the gateway's namespace only, not in every namespace", DRIVER,
+       """    if ! list=$(k get "$what" -A -o json) ||\n""", """    if ! list=$(k get "$what" -n switchboard -o json) ||\n""")
 mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whichever pod the Deployment's log picks", DRIVER,
        ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
@@ -3556,6 +3756,38 @@ mutate("route-check-version-json-unchecked", "a version read of two objects is r
        """ && json_object "$version" &&""", " &&")
 mutate("route-check-node-json-unchecked", "a node read of two objects is read as the last", ROUTE_CHECK,
        """ && json_object "$node" &&""", " &&")
+# #60: the RBAC rules bound to the workload, whatever their resourceNames (rbac-match.jq, which
+# demo.sh's operator checks run too).
+RBAC_MATCH = "deploy/route-check/rbac-match.jq"
+mutate("route-check-resource-names-ignored", "a rule limited by resourceNames grants nothing, as a review sees it", RBAC_MATCH,
+       "def grants($row):\n  .resources != []\n", "def grants($row):\n  .resources != [] and .resourceNames == []\n")
+mutate("route-check-group-subjects-ignored", "a binding to the ServiceAccount's groups does not count", RBAC_MATCH,
+       """      or (.kind == "Group" and (.name as $group | any($groups[]; . == $group))))\n""", "      or false)\n")
+mutate("route-check-wildcards-ignored", "a verb, group or resource of * matches nothing", RBAC_MATCH,
+       """def named($want): . == $want or . == "*";""", "def named($want): . == $want;")
+mutate("route-check-clusterrole-via-rolebinding-ignored", "a RoleBinding to a ClusterRole grants nothing", RBAC_MATCH,
+       """rules: (if $ref.kind == "ClusterRole" then""", """rules: (if $ref.kind == "ClusterRole" and $kind == "ClusterRoleBinding" then""")
+mutate_all("route-check-binding-rows-dropped", "updating and patching a binding are gone from the permissions list",
+           ("deploy/route-check/permissions.tsv",
+            "update\trolebindings.rbac.authorization.k8s.io\t-\tnamespaced\npatch\trolebindings.rbac.authorization.k8s.io\t-\tnamespaced\n", ""),
+           ("deploy/route-check/permissions.tsv",
+            "update\tclusterrolebindings.rbac.authorization.k8s.io\t-\tcluster\npatch\tclusterrolebindings.rbac.authorization.k8s.io\t-\tcluster\n", ""))
+mutate_all("route-check-rbac-unread-list-skipped", "an RBAC list the step cannot read counts as empty",
+           (ROUTE_CHECK,
+            """      fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what in every namespace"\n      return\n""",
+            """      continue\n"""),
+           (ROUTE_CHECK,
+            """      fail "$SA is bound to no RBAC rule for a row of control 1: could not read the $what"\n      return\n""",
+            """      continue\n"""),
+           (RBAC_MATCH,
+            """    | if length == 0 then unreadable(""", """    | if length == 0 then [] elif false then unreadable("""))
+# A RoleBinding outside the workload's, the gateway's and the servers' namespaces binds the
+# ServiceAccount too, and no review counts it.
+mutate("route-check-rbac-other-namespaces-unread", "the Roles and RoleBindings are read in the workload's namespace only, not in every namespace", ROUTE_CHECK,
+       """    if ! list=$(k get "$what" -A -o json) || ! json_object "$list" ||\n""",
+       """    if ! list=$(k get "$what" -n "$NAMESPACE" -o json) || ! json_object "$list" ||\n""")
+mutate("route-check-rbac-role-any-namespace", "a RoleBinding binds a Role of that name in any namespace, not only its own", RBAC_MATCH,
+       """then ($roles[$bns] // {})[$ref.name] // []""", """then ([$roles[]] | add // {})[$ref.name] // []""")
 
 # The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
 # tests/route_check.rs.

@@ -2072,6 +2072,300 @@ async fn a_function_in_an_untrusted_language_that_the_gateway_can_run_is_refused
     store.check_at_boot().await.unwrap();
 }
 
+/// A trigger runs its function without EXECUTE, for any write that reaches its table, so a
+/// trigger on any table that runs a function in an untrusted language is refused, whoever can
+/// write the table, though no role the gateway can become may run the function. An enabled
+/// event trigger that runs one is refused too, since it fires on statements any role may run;
+/// a disabled one passes. The language is plpgsql's handler under a name not marked trusted,
+/// as in the test above.
+#[tokio::test]
+async fn a_trigger_or_an_enabled_event_trigger_that_runs_an_untrusted_function_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE LANGUAGE plpgsql_untrusted HANDLER plpgsql_call_handler;
+             CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE FUNCTION reports.mark() RETURNS trigger
+                 LANGUAGE plpgsql_untrusted
+                 AS $$BEGIN PERFORM set_config('reports.fired', 'yes', false); RETURN NEW; END$$;
+             REVOKE EXECUTE ON FUNCTION reports.mark() FROM PUBLIC;
+             CREATE TABLE reports.notes (id uuid);
+             CREATE TRIGGER mark BEFORE INSERT ON reports.notes
+                 FOR EACH ROW EXECUTE FUNCTION reports.mark();
+             GRANT INSERT ON reports.notes TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    let found = problems_of(&db).await;
+    assert_eq!(
+        found,
+        vec![Problem::UntrustedTrigger {
+            function: "reports.mark()".into(),
+            language: "plpgsql_untrusted".into(),
+            trigger: "mark".into(),
+            table: "reports.notes".into(),
+        }]
+    );
+    assert_eq!(
+        found[0].to_string(),
+        "the trigger mark on reports.notes runs reports.mark(), in the untrusted language \
+         plpgsql_untrusted, which reaches the database server's own files and programs; a \
+         trigger asks for no EXECUTE, and any write that reaches reports.notes fires it"
+    );
+    // What the check refuses is real: the gateway may not run the function, and its insert
+    // runs it.
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let may: bool = gateway
+        .query_one(
+            "SELECT has_function_privilege('reports.mark()', 'EXECUTE')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!may);
+    gateway
+        .batch_execute("INSERT INTO reports.notes VALUES (NULL)")
+        .await
+        .unwrap();
+    assert_eq!(fired_in(&gateway).await, "yes");
+
+    admin
+        .batch_execute(
+            "DROP TRIGGER mark ON reports.notes;
+             CREATE FUNCTION reports.mark_ddl() RETURNS event_trigger
+                 LANGUAGE plpgsql_untrusted
+                 AS $$BEGIN PERFORM set_config('reports.fired', 'yes', false); END$$;
+             REVOKE EXECUTE ON FUNCTION reports.mark_ddl() FROM PUBLIC;
+             CREATE EVENT TRIGGER mark_ddl ON ddl_command_start
+                 EXECUTE FUNCTION reports.mark_ddl();",
+        )
+        .await
+        .unwrap();
+    let found = problems_of(&db).await;
+    assert_eq!(
+        found,
+        vec![Problem::UntrustedEventTrigger {
+            function: "reports.mark_ddl()".into(),
+            language: "plpgsql_untrusted".into(),
+            event_trigger: "mark_ddl".into(),
+        }]
+    );
+    assert_eq!(
+        found[0].to_string(),
+        "the enabled event trigger mark_ddl runs reports.mark_ddl(), in the untrusted language \
+         plpgsql_untrusted, which reaches the database server's own files and programs, on \
+         statements any role may run"
+    );
+    // What the check refuses is real: the gateway makes a temporary table, which runs it.
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    gateway
+        .batch_execute("CREATE TEMP TABLE scratch (id int)")
+        .await
+        .unwrap();
+    assert_eq!(fired_in(&gateway).await, "yes");
+
+    // Disabled, it fires on nothing, and passes.
+    admin
+        .batch_execute("ALTER EVENT TRIGGER mark_ddl DISABLE")
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
+/// What the test functions above set in `session`, or an empty string if none ran there.
+async fn fired_in(session: &tokio_postgres::Client) -> String {
+    session
+        .query_one(
+            "SELECT coalesce(current_setting('reports.fired', true), '')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A foreign key's action runs as the owner of the table that holds the key, whoever deleted or
+/// updated the row it references, as a rule's statements run as their table's owner. So a
+/// foreign key on `call_rows` with a `CASCADE`, `SET NULL` or `SET DEFAULT` action, on delete
+/// or on update, is refused. `NO ACTION` and `RESTRICT` only refuse a write, and pass; so does
+/// any action of a foreign key on another table that references `call_rows`, which writes only
+/// that table.
+#[tokio::test]
+async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let row = a_row(&db).await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             INSERT INTO reports.parents VALUES ('{row}');
+             ALTER TABLE switchboard_audit.call_rows
+                 ADD CONSTRAINT purge FOREIGN KEY (id) REFERENCES reports.parents
+                     ON DELETE CASCADE,
+                 ADD CONSTRAINT blank FOREIGN KEY (id) REFERENCES reports.parents
+                     ON UPDATE SET NULL;
+             GRANT DELETE ON reports.parents TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    let action = |constraint: &str, event: &str, action: &str| Problem::ReferentialAction {
+        constraint: constraint.into(),
+        referenced: "reports.parents".into(),
+        event: event.into(),
+        action: action.into(),
+    };
+    let found = problems_of(&db).await;
+    assert_eq!(
+        found,
+        vec![
+            action("blank", "UPDATE", "SET NULL"),
+            action("purge", "DELETE", "CASCADE"),
+        ]
+    );
+    assert_eq!(
+        found[1].to_string(),
+        "the table switchboard_audit.call_rows has the foreign key purge, which references \
+         reports.parents with ON DELETE CASCADE, so each DELETE on reports.parents, by any role \
+         that may make one, writes audit rows as the table's owner"
+    );
+    // What the check refuses is real: the gateway, which may not delete an audit row, deletes
+    // one by deleting the row it references.
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+
+    // Foreign keys that only refuse a write pass, as does a cascade from call_rows to another
+    // table.
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             ALTER TABLE switchboard_audit.call_rows
+                 DROP CONSTRAINT purge,
+                 DROP CONSTRAINT blank,
+                 ADD CONSTRAINT kept FOREIGN KEY (id) REFERENCES reports.parents
+                     ON DELETE RESTRICT ON UPDATE RESTRICT,
+                 ADD CONSTRAINT plain FOREIGN KEY (id) REFERENCES reports.parents
+                     ON DELETE NO ACTION ON UPDATE NO ACTION;
+             CREATE TABLE reports.notes (
+                 call uuid REFERENCES switchboard_audit.call_rows
+                     ON DELETE CASCADE ON UPDATE SET NULL
+             );
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
+/// A role that can act as `pg_read_server_files`, `pg_write_server_files` or
+/// `pg_execute_server_program` reaches the server's files and programs, and through them every
+/// setting and every row, as a superuser does. So a `SECURITY DEFINER` function it owns is
+/// refused when the gateway can run it, whether the owner holds the role itself or inherits it
+/// through another.
+#[tokio::test]
+async fn a_definer_function_whose_owner_can_reach_the_servers_files_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let reader = db.new_role("NOLOGIN", &["pg_read_server_files"]).await;
+    let writer = db.new_role("NOLOGIN", &["pg_write_server_files"]).await;
+    let programs = db.new_role("NOLOGIN", &["pg_execute_server_program"]).await;
+    let runner = db.new_role("NOLOGIN", &[&programs]).await;
+    let admin = db.admin().await;
+    let data: String = admin
+        .query_one("SELECT current_setting('data_directory')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE TABLE reports.lines (line text);
+             GRANT SELECT, INSERT ON reports.lines TO {reader}, {runner};
+             CREATE FUNCTION reports.peek_file() RETURNS text
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN
+                     COPY reports.lines FROM '{data}/PG_VERSION';
+                     RETURN (SELECT line FROM reports.lines LIMIT 1);
+                 END$$;
+             ALTER FUNCTION reports.peek_file() OWNER TO {reader};
+             CREATE FUNCTION reports.run_program() RETURNS text
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN
+                     COPY reports.lines FROM PROGRAM 'echo ran';
+                     RETURN (SELECT line FROM reports.lines WHERE line = 'ran');
+                 END$$;
+             ALTER FUNCTION reports.run_program() OWNER TO {runner};
+             CREATE FUNCTION reports.write_file() RETURNS int
+                 LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+             ALTER FUNCTION reports.write_file() OWNER TO {writer};
+             REVOKE EXECUTE ON FUNCTION reports.peek_file(), reports.run_program(),
+                 reports.write_file() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.peek_file(), reports.run_program(),
+                 reports.write_file() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![
+            definer("reports.peek_file()", &reader, "EXECUTE on it"),
+            definer("reports.run_program()", &runner, "EXECUTE on it"),
+            definer("reports.write_file()", &writer, "EXECUTE on it"),
+        ]
+    );
+
+    // What the check refuses is real: the gateway reads a file of the server's own, and runs a
+    // program on it.
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let version: String = gateway
+        .query_one("SELECT reports.peek_file()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(version.trim().parse::<u32>().is_ok(), "{version}");
+    let ran: String = gateway
+        .query_one("SELECT reports.run_program()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(ran, "ran");
+
+    // With EXECUTE gone, it passes.
+    admin
+        .batch_execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION reports.peek_file(), reports.run_program(),
+                 reports.write_file() FROM {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
 /// EXECUTE on `lo_export` writes any file the server's operating-system user can write, and
 /// `pg_read_file` and the others read or list them, as membership in `pg_write_server_files`
 /// or `pg_read_server_files` would. Each is refused, for every argument list, whether the role
