@@ -166,8 +166,8 @@ impl MockDocs {
             .with_state(self.clone())
     }
 
-    /// The admin endpoint. It answers only the admin credential, if one is set, and no caller;
-    /// without one, it answers the accepted callers, so serve it only where none can reach it,
+    /// The admin endpoint. It answers only the admin credential, if one is set, and no caller,
+    /// not even a caller whose token has the admin credential's digest; without one, it answers the accepted callers, so serve it only where none can reach it,
     /// such as on loopback. It logs each request. Serve it on its own listener, so a network
     /// policy can keep it apart from the MCP endpoint.
     ///
@@ -329,6 +329,11 @@ impl MockDocs {
 
     /// Who sent an admin request. With an admin credential set, only its bearer is accepted,
     /// and no caller's; without one, the callers are, as on `POST /mcp`.
+    ///
+    /// The admin credential is known by its digest alone. In the static mode the settings
+    /// refuse a digest that is also a caller's, but in the JWT mode nothing at start can tell
+    /// whether it is the digest of a caller's token. So a bearer `POST /mcp` would accept is
+    /// refused here, whatever its digest.
     fn authenticate_admin(&self, headers: &HeaderMap) -> Caller {
         let Some(admin) = &self.inner.admin else {
             return self.authenticate(headers);
@@ -336,7 +341,8 @@ impl MockDocs {
         let token = request_bearer(headers);
         Caller {
             bearer_sha256: token.map(|token| logged_prefix(&sha256(token))),
-            accepted: token.is_some_and(|token| admin.accepts(token)),
+            accepted: token.is_some_and(|token| admin.accepts(token))
+                && !self.authenticate(headers).accepted,
             name: None,
             jwt: None,
         }

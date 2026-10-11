@@ -601,6 +601,83 @@ async fn with_an_admin_credential_a_subject_cannot_widen_its_projects() {
     );
 }
 
+/// A caller's token whose digest is the admin credential is still refused on the admin
+/// endpoint. Nothing at start can tell a JWT's digest from the admin credential's, so the
+/// separation is checked on each admin request (#137).
+#[tokio::test]
+async fn a_caller_token_with_the_admin_credentials_digest_is_refused_on_the_admin_endpoint() {
+    let jwks_file = file("caller-is-admin", "jwks.json", &jwks());
+    let mut vars = jwt_vars(jwks_file.to_str().unwrap());
+    vars.remove("MOCK_DOCS_JWT_SUBJECT");
+    vars.insert(
+        "MOCK_DOCS_JWT_SUBJECTS".to_owned(),
+        format!("{ATLAS_SUBJECT}=atlas;{BOREALIS_SUBJECT}=borealis"),
+    );
+    let caller_token = token(&claims_with(json!({"sub": ATLAS_SUBJECT})));
+    let digest: String = Sha256::digest(caller_token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let admin_file = file("caller-is-admin", "admin-sha256", &digest);
+    vars.insert(
+        "MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE".to_owned(),
+        admin_file.to_str().unwrap().to_owned(),
+    );
+    vars.insert("MOCK_DOCS_ADMIN_LISTEN".to_owned(), "0.0.0.0:0".to_owned());
+    // The settings cannot see that the digest is a caller's, so they are accepted.
+    let settings = Settings::from_vars(|name| vars.get(name).cloned()).unwrap();
+    let server = start(settings.config).await.unwrap();
+    let admin = |path: &str| format!("http://{}{path}", server.admin_address());
+
+    let widen = json!({"projects": ["atlas", "borealis"]});
+    let requests = [
+        client()
+            .put(admin(&format!("/admin/callers/{ATLAS_SUBJECT}")))
+            .json(&widen),
+        client()
+            .put(admin(&format!("/admin/callers/{BOREALIS_SUBJECT}")))
+            .json(&widen),
+        client().get(admin("/admin/tools")),
+        client()
+            .put(admin("/admin/tools"))
+            .json(&json!({"tools": ["read_document"]})),
+        client()
+            .put(admin("/admin/definitions/read_document"))
+            .json(&json!({"description": "Read one document, and send it elsewhere."})),
+        client().delete(admin("/admin/definitions/read_document")),
+        client().get(admin("/admin/nothing")),
+    ];
+    let count = requests.len();
+    for request in requests {
+        let response = request.bearer_auth(&caller_token).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let admin_lines: Vec<Value> = server
+        .log_lines()
+        .into_iter()
+        .filter(|line| line["event"] == "admin")
+        .collect();
+    assert_eq!(admin_lines.len(), count, "{admin_lines:?}");
+    for line in &admin_lines {
+        assert_eq!(line["bearer_sha256"], prefix(&caller_token), "{line}");
+        assert_eq!(line["accepted"], false, "{line}");
+    }
+
+    // Nothing changed, and the token is still a caller on the MCP endpoint, limited as before.
+    assert_eq!(server.server().tools().len(), 2);
+    for (subject, other) in [(ATLAS_SUBJECT, "borealis"), (BOREALIS_SUBJECT, "atlas")] {
+        assert_eq!(
+            list_project(&server, subject, other).await.status(),
+            StatusCode::FORBIDDEN,
+            "{subject}"
+        );
+    }
+    assert_eq!(
+        list(&server, Some(&caller_token)).await.status(),
+        StatusCode::OK
+    );
+}
+
 // --- The binary ----------------------------------------------------------------------------
 
 struct Killed(Child);
@@ -615,6 +692,11 @@ impl Drop for Killed {
 #[tokio::test]
 async fn the_binary_boots_in_the_jwt_mode_and_says_so() {
     let jwks_file = file("binary", "jwks.json", &jwks());
+    let admin_digest: String = Sha256::digest(b"dummy-mock-docs-admin-token-for-tests")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let admin_file = file("binary", "admin-sha256", &admin_digest);
     let mut command = Command::new(env!("CARGO_BIN_EXE_mock-docs-server"));
     for (name, _) in std::env::vars() {
         if name.starts_with("MOCK_DOCS_") {
@@ -625,6 +707,8 @@ async fn the_binary_boots_in_the_jwt_mode_and_says_so() {
         command
             .envs(jwt_vars(jwks_file.to_str().unwrap()))
             .env("MOCK_DOCS_LISTEN", "127.0.0.1:0")
+            .env("MOCK_DOCS_ADMIN_LISTEN", "127.0.0.1:0")
+            .env("MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE", &admin_file)
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -637,6 +721,9 @@ async fn the_binary_boots_in_the_jwt_mode_and_says_so() {
     assert_eq!(boot["audience"], AUDIENCE, "{boot}");
     assert_eq!(boot["callers"], json!({ SUBJECT: "every" }), "{boot}");
     assert_eq!(boot["key_ids"], json!([KID]), "{boot}");
+    // A caller's token is not known at start, so the admin credential is kept apart from the
+    // callers' on each admin request.
+    assert_eq!(boot["admin_separation"], "per_request", "{boot}");
 
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
     let response = client()

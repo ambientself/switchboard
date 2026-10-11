@@ -774,6 +774,7 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
     );
     assert_eq!(boot["admin_listen"], Value::Null);
     assert_eq!(boot["admin_credential"], Value::Null);
+    assert_eq!(boot["admin_separation"], Value::Null);
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
 
     let client = reqwest::Client::new();
@@ -878,6 +879,7 @@ async fn the_binary_admin_endpoint_answers_only_the_admin_credential() {
     let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
     let boot: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
     assert_eq!(boot["admin_credential"], sha256_hex(ADMIN_TOKEN)[..12]);
+    assert_eq!(boot["admin_separation"], "at_start");
     let url = format!(
         "http://{}/admin/tools",
         boot["admin_listen"].as_str().unwrap()

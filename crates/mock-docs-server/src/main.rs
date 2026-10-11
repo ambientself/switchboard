@@ -19,7 +19,10 @@
 //!   endpoint then answers the callers, who could otherwise widen their own projects.
 //! - `MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE`: a file holding the hex SHA-256 of the admin
 //!   credential. The admin endpoint then answers only that bearer, and no caller's. It must
-//!   differ from every caller's, and needs `MOCK_DOCS_ADMIN_LISTEN`.
+//!   differ from every caller's, and needs `MOCK_DOCS_ADMIN_LISTEN`. The static mode checks
+//!   that at start. The JWT mode cannot, since a caller's token is not known in advance: it
+//!   refuses, on each admin request, a bearer that verifies as a caller's, and the boot line
+//!   says so with `"admin_separation": "per_request"`.
 //! - `MOCK_DOCS_TOOLS`: the tools offered at start, comma-separated, default
 //!   `list_documents,read_document`. Empty, it offers none.
 //! - `MOCK_DOCS_SLOW_MS`: how long `slow-doc` takes, default 10000.
@@ -30,7 +33,7 @@
 
 use std::process::ExitCode;
 
-use mock_docs_server::{AcceptedCredential, Credential, Log, MockDocs, Settings};
+use mock_docs_server::{AcceptedCredential, Config, Credential, Log, MockDocs, Settings};
 use serde_json::{Map, Value, json};
 
 #[tokio::main]
@@ -66,6 +69,7 @@ async fn main() -> ExitCode {
             .admin
             .as_ref()
             .map(AcceptedCredential::logged_prefix),
+        "admin_separation": admin_separation(&settings.config),
         "tools": tools,
         "slow_ms": settings.config.slow.as_millis(),
     });
@@ -114,6 +118,16 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// How the admin credential is kept apart from the callers', if one is set: checked once at
+/// start in the static mode, and on each admin request in the JWT mode, where a caller's token
+/// is not known in advance. The server refuses a caller's bearer on the admin endpoint in both.
+fn admin_separation(config: &Config) -> Option<&'static str> {
+    config.admin.as_ref().map(|_| match config.accepted {
+        Credential::Static(_) => "at_start",
+        Credential::Jwt(_) => "per_request",
+    })
 }
 
 /// The address a listener is bound to, which differs from the configured one for port 0.

@@ -2444,13 +2444,17 @@ mutate("mock-docs-admin-credential-unused-accepted", "an admin credential withou
 mutate("mock-docs-admin-credential-is-a-caller", "the admin credential may also be a caller's", MC,
        "            && callers.iter().any(|caller| caller.same_token(admin))", "            && callers.is_empty()")
 mutate("mock-docs-admin-callers-accepted", "with an admin credential, the admin endpoint still answers the callers", MS,
-       "            accepted: token.is_some_and(|token| admin.accepts(token)),",
+       "            accepted: token.is_some_and(|token| admin.accepts(token))\n                && !self.authenticate(headers).accepted,",
        "            accepted: token.is_some_and(|token| admin.accepts(token))\n                || self.authenticate(headers).accepted,")
 mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the callers and ignores the admin credential", MS,
        "        let Some(admin) = &self.inner.admin else {", "        let Some(admin) = None::<&AcceptedCredential> else {")
 mutate("mock-docs-admin-fallback-takes-callers", "an unknown path on the admin endpoint accepts the callers' bearers", MS,
        "            .fallback(admin_other_request)\n            .with_state(self.clone())",
        "            .fallback(other_request)\n            .with_state(self.clone())")
+# A caller's JWT with the admin credential's digest (#137).
+mutate("mock-docs-admin-caller-jwt-accepted", "a caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "            accepted: token.is_some_and(|token| admin.accepts(token))\n                && !self.authenticate(headers).accepted,",
+       "            accepted: token.is_some_and(|token| admin.accepts(token)),")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
