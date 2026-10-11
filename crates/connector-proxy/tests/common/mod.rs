@@ -16,8 +16,8 @@ use gateway_core::{
     decide,
 };
 use gateway_testkit::{
-    CONNECTOR, Caller, Fixture, InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_READ,
-    TEAM_A_DOCUMENT, document, row_start,
+    CONNECTOR, Caller, DRAFT_TOOL, Fixture, InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL,
+    SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, document, row_start,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -207,17 +207,23 @@ impl Harness {
         &self.caller_token
     }
 
-    /// Decides, begins, runs and finishes one call to `tool` on the read surface, and returns
-    /// the answer. The read tool's call names team A's own document, so the decision allows it;
-    /// the scope-checking tool's resources are unknown until it runs.
+    /// Decides, begins, runs and finishes one call to `tool` on the read surface, or for the
+    /// draft tool, which is classified `propose`, on the surface that serves every tool, and
+    /// returns the answer. The read and draft tools' calls name team A's own document, so the
+    /// decision allows them; the scope-checking tool's resources are unknown until it runs.
     pub async fn call(&self, connector: &ProxyConnector, tool: &str, arguments: Value) -> Answer {
         let resources = if tool == SCOPED_READ_TOOL {
             Resources::Unknown
         } else {
             Resources::Named(vec![document(TEAM_A_DOCUMENT)])
         };
+        let surface = if tool == DRAFT_TOOL {
+            SURFACE_ALL
+        } else {
+            SURFACE_READ
+        };
         let call = CallContext {
-            caller: Fixture::context_for(self.principal.clone(), SURFACE_READ),
+            caller: Fixture::context_for(self.principal.clone(), surface),
             tool: RequestedTool::new(tool),
             resources,
         };

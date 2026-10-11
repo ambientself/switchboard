@@ -62,10 +62,14 @@ gateway-testkit = { path = "../gateway-testkit" }
 gateway = { path = ".", features = ["test-support"] }
 # The proxied server the wiring tests forward to.
 mock-docs-server = { path = "../mock-docs-server" }
+# A CA and a certificate for the HTTPS issuer the keys tests boot from, made when they run.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Reads the mock server's log of which bearers reached it.
 sha2 = "0.10"
 # The loopback tests write HTTP by hand over a socket.
 tokio = { version = "1", features = ["io-util", "sync"] }
+# The HTTPS issuer's TLS, with ring, as the gateway's own client has it.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 trybuild = "1"
 
 [lints]

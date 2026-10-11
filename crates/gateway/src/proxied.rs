@@ -1,10 +1,12 @@
 //! What a proxied server's connector is wrapped in when the policy comes from the registry:
 //! the resources a call names, and the check of its arguments against the tool's approved
 //! schema, both read from the policy version the call's request took. A call whose arguments
-//! fail the check is outcome `error` and nothing is sent upstream; a call whose tool was
-//! withdrawn meanwhile is outcome `refused`.
+//! fail the check is outcome `error`, of the kind `invalid_arguments`, and nothing is sent
+//! upstream; a call whose tool was withdrawn meanwhile is outcome `refused`.
 
-use gateway_core::{ApprovedTool, BoxFuture, Connector, Resources, ToolCall, ToolOutcome};
+use gateway_core::{
+    ApprovedTool, BoxFuture, Connector, ErrorKind, Resources, ToolCall, ToolOutcome,
+};
 use gateway_registry::ArgumentError;
 use serde_json::Value;
 
@@ -17,6 +19,16 @@ pub fn undeclared_argument(tool: &str) -> String {
     format!(
         "Tool `{tool}` was called with an argument its approved definition does not declare, so \
          the call was not sent. Call `tools/list` to see the arguments it takes."
+    )
+}
+
+/// The sentence for a call whose arguments are declared but do not match the tool's approved
+/// schema: a value of the wrong type, out of bounds, or missing where required. The call is
+/// not sent (decision 0011, section 1).
+pub fn invalid_argument(tool: &str) -> String {
+    format!(
+        "Tool `{tool}` was called with arguments that do not match its approved schema, so the \
+         call was not sent. Call `tools/list` to see the arguments it takes."
     )
 }
 
@@ -88,18 +100,34 @@ impl Connector for CheckedArguments<'_> {
                 adapter.check_arguments(call.arguments()).map_err(|error| {
                     // The path is the caller's own text, so only the tool goes in the sentence;
                     // the log has the rest.
-                    match &error {
-                        ArgumentError::Undeclared { path, .. } => tracing::warn!(
-                            %tool,
-                            path = path.as_str(),
-                            "a call with an undeclared argument failed the argument check"
-                        ),
-                        ArgumentError::NotAnObject { .. } => tracing::warn!(
-                            %tool,
-                            "a call whose arguments are not an object failed the argument check"
-                        ),
-                    }
-                    ToolOutcome::Error(undeclared_argument(tool.as_str()))
+                    let sentence = match &error {
+                        ArgumentError::Undeclared { path, .. } => {
+                            tracing::warn!(
+                                %tool,
+                                path = path.as_str(),
+                                "a call with an undeclared argument failed the argument check"
+                            );
+                            undeclared_argument(tool.as_str())
+                        }
+                        ArgumentError::Invalid { path, keyword, .. } => {
+                            tracing::warn!(
+                                %tool,
+                                path = path.as_str(),
+                                keyword,
+                                "a call whose arguments do not match the approved schema failed \
+                                 the argument check"
+                            );
+                            invalid_argument(tool.as_str())
+                        }
+                        ArgumentError::NotAnObject { .. } => {
+                            tracing::warn!(
+                                %tool,
+                                "a call whose arguments are not an object failed the argument check"
+                            );
+                            undeclared_argument(tool.as_str())
+                        }
+                    };
+                    ToolOutcome::error(ErrorKind::InvalidArguments, sentence)
                 })
             }
             // Withdrawn from the policy served now. The request's own version always holds an

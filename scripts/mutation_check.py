@@ -648,9 +648,15 @@ for field, old, new in [
     ("surface-constant", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),", '        surface: SurfaceName::new(sentences::escape(\n            "x",'),
 ]:
     mutate(f"record-{field}", f"the row's {field} is wrong", SRC + "audit.rs", old, new)
-for variant, renamed in [("Ok", "success"), ("Error", "failed")]:
-    mutate(f"outcome-{variant.lower()}-renamed", f"the {variant} outcome is written as `{renamed}`", SRC + "audit.rs",
-           f"    {variant},\n    /// The ", f"    #[serde(rename = \"{renamed}\")]\n    {variant},\n    /// The ")
+mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
+       "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
+mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
+       "    Error {\n        /// What kind of failure.", "    #[serde(rename = \"failed\")]\n    Error {\n        /// What kind of failure.")
+mutate("core-error-kind-field-renamed", "an error's kind is written under the name `kind`", SRC + "audit.rs",
+       "        /// What kind of failure. The caller's message is not recorded.\n        error_kind: ErrorKind,",
+       "        /// What kind of failure. The caller's message is not recorded.\n        #[serde(rename = \"kind\")]\n        error_kind: ErrorKind,")
+mutate("core-error-kind-names-changed", "the error kinds are written in kebab case, which the table's check does not hold", SRC + "connector.rs",
+       "#[serde(rename_all = \"snake_case\")]\npub enum ErrorKind {", "#[serde(rename_all = \"kebab-case\")]\npub enum ErrorKind {")
 mutate("outcome-refused-renamed", "the refused outcome is written as `rejected`", SRC + "audit.rs",
        "    Refused {\n        /// The connector's sentence", "    #[serde(rename = \"rejected\")]\n    Refused {\n        /// The connector's sentence")
 for variant in ("Allow", "Deny"):
@@ -720,9 +726,16 @@ mutate("finish-refusal-unrecorded-answered", "a refusal that could not be record
        "")
 mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not the one recorded", SRC + "audit.rs",
        "            Answer::Refused(sentence),", "            Answer::Refused(sentence.to_uppercase()),")
-# A guard given up (decision 0009): its row is completed as error, never ok, through the store.
+mutate("core-finish-error-kind-dropped", "finish records every error as other, whatever its kind", SRC + "audit.rs",
+       "            (Outcome::Error { error_kind }, Answer::Error(message))",
+       "            (Outcome::Error { error_kind: { let _ = error_kind; ErrorKind::Other } }, Answer::Error(message))")
+# A guard given up (decision 0009): its row is completed as error, of the kind other, never ok,
+# through the store.
+GIVE_UP_OUTCOME = "            outcome: Outcome::Error {\n                error_kind: ErrorKind::Other,\n            },\n            latency_ms: 0,"
 mutate("core-give-up-completes-ok", "a guard given up records its call as ok", SRC + "audit.rs",
-       "            outcome: Outcome::Error,\n            latency_ms: 0,", "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+       GIVE_UP_OUTCOME, "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+mutate("core-give-up-kind-not-other", "a guard given up records its error as a vendor refusal", SRC + "audit.rs",
+       GIVE_UP_OUTCOME, GIVE_UP_OUTCOME.replace("ErrorKind::Other", "ErrorKind::VendorRefusal"))
 mutate("core-give-up-skips-finish", "a guard given up leaves its row open and reports no failure", SRC + "audit.rs",
        "    let failure = store\n        .finish(&completion)\n        .await\n        .err()\n        .map(AuditFailure::from_store);",
        "    let failure: Option<AuditFailure> = None;")
@@ -740,7 +753,7 @@ mutate("core-read-not-cancelled-mid-run", "a read whose caller goes while it run
 mutate("core-read-gone-already-called", "a read whose caller has already gone is called all the same", SRC + "audit.rs",
        "    if already_gone {\n", "    if false && already_gone {\n")
 mutate("core-read-cancel-outcome-ok", "a cancelled read is recorded as ok", SRC + "audit.rs",
-       "    let cancelled = || ToolOutcome::Error(sentences::CALLER_DISCONNECTED.to_owned());",
+       "    let cancelled = || ToolOutcome::error(ErrorKind::Other, sentences::CALLER_DISCONNECTED);",
        "    let cancelled = || ToolOutcome::Ok(serde_json::Value::Null);")
 # A list row (decision 0009): the tools it names, its count, and the value only it can make.
 mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
@@ -1063,6 +1076,9 @@ mutate("identity-replace-keys-drops-other-issuers", "a replacement rebuilds the 
        REPLACE_BUILD, "        let verifier = TokenVerifier::new(vec![next[index].clone()], Arc::clone(&self.clock))?;\n")
 mutate("identity-replace-keys-while-disabled", "keys supplied to a disabled gate are accepted", IDENTITY_SRC + "identity.rs",
        "            return Err(ConfigError::KeysWhileDisabled(issuer.clone()));", "            return Ok(KeysReplaced::default());")
+mutate("identity-replace-changed-never", "a key replaced under a kept kid is reported as no change", IDENTITY_SRC + "identity.rs",
+       "                .filter(|(kid, key)| before.get(*kid).is_some_and(|old| old != *key))\n",
+       "                .filter(|_| false)\n")
 
 # --- The identity gate and the opaque failure ----------------------------------------------
 
@@ -1179,7 +1195,17 @@ mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clo
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
        "                let _ = state.complete(row, &error);", "                let _ = &error;")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
-       "            if state.confirmation_lost.take() {\n                let error", "            if false {\n                let error")
+       "            if state.confirmation_lost.take() {\n                // As the Postgres store",
+       "            if false {\n                // As the Postgres store")
+# A repeated finish must match the completion stored, an error's kind included, as Postgres's does.
+mutate("fake-audit-error-kind-repeat-unchecked", "a repeated finish with an error of another kind is accepted", A,
+       "            Some(written) if written == completion => Ok(()),",
+       "            Some(written)\n"
+       "                if written == completion\n"
+       "                    || (matches!(written.outcome, Outcome::Error { .. })\n"
+       "                        && matches!(completion.outcome, Outcome::Error { .. })\n"
+       "                        && written.latency_ms == completion.latency_ms) =>\n"
+       "            {\n                Ok(())\n            }")
 mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                return Err(lost());", "            if false {\n                return Err(lost());")
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
@@ -1263,7 +1289,7 @@ mutate("fake-connector-scope-any-team", "a workload may reach any team's documen
 mutate("fake-connector-scope-any-group", "a user may reach any group's documents through the scoped tool", K,
        "                    .filter_map(|group| state.group_scopes.get(group))", "                    .flat_map(|_| state.group_scopes.values())")
 mutate("fake-connector-credential-refusal-ignored", "a refused credential does not stop the call", K,
-       "                Err(_) => {\n                    return ToolOutcome::Error(\n                        \"the fixture connector could not get a credential\".into(),\n                    );\n                }",
+       "                Err(_) => {\n                    return ToolOutcome::error(\n                        ErrorKind::Other,\n                        \"the fixture connector could not get a credential\",\n                    );\n                }",
        "                Err(_) => String::new(),")
 mutate("fake-connector-echo-drops-credential", "the echo does not carry the credential label", K,
        '    json!({"tool": tool, "echo": arguments, "credential": credential})', '    json!({"tool": tool, "echo": arguments, "credential": ""})')
@@ -1660,8 +1686,8 @@ STALE_KEY = ('{"keys": [{"kty": "EC", "crv": "P-256", "kid": "stale", '
              '"x": "S8cWydNibCrzVUwFcMpa8CorM1ZTnJmxVTZWONUI_-o", '
              '"y": "0ziqidx7IOWX78hzezpoVuoCwdilEjtBLXKRwcxVbeo"}]}')
 mutate("gw-keys-refresh-never-runs", "the refresh timer ticks and fetches nothing", KEYS,
-       "        let _ = refresh(&identity, &refreshed.source, &mut last_failure).await;\n",
-       "        let _ = (&identity, &refreshed.source, &mut last_failure);\n")
+       "        let _ = refresh(&identity, &refreshed, &ages, &mut last_failure).await;\n",
+       "        let _ = (&identity, &refreshed, &ages, &mut last_failure);\n")
 mutate("gw-keys-refresh-failure-clears-keys", "a failed refresh drops the keys in use for a key the issuer does not sign with", KEYS,
        "        Err(error) => Err(RefreshError::from(error)),\n",
        "        Err(error) => {\n"
@@ -1682,6 +1708,37 @@ mutate("gw-keys-url-and-file-both-accepted", "an issuer with both a keys file an
        "        (Some(file), None) => {\n",
        "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
        "        (Some(file), _) => {\n")
+# Issue #88: a CA file and a token file belong to a keys URL, and are read from the deployment
+# file's directory.
+mutate("gw-deploy-keys-ca-beside-file-accepted", "keys_ca_file beside a keys file is accepted and ignored", GW_DEPLOY,
+       "            if issuer.keys_ca_file.is_some() {\n", "            if false {\n")
+mutate("gw-deploy-keys-token-relative-to-cwd", "a relative keys_token_file is read from the working directory", GW_DEPLOY,
+       "                token_file: issuer.keys_token_file.map(|path| base.join(path)),\n",
+       "                token_file: issuer.keys_token_file,\n")
+# Issue #91: the 30 s floor and the refusal of an interval beside a keys file; a key replaced
+# under a kept kid is reported and logged; boot's and each refresh's fetch time is exported; and
+# the binary starts both the key refresher and the registry watcher.
+mutate("gw-keys-refresh-floor-removed", "any keys_refresh_seconds is accepted, 0 included", GW_DEPLOY,
+       "            if refresh < MIN_KEYS_REFRESH {\n", "            if false {\n")
+mutate("gw-keys-refresh-floor-inclusive", "keys_refresh_seconds = 30 is refused", GW_DEPLOY,
+       "            if refresh < MIN_KEYS_REFRESH {\n", "            if refresh <= MIN_KEYS_REFRESH {\n")
+mutate("gw-keys-refresh-beside-file-accepted", "keys_refresh_seconds beside a keys file is accepted and ignored", GW_DEPLOY,
+       "            if issuer.keys_refresh_seconds.is_some() {\n", "            if false {\n")
+mutate("gw-keys-changed-not-logged", "a key replaced under a kept kid is put in force with no line logged", KEYS,
+       "                || !replaced.removed.is_empty()\n                || !replaced.changed.is_empty();\n",
+       "                || !replaced.removed.is_empty();\n")
+mutate("gw-keys-age-not-reset", "a refresh that succeeds leaves the exported age of the keys growing", KEYS,
+       "            ages.fetched(refreshed.age);\n", "            let _ = (ages, refreshed.age);\n")
+mutate("gw-bin-key-ages-not-exported", "switchboard's metrics leave out the age of each issuer's keys", GW_BIN,
+       "        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())\n"
+       "            .with_issuer_keys(prepared.keys.ages());\n",
+       "        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone());\n")
+mutate("gw-bin-keys-refresher-not-spawned", "switchboard never refreshes the keys it fetched at boot", GW_BIN,
+       "    let refreshing = tokio::spawn(prepared.keys.run());\n",
+       "    let refreshing = tokio::spawn(async {});\n")
+mutate("gw-bin-registry-watch-not-spawned", "switchboard never reads the registry file again", GW_BIN,
+       "    let watching = tokio::spawn(prepared.watch.run());\n",
+       "    let watching = tokio::spawn(async {});\n")
 
 # Metrics. Every answer with the audit-failure sentence is counted, in one place; the open-row
 # poller starts with the metrics listener; the metrics listener never takes the MCP port. And
@@ -2016,6 +2073,8 @@ mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin i
        "            begun\n        })", "            begun.or_else(|_| Ok(()))\n        })")
 mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so audit::listed hands out a Listed with no row stored", DEV_PRINTER,
        "            listed\n        })", "            listed.or_else(|_| Ok(()))\n        })")
+mutate("dev-printer-swallows-finish-failure", "the printer turns a failed finish into success, so a refusal the log does not hold is passed on as recorded", DEV_PRINTER,
+       "            finished\n        })", "            finished.or_else(|_| Ok(()))\n        })")
 mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
        "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
 mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
@@ -2086,7 +2145,7 @@ MC = MOCK + "src/config.rs"
 MD = MOCK + "src/documents.rs"
 MJ = MOCK + "src/jwt.rs"
 mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
-       "                accepted: accepted.accepts(token),", "                accepted: true,")
+       "                    accepted: found.is_some(),", "                    accepted: true,")
 mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
@@ -2107,7 +2166,8 @@ mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools f
        '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
        '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
 mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
-       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(accepted.logged_prefix()),")
+       "                    bearer_sha256: Some(logged_prefix(&sha256(token))),",
+       "                    bearer_sha256: found.map(AcceptedCredential::logged_prefix),")
 mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
 mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
        "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
@@ -2130,7 +2190,7 @@ mutate("mock-fail-doc-succeeds", "fail-doc answers with a result", MS,
        "            Some(Content::Fail) => Err(RpcError::new(", "            Some(Content::Fail) => Ok(text_result(String::new())).map_err(|_: RpcError| RpcError::new(")
 mutate("mock-huge-doc-half-size", "huge-doc answers with half a mebibyte", MS, '"x".repeat(HUGE_BYTES)', '"x".repeat(HUGE_BYTES / 2)')
 mutate("mock-two-credentials-take-the-file", "with both credential variables set, the file wins", MC,
-       "            (Some(path), None, None) => read_token_file", "            (Some(path), _, _) => read_token_file")
+       "            (Some(path), None, None) => vec![read_token_file", "            (Some(path), _, _) => vec![read_token_file")
 mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part of the token", MC,
        "    let token = text.trim();", "    let token = text.as_str();")
 mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
@@ -2147,7 +2207,7 @@ mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice",
        "                if tools.contains(&tool) {", "                if false {")
 # The JWT mode (decision 0010).
 mutate("mock-docs-jwt-subject-unchecked", "any subject from the trusted issuer is accepted", MJ,
-       "            Some(subject) if subject == self.subject => Ok(subject.to_owned()),",
+       "            Some(subject) if self.subjects.contains_key(subject) => Ok(subject.to_owned()),",
        "            Some(subject) => Ok(subject.to_owned()),")
 mutate("mock-docs-jwt-audience-off", "a token for any audience is accepted", MJ,
        "        validation.set_audience(&[&self.audience]);", "        validation.validate_aud = false;")
@@ -2166,7 +2226,7 @@ mutate("mock-docs-jwt-logs-unverified-sub", "a refused token's claimed subject i
        "        ),")
 mutate("mock-docs-jwt-subject-before-audience", "the subject is checked before the issuer and audience", MJ,
        "        validation.set_audience(&[&self.audience]);",
-       "        validation.set_audience(&[&self.audience]);\n        validation.sub = Some(self.subject.clone());")
+       "        validation.set_audience(&[&self.audience]);\n        validation.sub = self.subjects.keys().next().cloned();")
 mutate("mock-docs-jwt-issuer-array", "an array of issuers that includes the trusted one is accepted", MJ,
        "        if claims.get(\"iss\").and_then(Value::as_str) != Some(self.issuer.as_str()) {", "        if false {")
 # Without aud required, jsonwebtoken 11 accepts a token with no aud. Dropping iss from the list
@@ -2199,6 +2259,31 @@ mutate("mock-docs-jwt-key-use-unchecked", "a key declared for encryption is acce
        "                .is_some_and(|key_use| *key_use != PublicKeyUse::Signature)", "                .is_some_and(|_| false)")
 mutate("mock-docs-jwt-duplicate-kid-accepted", "two keys with one kid are accepted, the last one kept", MJ,
        "            if keys.insert(kid.clone(), key).is_some() {", "            if keys.insert(kid.clone(), key).is_some() && false {")
+# Each caller limited to its projects (#11), and the admin changes to definitions and callers.
+mutate("mock-docs-project-limit-ignored", "a caller may name a project outside its list", MS,
+       "        let allowed = server.allows(&caller, project.as_ref().and_then(Value::as_str));",
+       "        let allowed = true;")
+mutate("mock-docs-forbidden-carries-jsonrpc", "the 403 for a project outside the list carries a JSON-RPC error", MS,
+       "            return StatusCode::FORBIDDEN.into_response();",
+       "            return rpc_error(StatusCode::FORBIDDEN, id, INVALID_PARAMS, \"project not allowed\");")
+mutate("mock-docs-subject-map-first-only", "MOCK_DOCS_JWT_SUBJECTS keeps only its first subject", MC,
+       "        .filter(|entry| !entry.is_empty())\n    {", "        .filter(|entry| !entry.is_empty())\n        .take(1)\n    {")
+mutate("mock-docs-subject-twice-accepted", "MOCK_DOCS_JWT_SUBJECTS may name a subject twice, the last one kept", MC,
+       "        if subjects.insert(subject.to_owned(), projects).is_some() {",
+       "        if subjects.insert(subject.to_owned(), projects).is_some() && false {")
+mutate("mock-docs-static-project-ignored", "a digest file's projects are read and then ignored", MC,
+       "                .limited_to(parse_projects(projects.trim()).map_err(ConfigError::DigestFile)?),",
+       "                .limited_to(parse_projects(projects.trim()).map_err(ConfigError::DigestFile).map(|_| Projects::Every)?),")
+mutate("mock-docs-digest-twice-accepted", "a digest file may give one digest twice", MC,
+       "        if accepted.iter().any(|other| other.logged_prefix() == prefix) {", "        if false {")
+mutate("mock-docs-unknown-project-accepted", "a project list may name a project the server does not hold", MC,
+       "        if !PROJECTS.contains(&project) {", "        if false {")
+mutate("mock-docs-definition-override-ignored", "tools/list serves the default description after an override", MS,
+       "            definition[\"description\"] = json!(description);", "            let _ = description;")
+mutate("mock-docs-admin-projects-ignored", "the admin endpoint answers a change to a caller's projects without making it", MS,
+       "    if !server.set_projects(&target, projects.clone()) {", "    if server.projects(&target).is_none() {")
+mutate("mock-docs-admin-change-refusal-skipped", "the admin changes to definitions and callers answer a caller they did not accept", MS,
+       "    if caller.accepted {\n        Some(line)", "    if true {\n        Some(line)")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
@@ -2218,8 +2303,14 @@ PO = PROXY + "src/outcome.rs"
 PK = PROXY + "src/credentials.rs"
 # The bounds.
 mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
-       "        match tokio::time::timeout(self.deadline, self.exchange(request)).await {",
-       "        match Ok::<_, ()>(self.exchange(request).await) {")
+       "        match tokio::time::timeout(self.deadline, self.exchange(request, late)).await {",
+       "        match Ok::<_, ()>(self.exchange(request, late).await) {")
+# The kind of an answer too large, too late or broken off: its own from a read, other from any
+# other tool until `unknown` is built (decision 0011).
+mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
+       "            ErrorKind::OversizedOrLateRead\n        } else {", "            ErrorKind::Other\n        } else {")
+mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
+       "        } else {\n            ErrorKind::Other\n        };", "        } else {\n            ErrorKind::OversizedOrLateRead\n        };")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -2234,7 +2325,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| ToolOutcome::Error(outcome::BROKEN_OFF.to_owned()))?;",
+       "            let frame = frame.map_err(|_| ToolOutcome::error(late, outcome::BROKEN_OFF))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -2247,20 +2338,26 @@ mutate("proxy-unmapped-tool-sent-as-is", "a tool with no upstream name is sent u
        "        let upstream_name = self.tools.get(&tool.name).map_or(tool.name.as_str(), String::as_str);")
 mutate("proxy-exposed-name-sent", "the exposed name is sent instead of the upstream name", PC,
        "self.request(id, upstream_name, arguments, &secret)", "self.request(id, tool.name.as_str(), arguments, &secret)")
+PROXY_NOT_AN_OBJECT = ("            return ToolOutcome::error(\n                ErrorKind::InvalidArguments,\n"
+                       "                outcome::ARGUMENTS_NOT_AN_OBJECT,\n            );")
 mutate("proxy-arguments-unchecked", "arguments that are not an object are sent as an empty object", PC,
-       "        let Value::Object(arguments) = call.arguments() else {\n"
-       "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
+       "        let Value::Object(arguments) = call.arguments() else {\n" + PROXY_NOT_AN_OBJECT + "\n        };",
        "        let empty = Map::new();\n        let arguments = match call.arguments() {\n"
        "            Value::Object(arguments) => arguments,\n            _ => &empty,\n        };")
 mutate("proxy-arguments-not-object-refused", "arguments that are not an object are recorded as refused, not as an error", PC,
-       "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());",
-       "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());")
+       PROXY_NOT_AN_OBJECT, "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());")
+mutate("proxy-arguments-kind-other", "arguments that are not an object are recorded as another error, not invalid arguments", PC,
+       PROXY_NOT_AN_OBJECT, PROXY_NOT_AN_OBJECT.replace("ErrorKind::InvalidArguments", "ErrorKind::Other"))
 # Statuses.
 mutate("proxy-401-not-named", "a rejected credential is reported as a bare status", PC,
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
-mutate("proxy-403-is-an-error", "the server's refusal is recorded as an error", PC,
-       "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));",
-       "            return Err(ToolOutcome::Error(outcome::UPSTREAM_REFUSED.to_owned()));")
+# A 403 is the vendor's refusal (#61): an error of the kind vendor_refusal, not a connector's refusal.
+PROXY_403 = ("            return Err(ToolOutcome::error(\n                ErrorKind::VendorRefusal,\n"
+             "                outcome::UPSTREAM_REFUSED,\n            ));")
+mutate("proxy-403-is-refused", "the server's 403 is recorded as a connector's refusal, not as an error", PC,
+       PROXY_403, "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));")
+mutate("proxy-403-kind-other", "the server's 403 is recorded as another error, not a vendor refusal", PC,
+       PROXY_403, PROXY_403.replace("ErrorKind::VendorRefusal", "ErrorKind::Other"))
 mutate("proxy-any-status-read", "a body is read whatever the status", PC,
        "        if status != StatusCode::OK {", "        if false {")
 # Reading the answer.
@@ -2276,7 +2373,7 @@ mutate("proxy-result-and-error-accepted", "an answer with a result and an error 
        "        (Some(Value::Object(result)), _) => tool_result(result),")
 mutate("proxy-content-unchecked", "a result without content is accepted", PO,
        '    let Some(Value::Array(content)) = result.get("content") else {\n'
-       "        return ToolOutcome::Error(NOT_MCP.to_owned());\n    };",
+       "        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);\n    };",
        "    let empty = Vec::new();\n"
        '    let content = match result.get("content") {\n        Some(Value::Array(content)) => content,\n        _ => &empty,\n    };')
 mutate("proxy-tool-error-is-ok", "a tool result marked isError is passed on as success", PO,
@@ -2393,13 +2490,14 @@ mutate("registry-hash-ignores-title", "the approval hash does not cover the titl
 mutate("registry-schema-type-unchecked", "an input schema need not be an object schema", RR,
        '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
 mutate("registry-schema-keywords-unchecked", "a schema may use keywords the argument check does not follow", RA,
-       ".find(|keyword| object.contains_key(**keyword))", ".find(|keyword| false && object.contains_key(**keyword))")
+       "            annotation if ANNOTATIONS.contains(&annotation) => true,", "            _ => true,")
 mutate("registry-schema-properties-unwalked", "keywords inside a property are not looked for", RA,
-       "            followable(property, &at.child(name))?;", "            let _ = (property, name);")
+       "                    followable(property, &here.child(name))?;", "                    let _ = (property, name);")
 mutate("registry-schema-items-unwalked", "keywords inside items are not looked for", RA,
-       '        followable(items, &at.child("items"))?;', "        let _ = items;")
+       '            "items" => {\n                followable(value, &here)?;', '            "items" => {\n                let _ = value;')
 mutate("registry-schema-properties-not-object", "`properties` may be something other than an object", RA,
-       "            return Err(SchemaProblem::Malformed { at });", "            return Ok(());")
+       "                    return Err(SchemaProblem::Malformed { at: here });\n                };",
+       "                    return Ok(());\n                };")
 mutate("registry-schema-node-not-schema", "a property or items may be something other than a schema", RA,
        "        _ => return Err(SchemaProblem::Malformed { at: at.clone() }),", "        _ => return Ok(()),")
 mutate("registry-adapter-without-sources", "a tool may read its resources from no argument", RR,
@@ -2426,15 +2524,19 @@ mutate("adapter-empty-identifier-accepted", "the empty string names a resource",
 mutate("adapter-not-an-object-accepted", "arguments that are not an object pass the check", RA,
        "        if !arguments.is_object() {", "        if false {")
 mutate("adapter-closed-without-properties-accepted", "a closed object without properties admits arguments", RA,
-       'schema.get("additionalProperties") == Some(&Value::Bool(false))', "false")
+       "                        if let Some(key) = object.keys().next() {",
+       "                        if let Some(key) = object.keys().next().filter(|_| false) {")
 mutate("adapter-open-without-properties-refused", "an open object without properties refuses arguments", RA,
-       'schema.get("additionalProperties") == Some(&Value::Bool(false))', "true")
+       "                    None => {}\n                },",
+       "                    None => {\n                        if let Some(key) = object.keys().next() {\n"
+       "                            return Err(Failure::Undeclared(at.child(key)));\n                        }\n"
+       "                    }\n                },")
 mutate("adapter-undeclared-accepted", "an undeclared argument passes the check", RA,
-       "                    None => Some(at.child(key)),", "                    None => None,")
+       ".find(|key| !properties.contains_key(*key))", ".find(|_| false)")
 mutate("adapter-undeclared-not-nested", "nested objects are not checked", RA,
-       "                    Some(property) => undeclared(property, value, &at.child(key)),", "                    Some(_) => None,")
+       "                            validate(property, value, &at.child(key))?;", "                            let _ = (property, value);")
 mutate("adapter-undeclared-not-in-items", "array elements are not checked", RA,
-       "        Value::Array(items) => {", "        Value::Array(items) if false => {")
+       '            let Some(each) = schema.get("items") else {', '            let Some(each) = schema.get("items").filter(|_| false) else {')
 mutate("adapter-pointer-unescaped", "a pointer does not escape `~` and `/`", RA,
        "            token.replace('~', \"~0\").replace('/', \"~1\")", "            token")
 mutate("selection-issuer-ignored", "a rule covers principals of any issuer", RS,
@@ -2449,6 +2551,72 @@ mutate("selection-first-rule-wins", "disagreeing rules resolve to one of them", 
 mutate("registry-links-testkit", "the registry, and so the gateway, links the testkit", REGISTRY + "Cargo.toml",
        'toml = "1"\n\n[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n',
        'toml = "1"\ngateway-testkit = { path = "../gateway-testkit" }\n\n[dev-dependencies]\n')
+
+
+# --- gateway-registry: schema validation ---------------------------------------------------
+#
+# The argument check against the approved schema's subset of JSON Schema 2020-12 (#11, #94), and
+# the loader's allowlist of that subset.
+
+OLD_DENYLIST = ('["$ref", "$dynamicRef", "$recursiveRef", "allOf", "anyOf", "oneOf", "not", "if", "then", "else", '
+                '"dependentSchemas", "dependencies", "patternProperties", "unevaluatedProperties", "unevaluatedItems", '
+                '"prefixItems", "additionalItems"]')
+mutate("schema-allowlist-is-denylist", "the loader refuses only the keywords it once named, and accepts any other", RA,
+       "            annotation if ANNOTATIONS.contains(&annotation) => true,",
+       f"            annotation if !{OLD_DENYLIST}.contains(&annotation) => true,")
+mutate("schema-keyword-form-unchecked", "a keyword may have a value not of its 2020-12 form", RA,
+       "        if !formed {", "        if false {")
+mutate("schema-dialect-unchecked", "a schema may name any dialect in `$schema`", RA,
+       "                if value.as_str() != Some(DIALECT) {", "                if false {")
+mutate("schema-dialect-anywhere", "`$schema` is accepted below the root", RA,
+       '            "$schema" if at.as_str().is_empty() => {', '            "$schema" => {')
+mutate("schema-additional-properties-unshaped", "an `additionalProperties` that is not a boolean or a schema loads, and is ignored", RA,
+       "                if !(value.is_boolean() || value.is_object()) {\n"
+       "                    return Err(SchemaProblem::AdditionalProperties { at: here });\n"
+       "                }\n                followable(value, &here)?;",
+       "                if value.is_boolean() || value.is_object() {\n                    followable(value, &here)?;\n                }")
+mutate("schema-false-admits", "the schema `false` admits anything", RA,
+       "        return if *schema == Value::Bool(true) {", "        return if true {")
+mutate("schema-type-unchecked", "`type` is not checked", RA,
+       "        && !has_type(types, value)", "        && !has_type(types, value) && false")
+mutate("schema-integer-is-number", "`integer` admits any number", RA,
+       '        ("integer", Value::Number(number)) => is_integer(number),', '        ("integer", Value::Number(_)) => true,')
+mutate("schema-integer-by-representation", "`1.0` is not an integer", RA,
+       "    integer(number).is_some() || number.as_f64().is_some_and(|float| float.fract() == 0.0)",
+       "    integer(number).is_some()")
+mutate("schema-enum-unchecked", "`enum` is not checked", RA,
+       "        && !allowed.iter().any(|allowed| same(allowed, value))", "        && allowed.is_empty() && false")
+mutate("schema-const-unchecked", "`const` is not checked", RA,
+       "        && !same(constant, value)", "        && !same(constant, constant)")
+mutate("schema-number-equality-by-representation", "`1` and `1.0` differ in `enum` and `const`", RA,
+       "        (Value::Number(a), Value::Number(b)) => compare(a, b) == Ordering::Equal,",
+       "        (Value::Number(a), Value::Number(b)) => a == b,")
+mutate("schema-number-compared-as-float", "two integers are compared as floats, so 2^53 + 1 equals 2^53", RA,
+       "        (Some(a), Some(b)) => a.cmp(&b),",
+       "        (Some(_), Some(_)) => float(a).partial_cmp(&float(b)).unwrap_or(Ordering::Equal),")
+mutate("schema-integer-float-fraction-ignored", "an integer equals a float with the same whole part", RA,
+       "        Ordering::Equal if float > floor => Ordering::Less,", "        Ordering::Equal if false => Ordering::Less,")
+mutate("schema-required-unchecked", "`required` is not checked", RA,
+       '            if let Some(Value::Array(required)) = schema.get("required")',
+       '            if let Some(Value::Array(required)) = schema.get("required").filter(|_| false)')
+mutate("schema-length-off-by-one", "a maximum length or count admits one more", RA,
+       "        .is_some_and(|most| count > most)", "        .is_some_and(|most| count > most + 1)")
+mutate("schema-length-in-bytes", "a string's length is counted in bytes, not code points", RA,
+       "            let length = text.chars().count() as u64;", "            let length = text.len() as u64;")
+mutate("schema-item-counts-unchecked", "`minItems` and `maxItems` are not checked", RA,
+       '            counted(schema, items.len() as u64, "minItems", "maxItems", at)?;', "            let _ = items.len();")
+mutate("schema-number-bounds-unchecked", "`minimum`, `maximum` and the exclusive bounds are not checked", RA,
+       "            for (keyword, meets) in NUMBER_BOUNDS {",
+       "            for (keyword, meets) in NUMBER_BOUNDS.into_iter().filter(|_| false) {")
+mutate("schema-bound-exclusive-inclusive", "`exclusiveMinimum` admits the bound itself", RA,
+       '    ("exclusiveMinimum", Ordering::is_gt),', '    ("exclusiveMinimum", Ordering::is_ge),')
+mutate("schema-bound-inclusive-exclusive", "`maximum` refuses the bound itself", RA,
+       '    ("maximum", Ordering::is_le),', '    ("maximum", Ordering::is_lt),')
+mutate("schema-additional-properties-unenforced", "an `additionalProperties` schema is not checked against the values", RA,
+       "                            validate(additional, value, &at.child(key))?;", "                            let _ = (additional, value);")
+mutate("schema-invalid-says-undeclared", "a call that fails a schema keyword is told it carried an undeclared argument",
+       "crates/gateway/src/proxied.rs",
+       "                            invalid_argument(tool.as_str())\n", "                            undeclared_argument(tool.as_str())\n")
 
 
 # --- audit-postgres ------------------------------------------------------------------------
@@ -2574,8 +2742,8 @@ mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
        "WHERE id = ($1::text)::uuid AND outcome IS NULL", "WHERE id = ($1::text)::uuid")
 mutate("pg-finish-same-again-refused", "the same completion written again is an error", PG_STORE,
-       "        Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),",
-       "        Some(outcome) if false && finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),")
+       "        Some(outcome)\n            if finish.is(\n",
+       "        Some(outcome)\n            if false && finish.is(\n")
 mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
        "        Some(_) => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
        "        Some(_) => Ok(()),")
@@ -2614,8 +2782,8 @@ mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is p
        '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
        "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
 mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
-       'Outcome::Refused { sentence } => Some(stored("outcome_sentence", sentence)?),',
-       "Outcome::Refused { sentence } => Some(sentence.clone()),")
+       'Outcome::Refused { sentence } => (Some(stored("outcome_sentence", sentence)?), None),',
+       "Outcome::Refused { sentence } => (Some(sentence.clone()), None),")
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
@@ -3030,12 +3198,6 @@ mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that
 mutate("pg-check-definers-ignored", "a SECURITY DEFINER function that can reach the table passes the check", PG_CHECK,
        "                     WHERE p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x",
        "                     WHERE false AND p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x")
-mutate("pg-check-definer-trigger-ignored", "a write to a table whose trigger runs such a function passes the check", PG_CHECK,
-       "unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS w", "unnest(ARRAY[]::text[]) AS w")
-mutate("pg-check-definer-trigger-own-role-only", "the trigger route asks only of the session's role, for a privilege on the whole table", PG_CHECK,
-       "has_table_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_table_privilege(r.oid, c.oid, w)")
-mutate("pg-check-definer-trigger-column-own-role-only", "the trigger route asks only of the session's role, for a column privilege", PG_CHECK,
-       "has_any_column_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_any_column_privilege(r.oid, c.oid, w)")
 mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner holds only column privileges passes the check", PG_CHECK,
        "OR has_any_column_privilege(p.proowner, x.oid,", "OR false AND has_any_column_privilege(p.proowner, x.oid,")
 mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
@@ -3049,6 +3211,26 @@ mutate("pg-check-definer-chain-execute-not-followed", "a definer function that r
        "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
 mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
+# #43: ownership counts wherever a privilege does, a definer's owner that can silence the
+# triggers counts, every trigger and enabled event trigger that runs a definer is refused
+# whoever can fire it (this replaced the hunt for write paths), and so is EXECUTE on a
+# function in an untrusted language.
+mutate("pg-check-definer-ignores-table-owner", "a definer function whose owner owns the table, but holds no privilege on it, passes the check", PG_CHECK,
+       "OR pg_has_role(p.proowner, c.relowner, 'USAGE'))", "OR false AND pg_has_role(p.proowner, c.relowner, 'USAGE'))")
+mutate("pg-check-definer-ignores-trigger-function-owner", "a definer function whose owner owns a function the table's triggers run passes the check", PG_CHECK,
+       "AND pg_has_role(p.proowner, f.proowner, 'USAGE'))", "AND false AND pg_has_role(p.proowner, f.proowner, 'USAGE'))")
+mutate("pg-check-reaching-owner-ignored", "a view outside the schema that reaches the table, owned by the gateway's role, passes the check", PG_CHECK,
+       "                     AND pg_has_role(current_user, v.relowner, 'MEMBER')", "                     AND false")
+mutate("pg-check-replication-role-set-ignored", "a definer function whose owner can set session_replication_role passes the check", PG_CHECK,
+       "\"OR has_parameter_privilege(p.proowner, 'session_replication_role', 'SET')\"", "\"\"")
+mutate("pg-check-definer-trigger-allowed", "a trigger that runs a definer function passes the check", PG_CHECK,
+       "    problems.extend(triggered.into_iter().map(", "    problems.extend(triggered.into_iter().filter(|_| false).map(")
+mutate("pg-check-event-trigger-allowed", "an enabled event trigger that runs a definer function passes the check", PG_CHECK,
+       "WHERE p.oid = ANY($1::oid[]) AND e.evtenabled <> 'D'", "WHERE false AND p.oid = ANY($1::oid[]) AND e.evtenabled <> 'D'")
+mutate("pg-check-disabled-event-trigger-refused", "a disabled event trigger that runs a definer function is refused", PG_CHECK,
+       "AND e.evtenabled <> 'D'", "AND true")
+mutate("pg-check-untrusted-language-allowed", "a function in an untrusted language that the gateway can run passes the check", PG_CHECK,
+       "WHERE l.lanispl AND NOT l.lanpltrusted", "WHERE false AND l.lanispl AND NOT l.lanpltrusted")
 mutate("pg-check-server-functions-ignored", "a role that can run a function reaching the server's files passes the check", PG_CHECK,
        "    problems.extend(found.into_iter().map(|row| Problem::ServerFunction {",
        "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::ServerFunction {")
@@ -3098,6 +3280,31 @@ mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time lim
 mutate("pg-open-rows-not-cancelled", "an open-row query past its time limit is not cancelled, and its connection goes back to the pool", PG_STORE,
        "                abandon(client, &self.cancel);\n                Err(PgAuditError::OpenRowsTimedOut { budget })",
        "                drop(client);\n                Err(PgAuditError::OpenRowsTimedOut { budget })")
+# The error kind (#56, migration 0006): written with the completion, compared on a repeat, held to
+# the five kinds and to error rows alone, part of the completion for complete_once, granted to the
+# gateway, and `other` for a lost begin's completion, as for a guard given up.
+PG_ERROR_KIND = PG + "sql/migrations/0006_error_kind.sql"
+mutate("pg-error-kind-not-written", "an error is written without its kind", PG_COLUMNS,
+       "            Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),",
+       "            Outcome::Error { .. } => (None, None),")
+mutate("pg-error-kind-repeat-unchecked", "a repeated finish with an error of another kind is accepted", PG_COLUMNS,
+       "            && self.error_kind == error_kind\n", "")
+mutate("pg-error-kind-shape-removed", "a row may have an error kind without an error, or an error without a kind", PG_ERROR_KIND,
+       "        coalesce(outcome = 'error', false) = (error_kind IS NOT NULL)\n", "        true\n")
+mutate("pg-error-kind-known-removed", "an error kind may be any text", PG_ERROR_KIND,
+       "        'other', 'before-0006'\n    )),", "        'other', 'before-0006'\n    ) OR true),")
+mutate_all("pg-error-kind-not-in-complete-once", "complete_once refuses a completion that writes the error kind",
+           (PG_ERROR_KIND, "    IF to_jsonb(NEW) - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
+            "    IF to_jsonb(NEW) - ARRAY['outcome', 'outcome_sentence', 'latency_ms',"),
+           (PG_ERROR_KIND, "       to_jsonb(OLD) - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
+            "       to_jsonb(OLD) - ARRAY['outcome', 'outcome_sentence', 'latency_ms',"))
+mutate("pg-error-kind-grant-missing", "the gateway's role cannot write the error kind", PG_ERROR_KIND,
+       "GRANT UPDATE (error_kind) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-error-kind-backfill-skipped", "error rows written before 0006 are not given a kind", PG_ERROR_KIND,
+       "    WHERE outcome = 'error';", "    WHERE false;")
+mutate("pg-lost-begin-kind-differs", "a lost begin's row is completed as a vendor refusal, unlike a guard given up", PG_STORE,
+       "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::Other)),",
+       "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::VendorRefusal)),")
 
 
 # --- demo-checks ---------------------------------------------------------------------------
@@ -3151,10 +3358,54 @@ mutate("demo-driver-log-mark-is-epoch", "the log mark is the epoch number, not a
 mutate("demo-driver-compose-registry-replaced", "a Compose run replaces the registry directory a reused gateway still mounts", DRIVER,
        """  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""",
        """  rm -rf "$DEMO_DIR/compose-registry"\n  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""")
+# #52: each log or metrics read is checked before it is passed on, and a workload's RESULT line
+# must count the lines tallied.
+mutate("demo-driver-fetch-status-ignored", "a read that fails is checked as what it printed", DRIVER,
+       '  FETCHED=$("$@") || status=$?\n', '  FETCHED=$("$@") || true\n')
+mutate("demo-driver-job-log-status-ignored", "a Job's log that kubectl could not read is tallied as the run", DRIVER,
+       '  if fetch "$label\'s log (job $ns/$JOB)" k -n "$ns" logs "job/$JOB"; then\n    tally_workload "$label" "$JOB_STATUS" "$FETCHED"\n  fi\n',
+       '  tally_workload "$label" "$JOB_STATUS" "$(k -n "$ns" logs "job/$JOB")"\n')
+mutate_all("demo-driver-mock-log-status-ignored", "a mock-docs log that could not be read is checked as an empty log",
+           (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_bearers "$FETCHED" \\\n      "$(cat""",
+            """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_bearers "$FETCHED" \\\n      "$(cat"""),
+           (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_callers""",
+            """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_callers"""))
+mutate_all("demo-driver-boot-log-status-ignored", "a gateway log that could not be read is checked for boot lines",
+           (DRIVER, """  if fetch "the gateway's log" dc logs --no-log-prefix gateway; then\n""",
+            """  if FETCHED=$(dc logs --no-log-prefix gateway) || true; then\n"""),
+           (DRIVER, """  if fetch "the gateway's log (pod $GATEWAY_POD)" k -n switchboard logs "pod/$GATEWAY_POD"; then\n""",
+            """  if FETCHED=$(k -n switchboard logs "pod/$GATEWAY_POD") || true; then\n"""))
+mutate_all("demo-driver-metrics-read-status-ignored", "metrics that could not be read are checked as no samples",
+           (DRIVER, """  if fetch "the gateway's metrics" dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics; then\n""",
+            """  if FETCHED=$(dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics) || true; then\n"""),
+           (DRIVER, """  if fetch "the gateway's metrics (pod $GATEWAY_POD)" k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics; then\n""",
+            """  if FETCHED=$(k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics) || true; then\n"""))
+mutate("demo-driver-result-count-unchecked", "a workload's RESULT may count more checks than the lines tallied", DRIVER,
+       '  elif [ "$total" != "$((passed + failed))" ]; then\n', "  elif false; then\n")
+mutate("demo-driver-result-line-optional", "a workload with no RESULT line fails only as a count that differs", DRIVER,
+       '  elif [ -z "$result" ]; then\n', "  elif false; then\n")
+mutate("demo-driver-route-check-status-ignored", "the route check's exit status is read as 0, so a non-zero exit without a FAIL line passes", DRIVER,
+       '    status=$?\n  fi\n  tally_workload "route check in', '    status=0\n  fi\n  tally_workload "route check in')
+mutate("demo-driver-result-last-line", "the RESULT is read from the workload's last line, not its last RESULT line", DRIVER,
+       """awk '/^RESULT: / { last = $0 } END { print last }'""", """awk 'NF { last = $0 } END { print last }'""")
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
        '"127.0.0.1:18080:8080"', '"18080:8080"')
 mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
-       "    image: postgres:17-alpine\n", "    image: postgres:17-alpine\n    ports:\n      - \"127.0.0.1:15433:5432\"\n")
+       "    image: postgres:17.11-alpine@sha256:", "    ports:\n      - \"127.0.0.1:15433:5432\"\n    image: postgres:17.11-alpine@sha256:")
+# #53: the demo's images are pinned by tag and digest, and the three Postgres places agree.
+mutate("demo-pins-digest-dropped", "Compose names the Postgres tag without demo.sh's digest", COMPOSE,
+       "    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\n",
+       "    image: postgres:17.11-alpine\n")
+mutate("demo-pins-kind-tag-differs", "the kind manifest names another Postgres tag than the one demo.sh loads",
+       "deploy/kind/base/postgres.yaml", "          image: postgres:17.11-alpine\n", "          image: postgres:17-alpine\n")
+mutate("demo-pins-load-untagged", "demo.sh saves its Postgres tag without tagging it from the pinned digest", DRIVER,
+       '  docker tag "$POSTGRES_IMAGE" "$postgres_tag"\n', "")
+mutate("demo-pins-base-digest-dropped", "the Dockerfile's runtime image is pinned by tag only", "deploy/Dockerfile",
+       "FROM debian:trixie-slim@sha256:", "FROM debian:trixie-slim\n# @sha256:")
+mutate("demo-pins-frontend-unpinned", "the Dockerfile's syntax frontend is pinned by tag only", "deploy/Dockerfile",
+       "# syntax=docker/dockerfile:1@sha256:", "# syntax=docker/dockerfile:1\n# @sha256:")
+mutate("demo-pins-rust-not-toolchain", "the Dockerfile builds with another rust than rust-toolchain.toml's", "deploy/Dockerfile",
+       "FROM rust:1.99.0-slim-trixie@", "FROM rust:1.98.0-slim-trixie@")
 mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switchboard namespace", POLICY,
        "              kubernetes.io/metadata.name: switchboard\n          podSelector:\n            matchLabels:\n              app: gateway\n",
        "              kubernetes.io/metadata.name: switchboard\n")
@@ -3170,8 +3421,8 @@ mutate("demo-before-policy-own-project-optional", "before-policy runs without OW
 mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
        "                - {name: OWN_PROJECT, value: borealis}\n", "")
 mutate("demo-kind-accepted-count-6", "the kind caller check still expects 6 calls, without the before-policy reads", DRIVER,
-       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n',
-       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 6 2 "$OPEN_ATTEMPTS"\n')
+       '    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n',
+       '    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 6 2 "$OPEN_ATTEMPTS"\n')
 PERMISSIONS = "deploy/route-check/permissions.tsv"
 mutate("demo-operator-checks-no-attach", "attach is not checked", PERMISSIONS,
        "create\tpods\tattach\tnamespaced\nget\tpods\tattach\tnamespaced\n", "")
@@ -3207,7 +3458,7 @@ mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kub
 mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
        "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
 mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whichever pod the Deployment's log picks", DRIVER,
-       '  check_boot "$(k -n switchboard logs "pod/$GATEWAY_POD")"\n', '  check_boot "$(k -n switchboard logs deploy/gateway)"\n')
+       ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
        """      | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision)\n""", "")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
@@ -3413,9 +3664,11 @@ mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing",
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(outcome) => Box::pin(std::future::ready(outcome)),",
        "            Err(_outcome) => self.inner.run(call),")
+PROXIED_INVALID = "                    ToolOutcome::error(ErrorKind::InvalidArguments, sentence)"
 mutate("gw-proxied-invalid-arguments-refused", "a call that fails the argument check is recorded as refused, not as an error", PROXIED,
-       "                    ToolOutcome::Error(undeclared_argument(tool.as_str()))",
-       "                    ToolOutcome::Refused(undeclared_argument(tool.as_str()))")
+       PROXIED_INVALID, "                    ToolOutcome::Refused(sentence)")
+mutate("gw-proxied-invalid-arguments-kind-other", "a call that fails the argument check is recorded as another error, not invalid arguments", PROXIED,
+       PROXIED_INVALID, PROXIED_INVALID.replace("ErrorKind::InvalidArguments", "ErrorKind::Other"))
 mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
        "            Some(adapter) if !withdrawn => {", "            Some(adapter) => {")
 mutate("gw-proxied-checks-live-schema", "a call's arguments are checked against the policy served now, not the one it was decided under", PROXIED,
@@ -3654,26 +3907,113 @@ mutate("issuer-keys-userinfo-allowed", "a keys URL with a user name or password 
        "        if !url.username().is_empty() || url.password().is_some() {", "        if false {")
 mutate("issuer-keys-fragment-allowed", "a keys URL with a fragment is accepted", IK,
        "        if url.fragment().is_some() {", "        if false {")
-mutate("issuer-keys-https-accepted", "an https source is accepted with no TLS client to fetch it", IK,
-       '        if url.scheme() != "http" {', "        if false {")
 mutate("issuer-keys-zero-deadline-allowed", "a zero deadline is accepted", IK,
        "        if options.deadline.is_zero() {", "        if false {")
 mutate("issuer-keys-zero-cap-allowed", "a zero body cap is accepted", IK,
        "        if options.max_body_bytes == 0 {", "        if false {")
-mutate("issuer-keys-redirect-followed", "a redirect is followed once, wherever it points", IK,
-       "        let response = self.send(self.uri.clone()).await?;\n",
-       "        let mut response = self.send(self.uri.clone()).await?;\n"
+# Only a redirect to another host or port is followed, so only the tests whose redirect changes
+# the host (plain and over TLS) or the port can catch it.
+mutate("issuer-keys-redirect-followed", "a redirect to another host or port is followed once", IK,
+       "        let response = self.send(self.uri.clone(), authorization).await?;\n",
+       "        let mut response = self.send(self.uri.clone(), authorization).await?;\n"
        "        if response.status().is_redirection() {\n"
+       "            let here = Url::parse(&self.uri.to_string()).ok();\n"
        "            let next = response\n"
        "                .headers()\n"
        "                .get(hyper::header::LOCATION)\n"
        "                .and_then(|location| location.to_str().ok())\n"
-       "                .and_then(|location| Url::parse(&self.uri.to_string()).ok()?.join(location).ok())\n"
+       "                .and_then(|location| here.as_ref()?.join(location).ok())\n"
+       "                .filter(|next| here.as_ref().is_some_and(|here| {\n"
+       "                    (here.host(), here.port_or_known_default())\n"
+       "                        != (next.host(), next.port_or_known_default())\n"
+       "                }))\n"
        "                .and_then(|next| next.as_str().parse::<Uri>().ok());\n"
        "            if let Some(next) = next {\n"
-       "                response = self.send(next).await?;\n"
+       "                response = self.send(next, None).await?;\n"
        "            }\n"
        "        }\n")
+# Over TLS: only the configured CAs, for the keys URL's own name. Each mutation below installs a
+# verifier around the one rustls builds from the CA bundle, and lets through what it should not.
+IK_TLS_CONFIG = '    config.alpn_protocols = vec![b"http/1.1".to_vec()];\n'
+IK_LAST_FN = "fn parse(body: &[u8]) -> Result<JwkSet, FetchError> {\n"
+
+
+def ik_weakened_verifier(id: str, description: str, verify_server_cert: str) -> None:
+    install = (
+        IK_TLS_CONFIG
+        + "    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(\n"
+        "        Arc::new(trusted(issuer, ca_file)?),\n"
+        "        Arc::new(rustls::crypto::ring::default_provider()),\n"
+        "    )\n"
+        "    .build()\n"
+        "    .map_err(|_| SourceError::Tls(issuer.clone()))?;\n"
+        "    config.dangerous().set_certificate_verifier(Arc::new(Weakened(inner)));\n"
+    )
+    verifier = (
+        "#[derive(Debug)]\n"
+        "struct Weakened(Arc<rustls::client::WebPkiServerVerifier>);\n\n"
+        "impl rustls::client::danger::ServerCertVerifier for Weakened {\n"
+        "    fn verify_server_cert(\n"
+        "        &self,\n"
+        "        end_entity: &CertificateDer<'_>,\n"
+        "        intermediates: &[CertificateDer<'_>],\n"
+        "        server_name: &rustls::pki_types::ServerName<'_>,\n"
+        "        ocsp: &[u8],\n"
+        "        now: rustls::pki_types::UnixTime,\n"
+        "    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {\n"
+        + verify_server_cert
+        + "    }\n\n"
+        "    fn verify_tls12_signature(\n"
+        "        &self,\n"
+        "        message: &[u8],\n"
+        "        cert: &CertificateDer<'_>,\n"
+        "        dss: &rustls::DigitallySignedStruct,\n"
+        "    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {\n"
+        "        self.0.verify_tls12_signature(message, cert, dss)\n"
+        "    }\n\n"
+        "    fn verify_tls13_signature(\n"
+        "        &self,\n"
+        "        message: &[u8],\n"
+        "        cert: &CertificateDer<'_>,\n"
+        "        dss: &rustls::DigitallySignedStruct,\n"
+        "    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {\n"
+        "        self.0.verify_tls13_signature(message, cert, dss)\n"
+        "    }\n\n"
+        "    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {\n"
+        "        self.0.supported_verify_schemes()\n"
+        "    }\n"
+        "}\n\n"
+    )
+    mutate_all(id, description, (IK, IK_TLS_CONFIG, install), (IK, IK_LAST_FN, verifier + IK_LAST_FN))
+
+
+ik_weakened_verifier(
+    "issuer-keys-ca-ignored", "any certificate is accepted, whoever signed it and whatever it names",
+    "        let _ = (end_entity, intermediates, server_name, ocsp, now);\n"
+    "        Ok(rustls::client::danger::ServerCertVerified::assertion())\n")
+ik_weakened_verifier(
+    "issuer-keys-name-unchecked", "a certificate from the configured CA is accepted for any name",
+    "        match self.0.verify_server_cert(end_entity, intermediates, server_name, ocsp, now) {\n"
+    "            Err(rustls::Error::InvalidCertificate(\n"
+    "                rustls::CertificateError::NotValidForName\n"
+    "                | rustls::CertificateError::NotValidForNameContext { .. },\n"
+    "            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),\n"
+    "            other => other,\n"
+    "        }\n")
+# The token: refused beside http, read on every fetch, and sent only when configured.
+mutate("issuer-keys-token-over-http", "a token file beside an http keys URL is accepted, and its token sent in the clear", IK,
+       "            if files.token_file.is_some() {", "            if false {")
+mutate("issuer-keys-token-read-once", "the token is read on the first fetch and that one is sent ever after", IK,
+       "            Some(path) => Some(bearer(path)?),\n",
+       "            Some(path) => {\n"
+       "                static FIRST: std::sync::OnceLock<Result<HeaderValue, FetchError>> =\n"
+       "                    std::sync::OnceLock::new();\n"
+       "                Some(FIRST.get_or_init(|| bearer(path)).clone()?)\n"
+       "            }\n")
+mutate("issuer-keys-token-without-config", "a bearer is sent with every fetch, a token file given or not", IK,
+       "            Some(path) => Some(bearer(path)?),\n            None => None,\n",
+       "            Some(path) => Some(bearer(path)?),\n"
+       '            None => Some(HeaderValue::from_static("Bearer dummy-unconfigured")),\n')
 mutate("issuer-keys-status-unchecked", "only a server error status is refused", IK,
        "        if status != StatusCode::OK {", "        if status.is_server_error() {")
 # The bounds.

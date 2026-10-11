@@ -31,11 +31,13 @@
 //! leeway_seconds = 30
 //!
 //! [[identity.issuers]]
-//! issuer = "http://issuer.internal:8081"
+//! issuer = "https://issuer.internal:8443"
 //! kind = "user"
 //! audiences = ["switchboard"]
 //! algorithm = "ES256"
-//! keys_url = "http://issuer.internal:8081/jwks"   # instead of keys_file
+//! keys_url = "https://issuer.internal:8443/jwks"  # instead of keys_file
+//! keys_ca_file = "issuer-ca.pem"                  # needed for https; the only CAs trusted
+//! keys_token_file = "/run/secrets/issuer-token"   # optional; read again on every fetch
 //! keys_refresh_seconds = 300                      # 300 if left out; at least 30
 //! max_lifetime_seconds = 3600
 //! leeway_seconds = 30
@@ -60,9 +62,14 @@
 //!     boot, and again every `keys_refresh_seconds`: 300 unless given, and at least 30 (see
 //!     [`crate::keys`]). Loading the file checks only these fields. The URL's origin is checked,
 //!     and the first fetch made, when the gateway starts
-//!     ([`start::prepare`](crate::start::prepare)). This build has no TLS client, so an `https`
-//!     URL, which an `https` issuer needs, is refused when the gateway starts (issue #88).
-//!     `keys_refresh_seconds` belongs to `keys_url` and is refused beside `keys_file`.
+//!     ([`start::prepare`](crate::start::prepare)).
+//!   - An `https` keys URL needs `keys_ca_file`, a PEM bundle of the only CAs its certificate
+//!     may chain to, read when the gateway starts. `keys_token_file`, if given, holds a bearer
+//!     token sent with each fetch to the keys URL only, and is read again on every fetch, so a
+//!     token rotated in place is the one sent. The gateway refuses to start with either beside
+//!     an `http` keys URL.
+//!   - `keys_refresh_seconds`, `keys_ca_file` and `keys_token_file` belong to `keys_url` and are
+//!     refused beside `keys_file`.
 //! - **The team manifest** is a TOML table of subject to team:
 //!
 //!   ```toml
@@ -188,6 +195,14 @@ pub struct IssuerFile {
     /// [`DEFAULT_KEYS_REFRESH`] if it is not given, and at least [`MIN_KEYS_REFRESH`].
     #[serde(default)]
     pub keys_refresh_seconds: Option<u64>,
+    /// With an `https` `keys_url`, and only with one: the PEM bundle of the CAs its certificate
+    /// is verified against, and the only ones trusted.
+    #[serde(default)]
+    pub keys_ca_file: Option<PathBuf>,
+    /// With an `https` `keys_url`, and only with one: a file holding a bearer token sent with
+    /// each fetch, read again on every fetch.
+    #[serde(default)]
+    pub keys_token_file: Option<PathBuf>,
     /// For a workload issuer, and only for one: the team manifest.
     #[serde(default)]
     pub subjects_file: Option<PathBuf>,
@@ -272,6 +287,14 @@ pub enum DeploymentError {
     /// An issuer whose keys are in a file was given a refresh interval.
     #[error("issuer `{0}` has `keys_refresh_seconds`, which only an issuer with `keys_url` takes")]
     RefreshForKeysFile(Issuer),
+    /// An issuer whose keys are in a file was given a CA file or a token file for fetching them.
+    #[error("issuer `{issuer}` has `{field}`, which only an issuer with `keys_url` takes")]
+    FetchFileForKeysFile {
+        /// The issuer.
+        issuer: Issuer,
+        /// `keys_ca_file` or `keys_token_file`.
+        field: &'static str,
+    },
     /// An issuer's keys would be fetched more often than the minimum allows.
     #[error(
         "issuer `{issuer}` has `keys_refresh_seconds = {seconds}`; it must be at least {}",
@@ -366,6 +389,11 @@ pub struct KeysUrl {
     /// How often the keys are fetched again. Loading the deployment file holds it to at least
     /// [`MIN_KEYS_REFRESH`].
     pub refresh: Duration,
+    /// The CA bundle an `https` URL is verified against, from the deployment file's directory.
+    pub ca_file: Option<PathBuf>,
+    /// The file holding a bearer token for each fetch, from the deployment file's directory.
+    /// Only its path is kept; the token is read when a fetch is made.
+    pub token_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for KeysUrl {
@@ -373,6 +401,8 @@ impl std::fmt::Debug for KeysUrl {
         f.debug_struct("KeysUrl")
             .field("issuer", &self.issuer)
             .field("refresh", &self.refresh)
+            .field("ca_file", &self.ca_file)
+            .field("token_file", &self.token_file)
             .finish_non_exhaustive()
     }
 }
@@ -527,6 +557,18 @@ fn issuer_entry(
             if issuer.keys_refresh_seconds.is_some() {
                 return Err(DeploymentError::RefreshForKeysFile(issuer.issuer));
             }
+            if issuer.keys_ca_file.is_some() {
+                return Err(DeploymentError::FetchFileForKeysFile {
+                    issuer: issuer.issuer,
+                    field: "keys_ca_file",
+                });
+            }
+            if issuer.keys_token_file.is_some() {
+                return Err(DeploymentError::FetchFileForKeysFile {
+                    issuer: issuer.issuer,
+                    field: "keys_token_file",
+                });
+            }
             let keys_path = base.join(file);
             serde_json::from_str(&read_text(&keys_path)?).map_err(|error| {
                 DeploymentError::Keys {
@@ -549,6 +591,8 @@ fn issuer_entry(
                 issuer: issuer.issuer.clone(),
                 url,
                 refresh,
+                ca_file: issuer.keys_ca_file.map(|path| base.join(path)),
+                token_file: issuer.keys_token_file.map(|path| base.join(path)),
             });
             // Fetched when the gateway starts. Left unfilled it is not a JWK set, and the
             // identity gate would refuse to build.

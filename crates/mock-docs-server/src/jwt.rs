@@ -1,4 +1,4 @@
-//! The JWT mode: the server accepts one subject's tokens, signed by a key in a fixed set.
+//! The JWT mode: the server accepts the tokens of some subjects, signed by a key in a fixed set.
 //!
 //! In the kind deployment the gateway calls with its projected ServiceAccount token, and the
 //! server checks it against the cluster's signing keys (decision 0010). A token is accepted
@@ -10,7 +10,7 @@
 //! - `exp` is present and has not passed, give or take [`LEEWAY_SECONDS`], and `nbf`, if
 //!   present, has come;
 //! - `iss` is exactly the configured issuer, and `aud` contains the configured audience;
-//! - `sub` is exactly the one configured subject.
+//! - `sub` is exactly one of the configured subjects.
 //!
 //! The subject is compared last, after the issuer and audience, so a token that is wrong in
 //! both is refused as `wrong_audience`: it was never meant for this server. Keys are read once,
@@ -23,6 +23,8 @@ use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{Map, Value};
+
+use crate::config::Projects;
 
 /// How far past `exp`, or before `nbf`, a token is still taken, for clocks that differ.
 pub const LEEWAY_SECONDS: u64 = 30;
@@ -46,7 +48,7 @@ pub enum Refusal {
     Expired,
     /// `nbf` has not come yet.
     NotYetValid,
-    /// `sub` is missing or not the configured subject.
+    /// `sub` is missing or not one of the configured subjects.
     WrongSubject,
 }
 
@@ -73,12 +75,13 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Checks bearer tokens against one issuer, audience and subject and a fixed set of RSA keys.
+/// Checks bearer tokens against one issuer, audience and set of subjects and a fixed set of RSA
+/// keys. Each subject comes with the projects it may name at start.
 #[derive(Clone)]
 pub struct JwtVerifier {
     issuer: String,
     audience: String,
-    subject: String,
+    subjects: BTreeMap<String, Projects>,
     keys: BTreeMap<String, DecodingKey>,
 }
 
@@ -86,8 +89,24 @@ impl JwtVerifier {
     /// A verifier for tokens from `issuer`, for `audience`, about `subject`, signed by a key in
     /// `jwks`: a JWK set as JSON, in the shape a Kubernetes API server's `/openid/v1/jwks`
     /// returns. Every key must be an RSA key with a `kid` of its own; a key that declares an
-    /// algorithm must declare RS256, and one that declares a use must declare `sig`.
+    /// algorithm must declare RS256, and one that declares a use must declare `sig`. The subject
+    /// may name every project.
     pub fn new(issuer: &str, audience: &str, subject: &str, jwks: &str) -> Result<Self, String> {
+        let subjects = BTreeMap::from([(subject.to_owned(), Projects::Every)]);
+        Self::with_subjects(issuer, audience, subjects, jwks)
+    }
+
+    /// As [`JwtVerifier::new`], for tokens about any of `subjects`, each limited to its
+    /// projects. There must be at least one subject.
+    pub fn with_subjects(
+        issuer: &str,
+        audience: &str,
+        subjects: BTreeMap<String, Projects>,
+        jwks: &str,
+    ) -> Result<Self, String> {
+        if subjects.is_empty() {
+            return Err("no subject is accepted".to_owned());
+        }
         let set: JwkSet =
             serde_json::from_str(jwks).map_err(|error| format!("not a JWK set: {error}"))?;
         if set.keys.is_empty() {
@@ -127,7 +146,7 @@ impl JwtVerifier {
         Ok(Self {
             issuer: issuer.to_owned(),
             audience: audience.to_owned(),
-            subject: subject.to_owned(),
+            subjects,
             keys,
         })
     }
@@ -142,9 +161,9 @@ impl JwtVerifier {
         &self.audience
     }
 
-    /// The one subject accepted.
-    pub fn subject(&self) -> &str {
-        &self.subject
+    /// The subjects accepted, each with the projects it may name at start.
+    pub fn subjects(&self) -> &BTreeMap<String, Projects> {
+        &self.subjects
     }
 
     /// The key IDs in the set, in order.
@@ -152,7 +171,7 @@ impl JwtVerifier {
         self.keys.keys().map(String::as_str).collect()
     }
 
-    /// Verifies `token`. On success, the subject, which is the configured one; nothing is read
+    /// Verifies `token`. On success, the subject, which is a configured one; nothing is read
     /// from the token's claims before its signature has verified.
     pub fn verify(&self, token: &str) -> Result<String, Refusal> {
         // An algorithm `jsonwebtoken` does not know, `none` among them, fails here.
@@ -182,7 +201,7 @@ impl JwtVerifier {
             return Err(Refusal::WrongIssuer);
         }
         match claims.get("sub").and_then(Value::as_str) {
-            Some(subject) if subject == self.subject => Ok(subject.to_owned()),
+            Some(subject) if self.subjects.contains_key(subject) => Ok(subject.to_owned()),
             _ => Err(Refusal::WrongSubject),
         }
     }
@@ -207,7 +226,7 @@ impl fmt::Debug for JwtVerifier {
             .debug_struct("JwtVerifier")
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
-            .field("subject", &self.subject)
+            .field("subjects", &self.subjects)
             .field("key_ids", &self.key_ids())
             .finish()
     }

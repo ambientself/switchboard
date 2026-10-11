@@ -3,7 +3,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use gateway_core::audit::{self, AuditRowId, Begun, Outcome, RowStart};
+use gateway_core::audit::{self, AuditRowId, Begun, ErrorKind, Outcome, RowStart};
 use gateway_core::{CallContext, RequestedTool, decide, list_tools};
 use gateway_testkit::{
     Caller, Fixture, FixtureConnector, READ_TOOL, SURFACE_ALL, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
@@ -316,7 +316,15 @@ async fn a_late_finish_closes_the_row() {
     wait_past(&admin, &row).await;
     assert_eq!(store.open_rows().await.unwrap().count, 1);
     store
-        .complete(&row, &completion(Outcome::Error, 2_500))
+        .complete(
+            &row,
+            &completion(
+                Outcome::Error {
+                    error_kind: ErrorKind::Other,
+                },
+                2_500,
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(store.open_rows().await.unwrap(), none_open());

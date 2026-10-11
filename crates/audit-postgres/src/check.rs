@@ -39,6 +39,7 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("claimed_team", "text"),
     ("outcome", "text"),
     ("outcome_sentence", "text"),
+    ("error_kind", "text"),
     ("latency_ms", "bigint"),
     ("instance", "text"),
     ("kind", "text"),
@@ -81,16 +82,18 @@ pub(crate) const INSERTED: &[&str] = &[
     "listed_omitted",
 ];
 
-/// The columns the gateway's role updates: the completion.
-pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "latency_ms"];
+/// The columns the gateway's role updates: the completion, with an error's kind.
+pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "error_kind", "latency_ms"];
 
 /// The columns the gateway's role reads: which row, whether it was allowed, its completion,
-/// and its kind and deadline, which say whether an empty completion is open.
+/// with an error's kind, and its kind and deadline, which say whether an empty completion is
+/// open.
 pub(crate) const SELECTED: &[&str] = &[
     "id",
     "decision",
     "outcome",
     "outcome_sentence",
+    "error_kind",
     "latency_ms",
     "kind",
     "deadline",
@@ -193,6 +196,9 @@ const REACHING: &str = "reaching(oid) AS (
                 AND d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass
             JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
     )";
+
+/// A condition, for [`by_any_role`], that the role `r.oid` may run the function `p.oid`.
+const RUNS_FUNCTION: &str = "has_function_privilege(r.oid, p.oid, 'EXECUTE')";
 
 /// A function's name as reports give it: schema, name and argument types.
 const FUNCTION_NAME: &str =
@@ -332,9 +338,9 @@ pub enum Problem {
         /// The rule.
         rule: String,
     },
-    /// A `SECURITY DEFINER` function runs as a role that can read or change `call_rows`, itself
-    /// or through another such function, and the session's role, or a role it can become, can
-    /// run it: with EXECUTE, or by writing to a table whose trigger runs it.
+    /// A `SECURITY DEFINER` function runs as a role that can read or change `call_rows` or turn
+    /// off its triggers, itself or through another such function, and the session's role, or a
+    /// role it can become, can run it with EXECUTE.
     Definer {
         /// The function, with its schema and argument types.
         function: String,
@@ -342,6 +348,40 @@ pub enum Problem {
         owner: String,
         /// How the session can run it.
         by: String,
+    },
+    /// A trigger, on any table, runs a `SECURITY DEFINER` function of the kind
+    /// [`Problem::Definer`] names. A trigger runs its function without asking for EXECUTE, for
+    /// whoever writes to its table by whatever route, a view, a rule or a foreign key's cascade
+    /// among them, so the trigger is refused whoever can write the table.
+    DefinerTrigger {
+        /// The function, with its schema and argument types.
+        function: String,
+        /// The role it runs as.
+        owner: String,
+        /// The trigger.
+        trigger: String,
+        /// The table the trigger is on.
+        table: String,
+    },
+    /// An enabled event trigger runs a `SECURITY DEFINER` function of the kind
+    /// [`Problem::Definer`] names. An event trigger fires on statements any role may run, such
+    /// as `CREATE TEMP TABLE`, without asking for EXECUTE.
+    DefinerEventTrigger {
+        /// The function, with its schema and argument types.
+        function: String,
+        /// The role it runs as.
+        owner: String,
+        /// The event trigger.
+        event_trigger: String,
+    },
+    /// The session's role, or a role it can become, PUBLIC included, can run a function in an
+    /// untrusted language, such as `plpython3u`, which runs with the access of the server's
+    /// operating-system user to its files.
+    UntrustedLanguage {
+        /// The function, with its schema and argument types.
+        function: String,
+        /// The language.
+        language: String,
     },
     /// The session's role, or a role it can become, can run a catalog function that reads or
     /// writes the server's own files, such as `lo_export`, which writes any file the server's
@@ -486,8 +526,36 @@ impl fmt::Display for Problem {
             } => write!(
                 f,
                 "the SECURITY DEFINER function {function} runs as {owner}, which can read or \
-                 change switchboard_audit.call_rows, and this session's role, or a role it can \
-                 become, holds {by}"
+                 change switchboard_audit.call_rows or turn off its triggers, and this \
+                 session's role, or a role it can become, holds {by}"
+            ),
+            Self::DefinerTrigger {
+                function,
+                owner,
+                trigger,
+                table,
+            } => write!(
+                f,
+                "the trigger {trigger} on {table} runs the SECURITY DEFINER function {function} \
+                 as {owner}, which can read or change switchboard_audit.call_rows or turn off \
+                 its triggers; a trigger asks for no EXECUTE, and any write that reaches \
+                 {table}, through a view, a rule or a foreign key, fires it"
+            ),
+            Self::DefinerEventTrigger {
+                function,
+                owner,
+                event_trigger,
+            } => write!(
+                f,
+                "the enabled event trigger {event_trigger} runs the SECURITY DEFINER function \
+                 {function} as {owner}, which can read or change switchboard_audit.call_rows \
+                 or turn off its triggers, on statements any role may run"
+            ),
+            Self::UntrustedLanguage { function, language } => write!(
+                f,
+                "this session's role, or a role it can become, can run {function}, in the \
+                 untrusted language {language}, which reaches the database server's own files \
+                 and programs"
             ),
             Self::ServerFunction { function } => write!(
                 f,
@@ -560,6 +628,30 @@ impl PgAuditStore {
     /// audit log, and refuses otherwise, naming every reason. Run it at boot, before serving,
     /// and do not serve if it fails.
     ///
+    /// # What it is for
+    ///
+    /// The check catches misconfiguration of a database whose roles, schema and grants come
+    /// from `sql/roles.sql` and the migrations: a grant, membership, setting or object that
+    /// gives the gateway's role a way to read or change audit rows beyond its own. It is not a
+    /// defence against a hostile superuser or table owner, who can defeat any check run from
+    /// inside the database.
+    ///
+    /// The routes the review of the first check left open (#43) are each closed or ruled out
+    /// of scope:
+    ///
+    /// - A definer function whose owner owns the table, a relation that reaches it, or a
+    ///   trigger function, without holding a privilege: closed. Ownership counts.
+    /// - A view or rule outside the schema owned by the session's role, or a role it can
+    ///   become, after revoking its own grants: closed. Ownership is refused.
+    /// - A definer function whose owner can set `session_replication_role`: closed.
+    /// - A view, rule or foreign key's cascade running a definer trigger: closed, with event
+    ///   triggers, by refusing every trigger and enabled event trigger that runs a definer.
+    /// - Functions in untrusted languages: closed. EXECUTE on any is refused.
+    /// - Changes after boot, C functions from extensions, and connections back in through
+    ///   `postgres_fdw` or `dblink`: out of scope, as the last section says.
+    ///
+    /// # What it requires
+    ///
     /// - The server syncs commits to disk: `fsync` and `full_page_writes` are on.
     /// - The session has the settings the store sets in its startup options:
     ///   `synchronous_commit` is `on` and `search_path` is `pg_catalog,pg_temp`. A pooler that
@@ -602,30 +694,39 @@ impl PgAuditStore {
     /// - Neither the role nor any role it can become, PUBLIC included, holds anything on a
     ///   view, materialized view or table with a rule, in any schema, that reaches `call_rows`
     ///   directly or through other views and rules. A view runs with its owner's privileges,
-    ///   and a rule with its table's owner's.
-    /// - Neither can run a `SECURITY DEFINER` function, in any schema, whose owner can read or
-    ///   change `call_rows`: one that holds a privilege on it, or on a view or rule that
-    ///   reaches it, or can act as the schema's owner, or can run another such function. Running
-    ///   it means EXECUTE, which PUBLIC holds on every new function unless it is revoked, or a
-    ///   write to a table whose trigger runs it, since a trigger does not ask for EXECUTE.
+    ///   and a rule with its table's owner's. Neither owns one outside the schema: an owner
+    ///   that has revoked its own grants can grant them back.
+    /// - Neither can run, with EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
+    ///   owner can read or change `call_rows` or turn off its triggers: one that holds a
+    ///   privilege on it, or on a view or rule that reaches it; or can act as the owner of the
+    ///   table, of such a view or rule, of the schema, or of the functions the table's
+    ///   triggers run; or can set `session_replication_role`; or can run another such
+    ///   function. PUBLIC holds EXECUTE on every new function unless it is revoked.
+    /// - No trigger on any table, and no enabled event trigger, runs such a function, whoever
+    ///   can write the table. A trigger does not ask for EXECUTE, and a write through a view,
+    ///   a rule or a foreign key's cascade fires it as a direct one does. An event trigger
+    ///   fires on statements any role may run, such as `CREATE TEMP TABLE`. The migrations'
+    ///   trigger functions are not `SECURITY DEFINER`.
     /// - Neither can run the catalog's functions that read or write the server's own files:
     ///   `lo_export`, `lo_import`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
     ///   `pg_stat_file`, and adminpack's `pg_file_*` where the server has them.
+    /// - Neither can run a function in an untrusted language, such as `plpython3u` or
+    ///   `plperlu`, which runs with the server's operating-system user's access to its files.
     ///
     /// # What it does not look for
     ///
-    /// The check reads the catalog of one database, once. It does not see:
+    /// The check reads the catalog of one database, once. Each of these is out of scope: it
+    /// needs an administrator's act, not a misconfiguration of what the role script and the
+    /// migrations make.
     ///
-    /// - anything changed after it passes, until the next boot;
-    /// - an event trigger, which fires on statements the role may be able to run, such as
-    ///   `CREATE TEMP TABLE`, and whose function may be `SECURITY DEFINER`;
-    /// - functions that reach outside the database other than the catalog's file functions
-    ///   named above: one in an untrusted language such as `plpython3u`, or in C from an
-    ///   extension, runs with the server's operating-system user's access to its files;
-    /// - a way back in through another connection: `postgres_fdw` or `dblink`, through a user
+    /// - Anything changed after it passes, until the next boot. Making a grant, view, rule or
+    ///   function that reaches `call_rows` needs a role the check refuses to the gateway.
+    /// - Functions in C from an extension. Only a superuser installs C code, and the catalog
+    ///   cannot say what it does.
+    /// - A way back in through another connection: `postgres_fdw` or `dblink`, through a user
     ///   mapping or a function that holds another role's password, can reach `call_rows` as
-    ///   that role. A foreign table in `switchboard_audit` is refused; one elsewhere is not
-    ///   followed to where it connects.
+    ///   that role. Only an administrator stores that password. A foreign table in
+    ///   `switchboard_audit` is refused; one elsewhere is not followed to where it connects.
     ///
     /// Has no time limit: wrap it in one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {
@@ -730,6 +831,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
         definers(client, table, version, &mut problems).await?;
     }
     server_functions(client, &mut problems).await?;
+    untrusted_functions(client, &mut problems).await?;
 
     if problems.is_empty() {
         Ok(())
@@ -1280,7 +1382,9 @@ async fn open_rows(
 
 /// Nothing, for the session's role or any role it can become, PUBLIC included, on any view,
 /// materialized view or table with a rule, in another schema, that reaches `call_rows`
-/// ([`REACHING`]). Those in the schema are refused with everything else there.
+/// ([`REACHING`]); and neither owns one. An owner that has revoked its own privileges can grant
+/// them back, and a materialized view's owner can read what it copied from `call_rows`. Those
+/// in the schema are refused with everything else there.
 async fn reaching_privileges(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
@@ -1313,18 +1417,51 @@ async fn reaching_privileges(
             object: row.get(0),
         });
     }
+    let owned = client
+        .query(
+            &format!(
+                "WITH RECURSIVE {REACHING}
+                 SELECT 'the relation ' || n.nspname || '.' || v.relname
+                        || ', which reaches {CALL_ROWS}'
+                 FROM reaching x
+                     JOIN pg_catalog.pg_class v ON v.oid = x.oid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = v.relnamespace
+                 WHERE n.nspname <> 'switchboard_audit'
+                     AND pg_has_role(current_user, v.relowner, 'MEMBER')
+                 ORDER BY 1"
+            ),
+            &[&table],
+        )
+        .await?;
+    problems.extend(
+        owned
+            .into_iter()
+            .map(|row| Problem::Owns { object: row.get(0) }),
+    );
     Ok(())
 }
 
 /// No `SECURITY DEFINER` function, in any schema, that runs as a role able to read or change
-/// `call_rows` may be run by the session's role or a role it can become, PUBLIC included,
-/// which holds EXECUTE on every new function unless it is revoked. A function's owner is able
-/// when it holds a privilege on `call_rows` or on anything [`REACHING`] finds, superusers among
-/// them since they hold every privilege; when it can act as the owner of the schema, which may
-/// drop the table; or when it can run another such function, itself or through a trigger on a
-/// table it can write. A trigger runs its function without asking for EXECUTE, so a write to a
-/// table with such a trigger counts as running it. A function owned by a role the session can
-/// become is left out: what that role holds is checked as the session's own.
+/// `call_rows`, or turn off its triggers, may be run by the session's role or a role it can
+/// become, PUBLIC included, which holds EXECUTE on every new function unless it is revoked.
+///
+/// A function's owner is able when it holds a privilege on `call_rows` or on anything
+/// [`REACHING`] finds, superusers among them since they hold every privilege; when it can act
+/// as the owner of one of those, which may grant itself any privilege on it, or of the schema,
+/// which may drop the table, or of a function the table's triggers run (`set_times` and
+/// `complete_once`), which may drop the trigger with it; when it can set
+/// `session_replication_role`, under which neither trigger fires; or when it can run another
+/// such function, itself or through a trigger on a table it can write.
+///
+/// A trigger runs its function without asking for EXECUTE, for whoever writes its table by
+/// whatever route: directly, through a view or a rule, or by a foreign key's cascade. Rather
+/// than follow every route, a trigger on any table that runs such a function is refused,
+/// whoever can write the table; and so is an enabled event trigger that runs one, since an
+/// event trigger fires on statements any role may run. The migrations' trigger functions are
+/// not `SECURITY DEFINER`.
+///
+/// A function owned by a role the session can become is left out: what that role holds is
+/// checked as the session's own.
 async fn definers(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
@@ -1332,7 +1469,13 @@ async fn definers(
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let privileges = table_privileges(version).join(", ");
-    let found = client
+    // From version 15 a role can be granted SET on a setting only a superuser may set.
+    let replication = if version >= 150_000 {
+        "OR has_parameter_privilege(p.proowner, 'session_replication_role', 'SET')"
+    } else {
+        ""
+    };
+    let definers: Vec<tokio_postgres::types::Oid> = client
         .query(
             &format!(
                 "WITH RECURSIVE {REACHING},
@@ -1340,12 +1483,19 @@ async fn definers(
                      SELECT p.oid FROM pg_catalog.pg_proc p
                      WHERE p.prosecdef
                          AND (EXISTS (SELECT FROM reaching x
+                                          JOIN pg_catalog.pg_class c ON c.oid = x.oid
                                       WHERE has_table_privilege(p.proowner, x.oid, $2)
                                           OR has_any_column_privilege(p.proowner, x.oid,
-                                                                      'SELECT, INSERT, UPDATE'))
+                                                                      'SELECT, INSERT, UPDATE')
+                                          OR pg_has_role(p.proowner, c.relowner, 'USAGE'))
                               OR EXISTS (SELECT FROM pg_catalog.pg_namespace s
                                          WHERE s.nspname = 'switchboard_audit'
-                                             AND pg_has_role(p.proowner, s.nspowner, 'USAGE')))
+                                             AND pg_has_role(p.proowner, s.nspowner, 'USAGE'))
+                              OR EXISTS (SELECT FROM pg_catalog.pg_trigger g
+                                             JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid
+                                         WHERE g.tgrelid = $1::oid
+                                             AND pg_has_role(p.proowner, f.proowner, 'USAGE'))
+                              {replication})
                      UNION
                      SELECT p.oid
                      FROM definers d
@@ -1360,41 +1510,115 @@ async fn definers(
                                                           p.proowner, t.tgrelid,
                                                           'DELETE, TRUNCATE'))))
                  )
-                 SELECT {FUNCTION_NAME}, o.rolname::text, 'EXECUTE on it'
-                 FROM definers d
+                 SELECT d.oid FROM definers d
                      JOIN pg_catalog.pg_proc p ON p.oid = d.oid
-                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
-                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
-                 WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')
-                     AND {}
-                 UNION ALL
-                 SELECT {FUNCTION_NAME}, o.rolname::text,
-                        w || ' on ' || n.nspname || '.' || c.relname || ', whose trigger '
-                            || t.tgname || ' runs it'
-                 FROM definers d
-                     JOIN pg_catalog.pg_proc p ON p.oid = d.oid
-                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
-                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
-                     JOIN pg_catalog.pg_trigger t ON t.tgfoid = p.oid
-                     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
-                     unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS w
-                 WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')
-                     AND {}
-                 ORDER BY 1, 3",
-                by_any_role("has_function_privilege(r.oid, d.oid, 'EXECUTE')"),
-                by_any_role(
-                    "(has_table_privilege(r.oid, c.oid, w)
-                      OR w IN ('INSERT', 'UPDATE') AND has_any_column_privilege(r.oid, c.oid, w))"
-                ),
+                 WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')"
             ),
             &[&table, &privileges],
         )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+
+    let executable = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}, o.rolname::text
+                 FROM unnest($1::oid[]) AS d(oid)
+                     JOIN pg_catalog.pg_proc p ON p.oid = d.oid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
+                 WHERE {}
+                 ORDER BY 1",
+                by_any_role("has_function_privilege(r.oid, d.oid, 'EXECUTE')"),
+            ),
+            &[&definers],
+        )
         .await?;
-    problems.extend(found.into_iter().map(|row| Problem::Definer {
+    problems.extend(executable.into_iter().map(|row| Problem::Definer {
         function: row.get(0),
         owner: row.get(1),
-        by: row.get(2),
+        by: "EXECUTE on it".into(),
+    }));
+
+    let triggered = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}, o.rolname::text, t.tgname::text,
+                        n.nspname || '.' || c.relname
+                 FROM pg_catalog.pg_trigger t
+                     JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
+                     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                 WHERE p.oid = ANY($1::oid[])
+                 ORDER BY 4, 3"
+            ),
+            &[&definers],
+        )
+        .await?;
+    problems.extend(triggered.into_iter().map(|row| Problem::DefinerTrigger {
+        function: row.get(0),
+        owner: row.get(1),
+        trigger: row.get(2),
+        table: row.get(3),
+    }));
+
+    let event_triggered = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}, o.rolname::text, e.evtname::text
+                 FROM pg_catalog.pg_event_trigger e
+                     JOIN pg_catalog.pg_proc p ON p.oid = e.evtfoid
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_roles o ON o.oid = p.proowner
+                 WHERE p.oid = ANY($1::oid[]) AND e.evtenabled <> 'D'
+                 ORDER BY 3"
+            ),
+            &[&definers],
+        )
+        .await?;
+    problems.extend(
+        event_triggered
+            .into_iter()
+            .map(|row| Problem::DefinerEventTrigger {
+                function: row.get(0),
+                owner: row.get(1),
+                event_trigger: row.get(2),
+            }),
+    );
+    Ok(())
+}
+
+/// No function in an untrusted language, one that is procedural and not trusted, such as
+/// `plpython3u` or `plperlu`, may be run by the session's role or a role it can become,
+/// PUBLIC included. Only a superuser makes one, and it runs with the access of the server's
+/// operating-system user to its files and programs. C and internal functions are not
+/// procedural and are not looked at.
+async fn untrusted_functions(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query(
+            &format!(
+                "SELECT {FUNCTION_NAME}, l.lanname::text
+                 FROM pg_catalog.pg_proc p
+                     JOIN pg_catalog.pg_namespace fn ON fn.oid = p.pronamespace
+                     JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+                 WHERE l.lanispl AND NOT l.lanpltrusted
+                     AND {}
+                 ORDER BY 1",
+                by_any_role(RUNS_FUNCTION),
+            ),
+            &[],
+        )
+        .await?;
+    problems.extend(found.into_iter().map(|row| Problem::UntrustedLanguage {
+        function: row.get(0),
+        language: row.get(1),
     }));
     Ok(())
 }
@@ -1413,7 +1637,7 @@ async fn server_functions(
                  WHERE fn.nspname = 'pg_catalog' AND p.proname::text = ANY($1::text[])
                      AND {}
                  ORDER BY 1",
-                by_any_role("has_function_privilege(r.oid, p.oid, 'EXECUTE')"),
+                by_any_role(RUNS_FUNCTION),
             ),
             &[&SERVER_FUNCTIONS],
         )
@@ -1530,6 +1754,58 @@ mod tests {
             assert!(sql.contains(&created), "{created}");
         }
         assert_eq!(sql.matches("CREATE TRIGGER").count(), TRIGGERS.len());
+    }
+
+    #[test]
+    fn each_definer_route_and_untrusted_language_is_named() {
+        let cases = [
+            (
+                Problem::Definer {
+                    function: "reports.take()".into(),
+                    owner: "audit_table_owner".into(),
+                    by: "EXECUTE on it".into(),
+                },
+                "the SECURITY DEFINER function reports.take() runs as audit_table_owner, which \
+                 can read or change switchboard_audit.call_rows or turn off its triggers, and \
+                 this session's role, or a role it can become, holds EXECUTE on it",
+            ),
+            (
+                Problem::DefinerTrigger {
+                    function: "reports.purge_rows()".into(),
+                    owner: "switchboard_owner".into(),
+                    trigger: "purge_rows".into(),
+                    table: "reports.notes".into(),
+                },
+                "the trigger purge_rows on reports.notes runs the SECURITY DEFINER function \
+                 reports.purge_rows() as switchboard_owner, which can read or change \
+                 switchboard_audit.call_rows or turn off its triggers; a trigger asks for no \
+                 EXECUTE, and any write that reaches reports.notes, through a view, a rule or \
+                 a foreign key, fires it",
+            ),
+            (
+                Problem::DefinerEventTrigger {
+                    function: "reports.purge_on_ddl()".into(),
+                    owner: "switchboard_owner".into(),
+                    event_trigger: "purge_on_ddl".into(),
+                },
+                "the enabled event trigger purge_on_ddl runs the SECURITY DEFINER function \
+                 reports.purge_on_ddl() as switchboard_owner, which can read or change \
+                 switchboard_audit.call_rows or turn off its triggers, on statements any role \
+                 may run",
+            ),
+            (
+                Problem::UntrustedLanguage {
+                    function: "reports.outside()".into(),
+                    language: "plpython3u".into(),
+                },
+                "this session's role, or a role it can become, can run reports.outside(), in \
+                 the untrusted language plpython3u, which reaches the database server's own \
+                 files and programs",
+            ),
+        ];
+        for (problem, expected) in cases {
+            assert_eq!(problem.to_string(), expected);
+        }
     }
 
     #[test]

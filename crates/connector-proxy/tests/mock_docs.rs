@@ -12,7 +12,7 @@ use common::{
 };
 use connector_proxy::{DEFAULT_DEADLINE, ProxyConnector, Upstream, outcome};
 use gateway_core::ToolName;
-use gateway_core::audit::{Answer, Outcome};
+use gateway_core::audit::{Answer, ErrorKind, Outcome};
 use gateway_testkit::{CONNECTOR, READ_TOOL, SCOPED_READ_TOOL};
 use mock_docs_server::{
     AcceptedCredential, Config, FAIL_CODE, FAIL_DOC, HANG_DOC, HUGE_DOC, PLAN, Running, SLOW_DOC,
@@ -121,7 +121,12 @@ async fn a_tool_result_marked_as_an_error_is_an_error_with_its_text() {
         Answer::Error("There is no document `no-such-doc` in project `atlas`.".to_owned())
     );
     let row = harness.rows().pop().unwrap();
-    assert_eq!(row.completion.unwrap().outcome, Outcome::Error);
+    assert_eq!(
+        row.completion.unwrap().outcome,
+        Outcome::Error {
+            error_kind: ErrorKind::Other
+        }
+    );
 }
 
 #[tokio::test]
@@ -161,7 +166,12 @@ async fn a_call_that_never_answers_is_abandoned_at_the_deadline() {
     // The call was sent: abandoning it is the connector's doing, not a failure to reach.
     assert_eq!(requests(&server)[0]["document"], HANG_DOC);
     let row = harness.rows().pop().unwrap();
-    assert_eq!(row.completion.unwrap().outcome, Outcome::Error);
+    assert_eq!(
+        row.completion.unwrap().outcome,
+        Outcome::Error {
+            error_kind: ErrorKind::OversizedOrLateRead
+        }
+    );
 }
 
 #[tokio::test]
@@ -286,7 +296,12 @@ async fn arguments_that_are_not_an_object_are_an_error_and_nothing_is_sent() {
             Answer::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned())
         );
         let row = harness.rows().pop().unwrap();
-        assert_eq!(row.completion.unwrap().outcome, Outcome::Error);
+        assert_eq!(
+            row.completion.unwrap().outcome,
+            Outcome::Error {
+                error_kind: ErrorKind::InvalidArguments
+            }
+        );
     }
     assert!(server.log_lines().is_empty(), "{:?}", server.log_lines());
 }

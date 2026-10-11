@@ -8,7 +8,7 @@
 //! - a [`ToolDefinition`] per approved tool, which `tools/list` is answered from without
 //!   contacting the server. The core holds no definitions; they live here;
 //! - an [`ArgumentAdapter`] per approved tool, which names the resources a call reaches and
-//!   refuses arguments its schema does not declare;
+//!   checks a call's arguments against the approved schema;
 //! - a [`Route`] and an [`Approval`] per tool, the [`Server`] records, and the
 //!   [`ProfileRules`].
 //!

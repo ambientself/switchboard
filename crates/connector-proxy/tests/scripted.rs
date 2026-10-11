@@ -11,8 +11,9 @@ use common::{
     json_response, last_chunk, response, result_of_size, text_result, upstream,
 };
 use connector_proxy::{DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Upstream, outcome};
-use gateway_core::audit::{Answer, Outcome};
-use gateway_testkit::READ_TOOL;
+use gateway_core::ToolName;
+use gateway_core::audit::{Answer, ErrorKind, Outcome};
+use gateway_testkit::{DRAFT_TOOL, READ_TOOL};
 use serde_json::{Value, json};
 
 const CAP: usize = 1000;
@@ -22,13 +23,26 @@ fn arguments() -> Value {
     json!({"project": "atlas", "document": "plan"})
 }
 
-/// A connector to `server` with a small cap and a short deadline.
+/// A connector to `server` with a small cap and a short deadline, serving the draft tool, which
+/// is classified `propose`, besides the fixture's read tools.
 fn bounded(server: &Scripted) -> connector_proxy::ProxyConnector {
     connector(Upstream {
         deadline: DEADLINE,
         max_response_bytes: CAP,
-        ..upstream(server.url())
+        ..upstream(server.url()).tool(ToolName::parse(DRAFT_TOOL).unwrap(), "draft_document")
     })
+}
+
+/// The answer to one call to `tool`, and the outcome its row records.
+async fn recorded(
+    tool: &str,
+    steps: impl Fn(&Value) -> Vec<Step> + Send + Sync + 'static,
+) -> (Answer, Outcome) {
+    let server = Scripted::start(steps).await;
+    let harness = Harness::new();
+    let answer = harness.call(&bounded(&server), tool, arguments()).await;
+    let row = harness.rows().pop().unwrap();
+    (answer, row.completion.unwrap().outcome)
 }
 
 async fn answer_to(steps: impl Fn(&Value) -> Vec<Step> + Send + Sync + 'static) -> Answer {
@@ -134,30 +148,110 @@ async fn a_403_is_the_servers_refusal() {
     })
     .await;
 
-    assert_eq!(
-        answer,
-        Answer::Refused(outcome::UPSTREAM_REFUSED.to_owned())
-    );
+    assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
 }
 
 #[tokio::test]
-async fn a_403_is_recorded_as_refused() {
-    let server =
-        Scripted::start(|_| vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))])
-            .await;
-    let harness = Harness::new();
-
-    harness
-        .call(&bounded(&server), READ_TOOL, arguments())
+async fn a_403_is_recorded_as_a_vendor_refusal() {
+    for tool in [READ_TOOL, DRAFT_TOOL] {
+        let (answer, outcome) = recorded(tool, |_| {
+            vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
+        })
         .await;
 
-    let row = harness.rows().pop().unwrap();
+        assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
+        assert_eq!(
+            outcome,
+            Outcome::Error {
+                error_kind: ErrorKind::VendorRefusal
+            },
+            "{tool}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_401_is_recorded_as_another_error() {
+    let (answer, outcome) = recorded(READ_TOOL, |_| {
+        vec![Step::Write(response(
+            "401 Unauthorized",
+            "text/plain",
+            b"no",
+        ))]
+    })
+    .await;
+
     assert_eq!(
-        row.completion.unwrap().outcome,
-        Outcome::Refused {
-            sentence: outcome::UPSTREAM_REFUSED.to_owned()
+        answer,
+        Answer::Error(outcome::CREDENTIAL_REJECTED.to_owned())
+    );
+    assert_eq!(
+        outcome,
+        Outcome::Error {
+            error_kind: ErrorKind::Other
         }
     );
+}
+
+/// An answer too large, too late or broken off is its own kind of error from a tool classified
+/// `read`. From the draft tool, classified `propose`, it is another error: decision 0011 makes
+/// it `unknown`, which is not built yet.
+#[tokio::test]
+async fn an_oversized_or_late_answer_is_its_own_kind_only_from_a_read() {
+    fn too_large(request: &Value) -> Vec<Step> {
+        vec![Step::Write(response(
+            "200 OK",
+            "application/json",
+            &result_of_size(request, CAP + 1),
+        ))]
+    }
+    fn declared_too_large(_: &Value) -> Vec<Step> {
+        vec![
+            Step::Write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
+                    .to_vec(),
+            ),
+            Step::Hang,
+        ]
+    }
+    fn late(_: &Value) -> Vec<Step> {
+        vec![Step::Sleep(DEADLINE * 3)]
+    }
+    fn broken_off(request: &Value) -> Vec<Step> {
+        let body = text_result(request, "cut short").to_string().into_bytes();
+        vec![Step::Write(
+            [
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes(),
+                body[..body.len() / 2].to_vec(),
+            ]
+            .concat(),
+        )]
+    }
+    type Script = fn(&Value) -> Vec<Step>;
+    let cases: [(&str, Script, &str); 4] = [
+        ("too large", too_large, outcome::TOO_LARGE),
+        ("declared too large", declared_too_large, outcome::TOO_LARGE),
+        ("late", late, outcome::TIMED_OUT),
+        ("broken off", broken_off, outcome::BROKEN_OFF),
+    ];
+    for (tool, kind) in [
+        (READ_TOOL, ErrorKind::OversizedOrLateRead),
+        (DRAFT_TOOL, ErrorKind::Other),
+    ] {
+        for (case, steps, sentence) in cases {
+            let (answer, outcome) = recorded(tool, steps).await;
+            assert_eq!(answer, Answer::Error(sentence.to_owned()), "{tool}, {case}");
+            assert_eq!(
+                outcome,
+                Outcome::Error { error_kind: kind },
+                "{tool}, {case}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

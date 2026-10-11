@@ -286,12 +286,22 @@ Each refresh goes through the identity gate's replacement of one configured issu
 builds a whole new verifier with the new set, which gets every check a set gets at boot, and
 puts it in force only if that succeeds. A refused set, or a fetch that fails, leaves the keys in
 use. The refresher names the issuer; nothing in a token chooses whose keys are replaced, and
-keys for an issuer that is not configured are refused. There is no maximum age: keys that
-cannot be refreshed stay in force until a refresh succeeds. A bound on how old they may get
-before tokens are refused is a freshness bound, and Q11 owns it.
+keys for an issuer that is not configured are refused. Keys that cannot be refreshed stay in
+force until a refresh succeeds, with no maximum age ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Refusing every token because
+a refresh failed would turn an outage of the issuer's host into an outage of the gateway. Each
+issuer's key age is exported instead, as `switchboard_issuer_keys_age_seconds{issuer}` (#91),
+with an alert condition at four refresh intervals (Q12).
 
-This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
-is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
+An `https` keys URL is fetched over TLS (#88), and needs `keys_ca_file`: a PEM bundle, read at
+boot, whose CAs are the only ones trusted. No roots are compiled in and none are read from the
+system: in Kubernetes the bundle is `kube-root-ca.crt`, and for a public issuer it is the image's
+own CA bundle. The certificate is verified against the keys URL's host, a DNS name or an IP
+address. The client is rustls with ring, passed to the client itself and never installed as the
+process default; it offers HTTP/1.1 only, and the deadline covers the TLS handshake. An issuer
+whose keys need a bearer token takes `keys_token_file`, read again on every fetch because the
+kubelet rotates projected tokens, and sent to the keys URL only. Both are refused beside an
+`http` keys URL. The demo deployments still use keys files.
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
@@ -513,6 +523,23 @@ rule is about every profile, not Otto's. Instead the decision function refuses a
 a property that such a tool is never allowed or listed, decision-table cases for each
 profile, and mutations that remove each half of the check
 ([decision 0006](decisions/0006-what-the-decision-function-sees.md), amended 2026-10-04).
+
+**Freshness.** Each replica serves one snapshot at a time, with a revision every row records. A
+new version of the registry loads whole or not at all and replaces it atomically; one that does
+not load is logged, and the last good one keeps serving. A replica that has not read its
+registry file for longer than the maximum age, 60 s by default and never less than twice the
+poll interval, fails `/readyz` and refuses `tools/call` and `tools/list` with a fixed sentence
+and no row. How long a merged change takes to reach the file is the delivery path's own bound,
+stated with it: kubelet's part was measured at up to 88 s in kind, and is stated as at most
+120 s. A change the reloader accepts takes effect within that bound plus one poll. That
+includes an emergency withdrawal, which removes a tool or removes it from its surfaces, and a
+team removed from a surface. A version that removes or changes a server entry, or changes a
+remaining tool's route, is refused on reload and keeps the last good policy, so it takes effect
+only through a restart, within the rollout. Group claims are as fresh as their
+token, at most an hour for a user issuer; a team manifest change takes one rollout; a per-user
+grant is looked up on every call, so deleting it takes effect on the next. A token for a deleted
+pod or ServiceAccount is accepted until it expires ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 
 ## 9. Credentials
 
@@ -860,6 +887,17 @@ its tools on a surface refuses to start, rather than starting with that tool dro
 the policy serves is either served or loudly refused, never silently missing. A snapshot loaded
 later is held to the same rule.
 
+The Postgres store's boot check has a stated scope. It catches misconfiguration of a database
+whose roles, schema and grants come from the store's role script (`sql/roles.sql`) and its
+migrations: a grant, membership, setting or object that gives the gateway's role a way to read
+or change audit rows beyond its own. It is not a defence against a hostile superuser or table
+owner, who can defeat any check run from inside the database. Against that scope, the routes
+the first check's review left open (#43) are each closed or ruled out: ownership now counts
+wherever a privilege does; a definer function whose owner can set `session_replication_role`
+is refused; every trigger and enabled event trigger that runs a definer function is refused,
+whoever can fire it; functions in untrusted languages are refused; and the three below are out
+of scope.
+
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
 Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the audit
@@ -880,26 +918,36 @@ pooler may drop, so the check reads them back and refuses a session without them
 The grants on the audit table are not the only way to it, so the Postgres check also refuses,
 for the gateway's role and every role it can become, PUBLIC included: an audit table that is a
 view or foreign table, or has a rule; any privilege on a view, materialized view or table with
-a rule, in any schema, that reaches the audit table directly or through other views and rules;
-being able to run a `SECURITY DEFINER` function, in any schema, whose owner can read or change
-the audit table, by EXECUTE or by writing to a table whose trigger runs it; and EXECUTE on the
-catalog's functions that read or write the server's files (`lo_export`, `lo_import`,
-`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's
-`pg_file_*`).
+a rule, in any schema, that reaches the audit table directly or through other views and rules,
+or owning one outside the audit schema, since an owner that revoked its own grants can grant
+them back; being able to run, by EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
+owner can read or change the audit table or turn off its triggers; EXECUTE on the catalog's
+functions that read or write the server's files (`lo_export`, `lo_import`, `pg_read_file`,
+`pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's `pg_file_*`); and EXECUTE
+on any function in an untrusted language, such as `plpython3u`, which runs with the access of
+the server's operating-system user. A definer function's owner counts as able when it holds a
+privilege on the audit table or on a view or rule that reaches it, can act as the owner of any
+of those, of the schema, or of the functions the table's triggers run, can set
+`session_replication_role`, or can run another such function. A trigger runs its function
+without EXECUTE, for any write that reaches its table, through a view, a rule or a foreign
+key's cascade as well as directly, and an event trigger fires on statements any role may run,
+such as `CREATE TEMP TABLE`. So rather than follow each route, the check refuses every trigger
+on any table, and every enabled event trigger, that runs such a function, whoever can fire it.
+The migrations' trigger functions are not `SECURITY DEFINER`, so a database they built passes.
 
-What the Postgres check does not look for, which an administrator must keep from the gateway's
-role without its help:
+What the Postgres check does not look for, each out of scope because it needs an
+administrator's act rather than a misconfiguration of what the role script and the migrations
+make:
 
 - **Changes after boot.** It reads the catalog once. A grant, view, rule or function made
-  later is not seen until the next boot.
-- **Event triggers.** One fires on statements the gateway's role may be able to run, such as
-  `CREATE TEMP TABLE`, and its function may be `SECURITY DEFINER`.
-- **Other functions that leave the database.** Only the catalog's file functions above are
-  refused by name. A function in an untrusted language such as `plpython3u`, or in C from an
-  extension, runs with the access of the server's operating-system user.
+  later is not seen until the next boot. Making one needs a role the check refuses to the
+  gateway's.
+- **Functions in C from an extension.** Only a superuser installs C code, and the catalog
+  cannot say what it does.
 - **Other connections back in.** `postgres_fdw` or `dblink` can log in again as another role,
-  through a user mapping or a function holding that role's password. A foreign table in the
-  audit schema is refused; one elsewhere is not followed to where it connects.
+  through a user mapping or a function holding that role's password, which only an
+  administrator stores. A foreign table in the audit schema is refused; one elsewhere is not
+  followed to where it connects.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
@@ -961,8 +1009,9 @@ proxied server usually cannot be checked that way. The rules are in
   write. A mismatch withdraws the entry's tools from every surface. A withdrawal does not wait
   for the next snapshot to load from the policy files: it makes a snapshot of its own, the one
   in force less the withdrawn tools, with a revision naming both, and swaps it in atomically.
-  How it reaches every replica is Q11. A per-user entry is not checked on a schedule, since its
-  reach is already the whole site; its test shows that another site is refused.
+  Each replica checks and withdraws for itself (Drift, below). A per-user entry is not checked
+  on a schedule, since its reach is already the whole site; its test shows that another site is
+  refused.
 
 **Built-in connectors** are gateway code calling a vendor API. The GitHub connector is the
 model: it brokers a GitHub App token, limits every call to one organization before any request
@@ -979,13 +1028,25 @@ leaves, bounds result sizes, and tags every result as external evidence.
    None may get a JSON-RPC result or error, which would show the call was dispatched.
    Otherwise the server is not registered. The third token comes from TokenRequest for the
    registry's own probe ServiceAccount
-   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)).
+   ([decision 0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). Until
+   the registry is a service, registration is the approval pull request:
+   `switchboard probe --config=FILE --server=NAME` sends the three calls, and the entry records
+   `probe = { result = "refused", date = ... }`. The loader refuses a proxied entry without
+   it, and a probe that could not connect is never recorded as refused. Compose has no
+   TokenRequest and no route claim, so there the third call presents a static dummy
+   credential, and the record shows only that the server checks its caller
+   ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 3. The registry reads the server's tool list.
 4. A person assigns each tool a classification and approves it. A server is never trusted to
    classify its own tools.
-5. Each approval records a hash of the tool's name, description and input schema, together
-   with the server's identity, its address, its credential configuration, the schema's
-   dialect, and the reach and the date of its test. A second reviewer approves it.
+5. Each approval records two hashes. `definition_sha256` covers the tool's upstream name,
+   title, description and input schema, exactly as the server serves them. `binding_sha256`
+   covers the schema's dialect, which is always `"2020-12"`, and the server's binding: its
+   identity, address and destination, its credential mode and reference, and its connector
+   entry's principal, narrowing, what the credential permits, reach and the date of its reach
+   test. `outputSchema` and annotations are in neither. The loader recomputes both at boot and
+   on every reload, and refuses a registry in which either differs. A schema in another dialect
+   is refused, never converted. A second reviewer approves it.
 6. Approved tools are added to tool surfaces.
 
 A side-effecting tool's approval also declares how an `unknown` receipt is settled, by a
@@ -993,12 +1054,34 @@ lookup by marker or by a person, and, for a proxied tool, whether its errors are
 the vendor did nothing (section 11). A connector attaches the receipt marker to what it makes,
 and sends the receipt identifier as the vendor's idempotency key where the vendor honors one.
 
-**Drift.** The registry re-reads each server's tool list on a schedule. A tool whose
-definition no longer matches its hash is withdrawn from every surface until it is approved
-again. A description is text an agent reads as guidance, so a changed description is a changed
-interface and a possible attack. The hash detects a changed interface. It does not detect a
-changed implementation behind the same interface; that remains a risk, covered by the owner's
-accountability, monitoring and emergency withdrawal.
+**Drift.** Every gateway replica runs a drift pass beside its registry reloader, every 300 s
+by default (from 5 s to 900 s; 10 s in the demos). For each proxied entry it reads the tool
+list with the entry's own credential, sends the three calls of step 2, and makes the reach
+check. A tool whose served definition no longer matches `definition_sha256`, or that the
+server no longer lists, is withdrawn. A description is text an agent reads as guidance, so a
+changed description is a changed interface and a possible attack. The hash detects a changed
+interface. It does not detect a changed implementation behind the same interface; that remains
+a risk, covered by the owner's accountability, monitoring and emergency withdrawal.
+
+A withdrawal makes a snapshot of its own, with the revision `{base}+withdrawn:{names}`, the
+withdrawn tools' exposed names sorted and joined by commas. The loader refuses a registry
+revision containing `+`, so the derived form cannot be mistaken for a loaded one. It survives a
+reload while the tool's hashes and `approved_at` are unchanged; a new approval clears it. The
+first pass's tool lists and probes run at boot, before the replica binds the one listener that
+serves `/readyz` and every surface, so it serves nothing until they finish. Its reach checks
+are calls through that listener, so they run as soon as it is bound; until they finish, at
+most one call deadline, a reach that has widened is served, as between any two passes. A poll
+that fails, by being unreachable, late or unparsable, is not drift: the tools stay served and
+the failure is counted and alerted on.
+Each replica checks for itself, so a change that lasts one interval plus one call deadline,
+about 305 s at the defaults, is withdrawn on every replica whose polls succeed. While a
+replica's polls of an entry fail, a changed tool stays served on that replica, and the alert on
+failed polls covers it. In milestone 3 a withdrawal lives in each replica's memory: it lasts
+until a new approval or until that replica restarts, and a restarted replica serves the tool
+again if the server has gone back to its approved definition. Every withdrawal is logged at
+ERROR and alerted on, so that a person makes it standing by a new approval or a registry edit.
+Persisted withdrawals come with the registry service ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 
 The three calls of step 2 repeat on each poll. A server that starts dispatching any of them
 is recorded as open, and its owner and the owner of [route-exceptions.md](route-exceptions.md)
@@ -1006,9 +1089,15 @@ are told. Each environment whose current evidence does not show that server refu
 the governed path until it is closed. Its tools stay listed: withdrawing them would close the
 governed route and leave the open one.
 
-**Where the gateway will connect** is limited to approved destinations, with the server's
-identity verified, redirects refused and internal addresses unreachable through a registered
-URL.
+**Where the gateway will connect** is limited to approved destinations ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). A server's identity is the
+DNS name the connection proves, and must equal its address's host. Every server is reached over
+`https` with a certificate verified against a CA file the deployment names, except an entry
+marked `in_cluster`, which may use plain `http`. The address is checked when the gateway
+connects, and the checked address is the one connected to. Redirects are refused. Loopback,
+unspecified, link-local and multicast addresses are always refused, and private and
+carrier-grade NAT ranges are allowed only for `in_cluster` entries. Loopback is allowed only in
+a development build, for tests.
 
 **Descriptions shown to agents** are the approved ones, never the live ones.
 
@@ -1035,11 +1124,16 @@ server that is down still appears in the list and fails when called.
 ## 15. Sessions
 
 The gateway keeps no client-facing MCP session. It issues no session ID and every request
-carries its own token, so any instance can answer any request. Upstream sessions to proxied
-servers that need one are a per-instance cache that can be rebuilt. Sessions must be isolated
-by server, credential identity and authorization context. Rebuilding a session does not
-authorize replaying a write whose outcome is unknown: the gateway never repeats a tool call on
-its own ([decision 0009](decisions/0009-audit-completion-receipts-and-recovery.md)).
+carries its own token, so any instance can answer any request. The proxy connector keeps no
+upstream session either: it never sends `initialize`, and a server that needs a session is
+refused at registration in milestone 3 ([decision
+0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Each connector entry has its
+own client and connection pool, and the HTTP client's retry of cancelled requests is turned off,
+so a call is never sent twice when a connection breaks. If upstream sessions are added later,
+they are a per-instance cache that can be rebuilt, isolated by server, credential identity and
+authorization context. Rebuilding a session does not authorize replaying a write whose outcome
+is unknown: the gateway never repeats a tool call on its own ([decision
+0009](decisions/0009-audit-completion-receipts-and-recovery.md)).
 
 ## 16. Invariants
 
@@ -1079,7 +1173,7 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. The gateway refuses, at boot and at each snapshot swap, a snapshot serving a tool not classified `read` without a receipt store (decision 0009), and CI checks the release artifact for it. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. The code owners of the policy files and the branch rule requiring their review, since no policy file lands before them (decision 0011). |
-| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. Per-server limits in the deployment file, the instance, server and team caps, the identity and audit opt-outs refused outside development builds, configurable audit pools, the row's size bound, and the agreed metrics ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). | Freshness and revocation bounds (Q11). Tool assurance and proxied exposure (decision 0011). Rollout safeguards and audit operations (decision 0014), except the per-user rate limit, which waits for milestone 5. |
+| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. Per-server limits in the deployment file, the instance, server and team caps, the identity and audit opt-outs refused outside development builds, configurable audit pools, the row's size bound, and the agreed metrics ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). | Freshness and revocation bounds ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Tool assurance and proxied exposure (decision 0011). Rollout safeguards and audit operations (decision 0014), except the per-user rate limit, which waits for milestone 5. |
 | 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Before stage 3, the pod binding and the currency check (decision 0012). Built-in GitHub and Jira tools, and the exception list in check 5 for Otto's two comment tools (decision 0011, #12). Built-in tools that check their own scope report what they reached (decision 0011). Receipts and the key check before the first side effect reaches a real system (decision 0009, part 2). The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Who the owner names to raise the one list of Otto requests from decisions 0009 to 0012 (Q18); nothing reaches Otto's owners before then. Otto's owners' answers to decision 0011: the review of the declarations for Otto's eighteen tools, team repositories moving into the snapshot's limits, and the proposal tools checked against the interim automation refusals; until then this gateway serves none of Otto's tools. Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The security owner named and the comment-tool exception's register entry signed, before Otto's two comment tools are served (decision 0011). The vendor actions Otto's control plane needs. Asked but not blocking: Otto's answers to decision 0010 (its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant). Until they come, every Otto turn has the governed path. |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13), including that each client sends a tool-use identifier or can set the named `_meta` field before it is served a `propose` tool (decision 0009). The security reviewer of data approvals, named by the security team, since no resource enters a group's limit, and so no employee read works, until then (decision 0011). Whether group limits and broad-read opt-ins expire (decision 0011). Per-user grants and receipts before any employee proposal for that system (decision 0011), and whether a per-user rate limit must come first (Q12). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
@@ -1148,11 +1242,19 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - Columns for the instance, the kind and the deadline: built. The gateway names its instance
   from `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, and refuses to start with neither. Rows
   written before the migration read as calls by the instance `before-0003`, due when they were
-  completed or begun. Not built, for decisions 0011 and 0012: how the resources were found,
-  with the reach by reference, the credential identity, the error kind, an unverified
-  delegation's failure kind, and a grant's digest, issuer, key ID, pod UID, egress setting and
-  currency answer. With #12, a column for the exception that allowed a call, since the row's
-  shape constraint rightly allows no reason on an allowed row.
+  completed or begun. The error kind: built (#56). An `error` outcome carries one of five
+  kinds from the core's closed `ErrorKind`, and migration 0006 adds `error_kind`, which a row
+  has exactly when its outcome is `error` (`error_kind_shape`), completed once with the rest of
+  the completion. Error rows written before it read `before-0006`. The argument check is
+  `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
+  refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
+  a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
+  begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
+  Not built, for decisions 0011 and 0012: how the resources were found, with the reach by
+  reference, the credential identity, an unverified delegation's failure kind, and a grant's
+  digest, issuer, key ID, pod UID, egress setting and currency answer. With #12, a column for
+  the exception that allowed a call, since the row's shape constraint rightly allows no reason
+  on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
@@ -1216,6 +1318,20 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   finish pool of its own, finish waiting at most the answer budget and then retrying on its
   own task until the deadline, an identical repeat finish accepted, column grants, and the
   report of each finish given up.
+
+**#11, the argument check against the approved schema.** Built (#94): the loader accepts a
+subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
+another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
+refuses another dialect rather than converting it. An enforced keyword must have the JSON type
+2020-12 gives it; an annotation's value, and whether the names in a `type` list or in
+`required` are unique, are not checked. The
+argument check enforces every keyword the loader accepts other than annotations: `type`,
+`properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, and the bounds on
+lengths, item counts and numbers. Numbers compare by value, so `1.0` is an integer, and the
+schema `false` admits nothing. A call that fails is outcome `error` of kind
+`invalid_arguments`, and nothing is sent. The exact rules are in the `adapter` module of
+`gateway-registry`. `pattern`, `$ref` and the composition keywords are refused at load, not
+checked; a schema that needs them cannot be approved yet.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1400,8 +1516,10 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
     under such a profile is never allowed unless its currency is current. A mutation that
     applies the check to `propose` alone fails the excepted `write` case. In Otto: a
     superseded control plane that is still running answers superseded for its own turns.
-  - Revocation. A revoked turn's next proposal denied. A removed key, and a team removed from
-    the allowlist, each taking effect within one rollout until Q11 sets a bound.
+  - Revocation. A revoked turn's next proposal denied. A removed key taking effect within one
+    rollout. A team removed from the allowlist taking effect within the delivery bound plus one
+    registry poll, the bound [decision
+    0013](decisions/0013-registry-freshness-drift-and-withdrawal.md) sets.
   - Failures. A grant that fails verification denied at check 3 as an unverified delegation,
     under one reason kind, with a deny row that records which check failed and no claims. An
     audience or pod failure also recorded with the grant's digest; a bad signature recorded
@@ -1486,14 +1604,14 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9, Q10, Q17 and Q18, and Q11 to Q13, are in
+What remains of Q9, Q10, Q17 and Q18, and Q12 and Q13, are in
 [open-questions.md](open-questions.md). Q9 is narrowed to what decision 0011 leaves to others,
 Q10 to what compliance requires of read auditing, Q17 to what decision 0010 leaves to others,
 and Q18 to what decision 0012 leaves to Otto's owners and to the owner; the rest of each is
-decided. Each of decisions 0009 to 0012 lists what it leaves to Otto's owners, IT, IT security,
-the security team, platform owners and others, with who decides and what holds meanwhile. Every
-request of Otto's owners goes to them as one list, raised by whoever the owner names
-(decision 0012). The milestone table says which each milestone must settle before it starts, and
-section 17 lists the changes the records need in code already built. Vendor feasibility remains
-research in [systems.md](systems.md). The independent review's findings that are not yet
-reflected here are listed at the end of that file.
+decided. Q11 is settled by decision 0013. Each of decisions 0009 to 0013 lists what it leaves
+to Otto's owners, IT, IT security, the security team, platform owners and others, with who
+decides and what holds meanwhile. Every request of Otto's owners goes to them as one list,
+raised by whoever the owner names (decision 0012). The milestone table says which each milestone
+must settle before it starts, and section 17 lists the changes the records need in code already
+built. Vendor feasibility remains research in [systems.md](systems.md). The independent
+review's findings that are not yet reflected here are listed at the end of that file.

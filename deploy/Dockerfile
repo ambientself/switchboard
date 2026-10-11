@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 #
 # The demo image: the Switchboard binaries, the scripted workload, and the migration runner. One
 # image serves every role in Compose and kind; each service picks its command. Built from the
@@ -20,11 +20,18 @@
 # packages of one build), and a `test-support` build serves tools not classified `read` with no
 # receipt store (decision 0009). crates/demo-checks/tests/release.rs pins the line, and CI runs
 # the same command and checks the binary refuses such a tool.
+#
+# Every image is pinned by the digest of its tag's multi-arch index: the frontend in the syntax
+# line above and both base images below. The rust tag is rust-toolchain.toml's channel, and
+# crates/demo-checks/tests/driver.rs holds it there. Dependabot proposes new digests for the base
+# images and never a new rust version (.github/dependabot.yml); it does not read the syntax line.
+# To bump a pin by hand, keep the tag and take the new digest from
+#
+#     docker buildx imagetools inspect <image>:<tag>
+#
+# The apt packages below are not pinned.
 
-ARG RUST_IMAGE=rust:1.99.0-slim-trixie
-ARG RUNTIME_IMAGE=debian:trixie-slim
-
-FROM ${RUST_IMAGE} AS build
+FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS build
 ARG BINS="switchboard switchboard-dev mock-docs-server"
 ARG REQUIRE_ALL_BINS=false
 WORKDIR /src
@@ -50,7 +57,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     done; \
     ls -l /out/bin
 
-FROM ${RUNTIME_IMAGE}
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 # curl and jq for the workload and health checks, psql for the migration runner and the audit
 # query, ca-certificates for any TLS upstream.
 RUN set -eu; \

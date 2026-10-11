@@ -410,6 +410,138 @@ async fn the_admin_endpoint_takes_the_same_verification() {
     );
 }
 
+// --- Subjects limited to their projects ---------------------------------------------------
+
+const ATLAS_SUBJECT: &str = "system:serviceaccount:team-atlas:agent";
+const BOREALIS_SUBJECT: &str = "system:serviceaccount:team-borealis:agent";
+
+/// A server accepting the two team subjects, each limited to its own project, configured as the
+/// binary reads `MOCK_DOCS_JWT_SUBJECTS`.
+async fn teams_server(test: &str) -> Running {
+    let jwks_file = file(test, "jwks.json", &jwks());
+    let mut vars = jwt_vars(jwks_file.to_str().unwrap());
+    vars.remove("MOCK_DOCS_JWT_SUBJECT");
+    vars.insert(
+        "MOCK_DOCS_JWT_SUBJECTS".to_owned(),
+        format!("{ATLAS_SUBJECT}=atlas;{BOREALIS_SUBJECT}=borealis"),
+    );
+    let settings = Settings::from_vars(|name| vars.get(name).cloned()).unwrap();
+    start(Config::new(settings.config.accepted)).await.unwrap()
+}
+
+/// `list_documents` for `project`, as `subject`.
+async fn list_project(server: &Running, subject: &str, project: &str) -> reqwest::Response {
+    client()
+        .post(server.url())
+        .bearer_auth(token(&claims_with(json!({"sub": subject}))))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "list_documents", "arguments": {"project": project}}}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn each_subject_reaches_only_its_own_project() {
+    let server = teams_server("teams").await;
+    for (subject, own, other) in [
+        (ATLAS_SUBJECT, "atlas", "borealis"),
+        (BOREALIS_SUBJECT, "borealis", "atlas"),
+    ] {
+        let allowed = list_project(&server, subject, own).await;
+        assert_eq!(allowed.status(), StatusCode::OK, "{subject} {own}");
+        let answer: Value = allowed.json().await.unwrap();
+        assert_eq!(
+            answer["result"]["structuredContent"]["project"], own,
+            "{answer}"
+        );
+
+        let refused = list_project(&server, subject, other).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{subject} {other}");
+        assert!(refused.headers().get("www-authenticate").is_none());
+        assert!(refused.bytes().await.unwrap().is_empty());
+        let line = server.log_lines().pop().unwrap();
+        assert_eq!(
+            (&line["caller"], &line["project"], &line["refused"]),
+            (&json!(subject), &json!(other), &json!("project")),
+            "{line}"
+        );
+    }
+    // The gateway's own subject is not one of the teams', so it is refused before any project.
+    let response = list(&server, Some(&token(&claims()))).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Calls naming no project are not limited.
+    let response = client()
+        .post(server.url())
+        .bearer_auth(token(&claims_with(json!({"sub": ATLAS_SUBJECT}))))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `MOCK_DOCS_JWT_SUBJECT`, as the kind demo sets it, names one subject that reaches every
+/// project.
+#[tokio::test]
+async fn the_single_subject_variable_still_reaches_every_project() {
+    let server = server("legacy-subject").await;
+    for project in ["atlas", "borealis"] {
+        let response = list_project(&server, SUBJECT, project).await;
+        assert_eq!(response.status(), StatusCode::OK, "{project}");
+    }
+}
+
+#[tokio::test]
+async fn the_admin_endpoint_changes_a_subjects_projects() {
+    let server = teams_server("teams-admin").await;
+    assert_eq!(
+        list_project(&server, ATLAS_SUBJECT, "borealis")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let url = format!(
+        "http://{}/admin/callers/{ATLAS_SUBJECT}",
+        server.admin_address()
+    );
+    let response = client()
+        .put(&url)
+        .bearer_auth(token(&claims_with(json!({"sub": BOREALIS_SUBJECT}))))
+        .json(&json!({"projects": ["borealis"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"caller": ATLAS_SUBJECT, "projects": ["borealis"]})
+    );
+    let line = server.log_lines().pop().unwrap();
+    assert_eq!(
+        (&line["event"], &line["target"], &line["projects"]),
+        (&json!("admin"), &json!(ATLAS_SUBJECT), &json!(["borealis"])),
+        "{line}"
+    );
+    assert_eq!(
+        list_project(&server, ATLAS_SUBJECT, "borealis")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_project(&server, ATLAS_SUBJECT, "atlas").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    // The other subject is untouched.
+    assert_eq!(
+        list_project(&server, BOREALIS_SUBJECT, "atlas")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
 // --- The binary ----------------------------------------------------------------------------
 
 struct Killed(Child);
@@ -444,9 +576,8 @@ async fn the_binary_boots_in_the_jwt_mode_and_says_so() {
     assert_eq!(boot["mode"], "jwt", "{boot}");
     assert_eq!(boot["issuer"], ISSUER, "{boot}");
     assert_eq!(boot["audience"], AUDIENCE, "{boot}");
-    assert_eq!(boot["subject"], SUBJECT, "{boot}");
+    assert_eq!(boot["callers"], json!({ SUBJECT: "every" }), "{boot}");
     assert_eq!(boot["key_ids"], json!([KID]), "{boot}");
-    assert!(boot.get("accepted_sha256").is_none(), "{boot}");
 
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
     let response = client()

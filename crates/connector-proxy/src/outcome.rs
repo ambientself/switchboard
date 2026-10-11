@@ -3,13 +3,17 @@
 //! The outcome follows the core's meaning of each [`ToolOutcome`]:
 //!
 //! - [`ToolOutcome::Refused`] when the connector would not send the call because of what it
-//!   names ([`NOT_SERVED`], [`NO_CREDENTIAL`]), and when the server answered `403`, its
-//!   refusal of the call's scope ([`UPSTREAM_REFUSED`]).
-//! - [`ToolOutcome::Error`] for arguments that are not an object, which are never sent
-//!   ([`ARGUMENTS_NOT_AN_OBJECT`]), and for everything that went wrong on the gateway's side
-//!   or the server's: the deadline, the size cap, a connection that failed, a credential the
-//!   server did not accept, any other HTTP status, an answer that is not MCP, a JSON-RPC error,
-//!   and a tool result marked `isError`.
+//!   names ([`NOT_SERVED`], [`NO_CREDENTIAL`]).
+//! - [`ToolOutcome::Error`], with its [`ErrorKind`]:
+//!   - `InvalidArguments` for arguments that are not an object, which are never sent
+//!     ([`ARGUMENTS_NOT_AN_OBJECT`]);
+//!   - `VendorRefusal` when the server answered `403`, its refusal of the call
+//!     ([`UPSTREAM_REFUSED`]);
+//!   - `OversizedOrLateRead` for the deadline, the size cap or an answer broken off, from a
+//!     tool classified `read`, and `Other` for the same from any other tool;
+//!   - `Other` for everything else that went wrong on the gateway's side or the server's: a
+//!     connection that failed, a credential the server did not accept, any other HTTP status,
+//!     an answer that is not MCP, a JSON-RPC error, and a tool result marked `isError`.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
 //! A successful result is bounded only by the answer cap; the gateway passes its content and
@@ -17,7 +21,7 @@
 //! server reaches the caller only from a JSON-RPC error's message and from a failed tool
 //! result's text, each cut to [`MAX_MESSAGE_CHARS`] with control characters replaced by spaces.
 
-use gateway_core::ToolOutcome;
+use gateway_core::{ErrorKind, ToolOutcome};
 use serde_json::{Map, Value};
 
 /// The tool is not one this connector forwards: it routes to another connector, or the
@@ -60,7 +64,8 @@ pub const BROKEN_OFF: &str = "This tool's server stopped answering before its an
 pub const CREDENTIAL_REJECTED: &str = "This tool's server did not accept the gateway's credential.";
 
 /// The server answered `403`: it refused the call as outside what the gateway's credential
-/// may do.
+/// may do. The outcome is an error of the kind `VendorRefusal`, which the row records in
+/// place of this sentence.
 pub const UPSTREAM_REFUSED: &str =
     "This tool's server refused the call as outside what the gateway's credential may do.";
 
@@ -88,7 +93,7 @@ pub fn rpc_error(code: i64, message: &str) -> String {
 
 /// The outcome of a `200` answer to the request with ID `id`.
 pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> ToolOutcome {
-    let not_mcp = || ToolOutcome::Error(NOT_MCP.to_owned());
+    let not_mcp = || ToolOutcome::error(ErrorKind::Other, NOT_MCP);
     if !content_type.is_some_and(is_json) {
         return not_mcp();
     }
@@ -107,7 +112,9 @@ pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> Too
                 error.get("code").and_then(Value::as_i64),
                 error.get("message").and_then(Value::as_str),
             ) {
-                (Some(code), Some(text)) => ToolOutcome::Error(rpc_error(code, text)),
+                (Some(code), Some(text)) => {
+                    ToolOutcome::error(ErrorKind::Other, rpc_error(code, text))
+                }
                 _ => not_mcp(),
             }
         }
@@ -117,7 +124,7 @@ pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> Too
 
 fn tool_result(result: &Map<String, Value>) -> ToolOutcome {
     let Some(Value::Array(content)) = result.get("content") else {
-        return ToolOutcome::Error(NOT_MCP.to_owned());
+        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);
     };
     if result.get("isError") != Some(&Value::Bool(true)) {
         return ToolOutcome::Ok(Value::Object(result.clone()));
@@ -128,9 +135,9 @@ fn tool_result(result: &Map<String, Value>) -> ToolOutcome {
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect();
     if text.is_empty() {
-        ToolOutcome::Error(TOOL_FAILED.to_owned())
+        ToolOutcome::error(ErrorKind::Other, TOOL_FAILED)
     } else {
-        ToolOutcome::Error(bounded(&text.join("\n")))
+        ToolOutcome::error(ErrorKind::Other, bounded(&text.join("\n")))
     }
 }
 

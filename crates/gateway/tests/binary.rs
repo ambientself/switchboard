@@ -13,7 +13,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use files::{AUDIENCE, Files, READ_TOOL, SURFACE, TEAM_A_SA, cluster_issuer, kubernetes_token};
+use gateway::keys::REFRESH_STARTED_EVENT;
 use gateway_core::IDENTITY_FAILURE;
+use gateway_identity::SigningAlgorithm;
 use gateway_testkit::LocalIssuer;
 use mock_docs_server::{AcceptedCredential, Config};
 use serde_json::{Value, json};
@@ -371,6 +373,25 @@ impl Running {
         }
     }
 
+    /// The first line logged with `event` as its `event` field: one already read, or the next
+    /// one to come.
+    fn logged(&mut self, event: &str) -> Value {
+        let is = |line: &Value| line["fields"]["event"] == json!(event);
+        if let Some(line) = self.seen.iter().find(|line| is(line)) {
+            return line.clone();
+        }
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(PATIENCE)
+                .unwrap_or_else(|_| panic!("no `{event}` line was logged: {:#?}", self.seen));
+            self.seen.push(line.clone());
+            if is(&line) {
+                return line;
+            }
+        }
+    }
+
     /// The `"event":"boot"` lines logged so far.
     fn boot_lines(&self) -> Vec<&Value> {
         self.seen
@@ -536,4 +557,93 @@ async fn with_metrics_configured_it_serves_them_on_their_own_listener_only() {
     // The MCP listener does not serve them.
     let (status, _) = tokio::task::block_in_place(|| get(running.address, "/metrics"));
     assert_eq!(status, 404);
+    // No issuer is fetched from a keys URL: there is no key age to export.
+    assert!(
+        !text.contains("switchboard_issuer_keys_age_seconds"),
+        "{text}"
+    );
+}
+
+/// The binary starts the key refresher: its timer for an issuer with a keys URL says so as it
+/// starts, at the deployment's interval, five minutes, and the age of that issuer's keys is
+/// exported. The timer's first fetch is five minutes away, so only its start is seen here.
+#[tokio::test(flavor = "multi_thread")]
+async fn it_starts_the_key_refresher_and_exports_the_age_of_the_keys() {
+    let keys = files::KeysServer::start().await;
+    let fetched = LocalIssuer::new(&keys.url, SigningAlgorithm::Es256).unwrap();
+    keys.serve(fetched.jwks_document());
+    let files = Files::new(
+        "binary-keys",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    files.write(
+        "gateway.toml",
+        &files::deployment_file(&format!(
+            "{}\n[audit]\nmode = \"disabled\"\n\n[metrics]\nlisten = \"127.0.0.1:0\"\n",
+            files::keys_url_issuer(&keys.url, &keys.keys_url()),
+        )),
+    );
+    let mut running = tokio::task::block_in_place(|| Running::start(&files));
+    let started = tokio::task::block_in_place(|| running.logged(REFRESH_STARTED_EVENT));
+    assert_eq!(started["level"], json!("INFO"), "{started}");
+    assert_eq!(started["fields"]["issuer"], json!(keys.url), "{started}");
+    assert_eq!(
+        started["fields"]["refresh_seconds"],
+        json!(300),
+        "{started}"
+    );
+
+    let serving = tokio::task::block_in_place(|| {
+        let logged = running
+            .seen
+            .iter()
+            .find(|line| line["fields"]["message"] == json!(SERVING_METRICS))
+            .cloned();
+        logged.unwrap_or_else(|| running.event(SERVING_METRICS))
+    });
+    let metrics: SocketAddr = serving["fields"]["address"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (status, text) = tokio::task::block_in_place(|| get(metrics, "/metrics"));
+    assert_eq!(status, 200, "{text}");
+    let ages: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("switchboard_issuer_keys_age_seconds"))
+        .collect();
+    assert_eq!(ages.len(), 1, "{text}");
+    let series = format!(
+        "switchboard_issuer_keys_age_seconds{{issuer=\"{}\"}} ",
+        keys.url
+    );
+    let age: f64 = ages[0]
+        .strip_prefix(&series)
+        .unwrap_or_else(|| panic!("{text}"))
+        .parse()
+        .unwrap();
+    assert!(age < PATIENCE.as_secs_f64(), "{text}");
+}
+
+/// The binary starts the registry watcher: a new revision written to the registry file is
+/// served once the next poll, a second later, reads it.
+#[test]
+fn it_watches_the_registry_file_and_serves_a_new_revision() {
+    let files = Files::new(
+        "binary-watch",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    let mut running = Running::start(&files);
+    files.write(
+        "registry/registry.toml",
+        &files::registry_at_revision("http://127.0.0.1:9/mcp", "demo-2"),
+    );
+    let reloaded = running.logged("policy_reloaded");
+    assert_eq!(
+        reloaded["fields"]["revision"],
+        json!("demo-2"),
+        "{reloaded}"
+    );
 }

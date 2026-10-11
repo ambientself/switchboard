@@ -57,6 +57,7 @@ contract!(
     a_record_the_store_cannot_hold_is_refused_and_leaves_no_row,
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
+    an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,
     the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline,
     a_list_row_is_stored_complete_with_no_deadline,
 );

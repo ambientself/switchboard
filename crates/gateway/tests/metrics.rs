@@ -16,17 +16,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use audit_postgres::{Budgets, GATEWAY_ROLE, OWNER_ROLE, PgAuditStore, PoolSizes, ROLES, migrate};
+use files::Files;
 use gateway::{
     DeploymentError, METRICS_CONTENT_TYPE, Metrics, TELEMETRY_QUEUE, Telemetry, Wiring, boot,
-    path::RequestPath, serve_metrics,
+    path::RequestPath, serve_metrics, start,
 };
 use gateway_core::audit::{self, Begun, RowStart};
-use gateway_core::{CallContext, RequestedTool, decide};
+use gateway_core::{CallContext, InstanceName, RequestedTool, decide};
+use gateway_identity::{SigningAlgorithm, SystemClock};
 use gateway_testkit::{
-    CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector, READ_TOOL, SURFACE_ALL,
-    SURFACE_READ, TEAM_A_DOCUMENT, row_start,
+    CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector, LocalIssuer, READ_TOOL,
+    SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, row_start,
 };
-use http::{HeaderMap, HeaderValue, Method};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -236,6 +238,68 @@ async fn the_open_row_poll_runs_at_once_and_a_failed_poll_is_counted() {
         None,
         "{text}"
     );
+}
+
+/// Each issuer whose keys come from a keys URL has the age of its keys exported, from boot's
+/// fetch. A refresh that fails lets it grow; one that succeeds starts it again. An issuer with
+/// a keys file has no series.
+#[tokio::test]
+async fn the_age_of_each_issuers_fetched_keys_is_exported() {
+    let keys = files::KeysServer::start().await;
+    let fetched = LocalIssuer::new(&keys.url, SigningAlgorithm::Es256).unwrap();
+    keys.serve(fetched.jwks_document());
+    let files = Files::new(
+        "metrics-key-ages",
+        &files::cluster_issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    files.write(
+        "gateway.toml",
+        &files::deployment_file(&format!(
+            "{}\n[audit]\nmode = \"disabled\"\n",
+            files::keys_url_issuer(&keys.url, &keys.keys_url()),
+        )),
+    );
+    let prepared = start::prepare(
+        files.load(),
+        InstanceName::new("metrics-test"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap();
+    let (telemetry, _drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+    let metrics = Metrics::new(telemetry, None).with_issuer_keys(prepared.keys.ages());
+    let series = format!(
+        "switchboard_issuer_keys_age_seconds{{issuer=\"{}\"}}",
+        keys.url
+    );
+    let age = || {
+        let text = metrics.render();
+        assert!(
+            text.contains("# TYPE switchboard_issuer_keys_age_seconds gauge\n"),
+            "{text}"
+        );
+        let samples = text
+            .lines()
+            .filter(|line| line.starts_with("switchboard_issuer_keys_age_seconds"))
+            .count();
+        assert_eq!(samples, 1, "{text}");
+        sample(&text, &series).unwrap_or_else(|| panic!("{series}\n{text}"))
+    };
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = age();
+    assert!((0.3..PATIENCE.as_secs_f64()).contains(&before), "{before}");
+
+    keys.fail(StatusCode::INTERNAL_SERVER_ERROR);
+    let refreshed = prepared.keys.refresh_all().await;
+    assert!(matches!(refreshed.as_slice(), [Err(_)]), "{refreshed:?}");
+    assert!(age() >= before);
+
+    keys.serve(fetched.jwks_document());
+    let refreshed = prepared.keys.refresh_all().await;
+    assert!(matches!(refreshed.as_slice(), [Ok(_)]), "{refreshed:?}");
+    assert!(age() < before, "{}", metrics.render());
 }
 
 /// The headers a well-behaved client sends, with `token`.

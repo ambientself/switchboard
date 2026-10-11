@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, Begun, Completion, DecisionKind, ListRecord,
+    self, Answer, AuditFailure, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
     MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, Outcome, RecordedResource,
     RecordedResources, RequestMetadata, RowKind, RowStart,
 };
@@ -246,7 +246,8 @@ fn an_allowed_call_runs_its_own_arguments_once_and_completes_its_row() {
 #[test]
 fn finish_completes_the_row_its_call_began_and_no_other() {
     let store = MemoryStore::default();
-    let connector = RecordingConnector::answering(ToolOutcome::Error("upstream 503".into()));
+    let connector =
+        RecordingConnector::answering(ToolOutcome::error(ErrorKind::VendorRefusal, "upstream 503"));
     let first = allowed(&store, "fixture__read");
     let second = allowed(&store, "fixture__read");
     let third = allowed(&store, "fixture__read");
@@ -259,7 +260,9 @@ fn finish_completes_the_row_its_call_began_and_no_other() {
         vec![
             None,
             Some(Completion {
-                outcome: Outcome::Error,
+                outcome: Outcome::Error {
+                    error_kind: ErrorKind::VendorRefusal
+                },
                 latency_ms: 7,
             }),
             None,
@@ -540,7 +543,9 @@ fn giving_up_a_guard_completes_its_row_as_error_and_runs_nothing() {
     assert_eq!(
         completion_of(&row),
         Some(Completion {
-            outcome: Outcome::Error,
+            outcome: Outcome::Error {
+                error_kind: ErrorKind::Other
+            },
             latency_ms: 0,
         }),
         "a call that never ran is recorded as error, never ok"
@@ -909,11 +914,27 @@ fn the_record_serializes_under_pinned_names_and_reads_back() {
         ),
         (
             json!(Completion {
-                outcome: Outcome::Error,
+                outcome: Outcome::Error {
+                    error_kind: ErrorKind::Other
+                },
                 latency_ms: 6
             }),
-            json!({"outcome": "error", "latency_ms": 6}),
+            json!({"outcome": "error", "error_kind": "other", "latency_ms": 6}),
         ),
+        (
+            json!(ErrorKind::InvalidArguments),
+            json!("invalid_arguments"),
+        ),
+        (
+            json!(ErrorKind::OversizedOrLateRead),
+            json!("oversized_or_late_read"),
+        ),
+        (
+            json!(ErrorKind::CustodianRefusal),
+            json!("custodian_refusal"),
+        ),
+        (json!(ErrorKind::VendorRefusal), json!("vendor_refusal")),
+        (json!(ErrorKind::Other), json!("other")),
         (
             json!(Completion {
                 outcome: Outcome::Refused {
@@ -1253,7 +1274,9 @@ fn a_read_whose_caller_goes_away_is_cancelled_and_finishes_as_error() {
     assert_eq!(
         store.last().completion,
         Some(Completion {
-            outcome: Outcome::Error,
+            outcome: Outcome::Error {
+                error_kind: ErrorKind::Other
+            },
             latency_ms: 7,
         })
     );
@@ -1273,7 +1296,9 @@ fn a_read_whose_caller_has_already_gone_is_not_called() {
     );
     assert_eq!(
         store.last().completion.map(|completion| completion.outcome),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
 }
 

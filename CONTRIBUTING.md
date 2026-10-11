@@ -17,6 +17,18 @@ Bumping the pin is a deliberate change that regenerates those files in the same 
 with `TRYBUILD=overwrite cargo test -p gateway-core --test compile_fail`, after checking that
 each error is still the intended one.
 
+The demo's images are pinned by tag and by the digest of the tag's multi-arch index:
+`deploy/Dockerfile`'s syntax frontend and its `rust` and `debian` base images, and Postgres in
+`deploy/compose/compose.yaml` and `deploy/demo/demo.sh` (`POSTGRES_IMAGE`). The kind manifest
+`deploy/kind/base/postgres.yaml` names the Postgres tag alone, because kind's image load does
+not keep the index digest (`deploy/README.md`). The `rust` tag is `rust-toolchain.toml`'s
+channel. `crates/demo-checks/tests/driver.rs` checks that every one is pinned, that the three
+Postgres places agree, and that the `rust` tag is the toolchain's. Dependabot proposes new
+digests for the base images, never a new `rust` version, and new Postgres tags or digests for
+Compose; it does not read the syntax line, `demo.sh` or the kind manifest. To bump one by hand,
+take the digest from `docker buildx imagetools inspect <image>:<tag>`, and change the three
+Postgres places together.
+
 ## Running the gateway on fixtures
 
 `switchboard-dev` runs the gateway on the test fakes in `crates/gateway-testkit`: two
@@ -112,7 +124,8 @@ needs its own Postgres, because the tests change cluster-wide roles:
 
 ```sh
 for i in 0 1 2 3; do
-  docker run -d --rm --name sb-pg-$i -p 127.0.0.1:2543$i:5432 -e POSTGRES_PASSWORD=dev postgres:17-alpine
+  docker run -d --rm --name sb-pg-$i -p 127.0.0.1:2543$i:5432 -e POSTGRES_PASSWORD=dev \
+    postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
 done
 for i in 0 1 2 3; do
   SWITCHBOARD_TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:2543$i/postgres \
@@ -140,7 +153,8 @@ roles of their own, named after their database, and drop them at the end, and so
 connections to their own database for a moment.
 
 ```sh
-docker run -d --rm --name sb-pg -p 127.0.0.1:25432:5432 -e POSTGRES_PASSWORD=dev postgres:17-alpine
+docker run -d --rm --name sb-pg -p 127.0.0.1:25432:5432 -e POSTGRES_PASSWORD=dev \
+  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
 export SWITCHBOARD_TEST_DATABASE_URL=postgres://postgres:dev@127.0.0.1:25432/postgres
 cargo test -p audit-postgres
 cargo test -p gateway --test postgres
