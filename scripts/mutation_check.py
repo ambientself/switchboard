@@ -3642,8 +3642,34 @@ mutate("demo-pins-base-digest-dropped", "the Dockerfile's runtime image is pinne
        "FROM debian:trixie-slim@sha256:", "FROM debian:trixie-slim\n# @sha256:")
 mutate("demo-pins-frontend-unpinned", "the Dockerfile's syntax frontend is pinned by tag only", "deploy/Dockerfile",
        "# syntax=docker/dockerfile:1@sha256:", "# syntax=docker/dockerfile:1\n# @sha256:")
-mutate("demo-pins-rust-not-toolchain", "the Dockerfile builds with another rust than rust-toolchain.toml's", "deploy/Dockerfile",
+# Only the tag changes: the digest, which is what Docker pulls, still names the toolchain's rust.
+mutate("demo-pins-rust-not-toolchain", "the Dockerfile's build stage names another rust tag than rust-toolchain.toml's channel", "deploy/Dockerfile",
        "FROM rust:1.99.0-slim-trixie@", "FROM rust:1.98.0-slim-trixie@")
+# #125: a new Postgres digest rolls the kind pod, the pod never pulls, the run checks the digest
+# the pod runs, and every Postgres pin in the repository agrees.
+mutate("demo-pins-postgres-annotation-unset", "apply_base leaves the Postgres digest off the pod template, so a new digest under the same tag rolls nothing", DRIVER,
+       '      -e "s|switchboard.io/image-digest: .*|switchboard.io/image-digest: ${POSTGRES_IMAGE#*@}|" \\\n', "")
+mutate("demo-pins-postgres-annotation-dropped", "the kind Postgres pod template has no digest annotation for apply_base to fill in",
+       "deploy/kind/base/postgres.yaml", "      annotations:\n        switchboard.io/image-digest: set-by-demo-sh\n", "")
+mutate("demo-pins-postgres-pulls", "the kind Postgres pod pulls the tag when the loaded image is missing",
+       "deploy/kind/base/postgres.yaml", "          imagePullPolicy: Never\n", "          imagePullPolicy: IfNotPresent\n")
+mutate("demo-pins-postgres-running-unchecked", "the kind run never checks the digest Postgres runs", DRIVER,
+       "  k -n switchboard rollout status deploy/postgres --timeout=120s\n  check_postgres_image\n",
+       "  k -n switchboard rollout status deploy/postgres --timeout=120s\n")
+mutate("demo-pins-postgres-running-any-digest", "the Postgres digest check passes whatever the pod runs", DRIVER,
+       '  if printf \'%s\\n\' "$got" | grep -qxF "$want"; then\n', "  if true; then\n")
+mutate("demo-pins-postgres-running-first-pod", "the Postgres digest check reads the first of several pods", DRIVER,
+       '  if [ "$(count_lines . "$pods")" -ne 1 ]; then\n', "  if false; then\n")
+mutate("demo-pins-postgres-running-index-id", "the Postgres digest check wants the image's ID for every platform, not this one's manifest", DRIVER,
+       """docker image inspect --platform "linux/$arch" --format '{{.Id}}' "$POSTGRES_IMAGE\"""",
+       """docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE\"""")
+mutate("demo-pins-contributing-digest-differs", "a docker run command in CONTRIBUTING.md names another Postgres digest", "CONTRIBUTING.md",
+       "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\nexport",
+       "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b25\nexport")
+mutate("demo-pins-libdoc-release-differs", "the audit store's documentation runs another Postgres release", "crates/audit-postgres/src/lib.rs",
+       "//!   postgres:17.11-alpine@sha256:", "//!   postgres:17.10-alpine@sha256:")
+mutate("demo-pins-ci-release-differs", "CI's Postgres service is another release than the demo's", ".github/workflows/ci.yml",
+       "        image: postgres:17.11@sha256:", "        image: postgres:17.10@sha256:")
 mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switchboard namespace", POLICY,
        "              kubernetes.io/metadata.name: switchboard\n          podSelector:\n            matchLabels:\n              app: gateway\n",
        "              kubernetes.io/metadata.name: switchboard\n")
@@ -4042,8 +4068,8 @@ mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes 
 # cluster replaces the previous build's pods.
 
 mutate("demo-driver-kind-fixed-tag", "a kind run deploys the manifests' fixed tag", DRIVER,
-       r'''  k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -''',
-       r'''  k kustomize "$ROOT/deploy/kind/base" | k apply -f -''')
+       '    | sed -e "s|image: $IMG\\$|image: $IMG_RUN|" \\\n      -e ',
+       '    | sed -e ')
 mutate("demo-driver-kind-tag-not-from-id", "the run's tag is not taken from the image's ID", DRIVER,
        "  IMG_RUN=${IMG%:*}:${image_id:0:12}\n", "  IMG_RUN=$IMG\n")
 mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's ID", DRIVER,
@@ -4320,8 +4346,8 @@ mutate("issuer-keys-default-cap-larger", "the default body cap is 1 MiB", IK,
 # tests, not in code another package links, so their dependents are not added.
 #
 # A path outside every crate that no prefix matches runs the whole workspace. That covers the root
-# Cargo.toml and Cargo.lock, which every build reads, and docs/, scripts/, .github/, README.md and
-# CONTRIBUTING.md, which no test reads today.
+# Cargo.toml and Cargo.lock, which every build reads, and docs/, scripts/, the rest of .github/ and
+# README.md, which no test reads today.
 #
 # Left out on purpose: gateway-testkit's no_private_key_is_checked_in reads every file under
 # crates/. A mutation that wrote private key armour would be caught only by the whole-workspace run.
@@ -4340,6 +4366,11 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
     # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.
     ("crates/gateway-identity/Cargo.toml", frozenset({"mock-docs-server"})),
+    # demo-checks/tests/pins.rs holds the Postgres pins in these to demo.sh's, and
+    # demo-checks/tests/release.rs reads CI's release build.
+    ("CONTRIBUTING.md", frozenset({"demo-checks"})),
+    (".github/workflows/ci.yml", frozenset({"demo-checks"})),
+    ("crates/audit-postgres/src/lib.rs", frozenset({"demo-checks"})),
 ]
 
 
