@@ -1,13 +1,15 @@
 # 0014: Rollout safeguards and audit operations
 
-Date: 2026-10-10. Status: proposed, awaiting the owner. Would settle Q12 (#5), except the
-per-user rate limit, which stays the owner's, and the parts under Still open, which wait on
-other people. Written against [decision 0009](0009-audit-completion-receipts-and-recovery.md)
-as amended on 2026-10-10, [decision 0011](0011-resource-authorization-and-tool-assurance.md),
-and the code on main at the end of milestone 2, including the metrics export of #47. Decision
-0013, proposed beside this one, settles Q11. Neither depends on the other. The alert conditions
-below on drift, probes, reach checks and the policy's age apply to the signals decision 0013
-defines.
+Date: 2026-10-10. Status: accepted on 2026-10-11, when the owner accepted every recommendation
+this record made, including the two that were the owner's own (see The owner's answers).
+Settles Q12 (#5), except the parts under Still open: the per-user rate limit, which the owner
+left open until milestone 5, and the parts that wait on other people. Written against
+[decision 0009](0009-audit-completion-receipts-and-recovery.md) as amended on 2026-10-10,
+[decision 0011](0011-resource-authorization-and-tool-assurance.md), and the code on main at
+the end of milestone 2, including the metrics export of #47. Decision 0013, proposed beside
+this one and accepted with it on 2026-10-11, settles Q11. Neither depends on the other. The
+alert conditions below on drift, probes, reach checks and the policy's age apply to the
+signals decision 0013 defines.
 
 ## Context
 
@@ -259,13 +261,21 @@ is no longer a question in Q12.
   the begin pool at its limit, both alerted.
 - Q12 is narrowed to what others decide and the per-user rate limit.
 
-## Decided by the owner
+## The owner's answers
 
-On 2026-10-10 the owner asked for the work to keep going on the recommendations made for it.
-This record adopts the recommendation on each question above. It is proposed on that basis and
-is accepted when the owner merges it, or changed if the owner asks in its review. The one
-question it leaves to the owner, with no answer adopted, is the per-user rate limit, under
-Still open.
+The owner accepted the record on 2026-10-11, taking the recommendation on every question it
+raised, including the two that were the owner's own:
+
+- **The per-user rate limit stays open until milestone 5.** Whether one must be in place
+  before the first employee proposal tool, and what limit, is answered before that tool is
+  approved, in milestone 5, since no employee is served a proposal tool before then. No limit
+  is set, and no number is decided. The question is tracked in #15, and #5's box for it moves
+  there. It stays under Still open, with what holds until it is answered.
+- **#69 is not planned.** Identity disabled stays development-only and refuses everything:
+  nothing is listed and every `tools/call` is refused, with no row (section 4). Reads are not
+  served with rows whose identity is `disabled`, and #69 closes as not planned.
+
+Every other answer in this record is its recommendation as proposed on 2026-10-10, unchanged.
 
 ## Still open
 
@@ -273,9 +283,10 @@ Each needs someone other than the owner, except the first. The record holds whil
 open; each says what holds until it is answered.
 
 - **Whether a per-user rate limit must be in place before the first employee proposal tool,**
-  and if so what limit. For the owner; decision 0011 reserved it. The recommendation is to
-  leave it open until milestone 5, since no employee is served a proposal tool before then,
-  and to track it in #15. Until it is answered no employee proposal tool is approved.
+  and if so what limit. For the owner; decision 0011 reserved it. The owner left it open until
+  milestone 5 (The owner's answers), since no employee is served a proposal tool before then.
+  It is tracked in #15, and no limit is decided. Until it is answered no employee proposal
+  tool is approved.
 - **How long rows, receipts and resolution records are kept.** Compliance decides, with Q10.
   Until then 400 days, and nothing is deleted before the retention role exists.
 - **Who runs the audit database:** its backups, failover, `max_connections` and superuser

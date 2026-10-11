@@ -119,7 +119,7 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   asked to make the changes this needs; none has been agreed with Otto's owners yet, and what
   waits on them is listed in the decision and under Q18 below. See
   [decision 0012](decisions/0012-what-a-turn-grant-binds.md).
-- **2026-10-10 (most of Q12):** A 1 MiB request body; proxied results of 64 KiB and calls of
+- **2026-10-11 (most of Q12):** A 1 MiB request body; proxied results of 64 KiB and calls of
   5 s by default, set per server in the deployment file up to 1 MiB and 60 s. No queue and no
   circuit breaker: 256 requests in flight per instance, refused at admission with no row; 32
   calls in flight per proxied server and 8 per team per server, refused after begin as
@@ -132,8 +132,9 @@ remove the open question. Vendor research remains in [systems.md](systems.md).
   entry identity at begin. The schema stays in this repository; rows, receipts and resolution
   records are kept 400 days until compliance answers. Metrics and alert conditions are
   written, with no paging until a rotation exists. Otto's `gateway_audit` question moves to
-  Q18. What the owner and others still decide is under Q12 below. See
-  [decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md).
+  Q18. The owner accepted the record's recommendations on 2026-10-11, leaving the per-user
+  rate limit open until milestone 5. That, and what others still decide, is under Q12 below.
+  See [decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md).
 
 ## Q9. What does authorization check beyond tool classification?
 
@@ -243,9 +244,9 @@ retire Q12.
 
 - **The owner:** whether a per-user rate limit must be in place before the first employee
   proposal tool is approved, and if so what limit
-  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). The
-  recommendation is to leave it open until milestone 5 and track it in #15. Until it is
-  answered no employee proposal tool is approved.
+  ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)). The owner
+  left it open until milestone 5, tracked in #15, with no limit decided. Until it is answered
+  no employee proposal tool is approved.
 - **Compliance:** how long rows, receipts and resolution records are kept, with Q10. Until
   then 400 days, and nothing is deleted before the retention role exists.
 - **Whoever runs Postgres, named with IT:** who runs the audit database, its backups,
