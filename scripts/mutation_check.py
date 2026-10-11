@@ -1781,7 +1781,30 @@ mutate("gw-open-rows-poller-not-started", "the metrics listener serves without p
 mutate("gw-metrics-on-mcp-listener", "a [metrics] listener on the MCP listener's port is accepted", GW_DEPLOY,
        "            && takes_port(metrics.listen, file.listen)\n",
        "            && false\n            && takes_port(metrics.listen, file.listen)\n")
-mutate("gw-start-call-deadline-not-wired", "a proxied server's connector deadline does not reach the wiring", GW + "start.rs",
+# Issue #110: the finish's audit-failure answer is counted (tests/metrics.rs); the binary's
+# metrics read the telemetry its MCP path counts in (tests/binary.rs); a histogram's +Inf and
+# _count are the buckets' total, from one read (metrics.rs's own tests); and the kind run's
+# open-row message names no outage (demo-checks' driver tests). gw-start-call-deadline-not-wired
+# is caught by its behaviour: tests/postgres.rs sets a 7 s deadline for mock-docs and reads it
+# in each row's allowance, so it needs SWITCHBOARD_TEST_DATABASE_URL (start.rs's own test reads
+# a test-only accessor and catches it without).
+mutate("gw-finish-audit-failure-not-counted", "a refused call whose row cannot be completed is answered with the audit-failure sentence uncounted", GW + "path.rs",
+       "            Answer::AuditFailed { sentence } => self.audit_failed(sentence),\n",
+       "            Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),\n")
+mutate("gw-bin-metrics-own-telemetry", "switchboard's metrics read a telemetry of their own, not the one its MCP path counts in", GW_BIN,
+       "        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())\n",
+       "        let metrics = Metrics::new(Telemetry::bounded(TELEMETRY_QUEUE).0, prepared.store.clone())\n")
+mutate("gw-metrics-histogram-inf-read-apart", "a histogram's +Inf bucket is the count read apart from the buckets", GW_METRICS,
+       "            .chain(std::iter::once((\"+Inf\".to_owned(), total)));\n",
+       "            .chain(std::iter::once((\"+Inf\".to_owned(), histogram.count)));\n")
+mutate("gw-metrics-histogram-count-read-apart", "a histogram's _count is the count read apart from the buckets", GW_METRICS,
+       "        self.sample(&format!(\"{name}_count\"), labels, total);\n",
+       "        self.sample(&format!(\"{name}_count\"), labels, histogram.count);\n")
+mutate("gw-demo-kind-open-rows-names-outage", "the kind run's open-row metrics check names a database outage it did not have",
+       "deploy/demo/demo.sh",
+       "  local open=\"one row\"\n",
+       "  local open=\"the database outage's refused call's row\"\n")
+mutate("gw-start-call-deadline-not-wired", "a proxied server's connector deadline does not reach the wiring, so its rows are due by the default", GW + "start.rs",
        "            .proxied(server.name.clone(), Arc::new(bulkhead))\n"
        "            .call_deadline(server.name.clone(), deadline);\n",
        "            .proxied(server.name.clone(), Arc::new(bulkhead));\n"
