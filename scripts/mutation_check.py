@@ -2066,6 +2066,8 @@ mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin i
        "            begun\n        })", "            begun.or_else(|_| Ok(()))\n        })")
 mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so audit::listed hands out a Listed with no row stored", DEV_PRINTER,
        "            listed\n        })", "            listed.or_else(|_| Ok(()))\n        })")
+mutate("dev-printer-swallows-finish-failure", "the printer turns a failed finish into success, so a refusal the log does not hold is passed on as recorded", DEV_PRINTER,
+       "            finished\n        })", "            finished.or_else(|_| Ok(()))\n        })")
 mutate("dev-tokens-readable-by-all", "the tokens file keeps whatever mode it was created with", DEV_TOKENS,
        "    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;\n", "")
 mutate("dev-token-lifetime-over-ceiling", "the tokens file's tokens live longer than the issuers allow", DEV_TOKENS,
