@@ -1,13 +1,15 @@
 //! Decision 0014's limits, against scripted servers that hang or answer: the instance's cap on
-//! requests in flight, each server's and each team's cap on calls in flight, a hanging server
-//! isolated by them, the slots freed at the deadline, the argument check before any slot is
-//! taken, each server's bounds from the deployment file, their ceilings, and the signals.
+//! requests in flight, each server's and each team's cap on calls in flight, the team's slot
+//! given back when the server's cap refuses, a hanging server isolated by them, the slots freed
+//! at the deadline, the argument check before any slot is taken, the caps and each server's
+//! bounds from the deployment file, their ceilings, and the signals.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
 mod support;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -295,12 +297,9 @@ fn outcome_of(completion: &Option<Completion>) -> Option<&Outcome> {
     completion.as_ref().map(|completion| &completion.outcome)
 }
 
-/// Decision 0014, section 2: a request over the instance's cap is answered 503 before its body
-/// is read, with `Retry-After`, a `call_shed` event and no row. The slots are the answer tasks'
-/// until they end, so the calls holding them complete and the next request is served.
-#[tokio::test]
-async fn the_instance_cap_sheds_with_503_and_no_row() {
-    let (gates, world) = wired("instance", 32, 8, Duration::from_secs(3)).await;
+/// `gates` served over HTTP on loopback with at most `max_in_flight` requests in flight: its
+/// address, and the telemetry it counts in.
+async fn serve(gates: Gates, max_in_flight: usize) -> (SocketAddr, Telemetry) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
@@ -311,26 +310,38 @@ async fn the_instance_cap_sheds_with_503_and_no_row() {
         drain,
         std::future::pending(),
         Timeouts::default(),
-        2,
+        max_in_flight,
     ));
-    let request = |subject: &str, tool: &str| {
-        let body = legacy("tools/call", json!({"name": tool, "arguments": {"n": "1"}}))
-            .to_string()
-            .into_bytes();
-        let http = Http::new("POST", "/mcp/docs")
-            .header("host", "127.0.0.1")
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .bearer(&token(subject))
-            .header("content-length", &body.len().to_string())
-            .body(body);
-        let mut bytes = http.head();
-        bytes.extend_from_slice(&http.body);
-        bytes
-    };
+    (address, telemetry)
+}
+
+/// The bytes of an HTTP request that calls `tool` on the surface `docs` as `subject`.
+fn http_call(subject: &str, tool: &str) -> Vec<u8> {
+    let body = legacy("tools/call", json!({"name": tool, "arguments": {"n": "1"}}))
+        .to_string()
+        .into_bytes();
+    let http = Http::new("POST", "/mcp/docs")
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .bearer(&token(subject))
+        .header("content-length", &body.len().to_string())
+        .body(body);
+    let mut bytes = http.head();
+    bytes.extend_from_slice(&http.body);
+    bytes
+}
+
+/// Decision 0014, section 2: a request over the instance's cap is answered 503 before its body
+/// is read, with `Retry-After`, a `call_shed` event and no row. The slots are the answer tasks'
+/// until they end, so the calls holding them complete and the next request is served.
+#[tokio::test]
+async fn the_instance_cap_sheds_with_503_and_no_row() {
+    let (gates, world) = wired("instance", 32, 8, Duration::from_secs(3)).await;
+    let (address, telemetry) = serve(gates, 2).await;
     let hanging: Vec<_> = (0..2)
         .map(|_| {
-            let bytes = request(TEAM_A_SA, SLOW_TOOL);
+            let bytes = http_call(TEAM_A_SA, SLOW_TOOL);
             tokio::spawn(async move { exchange(address, &bytes).await })
         })
         .collect();
@@ -340,7 +351,7 @@ async fn the_instance_cap_sheds_with_503_and_no_row() {
     .await;
     let rows = world.store.rows().len();
 
-    let shed = exchange(address, &request(TEAM_B_SA, OTHER_TOOL)).await;
+    let shed = exchange(address, &http_call(TEAM_B_SA, OTHER_TOOL)).await;
     assert_eq!(shed.status, 503, "{shed:?}");
     assert_eq!(shed.header("retry-after"), Some("1"));
     assert_eq!(shed.error_message(), AT_CAPACITY);
@@ -358,7 +369,7 @@ async fn the_instance_cap_sheds_with_503_and_no_row() {
         let answer = answer.await.unwrap();
         assert_eq!(answer.status, 200, "{answer:?}");
     }
-    let served = exchange(address, &request(TEAM_B_SA, OTHER_TOOL)).await;
+    let served = exchange(address, &http_call(TEAM_B_SA, OTHER_TOOL)).await;
     assert_eq!(served.status, 200, "{served:?}");
     assert_eq!(
         served.json()["result"]["isError"],
@@ -407,6 +418,44 @@ async fn a_call_past_the_servers_cap_is_refused_with_a_row_until_the_deadline_fr
     assert_eq!(outcome_of(&completions[2]), Some(&late_read));
     let counts = world.up.signals.counts();
     assert_eq!(counts[1].0.as_str(), SLOW);
+    assert_eq!((counts[1].1.shed_server, counts[1].1.shed_team), (1, 0));
+}
+
+/// A call the server's cap refuses gives back the team slot it took first. Team-b fills the
+/// server's cap of 2, and team-a's call is refused at it. Once team-b's calls end at their
+/// deadline, team-a still has its whole cap of 2: both of its calls are sent at once.
+#[tokio::test]
+async fn a_call_refused_at_the_servers_cap_gives_back_its_teams_slot() {
+    let world = World::new("team-slot", 2, 2, Duration::from_secs(1)).await;
+    let team_b: Vec<_> = (0..2)
+        .map(|_| world.spawn_call(TEAM_B_SA, SLOW_TOOL))
+        .collect();
+    eventually("team-b's two calls reach the hanging server", || {
+        world.up.slow.received() == 2
+    })
+    .await;
+
+    let refused = world.call(TEAM_A_SA, SLOW_TOOL).await;
+    assert_eq!(refusal(&refused), server_at_capacity(SLOW, SLOW_TOOL));
+    assert_eq!(world.up.slow.received(), 2, "the refused call was sent");
+    for call in team_b {
+        assert_eq!(tool_error(&call.await.unwrap()), outcome::TIMED_OUT);
+    }
+
+    let first = world.spawn_call(TEAM_A_SA, SLOW_TOOL);
+    eventually("team-a's first call reaches the hanging server", || {
+        world.up.slow.received() == 3
+    })
+    .await;
+    let second = world.call(TEAM_A_SA, SLOW_TOOL).await;
+    assert_eq!(tool_error(&second), outcome::TIMED_OUT);
+    assert_eq!(tool_error(&first.await.unwrap()), outcome::TIMED_OUT);
+    assert_eq!(
+        world.up.slow.received(),
+        4,
+        "team-a's second call was not sent"
+    );
+    let counts = world.up.signals.counts();
     assert_eq!((counts[1].1.shed_server, counts[1].1.shed_team), (1, 0));
 }
 
@@ -588,6 +637,86 @@ async fn the_deployment_files_bounds_and_caps_reach_the_gateway() {
     assert_eq!(counts[1].1.shed_team, 1);
     assert_eq!(counts[0].1.late_or_oversized, 1);
     assert_eq!(prepared.max_in_flight, gateway::DEFAULT_MAX_IN_FLIGHT);
+}
+
+/// `start::prepare` holds the instance and each server to the caps `[limits]` sets, served as
+/// the binary serves it, with both servers hanging. With `per_server_in_flight = 1`, team-b's
+/// call to the server team-a's call holds is refused with the server's sentence. With
+/// `max_in_flight = 2`, a third request while two hang is answered 503 before it is read.
+#[tokio::test]
+async fn the_deployment_files_caps_on_calls_in_flight_reach_the_server_and_each_bulkhead() {
+    let slow = Scripted::hanging().await;
+    let other = Scripted::hanging().await;
+    let files = Files::new("caps", &issuer().jwks_document(), &slow.url);
+    files.write(
+        "registry/registry.toml",
+        &registry_text(&slow.url, &other.url),
+    );
+    files.write(
+        "gateway.toml",
+        &deployment_file(
+            "[audit]\nmode = \"disabled\"\n\n[limits]\nmax_in_flight = 2\nper_server_in_flight = 1\n\n\
+             [servers.slow]\ndeadline_seconds = 3\n\n[servers.other]\ndeadline_seconds = 3\n",
+        ),
+    );
+    let prepared = prepare(
+        files.load(),
+        InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap();
+    let (address, telemetry) = serve(prepared.gates, prepared.max_in_flight).await;
+    let spawn_call = |subject: &str, tool: &str| {
+        let bytes = http_call(subject, tool);
+        tokio::spawn(async move { exchange(address, &bytes).await })
+    };
+
+    let holding_slow = spawn_call(TEAM_A_SA, SLOW_TOOL);
+    eventually("team-a's call reaches the hanging server", || {
+        slow.received() == 1
+    })
+    .await;
+    let refused = exchange(address, &http_call(TEAM_B_SA, SLOW_TOOL)).await;
+    assert_eq!(refused.status, 200, "{refused:?}");
+    assert_eq!(
+        refused.json()["error"]["message"],
+        json!(server_at_capacity(SLOW, SLOW_TOOL)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        slow.received(),
+        1,
+        "the call over the server's cap was sent"
+    );
+
+    let holding_other = spawn_call(TEAM_B_SA, OTHER_TOOL);
+    eventually("team-b's call reaches the other hanging server", || {
+        other.received() == 1
+    })
+    .await;
+    let shed = exchange(address, &http_call(TEAM_A_SA, OTHER_TOOL)).await;
+    assert_eq!(shed.status, 503, "{shed:?}");
+    assert_eq!(shed.error_message(), AT_CAPACITY);
+    assert_eq!(
+        other.received(),
+        1,
+        "the request over the instance's cap was sent"
+    );
+    assert_eq!(telemetry.counts().calls_shed, 1);
+
+    for holding in [holding_slow, holding_other] {
+        let late = holding.await.unwrap();
+        assert_eq!(late.status, 200, "{late:?}");
+        assert_eq!(
+            late.json()["result"]["content"][0]["text"],
+            json!(outcome::TIMED_OUT),
+            "{late:?}"
+        );
+    }
+    let counts = prepared.proxied.counts();
+    assert_eq!((counts[1].1.shed_server, counts[1].1.shed_team), (1, 0));
+    assert_eq!((counts[0].1.shed_server, counts[0].1.shed_team), (0, 0));
 }
 
 /// `[servers.<name>]` for a server the registry does not name refuses the start.

@@ -2082,9 +2082,9 @@ mutate("gw-event-source-not-peer", "events name the gateway's own address, not t
 
 # Decision 0014, sections 1 and 2: the instance's cap on requests in flight, refused 503 before
 # the body with no row; each server's and each team's cap on calls in flight, refused with a
-# row and nothing sent, inside the argument check, held until the call ends; and each server's
-# deadline and answer cap from the deployment file, within their ceilings. tests/limits.rs
-# watches each; start.rs's own tests the wiring of the deadline.
+# row and nothing sent, inside the argument check, held until the call ends; and the caps and
+# each server's deadline and answer cap from the deployment file, within their ceilings.
+# tests/limits.rs watches each; start.rs's own tests the wiring of the deadline.
 GW_BULKHEAD = GW + "bulkhead.rs"
 GW_START = GW + "start.rs"
 
@@ -2111,6 +2111,9 @@ mutate("gw-team-cap-ignored", "a call over its team's cap on calls to a server i
 mutate("gw-team-cap-keyed-by-server-only", "every team shares one team-sized cap per server, so one team's calls hold up another's", GW_BULKHEAD,
        "            .entry(team.clone())\n",
        "            .entry(TeamId::new(\"every-team\"))\n")
+mutate("gw-team-slot-leaked-on-server-shed", "a call the server's cap refuses keeps the team slot it took, so its team's cap shrinks", GW_BULKHEAD,
+       "            return self.shed(Scope::Server, tool.as_str());\n",
+       "            std::mem::forget(team);\n            return self.shed(Scope::Server, tool.as_str());\n")
 mutate("gw-bulkhead-permit-released-early", "a call's slots are freed before its server's connector returns", GW_BULKHEAD,
        "            let _slots = (server, team);\n",
        "            drop((server, team));\n")
@@ -2135,6 +2138,12 @@ mutate("gw-server-result-ceiling-unchecked", "a server's answer cap past 1 MiB l
        "        Some(bytes) if bytes == 0 => {\n")
 mutate("gw-limit-zero-accepted", "a cap of zero in [limits] loads", GW_DEPLOY,
        "        Some(0) => Err(DeploymentError::LimitZero(field)),\n", "        Some(0) if false => Err(DeploymentError::LimitZero(field)),\n")
+mutate("gw-max-in-flight-not-from-file", "the deployment file's max_in_flight does not reach the HTTP server, which holds the instance to the default", GW_START,
+       "        max_in_flight: limits.max_in_flight,\n",
+       "        max_in_flight: crate::deployment::DEFAULT_MAX_IN_FLIGHT,\n")
+mutate("gw-per-server-in-flight-not-from-file", "the deployment file's per_server_in_flight does not reach the bulkheads, which hold each server to the default", GW_START,
+       "            limits.per_server_in_flight,\n",
+       "            crate::deployment::DEFAULT_PER_SERVER_IN_FLIGHT,\n")
 mutate("gw-unknown-server-limits-accepted", "bounds for a server the registry does not name are ignored", GW_START,
        "        return Err(StartError::UnknownServerLimits(unknown.clone()));\n",
        "        let _ = unknown;\n")
