@@ -1,0 +1,12 @@
+# CI's check of the release artifact's opt-out refusal (decision 0014, section 4): a registry
+# with no servers, tools or surfaces, so the only reason not to start is the opt-out.
+
+revision = "audit-disabled-1"
+
+profiles = []
+profile_rules = []
+servers = []
+tools = []
+surfaces = []
+
+[limits]
