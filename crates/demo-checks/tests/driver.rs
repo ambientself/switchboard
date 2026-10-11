@@ -233,7 +233,9 @@ fn sourced(body: &str) -> Run {
 
 #[test]
 fn a_finished_run_with_every_check_passing_passes() {
-    let run = sourced("tally_workload w 0 'PASS one\nPASS two'\nFINISHED=1\nresult 0");
+    let run = sourced(
+        "tally_workload w 0 'PASS one\nPASS two\nRESULT: PASS (2/2)'\nFINISHED=1\nresult 0",
+    );
     assert_eq!(run.status, Some(0), "{}", run.transcript());
     assert_eq!(
         run.stdout.lines().last(),
@@ -245,7 +247,9 @@ fn a_finished_run_with_every_check_passing_passes() {
 
 #[test]
 fn a_workload_fail_line_fails_the_run() {
-    let run = sourced("tally_workload w 1 'PASS one\nFAIL two'\nFINISHED=1\nresult 0");
+    let run = sourced(
+        "tally_workload w 1 'PASS one\nFAIL two\nRESULT: FAIL (1 of 2 failed)'\nFINISHED=1\nresult 0",
+    );
     assert_eq!(run.status, Some(1), "{}", run.transcript());
     assert_eq!(
         run.stdout.lines().last(),
@@ -257,7 +261,7 @@ fn a_workload_fail_line_fails_the_run() {
 
 #[test]
 fn a_workload_that_exits_non_zero_without_a_fail_line_fails_the_run() {
-    let run = sourced("tally_workload w 3 'PASS one'\nFINISHED=1\nresult 0");
+    let run = sourced("tally_workload w 3 'PASS one\nRESULT: PASS (1/1)'\nFINISHED=1\nresult 0");
     assert_eq!(run.status, Some(1), "{}", run.transcript());
     assert!(
         run.failed("w: the workload exited 3 without a FAIL line"),
@@ -268,7 +272,9 @@ fn a_workload_that_exits_non_zero_without_a_fail_line_fails_the_run() {
 
 #[test]
 fn a_workload_that_exits_zero_despite_a_fail_line_fails_the_run() {
-    let run = sourced("tally_workload w 0 'FAIL one'\nFINISHED=1\nresult 0");
+    let run = sourced(
+        "tally_workload w 0 'FAIL one\nRESULT: FAIL (1 of 1 failed)'\nFINISHED=1\nresult 0",
+    );
     assert_eq!(run.status, Some(1), "{}", run.transcript());
     assert!(
         run.failed("w: the workload exited 0 despite 1 FAIL lines"),
@@ -279,13 +285,207 @@ fn a_workload_that_exits_zero_despite_a_fail_line_fails_the_run() {
 
 #[test]
 fn a_workload_that_checked_nothing_fails_the_run() {
-    let run = sourced("tally_workload w 0 'no checks here'\nFINISHED=1\nresult 0");
+    // Its RESULT counts the zero lines read, and it exits 0: only the missing checks fail it.
+    let run = sourced(
+        "tally_workload w 0 'no checks here\nRESULT: FAIL (0 of 0 failed)'\nFINISHED=1\nresult 0",
+    );
     assert_eq!(run.status, Some(1), "{}", run.transcript());
     assert!(
-        run.failed("w: the workload ran no checks"),
+        run.failed("w: the workload ran no checks (exit 0)"),
         "{}",
         run.transcript()
     );
+}
+
+#[test]
+fn a_workloads_last_result_line_must_count_the_lines_tallied() {
+    // The last RESULT line, not the last line: `dc run --rm` may print after it. route-check.sh
+    // shows its probe's own RESULT indented, which is not a RESULT line of its own.
+    let run = sourced(
+        "tally_workload w 0 'PASS one\n    RESULT: PASS\nPASS two\n\nRESULT: PASS (2/2)\nContainer removed'\nFINISHED=1\nresult 0",
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.stdout.lines().last(),
+        Some("RESULT: PASS (2/2)"),
+        "{}",
+        run.transcript()
+    );
+
+    for (case, output, status, failure) in [
+        // A log cut short: its RESULT counts more checks than were read.
+        (
+            "short",
+            "PASS one\nPASS two\nRESULT: PASS (3/3)",
+            "0",
+            "w: the workload's RESULT counts 3 checks, but 2 PASS and FAIL lines were read (RESULT: PASS (3/3))",
+        ),
+        (
+            "short-fail",
+            "PASS one\nFAIL two\nRESULT: FAIL (1 of 3 failed)",
+            "1",
+            "w: the workload's RESULT counts 3 checks, but 2 PASS and FAIL lines were read",
+        ),
+        (
+            "more-lines",
+            "PASS one\nPASS two\nRESULT: PASS (1/1)",
+            "0",
+            "w: the workload's RESULT counts 1 checks, but 2 PASS and FAIL lines were read",
+        ),
+        (
+            "no-result",
+            "PASS one\nPASS two",
+            "0",
+            "w: the workload printed no RESULT line (exit 0)",
+        ),
+        (
+            "no-count",
+            "PASS one\nRESULT: PASS",
+            "0",
+            "w: the workload's RESULT counts no number of checks, but 1 PASS and FAIL lines were read",
+        ),
+    ] {
+        let run = sourced(&format!(
+            "tally_workload w {status} '{output}'\nFINISHED=1\nresult 0"
+        ));
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(failure), "{case}: {}", run.transcript());
+    }
+}
+
+#[test]
+fn a_kind_workload_log_that_cannot_be_read_fails_the_run() {
+    // kubectl can print part of a Job's log and then fail. What it printed is not the run's
+    // log, even when it reads as a run that passed.
+    let fake = |status: u8| {
+        format!(
+            "start_job() {{ JOB=$2-$3-1; }}\nwait_job() {{ JOB_STATUS=0; }}\n\
+             k() {{ case \"$*\" in\n\
+               '-n team-a logs job/mock-workload-full-1') printf 'PASS one\\nPASS two\\nRESULT: PASS (2/2)\\n'; return {status} ;;\n\
+               *) echo \"unexpected: k $*\" >&2; return 2 ;;\n\
+             esac; }}\n\
+             kind_workload 'team-a workload' team-a mock-workload full\nFINISHED=1\nresult 0"
+        )
+    };
+    let run = sourced(&fake(1));
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    assert_eq!(
+        run.lines("FAIL "),
+        ["FAIL could not read team-a workload's log (job team-a/mock-workload-full-1) (exit 1)"],
+        "{}",
+        run.transcript()
+    );
+    assert!(run.lines("PASS ").is_empty(), "{}", run.transcript());
+
+    // The same log, read: it passes.
+    let run = sourced(&fake(0));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.stdout.lines().last(),
+        Some("RESULT: PASS (2/2)"),
+        "{}",
+        run.transcript()
+    );
+}
+
+/// The text of the step of demo.sh's function `function` whose title starts with `title`, up to
+/// the next step or the function's end.
+fn step_text(driver: &str, function: &str, title: &str) -> String {
+    let body = function_body(driver, function);
+    let start = body
+        .find(&format!("\n  step \"{title}"))
+        .unwrap_or_else(|| panic!("{function} has no step {title:?}"));
+    let rest = &body[start + 1..];
+    let end = rest[1..].find("\n  step ").map_or(rest.len(), |at| at + 1);
+    rest[..end].to_owned()
+}
+
+#[test]
+fn a_log_or_metrics_read_that_fails_fails_as_that() {
+    // Each read the runs check: the gateway's boot lines, mock-docs' log and the gateway's
+    // metrics, in each run. The fake prints a boot line that would pass the boot check, then
+    // fails. The step fails once, as a read that failed, and checks nothing from what it read.
+    let driver = common::read("deploy/demo/demo.sh");
+    let boot = r#"{"event":"boot","identity":"enforce","audit":"postgres"}"#;
+    for (function, mode, fake, title, read) in [
+        (
+            "compose_run",
+            "compose",
+            "dc",
+            "the gateway's boot lines",
+            "the gateway's log (exit 1)",
+        ),
+        (
+            "compose_run",
+            "compose",
+            "dc",
+            "the server never saw",
+            "mock-docs' log (exit 1)",
+        ),
+        (
+            "compose_run",
+            "compose",
+            "dc",
+            "the gateway's metrics",
+            "the gateway's metrics (exit 1)",
+        ),
+        (
+            "kind_run",
+            "kind",
+            "k",
+            "the gateway's boot lines",
+            "the gateway's log (pod gateway-1) (exit 1)",
+        ),
+        (
+            "kind_run",
+            "kind",
+            "k",
+            "mock-docs accepted only",
+            "mock-docs' log (exit 1)",
+        ),
+        (
+            "kind_run",
+            "kind",
+            "k",
+            "the gateway's metrics",
+            "the gateway's metrics (pod gateway-1) (exit 1)",
+        ),
+    ] {
+        let step = step_text(&driver, function, title);
+        let run = sourced(&format!(
+            "GATEWAY_POD=gateway-1\ngateway_pod() {{ GATEWAY_POD=gateway-1; }}\naudit_rows() {{ :; }}\n\
+             MODE={mode}\nLOG_SINCE=2026-10-08T10:00:00.123456Z\nOPEN_ATTEMPTS=1\n\
+             {fake}() {{ printf '%s\\n' '{boot}'; return 1; }}\n{step}\nFINISHED=1\nresult 0"
+        ));
+        assert_eq!(
+            run.status,
+            Some(1),
+            "{function} {title}: {}",
+            run.transcript()
+        );
+        assert_eq!(
+            run.lines("FAIL "),
+            [format!("FAIL could not read {read}")],
+            "{function} {title}: {}",
+            run.transcript()
+        );
+        assert!(
+            run.lines("PASS ").is_empty(),
+            "{function} {title}: {}",
+            run.transcript()
+        );
+    }
+    // No read is passed on unchecked.
+    for unchecked in [
+        "\"$(mock_docs_log)\"",
+        "\"$(dc logs",
+        "\"$(k -n \"$ns\" logs",
+        "\"$(k -n switchboard logs \"pod/",
+        "\"$(dc exec -T gateway curl",
+        "\"$(k -n switchboard exec",
+    ] {
+        assert!(!driver.contains(unchecked), "{unchecked}");
+    }
 }
 
 #[test]
@@ -402,10 +602,10 @@ fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
     let probes = driver.matches(" mock-workload before-policy\n").count();
     assert_eq!(probes, 2);
     let compose_call = format!(
-        "  check_server_bearers \"$(mock_docs_log)\" \\\n    \"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
+        "  if fetch \"mock-docs' log\" mock_docs_log; then\n    check_server_bearers \"$FETCHED\" \\\n      \"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
     );
     let kind_call = format!(
-        "  check_server_callers \"$(mock_docs_log)\" \"$KIND_GATEWAY_SUBJECT\" {kind} {probes} \"$OPEN_ATTEMPTS\"\n"
+        "  if fetch \"mock-docs' log\" mock_docs_log; then\n    check_server_callers \"$FETCHED\" \"$KIND_GATEWAY_SUBJECT\" {kind} {probes} \"$OPEN_ATTEMPTS\"\n"
     );
     for call in [compose_call, kind_call] {
         assert_eq!(driver.matches(&call).count(), 1, "{call}");
@@ -594,7 +794,7 @@ fn the_kind_boot_lines_are_read_from_the_current_replica_sets_pod() {
         .find("\n  gateway_pod\n")
         .expect("kind_run finds the gateway's pod");
     let boot = driver
-        .find("\n  check_boot \"$(k -n switchboard logs \"pod/$GATEWAY_POD\")\"\n")
+        .find("\n  if fetch \"the gateway's log (pod $GATEWAY_POD)\" k -n switchboard logs \"pod/$GATEWAY_POD\"; then\n    check_boot \"$FETCHED\"\n")
         .expect("kind_run reads the boot lines from that pod");
     assert!(found < boot);
     assert!(!driver.contains("logs deploy/gateway"));
@@ -1447,7 +1647,7 @@ fn the_route_check_runs_as_its_operator_against_the_idle_pod() {
     // The control before the policy expects every route open, and keeps its report apart.
     let (run, args) = with_route_check(
         "route-check-open",
-        &[("FAKE_OUTPUT", "PASS one")],
+        &[("FAKE_OUTPUT", "PASS one\n\nRESULT: PASS (1/1)")],
         "route_check team-a open mock-workload-idle-2\nFINISHED=1\nresult 0",
     );
     assert_eq!(run.status, Some(0), "{}", run.transcript());
@@ -1462,19 +1662,32 @@ fn the_route_check_runs_as_its_operator_against_the_idle_pod() {
 
 #[test]
 fn a_route_check_fail_fails_the_run() {
-    for (case, output, status) in [
+    // Each output ends in a RESULT line that counts its lines, so the run fails on the line or
+    // the exit status alone, not on a missing or short RESULT.
+    let label = "route check in team-a, every route refused";
+    for (case, output, status, message, last) in [
         (
             "fail-line",
-            "PASS one\nFAIL the probe passed: RESULT: FAIL",
+            "PASS one\nFAIL the probe passed: RESULT: FAIL\nRESULT: FAIL (1 of 2 failed)",
             "1",
+            None,
+            "RESULT: FAIL (1 of 3 failed)",
         ),
         // A FAIL with exit 0, or a non-zero exit with no FAIL, is caught too.
         (
             "fail-exit-0",
-            "PASS one\nFAIL the probe passed: RESULT: FAIL",
+            "PASS one\nFAIL the probe passed: RESULT: FAIL\nRESULT: FAIL (1 of 2 failed)",
             "0",
+            Some("the workload exited 0 despite 1 FAIL lines"),
+            "RESULT: FAIL (2 of 4 failed)",
         ),
-        ("exit-without-fail", "PASS one", "1"),
+        (
+            "exit-without-fail",
+            "PASS one\nRESULT: PASS (1/1)",
+            "1",
+            Some("the workload exited 1 without a FAIL line"),
+            "RESULT: FAIL (1 of 3 failed)",
+        ),
     ] {
         let (run, _) = with_route_check(
             case,
@@ -1482,12 +1695,17 @@ fn a_route_check_fail_fails_the_run() {
             "pass before\nroute_check team-a refused mock-workload-idle-1\nFINISHED=1\nresult 0",
         );
         assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
-        assert!(
-            run.stdout
-                .lines()
-                .last()
-                .unwrap_or_default()
-                .starts_with("RESULT: FAIL ("),
+        match message {
+            Some(message) => assert!(
+                run.failed(&format!("{label}: {message}")),
+                "{case}: {}",
+                run.transcript()
+            ),
+            None => assert!(!run.failed(label), "{case}: {}", run.transcript()),
+        }
+        assert_eq!(
+            run.stdout.lines().last(),
+            Some(last),
             "{case}: {}",
             run.transcript()
         );
@@ -1509,7 +1727,10 @@ fn the_route_check_before_the_policy_counts_its_open_attempts() {
                  stop_idle() { echo \"stop_idle $*\"; }\n";
     let (run, args) = with_route_check(
         "route-check-before",
-        &[("FAKE_OUTPUT", "PASS one"), ("FAKE_REPORT", &report)],
+        &[
+            ("FAKE_OUTPUT", "PASS one\n\nRESULT: PASS (1/1)"),
+            ("FAKE_REPORT", &report),
+        ],
         &format!("{stubs}route_checks_before_policy\necho \"open=$OPEN_ATTEMPTS\""),
     );
     assert_eq!(run.status, Some(0), "{}", run.transcript());
@@ -1539,7 +1760,7 @@ fn the_route_check_before_the_policy_counts_its_open_attempts() {
     // A report that records no open attempt is a FAIL.
     let (run, _) = with_route_check(
         "route-check-before-none",
-        &[("FAKE_OUTPUT", "PASS one")],
+        &[("FAKE_OUTPUT", "PASS one\n\nRESULT: PASS (1/1)")],
         &format!("{stubs}route_checks_before_policy\nFINISHED=1\nresult 0"),
     );
     assert!(
@@ -1621,7 +1842,7 @@ fn the_kind_run_checks_the_routes_open_before_the_policy_and_refused_after_it() 
     let open = at("\n  route_checks_before_policy\n");
     let policy = at("\n  k apply -k \"$ROOT/deploy/kind/policy\"\n  sleep 10\n");
     let refused = at("\n  route_checks_after_policy\n");
-    let server = at("\n  check_server_callers \"$(mock_docs_log)\"");
+    let server = at("\n    check_server_callers \"$FETCHED\"");
     assert!(
         rbac < probes && probes < open && open < policy && policy < refused && refused < server
     );
@@ -1755,14 +1976,14 @@ fn function_body(driver: &str, name: &str) -> String {
 fn each_run_reads_the_metrics_inside_the_gateways_container_after_its_workloads() {
     let driver = common::read("deploy/demo/demo.sh");
     let compose = function_body(&driver, "compose_run");
-    let reading = "  check_metrics outage \"$(dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics)\"\n";
+    let reading = "  if fetch \"the gateway's metrics\" dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics; then\n    check_metrics outage \"$FETCHED\"\n";
     assert!(compose.contains(reading), "{compose}");
     // After the outage step, whose refused call it counts.
     assert!(compose.find("dc unpause postgres").unwrap() < compose.find(reading).unwrap());
 
     let kind = function_body(&driver, "kind_run");
-    let reading = "  check_metrics none \"$(k -n switchboard exec \"pod/$GATEWAY_POD\" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics)\"\n";
+    let reading = "  if fetch \"the gateway's metrics (pod $GATEWAY_POD)\" k -n switchboard exec \"pod/$GATEWAY_POD\" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics; then\n    check_metrics none \"$FETCHED\"\n";
     assert!(kind.contains(reading), "{kind}");
     assert!(kind.find("team-a and team-b workloads").unwrap() < kind.find(reading).unwrap());
-    assert_eq!(driver.matches("\n  check_metrics ").count(), 2);
+    assert_eq!(driver.matches("\n    check_metrics ").count(), 2);
 }
