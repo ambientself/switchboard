@@ -14,17 +14,23 @@
 //!   with the projects it may name: `<subject>=<project>[,<project>]`, entries separated by
 //!   `;`. A subject named twice, an unknown project or a malformed entry is refused.
 //! - `MOCK_DOCS_LISTEN`: the MCP endpoint's address, default `0.0.0.0:8080`.
-//! - `MOCK_DOCS_ADMIN_LISTEN`: the admin endpoint's address. Unset, there is none.
+//! - `MOCK_DOCS_ADMIN_LISTEN`: the admin endpoint's address. Unset, there is none. Without
+//!   `MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE` it must be a loopback address, since the admin
+//!   endpoint then answers the callers, who could otherwise widen their own projects.
+//! - `MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE`: a file holding the hex SHA-256 of the admin
+//!   credential. The admin endpoint then answers only that bearer, and no caller's. It must
+//!   differ from every caller's, and needs `MOCK_DOCS_ADMIN_LISTEN`.
 //! - `MOCK_DOCS_TOOLS`: the tools offered at start, comma-separated, default
-//!   `list_documents,read_document`.
+//!   `list_documents,read_document`. Empty, it offers none.
 //! - `MOCK_DOCS_SLOW_MS`: how long `slow-doc` takes, default 10000.
 //!
 //! It logs one JSON object per line on standard output and exits with status 2, before binding
-//! anything, if the settings are missing or contradictory.
+//! anything, if the settings are missing, blank or contradictory. Every variable but
+//! `MOCK_DOCS_TOOLS` that is set must hold more than whitespace.
 
 use std::process::ExitCode;
 
-use mock_docs_server::{Credential, Log, MockDocs, Settings};
+use mock_docs_server::{AcceptedCredential, Credential, Log, MockDocs, Settings};
 use serde_json::{Map, Value, json};
 
 #[tokio::main]
@@ -55,6 +61,11 @@ async fn main() -> ExitCode {
         "event": "boot",
         "listen": bound(Some(&listener)),
         "admin_listen": bound(admin_listener.as_ref()),
+        "admin_credential": settings
+            .config
+            .admin
+            .as_ref()
+            .map(AcceptedCredential::logged_prefix),
         "tools": tools,
         "slow_ms": settings.config.slow.as_millis(),
     });

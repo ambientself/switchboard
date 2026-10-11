@@ -91,6 +91,8 @@ pub struct MockDocs {
 #[derive(Debug)]
 struct Inner {
     accepted: Credential,
+    /// The one credential the admin endpoint accepts, in place of the callers, if one is set.
+    admin: Option<AcceptedCredential>,
     slow: std::time::Duration,
     documents: Documents,
     tools: RwLock<Vec<ToolName>>,
@@ -145,6 +147,7 @@ impl MockDocs {
         Self {
             inner: Arc::new(Inner {
                 accepted: config.accepted,
+                admin: config.admin,
                 slow: config.slow,
                 documents: Documents::seeded(),
                 tools: RwLock::new(config.tools),
@@ -163,9 +166,10 @@ impl MockDocs {
             .with_state(self.clone())
     }
 
-    /// The admin endpoint. It also answers only an accepted credential, and logs each request.
-    /// Serve it on its own listener, so a network policy can keep it apart from the MCP
-    /// endpoint.
+    /// The admin endpoint. It answers only the admin credential, if one is set, and no caller;
+    /// without one, it answers the accepted callers, so serve it only where none can reach it,
+    /// such as on loopback. It logs each request. Serve it on its own listener, so a network
+    /// policy can keep it apart from the MCP endpoint.
     ///
     /// - `GET /admin/tools`, and `PUT /admin/tools` with `{"tools": ["list_documents", …]}`:
     ///   the tools offered.
@@ -294,10 +298,7 @@ impl MockDocs {
     }
 
     fn authenticate(&self, headers: &HeaderMap) -> Caller {
-        let token = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(bearer_token);
+        let token = request_bearer(headers);
         let accepted = match &self.inner.accepted {
             Credential::Static(accepted) => accepted,
             Credential::Jwt(verifier) => return jwt_caller(verifier, token),
@@ -318,6 +319,21 @@ impl MockDocs {
                 name: None,
                 jwt: None,
             },
+        }
+    }
+
+    /// Who sent an admin request. With an admin credential set, only its bearer is accepted,
+    /// and no caller's; without one, the callers are, as on `POST /mcp`.
+    fn authenticate_admin(&self, headers: &HeaderMap) -> Caller {
+        let Some(admin) = &self.inner.admin else {
+            return self.authenticate(headers);
+        };
+        let token = request_bearer(headers);
+        Caller {
+            bearer_sha256: token.map(|token| logged_prefix(&sha256(token))),
+            accepted: token.is_some_and(|token| admin.accepts(token)),
+            name: None,
+            jwt: None,
         }
     }
 
@@ -425,6 +441,14 @@ fn jwt_caller(verifier: &JwtVerifier, token: Option<&str>) -> Caller {
         name: caller.clone(),
         jwt: Some(JwtOutcome { caller, refusal }),
     }
+}
+
+/// The bearer token a request carries, if any.
+fn request_bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token)
 }
 
 /// The token of an `Authorization: Bearer <token>` header. The scheme is matched without
@@ -676,7 +700,7 @@ async fn admin_get_tools(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let caller = server.authenticate(&headers);
+    let caller = server.authenticate_admin(&headers);
     server
         .log()
         .write(request_line("admin", &method, &uri, &caller));
@@ -695,7 +719,7 @@ async fn admin_put_tools(State(server): State<MockDocs>, request: Request) -> Re
         headers,
         ..
     } = parts;
-    let caller = server.authenticate(&headers);
+    let caller = server.authenticate_admin(&headers);
     let line = request_line("admin", &method, &uri, &caller);
     if !caller.accepted {
         server.log().write(line);
@@ -741,7 +765,7 @@ async fn admin_put_tools(State(server): State<MockDocs>, request: Request) -> Re
 /// Checks an admin request's caller from its headers alone. A refused caller is logged here,
 /// and gets `None`, for a 401; an accepted one's log line comes back for the handler to finish.
 fn admin_accepted(server: &MockDocs, parts: &Parts) -> Option<Value> {
-    let caller = server.authenticate(&parts.headers);
+    let caller = server.authenticate_admin(&parts.headers);
     let line = request_line("admin", &parts.method, &parts.uri, &caller);
     if caller.accepted {
         Some(line)

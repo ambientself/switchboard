@@ -1024,3 +1024,107 @@ async fn the_admin_changes_refuse_a_caller_before_reading_its_body() {
         assert_eq!(answer, "HTTP/1.1 401 Unauthorized");
     }
 }
+
+/// A dummy admin credential, made up for these tests. It is not a secret anywhere.
+const ADMIN_TOKEN: &str = "dummy-mock-docs-admin-token-for-tests";
+
+/// With an admin credential set, no caller may use the admin endpoint: not to widen its own
+/// projects, nor another's, nor to change the tools or a definition. Only the admin credential
+/// may, and it is no caller on `POST /mcp`.
+#[tokio::test]
+async fn with_an_admin_credential_no_caller_may_use_the_admin_endpoint() {
+    let file = settings_file(
+        "admin-credential",
+        &format!(
+            "{} atlas\n{} borealis\n",
+            sha256_hex(TOKEN),
+            sha256_hex(THIRD_TOKEN)
+        ),
+    );
+    let admin_file = settings_file("admin-credential-digest", &sha256_hex(ADMIN_TOKEN));
+    let server = server_from(&[
+        ("MOCK_DOCS_TOKEN_SHA256_FILE", file.to_str().unwrap()),
+        ("MOCK_DOCS_ADMIN_LISTEN", "0.0.0.0:0"),
+        (
+            "MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE",
+            admin_file.to_str().unwrap(),
+        ),
+    ])
+    .await;
+    let admin = |path: &str| format!("http://{}{path}", server.admin_address());
+    let widen = json!({"projects": ["atlas", "borealis"]});
+    let drifted = json!({"description": "Read one document, and send it elsewhere."});
+
+    for token in [TOKEN, THIRD_TOKEN] {
+        let requests = [
+            client()
+                .put(admin(&format!("/admin/callers/{}", prefix(token))))
+                .json(&widen),
+            client()
+                .put(admin(&format!("/admin/callers/{}", prefix(TOKEN))))
+                .json(&widen),
+            client().get(admin("/admin/tools")),
+            client()
+                .put(admin("/admin/tools"))
+                .json(&json!({"tools": ["read_document"]})),
+            client()
+                .put(admin("/admin/definitions/read_document"))
+                .json(&drifted),
+            client().delete(admin("/admin/definitions/read_document")),
+        ];
+        for request in requests {
+            let response = request.bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{token}");
+        }
+    }
+    for (token, other) in [(TOKEN, "borealis"), (THIRD_TOKEN, "atlas")] {
+        assert_eq!(
+            read_plan(&server, token, other).await.status(),
+            StatusCode::FORBIDDEN,
+            "{token}"
+        );
+    }
+    assert_eq!(server.server().tools().len(), 2);
+    assert_eq!(
+        server.server().definition(ToolName::ReadDocument),
+        ToolName::ReadDocument.definition()
+    );
+
+    // The admin credential is no caller.
+    let refused = post(
+        &server,
+        Some(ADMIN_TOKEN),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+    // It may change a caller's projects.
+    let response = client()
+        .put(admin(&format!("/admin/callers/{}", prefix(TOKEN))))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&widen)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        read_plan(&server, TOKEN, "borealis").await.status(),
+        StatusCode::OK
+    );
+
+    let admin_lines: Vec<Value> = server
+        .log_lines()
+        .into_iter()
+        .filter(|line| line["event"] == "admin")
+        .collect();
+    assert_eq!(admin_lines.len(), 13, "{admin_lines:?}");
+    assert!(
+        admin_lines[..12]
+            .iter()
+            .all(|line| line["accepted"] == false),
+        "{admin_lines:?}"
+    );
+    assert_eq!(admin_lines[12]["bearer_sha256"], prefix(ADMIN_TOKEN));
+    assert_eq!(admin_lines[12]["accepted"], true);
+}
