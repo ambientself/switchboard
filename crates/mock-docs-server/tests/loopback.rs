@@ -1072,6 +1072,8 @@ async fn with_an_admin_credential_no_caller_may_use_the_admin_endpoint() {
                 .json(&drifted),
             client().delete(admin("/admin/definitions/read_document")),
             client().post(admin("/admin/tools")),
+            client().get(admin(&format!("/admin/callers/{}", prefix(TOKEN)))),
+            client().post(admin("/admin/definitions/read_document")),
             client().get(admin("/admin/nothing")),
         ];
         for request in requests {
@@ -1127,14 +1129,14 @@ async fn with_an_admin_credential_no_caller_may_use_the_admin_endpoint() {
         .into_iter()
         .filter(|line| line["event"] == "admin")
         .collect();
-    assert_eq!(admin_lines.len(), 18, "{admin_lines:?}");
+    assert_eq!(admin_lines.len(), 22, "{admin_lines:?}");
     assert!(
-        admin_lines[..16]
+        admin_lines[..20]
             .iter()
             .all(|line| line["accepted"] == false),
         "{admin_lines:?}"
     );
-    for line in &admin_lines[16..] {
+    for line in &admin_lines[20..] {
         assert_eq!(line["bearer_sha256"], prefix(ADMIN_TOKEN), "{line}");
         assert_eq!(line["accepted"], true, "{line}");
     }

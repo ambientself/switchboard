@@ -166,10 +166,11 @@ impl MockDocs {
             .with_state(self.clone())
     }
 
-    /// The admin endpoint. It answers only the admin credential, if one is set, and no caller;
-    /// without one, it answers the accepted callers, so serve it only where none can reach it,
-    /// such as on loopback. It logs each request. Serve it on its own listener, so a network
-    /// policy can keep it apart from the MCP endpoint.
+    /// The admin endpoint. It answers only the admin credential, if one is set, and no caller,
+    /// not even a caller whose token has the admin credential's digest, valid, expired or not
+    /// yet valid; without one, it answers the accepted callers, so serve it only where none can
+    /// reach it, such as on loopback. It logs each request. Serve it on its own listener, so a
+    /// network policy can keep it apart from the MCP endpoint.
     ///
     /// - `GET /admin/tools`, and `PUT /admin/tools` with `{"tools": ["list_documents", …]}`:
     ///   the tools offered.
@@ -329,6 +330,11 @@ impl MockDocs {
 
     /// Who sent an admin request. With an admin credential set, only its bearer is accepted,
     /// and no caller's; without one, the callers are, as on `POST /mcp`.
+    ///
+    /// The admin credential is known by its digest alone. In the static mode the settings
+    /// refuse a digest that is also a caller's, but in the JWT mode nothing at start can tell
+    /// whether it is the digest of a caller's token. So a caller's token is refused here,
+    /// whatever its digest: see [`MockDocs::is_callers_token`].
     fn authenticate_admin(&self, headers: &HeaderMap) -> Caller {
         let Some(admin) = &self.inner.admin else {
             return self.authenticate(headers);
@@ -336,9 +342,26 @@ impl MockDocs {
         let token = request_bearer(headers);
         Caller {
             bearer_sha256: token.map(|token| logged_prefix(&sha256(token))),
-            accepted: token.is_some_and(|token| admin.accepts(token)),
+            accepted: token
+                .is_some_and(|token| admin.accepts(token) && !self.is_callers_token(token)),
             name: None,
             jwt: None,
+        }
+    }
+
+    /// Whether `token` is a caller's, now or at another time. In the static mode, a token
+    /// `POST /mcp` accepts. In the JWT mode, a token whose signature verifies under a trusted
+    /// key, even one past its `exp` or before its `nbf`: such a token is a caller's credential
+    /// for a while, and the admin credential is opaque, never a JWT signed by those keys.
+    /// `jsonwebtoken` checks the signature before `exp` and `nbf`, so those two refusals come
+    /// only for a signed token.
+    fn is_callers_token(&self, token: &str) -> bool {
+        match &self.inner.accepted {
+            Credential::Static(accepted) => accepted.iter().any(|accepted| accepted.accepts(token)),
+            Credential::Jwt(verifier) => matches!(
+                verifier.verify(token),
+                Ok(_) | Err(Refusal::Expired | Refusal::NotYetValid)
+            ),
         }
     }
 

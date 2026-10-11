@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Tests only. The scripts under test need sh, bash, curl, jq and awk on the machine.
+# Tests only. The scripts under test need sh, bash, curl, jq, awk and tar on the machine.
 [dev-dependencies]
 # The audit store's budgets and the proxy's call deadline, which the gateway's grace period
 # must outlast.

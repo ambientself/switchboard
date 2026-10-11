@@ -936,6 +936,274 @@ fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
     );
 }
 
+/// What kustomize renders of the Postgres Deployment, as far as apply_base reads it.
+const POSTGRES_RENDERED: &str = "  template:\n    metadata:\n      annotations:\n        switchboard.io/image-digest: set-by-demo-sh\n    spec:\n      containers:\n        - image: postgres:17.11-alpine\n";
+
+/// apply_base's output for the Postgres Deployment, with `POSTGRES_IMAGE` set to `postgres`, or
+/// left as demo.sh sets it when `None`.
+fn applied_postgres(postgres: Option<&str>) -> String {
+    let set = postgres
+        .map(|image| format!("POSTGRES_IMAGE='{image}'\n"))
+        .unwrap_or_default();
+    let run = sourced(&format!(
+        "k() {{ case \"$1\" in kustomize) printf '%s' '{POSTGRES_RENDERED}' ;; apply) cat ;; esac; }}\n{set}apply_base"
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    run.stdout
+}
+
+#[test]
+fn a_new_postgres_digest_under_the_same_tag_changes_its_pod_template() {
+    // The kind manifest names Postgres's tag alone. The digest goes on the pod template as an
+    // annotation, so a bump that changes only the digest still changes the template, and
+    // Kubernetes replaces the pod.
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let before = applied_postgres(Some(&format!("postgres:17.11-alpine@sha256:{a}")));
+    let after = applied_postgres(Some(&format!("postgres:17.11-alpine@sha256:{b}")));
+    assert!(
+        before.contains(&format!(
+            "      annotations:\n        switchboard.io/image-digest: sha256:{a}\n"
+        )),
+        "{before}"
+    );
+    assert!(
+        after.contains(&format!(
+            "      annotations:\n        switchboard.io/image-digest: sha256:{b}\n"
+        )),
+        "{after}"
+    );
+    assert!(after.contains("image: postgres:17.11-alpine\n"), "{after}");
+    assert_ne!(before, after);
+
+    // A run puts its own pin on the template.
+    let driver = read("deploy/demo/demo.sh");
+    let script = only_line(&driver, "POSTGRES_IMAGE=", "demo.sh");
+    let (_, digest) = pinned(script, "demo.sh's POSTGRES_IMAGE");
+    let applied = applied_postgres(None);
+    assert!(
+        applied.contains(&format!("switchboard.io/image-digest: sha256:{digest}\n")),
+        "{applied}"
+    );
+}
+
+/// A Docker image store, as check_postgres_image's reads of the pinned Postgres image see it.
+struct Store {
+    name: &'static str,
+    /// What `docker image inspect --platform linux/arm64 --format '{{.Id}}'` prints.
+    id: String,
+    /// The manifest.json `docker save --platform linux/arm64` writes, or `None` when the save
+    /// fails.
+    saved: Option<String>,
+}
+
+/// The pinned image's config digest, the ID the node gives the image it runs.
+fn postgres_config() -> String {
+    format!("sha256:{}", "c".repeat(64))
+}
+
+/// Docker's containerd image store: an image's ID is its manifest's digest, and a save keeps the
+/// pulled manifest, layers and config.
+fn containerd_store() -> Store {
+    Store {
+        name: "containerd",
+        id: format!("sha256:{}", "8".repeat(64)),
+        saved: Some(format!(
+            r#"[{{"Config":"blobs/sha256/{}","RepoTags":null,"Layers":["blobs/sha256/{}"]}}]"#,
+            "c".repeat(64),
+            "f".repeat(64)
+        )),
+    }
+}
+
+/// Docker's classic image store: an image's ID is its config's digest, and a save writes a
+/// manifest of its own over uncompressed layers. Before Docker 25 the archive named the config
+/// `<hex>.json`.
+fn classic_stores() -> [Store; 2] {
+    let id = postgres_config();
+    [
+        Store {
+            name: "classic",
+            id: id.clone(),
+            saved: Some(format!(
+                r#"[{{"Config":"blobs/sha256/{}","RepoTags":null,"Layers":["blobs/sha256/{}"]}}]"#,
+                "c".repeat(64),
+                "a".repeat(64)
+            )),
+        },
+        Store {
+            name: "classic before Docker 25",
+            id,
+            saved: Some(format!(
+                r#"[{{"Config":"{}.json","RepoTags":null,"Layers":["{}/layer.tar"]}}]"#,
+                "c".repeat(64),
+                "b".repeat(64)
+            )),
+        },
+    ]
+}
+
+/// What crictl lists for the Postgres container when it runs the image with ID `image`.
+fn postgres_container(image: &str) -> String {
+    format!(
+        r#"{{"containers":[{{"id":"{}","imageRef":"{image}","state":"CONTAINER_RUNNING"}}]}}"#,
+        "e".repeat(64)
+    )
+}
+
+/// Runs check_postgres_image against fakes: `pods` is what kubectl lists for the Postgres pods
+/// (a node and a container ID per line, as printf reads it), `store` the Docker image store the
+/// pinned image is saved from, and `running` what crictl on that node lists for the container
+/// (empty when crictl fails).
+fn postgres_image_check(pods: &str, store: &Store, running: &str) -> Run {
+    require(&["jq", "tar"]);
+    let dir = scratch("postgres-image");
+    let save = match &store.saved {
+        Some(manifest) => {
+            write(&dir, "manifest.json", manifest);
+            format!(
+                "[ \"$3 $4\" = \"linux/arm64 $POSTGRES_IMAGE\" ] && tar -cf - -C '{}' manifest.json",
+                dir.display()
+            )
+        }
+        None => "return 1".to_string(),
+    };
+    sourced(&format!(
+        "k() {{ echo \"kubectl $*\" >&2; printf '{pods}'; }}\n\
+         docker() {{\n\
+           echo \"docker $*\" >&2\n\
+           case \"$1 $2\" in\n\
+             'version --format') echo arm64 ;;\n\
+             'image inspect') [ \"$3 $4\" = '--platform linux/arm64' ] && printf '%s' '{id}' ;;\n\
+             'save --platform') {save} ;;\n\
+             'exec kind-node') [ -n '{running}' ] && printf '%s' '{running}' ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         PASSES=0 FAILS=0\ncheck_postgres_image\necho \"passes=$PASSES fails=$FAILS\"",
+        id = store.id,
+    ))
+}
+
+#[test]
+fn the_kind_run_fails_unless_postgres_runs_the_pinned_digest() {
+    let container = "e".repeat(64);
+    let pod = format!("kind-node containerd://{container}\\n");
+    let config = postgres_config();
+    let other = format!("sha256:{}", "d".repeat(64));
+    let driver = read("deploy/demo/demo.sh");
+    let pin = only_line(&driver, "POSTGRES_IMAGE=", "demo.sh");
+
+    // Whichever store saved it, the check reads the config's digest of the pinned image for this
+    // platform, and passes when the pod's container runs the image with that ID: the ID Docker
+    // gives the image is the manifest's digest on one store and the config's on the other.
+    let [classic, classic_old] = classic_stores();
+    for store in [containerd_store(), classic, classic_old] {
+        let run = postgres_image_check(&pod, &store, &postgres_container(&config));
+        assert!(
+            run.stdout.contains("PASS Postgres runs the pinned digest"),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+        assert!(
+            run.stdout.contains("passes=1 fails=0"),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+        // It saved the pinned image for this platform, asked for the Postgres pods, and listed
+        // the pod's container on the pod's node.
+        assert!(
+            run.stderr
+                .contains(&format!("docker save --platform linux/arm64 {pin}\n")),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+        assert!(
+            run.stderr
+                .contains("kubectl -n switchboard get pods -l app=postgres"),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+        assert!(
+            run.stderr.contains(&format!(
+                "docker exec kind-node crictl ps -o json --id {container}\n"
+            )),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+
+        // The pod runs another image: the old pod, after a bump that did not replace it.
+        let run = postgres_image_check(&pod, &store, &postgres_container(&other));
+        assert!(
+            run.stdout.contains("FAIL Postgres runs the pinned digest"),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+        assert!(
+            run.stdout.contains("passes=0 fails=1"),
+            "{}: {}",
+            store.name,
+            run.transcript()
+        );
+    }
+
+    // Nothing to compare fails too: no pod, two pods, a pod with no container yet, a container
+    // the node does not list, no config for this platform, and neither read, where only the
+    // check that the config was read stops two empty reads from agreeing.
+    let unsaved = || Store {
+        saved: None,
+        ..containerd_store()
+    };
+    for (pods, store, running) in [
+        (
+            String::new(),
+            containerd_store(),
+            postgres_container(&config),
+        ),
+        (
+            format!("{pod}{pod}"),
+            containerd_store(),
+            postgres_container(&config),
+        ),
+        (
+            "kind-node \\n".to_string(),
+            containerd_store(),
+            postgres_container(&config),
+        ),
+        (
+            pod.clone(),
+            containerd_store(),
+            r#"{"containers":[]}"#.to_string(),
+        ),
+        (pod.clone(), unsaved(), postgres_container(&config)),
+        (pod.clone(), unsaved(), String::new()),
+    ] {
+        let run = postgres_image_check(&pods, &store, &running);
+        assert!(
+            run.stdout.contains("passes=0 fails=1"),
+            "{pods:?} {:?} {running:?}: {}",
+            store.saved,
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn the_kind_run_checks_the_postgres_digest_after_its_rollout() {
+    let driver = read("deploy/demo/demo.sh");
+    assert!(
+        driver.contains(
+            "  k -n switchboard rollout status deploy/postgres --timeout=120s\n  check_postgres_image\n"
+        ),
+        "kind_run does not check Postgres's digest once its rollout is done"
+    );
+}
+
 /// The one line of `text` that starts, after its indentation, with `prefix`, without the prefix.
 fn only_line<'a>(text: &'a str, prefix: &str, what: &str) -> &'a str {
     let found: Vec<&str> = text
@@ -2308,22 +2576,30 @@ fn the_metrics_check_counts_the_outage_and_bounds_the_open_rows() {
     let open = check_metrics("none", &metrics_text("0", "0", Some("2")));
     assert_eq!(open.status, Some(1), "{}", open.transcript());
     assert!(
-        open.failed("refused call's row open (got 2, want at most 1)"),
+        open.failed("found at most one row open (got 2, want at most 1)"),
         "{}",
         open.transcript()
+    );
+    let outage_open = check_metrics("outage", &metrics_text("1", "1", Some("2")));
+    assert!(
+        outage_open.failed("found at most the database outage's refused call's row open (got 2"),
+        "{}",
+        outage_open.transcript()
     );
     // A poll that never succeeded leaves no sample, which is not a count.
     let unpolled = check_metrics("none", &metrics_text("0", "0", None));
     assert!(
-        unpolled.failed("refused call's row open (got '', want a number of at most 1)"),
+        unpolled.failed("found at most one row open (got '', want a number of at most 1)"),
         "{}",
         unpolled.transcript()
     );
 
-    // Without the outage, only telemetry dropped and the open rows are checked.
+    // Without the outage, only telemetry dropped and the open rows are checked, and nothing
+    // speaks of an outage the run did not have.
     let kind = check_metrics("none", &metrics_text("0", "0", Some("0")));
     assert_eq!(kind.status, Some(0), "{}", kind.transcript());
     assert_eq!(kind.lines("PASS ").len(), 2, "{}", kind.transcript());
+    assert!(!kind.stdout.contains("outage"), "{}", kind.transcript());
 
     // A gateway that answered nothing fails every check.
     let silent = check_metrics("outage", "");

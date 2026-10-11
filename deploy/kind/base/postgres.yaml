@@ -17,6 +17,11 @@ spec:
     metadata:
       labels:
         app: postgres
+      # demo.sh's apply_base sets this to the digest it pins (POSTGRES_IMAGE). The image below
+      # names the tag alone, so without it a new digest under the same tag would leave the pod
+      # template unchanged and the old pod running.
+      annotations:
+        switchboard.io/image-digest: set-by-demo-sh
     spec:
       automountServiceAccountToken: false
       containers:
@@ -25,10 +30,11 @@ spec:
           # as Compose's) and loads it into the cluster under this tag. kind's image load keeps
           # this platform's manifest, not the tag's multi-arch index, so a pod naming the index
           # digest does not find the loaded image and pulls from Docker Hub instead.
-          # crates/demo-checks/tests/driver.rs holds this tag to demo.sh's. Dependabot does not
-          # read this file; bump it by hand with demo.sh and Compose.
+          # crates/demo-checks/tests/pins.rs holds this tag to demo.sh's. Dependabot does not
+          # read this file; bump it by hand with demo.sh and Compose. Never, so a missing image
+          # stops the pod instead of pulling whatever the tag names today: demo.sh loads it first.
           image: postgres:17.11-alpine
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           env:
             - name: POSTGRES_PASSWORD
               valueFrom:

@@ -7,7 +7,8 @@
 //! sentence and no row. A read that succeeds again ends it. Every read counts, so an unchanged
 //! file keeps the policy fresh, and so does a file that reads but does not load. The age counts
 //! from boot's own read of the file, so a boot slower than the maximum age, started through
-//! `start::prepare` with an issuer whose keys are slow to fetch, starts stale.
+//! `start::prepare` with an issuer whose keys are slow to fetch, starts stale. The reloader
+//! reads the file as soon as it starts, so a file that reads ends that at once.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -299,10 +300,19 @@ async fn a_registry_file_that_reads_but_does_not_load_is_not_stale() {
     assert_eq!(gateway.telemetry.counts().policy_stale, 0);
 }
 
+/// What a slow issuer does to the registry file when its keys are fetched.
+#[derive(Clone, Copy, PartialEq)]
+enum DuringFetch {
+    /// Moves it aside, so boot's read is the last one that succeeds.
+    MoveAside,
+    /// Leaves it where it is, readable.
+    LeaveIt,
+}
+
 /// An issuer's origin on loopback whose keys take [`PAST_MAX_AGE`] to fetch. When the fetch
-/// begins it moves `registry_file` aside, so boot's read of the registry file is the last one
-/// that succeeds. Returns the origin, which is also the issuer's name.
-async fn slow_issuer(registry_file: PathBuf) -> String {
+/// begins it does `during` to `registry_file`. Returns the origin, which is also the issuer's
+/// name.
+async fn slow_issuer(registry_file: PathBuf, during: DuringFetch) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let document = LocalIssuer::new(&url, SigningAlgorithm::Es256)
@@ -314,7 +324,9 @@ async fn slow_issuer(registry_file: PathBuf) -> String {
             let registry_file = registry_file.clone();
             let document = document.clone();
             async move {
-                std::fs::rename(&registry_file, registry_file.with_extension("away")).unwrap();
+                if during == DuringFetch::MoveAside {
+                    std::fs::rename(&registry_file, registry_file.with_extension("away")).unwrap();
+                }
                 tokio::time::sleep(PAST_MAX_AGE).await;
                 document
             }
@@ -324,6 +336,74 @@ async fn slow_issuer(registry_file: PathBuf) -> String {
     url
 }
 
+/// A gateway started through `start::prepare` with an issuer whose keys take longer than the
+/// maximum age to fetch, served on loopback. Its reloader is not started.
+struct SlowBoot {
+    address: SocketAddr,
+    token: String,
+    telemetry: Telemetry,
+    registry_file: PathBuf,
+    watch: gateway::start::Watch,
+    _mock: mock_docs_server::Running,
+    _files: Files,
+}
+
+impl SlowBoot {
+    /// Boots as `name`, the slow issuer doing `during` to the registry file, with the
+    /// reloader to read it every `poll`.
+    async fn start(name: &str, during: DuringFetch, poll: Duration) -> Self {
+        let mock =
+            mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+                .await
+                .unwrap();
+        let cluster = cluster_issuer();
+        let files = Files::new(name, &cluster.jwks_document(), &mock.url());
+        let registry_file = files.path("registry/registry.toml");
+        let url = slow_issuer(registry_file.clone(), during).await;
+        files.write(
+            "gateway.toml",
+            &files::deployment_file(&format!(
+                "{}\n[audit]\nmode = \"disabled\"\n",
+                files::keys_url_issuer(&url, &format!("{url}{}", files::KEYS_PATH)),
+            )),
+        );
+        let mut deployment = files.load();
+        deployment.poll = poll;
+        deployment.max_age = MAX_AGE;
+        let prepared =
+            gateway::start::prepare(deployment, InstanceName::new(name), Arc::new(SystemClock))
+                .await
+                .unwrap();
+        assert_eq!(
+            registry_file.exists(),
+            during == DuringFetch::LeaveIt,
+            "the keys were not fetched as the test means"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+        tokio::spawn(serve_with_telemetry(
+            listener,
+            prepared.gates,
+            telemetry.clone(),
+            drain,
+            std::future::pending(),
+            Timeouts::default(),
+            gateway::DEFAULT_MAX_IN_FLIGHT,
+        ));
+        Self {
+            address,
+            token: files::kubernetes_token(&cluster, TEAM_A_SA, &[AUDIENCE]),
+            telemetry,
+            registry_file,
+            watch: prepared.watch,
+            _mock: mock,
+            _files: files,
+        }
+    }
+}
+
 /// The policy's age counts from boot's read of the registry file, not from when the gates pass
 /// (decision 0013, section 8). A boot that takes longer than the maximum age, here fetching an
 /// issuer's keys, with the file unreadable from just after that read, starts stale: `/readyz`
@@ -331,57 +411,39 @@ async fn slow_issuer(registry_file: PathBuf) -> String {
 /// again, the gateway serves.
 #[tokio::test]
 async fn a_boot_slower_than_the_maximum_age_starts_stale() {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
-        .await
-        .unwrap();
-    let cluster = cluster_issuer();
-    let files = Files::new("slow-boot", &cluster.jwks_document(), &mock.url());
-    let registry_file = files.path("registry/registry.toml");
-    let url = slow_issuer(registry_file.clone()).await;
-    files.write(
-        "gateway.toml",
-        &files::deployment_file(&format!(
-            "{}\n[audit]\nmode = \"disabled\"\n",
-            files::keys_url_issuer(&url, &format!("{url}{}", files::KEYS_PATH)),
-        )),
-    );
-    let mut deployment = files.load();
-    deployment.poll = POLL;
-    deployment.max_age = MAX_AGE;
-    let prepared = gateway::start::prepare(
-        deployment,
-        InstanceName::new("slow-boot"),
-        Arc::new(SystemClock),
-    )
-    .await
-    .unwrap();
-    assert!(
-        !registry_file.exists(),
-        "the keys were fetched without moving the registry file aside"
-    );
-    tokio::spawn(prepared.watch.run());
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
-    tokio::spawn(serve_with_telemetry(
-        listener,
-        prepared.gates,
-        telemetry.clone(),
-        drain,
-        std::future::pending(),
-        Timeouts::default(),
-        gateway::DEFAULT_MAX_IN_FLIGHT,
-    ));
-    let token = files::kubernetes_token(&cluster, TEAM_A_SA, &[AUDIENCE]);
+    let gateway = SlowBoot::start("slow-boot", DuringFetch::MoveAside, POLL).await;
+    let (address, token) = (gateway.address, &gateway.token);
+    tokio::spawn(gateway.watch.run());
 
     assert_eq!(ready(address).await, 503);
-    assert_stale(&list(address, &token).await);
-    assert_stale(&read(address, &token).await);
-    assert_eq!(telemetry.counts().policy_stale, 2);
+    assert_stale(&list(address, token).await);
+    assert_stale(&read(address, token).await);
+    assert_eq!(gateway.telemetry.counts().policy_stale, 2);
 
-    std::fs::rename(registry_file.with_extension("away"), &registry_file).unwrap();
+    let registry_file = &gateway.registry_file;
+    std::fs::rename(registry_file.with_extension("away"), registry_file).unwrap();
     until_ready_is(address, 200).await;
-    assert_listed(&list(address, &token).await);
-    assert_ran(&read(address, &token).await);
+    assert_listed(&list(address, token).await);
+    assert_ran(&read(address, token).await);
+}
+
+/// The reloader reads the registry file as soon as it starts, not a poll later. A boot slower
+/// than the maximum age with the file readable throughout is stale until then; once the
+/// reloader starts, the gateway serves at once, though the next poll is a minute away.
+#[tokio::test]
+async fn a_slow_boot_with_the_file_readable_serves_as_soon_as_the_reloader_starts() {
+    /// Far longer than the test waits for `/readyz`.
+    const LONG_POLL: Duration = Duration::from_secs(60);
+    const _: () = assert!(PATIENCE.as_secs() < LONG_POLL.as_secs());
+
+    let gateway = SlowBoot::start("slow-boot-readable", DuringFetch::LeaveIt, LONG_POLL).await;
+    let (address, token) = (gateway.address, &gateway.token);
+    assert_eq!(ready(address).await, 503);
+    assert_stale(&list(address, token).await);
+
+    tokio::spawn(gateway.watch.run());
+    until_ready_is(address, 200).await;
+    assert_listed(&list(address, token).await);
+    assert_ran(&read(address, token).await);
+    assert_eq!(gateway.telemetry.counts().policy_stale, 1);
 }

@@ -1743,6 +1743,11 @@ mutate("gw-deploy-keys-ca-beside-file-accepted", "keys_ca_file beside a keys fil
 mutate("gw-deploy-keys-token-relative-to-cwd", "a relative keys_token_file is read from the working directory", GW_DEPLOY,
        "                token_file: issuer.keys_token_file.map(|path| base.join(path)),\n",
        "                token_file: issuer.keys_token_file,\n")
+# Issue #120: boot hands the key source both files. Caught by tests/issuer_keys.rs's https boot.
+mutate("gw-start-keys-ca-file-dropped", "boot builds an https key source without its CA file", GW + "start.rs",
+       "            ca_file: keys_url.ca_file.clone(),\n", "            ca_file: None,\n")
+mutate("gw-start-keys-token-file-dropped", "boot builds a key source without its token file, so no token is sent", GW + "start.rs",
+       "            token_file: keys_url.token_file.clone(),\n", "            token_file: None,\n")
 # Issue #91: the 30 s floor and the refusal of an interval beside a keys file; a key replaced
 # under a kept kid is reported and logged; boot's and each refresh's fetch time is exported; and
 # the binary starts both the key refresher and the registry watcher.
@@ -1781,7 +1786,30 @@ mutate("gw-open-rows-poller-not-started", "the metrics listener serves without p
 mutate("gw-metrics-on-mcp-listener", "a [metrics] listener on the MCP listener's port is accepted", GW_DEPLOY,
        "            && takes_port(metrics.listen, file.listen)\n",
        "            && false\n            && takes_port(metrics.listen, file.listen)\n")
-mutate("gw-start-call-deadline-not-wired", "a proxied server's connector deadline does not reach the wiring", GW + "start.rs",
+# Issue #110: the finish's audit-failure answer is counted (tests/metrics.rs); the binary's
+# metrics read the telemetry its MCP path counts in (tests/binary.rs); a histogram's +Inf and
+# _count are the buckets' total, from one read (metrics.rs's own tests); and the kind run's
+# open-row message names no outage (demo-checks' driver tests). gw-start-call-deadline-not-wired
+# is caught by its behaviour: tests/postgres.rs sets a 7 s deadline for mock-docs and reads it
+# in each row's allowance, so it needs SWITCHBOARD_TEST_DATABASE_URL (start.rs's own test reads
+# a test-only accessor and catches it without).
+mutate("gw-finish-audit-failure-not-counted", "a refused call whose row cannot be completed is answered with the audit-failure sentence uncounted", GW + "path.rs",
+       "            Answer::AuditFailed { sentence } => self.audit_failed(sentence),\n",
+       "            Answer::AuditFailed { sentence } => Reply::Denied(sentence.to_owned()),\n")
+mutate("gw-bin-metrics-own-telemetry", "switchboard's metrics read a telemetry of their own, not the one its MCP path counts in", GW_BIN,
+       "        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())\n",
+       "        let metrics = Metrics::new(Telemetry::bounded(TELEMETRY_QUEUE).0, prepared.store.clone())\n")
+mutate("gw-metrics-histogram-inf-read-apart", "a histogram's +Inf bucket is the count read apart from the buckets", GW_METRICS,
+       "            .chain(std::iter::once((\"+Inf\".to_owned(), total)));\n",
+       "            .chain(std::iter::once((\"+Inf\".to_owned(), histogram.count)));\n")
+mutate("gw-metrics-histogram-count-read-apart", "a histogram's _count is the count read apart from the buckets", GW_METRICS,
+       "        self.sample(&format!(\"{name}_count\"), labels, total);\n",
+       "        self.sample(&format!(\"{name}_count\"), labels, histogram.count);\n")
+mutate("gw-demo-kind-open-rows-names-outage", "the kind run's open-row metrics check names a database outage it did not have",
+       "deploy/demo/demo.sh",
+       "  local open=\"one row\"\n",
+       "  local open=\"the database outage's refused call's row\"\n")
+mutate("gw-start-call-deadline-not-wired", "a proxied server's connector deadline does not reach the wiring, so its rows are due by the default", GW + "start.rs",
        "            .proxied(server.name.clone(), Arc::new(bulkhead))\n"
        "            .call_deadline(server.name.clone(), deadline);\n",
        "            .proxied(server.name.clone(), Arc::new(bulkhead));\n"
@@ -2154,8 +2182,9 @@ mutate("gw-unknown-server-limits-accepted", "bounds for a server the registry do
 # Decision 0013, section 8: past the maximum age since the registry file was last read, /readyz
 # fails and tools/call and tools/list are refused with the stale-policy sentence and no row.
 # Every read counts, changed or not, and the age counts from boot's own read of the file, not
-# from when the gates pass. tests/stale.rs watches each; tests/deployment.rs the floor; and
-# tests/logs.rs the stale-policy event's line.
+# from when the gates pass. The reloader reads the file as soon as it starts, so a slow boot is
+# not stale a poll longer than it must be. tests/stale.rs watches each; tests/deployment.rs the
+# floor; and tests/logs.rs the stale-policy event's line.
 mutate("gw-stale-never", "the policy is never stale, however long since the file was read", GW + "reload.rs",
        "        self.0.max_age.is_some_and(|max_age| self.age() > max_age)", "        false")
 mutate("gw-stale-age-from-gates", "the policy's age counts from when the boot gates pass, not from boot's read of the registry file, so a slow boot starts fresh", BOOT,
@@ -2169,6 +2198,13 @@ mutate_all("gw-stale-event-age-dropped", "the stale-policy event's line leaves o
 mutate_all("gw-stale-read-time-only-on-change", "only a read whose bytes changed counts as a read",
            (GW + "reload.rs", "            self.freshness.read_now();\n            if bytes == seen {\n                continue;\n            }\n",
             "            if bytes == seen {\n                continue;\n            }\n            self.freshness.read_now();\n"))
+mutate_all("gw-stale-read-at-after-keys", "start::prepare takes boot's read time after the keys are fetched, so a slow boot starts fresh",
+           (GW_START, "    let read_at = Instant::now();\n", ""),
+           (GW_START, "    let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;\n",
+            "    let fetched = fetch_keys(&deployment.keys_urls, &mut identity).await?;\n    let read_at = Instant::now();\n"))
+mutate("gw-stale-first-read-a-poll-late", "the reloader skips its first, immediate read, so a slow boot stays stale a poll though the file reads", GW + "reload.rs",
+       "        // once rather than a poll later. Unchanged bytes are not loaded again.\n        loop {\n",
+       "        // once rather than a poll later. Unchanged bytes are not loaded again.\n        interval.tick().await;\n        loop {\n")
 mutate("gw-stale-readyz-ignored", "a stale gateway stays ready", GW_SERVER,
        "    } else if endpoint.ready.load(Ordering::SeqCst) && !endpoint.path.gates().freshness().is_stale()\n    {\n",
        "    } else if endpoint.ready.load(Ordering::SeqCst) {\n")
@@ -2444,13 +2480,33 @@ mutate("mock-docs-admin-credential-unused-accepted", "an admin credential withou
 mutate("mock-docs-admin-credential-is-a-caller", "the admin credential may also be a caller's", MC,
        "            && callers.iter().any(|caller| caller.same_token(admin))", "            && callers.is_empty()")
 mutate("mock-docs-admin-callers-accepted", "with an admin credential, the admin endpoint still answers the callers", MS,
-       "            accepted: token.is_some_and(|token| admin.accepts(token)),",
-       "            accepted: token.is_some_and(|token| admin.accepts(token))\n                || self.authenticate(headers).accepted,")
+       "                .is_some_and(|token| admin.accepts(token) && !self.is_callers_token(token)),",
+       "                .is_some_and(|token| admin.accepts(token) || self.is_callers_token(token)),")
 mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the callers and ignores the admin credential", MS,
        "        let Some(admin) = &self.inner.admin else {", "        let Some(admin) = None::<&AcceptedCredential> else {")
 mutate("mock-docs-admin-fallback-takes-callers", "an unknown path on the admin endpoint accepts the callers' bearers", MS,
        "            .fallback(admin_other_request)\n            .with_state(self.clone())",
        "            .fallback(other_request)\n            .with_state(self.clone())")
+# A caller's JWT with the admin credential's digest, the route fallbacks, and the digest file's
+# later lines (#137).
+mutate("mock-docs-admin-caller-jwt-accepted", "a caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "                .is_some_and(|token| admin.accepts(token) && !self.is_callers_token(token)),",
+       "                .is_some_and(|token| admin.accepts(token)),")
+mutate("mock-docs-admin-expired-caller-jwt-accepted", "an expired caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "                Ok(_) | Err(Refusal::Expired | Refusal::NotYetValid)",
+       "                Ok(_) | Err(Refusal::NotYetValid)")
+mutate("mock-docs-admin-premature-caller-jwt-accepted", "a not yet valid caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "                Ok(_) | Err(Refusal::Expired | Refusal::NotYetValid)",
+       "                Ok(_) | Err(Refusal::Expired)")
+mutate("mock-docs-admin-callers-route-fallback-takes-callers", "another method on /admin/callers/{caller} accepts the callers' bearers", MS,
+       "                put(admin_put_caller).fallback(admin_other_request),",
+       "                put(admin_put_caller).fallback(other_request),")
+mutate("mock-docs-admin-definitions-route-fallback-takes-callers", "another method on /admin/definitions/{tool} accepts the callers' bearers", MS,
+       "                    .delete(admin_delete_definition)\n                    .fallback(admin_other_request),",
+       "                    .delete(admin_delete_definition)\n                    .fallback(other_request),")
+mutate("mock-docs-admin-is-a-caller-first-line-only", "only a digest file's first line is checked against the admin credential", MC,
+       "            && callers.iter().any(|caller| caller.same_token(admin))",
+       "            && callers.first().is_some_and(|caller| caller.same_token(admin))")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
@@ -3290,7 +3346,7 @@ mutate("pg-check-children-ignored", "a table that inherits from call_rows, or a 
 mutate("pg-check-parents-ignored", "call_rows inheriting from a table passes the check", PG_CHECK,
        "WHERE i.inhparent = $1::oid OR i.inhrelid = $1::oid", "WHERE i.inhparent = $1::oid")
 mutate("pg-check-parameter-grants-ignored", "a role holding a grant on a setting passes the check", PG_CHECK,
-       "    if version >= 150_000 {", "    if false {")
+       "    if version >= 150_000 {\n        let held = client", "    if false {\n        let held = client")
 mutate("pg-check-alter-system-ignored", "a role that may change a setting with ALTER SYSTEM passes the check", PG_CHECK,
        "unnest(ARRAY['ALTER SYSTEM', 'SET']) AS p", "unnest(ARRAY['SET']) AS p")
 mutate("pg-check-setting-set-ignored", "a role that may set a setting only a superuser may set passes the check", PG_CHECK,
@@ -3387,19 +3443,19 @@ mutate("pg-check-reaching-views-only", "a rule on another table that writes the 
 mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that reaches the table passes the check", PG_CHECK,
        "OR (p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND {}))", "OR (false AND {}))")
 mutate("pg-check-definers-ignored", "a SECURITY DEFINER function that can reach the table passes the check", PG_CHECK,
-       "                     WHERE p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x",
-       "                     WHERE false AND p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x")
+       "             WHERE p.prosecdef\n                 AND {}\n",
+       "             WHERE false AND p.prosecdef\n                 AND {}\n")
 mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner holds only column privileges passes the check", PG_CHECK,
-       "OR has_any_column_privilege(p.proowner, x.oid,", "OR false AND has_any_column_privilege(p.proowner, x.oid,")
+       "OR has_any_column_privilege({owner}, x.oid,", "OR false AND has_any_column_privilege({owner}, x.oid,")
 mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
        "SELECT FROM reaching x\n", "SELECT FROM (SELECT $1::oid AS oid) x\n")
 mutate("pg-check-definer-schema-owner-ignored", "a definer function of the schema's owner passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM pg_catalog.pg_namespace s", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_namespace s")
 mutate("pg-check-definer-chain-not-followed", "a definer function that reaches the table through another passes the check", PG_CHECK,
-       "                         JOIN pg_catalog.pg_proc p ON p.prosecdef\n",
-       "                         JOIN pg_catalog.pg_proc p ON false AND p.prosecdef\n")
+       "                 JOIN pg_catalog.pg_proc p ON p.prosecdef\n",
+       "                 JOIN pg_catalog.pg_proc p ON false AND p.prosecdef\n")
 mutate("pg-check-definer-chain-execute-not-followed", "a definer function that runs another passes the check", PG_CHECK,
-       "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
+       "\"(has_function_privilege({owner}, d.oid, 'EXECUTE')", "\"(false AND has_function_privilege({owner}, d.oid, 'EXECUTE')")
 mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
 # #43: ownership counts wherever a privilege does, a definer's owner that can silence the
@@ -3407,13 +3463,13 @@ mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that w
 # whoever can fire it (this replaced the hunt for write paths), and so is EXECUTE on a
 # function in an untrusted language.
 mutate("pg-check-definer-ignores-table-owner", "a definer function whose owner owns the table, but holds no privilege on it, passes the check", PG_CHECK,
-       "OR pg_has_role(p.proowner, c.relowner, 'USAGE'))", "OR false AND pg_has_role(p.proowner, c.relowner, 'USAGE'))")
+       "OR pg_has_role({owner}, c.relowner, 'USAGE'))", "OR false AND pg_has_role({owner}, c.relowner, 'USAGE'))")
 mutate("pg-check-definer-ignores-trigger-function-owner", "a definer function whose owner owns a function the table's triggers run passes the check", PG_CHECK,
-       "AND pg_has_role(p.proowner, f.proowner, 'USAGE'))", "AND false AND pg_has_role(p.proowner, f.proowner, 'USAGE'))")
+       "AND pg_has_role({owner}, f.proowner, 'USAGE'))", "AND false AND pg_has_role({owner}, f.proowner, 'USAGE'))")
 mutate("pg-check-reaching-owner-ignored", "a view outside the schema that reaches the table, owned by the gateway's role, passes the check", PG_CHECK,
        "                     AND pg_has_role(current_user, v.relowner, 'MEMBER')", "                     AND false")
 mutate("pg-check-replication-role-set-ignored", "a definer function whose owner can set session_replication_role passes the check", PG_CHECK,
-       "\"OR has_parameter_privilege(p.proowner, 'session_replication_role', 'SET')\"", "\"\"")
+       "\"OR has_parameter_privilege({owner}, 'session_replication_role', 'SET')\".into()", "String::new()")
 mutate("pg-check-definer-trigger-allowed", "a trigger that runs a definer function passes the check", PG_CHECK,
        "    problems.extend(triggered.into_iter().map(", "    problems.extend(triggered.into_iter().filter(|_| false).map(")
 mutate("pg-check-event-trigger-allowed", "an enabled event trigger that runs a definer function passes the check", PG_CHECK,
@@ -3453,11 +3509,45 @@ mutate("pg-check-untrusted-event-trigger-allowed", "an enabled event trigger tha
 mutate("pg-check-disabled-untrusted-event-trigger-refused", "a disabled event trigger that runs a function in an untrusted language is refused", PG_CHECK,
        "                 WHERE e.evtenabled <> 'D'\n", "                 WHERE true\n")
 mutate("pg-check-definer-server-roles-ignored", "a definer function whose owner is a member of pg_read_server_files passes the check", PG_CHECK,
-       "                              OR EXISTS (SELECT FROM pg_catalog.pg_roles s\n",
-       "                              OR false AND EXISTS (SELECT FROM pg_catalog.pg_roles s\n")
+       "                      OR EXISTS (SELECT FROM pg_catalog.pg_roles s\n",
+       "                      OR false AND EXISTS (SELECT FROM pg_catalog.pg_roles s\n")
 mutate("pg-check-definer-server-roles-direct-only", "a definer function whose owner inherits pg_execute_server_program through another role passes the check", PG_CHECK,
-       "AND pg_has_role(p.proowner, s.oid, 'USAGE'))",
-       "AND s.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = p.proowner))")
+       "WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})",
+       "WHERE (mo.oid = {owner} OR mo.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = {owner})) AND {})")
+# #138: a definer's owner, or a cascading table's, is able when any role it is a member of is,
+# inherited or not, as a member can give a function it makes to that role; a definer's owner
+# that may run a server function or a function in an untrusted language is able; and a foreign
+# key on another table whose action writes that table, as its owner, is refused when the owner
+# is able, whatever the table has, judged on a partitioned table by the partitioned table's
+# owner.
+mutate("pg-check-definer-server-roles-inherited-only", "a definer function whose owner is a member of pg_execute_server_program, or of the owner of call_rows, without inheriting it passes the check", PG_CHECK,
+       "WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})", "WHERE pg_has_role({owner}, mo.oid, 'USAGE') AND {})")
+mutate("pg-check-definer-owner-server-functions-ignored", "a definer function whose owner may run lo_export passes the check", PG_CHECK,
+       "AND f.proname::text = ANY($4::text[]))", "AND f.proname::text = ANY($4::text[]) AND false)")
+mutate("pg-check-definer-owner-untrusted-ignored", "a definer function whose owner may run a function in an untrusted language passes the check", PG_CHECK,
+       "OR (l.lanispl AND NOT l.lanpltrusted))", "OR false)")
+mutate("pg-check-cascade-action-ignored", "a foreign key whose action cascades, on a table owned by a role that can write call_rows, passes the check", PG_CHECK,
+       "    problems.extend(found.into_iter().map(|row| Problem::CascadeAction {",
+       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::CascadeAction {")
+mutate("pg-check-cascade-update-ignored", "a foreign key that acts only on update passes the check", PG_CHECK,
+       "OR k.confupdtype NOT IN ('a', 'r'))", "OR false)")
+mutate("pg-check-cascade-restrict-refused", "a foreign key that is ON DELETE RESTRICT is refused", PG_CHECK,
+       "AND (k.confdeltype NOT IN ('a', 'r')", "AND (k.confdeltype NOT IN ('a')")
+mutate("pg-check-cascade-any-owner", "a foreign key whose action cascades is refused whoever owns its table", PG_CHECK,
+       "                     AND ({}\n                          OR {})",
+       "                     AND (true OR {}\n                          OR {})")
+mutate("pg-check-cascade-definer-runner-ignored", "a cascading foreign key on a table owned by a role that can run a refused definer function passes the check", PG_CHECK,
+       "\"EXISTS (SELECT FROM definers d", "\"false AND EXISTS (SELECT FROM definers d")
+mutate("pg-check-cascade-triggers-only", "a cascading foreign key whose table has a rule, a check or a default but no trigger passes the check", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n",
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n                     AND EXISTS (SELECT FROM pg_catalog.pg_trigger t WHERE t.tgrelid = tbl.oid AND NOT t.tgisinternal)\n")
+mutate("pg-check-cascade-partition-copy-judged", "a partitioned table's foreign key is judged by its partitions' owners, so a partition owned by a role that can reach nothing passes the check", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n",
+       "WHERE k.contype = 'f' AND (k.conparentid <> 0 OR NOT EXISTS (SELECT FROM pg_catalog.pg_inherits i WHERE i.inhparent = k.conrelid))\n")
+mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a foreign key is refused for the partition's owner, which the action does not run as", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
+mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
+       "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
 # Open rows. The boot check compares the view with the definition it expects, so each change to
 # the view changes that definition as well, and the open-row tests must catch it themselves.
 PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"
@@ -3623,8 +3713,63 @@ mutate("demo-pins-base-digest-dropped", "the Dockerfile's runtime image is pinne
        "FROM debian:trixie-slim@sha256:", "FROM debian:trixie-slim\n# @sha256:")
 mutate("demo-pins-frontend-unpinned", "the Dockerfile's syntax frontend is pinned by tag only", "deploy/Dockerfile",
        "# syntax=docker/dockerfile:1@sha256:", "# syntax=docker/dockerfile:1\n# @sha256:")
-mutate("demo-pins-rust-not-toolchain", "the Dockerfile builds with another rust than rust-toolchain.toml's", "deploy/Dockerfile",
+# Only the tag changes: the digest, which is what Docker pulls, still names the toolchain's rust.
+mutate("demo-pins-rust-not-toolchain", "the Dockerfile's build stage names another rust tag than rust-toolchain.toml's channel", "deploy/Dockerfile",
        "FROM rust:1.99.0-slim-trixie@", "FROM rust:1.98.0-slim-trixie@")
+# #125: a new Postgres digest rolls the kind pod, the pod never pulls, the run checks the digest
+# the pod runs, and every Postgres pin in the repository agrees.
+mutate("demo-pins-postgres-annotation-unset", "apply_base leaves the Postgres digest off the pod template, so a new digest under the same tag rolls nothing", DRIVER,
+       '      -e "s|switchboard.io/image-digest: .*|switchboard.io/image-digest: ${POSTGRES_IMAGE#*@}|" \\\n', "")
+mutate("demo-pins-postgres-annotation-dropped", "the kind Postgres pod template has no digest annotation for apply_base to fill in",
+       "deploy/kind/base/postgres.yaml", "      annotations:\n        switchboard.io/image-digest: set-by-demo-sh\n", "")
+mutate("demo-pins-postgres-pulls", "the kind Postgres pod pulls the tag when the loaded image is missing",
+       "deploy/kind/base/postgres.yaml", "          imagePullPolicy: Never\n", "          imagePullPolicy: IfNotPresent\n")
+mutate("demo-pins-postgres-running-unchecked", "the kind run never checks the digest Postgres runs", DRIVER,
+       "  k -n switchboard rollout status deploy/postgres --timeout=120s\n  check_postgres_image\n",
+       "  k -n switchboard rollout status deploy/postgres --timeout=120s\n")
+mutate("demo-pins-postgres-running-any-digest", "the Postgres digest check passes whatever the pod runs", DRIVER,
+       '  if [ "$got" = "$want" ]; then\n', "  if true; then\n")
+mutate("demo-pins-postgres-running-first-pod", "the Postgres digest check reads the first of several pods", DRIVER,
+       '  if [ "$(count_lines . "$pods")" -ne 1 ]; then\n', "  if false; then\n")
+mutate("demo-pins-postgres-running-no-container", "the Postgres digest check lists the containers of a pod that has none yet", DRIVER,
+       '  if [ -z "$container" ]; then\n', "  if false; then\n")
+mutate("demo-pins-postgres-running-pin-unread", "the Postgres digest check compares whatever it read of the pin, so two failed reads pass", DRIVER,
+       """  case "$want" in
+    sha256:*) ;;
+    *)
+      fail "Postgres runs the pinned digest (cannot read the config of $POSTGRES_IMAGE for linux/$arch: got '$want')"
+      return
+      ;;
+  esac
+""", "")
+# Docker's image ID is the config's digest only on the classic store; on the containerd store it
+# is the manifest's, which the node does not name the image by.
+mutate("demo-pins-postgres-running-image-id", "the Postgres digest check wants Docker's image ID, not the config's digest", DRIVER,
+       """  want=$(docker save --platform "linux/$arch" "$POSTGRES_IMAGE" | tar -xOf - manifest.json |
+    jq -r '.[0].Config | capture("^(blobs/sha256/)?(?<hex>[0-9a-f]{64})(\\\\.json)?$").hex | "sha256:" + .') || want=''
+""", """  want=$(docker image inspect --platform "linux/$arch" --format '{{.Id}}' "$POSTGRES_IMAGE") || want=''
+""")
+mutate("demo-pins-postgres-running-any-platform", "the Postgres digest check saves the image for every platform and reads the first one's config", DRIVER,
+       """docker save --platform "linux/$arch" "$POSTGRES_IMAGE" |""", """docker save "$POSTGRES_IMAGE" |""")
+mutate("demo-pins-contributing-digest-differs", "a docker run command in CONTRIBUTING.md names another Postgres digest", "CONTRIBUTING.md",
+       "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\nexport",
+       "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b25\nexport")
+# Only the tag changes in these two: the digest, which is what Docker pulls, is kept, so Docker
+# runs the same image under the name of another release.
+mutate("demo-pins-libdoc-release-differs", "the audit store's documentation names another Postgres release", "crates/audit-postgres/src/lib.rs",
+       "//!   postgres:17.11-alpine@sha256:", "//!   postgres:17.10-alpine@sha256:")
+mutate("demo-pins-ci-release-differs", "CI's Postgres service names another release than the demo's", ".github/workflows/ci.yml",
+       "        image: postgres:17.11@sha256:", "        image: postgres:17.10@sha256:")
+# Each docker run command is held to the pin, not only the file: the other command still names it.
+mutate("demo-pins-contributing-digest-dropped", "one docker run command in CONTRIBUTING.md names the Postgres tag without its digest", "CONTRIBUTING.md",
+       "    postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\ndone",
+       "    postgres:17.11-alpine\ndone")
+mutate("demo-pins-contributing-latest", "one docker run command in CONTRIBUTING.md runs postgres:latest", "CONTRIBUTING.md",
+       "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\nexport",
+       "  postgres:latest\nexport")
+mutate("demo-pins-contributing-untagged", "one docker run command in CONTRIBUTING.md runs postgres with no tag", "CONTRIBUTING.md",
+       "    postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\ndone",
+       "    postgres\ndone")
 mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switchboard namespace", POLICY,
        "              kubernetes.io/metadata.name: switchboard\n          podSelector:\n            matchLabels:\n              app: gateway\n",
        "              kubernetes.io/metadata.name: switchboard\n")
@@ -4023,8 +4168,8 @@ mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes 
 # cluster replaces the previous build's pods.
 
 mutate("demo-driver-kind-fixed-tag", "a kind run deploys the manifests' fixed tag", DRIVER,
-       r'''  k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -''',
-       r'''  k kustomize "$ROOT/deploy/kind/base" | k apply -f -''')
+       '    | sed -e "s|image: $IMG\\$|image: $IMG_RUN|" \\\n      -e ',
+       '    | sed -e ')
 mutate("demo-driver-kind-tag-not-from-id", "the run's tag is not taken from the image's ID", DRIVER,
        "  IMG_RUN=${IMG%:*}:${image_id:0:12}\n", "  IMG_RUN=$IMG\n")
 mutate("demo-driver-kind-image-id-unchecked", "a run goes on without the image's ID", DRIVER,
@@ -4272,6 +4417,20 @@ mutate("issuer-keys-token-without-config", "a bearer is sent with every fetch, a
        '            None => Some(HeaderValue::from_static("Bearer dummy-unconfigured")),\n')
 mutate("issuer-keys-status-unchecked", "only a server error status is refused", IK,
        "        if status != StatusCode::OK {", "        if status.is_server_error() {")
+# Issue #120: the token file's checks, as connector-proxy's credential file has them.
+mutate("issuer-keys-token-size-off-by-one", "a token file of exactly the limit is refused", IK,
+       "    if bytes.len() as u64 > MAX_TOKEN_BYTES {", "    if bytes.len() as u64 >= MAX_TOKEN_BYTES {")
+mutate("issuer-keys-token-size-unbounded", "a token file of any size is sent", IK,
+       "    if bytes.len() as u64 > MAX_TOKEN_BYTES {", "    if false {")
+mutate("issuer-keys-token-read-unbounded", "the whole token file is read before its size is checked", IK,
+       ".and_then(|file| file.take(MAX_TOKEN_BYTES + 1).read_to_end(&mut bytes))",
+       ".and_then(|mut file| file.read_to_end(&mut bytes))")
+mutate("issuer-keys-token-not-trimmed", "the token file's surrounding whitespace is part of the token", IK,
+       "    let token = text.trim();", "    let token = text.as_str();")
+mutate("issuer-keys-token-empty-accepted", "a token file of only whitespace is sent as an empty bearer", IK,
+       "    if token.is_empty() {", "    if false {")
+mutate("issuer-keys-token-any-bytes", "a token with a space inside is sent", IK,
+       "    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {", "    if false {")
 # The bounds.
 mutate("issuer-keys-no-deadline", "a fetch is never abandoned", IK,
        "        let body = match tokio::time::timeout(self.deadline, self.exchange()).await {",
@@ -4287,6 +4446,30 @@ mutate("issuer-keys-declared-length-ignored", "a declared length over the cap is
        "            .is_some_and(|length| length > self.max_body_bytes as u64)", "            .is_some_and(|_| false)")
 mutate("issuer-keys-default-cap-larger", "the default body cap is 1 MiB", IK,
        "usize = 256 * 1024;", "usize = 1024 * 1024;")
+# Issue #120: the CA file's checks beyond #88's list, and ring never installed process-wide.
+# issuer-keys-provider-installed is caught only by tests/process_provider.rs, its own binary.
+mutate("issuer-keys-ca-file-for-http", "a CA file beside an http keys URL is accepted and ignored", IK,
+       "            if files.ca_file.is_some() {", "            if false {")
+mutate("issuer-keys-ca-no-sections-accepted", "a CA file with no PEM section is taken as holding no certificate", IK,
+       "    if sections == 0 {", "    if false {")
+mutate("issuer-keys-ca-broken-section-skipped", "a CA file is read up to its first broken section and the rest ignored", IK,
+       "        let (kind, der) = section.map_err(|_| not_pem())?;",
+       "        let Ok((kind, der)) = section else { break };")
+mutate("issuer-keys-ca-no-certificate-accepted", "a CA file with no certificate is taken, trusting nothing", IK,
+       "    if roots.is_empty() {", "    if false {")
+mutate("issuer-keys-ca-bad-certificate-skipped", "a certificate that does not parse is skipped", IK,
+       "            roots\n"
+       "                .add(CertificateDer::from(der))\n"
+       "                .map_err(|_| SourceError::CaBadCertificate {\n"
+       "                    issuer: issuer.clone(),\n"
+       "                    path: path.to_owned(),\n"
+       "                })?;\n",
+       "            let _ = roots.add(CertificateDer::from(der));\n")
+mutate("issuer-keys-provider-installed", "the TLS client reads the process default provider, installing ring when none is set", IK,
+       "    let mut config = ClientConfig::builder_with_provider(provider)\n"
+       "        .with_safe_default_protocol_versions()\n"
+       "        .map_err(|_| SourceError::Tls(issuer.clone()))?\n",
+       "    let _ = provider;\n    let mut config = ClientConfig::builder()\n")
 
 # --- Which tests can see a mutation ----------------------------------------------------------
 #
@@ -4301,8 +4484,8 @@ mutate("issuer-keys-default-cap-larger", "the default body cap is 1 MiB", IK,
 # tests, not in code another package links, so their dependents are not added.
 #
 # A path outside every crate that no prefix matches runs the whole workspace. That covers the root
-# Cargo.toml and Cargo.lock, which every build reads, and docs/, scripts/, .github/, README.md and
-# CONTRIBUTING.md, which no test reads today.
+# Cargo.toml and Cargo.lock, which every build reads, and docs/, scripts/, the rest of .github/ and
+# README.md, which no test reads today.
 #
 # Left out on purpose: gateway-testkit's no_private_key_is_checked_in reads every file under
 # crates/. A mutation that wrote private key armour would be caught only by the whole-workspace run.
@@ -4321,6 +4504,11 @@ READERS: list[tuple[str, frozenset[str]]] = [
     ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
     # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.
     ("crates/gateway-identity/Cargo.toml", frozenset({"mock-docs-server"})),
+    # demo-checks/tests/pins.rs holds the Postgres pins in these to demo.sh's, and
+    # demo-checks/tests/release.rs reads CI's release build.
+    ("CONTRIBUTING.md", frozenset({"demo-checks"})),
+    (".github/workflows/ci.yml", frozenset({"demo-checks"})),
+    ("crates/audit-postgres/src/lib.rs", frozenset({"demo-checks"})),
 ]
 
 
