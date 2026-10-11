@@ -51,6 +51,12 @@ DEMO_DIR=$ROOT/.demo
 KCFG=$DEMO_DIR/kubeconfig
 IMG=switchboard-demo:dev
 IMG_RUN=$IMG
+# Postgres, pinned by the digest of the tag's multi-arch index. Compose names the same reference;
+# the kind manifest names only the tag, and load_images loads this digest under it.
+# crates/demo-checks/tests/driver.rs holds the three to one tag and digest. Dependabot does not
+# read this file: bump it by hand with the other two, taking the digest from
+# `docker buildx imagetools inspect postgres:<tag>`.
+POSTGRES_IMAGE=postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
 COMPOSE_FILE=$ROOT/deploy/compose/compose.yaml
 KIND_ISSUER=https://kubernetes.default.svc.cluster.local
 # The gateway's ServiceAccount: the one caller mock-docs accepts in kind (deploy/kind/base).
@@ -921,13 +927,18 @@ apply_base() {
   k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -
 }
 
+# load_images: loads this run's image and Postgres into the cluster. Postgres goes in under its
+# tag alone, which is what the kind manifest names: the archive holds this platform's manifest,
+# not the tag's multi-arch index, so a pod naming the index digest would miss it and pull.
 load_images() {
-  local arch
+  local arch postgres_tag=${POSTGRES_IMAGE%@*}
   arch=$(docker version --format '{{.Server.Arch}}')
-  docker image inspect postgres:17-alpine >/dev/null 2>&1 || docker pull postgres:17-alpine
+  docker image inspect "$POSTGRES_IMAGE" >/dev/null 2>&1 || docker pull "$POSTGRES_IMAGE"
+  # Tagged from the pinned digest, so the tag is that image whatever it named here before.
+  docker tag "$POSTGRES_IMAGE" "$postgres_tag"
   # `kind load docker-image` fails on Docker's containerd image store with multi-platform
   # images, so save this platform's images to an archive and load that.
-  docker save --platform "linux/$arch" -o "$DEMO_DIR/images.tar" "$IMG_RUN" postgres:17-alpine
+  docker save --platform "linux/$arch" -o "$DEMO_DIR/images.tar" "$IMG_RUN" "$postgres_tag"
   kind load image-archive "$DEMO_DIR/images.tar" --name "$CLUSTER"
   rm -f "$DEMO_DIR/images.tar"
 }

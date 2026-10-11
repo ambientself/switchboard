@@ -21,7 +21,13 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: postgres
-          image: postgres:17-alpine
+          # The tag only. demo.sh pulls this tag by the digest it pins (POSTGRES_IMAGE, the same
+          # as Compose's) and loads it into the cluster under this tag. kind's image load keeps
+          # this platform's manifest, not the tag's multi-arch index, so a pod naming the index
+          # digest does not find the loaded image and pulls from Docker Hub instead.
+          # crates/demo-checks/tests/driver.rs holds this tag to demo.sh's. Dependabot does not
+          # read this file; bump it by hand with demo.sh and Compose.
+          image: postgres:17.11-alpine
           imagePullPolicy: IfNotPresent
           env:
             - name: POSTGRES_PASSWORD
