@@ -1291,35 +1291,90 @@ fn each_list_row_is_one_of_the_workloads_lists() {
 }
 
 /// Runs `body` with `k` answering every `auth can-i` with `answer` and every SubjectAccessReview
-/// with `allowed`. Returns the run, each can-i asked and each review's body.
+/// with `allowed`, and serving a cluster whose RBAC objects bind nothing to the workloads.
+/// Returns the run, each can-i asked and each review's body.
 fn with_can_i(
     name: &str,
     answer: &str,
     allowed: &str,
     body: &str,
 ) -> (Run, Vec<String>, Vec<Value>) {
-    let log = scratch(name).join("calls.log");
+    let (run, asks, reviews, _) = with_rbac(name, answer, allowed, body, &[]);
+    (run, asks, reviews)
+}
+
+/// The RBAC lists `k` serves, by the file name `with_rbac` reads them from.
+const RBAC_LISTS: [&str; 10] = [
+    "clusterroles",
+    "clusterrolebindings",
+    "roles-mock-docs",
+    "rolebindings-mock-docs",
+    "roles-switchboard",
+    "rolebindings-switchboard",
+    "roles-team-a",
+    "rolebindings-team-a",
+    "roles-team-b",
+    "rolebindings-team-b",
+];
+
+/// As `with_can_i`, with `k get` serving each RBAC list from `rbac` by name (see `RBAC_LISTS`),
+/// or an empty list; a name given as None is not served, so its read fails. Returns the RBAC
+/// reads too, as `get ...`.
+fn with_rbac(
+    name: &str,
+    answer: &str,
+    allowed: &str,
+    body: &str,
+    rbac: &[(&str, Option<&str>)],
+) -> (Run, Vec<String>, Vec<Value>, Vec<String>) {
+    require(&["jq"]);
+    let dir = scratch(name);
+    let log = dir.join("calls.log");
+    for list in RBAC_LISTS {
+        let given = rbac.iter().find(|(name, _)| *name == list).map(|(_, v)| *v);
+        match given {
+            Some(None) => {}
+            Some(Some(contents)) => {
+                write(&dir, &format!("{list}.json"), contents);
+            }
+            None => {
+                write(
+                    &dir,
+                    &format!("{list}.json"),
+                    r#"{"apiVersion": "v1", "kind": "List", "items": []}"#,
+                );
+            }
+        }
+    }
     let run = sourced(&format!(
         "k() {{ case \"$1\" in\n  \
            create) printf 'review %s\\n' \"$(cat)\" >> '{log}'; echo {allowed} ;;\n  \
+           get) echo \"$*\" >> '{log}'; f=$2; [ \"$3\" != -n ] || f=$2-$4; cat '{dir}'/\"$f.json\" ;;\n  \
            *) echo \"k $*\" >> '{log}'; echo {answer} ;;\n\
          esac; }}\n{body}\nFINISHED=1\nresult 0",
-        log = log.display()
+        log = log.display(),
+        dir = dir.display()
     ));
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let mut asks = Vec::new();
     let mut reviews = Vec::new();
+    let mut reads = Vec::new();
     for line in text.lines() {
+        if line.starts_with("get ") {
+            reads.push(line.to_owned());
+            continue;
+        }
         match line.strip_prefix("review ") {
             Some(review) => reviews.push(serde_json::from_str(review).unwrap()),
             None => asks.push(line.to_owned()),
         }
     }
-    (run, asks, reviews)
+    (run, asks, reviews, reads)
 }
 
 /// What the operator checks asked of a team's workload before they read permissions.tsv
-/// (#47's kind demo checks), as `kubectl auth can-i` arguments. Each must still be asked.
+/// (#47's kind demo checks), and #60's updating and patching of bindings, as `kubectl auth
+/// can-i` arguments. Each must still be asked.
 fn operator_asks(team: &str) -> Vec<String> {
     let mut asks = Vec::new();
     // Reading a secret or the gateway's configuration: list and watch return the data too.
@@ -1339,7 +1394,11 @@ fn operator_asks(team: &str) -> Vec<String> {
     for verb in ["bind", "escalate"] {
         asks.push(format!("{verb} clusterroles.rbac.authorization.k8s.io"));
     }
-    asks.push("create clusterrolebindings.rbac.authorization.k8s.io".to_owned());
+    for verb in ["create", "update", "patch"] {
+        asks.push(format!(
+            "{verb} clusterrolebindings.rbac.authorization.k8s.io"
+        ));
+    }
     // In mock-docs, the gateway's namespace and the team's own.
     for ns in ["mock-docs", "switchboard", team] {
         asks.push(format!("create pods -n {ns}"));
@@ -1367,9 +1426,11 @@ fn operator_asks(team: &str) -> Vec<String> {
         for verb in ["bind", "escalate"] {
             asks.push(format!("{verb} roles.rbac.authorization.k8s.io -n {ns}"));
         }
-        asks.push(format!(
-            "create rolebindings.rbac.authorization.k8s.io -n {ns}"
-        ));
+        for verb in ["create", "update", "patch"] {
+            asks.push(format!(
+                "{verb} rolebindings.rbac.authorization.k8s.io -n {ns}"
+            ));
+        }
         // The controllers that start pods.
         for resource in [
             "deployments.apps",
@@ -1502,15 +1563,20 @@ fn the_operator_checks_ask_every_row_of_the_route_checks_list_for_both_teams() {
         }
         expected_reviews.extend(team_reviews);
     }
-    // Exactly these, and each once: 43 namespaced rows asked four ways and 8 cluster rows, 178
-    // asks and 2 reviews per team.
+    // Exactly these, and each once: 45 namespaced rows asked four ways and 10 cluster rows, 188
+    // asks and 2 reviews per team; then one RBAC check per row, 55 per team.
     let mut called = asks.clone();
     called.sort();
     expected.sort();
     assert_eq!(called, expected, "{}", run.transcript());
-    assert_eq!(called.len(), 2 * 178);
+    assert_eq!(called.len(), 2 * 188);
     assert_eq!(reviews, expected_reviews, "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 2 * 180, "{}", run.transcript());
+    assert_eq!(
+        run.lines("PASS ").len(),
+        2 * (190 + 55),
+        "{}",
+        run.transcript()
+    );
 
     // A yes, or no answer at all, fails the check.
     for (answer, allowed) in [("yes", "true"), ("''", "''")] {
@@ -1523,6 +1589,180 @@ fn the_operator_checks_ask_every_row_of_the_route_checks_list_for_both_teams() {
         ] {
             assert!(run.failed(check), "{answer}: {check}\n{}", run.transcript());
         }
+    }
+}
+
+/// The rows of deploy/route-check/permissions.tsv, as the operator checks name them.
+fn permission_rows() -> Vec<String> {
+    common::read("deploy/route-check/permissions.tsv")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let row: Vec<&str> = line.split('\t').collect();
+            match row[2] {
+                "-" => format!("{} {}", row[0], row[1]),
+                sub => format!("{} {}/{sub}", row[0], row[1]),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn the_operator_checks_read_the_rbac_rules_bound_to_each_team() {
+    let (run, _, _, mut reads) = with_rbac("rbac-clean", "no", "false", "operator_checks", &[]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    // One check per row and team, with rbac-match.jq, over the team's own three namespaces.
+    for team in ["team-a", "team-b"] {
+        for row in permission_rows() {
+            let check = format!(
+                "PASS {team}'s workload is bound to no RBAC rule for: {row}, whatever its resourceNames ("
+            );
+            assert!(
+                run.stdout.lines().any(|line| line.starts_with(&check)),
+                "{check}\n{}",
+                run.transcript()
+            );
+        }
+        assert!(
+            run.stdout.contains(&format!(
+                "PASS {team}'s workload is bound to no RBAC rule for: get secrets, whatever its resourceNames (RoleBindings in mock-docs,switchboard,{team}, and ClusterRoleBindings)\n"
+            )),
+            "{}",
+            run.transcript()
+        );
+    }
+    // Each list is read once, with the demo's own access.
+    reads.sort();
+    let mut want = vec![
+        "get clusterrolebindings -o json".to_owned(),
+        "get clusterroles -o json".to_owned(),
+    ];
+    for ns in ["mock-docs", "switchboard", "team-a", "team-b"] {
+        want.push(format!("get rolebindings -n {ns} -o json"));
+        want.push(format!("get roles -n {ns} -o json"));
+    }
+    want.sort();
+    assert_eq!(reads, want);
+    // demo.sh and route-check.sh run the one matcher.
+    let driver = common::read("deploy/demo/demo.sh");
+    assert!(driver.contains("RBAC_MATCH=$ROOT/deploy/route-check/rbac-match.jq\n"));
+    assert!(driver.contains("-f \"$RBAC_MATCH\""));
+    let route_check = common::read("deploy/route-check/route-check.sh");
+    assert!(route_check.contains("RBAC_MATCH=$HERE/rbac-match.jq\n"));
+    assert!(route_check.contains("-f \"$RBAC_MATCH\""));
+}
+
+#[test]
+fn a_grant_limited_by_resource_names_fails_the_operator_checks_for_its_team() {
+    // A RoleBinding in the gateway's namespace lets team-b's workload mint a token for the
+    // gateway's ServiceAccount, and only that one. can-i and the reviews answer no; the rules
+    // show it.
+    let clusterroles = r#"{"items": [{"metadata": {"name": "mint"}, "rules": [
+        {"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"], "resourceNames": ["gateway"]}
+    ]}]}"#;
+    let bindings = r#"{"items": [{"metadata": {"name": "mint"},
+        "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "mint"},
+        "subjects": [{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-b"}]}]}"#;
+    let (run, _, _, _) = with_rbac(
+        "rbac-names",
+        "no",
+        "false",
+        "operator_checks",
+        &[
+            ("clusterroles", Some(clusterroles)),
+            ("rolebindings-switchboard", Some(bindings)),
+        ],
+    );
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    assert_eq!(
+        run.lines("FAIL "),
+        [
+            "FAIL team-b's workload is bound to no RBAC rule for: create serviceaccounts/token, whatever its resourceNames (RoleBinding switchboard/mint binds ClusterRole mint to ServiceAccount team-b/mock-workload, for resourceNames gateway)"
+        ],
+        "{}",
+        run.transcript()
+    );
+    assert!(run.stdout.contains(
+        "PASS team-b's workload may not: create serviceaccounts --subresource=token -n switchboard\n"
+    ));
+    assert!(run.stdout.contains(
+        "PASS team-a's workload is bound to no RBAC rule for: create serviceaccounts/token, whatever its resourceNames ("
+    ));
+
+    // The same grant to every authenticated user fails both teams.
+    let everyone = bindings.replace(
+        r#"{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-b"}"#,
+        r#"{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:authenticated"}"#,
+    );
+    let (run, _, _, _) = with_rbac(
+        "rbac-names-everyone",
+        "no",
+        "false",
+        "operator_checks",
+        &[
+            ("clusterroles", Some(clusterroles)),
+            ("rolebindings-switchboard", Some(&everyone)),
+        ],
+    );
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    for team in ["team-a", "team-b"] {
+        assert!(
+            run.failed(&format!("{team}'s workload is bound to no RBAC rule for: create serviceaccounts/token, whatever its resourceNames (RoleBinding switchboard/mint binds ClusterRole mint to Group system:authenticated, for resourceNames gateway)")),
+            "{team}\n{}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn rbac_lists_the_operator_checks_cannot_read_fail() {
+    for (name, rbac, want) in [
+        (
+            "unread",
+            vec![("rolebindings-team-b", None)],
+            vec![
+                "operator checks: the RBAC rules bound to each team's workload (could not read the rolebindings in team-b)",
+            ],
+        ),
+        (
+            "not-json",
+            vec![("clusterroles", Some("{\"items\": ["))],
+            vec![
+                "operator checks: the RBAC rules bound to each team's workload (could not read the clusterroles)",
+            ],
+        ),
+        (
+            "shape",
+            vec![(
+                "clusterroles",
+                Some(
+                    r#"{"items": [{"metadata": {"name": "odd"}, "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": "get"}]}]}"#,
+                ),
+            )],
+            vec![
+                "team-a's workload is bound to no RBAC rule for a row of",
+                "team-b's workload is bound to no RBAC rule for a row of",
+                "could not read ClusterRole odd: verbs: not a list of strings",
+            ],
+        ),
+    ] {
+        let (run, _, _, _) = with_rbac(
+            &format!("rbac-{name}"),
+            "no",
+            "false",
+            "operator_checks",
+            &rbac,
+        );
+        assert_eq!(run.status, Some(1), "{name}: {}", run.transcript());
+        for text in want {
+            assert!(run.failed(text), "{name}: {text}\n{}", run.transcript());
+        }
+        assert!(
+            !run.stdout
+                .contains("PASS team-a's workload is bound to no RBAC rule"),
+            "{name}: {}",
+            run.transcript()
+        );
     }
 }
 

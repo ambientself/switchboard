@@ -74,6 +74,9 @@ KIND_GATEWAY_URL=http://gateway.switchboard.svc.cluster.local:8080/mcp/docs
 ROUTE_CHECK=$ROOT/deploy/route-check/route-check.sh
 ROUTE_CHECK_ROUTES=$ROOT/deploy/route-check/routes/kind.tsv
 PERMISSIONS=$ROOT/deploy/route-check/permissions.tsv
+# The matcher of the RBAC rules bound to a ServiceAccount against that list, which the route
+# check's operator step runs too (#60).
+RBAC_MATCH=$ROOT/deploy/route-check/rbac-match.jq
 ROUTE_CHECK_OPERATOR=system:serviceaccount:route-check:operator
 
 PASSES=0
@@ -794,6 +797,11 @@ sar_no() {
 # namespace's RoleBindings as well as ClusterRoleBindings, so a no there holds across the
 # cluster too, and covers more than --all-namespaces, which counts only ClusterRoleBindings.
 # A list that cannot be read fails the step; nothing is asked from a list of its own.
+#
+# A can-i names no resource, so it cannot see a rule limited by resourceNames: a workload able
+# to mint tokens for one named ServiceAccount answers no. So the checks also read the RBAC rules
+# bound to each team's workload with deploy/route-check/rbac-match.jq, the matcher the route
+# check's operator step runs (operator_rbac).
 operator_checks() {
   local rows team verb resource subresource scope ns
   if ! rows=$(awk -F'\t' '/^#/ || NF == 0 { next }
@@ -814,6 +822,54 @@ operator_checks() {
       fi
     done 3<<<"$rows"
   done
+  operator_rbac
+}
+
+# operator_rbac: for each team's workload, that no RBAC rule bound to its ServiceAccount or its
+# groups grants a row of permissions.tsv, whatever its resourceNames. It reads the ClusterRoles,
+# the ClusterRoleBindings, and the Roles and RoleBindings in mock-docs, the gateway's namespace
+# and each team's, and runs rbac-match.jq for each team over its own three. A list that cannot
+# be read or parsed fails the step, and nothing is matched.
+operator_rbac() {
+  local lists what ns list team verdicts verdict row detail status
+  lists=$(mktemp)
+  status=0
+  for what in clusterroles clusterrolebindings; do
+    if ! list=$(k get "$what" -o json) ||
+      ! jq -ce --arg what "$what" 'if type == "object" then {what: $what, namespace: "", list: .} else error end' <<<"$list" >>"$lists"; then
+      fail "operator checks: the RBAC rules bound to each team's workload (could not read the $what)"
+      status=1
+      break
+    fi
+  done
+  for ns in mock-docs switchboard team-a team-b; do
+    [ "$status" -eq 0 ] || break
+    for what in roles rolebindings; do
+      if ! list=$(k get "$what" -n "$ns" -o json) ||
+        ! jq -ce --arg what "$what" --arg ns "$ns" 'if type == "object" then {what: $what, namespace: $ns, list: .} else error end' <<<"$list" >>"$lists"; then
+        fail "operator checks: the RBAC rules bound to each team's workload (could not read the $what in $ns)"
+        status=1
+        break
+      fi
+    done
+  done
+  if [ "$status" -eq 0 ]; then
+    for team in team-a team-b; do
+      if ! verdicts=$(jq -n -r --rawfile permissions "$PERMISSIONS" --arg namespace "$team" --arg name mock-workload \
+        --argjson namespaces "[\"mock-docs\",\"switchboard\",\"$team\"]" -f "$RBAC_MATCH" <"$lists" 2>&1); then
+        fail "$team's workload is bound to no RBAC rule for a row of $PERMISSIONS (${verdicts%%$'\n'*})"
+        continue
+      fi
+      while IFS=$'\t' read -r verdict row detail; do
+        if [ "$verdict" = PASS ]; then
+          pass "$team's workload is bound to no RBAC rule for: $row, whatever its resourceNames ($detail)"
+        else
+          fail "$team's workload is bound to no RBAC rule for: $row, whatever its resourceNames ($detail)"
+        fi
+      done <<<"$verdicts"
+    done
+  fi
+  rm -f "$lists"
 }
 
 # operator_ask TEAM VERB RESOURCE SUBRESOURCE WHERE: one row of permissions.tsv for TEAM's
@@ -1022,7 +1078,7 @@ kind_run() {
   step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
   route_checks_after_policy
 
-  step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create a binding, nor get, list or watch secrets or configuration"
+  step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets or configuration; and no RBAC rule bound to either grants any of these, whatever its resourceNames"
   operator_checks
 
   step "mock-docs accepted only the gateway's own identity, and no denied call reached it"
