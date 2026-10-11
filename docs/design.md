@@ -225,7 +225,15 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    what the call names, such as a repository outside the team's scope. The gateway bounds the
    result's size and duration above any bound of the connector's own. A result over the bound
    is never cut short silently: for a `read` tool it is outcome `error`, and for any other tool
-   it is `unknown` (decision 0009).
+   it is `unknown` (decision 0009). For a proxied server the bounds are 64 KiB and 5 s unless
+   its entry in the deployment file sets others, up to 1 MiB and 60 s; a connector in the
+   gateway's own process gets its bound in milestone 4 (#12). Before a proxied call is sent it
+   takes a slot under two caps in the instance: 32 calls in flight to the server, and 8 from
+   the caller's team to it. A call over either is completed as `refused` with a capacity
+   sentence, and nothing is sent. The instance's own cap, 256 requests in flight, is checked
+   earlier, at admission, before the body is read: a request over it is answered 503, as
+   telemetry, with no row
+   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 9. **Complete the audit row** with the outcome (`ok`, `error`, `refused`, `unknown` or
    `duplicate`) and latency. The answer waits for this for at most the answer budget, and
    finish keeps retrying until its deadline.
@@ -283,7 +291,8 @@ force until a refresh succeeds, with no maximum age ([decision
 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Refusing every token because
 a refresh failed would turn an outage of the issuer's host into an outage of the gateway. Each
 issuer's key age is exported instead, as `switchboard_issuer_keys_age_seconds{issuer}` (#91),
-with an alert condition at four refresh intervals (Q12).
+with an alert condition at four refresh intervals
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 
 An `https` keys URL is fetched over TLS (#88), and needs `keys_ca_file`: a PEM bundle, read at
 boot, whose CAs are the only ones trusted. No roots are compiled in and none are read from the
@@ -297,10 +306,14 @@ kubelet rotates projected tokens, and sent to the keys URL only. Both are refuse
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
-was refused". "We were not checking" is a row with identity `disabled`. For identity, "someone
-tried and was refused" is a telemetry event (section 11); for a delegation, it is a deny row.
-The core cannot yet record a row with identity `disabled`, so until it can, the built path
-refuses every `tools/call` with identity disabled and lists nothing, with no row (section 17).
+was refused". For identity, "someone tried and was refused" is a telemetry event (section
+11); for a delegation, it is a deny row. "We were not checking" writes no row, and none is
+planned: with identity disabled the path lists nothing and refuses every `tools/call`, with no
+row. Reads are not served with rows whose identity is `disabled`, and #69, which would have
+built them, is not planned
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). Decision 0014
+also makes identity disabled development-only: the release build refuses it once #11's
+fail-closed work lands (section 12), and until then starts with a warning.
 
 **A wrong guess costs the same as a right one.** An unknown subject pays for the signature
 check before it is refused, so response time does not reveal which subjects exist.
@@ -611,8 +624,8 @@ list names what others must still decide.
 
 | Record | Covers | Written | If it cannot be written |
 | --- | --- | --- | --- |
-| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host or origin), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
-| Audit row | Every request that reaches a decision, from a proved principal or with identity checking explicitly disabled: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
+| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
+| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, nothing is listed and every `tools/call` is refused, with no row (section 7). Decision 0014 makes identity disabled development-only; the release build refuses it once #11's fail-closed work lands (section 12). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect: a call to any tool not classified `read`. | Postgres, in the same transaction as the call's begin. | The call is refused. |
 
 The exceptions to invariant 5 are the requests telemetry covers, which reach no decision, and
@@ -684,8 +697,10 @@ written complete, has no finish, and is never open.
   counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
   quotes again, so as JSON they reach 297,675 characters, or 298,059 bytes, since `…` takes 3
   bytes. Any call that gets a row can reach this, a denial included, and the row is written
-  before the tool runs. The size limits and audit latency targets in Q12 must cover a row this
-  large, counted as the store counts it.
+  before the tool runs. A row is at most 512 KiB, counted as the bytes of the values the
+  Postgres store sends, which holds this with room for the rest of the row; the bound and the
+  test that the largest row fits arrive with #11
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres
@@ -705,8 +720,10 @@ written complete, has no finish, and is never open.
   call, or the reach of the tool's connector entry. A reach is recorded by reference to the
   entry, not as a list, since it can hold more resources than a row keeps and the policy
   revision says exactly what it was.
-- **The credential identity used is recorded:** the mode and the vendor-side principal, never
-  the secret.
+- **The credential identity is recorded at begin, as configured:** the connector entry's stated
+  mode and vendor-side principal, never the secret. An entry has one credential and no
+  fallback, so it is the identity the call runs under until per-user grants arrive in
+  milestone 5 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
@@ -715,7 +732,7 @@ written complete, has no finish, and is never open.
   check 3 as an unverified delegation. Its row records which check failed and no claims, and,
   if its signature verified, its digest.
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
-  Otto adds them. Whether it does is part of the question about that table in Q12.
+  Otto adds them. Whether it does is part of the question about that table in Q18.
 
 **Open rows.** Nothing writes to a row except begin and finish, and nothing marks it
 afterwards. What a row of kind `call` means follows from its columns and the database's clock:
@@ -740,7 +757,9 @@ it cannot read who called what on the audit table. A trigger refuses any update 
 already set, so "at most once" holds in the database. The receipt table has grants and a
 trigger of its own. The same role reads receipts, which the reuse check needs, so it can read
 who caused each side effect, on which tool and where. Deletion for retention uses a separate
-role (Q12). None of this protects rows against a database superuser.
+role, created before the first production deployment; until it exists nothing is deleted
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). None of this
+protects rows against a database superuser.
 
 **Shutdown.** On termination an instance first fails its readiness check, then stops accepting
 calls, and lets running calls and their finishes complete. Its termination grace period is set
@@ -751,12 +770,14 @@ row, which is made at the finish deadline.
 **Signals,** counted and exported from milestone 2: begin failures and the audit-failure
 answers they cause; answers released before finish; finishes not written by their deadline;
 open rows; receipts in `unknown` and the age of the oldest; begin and finish latency;
-connections in use per pool; telemetry dropped. Alert thresholds and paging are set before the
-first production deployment.
+connections in use per pool; telemetry dropped. The alert conditions are written in
+[decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); nothing pages until
+a metrics sink and an on-call rotation exist.
 
-The provisional values are two seconds for the begin budget, two seconds for the answer budget
-(as in Otto) and thirty seconds for the finish deadline. Call deadlines are set per tool. Q12
-sets the final values.
+The values are two seconds for the begin budget, two seconds for the answer budget (as in Otto)
+and thirty seconds for the finish deadline, final for milestone 3 and revisited when measured
+against a networked Postgres. Call deadlines are set per proxied server in the deployment file,
+5 s by default and at most 60 s (decision 0014).
 
 This puts Postgres on the path of every call for the whole company. Its availability becomes
 the gateway's availability, and that is an accepted cost of the rule. The first slice
@@ -771,7 +792,7 @@ resource that caused it, as prose capped at 1,024 characters (`deny_reason`, `re
 `github_skill_body` also records the skill ref it was asked for (`skill_ref_requested`) and the
 repository and commit it read (`skill_repo`, `skill_commit`), but only on an allowed call, and
 those columns travel on the finish write, which Otto makes best-effort. Whether the table gains
-a general column, and who adds it, is open (Q12). The table's classification column allows only
+a general column, and who adds it, is open (Q18). The table's classification column allows only
 `read`, `write` and `destructive`, so Otto's adapter records a `propose` tool as `write` there,
 an explicit mapping like its tool names. The table has no `unknown` and no `duplicate`: the
 adapter writes `unknown` as an empty outcome, never `error`, and `duplicate` as `ok`, since
@@ -860,8 +881,8 @@ Checked before a socket is bound. Identity and audit each have four states:
 
 | | Configured | Explicit opt-out only | Neither | Both |
 | --- | --- | --- | --- | --- |
-| Identity | Starts; callers must prove themselves. | Starts with a loud warning. | Refuses to start. | Refuses, as a contradiction. |
-| Audit | Starts; every call recorded. | Starts with a loud warning. | Refuses to start. | Refuses, as a contradiction. |
+| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
+| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
 
 A partly configured gate is refused. A connector that is partly configured refuses to start. A
 connector that is not configured must be absent from every surface: a snapshot that puts one of
@@ -938,12 +959,20 @@ profile can change it. Only development builds are exempt.
 
 **A development build** is a build of the gateway with the `test-support` cargo feature, which
 the release build never enables. The harness's test builds and the Rust target of the
-conformance suite are development builds. A development build carries two exemptions: it may
-serve a snapshot holding a tool not classified `read` with no receipt store, and it may run with
-turn-grant checking off. `#[cfg(test)]` cannot provide them, because the harness runs the
-gateway from integration tests and other crates. Since a feature can be turned on in any build,
-CI checks the release artifact itself: started with a `propose` snapshot and no receipt store,
-and started with grant checking off, it must refuse both.
+conformance suite are development builds. A development build carries five exemptions: it may
+serve a snapshot holding a tool not classified `read` with no receipt store, run with
+turn-grant checking off, run with identity disabled, run with audit disabled
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)), and connect to
+loopback destinations, for the tests' local servers
+([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). The release
+build refuses the first four at boot, before it makes any connection, and refuses a loopback
+destination when it connects. `#[cfg(test)]` cannot provide them, because the harness runs the
+gateway from integration tests and other crates. Since a feature can be turned on in any
+build, CI checks the release artifact itself: started with a `propose` snapshot and no receipt
+store, with grant checking off, with identity disabled and with audit disabled, it must refuse
+each, and it must refuse a loopback destination. The identity, audit and loopback refusals,
+and CI's steps for them, arrive in milestone 3 (#11). With identity disabled a development
+build lists nothing and refuses every `tools/call`, with no row.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
@@ -1147,7 +1176,7 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. The gateway refuses, at boot and at each snapshot swap, a snapshot serving a tool not classified `read` without a receipt store (decision 0009), and CI checks the release artifact for it. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. The code owners of the policy files and the branch rule requiring their review, since no policy file lands before them (decision 0011). |
-| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Tool assurance and proxied exposure (decision 0011). |
+| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. Per-server limits in the deployment file, the instance, server and team caps, the identity and audit opt-outs refused outside development builds, configurable audit pools, the row's size bound, and the agreed metrics ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). | Freshness and revocation bounds ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Tool assurance and proxied exposure (decision 0011). Rollout safeguards and audit operations (decision 0014), except the per-user rate limit, which waits for milestone 5. |
 | 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Before stage 3, the pod binding and the currency check (decision 0012). Built-in GitHub and Jira tools, and the exception list in check 5 for Otto's two comment tools (decision 0011, #12). Built-in tools that check their own scope report what they reached (decision 0011). Receipts and the key check before the first side effect reaches a real system (decision 0009, part 2). The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Who the owner names to raise the one list of Otto requests from decisions 0009 to 0012 (Q18); nothing reaches Otto's owners before then. Otto's owners' answers to decision 0011: the review of the declarations for Otto's eighteen tools, team repositories moving into the snapshot's limits, and the proposal tools checked against the interim automation refusals; until then this gateway serves none of Otto's tools. Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The security owner named and the comment-tool exception's register entry signed, before Otto's two comment tools are served (decision 0011). The vendor actions Otto's control plane needs. Asked but not blocking: Otto's answers to decision 0010 (its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant). Until they come, every Otto turn has the governed path. |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13), including that each client sends a tool-use identifier or can set the named `_meta` field before it is served a `propose` tool (decision 0009). The security reviewer of data approvals, named by the security team, since no resource enters a group's limit, and so no employee read works, until then (decision 0011). Whether group limits and broad-read opt-ins expire (decision 0011). Per-user grants and receipts before any employee proposal for that system (decision 0011), and whether a per-user rate limit must come first (Q12). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
@@ -1185,8 +1214,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - Already built: the claimed issuer and subject are available beside a verification error,
   escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
   itself still carries nothing from the token. The `identity_failed` event records them (#26).
-- With #10 and #26: a principal state for identity checking turned off, which a row can record
-  as `disabled`.
+- Not planned: a principal state for identity checking turned off, which a row could record
+  as `disabled`. With identity disabled, nothing is listed and every `tools/call` is refused,
+  with no row ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69
+  closes as not planned). Decision 0014 makes identity disabled development-only; the release
+  build refuses it once #11's fail-closed work lands (section 12), and until then starts with
+  a warning.
 
 **#10, audit and receipts** (the core, the Postgres store built for #10, and the test stores).
 
@@ -1375,9 +1408,11 @@ off only in a development build, with CI's check of the release artifact; and th
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
   reaches it.
 - The key read from its carriers, the tool-use identifier and the named `_meta` field.
-- With identity disabled, reads served with rows whose identity is `disabled` (with #9 and
-  #10). Until then the path refuses every `tools/call` and lists nothing, with no row, which
-  is stricter.
+- Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
+  The path keeps refusing every `tools/call` and listing nothing, with no row
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
+  not planned). Disabling identity becomes development-only when #11's fail-closed work lands
+  (section 12).
 - Already built and matching: identity failures write no row and keep the opaque sentence
   during an audit outage; begin, run and finish still run on a spawned task the client cannot
   cancel, though a read is now cancelled through the disconnect signal; shutdown waits for
@@ -1573,14 +1608,16 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9, Q10, Q17 and Q18, and Q12 and Q13, are in
+What remains of Q9, Q10, Q12, Q17 and Q18, and Q13, are in
 [open-questions.md](open-questions.md). Q9 is narrowed to what decision 0011 leaves to others,
 Q10 to what compliance requires of read auditing, Q17 to what decision 0010 leaves to others,
 and Q18 to what decision 0012 leaves to Otto's owners and to the owner; the rest of each is
-decided. Q11 is settled by decision 0013. Each of decisions 0009 to 0013 lists what it leaves
-to Otto's owners, IT, IT security, the security team, platform owners and others, with who
-decides and what holds meanwhile. Every request of Otto's owners goes to them as one list,
-raised by whoever the owner names (decision 0012). The milestone table says which each milestone
-must settle before it starts, and section 17 lists the changes the records need in code already
-built. Vendor feasibility remains research in [systems.md](systems.md). The independent
-review's findings that are not yet reflected here are listed at the end of that file.
+decided. Q11 is settled by decision 0013. Q12 is narrowed by decision 0014 to the per-user rate
+limit, which the owner left open until milestone 5, and what it leaves to others. Each of
+decisions 0009 to 0014 lists what it leaves to Otto's owners, IT, IT security, the security
+team, platform owners and others, with who decides and what holds meanwhile. Every request of
+Otto's owners goes to them as one list, raised by whoever the owner names (decision 0012). The
+milestone table says which each milestone must settle before it starts, and section 17 lists the
+changes the records need in code already built. Vendor feasibility remains research in
+[systems.md](systems.md). The independent review's findings that are not yet reflected here are
+listed at the end of that file.

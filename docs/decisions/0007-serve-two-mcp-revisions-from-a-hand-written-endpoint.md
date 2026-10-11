@@ -92,3 +92,6 @@ in [open-questions.md](../open-questions.md). They are recorded here instead.
 5. **With identity disabled, nothing is listed and every `tools/call` is refused,** with a
    sentence that says why, and no row is written. Design section 17, under #26, names what
    replaces this: reads served, with rows whose identity is `disabled`.
+   Noted on 2026-10-10: [decision 0014](0014-rollout-safeguards-and-audit-operations.md) keeps
+   this, and only a development build may disable identity. Nothing replaces it: reads are not
+   served with rows whose identity is `disabled`, and #69 is not planned.
