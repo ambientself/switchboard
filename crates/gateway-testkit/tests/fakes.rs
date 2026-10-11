@@ -8,8 +8,8 @@ use std::task::Poll;
 use std::time::{Duration, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ListRecord, Outcome,
-    RecordedResource, RecordedResources, RequestMetadata, RowKind, RowStart,
+    self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
+    Outcome, RecordedResource, RecordedResources, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
     AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, Claimed, Connector, ConnectorName,
@@ -733,7 +733,9 @@ fn a_different_second_completion_is_refused_and_the_first_stands() {
 /// The completion the store gives an allowed row whose begin confirmation was lost.
 fn completed_as_error() -> Option<Completion> {
     Some(Completion {
-        outcome: Outcome::Error,
+        outcome: Outcome::Error {
+            error_kind: ErrorKind::Other,
+        },
         latency_ms: 0,
     })
 }

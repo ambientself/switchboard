@@ -43,7 +43,8 @@ impl ContractStore for Postgres {
                         decision, reason, sentence, policy_revision,
                         proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                         proved_delegation_team, claimed_acting_person, claimed_team,
-                        outcome, outcome_sentence, latency_ms, listed_tools, listed_omitted,
+                        outcome, outcome_sentence, error_kind, latency_ms, listed_tools,
+                        listed_omitted,
                         (extract(epoch FROM begun_at) * 1000000)::bigint AS begun_at_micros,
                         deadline IS NOT NULL AS deadline_set,
                         (extract(epoch FROM deadline - begun_at) * 1000000)::bigint
@@ -69,6 +70,9 @@ impl ContractStore for Postgres {
             });
             if let Some(sentence) = text("outcome_sentence") {
                 completion["sentence"] = json!(sentence);
+            }
+            if let Some(error_kind) = text("error_kind") {
+                completion["error_kind"] = json!(error_kind);
             }
             completion
         });
@@ -201,6 +205,7 @@ contract!(
     a_record_the_store_cannot_hold_is_refused_and_leaves_no_row,
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
+    an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,
     the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline,
     a_list_row_is_stored_complete_with_no_deadline,
 );

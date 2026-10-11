@@ -1,10 +1,12 @@
 //! What a proxied server's connector is wrapped in when the policy comes from the registry:
 //! the resources a call names, and the check of its arguments against the tool's approved
 //! schema, both read from the policy version the call's request took. A call whose arguments
-//! fail the check is outcome `error` and nothing is sent upstream; a call whose tool was
-//! withdrawn meanwhile is outcome `refused`.
+//! fail the check is outcome `error`, of the kind `invalid_arguments`, and nothing is sent
+//! upstream; a call whose tool was withdrawn meanwhile is outcome `refused`.
 
-use gateway_core::{ApprovedTool, BoxFuture, Connector, Resources, ToolCall, ToolOutcome};
+use gateway_core::{
+    ApprovedTool, BoxFuture, Connector, ErrorKind, Resources, ToolCall, ToolOutcome,
+};
 use gateway_registry::ArgumentError;
 use serde_json::Value;
 
@@ -99,7 +101,10 @@ impl Connector for CheckedArguments<'_> {
                             "a call whose arguments are not an object failed the argument check"
                         ),
                     }
-                    ToolOutcome::Error(undeclared_argument(tool.as_str()))
+                    ToolOutcome::error(
+                        ErrorKind::InvalidArguments,
+                        undeclared_argument(tool.as_str()),
+                    )
                 })
             }
             // Withdrawn from the policy served now. The request's own version always holds an

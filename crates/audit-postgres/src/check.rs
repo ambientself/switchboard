@@ -39,6 +39,7 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("claimed_team", "text"),
     ("outcome", "text"),
     ("outcome_sentence", "text"),
+    ("error_kind", "text"),
     ("latency_ms", "bigint"),
     ("instance", "text"),
     ("kind", "text"),
@@ -81,16 +82,18 @@ pub(crate) const INSERTED: &[&str] = &[
     "listed_omitted",
 ];
 
-/// The columns the gateway's role updates: the completion.
-pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "latency_ms"];
+/// The columns the gateway's role updates: the completion, with an error's kind.
+pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "error_kind", "latency_ms"];
 
 /// The columns the gateway's role reads: which row, whether it was allowed, its completion,
-/// and its kind and deadline, which say whether an empty completion is open.
+/// with an error's kind, and its kind and deadline, which say whether an empty completion is
+/// open.
 pub(crate) const SELECTED: &[&str] = &[
     "id",
     "decision",
     "outcome",
     "outcome_sentence",
+    "error_kind",
     "latency_ms",
     "kind",
     "deadline",

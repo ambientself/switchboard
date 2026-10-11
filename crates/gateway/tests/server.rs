@@ -12,7 +12,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use gateway::{MAX_BODY_BYTES, SHUTTING_DOWN, Timeouts};
-use gateway_core::audit::{Completion, DecisionKind, Outcome};
+use gateway_core::audit::{Completion, DecisionKind, ErrorKind, Outcome};
 use gateway_core::{AuditRecord, Classification};
 use gateway_mcp::{INTERNAL_ERROR, INVALID_REQUEST, LEGACY, MODERN, PARSE_ERROR};
 use gateway_testkit::{
@@ -432,7 +432,9 @@ async fn a_call_whose_client_goes_during_begin_is_not_run_and_its_row_is_an_erro
     assert_eq!(
         row.completion,
         Some(Completion {
-            outcome: Outcome::Error,
+            outcome: Outcome::Error {
+                error_kind: ErrorKind::Other
+            },
             latency_ms: 0
         })
     );
@@ -459,7 +461,9 @@ async fn a_read_whose_client_goes_is_cancelled_and_its_row_is_an_error() {
     .await;
     assert_eq!(
         completion(&server.store.row(0).unwrap()),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
     assert_eq!(gate.waiting(), 0, "the read's future was not dropped");
     assert_eq!(server.connector.received().len(), 1);

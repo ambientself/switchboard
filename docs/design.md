@@ -1119,11 +1119,19 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - Columns for the instance, the kind and the deadline: built. The gateway names its instance
   from `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, and refuses to start with neither. Rows
   written before the migration read as calls by the instance `before-0003`, due when they were
-  completed or begun. Not built, for decisions 0011 and 0012: how the resources were found,
-  with the reach by reference, the credential identity, the error kind, an unverified
-  delegation's failure kind, and a grant's digest, issuer, key ID, pod UID, egress setting and
-  currency answer. With #12, a column for the exception that allowed a call, since the row's
-  shape constraint rightly allows no reason on an allowed row.
+  completed or begun. The error kind: built (#56). An `error` outcome carries one of five
+  kinds from the core's closed `ErrorKind`, and migration 0006 adds `error_kind`, which a row
+  has exactly when its outcome is `error` (`error_kind_shape`), completed once with the rest of
+  the completion. Error rows written before it read `before-0006`. The argument check is
+  `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
+  refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
+  a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
+  begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
+  Not built, for decisions 0011 and 0012: how the resources were found, with the reach by
+  reference, the credential identity, an unverified delegation's failure kind, and a grant's
+  digest, issuer, key ID, pod UID, egress setting and currency answer. With #12, a column for
+  the exception that allowed a call, since the row's shape constraint rightly allows no reason
+  on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
