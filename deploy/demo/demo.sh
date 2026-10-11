@@ -410,8 +410,8 @@ metric_total() {
 }
 
 # check_metrics OUTAGE TEXT: what the gateway's GET /metrics answered (crates/gateway, metrics.rs).
-# Telemetry dropped is exported, and the last open-row poll found at most the outage's one row
-# open. With OUTAGE=outage, the database outage's refused call is counted as a begin failure and
+# Telemetry dropped is exported, and the last open-row poll found at most one row open: with
+# OUTAGE=outage, the outage's refused call's. With OUTAGE=outage, the database outage's refused call is counted as a begin failure and
 # as an answer with the audit-failure sentence.
 check_metrics() {
   local outage=$1 text=$2
@@ -420,8 +420,11 @@ check_metrics() {
     | sed 's/^/    /' || echo "    (no samples)"
   check_at_least "$(metric switchboard_telemetry_dropped_total "$text")" 0 \
     "metrics: telemetry dropped is exported"
+  # Only the Compose run has a database outage; the kind run's message does not name one.
+  local open="one row"
+  [ "$outage" != outage ] || open="the database outage's refused call's row"
   check_at_most "$(metric switchboard_audit_open_rows "$text")" 1 \
-    "metrics: the last open-row poll found at most the database outage's refused call's row open"
+    "metrics: the last open-row poll found at most $open open"
   if [ "$outage" = outage ]; then
     check_at_least "$(metric_total switchboard_audit_begin_failures_total "$text")" 1 \
       "metrics: the database outage's refused call counted as a begin failure"
