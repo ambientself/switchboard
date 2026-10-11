@@ -19,7 +19,7 @@
 //! max_age_seconds = 60        # 60 if left out; at least twice poll_seconds
 //!
 //! [identity]
-//! mode = "enforce"            # or "disabled", with nothing else in the table
+//! mode = "enforce"            # or "disabled" (test-support builds only), alone in the table
 //!
 //! [[identity.issuers]]
 //! issuer = "https://dev-issuer.switchboard.test"
@@ -44,7 +44,7 @@
 //! leeway_seconds = 30
 //!
 //! [audit]
-//! mode = "postgres"           # or "disabled", with nothing else in the table
+//! mode = "postgres"           # or "disabled" (test-support builds only), alone in the table
 //! url_env = "SWITCHBOARD_DATABASE_URL"
 //!
 //! [metrics]                   # optional; left out, nothing serves metrics

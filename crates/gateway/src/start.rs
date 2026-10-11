@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
 use connector_proxy::{
@@ -220,6 +220,9 @@ async fn prepare_with(
         path: deployment.registry_file.display().to_string(),
         message: error.to_string(),
     })?;
+    // The policy's age counts from this read (decision 0013, section 8), not from when the
+    // gates pass after the keys are fetched and the database checked.
+    let read_at = Instant::now();
     let text = std::str::from_utf8(&loaded).map_err(|error| RegistryError::Read {
         path: deployment.registry_file.display().to_string(),
         message: error.to_string(),
@@ -255,6 +258,7 @@ async fn prepare_with(
         audit: deployment.audit.section(),
         http: deployment.http,
         max_age: Some(deployment.max_age),
+        read_at,
     };
     let revision = registry.snapshot().revision().clone();
     let tools = registry.routes().len();

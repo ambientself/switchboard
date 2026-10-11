@@ -1518,8 +1518,10 @@ mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Hos
 RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, development)?;\n"
 RECEIPT_REGISTRY_PATH = "    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;\n"
 REGISTRY_BOOT_POLICY = "    check_registry_policy(&basis.registry, &live.current(), &basis)?;\n"
-mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate",
-           (BOOT, RECEIPT_CONFIG_PATH, ""), (BOOT, RECEIPT_REGISTRY_PATH, ""))
+RECEIPT_BEFORE_CONNECTING = "    receipt_gate(snapshot, development)\n}\n"
+mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate: not the boot gates, not a reload, not start::prepare before it connects",
+           (BOOT, RECEIPT_CONFIG_PATH, ""), (BOOT, RECEIPT_REGISTRY_PATH, ""),
+           (BOOT, RECEIPT_BEFORE_CONNECTING, "    let _ = snapshot;\n    Ok(())\n}\n"))
 mutate("gw-receipt-gate-config-path-skipped", "the JSON configuration's boot does not run the receipt-store gate", BOOT,
        RECEIPT_CONFIG_PATH, "")
 mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
@@ -2080,9 +2082,19 @@ mutate("gw-event-source-not-peer", "events name the gateway's own address, not t
 
 # Decision 0013, section 8: past the maximum age since the registry file was last read, /readyz
 # fails and tools/call and tools/list are refused with the stale-policy sentence and no row.
-# Every read counts, changed or not. tests/stale.rs watches each; tests/deployment.rs the floor.
+# Every read counts, changed or not, and the age counts from boot's own read of the file, not
+# from when the gates pass. tests/stale.rs watches each; tests/deployment.rs the floor; and
+# tests/logs.rs the stale-policy event's line.
 mutate("gw-stale-never", "the policy is never stale, however long since the file was read", GW + "reload.rs",
        "        self.0.max_age.is_some_and(|max_age| self.age() > max_age)", "        false")
+mutate("gw-stale-age-from-gates", "the policy's age counts from when the boot gates pass, not from boot's read of the registry file, so a slow boot starts fresh", BOOT,
+       "    let freshness = Freshness::new(settings.max_age, settings.read_at);\n",
+       "    let freshness = Freshness::new(settings.max_age, Instant::now());\n")
+mutate_all("gw-stale-event-age-dropped", "the stale-policy event's line leaves out the policy's age",
+           (TELEMETRY, "            method,\n            age_seconds,\n        } => tracing::error!(",
+            "            method,\n            age_seconds: _,\n        } => tracing::error!("),
+           (TELEMETRY, "            method,\n            age_seconds,\n            \"refused a request: the registry file",
+            "            method,\n            \"refused a request: the registry file"))
 mutate_all("gw-stale-read-time-only-on-change", "only a read whose bytes changed counts as a read",
            (GW + "reload.rs", "            self.freshness.read_now();\n            if bytes == seen {\n                continue;\n            }\n",
             "            if bytes == seen {\n                continue;\n            }\n            self.freshness.read_now();\n"))

@@ -9,6 +9,7 @@ mod files;
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
 use files::{
@@ -45,6 +46,7 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
         audit: AuditSection { disabled },
         http: deployment.http,
         max_age: None,
+        read_at: Instant::now(),
     };
     (settings, Registry::load(&deployment.registry_file).unwrap())
 }

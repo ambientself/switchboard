@@ -5,15 +5,21 @@
 //! A registry file that cannot be read for longer than the maximum age makes the policy stale:
 //! `/readyz` answers 503, and `tools/call` and `tools/list` are refused with the stale-policy
 //! sentence and no row. A read that succeeds again ends it. Every read counts, so an unchanged
-//! file keeps the policy fresh, and so does a file that reads but does not load.
+//! file keeps the policy fresh, and so does a file that reads but does not load. The age counts
+//! from boot's own read of the file, so a boot slower than the maximum age, started through
+//! `start::prepare` with an issuer whose keys are slow to fetch, starts stale.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
 mod support;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::routing::get;
 
 use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
 use files::{AUDIENCE, Files, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, cluster_issuer};
@@ -22,10 +28,11 @@ use gateway::{
     AuditSection, Freshness, Metrics, POLICY_STALE, TELEMETRY_QUEUE, Telemetry, Timeouts,
     serve_with_telemetry,
 };
-use gateway_identity::SystemClock;
+use gateway_core::InstanceName;
+use gateway_identity::{SigningAlgorithm, SystemClock};
 use gateway_mcp::DENIAL_CODE;
 use gateway_registry::Registry;
-use gateway_testkit::InMemoryAuditStore;
+use gateway_testkit::{InMemoryAuditStore, LocalIssuer};
 use mock_docs_server::{AcceptedCredential, Config};
 use serde_json::{Value, json};
 use support::{Answer, Http, PATIENCE, exchange, legacy};
@@ -61,15 +68,16 @@ impl Stale {
         let issuer = cluster_issuer();
         let files = Files::new(name, &issuer.jwks_document(), &mock.url());
         let deployment = files.load();
+        let registry_file = deployment.registry_file;
+        let loaded = std::fs::read(&registry_file).unwrap();
         let settings = Settings {
             deployment: deployment.deployment,
             identity: deployment.identity,
             audit: AuditSection { disabled: false },
             http: deployment.http,
             max_age: Some(MAX_AGE),
+            read_at: Instant::now(),
         };
-        let registry_file = deployment.registry_file;
-        let loaded = std::fs::read(&registry_file).unwrap();
         let registry = Registry::from_toml_str(std::str::from_utf8(&loaded).unwrap()).unwrap();
         let credentials =
             FileCredentials::load([("mock-docs".into(), files.path("docs-credential"))]).unwrap();
@@ -108,41 +116,16 @@ impl Stale {
         }
     }
 
-    async fn send(&self, request: Http) -> Answer {
-        let length = request.body.len().to_string();
-        let request = request
-            .header("host", &format!("127.0.0.1:{}", self.address.port()))
-            .header("content-length", &length);
-        let mut bytes = request.head();
-        bytes.extend_from_slice(&request.body);
-        exchange(self.address, &bytes).await
-    }
-
     async fn ready(&self) -> u16 {
-        self.send(Http::new("GET", "/readyz")).await.status
-    }
-
-    async fn rpc(&self, method: &str, params: Value) -> Value {
-        let request = Http::new("POST", &format!("/mcp/{SURFACE}"))
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .bearer(&self.token)
-            .body(legacy(method, params).to_string().into_bytes());
-        let answer = self.send(request).await;
-        assert_eq!(answer.status, 200, "{answer:?}");
-        answer.json()
+        ready(self.address).await
     }
 
     async fn list(&self) -> Value {
-        self.rpc("tools/list", json!({})).await
+        list(self.address, &self.token).await
     }
 
     async fn read(&self) -> Value {
-        self.rpc(
-            "tools/call",
-            json!({"name": READ_TOOL, "arguments": {"project": "atlas", "document": "plan"}}),
-        )
-        .await
+        read(self.address, &self.token).await
     }
 
     /// Every row written: call rows and list rows.
@@ -161,14 +144,7 @@ impl Stale {
 
     /// Waits until `/readyz` answers `status`, or fails the test.
     async fn until_ready_is(&self, status: u16) {
-        let deadline = tokio::time::Instant::now() + PATIENCE;
-        while self.ready().await != status {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "/readyz did not answer {status} within {PATIENCE:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        until_ready_is(self.address, status).await;
     }
 
     /// The policy-age gauge as `GET /metrics` would export it.
@@ -190,6 +166,57 @@ impl Stale {
             .parse()
             .unwrap()
     }
+}
+
+async fn send(address: SocketAddr, request: Http) -> Answer {
+    let length = request.body.len().to_string();
+    let request = request
+        .header("host", &format!("127.0.0.1:{}", address.port()))
+        .header("content-length", &length);
+    let mut bytes = request.head();
+    bytes.extend_from_slice(&request.body);
+    exchange(address, &bytes).await
+}
+
+async fn ready(address: SocketAddr) -> u16 {
+    send(address, Http::new("GET", "/readyz")).await.status
+}
+
+/// Waits until `/readyz` at `address` answers `status`, or fails the test.
+async fn until_ready_is(address: SocketAddr, status: u16) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while ready(address).await != status {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "/readyz did not answer {status} within {PATIENCE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn rpc(address: SocketAddr, token: &str, method: &str, params: Value) -> Value {
+    let request = Http::new("POST", &format!("/mcp/{SURFACE}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .bearer(token)
+        .body(legacy(method, params).to_string().into_bytes());
+    let answer = send(address, request).await;
+    assert_eq!(answer.status, 200, "{answer:?}");
+    answer.json()
+}
+
+async fn list(address: SocketAddr, token: &str) -> Value {
+    rpc(address, token, "tools/list", json!({})).await
+}
+
+async fn read(address: SocketAddr, token: &str) -> Value {
+    rpc(
+        address,
+        token,
+        "tools/call",
+        json!({"name": READ_TOOL, "arguments": {"project": "atlas", "document": "plan"}}),
+    )
+    .await
 }
 
 /// A served tool list: a result naming both tools.
@@ -269,4 +296,90 @@ async fn a_registry_file_that_reads_but_does_not_load_is_not_stale() {
     assert_listed(&gateway.list().await);
     assert_ran(&gateway.read().await);
     assert_eq!(gateway.telemetry.counts().policy_stale, 0);
+}
+
+/// An issuer's origin on loopback whose keys take [`PAST_MAX_AGE`] to fetch. When the fetch
+/// begins it moves `registry_file` aside, so boot's read of the registry file is the last one
+/// that succeeds. Returns the origin, which is also the issuer's name.
+async fn slow_issuer(registry_file: PathBuf) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let document = LocalIssuer::new(&url, SigningAlgorithm::Es256)
+        .unwrap()
+        .jwks_document();
+    let router = Router::new().route(
+        files::KEYS_PATH,
+        get(move || {
+            let registry_file = registry_file.clone();
+            let document = document.clone();
+            async move {
+                std::fs::rename(&registry_file, registry_file.with_extension("away")).unwrap();
+                tokio::time::sleep(PAST_MAX_AGE).await;
+                document
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    url
+}
+
+/// The policy's age counts from boot's read of the registry file, not from when the gates pass
+/// (decision 0013, section 8). A boot that takes longer than the maximum age, here fetching an
+/// issuer's keys, with the file unreadable from just after that read, starts stale: `/readyz`
+/// answers 503 from the first request, and calls and lists are refused. Once the file reads
+/// again, the gateway serves.
+#[tokio::test]
+async fn a_boot_slower_than_the_maximum_age_starts_stale() {
+    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+        .await
+        .unwrap();
+    let cluster = cluster_issuer();
+    let files = Files::new("slow-boot", &cluster.jwks_document(), &mock.url());
+    let registry_file = files.path("registry/registry.toml");
+    let url = slow_issuer(registry_file.clone()).await;
+    files.write(
+        "gateway.toml",
+        &files::deployment_file(&format!(
+            "{}\n[audit]\nmode = \"disabled\"\n",
+            files::keys_url_issuer(&url, &format!("{url}{}", files::KEYS_PATH)),
+        )),
+    );
+    let mut deployment = files.load();
+    deployment.poll = POLL;
+    deployment.max_age = MAX_AGE;
+    let prepared = gateway::start::prepare(
+        deployment,
+        InstanceName::new("slow-boot"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !registry_file.exists(),
+        "the keys were fetched without moving the registry file aside"
+    );
+    tokio::spawn(prepared.watch.run());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+    tokio::spawn(serve_with_telemetry(
+        listener,
+        prepared.gates,
+        telemetry.clone(),
+        drain,
+        std::future::pending(),
+        Timeouts::default(),
+    ));
+    let token = files::kubernetes_token(&cluster, TEAM_A_SA, &[AUDIENCE]);
+
+    assert_eq!(ready(address).await, 503);
+    assert_stale(&list(address, &token).await);
+    assert_stale(&read(address, &token).await);
+    assert_eq!(telemetry.counts().policy_stale, 2);
+
+    std::fs::rename(registry_file.with_extension("away"), &registry_file).unwrap();
+    until_ready_is(address, 200).await;
+    assert_listed(&list(address, &token).await);
+    assert_ran(&read(address, &token).await);
 }

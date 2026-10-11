@@ -67,7 +67,8 @@ pub enum ReloadError {
 }
 
 /// When the registry file was last read successfully, and how long after that the policy it
-/// holds is stale. Cheap to clone; clones share the time. The boot read counts as the first.
+/// holds is stale. Cheap to clone; clones share the time. The boot read counts as the first,
+/// from the moment it was made.
 #[derive(Clone)]
 pub struct Freshness(Arc<FreshnessState>);
 
@@ -86,11 +87,11 @@ impl std::fmt::Debug for Freshness {
 }
 
 impl Freshness {
-    /// Read just now, and stale `max_age` after the last read; never, with `None`.
-    pub(crate) fn new(max_age: Option<Duration>) -> Self {
+    /// Last read at `read_at`, and stale `max_age` after the last read; never, with `None`.
+    pub(crate) fn new(max_age: Option<Duration>, read_at: Instant) -> Self {
         Self(Arc::new(FreshnessState {
             max_age,
-            last_read: Mutex::new(Instant::now()),
+            last_read: Mutex::new(read_at),
         }))
     }
 
@@ -278,7 +279,11 @@ mod tests {
         let live = Arc::new(LivePolicy::new(
             ServedPolicy::from_registry(&started).unwrap(),
         ));
-        let reloader = Reloader::new(live.clone(), release_basis(started), Freshness::new(None));
+        let reloader = Reloader::new(
+            live.clone(),
+            release_basis(started),
+            Freshness::new(None, Instant::now()),
+        );
 
         // The same tool reclassified `propose`, at r2: same server, same route.
         let proposed = registry_text("propose", true, "r2");

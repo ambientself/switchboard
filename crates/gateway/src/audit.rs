@@ -7,10 +7,11 @@ use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 /// `"audit": {"disabled": true}`.
 ///
 /// It breaks the store's contract on purpose: `begin` and `list` return `Ok` and no row
-/// exists. That is what the opt-out means, and design section 12 lets a gateway start that way
-/// only with a loud warning. So the type has no public constructor. [`boot::check`](crate::boot::check) makes
-/// one when, and only when, configuration opts out, and no other code path can put it where a
-/// real store belongs. The identifier the gateway made for a row is carried through the call
+/// exists. That is what the opt-out means, and only a test-support build accepts it, with a
+/// loud warning (design section 12, decision 0014); the release build refuses to start with
+/// audit disabled, and CI checks that refusal. So the type has no public constructor. The boot
+/// gates make one when, and only when, a test-support build's configuration opts out, and no
+/// other code path can put it where a real store belongs. The identifier the gateway made for a row is carried through the call
 /// as usual and stored nowhere.
 #[derive(Debug)]
 pub struct DisabledAuditStore {

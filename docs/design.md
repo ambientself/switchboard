@@ -1353,7 +1353,8 @@ checked; a schema that needs them cannot be approved yet.
   ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 8).
   `registry.max_age_seconds` is 60 unless given, and is refused below twice `poll_seconds`.
   Every successful read of the registry file counts, whether or not its bytes changed and
-  whether or not it loads. Past the maximum age, `/readyz` answers 503 and `tools/call` and
+  whether or not it loads, and the age counts from boot's own read of the file, so a boot
+  slower than the maximum age starts stale. Past the maximum age, `/readyz` answers 503 and `tools/call` and
   `tools/list` are refused with a fixed stale-policy sentence before anything is decided, with
   no row; each refusal is a `policy_stale` telemetry event, counted under
   `switchboard_telemetry_events_total`. `switchboard_policy_age_seconds` and

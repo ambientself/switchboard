@@ -39,7 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
@@ -205,6 +205,10 @@ pub struct Settings {
     /// How long after the registry file was last read the policy is stale (decision 0013,
     /// section 8), or `None` for never.
     pub max_age: Option<Duration>,
+    /// When the registry file the policy comes from was read. The policy's age counts from
+    /// this read, not from when the gates pass, so a slow boot (keys fetched, the database
+    /// checked) cannot start a replica whose policy is already stale as if it were fresh.
+    pub read_at: Instant,
 }
 
 /// What code supplies to the gateway, beside its configuration: the clock, the instance, the
@@ -576,7 +580,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         ))),
         connectors,
         // No file is read again, so the policy never goes stale.
-        freshness: Freshness::new(None),
+        freshness: Freshness::new(None, Instant::now()),
     })
 }
 
@@ -664,7 +668,7 @@ pub(crate) fn check_registry_with(
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
 
     warn_disabled(&settings.deployment, identity_state, audit_state);
-    let freshness = Freshness::new(settings.max_age);
+    let freshness = Freshness::new(settings.max_age, settings.read_at);
     let reloader = Reloader::new(live.clone(), basis, freshness.clone());
     let gates = Gates {
         deployment: settings.deployment,
