@@ -1,9 +1,10 @@
 //! Every Postgres image the repository names is the same Postgres. demo.sh's `POSTGRES_IMAGE` is
-//! the reference. Every image names its release, and any that names its tag with a digest names
-//! its digest too. Compose and the commands in CONTRIBUTING.md and the audit store's crate
-//! documentation name it exactly, the kind manifest names its tag alone, and CI's service
-//! container, another variant of the same release, is pinned by a digest of its own. A bump that
-//! misses one of them fails here. The kind manifest's pod template carries the digest as an
+//! the reference. Every `postgres:<tag>` names its release, and any that names its tag with a
+//! digest names its digest too. Compose, CONTRIBUTING.md and the audit store's crate
+//! documentation name it exactly: wherever they name its tag, in each `docker run` command, and
+//! at least once in each file. The kind manifest names its tag alone, and CI's service container,
+//! another variant of the same release, is pinned by a digest of its own. A bump that misses one
+//! of them fails here. The kind manifest's pod template carries the digest as an
 //! annotation that demo.sh fills in, so a new digest under the same tag rolls the pod.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -23,7 +24,8 @@ const PLACES: [(&str, Pin); 6] = [
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Pin {
-    /// demo.sh's reference, tag and digest, at least once.
+    /// demo.sh's reference, tag and digest: every time the tag is named, in every `docker run`
+    /// command, and at least once.
     Exact,
     /// demo.sh's tag, with no digest, every time: kind's image load does not keep the index
     /// digest.
@@ -32,23 +34,46 @@ enum Pin {
     Version,
 }
 
-/// Every `postgres:<version>...` image reference in `text`, up to the next space, quote, backtick
-/// or bracket. A connection URL's `postgres:<password>@` is not one, because a version starts
-/// with a digit, and nor is its `@postgres:<port>`, a host named postgres.
+/// Every `postgres:<tag>...` image reference in `text`, up to the next space, quote, backtick or
+/// bracket. A tag starts with a letter, digit or underscore, so a YAML key `postgres:`, a URL's
+/// scheme `postgres://` and a placeholder `postgres:<tag>` are not one. Nor is a connection
+/// URL's `//postgres:<password>@`, a user named postgres, or its `@postgres:<port>`, a host.
 fn references(text: &str) -> Vec<&str> {
     let mut found = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find("postgres:") {
-        let host = rest[..at].ends_with('@');
+        let url = rest[..at].ends_with(['@', '/']);
         let from = &rest[at..];
         rest = &from["postgres:".len()..];
-        if host || !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        if url || !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
         let end = from
             .find(|c: char| c.is_whitespace() || "`\"'()[]{},".contains(c))
             .unwrap_or(from.len());
         found.push(&from[..end]);
+    }
+    found
+}
+
+/// Every `docker run` command in `text`, with its continuation lines: a line that starts with
+/// it, in a shell block or a Rust doc comment, not prose that names it.
+fn commands(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let start = line.trim_start();
+        let start = start.strip_prefix("//!").unwrap_or(start).trim_start();
+        if !start.starts_with("docker run ") {
+            continue;
+        }
+        let mut command = line.to_owned();
+        while command.trim_end().ends_with('\\') {
+            let Some(next) = lines.next() else { break };
+            command.push('\n');
+            command.push_str(next);
+        }
+        found.push(command);
     }
     found
 }
@@ -108,7 +133,7 @@ fn every_postgres_pin_names_the_same_version_and_digest() {
                 release,
                 "{place} names Postgres {image}, not demo.sh's release {release}"
             );
-            if image.split('@').next() == Some(tag) && image.contains('@') {
+            if image.split('@').next() == Some(tag) && (image.contains('@') || pin == Pin::Exact) {
                 assert_eq!(
                     *image, reference,
                     "{place} names {image}, not demo.sh's digest for {tag}"
@@ -130,6 +155,13 @@ fn every_postgres_pin_names_the_same_version_and_digest() {
                 found.contains(&reference.as_str()),
                 "{place} does not name demo.sh's {reference}: {found:?}"
             );
+            for command in commands(&text) {
+                assert_eq!(
+                    references(&command),
+                    [reference.as_str()],
+                    "{place} runs a Postgres other than demo.sh's {reference}: {command}"
+                );
+            }
         }
     }
 }
@@ -139,13 +171,25 @@ fn the_reference_scan_finds_images_and_skips_connection_urls() {
     let text = "docker run postgres:17.11-alpine@sha256:ab \\\n\
                 URL=postgres://postgres:dev@127.0.0.1:25432/postgres\n\
                 URL=postgres://gateway:dummy@postgres:5432/switchboard\n\
+                services:\n  postgres:\n    image: postgres:latest\n\
+                from `imagetools inspect postgres:<tag>`\n\
                 a `postgres:17.11` service, image: \"postgres:16\"\n";
     assert_eq!(
         references(text),
         [
             "postgres:17.11-alpine@sha256:ab",
+            "postgres:latest",
             "postgres:17.11",
             "postgres:16"
+        ]
+    );
+    assert_eq!(
+        commands(
+            "run it with `docker run`:\n//! docker run -d \\\n  -p 1:2 \\\n  postgres\nexport X=1\ndocker run postgres:16\n"
+        ),
+        [
+            "//! docker run -d \\\n  -p 1:2 \\\n  postgres",
+            "docker run postgres:16"
         ]
     );
     assert_eq!(version("postgres:17.11-alpine@sha256:ab"), "17.11");
