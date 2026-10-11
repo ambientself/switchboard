@@ -1,8 +1,8 @@
 //! The gateway built from files, as the `switchboard` binary builds it, forwarding to the mock
 //! docs server on loopback: tools listed from the approved definitions, an allowed read
 //! forwarded with the gateway's own credential, a read outside the team's limit denied by the
-//! gateway, undeclared arguments an error with nothing sent, a registry reload, and every
-//! boot refusal of the wiring.
+//! gateway, undeclared arguments and arguments that do not match the approved schema an error
+//! with nothing sent, a registry reload, and every boot refusal of the wiring.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -16,7 +16,7 @@ use files::{
 };
 use gateway::path::RequestPath;
 use gateway::start::{Prepared, StartError, prepare};
-use gateway::{ReloadError, undeclared_argument};
+use gateway::{ReloadError, invalid_argument, undeclared_argument};
 use gateway_core::IDENTITY_FAILURE;
 use gateway_identity::SystemClock;
 use gateway_registry::Registry;
@@ -282,6 +282,42 @@ async fn an_argument_the_approved_schema_does_not_declare_is_an_error_and_is_not
         assert_eq!(
             failed.body["result"]["content"][0]["text"],
             json!(undeclared_argument(tool)),
+            "{arguments}: {}",
+            failed.body
+        );
+        assert!(
+            failed.body.get("error").is_none(),
+            "{arguments}: {}",
+            failed.body
+        );
+    }
+    assert_eq!(world.calls(), 0, "{:?}", world.mock.log_lines());
+}
+
+#[tokio::test]
+async fn arguments_that_do_not_match_the_approved_schema_are_an_error_and_are_not_sent() {
+    let world = World::new("invalid").await;
+    let path = RequestPath::new(world.prepare().await.unwrap().gates);
+    let team_a = token(TEAM_A_SA);
+    // Each names `atlas`, within team-a's limit, so each is allowed and reaches the check.
+    for arguments in [
+        // `document` is typed as a string.
+        json!({"project": "atlas", "document": 7}),
+        json!({"project": "atlas", "document": ["plan"]}),
+        // `document` is required.
+        json!({"project": "atlas"}),
+    ] {
+        let failed = call(&path, &team_a, READ_TOOL, arguments.clone()).await;
+        assert_eq!(failed.status, 200);
+        assert_eq!(
+            failed.body["result"]["isError"],
+            json!(true),
+            "{arguments}: {}",
+            failed.body
+        );
+        assert_eq!(
+            failed.body["result"]["content"][0]["text"],
+            json!(invalid_argument(READ_TOOL)),
             "{arguments}: {}",
             failed.body
         );

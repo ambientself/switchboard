@@ -1203,6 +1203,20 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   own task until the deadline, an identical repeat finish accepted, column grants, and the
   report of each finish given up.
 
+**#11, the argument check against the approved schema.** Built (#94): the loader accepts a
+subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
+another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
+refuses another dialect rather than converting it. An enforced keyword must have the JSON type
+2020-12 gives it; an annotation's value, and whether the names in a `type` list or in
+`required` are unique, are not checked. The
+argument check enforces every keyword the loader accepts other than annotations: `type`,
+`properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, and the bounds on
+lengths, item counts and numbers. Numbers compare by value, so `1.0` is an integer, and the
+schema `false` admits nothing. A call that fails is outcome `error` of kind
+`invalid_arguments`, and nothing is sent. The exact rules are in the `adapter` module of
+`gateway-registry`. `pattern`, `$ref` and the composition keywords are refused at load, not
+checked; a schema that needs them cannot be approved yet.
+
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
 refusal of that list on a profile that does not require currency; the restated property; a

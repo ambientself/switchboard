@@ -2490,13 +2490,14 @@ mutate("registry-hash-ignores-title", "the approval hash does not cover the titl
 mutate("registry-schema-type-unchecked", "an input schema need not be an object schema", RR,
        '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {', "    if false {")
 mutate("registry-schema-keywords-unchecked", "a schema may use keywords the argument check does not follow", RA,
-       ".find(|keyword| object.contains_key(**keyword))", ".find(|keyword| false && object.contains_key(**keyword))")
+       "            annotation if ANNOTATIONS.contains(&annotation) => true,", "            _ => true,")
 mutate("registry-schema-properties-unwalked", "keywords inside a property are not looked for", RA,
-       "            followable(property, &at.child(name))?;", "            let _ = (property, name);")
+       "                    followable(property, &here.child(name))?;", "                    let _ = (property, name);")
 mutate("registry-schema-items-unwalked", "keywords inside items are not looked for", RA,
-       '        followable(items, &at.child("items"))?;', "        let _ = items;")
+       '            "items" => {\n                followable(value, &here)?;', '            "items" => {\n                let _ = value;')
 mutate("registry-schema-properties-not-object", "`properties` may be something other than an object", RA,
-       "            return Err(SchemaProblem::Malformed { at });", "            return Ok(());")
+       "                    return Err(SchemaProblem::Malformed { at: here });\n                };",
+       "                    return Ok(());\n                };")
 mutate("registry-schema-node-not-schema", "a property or items may be something other than a schema", RA,
        "        _ => return Err(SchemaProblem::Malformed { at: at.clone() }),", "        _ => return Ok(()),")
 mutate("registry-adapter-without-sources", "a tool may read its resources from no argument", RR,
@@ -2523,15 +2524,19 @@ mutate("adapter-empty-identifier-accepted", "the empty string names a resource",
 mutate("adapter-not-an-object-accepted", "arguments that are not an object pass the check", RA,
        "        if !arguments.is_object() {", "        if false {")
 mutate("adapter-closed-without-properties-accepted", "a closed object without properties admits arguments", RA,
-       'schema.get("additionalProperties") == Some(&Value::Bool(false))', "false")
+       "                        if let Some(key) = object.keys().next() {",
+       "                        if let Some(key) = object.keys().next().filter(|_| false) {")
 mutate("adapter-open-without-properties-refused", "an open object without properties refuses arguments", RA,
-       'schema.get("additionalProperties") == Some(&Value::Bool(false))', "true")
+       "                    None => {}\n                },",
+       "                    None => {\n                        if let Some(key) = object.keys().next() {\n"
+       "                            return Err(Failure::Undeclared(at.child(key)));\n                        }\n"
+       "                    }\n                },")
 mutate("adapter-undeclared-accepted", "an undeclared argument passes the check", RA,
-       "                    None => Some(at.child(key)),", "                    None => None,")
+       ".find(|key| !properties.contains_key(*key))", ".find(|_| false)")
 mutate("adapter-undeclared-not-nested", "nested objects are not checked", RA,
-       "                    Some(property) => undeclared(property, value, &at.child(key)),", "                    Some(_) => None,")
+       "                            validate(property, value, &at.child(key))?;", "                            let _ = (property, value);")
 mutate("adapter-undeclared-not-in-items", "array elements are not checked", RA,
-       "        Value::Array(items) => {", "        Value::Array(items) if false => {")
+       '            let Some(each) = schema.get("items") else {', '            let Some(each) = schema.get("items").filter(|_| false) else {')
 mutate("adapter-pointer-unescaped", "a pointer does not escape `~` and `/`", RA,
        "            token.replace('~', \"~0\").replace('/', \"~1\")", "            token")
 mutate("selection-issuer-ignored", "a rule covers principals of any issuer", RS,
@@ -2546,6 +2551,72 @@ mutate("selection-first-rule-wins", "disagreeing rules resolve to one of them", 
 mutate("registry-links-testkit", "the registry, and so the gateway, links the testkit", REGISTRY + "Cargo.toml",
        'toml = "1"\n\n[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n',
        'toml = "1"\ngateway-testkit = { path = "../gateway-testkit" }\n\n[dev-dependencies]\n')
+
+
+# --- gateway-registry: schema validation ---------------------------------------------------
+#
+# The argument check against the approved schema's subset of JSON Schema 2020-12 (#11, #94), and
+# the loader's allowlist of that subset.
+
+OLD_DENYLIST = ('["$ref", "$dynamicRef", "$recursiveRef", "allOf", "anyOf", "oneOf", "not", "if", "then", "else", '
+                '"dependentSchemas", "dependencies", "patternProperties", "unevaluatedProperties", "unevaluatedItems", '
+                '"prefixItems", "additionalItems"]')
+mutate("schema-allowlist-is-denylist", "the loader refuses only the keywords it once named, and accepts any other", RA,
+       "            annotation if ANNOTATIONS.contains(&annotation) => true,",
+       f"            annotation if !{OLD_DENYLIST}.contains(&annotation) => true,")
+mutate("schema-keyword-form-unchecked", "a keyword may have a value not of its 2020-12 form", RA,
+       "        if !formed {", "        if false {")
+mutate("schema-dialect-unchecked", "a schema may name any dialect in `$schema`", RA,
+       "                if value.as_str() != Some(DIALECT) {", "                if false {")
+mutate("schema-dialect-anywhere", "`$schema` is accepted below the root", RA,
+       '            "$schema" if at.as_str().is_empty() => {', '            "$schema" => {')
+mutate("schema-additional-properties-unshaped", "an `additionalProperties` that is not a boolean or a schema loads, and is ignored", RA,
+       "                if !(value.is_boolean() || value.is_object()) {\n"
+       "                    return Err(SchemaProblem::AdditionalProperties { at: here });\n"
+       "                }\n                followable(value, &here)?;",
+       "                if value.is_boolean() || value.is_object() {\n                    followable(value, &here)?;\n                }")
+mutate("schema-false-admits", "the schema `false` admits anything", RA,
+       "        return if *schema == Value::Bool(true) {", "        return if true {")
+mutate("schema-type-unchecked", "`type` is not checked", RA,
+       "        && !has_type(types, value)", "        && !has_type(types, value) && false")
+mutate("schema-integer-is-number", "`integer` admits any number", RA,
+       '        ("integer", Value::Number(number)) => is_integer(number),', '        ("integer", Value::Number(_)) => true,')
+mutate("schema-integer-by-representation", "`1.0` is not an integer", RA,
+       "    integer(number).is_some() || number.as_f64().is_some_and(|float| float.fract() == 0.0)",
+       "    integer(number).is_some()")
+mutate("schema-enum-unchecked", "`enum` is not checked", RA,
+       "        && !allowed.iter().any(|allowed| same(allowed, value))", "        && allowed.is_empty() && false")
+mutate("schema-const-unchecked", "`const` is not checked", RA,
+       "        && !same(constant, value)", "        && !same(constant, constant)")
+mutate("schema-number-equality-by-representation", "`1` and `1.0` differ in `enum` and `const`", RA,
+       "        (Value::Number(a), Value::Number(b)) => compare(a, b) == Ordering::Equal,",
+       "        (Value::Number(a), Value::Number(b)) => a == b,")
+mutate("schema-number-compared-as-float", "two integers are compared as floats, so 2^53 + 1 equals 2^53", RA,
+       "        (Some(a), Some(b)) => a.cmp(&b),",
+       "        (Some(_), Some(_)) => float(a).partial_cmp(&float(b)).unwrap_or(Ordering::Equal),")
+mutate("schema-integer-float-fraction-ignored", "an integer equals a float with the same whole part", RA,
+       "        Ordering::Equal if float > floor => Ordering::Less,", "        Ordering::Equal if false => Ordering::Less,")
+mutate("schema-required-unchecked", "`required` is not checked", RA,
+       '            if let Some(Value::Array(required)) = schema.get("required")',
+       '            if let Some(Value::Array(required)) = schema.get("required").filter(|_| false)')
+mutate("schema-length-off-by-one", "a maximum length or count admits one more", RA,
+       "        .is_some_and(|most| count > most)", "        .is_some_and(|most| count > most + 1)")
+mutate("schema-length-in-bytes", "a string's length is counted in bytes, not code points", RA,
+       "            let length = text.chars().count() as u64;", "            let length = text.len() as u64;")
+mutate("schema-item-counts-unchecked", "`minItems` and `maxItems` are not checked", RA,
+       '            counted(schema, items.len() as u64, "minItems", "maxItems", at)?;', "            let _ = items.len();")
+mutate("schema-number-bounds-unchecked", "`minimum`, `maximum` and the exclusive bounds are not checked", RA,
+       "            for (keyword, meets) in NUMBER_BOUNDS {",
+       "            for (keyword, meets) in NUMBER_BOUNDS.into_iter().filter(|_| false) {")
+mutate("schema-bound-exclusive-inclusive", "`exclusiveMinimum` admits the bound itself", RA,
+       '    ("exclusiveMinimum", Ordering::is_gt),', '    ("exclusiveMinimum", Ordering::is_ge),')
+mutate("schema-bound-inclusive-exclusive", "`maximum` refuses the bound itself", RA,
+       '    ("maximum", Ordering::is_le),', '    ("maximum", Ordering::is_lt),')
+mutate("schema-additional-properties-unenforced", "an `additionalProperties` schema is not checked against the values", RA,
+       "                            validate(additional, value, &at.child(key))?;", "                            let _ = (additional, value);")
+mutate("schema-invalid-says-undeclared", "a call that fails a schema keyword is told it carried an undeclared argument",
+       "crates/gateway/src/proxied.rs",
+       "                            invalid_argument(tool.as_str())\n", "                            undeclared_argument(tool.as_str())\n")
 
 
 # --- audit-postgres ------------------------------------------------------------------------
@@ -3565,10 +3636,9 @@ mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing",
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(outcome) => Box::pin(std::future::ready(outcome)),",
        "            Err(_outcome) => self.inner.run(call),")
-PROXIED_INVALID = ("                    ToolOutcome::error(\n                        ErrorKind::InvalidArguments,\n"
-                   "                        undeclared_argument(tool.as_str()),\n                    )")
+PROXIED_INVALID = "                    ToolOutcome::error(ErrorKind::InvalidArguments, sentence)"
 mutate("gw-proxied-invalid-arguments-refused", "a call that fails the argument check is recorded as refused, not as an error", PROXIED,
-       PROXIED_INVALID, "                    ToolOutcome::Refused(undeclared_argument(tool.as_str()))")
+       PROXIED_INVALID, "                    ToolOutcome::Refused(sentence)")
 mutate("gw-proxied-invalid-arguments-kind-other", "a call that fails the argument check is recorded as another error, not invalid arguments", PROXIED,
        PROXIED_INVALID, PROXIED_INVALID.replace("ErrorKind::InvalidArguments", "ErrorKind::Other"))
 mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
