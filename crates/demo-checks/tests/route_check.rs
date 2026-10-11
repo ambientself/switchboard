@@ -41,6 +41,9 @@ RESULT: PASS\n";
 /// - `kubectl debug` by saving the partial container spec to `debug-custom.json` and the
 ///   container's name to `probe-container`, and, when `$PROBE_SCRIPT` is set, by running that
 ///   script with the spec's variables and saving its output and exit code as the probe's;
+/// - `get clusterroles`, `get clusterrolebindings`, and `get roles` and `get rolebindings` in a
+///   namespace, from `clusterroles.json`, `clusterrolebindings.json`, `roles-<ns>.json` and
+///   `rolebindings-<ns>.json`;
 /// - `get pod` with the probe's container terminated (exit code in `probe-exit`), or running if
 ///   `probe-running` exists, or with the contents of `probe-pod` if that exists, after waiting
 ///   the seconds in `probe-pod-delay` if that exists;
@@ -71,6 +74,10 @@ case $args in
   "get configmap "*) set -- $args; serve "configmap-$5-$3.json" ;;
   "get service "*) set -- $args; serve "service-$5-$3.json" ;;
   "get endpointslices -n "*) set -- $args; serve "endpointslices-$4.json" ;;
+  "get clusterroles -o json") serve clusterroles.json ;;
+  "get clusterrolebindings -o json") serve clusterrolebindings.json ;;
+  "get roles -n "*" -o json") set -- $args; serve "roles-$4.json" ;;
+  "get rolebindings -n "*" -o json") set -- $args; serve "rolebindings-$4.json" ;;
   "create -f - -o json")
     cat >"$d/reviews.json"
     [ ! -f "$d/sar-fails" ] || { echo 'Error from server (Forbidden)' >&2; exit 1; }
@@ -127,6 +134,10 @@ struct Cluster {
     sar_drop: Value,
     sar_error: Value,
     sar_fails: bool,
+    /// The RBAC objects: `clusterroles` and `clusterrolebindings` lists of items, and `roles` and
+    /// `rolebindings` objects of lists by namespace. A namespace with none is served an empty
+    /// list.
+    rbac: Value,
     probe_log: String,
     probe_exit: i64,
     probe_running: bool,
@@ -216,6 +227,7 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
             sar_drop: json!([]),
             sar_error: json!([]),
             sar_fails: false,
+            rbac: kind_rbac(),
             probe_log: PASSING_PROBE.to_owned(),
             probe_exit: 0,
             probe_running: false,
@@ -279,6 +291,18 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
         if self.sar_fails {
             write(dir, "sar-fails", "");
         }
+        let list = |items: &Value| json!({"apiVersion": "v1", "kind": "List", "items": if items.is_null() { json!([]) } else { items.clone() }});
+        for what in ["clusterroles", "clusterrolebindings"] {
+            save(&format!("{what}.json"), &list(&self.rbac[what]));
+        }
+        for namespace in ["team-a", "switchboard", "mock-docs"] {
+            for what in ["roles", "rolebindings"] {
+                save(
+                    &format!("{what}-{namespace}.json"),
+                    &list(&self.rbac[what][namespace]),
+                );
+            }
+        }
         write(dir, "probe.log", &self.probe_log);
         write(dir, "probe-exit", &self.probe_exit.to_string());
         if self.probe_running {
@@ -297,6 +321,109 @@ I1008 01:34:19.623632       1 controller.go:185] \"Policy engine is ready.\"\n"
             write(dir, name, contents);
         }
     }
+}
+
+/// A Role, or a ClusterRole when `namespace` is None, with `rules`.
+fn role(namespace: Option<&str>, name: &str, rules: Value) -> Value {
+    let mut metadata = json!({"name": name});
+    let kind = match namespace {
+        Some(namespace) => {
+            metadata["namespace"] = json!(namespace);
+            "Role"
+        }
+        None => "ClusterRole",
+    };
+    json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": kind, "metadata": metadata, "rules": rules})
+}
+
+/// A RoleBinding, or a ClusterRoleBinding when `namespace` is None, of the `role_kind` named
+/// `role_name` to `subjects`.
+fn binding(
+    namespace: Option<&str>,
+    name: &str,
+    role_kind: &str,
+    role_name: &str,
+    subjects: Value,
+) -> Value {
+    let mut metadata = json!({"name": name});
+    let kind = match namespace {
+        Some(namespace) => {
+            metadata["namespace"] = json!(namespace);
+            "RoleBinding"
+        }
+        None => "ClusterRoleBinding",
+    };
+    json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": kind,
+        "metadata": metadata,
+        "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": role_kind, "name": role_name},
+        "subjects": subjects
+    })
+}
+
+/// The RBAC objects of a kind cluster with the demo applied, as far as they touch the
+/// namespaces the step reads: the default discovery roles bound to every ServiceAccount or every
+/// authenticated user, cluster-admin bound to system:masters, the route-check operator's own
+/// access, and a workload Role that reads pods and their logs. None grants a row of
+/// permissions.tsv to the workload: `get` on `pods` is not `get` on `pods/exec`.
+fn kind_rbac() -> Value {
+    let group = |name: &str| json!([{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": name}]);
+    let operator =
+        json!([{"kind": "ServiceAccount", "name": "operator", "namespace": "route-check"}]);
+    json!({
+        "clusterroles": [
+            role(None, "cluster-admin", json!([
+                {"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]},
+                {"nonResourceURLs": ["*"], "verbs": ["*"]}
+            ])),
+            role(None, "system:discovery", json!([{"nonResourceURLs": [
+                "/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/openapi", "/openapi/*",
+                "/readyz", "/version", "/version/"
+            ], "verbs": ["get"]}])),
+            role(None, "system:basic-user", json!([
+                {"apiGroups": ["authorization.k8s.io"], "resources": ["selfsubjectaccessreviews", "selfsubjectrulesreviews"], "verbs": ["create"]},
+                {"apiGroups": ["authentication.k8s.io"], "resources": ["selfsubjectreviews"], "verbs": ["create"]}
+            ])),
+            role(None, "system:public-info-viewer", json!([{"nonResourceURLs": [
+                "/healthz", "/livez", "/readyz", "/version", "/version/"
+            ], "verbs": ["get"]}])),
+            role(None, "system:service-account-issuer-discovery", json!([{"nonResourceURLs": [
+                "/.well-known/openid-configuration", "/.well-known/openid-configuration/",
+                "/openid/v1/jwks", "/openid/v1/jwks/"
+            ], "verbs": ["get"]}])),
+            role(None, "route-check-operator", json!([
+                {"apiGroups": [""], "resources": ["pods", "pods/log", "services", "serviceaccounts", "configmaps", "nodes"], "verbs": ["get", "list"]},
+                {"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles", "clusterroles", "rolebindings", "clusterrolebindings"], "verbs": ["get", "list"]},
+                {"apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"]}
+            ]))
+        ],
+        "clusterrolebindings": [
+            binding(None, "cluster-admin", "ClusterRole", "cluster-admin", group("system:masters")),
+            binding(None, "system:discovery", "ClusterRole", "system:discovery", group("system:authenticated")),
+            binding(None, "system:basic-user", "ClusterRole", "system:basic-user", group("system:authenticated")),
+            binding(None, "system:public-info-viewer", "ClusterRole", "system:public-info-viewer", json!([
+                {"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:authenticated"},
+                {"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:unauthenticated"}
+            ])),
+            binding(None, "system:service-account-issuer-discovery", "ClusterRole", "system:service-account-issuer-discovery", group("system:serviceaccounts")),
+            binding(None, "route-check-operator", "ClusterRole", "route-check-operator", operator.clone())
+        ],
+        "roles": {"team-a": [
+            role(Some("team-a"), "route-check-probe", json!([
+                {"apiGroups": [""], "resources": ["pods/ephemeralcontainers"], "verbs": ["patch"]}
+            ])),
+            role(Some("team-a"), "read-pods", json!([
+                {"apiGroups": [""], "resources": ["pods", "pods/log"], "verbs": ["get", "list", "watch"]}
+            ]))
+        ]},
+        "rolebindings": {"team-a": [
+            binding(Some("team-a"), "route-check-probe", "Role", "route-check-probe", operator),
+            binding(Some("team-a"), "read-pods", "Role", "read-pods", json!([
+                {"kind": "ServiceAccount", "name": "mock-workload"}
+            ]))
+        ]}
+    })
 }
 
 /// One run of the script: what it printed, its report, the fake's calls, and how long it took.
@@ -527,7 +654,31 @@ const PERMISSIONS: &[(&str, &str, &str, &str)] = &[
         "namespaced",
     ),
     (
+        "update",
+        "rolebindings.rbac.authorization.k8s.io",
+        "-",
+        "namespaced",
+    ),
+    (
+        "patch",
+        "rolebindings.rbac.authorization.k8s.io",
+        "-",
+        "namespaced",
+    ),
+    (
         "create",
+        "clusterrolebindings.rbac.authorization.k8s.io",
+        "-",
+        "cluster",
+    ),
+    (
+        "update",
+        "clusterrolebindings.rbac.authorization.k8s.io",
+        "-",
+        "cluster",
+    ),
+    (
+        "patch",
         "clusterrolebindings.rbac.authorization.k8s.io",
         "-",
         "cluster",
@@ -605,6 +756,8 @@ fn a_clean_pod_passes() {
         "no projected token for a server's audience",
         "team-a/mock-workload may not impersonate users (cluster)",
         "team-a/mock-workload may not get secrets (team-a,switchboard,mock-docs,cluster)",
+        "team-a/mock-workload is bound to no RBAC rule for get pods/exec, whatever its resourceNames (RoleBindings in team-a,switchboard,mock-docs, and ClusterRoleBindings)",
+        "team-a/mock-workload is bound to no RBAC rule for impersonate users, whatever its resourceNames (ClusterRoleBindings)",
         "the probe ended within 5 s (exit 0)",
         "the probe passed: every route refused (4 attempts, EXPECT=refused)",
     ] {
@@ -668,6 +821,39 @@ fn a_clean_pod_passes() {
     }
     assert_eq!(items.len(), asked.len());
     assert_eq!(asked, expected_reviews());
+
+    // The RBAC rules: one check per row, from the ClusterRoles, the ClusterRoleBindings, and the
+    // Roles and RoleBindings in each namespace asked, each read once.
+    assert_eq!(
+        run.lines("PASS team-a/mock-workload is bound to no RBAC rule for ")
+            .len(),
+        PERMISSIONS.len(),
+        "{}",
+        run.transcript()
+    );
+    let mut reads: Vec<&str> = checked
+        .calls
+        .iter()
+        .filter_map(|call| {
+            call.split_once("--request-timeout=30s get ")
+                .map(|(_, read)| read)
+        })
+        .filter(|read| read.contains("role"))
+        .collect();
+    reads.sort_unstable();
+    assert_eq!(
+        reads,
+        [
+            "clusterrolebindings -o json",
+            "clusterroles -o json",
+            "rolebindings -n mock-docs -o json",
+            "rolebindings -n switchboard -o json",
+            "rolebindings -n team-a -o json",
+            "roles -n mock-docs -o json",
+            "roles -n switchboard -o json",
+            "roles -n team-a -o json",
+        ]
+    );
 
     // The probe: an ephemeral container under the restricted profile, with only the probe's
     // variables, and {{ADDR}} replaced by the Service's ClusterIP and endpoint address.
@@ -765,10 +951,10 @@ fn the_report_has_every_field() {
     );
     let checks = report["checks"].as_array().unwrap();
     // The pod, the plugin, three Secret checks, the token scan, the audiences, every
-    // permission, the probe's end and its result.
+    // permission by review and by RBAC rule, the probe's end and its result.
     assert_eq!(
         checks.len(),
-        2 + 3 + 2 + PERMISSIONS.len() + 2,
+        2 + 3 + 2 + 2 * PERMISSIONS.len() + 2,
         "{checks:#?}"
     );
     assert!(checks.iter().all(|check| check["result"] == "PASS"));
@@ -1301,6 +1487,430 @@ fn a_review_with_no_answer_fails() {
     check("sar-refused", &cluster).assert_failed(
         "team-a/mock-workload may do none of control 1: could not create the SubjectAccessReviews",
     );
+}
+
+/// Adds `item` to the cluster's RBAC objects: to the list `what`, in `namespace` for a Role or a
+/// RoleBinding.
+fn add_rbac(cluster: &mut Cluster, what: &str, namespace: Option<&str>, item: Value) {
+    let list = match namespace {
+        Some(namespace) => &mut cluster.rbac[what][namespace],
+        None => &mut cluster.rbac[what],
+    };
+    if list.is_null() {
+        *list = json!([]);
+    }
+    list.as_array_mut().unwrap().push(item);
+}
+
+/// The step's line for a row granted by RBAC rules, as `why`.
+fn rbac_granted(row: &str, why: &str) -> String {
+    format!(
+        "team-a/mock-workload is bound to no RBAC rule for {row}, whatever its resourceNames: {why}"
+    )
+}
+
+#[test]
+fn a_grant_limited_by_resource_names_fails_however_it_is_bound() {
+    // The fake answers every review no, as the API server does for a rule limited to one name:
+    // the review names no resource. Only the rules show the grant.
+    let sa = json!([{"kind": "ServiceAccount", "name": "mock-workload"}]);
+    let group = |name: &str| json!([{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": name}]);
+    let user =
+        json!([{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": WORKLOAD_USER}]);
+    let mint = json!([{"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"], "resourceNames": ["gateway"]}]);
+    let cases: Vec<(&str, Vec<(&str, Option<&str>, Value)>, &str, String)> = vec![
+        (
+            "service-account",
+            vec![
+                (
+                    "roles",
+                    Some("team-a"),
+                    role(
+                        Some("team-a"),
+                        "act-as-gateway",
+                        json!([
+                            {"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["impersonate"], "resourceNames": ["gateway"]}
+                        ]),
+                    ),
+                ),
+                (
+                    "rolebindings",
+                    Some("team-a"),
+                    binding(
+                        Some("team-a"),
+                        "act-as-gateway",
+                        "Role",
+                        "act-as-gateway",
+                        sa.clone(),
+                    ),
+                ),
+            ],
+            "impersonate serviceaccounts",
+            rbac_granted(
+                "impersonate serviceaccounts",
+                "RoleBinding team-a/act-as-gateway binds Role act-as-gateway to ServiceAccount team-a/mock-workload, for resourceNames gateway",
+            ),
+        ),
+        (
+            "authenticated",
+            vec![
+                (
+                    "roles",
+                    Some("switchboard"),
+                    role(Some("switchboard"), "mint", mint.clone()),
+                ),
+                (
+                    "rolebindings",
+                    Some("switchboard"),
+                    binding(
+                        Some("switchboard"),
+                        "mint",
+                        "Role",
+                        "mint",
+                        group("system:authenticated"),
+                    ),
+                ),
+            ],
+            "create serviceaccounts/token",
+            rbac_granted(
+                "create serviceaccounts/token",
+                "RoleBinding switchboard/mint binds Role mint to Group system:authenticated, for resourceNames gateway",
+            ),
+        ),
+        (
+            "cluster-role-through-role-binding",
+            vec![
+                ("clusterroles", None, role(None, "mint", mint.clone())),
+                (
+                    "rolebindings",
+                    Some("mock-docs"),
+                    binding(Some("mock-docs"), "mint", "ClusterRole", "mint", user),
+                ),
+            ],
+            "create serviceaccounts/token",
+            rbac_granted(
+                "create serviceaccounts/token",
+                "RoleBinding mock-docs/mint binds ClusterRole mint to User system:serviceaccount:team-a:mock-workload, for resourceNames gateway",
+            ),
+        ),
+        (
+            "namespace-group",
+            vec![
+                (
+                    "clusterroles",
+                    None,
+                    role(
+                        None,
+                        "act-as-admin",
+                        json!([
+                            {"apiGroups": [""], "resources": ["users"], "verbs": ["impersonate"], "resourceNames": ["admin"]}
+                        ]),
+                    ),
+                ),
+                (
+                    "clusterrolebindings",
+                    None,
+                    binding(
+                        None,
+                        "act-as-admin",
+                        "ClusterRole",
+                        "act-as-admin",
+                        group("system:serviceaccounts:team-a"),
+                    ),
+                ),
+            ],
+            "impersonate users",
+            rbac_granted(
+                "impersonate users",
+                "ClusterRoleBinding act-as-admin binds ClusterRole act-as-admin to Group system:serviceaccounts:team-a, for resourceNames admin",
+            ),
+        ),
+        (
+            "every-service-account",
+            vec![
+                (
+                    "clusterroles",
+                    None,
+                    role(
+                        None,
+                        "read-credential",
+                        json!([
+                            {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"], "resourceNames": ["docs-credential"]}
+                        ]),
+                    ),
+                ),
+                (
+                    "clusterrolebindings",
+                    None,
+                    binding(
+                        None,
+                        "read-credential",
+                        "ClusterRole",
+                        "read-credential",
+                        json!([
+                            {"kind": "ServiceAccount", "name": "default", "namespace": "kube-system"},
+                            {"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:serviceaccounts"}
+                        ]),
+                    ),
+                ),
+            ],
+            "get secrets",
+            rbac_granted(
+                "get secrets",
+                "ClusterRoleBinding read-credential binds ClusterRole read-credential to Group system:serviceaccounts, for resourceNames docs-credential",
+            ),
+        ),
+    ];
+    for (name, items, row, text) in cases {
+        let mut cluster = Cluster::clean();
+        for (what, namespace, item) in items {
+            add_rbac(&mut cluster, what, namespace, item);
+        }
+        let checked = check(&format!("rbac-names-{name}"), &cluster);
+        checked.assert_failed(&text);
+        // The review alone answered no.
+        assert!(
+            checked.passed(&format!("team-a/mock-workload may not {row} (")),
+            "{name}\n{}",
+            checked.run.transcript()
+        );
+        // Every other row passes.
+        assert_eq!(
+            checked.run.lines("FAIL ").len(),
+            1,
+            "{name}\n{}",
+            checked.run.transcript()
+        );
+    }
+}
+
+#[test]
+fn a_wildcard_grant_fails() {
+    for (name, rule, row, rest) in [
+        (
+            "verb",
+            json!({"apiGroups": [""], "resources": ["secrets"], "verbs": ["*"]}),
+            "get secrets",
+            "",
+        ),
+        (
+            "group",
+            json!({"apiGroups": ["*"], "resources": ["deployments"], "verbs": ["patch"]}),
+            "patch deployments.apps",
+            "",
+        ),
+        (
+            "resource",
+            json!({"apiGroups": [""], "resources": ["*"], "verbs": ["create"], "resourceNames": ["agent-0"]}),
+            "create pods/exec",
+            ", for resourceNames agent-0",
+        ),
+        (
+            "subresource",
+            json!({"apiGroups": [""], "resources": ["*/exec"], "verbs": ["get"]}),
+            "get pods/exec",
+            "",
+        ),
+        (
+            "rbac",
+            json!({"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["*"], "verbs": ["bind"]}),
+            "bind roles.rbac.authorization.k8s.io",
+            "",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        add_rbac(
+            &mut cluster,
+            "roles",
+            Some("team-a"),
+            role(Some("team-a"), "wide", json!([rule])),
+        );
+        add_rbac(
+            &mut cluster,
+            "rolebindings",
+            Some("team-a"),
+            binding(
+                Some("team-a"),
+                "wide",
+                "Role",
+                "wide",
+                json!([{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]),
+            ),
+        );
+        check(&format!("rbac-wildcard-{name}"), &cluster).assert_failed(&rbac_granted(
+            row,
+            &format!("RoleBinding team-a/wide binds Role wide to ServiceAccount team-a/mock-workload{rest}"),
+        ));
+    }
+}
+
+#[test]
+fn rules_that_grant_no_row_to_the_workload_pass() {
+    let mut cluster = Cluster::clean();
+    // A RoleBinding grants nothing across the cluster, so no `cluster` row.
+    add_rbac(
+        &mut cluster,
+        "clusterroles",
+        None,
+        role(
+            None,
+            "act-as-users",
+            json!([{"apiGroups": [""], "resources": ["users"], "verbs": ["impersonate"]}]),
+        ),
+    );
+    add_rbac(
+        &mut cluster,
+        "rolebindings",
+        Some("team-a"),
+        binding(
+            Some("team-a"),
+            "act-as-users",
+            "ClusterRole",
+            "act-as-users",
+            json!([{"kind": "ServiceAccount", "name": "mock-workload"}]),
+        ),
+    );
+    // Another team's ServiceAccount, its user and its group, and unauthenticated users.
+    add_rbac(
+        &mut cluster,
+        "roles",
+        Some("team-a"),
+        role(
+            Some("team-a"),
+            "wide",
+            json!([{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]),
+        ),
+    );
+    add_rbac(
+        &mut cluster,
+        "rolebindings",
+        Some("team-a"),
+        binding(
+            Some("team-a"),
+            "other-team",
+            "Role",
+            "wide",
+            json!([
+                {"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-b"},
+                {"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "system:serviceaccount:team-b:mock-workload"},
+                {"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:serviceaccounts:team-b"},
+                {"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:unauthenticated"}
+            ]),
+        ),
+    );
+    // A role that does not exist.
+    add_rbac(
+        &mut cluster,
+        "rolebindings",
+        Some("switchboard"),
+        binding(
+            Some("switchboard"),
+            "missing",
+            "Role",
+            "not-there",
+            json!([{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]),
+        ),
+    );
+    // A resource without the subresource a row names, and URLs, which name no resource.
+    add_rbac(
+        &mut cluster,
+        "clusterroles",
+        None,
+        role(
+            None,
+            "accounts-and-urls",
+            json!([
+                {"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["create"]},
+                {"nonResourceURLs": ["*"], "verbs": ["*"]}
+            ]),
+        ),
+    );
+    add_rbac(
+        &mut cluster,
+        "clusterrolebindings",
+        None,
+        binding(
+            None,
+            "accounts-and-urls",
+            "ClusterRole",
+            "accounts-and-urls",
+            json!([{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]),
+        ),
+    );
+    let checked = check("rbac-no-grant", &cluster);
+    assert_eq!(checked.run.status, Some(0), "{}", checked.run.transcript());
+    for text in [
+        "team-a/mock-workload is bound to no RBAC rule for impersonate users, whatever its resourceNames (ClusterRoleBindings)",
+        "team-a/mock-workload is bound to no RBAC rule for create serviceaccounts/token, whatever its resourceNames (",
+    ] {
+        assert!(checked.passed(text), "{text}\n{}", checked.run.transcript());
+    }
+}
+
+#[test]
+fn rbac_objects_that_cannot_be_read_fail() {
+    let text =
+        "team-a/mock-workload is bound to no RBAC rule for a row of control 1: could not read";
+    let mut cases: Vec<(String, Cluster, String)> = Vec::new();
+    for (file, what) in [
+        ("clusterroles.json", "the clusterroles"),
+        ("clusterrolebindings.json", "the clusterrolebindings"),
+        ("roles-switchboard.json", "the roles in switchboard"),
+        (
+            "rolebindings-mock-docs.json",
+            "the rolebindings in mock-docs",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.unreadable = vec![file];
+        cases.push((format!("unread-{file}"), cluster, format!("{text} {what}")));
+        for (case, contents) in NOT_ONE_OBJECT {
+            let mut cluster = Cluster::clean();
+            cluster.raw = vec![(file, contents)];
+            cases.push((format!("{case}-{file}"), cluster, format!("{text} {what}")));
+        }
+    }
+    // JSON that jq parses, in a shape RBAC never gives.
+    for (case, file, contents, why) in [
+        (
+            "items",
+            "clusterroles.json",
+            r#"{"items": {}}"#,
+            "the clusterroles: not a list of objects",
+        ),
+        (
+            "verbs",
+            "clusterroles.json",
+            r#"{"items": [{"metadata": {"name": "odd"}, "rules": [{"apiGroups": [""], "resources": ["secrets"], "verbs": "get"}]}]}"#,
+            "ClusterRole odd: verbs: not a list of strings",
+        ),
+        (
+            "subjects",
+            "rolebindings-team-a.json",
+            r#"{"items": [{"metadata": {"name": "odd"}, "roleRef": {"kind": "Role", "name": "odd"}, "subjects": "system:authenticated"}]}"#,
+            "RoleBinding team-a/odd: subjects are not a list",
+        ),
+        (
+            "role-ref",
+            "clusterrolebindings.json",
+            r#"{"items": [{"metadata": {"name": "odd"}, "subjects": []}]}"#,
+            "ClusterRoleBinding odd: its roleRef has no kind or name",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.raw = vec![(file, contents)];
+        cases.push((format!("shape-{case}"), cluster, format!("{text} {why}")));
+    }
+    for (name, cluster, want) in cases {
+        let checked = check(&format!("rbac-unread-{name}"), &cluster);
+        checked.assert_failed(&want);
+        // Nothing is matched against the lists that were read.
+        assert!(
+            !checked.passed("is bound to no RBAC rule"),
+            "{name}\n{}",
+            checked.run.transcript()
+        );
+    }
 }
 
 #[test]
@@ -1981,6 +2591,9 @@ fn the_operator_is_granted_only_what_it_needs() {
     verbs: [get, list]
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
+    verbs: [get, list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, clusterroles, rolebindings, clusterrolebindings]
     verbs: [get, list]
   - apiGroups: [authorization.k8s.io]
     resources: [subjectaccessreviews]
