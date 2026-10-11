@@ -1,11 +1,11 @@
 //! The three states of verification, and the front that reaches them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use gateway_core::{Issuer, Principal, Proved};
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 
 use crate::clock::Clock;
 use crate::config::{ConfigError, IdentityConfig, IssuerConfig};
@@ -100,10 +100,11 @@ impl fmt::Debug for Identity {
 }
 
 /// What replacing an issuer's keys changed, for the log: the `kid`s in the new set that were not
-/// in the old one, and the reverse.
+/// in the old one, the reverse, and the `kid`s in both whose key is not the same.
 ///
-/// Read from the sets as supplied, so a key left out because it cannot verify still counts as
-/// in its set, and a `kid` kept with a different key is in neither list.
+/// The old set is the one in force when the replacement began, not the one last supplied: a
+/// refused set never becomes the old set. Read from the sets as supplied, so a key left out
+/// because it cannot verify still counts as in its set.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeysReplaced {
     /// Key IDs in the new set that were not in the old one.
@@ -111,20 +112,36 @@ pub struct KeysReplaced {
     /// Key IDs in the old set that are not in the new one. A token naming one is refused from
     /// now on.
     pub removed: BTreeSet<String>,
+    /// Key IDs in both sets whose key differs. A token naming one is verified with the new key
+    /// from now on, and a token signed with the old key is refused.
+    pub changed: BTreeSet<String>,
 }
 
 impl KeysReplaced {
     fn between(before: &JwkSet, after: &JwkSet) -> Self {
-        let kids = |set: &JwkSet| -> BTreeSet<String> {
+        let by_kid = |set: &JwkSet| -> BTreeMap<String, Jwk> {
             set.keys
                 .iter()
-                .filter_map(|key| key.common.key_id.clone())
+                .filter_map(|key| Some((key.common.key_id.clone()?, key.clone())))
                 .collect()
         };
-        let (before, after) = (kids(before), kids(after));
+        let (before, after) = (by_kid(before), by_kid(after));
         Self {
-            added: after.difference(&before).cloned().collect(),
-            removed: before.difference(&after).cloned().collect(),
+            added: after
+                .keys()
+                .filter(|kid| !before.contains_key(*kid))
+                .cloned()
+                .collect(),
+            removed: before
+                .keys()
+                .filter(|kid| !after.contains_key(*kid))
+                .cloned()
+                .collect(),
+            changed: after
+                .iter()
+                .filter(|(kid, key)| before.get(*kid).is_some_and(|old| old != *key))
+                .map(|(kid, _)| kid.clone())
+                .collect(),
         }
     }
 }
