@@ -2,12 +2,17 @@
 //!
 //! - `MOCK_DOCS_TOKEN_FILE`: a file holding the one accepted bearer token; or
 //! - `MOCK_DOCS_TOKEN_SHA256`: the token's SHA-256 in hex; or
-//! - `MOCK_DOCS_TOKEN_SHA256_FILE`: a file holding the token's SHA-256 in hex. Exactly one of
-//!   the three, in the static mode.
+//! - `MOCK_DOCS_TOKEN_SHA256_FILE`: a file holding the token's SHA-256 in hex, or several
+//!   tokens' digests, one per line, each alone or followed by a space and the projects that
+//!   token may name: `<hex> atlas,borealis`. Exactly one of the three, in the static mode. A
+//!   token named alone may name every project.
 //! - `MOCK_DOCS_JWT_ISSUER`, `MOCK_DOCS_JWT_AUDIENCE`, `MOCK_DOCS_JWT_SUBJECT` and
 //!   `MOCK_DOCS_JWKS_FILE`: the JWT mode, in place of the static one. All four together: the
-//!   issuer and audience a token must name, the one subject accepted, and a file holding the
-//!   JWK set of the keys that sign tokens.
+//!   issuer and audience a token must name, the one subject accepted, which may name every
+//!   project, and a file holding the JWK set of the keys that sign tokens.
+//! - `MOCK_DOCS_JWT_SUBJECTS`: in place of `MOCK_DOCS_JWT_SUBJECT`, the subjects accepted, each
+//!   with the projects it may name: `<subject>=<project>[,<project>]`, entries separated by
+//!   `;`. A subject named twice, an unknown project or a malformed entry is refused.
 //! - `MOCK_DOCS_LISTEN`: the MCP endpoint's address, default `0.0.0.0:8080`.
 //! - `MOCK_DOCS_ADMIN_LISTEN`: the admin endpoint's address. Unset, there is none.
 //! - `MOCK_DOCS_TOOLS`: the tools offered at start, comma-separated, default
@@ -20,7 +25,7 @@
 use std::process::ExitCode;
 
 use mock_docs_server::{Credential, Log, MockDocs, Settings};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -53,16 +58,23 @@ async fn main() -> ExitCode {
         "tools": tools,
         "slow_ms": settings.config.slow.as_millis(),
     });
+    let callers: Map<String, Value> = settings
+        .config
+        .accepted
+        .callers()
+        .into_iter()
+        .map(|(name, projects)| (name, projects.to_json()))
+        .collect();
     let mode = match &settings.config.accepted {
-        Credential::Static(accepted) => json!({
+        Credential::Static(_) => json!({
             "mode": "static",
-            "accepted_sha256": accepted.logged_prefix(),
+            "callers": callers,
         }),
         Credential::Jwt(verifier) => json!({
             "mode": "jwt",
             "issuer": verifier.issuer(),
             "audience": verifier.audience(),
-            "subject": verifier.subject(),
+            "callers": callers,
             "key_ids": verifier.key_ids(),
         }),
     };

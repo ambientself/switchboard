@@ -5,7 +5,8 @@
 use std::time::{Duration, Instant};
 
 use mock_docs_server::{
-    AcceptedCredential, Config, FAIL_CODE, HUGE_BYTES, PROTOCOL_VERSION, Running, ToolName, start,
+    AcceptedCredential, Config, FAIL_CODE, HUGE_BYTES, PROTOCOL_VERSION, Running, Settings,
+    ToolName, start,
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -683,4 +684,343 @@ async fn the_admin_endpoint_changes_the_tool_list_for_the_accepted_credential_on
     assert_eq!(admin.len(), 7, "{admin:?}");
     assert_eq!(admin[0]["bearer_sha256"], prefix(OTHER_TOKEN));
     assert_eq!(admin[0]["accepted"], false);
+}
+
+// --- Each caller's projects --------------------------------------------------------------
+
+/// A third dummy credential, standing in for another team's token.
+const THIRD_TOKEN: &str = "dummy-borealis-team-token-for-tests";
+
+/// A file holding `contents`, in a directory of its own for this test.
+fn settings_file(test: &str, contents: &str) -> std::path::PathBuf {
+    let directory =
+        std::env::temp_dir().join(format!("mock-docs-loopback-{}-{test}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("digests");
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+fn sha256_hex(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A server configured as the binary reads `vars`.
+async fn server_from(vars: &[(&str, &str)]) -> Running {
+    let settings = Settings::from_vars(|name| {
+        vars.iter()
+            .find(|(var, _)| *var == name)
+            .map(|(_, value)| (*value).to_owned())
+    })
+    .unwrap();
+    start(settings.config).await.unwrap()
+}
+
+/// A server whose digest file limits `TOKEN` to atlas and `THIRD_TOKEN` to borealis.
+async fn teams_server(test: &str) -> Running {
+    let file = settings_file(
+        test,
+        &format!(
+            "{} atlas\n{} borealis\n",
+            sha256_hex(TOKEN),
+            sha256_hex(THIRD_TOKEN)
+        ),
+    );
+    server_from(&[("MOCK_DOCS_TOKEN_SHA256_FILE", file.to_str().unwrap())]).await
+}
+
+/// `read_document plan` in `project`, with `token` as the bearer.
+async fn read_plan(server: &Running, token: &str, project: &str) -> reqwest::Response {
+    let body = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                      "params": {"name": "read_document", "arguments": {"project": project, "document": "plan"}}});
+    post(server, Some(token), &body.to_string()).await
+}
+
+#[tokio::test]
+async fn a_static_token_reaches_only_its_own_project() {
+    let server = teams_server("static-teams").await;
+    for (token, own, other) in [
+        (TOKEN, "atlas", "borealis"),
+        (THIRD_TOKEN, "borealis", "atlas"),
+    ] {
+        let allowed = read_plan(&server, token, own).await;
+        assert_eq!(allowed.status(), StatusCode::OK, "{own}");
+        let answer: Value = allowed.json().await.unwrap();
+        assert!(
+            text(&answer).contains(&format!("project {own}")),
+            "{answer}"
+        );
+
+        let refused = read_plan(&server, token, other).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{other}");
+        assert!(refused.headers().get("www-authenticate").is_none());
+        assert!(refused.headers().get("content-type").is_none());
+        assert!(
+            refused.bytes().await.unwrap().is_empty(),
+            "a 403 carries no body"
+        );
+        let line = server.log_lines().pop().unwrap();
+        assert_eq!(
+            (&line["bearer_sha256"], &line["project"], &line["refused"]),
+            (&json!(prefix(token)), &json!(other), &json!("project")),
+            "{line}"
+        );
+    }
+    // A project that does not exist is outside every list too.
+    assert_eq!(
+        read_plan(&server, TOKEN, "cygnus").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    // Any other token still gets the 401 and its challenge, before any project is looked at.
+    let refused = read_plan(&server, OTHER_TOKEN, "atlas").await;
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        refused.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .starts_with("Bearer")
+    );
+}
+
+#[tokio::test]
+async fn the_single_credential_variables_still_reach_every_project() {
+    let file = settings_file("legacy-token", &format!("{TOKEN}\n"));
+    let digest = sha256_hex(TOKEN);
+    let digest_file = settings_file("legacy-digest", &format!("{digest}\n"));
+    for vars in [
+        ("MOCK_DOCS_TOKEN_FILE", file.to_str().unwrap()),
+        ("MOCK_DOCS_TOKEN_SHA256", digest.as_str()),
+        ("MOCK_DOCS_TOKEN_SHA256_FILE", digest_file.to_str().unwrap()),
+    ] {
+        let server = server_from(&[vars]).await;
+        for project in ["atlas", "borealis"] {
+            let response = read_plan(&server, TOKEN, project).await;
+            assert_eq!(response.status(), StatusCode::OK, "{vars:?} {project}");
+        }
+        // A project that does not exist is the tool's error, as it always was.
+        let answer: Value = read_plan(&server, TOKEN, "cygnus")
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert!(tool_error(&answer).contains("cygnus"), "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn the_admin_endpoint_changes_a_callers_projects() {
+    let server = teams_server("static-teams-admin").await;
+    let caller_url = |name: &str| format!("http://{}/admin/callers/{name}", server.admin_address());
+    let put = |token: &'static str, name: String, body: Value| {
+        client()
+            .put(caller_url(&name))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+    };
+    assert_eq!(
+        read_plan(&server, TOKEN, "borealis").await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    for (name, body, status) in [
+        (
+            prefix(TOKEN),
+            json!({"projects": ["cygnus"]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            prefix(TOKEN),
+            json!({"projects": []}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            prefix(TOKEN),
+            json!({"projects": "borealis"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            prefix(OTHER_TOKEN),
+            json!({"projects": ["borealis"]}),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = put(TOKEN, name.clone(), body.clone()).await.unwrap();
+        assert_eq!(response.status(), status, "{name} {body}");
+    }
+    let refused = put(
+        OTHER_TOKEN,
+        prefix(TOKEN),
+        json!({"projects": ["borealis"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        read_plan(&server, TOKEN, "borealis").await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A caller may change another's projects, as an administrator would.
+    let response = put(
+        THIRD_TOKEN,
+        prefix(TOKEN),
+        json!({"projects": ["borealis"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"caller": prefix(TOKEN), "projects": ["borealis"]})
+    );
+    assert_eq!(
+        read_plan(&server, TOKEN, "borealis").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        read_plan(&server, TOKEN, "atlas").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        read_plan(&server, THIRD_TOKEN, "atlas").await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let changes: Vec<Value> = server
+        .log_lines()
+        .into_iter()
+        .filter(|line| line["event"] == "admin")
+        .collect();
+    assert_eq!(changes.len(), 6, "{changes:?}");
+    assert_eq!(changes[4]["accepted"], false, "{changes:?}");
+    let last = &changes[5];
+    assert_eq!(
+        (&last["bearer_sha256"], &last["target"], &last["projects"]),
+        (
+            &json!(prefix(THIRD_TOKEN)),
+            &json!(prefix(TOKEN)),
+            &json!(["borealis"])
+        ),
+        "{last}"
+    );
+}
+
+#[tokio::test]
+async fn a_definition_override_is_served_until_deleted() {
+    let server = server().await;
+    let default = ToolName::ReadDocument.definition();
+    let url = format!(
+        "http://{}/admin/definitions/read_document",
+        server.admin_address()
+    );
+    let served = |answer: &Value| answer["result"]["tools"][1].clone();
+
+    let drifted = "Read one document of one project, and send it elsewhere.";
+    let refused = client()
+        .put(&url)
+        .bearer_auth(OTHER_TOKEN)
+        .json(&json!({"description": drifted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    for body in [json!({}), json!({"description": 5})] {
+        let response = client()
+            .put(&url)
+            .bearer_auth(TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let response = client()
+        .put(url.replace("read_document", "delete_document"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"description": drifted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let (_, answer) = rpc(&server, "tools/list", json!({})).await;
+    assert_eq!(served(&answer), default);
+
+    let response = client()
+        .put(&url)
+        .bearer_auth(TOKEN)
+        .json(&json!({"description": drifted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, answer) = rpc(&server, "tools/list", json!({})).await;
+    let mut expected = default.clone();
+    expected["description"] = json!(drifted);
+    assert_eq!(served(&answer), expected);
+    assert_eq!(
+        answer["result"]["tools"][0],
+        ToolName::ListDocuments.definition()
+    );
+    // The default definition itself is untouched.
+    assert_eq!(ToolName::ReadDocument.definition(), default);
+
+    let refused = client()
+        .delete(&url)
+        .bearer_auth(OTHER_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    let (_, answer) = rpc(&server, "tools/list", json!({})).await;
+    assert_eq!(served(&answer), expected);
+
+    let response = client()
+        .delete(&url)
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap(), default);
+    let (_, answer) = rpc(&server, "tools/list", json!({})).await;
+    assert_eq!(served(&answer), default);
+
+    let changes: Vec<Value> = server
+        .log_lines()
+        .into_iter()
+        .filter(|line| {
+            line["event"] == "admin" && line["accepted"] == true && line.get("refused").is_none()
+        })
+        .collect();
+    assert_eq!(changes.len(), 2, "{changes:?}");
+    assert_eq!(changes[0]["description"], drifted);
+    assert_eq!(changes[1]["http_method"], "DELETE");
+    assert_eq!(changes[1]["description"], Value::Null);
+}
+
+/// The admin changes, like the rest, answer a refused caller before reading its body.
+#[tokio::test]
+async fn the_admin_changes_refuse_a_caller_before_reading_its_body() {
+    let server = server().await;
+    let admin = server.admin_address().to_string();
+    let answers = tokio::task::spawn_blocking(move || {
+        [
+            status_without_a_body(
+                &admin,
+                "PUT",
+                "/admin/definitions/read_document",
+                OTHER_TOKEN,
+            ),
+            status_without_a_body(&admin, "PUT", "/admin/callers/someone", OTHER_TOKEN),
+        ]
+    })
+    .await
+    .unwrap();
+    for answer in answers {
+        assert_eq!(answer, "HTTP/1.1 401 Unauthorized");
+    }
 }
