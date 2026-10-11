@@ -28,7 +28,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
@@ -235,6 +235,8 @@ async fn stored(contract: &impl ContractStore, row: &AuditRowId) -> StoredRow {
         .unwrap_or_else(|| panic!("no row is stored under {}", row.as_str()))
 }
 
+/// A duration in whole milliseconds, as the Postgres store counts each budget: a part
+/// millisecond is dropped.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -772,21 +774,41 @@ pub async fn an_error_is_stored_with_its_kind_and_a_repeat_must_match_it(
 
 // --- Item 4: the deadline -----------------------------------------------------------------------
 
+/// The span Postgres's `set_times` adds to a call row's time at begin for an allowance:
+/// `allowance_ms * interval '1 millisecond'`. The `bigint` is cast to `float8` and multiplied
+/// by the interval's 1000 microseconds in `float8`, so past 2^53 microseconds the span is the
+/// nearest `float8` to the exact one, a few microseconds off it.
+fn postgres_span(allowance_ms: u64) -> Duration {
+    // At these sizes the product is a whole number, and below 2^64.
+    Duration::from_micros((1000.0 * allowance_ms as f64) as u64)
+}
+
+/// The end of what a Postgres time holds, 294277-01-01 00:00:00 UTC, which is itself out of
+/// range: 9,223,371,331,200,000,000 microseconds after the Postgres epoch, 2000-01-01 UTC.
+fn postgres_end() -> SystemTime {
+    UNIX_EPOCH + Duration::from_micros(946_684_800_000_000 + 9_223_371_331_200_000_000)
+}
+
 /// Each row of kind `call`, allowed or denied, has a time at begin from the store's clock, and a
 /// deadline the store sets: its time at begin plus the begin budget, the call deadline and the
-/// finish deadline, each in whole milliseconds.
+/// finish deadline, each budget in whole milliseconds, added as Postgres adds them. A deadline
+/// at the end of what a Postgres time holds is refused, and leaves no row.
 pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline(
     contract: &impl ContractStore,
 ) {
     let store = contract.store();
     let fixture = fixture();
     let budgets = contract.budgets();
+    let budgets_ms = millis(budgets.begin) + millis(budgets.finish_deadline);
     for (call, call_deadline_ms) in [
         (&ALLOWED, crate::FIXTURE_CALL_DEADLINE_MS),
         (&DENIED, crate::FIXTURE_CALL_DEADLINE_MS),
         (&ALLOWED, 0),
         (&ALLOWED, 1),
         (&DENIED, 7 * 86_400_000 + 3),
+        // An odd allowance whose span in microseconds is past 2^56, where a `float8` holds
+        // only multiples of 16: Postgres's span is 8 microseconds off the exact one.
+        (&ALLOWED, 100_000_000_000_001 - budgets_ms),
     ] {
         let start = RowStart {
             call_deadline_ms,
@@ -805,13 +827,54 @@ pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_
              {before:?} and {after:?}"
         );
         assert!(stored.deadline_set, "{stored:?}");
-        let allowance = millis(budgets.begin) + call_deadline_ms + millis(budgets.finish_deadline);
+        let allowance = budgets_ms + call_deadline_ms;
         assert_eq!(
             stored.deadline_after_begin,
-            Some(Duration::from_millis(allowance)),
+            Some(postgres_span(allowance)),
             "{call:?} with a call deadline of {call_deadline_ms} ms"
         );
     }
+    assert_eq!(
+        postgres_span(100_000_000_000_001),
+        Duration::from_micros(100_000_000_000_000_992),
+        "Postgres's span is not the float8 product"
+    );
+
+    // The smallest allowance whose deadline, counted from a time read before the begin, is at
+    // or past the end. The row is begun at that time or later, so its deadline is too. On a
+    // clock that stands still, as the in-memory runner's does, the deadline is the end itself
+    // where some allowance reaches it exactly.
+    let before = contract.now().await;
+    let room = postgres_end()
+        .duration_since(before)
+        .expect("the store's clock is past the end of a Postgres time");
+    let (mut short, mut enough) = (0, u64::MAX / 1000);
+    while enough - short > 1 {
+        let middle = short + (enough - short) / 2;
+        if postgres_span(middle) >= room {
+            enough = middle;
+        } else {
+            short = middle;
+        }
+    }
+    let start = RowStart {
+        call_deadline_ms: enough - budgets_ms,
+        ..row_start()
+    };
+    let begun = begin(
+        store,
+        &fixture,
+        &start,
+        &ALLOWED,
+        RequestMetadata::default(),
+    )
+    .await;
+    assert!(
+        begun.is_err(),
+        "a deadline {:?} past the end of a Postgres time was written",
+        postgres_span(enough) - room
+    );
+    assert_eq!(contract.stored(&start.row).await, None);
 }
 
 // --- Item 5: list rows --------------------------------------------------------------------------

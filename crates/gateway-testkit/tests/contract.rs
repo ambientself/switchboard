@@ -10,10 +10,11 @@ use gateway_identity::Clock;
 use gateway_testkit::contract::{ContractStore, StoredRow};
 use gateway_testkit::{FixedClock, InMemoryAuditStore, StoreBudgets, block_on, contract};
 
-/// Budgets other than the defaults, so a store that ignores the ones it was given is caught.
+/// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
+/// each with a part millisecond, which the store drops as Postgres's does.
 const BUDGETS: StoreBudgets = StoreBudgets {
-    begin: Duration::from_secs(3),
-    finish_deadline: Duration::from_secs(45),
+    begin: Duration::from_micros(3_000_400),
+    finish_deadline: Duration::from_micros(45_000_700),
 };
 
 /// The in-memory store given [`BUDGETS`] and a clock. It answers the suite with [`BUDGETS`]

@@ -14,11 +14,12 @@ use tokio_postgres::Client;
 use super::TestDatabase;
 use crate::{Budgets, PgAuditStore, PoolSizes};
 
-/// Budgets other than the defaults, so a store that ignores the ones it was given is caught.
+/// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
+/// each with a part millisecond, which the store drops from the allowance.
 const BUDGETS: Budgets = Budgets {
-    begin: Duration::from_secs(3),
+    begin: Duration::from_micros(3_000_400),
     answer: Duration::from_secs(2),
-    finish_deadline: Duration::from_secs(45),
+    finish_deadline: Duration::from_micros(45_000_700),
 };
 
 /// The Postgres store, and a superuser session on its database to read rows back.
@@ -87,11 +88,12 @@ impl ContractStore for Postgres {
                     Some(Value::String(unknown)) => json!(unknown),
                     named => json!({ "named": named }),
                 };
-                // The table holds the allowance, which is the store's budgets and the call
-                // deadline. The budgets are worked out here, not with the store's own
-                // arithmetic, so a store that leaves one out is caught.
+                // The table holds the allowance, which is the store's budgets, each in whole
+                // milliseconds, and the call deadline. The budgets are worked out here, not
+                // with the store's own arithmetic, so a store that leaves one out is caught.
                 let budgets_ms =
-                    u64::try_from((BUDGETS.begin + BUDGETS.finish_deadline).as_millis()).unwrap();
+                    u64::try_from(BUDGETS.begin.as_millis() + BUDGETS.finish_deadline.as_millis())
+                        .unwrap();
                 let allowance = row
                     .get::<_, Option<i64>>("allowance_ms")
                     .map(|allowance| u64::try_from(allowance).unwrap());
