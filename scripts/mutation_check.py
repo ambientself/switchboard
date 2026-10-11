@@ -3151,6 +3151,34 @@ mutate("demo-driver-log-mark-is-epoch", "the log mark is the epoch number, not a
 mutate("demo-driver-compose-registry-replaced", "a Compose run replaces the registry directory a reused gateway still mounts", DRIVER,
        """  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""",
        """  rm -rf "$DEMO_DIR/compose-registry"\n  mkdir -p "$DEMO_DIR/compose-registry"\n  swap_registry""")
+# #52: each log or metrics read is checked before it is passed on, and a workload's RESULT line
+# must count the lines tallied.
+mutate("demo-driver-fetch-status-ignored", "a read that fails is checked as what it printed", DRIVER,
+       '  FETCHED=$("$@") || status=$?\n', '  FETCHED=$("$@") || true\n')
+mutate("demo-driver-job-log-status-ignored", "a Job's log that kubectl could not read is tallied as the run", DRIVER,
+       '  if fetch "$label\'s log (job $ns/$JOB)" k -n "$ns" logs "job/$JOB"; then\n    tally_workload "$label" "$JOB_STATUS" "$FETCHED"\n  fi\n',
+       '  tally_workload "$label" "$JOB_STATUS" "$(k -n "$ns" logs "job/$JOB")"\n')
+mutate_all("demo-driver-mock-log-status-ignored", "a mock-docs log that could not be read is checked as an empty log",
+           (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_bearers "$FETCHED" \\\n      "$(cat""",
+            """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_bearers "$FETCHED" \\\n      "$(cat"""),
+           (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_callers""",
+            """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_callers"""))
+mutate_all("demo-driver-boot-log-status-ignored", "a gateway log that could not be read is checked for boot lines",
+           (DRIVER, """  if fetch "the gateway's log" dc logs --no-log-prefix gateway; then\n""",
+            """  if FETCHED=$(dc logs --no-log-prefix gateway) || true; then\n"""),
+           (DRIVER, """  if fetch "the gateway's log (pod $GATEWAY_POD)" k -n switchboard logs "pod/$GATEWAY_POD"; then\n""",
+            """  if FETCHED=$(k -n switchboard logs "pod/$GATEWAY_POD") || true; then\n"""))
+mutate_all("demo-driver-metrics-read-status-ignored", "metrics that could not be read are checked as no samples",
+           (DRIVER, """  if fetch "the gateway's metrics" dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics; then\n""",
+            """  if FETCHED=$(dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics) || true; then\n"""),
+           (DRIVER, """  if fetch "the gateway's metrics (pod $GATEWAY_POD)" k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics; then\n""",
+            """  if FETCHED=$(k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \\\n    curl -sS --fail http://localhost:9090/metrics) || true; then\n"""))
+mutate("demo-driver-result-count-unchecked", "a workload's RESULT may count more checks than the lines tallied", DRIVER,
+       '  elif [ "$total" != "$((passed + failed))" ]; then\n', "  elif false; then\n")
+mutate("demo-driver-result-line-optional", "a workload with no RESULT line fails only as a count that differs", DRIVER,
+       '  elif [ -z "$result" ]; then\n', "  elif false; then\n")
+mutate("demo-driver-result-last-line", "the RESULT is read from the workload's last line, not its last RESULT line", DRIVER,
+       """awk '/^RESULT: / { last = $0 } END { print last }'""", """awk 'NF { last = $0 } END { print last }'""")
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
        '"127.0.0.1:18080:8080"', '"18080:8080"')
 mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
@@ -3170,8 +3198,8 @@ mutate("demo-before-policy-own-project-optional", "before-policy runs without OW
 mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
        "                - {name: OWN_PROJECT, value: borealis}\n", "")
 mutate("demo-kind-accepted-count-6", "the kind caller check still expects 6 calls, without the before-policy reads", DRIVER,
-       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n',
-       '  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 6 2 "$OPEN_ATTEMPTS"\n')
+       '    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n',
+       '    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 6 2 "$OPEN_ATTEMPTS"\n')
 PERMISSIONS = "deploy/route-check/permissions.tsv"
 mutate("demo-operator-checks-no-attach", "attach is not checked", PERMISSIONS,
        "create\tpods\tattach\tnamespaced\nget\tpods\tattach\tnamespaced\n", "")
@@ -3207,7 +3235,7 @@ mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kub
 mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
        "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
 mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whichever pod the Deployment's log picks", DRIVER,
-       '  check_boot "$(k -n switchboard logs "pod/$GATEWAY_POD")"\n', '  check_boot "$(k -n switchboard logs deploy/gateway)"\n')
+       ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
        """      | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision)\n""", "")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
