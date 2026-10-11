@@ -12,7 +12,7 @@ deploy/demo/demo.sh down all       # both
 
 Every check prints PASS or FAIL. The last line counts them, and the script exits non-zero if
 any check failed or any step could not run. Nothing is retried. It needs docker with compose,
-kind, kubectl, jq and awk.
+kind, kubectl, jq, awk and tar.
 
 A run leaves what it started running, so it can be looked at afterwards. `down` takes down
 only what it names: stopping Compose never deletes the cluster.
@@ -197,13 +197,28 @@ taken from its own ID (`switchboard-demo:<12 hex digits>`) and checks that the g
 mock-docs run that tag. With one fixed tag, a run on an existing cluster would leave the
 previous build's pods running, because `kubectl apply` sees no change.
 
-Postgres is pinned by tag and digest: `postgres:17.11-alpine@sha256:...` in
+Postgres is pinned by tag and digest (`postgres:<tag>@sha256:<digest>`) in
 `compose/compose.yaml` and in the driver's `POSTGRES_IMAGE`. The archive holds this platform's
 manifest, not the tag's multi-arch index, so a pod naming the index digest does not find the
 loaded image and pulls it from Docker Hub instead (checked on kind v0.32.0: with
 `imagePullPolicy: Never`, such a pod stops at `ErrImageNeverPull`). So `kind/base/postgres.yaml`
 names the tag alone, and the driver pulls the pinned digest, tags it with that tag and loads it.
-`crates/demo-checks/tests/driver.rs` holds the three places to one tag and digest.
+The pod has `imagePullPolicy: Never` too, so it never pulls whatever the tag names today. Its
+template carries the digest as the annotation `switchboard.io/image-digest`, which the driver
+fills in when it applies the manifests: a new digest under the same tag changes the template, and
+the pod is replaced. After the rollout the driver checks that the pod runs the pinned digest.
+The node never has that digest, and with Docker's classic image store not even this platform's
+manifest: kind's load wraps the archive in an index of its own, and the classic store writes a
+new manifest when it saves the image. Nor can Docker's image ID stand in for it: that is the
+config's digest on the classic store and the manifest's on the containerd store. What reaches
+the node unchanged is the image's config. So
+the driver reads the config's digest of the pinned image for this platform from what
+`docker save` writes, the same on both stores, and requires the pod's container to run the image
+with that ID, as `crictl ps` lists it on the node.
+
+`crates/demo-checks/tests/pins.rs` holds every Postgres pin in the repository to one release,
+and every one but CI's to one digest. CI's service container runs the Debian variant of the same
+release, pinned by a digest of its own.
 
 ## What runs
 
