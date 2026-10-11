@@ -3657,18 +3657,37 @@ mutate("demo-pins-postgres-running-unchecked", "the kind run never checks the di
        "  k -n switchboard rollout status deploy/postgres --timeout=120s\n  check_postgres_image\n",
        "  k -n switchboard rollout status deploy/postgres --timeout=120s\n")
 mutate("demo-pins-postgres-running-any-digest", "the Postgres digest check passes whatever the pod runs", DRIVER,
-       '  if printf \'%s\\n\' "$got" | grep -qxF "$want"; then\n', "  if true; then\n")
+       '  if [ "$got" = "$want" ]; then\n', "  if true; then\n")
 mutate("demo-pins-postgres-running-first-pod", "the Postgres digest check reads the first of several pods", DRIVER,
        '  if [ "$(count_lines . "$pods")" -ne 1 ]; then\n', "  if false; then\n")
-mutate("demo-pins-postgres-running-index-id", "the Postgres digest check wants the image's ID for every platform, not this one's manifest", DRIVER,
-       """docker image inspect --platform "linux/$arch" --format '{{.Id}}' "$POSTGRES_IMAGE\"""",
-       """docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE\"""")
+mutate("demo-pins-postgres-running-no-container", "the Postgres digest check lists the containers of a pod that has none yet", DRIVER,
+       '  if [ -z "$container" ]; then\n', "  if false; then\n")
+mutate("demo-pins-postgres-running-pin-unread", "the Postgres digest check compares whatever it read of the pin, so two failed reads pass", DRIVER,
+       """  case "$want" in
+    sha256:*) ;;
+    *)
+      fail "Postgres runs the pinned digest (cannot read the config of $POSTGRES_IMAGE for linux/$arch: got '$want')"
+      return
+      ;;
+  esac
+""", "")
+# Docker's image ID is the config's digest only on the classic store; on the containerd store it
+# is the manifest's, which the node does not name the image by.
+mutate("demo-pins-postgres-running-image-id", "the Postgres digest check wants Docker's image ID, not the config's digest", DRIVER,
+       """  want=$(docker save --platform "linux/$arch" "$POSTGRES_IMAGE" | tar -xOf - manifest.json |
+    jq -r '.[0].Config | capture("^(blobs/sha256/)?(?<hex>[0-9a-f]{64})(\\\\.json)?$").hex | "sha256:" + .') || want=''
+""", """  want=$(docker image inspect --platform "linux/$arch" --format '{{.Id}}' "$POSTGRES_IMAGE") || want=''
+""")
+mutate("demo-pins-postgres-running-any-platform", "the Postgres digest check saves the image for every platform and reads the first one's config", DRIVER,
+       """docker save --platform "linux/$arch" "$POSTGRES_IMAGE" |""", """docker save "$POSTGRES_IMAGE" |""")
 mutate("demo-pins-contributing-digest-differs", "a docker run command in CONTRIBUTING.md names another Postgres digest", "CONTRIBUTING.md",
        "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\nexport",
        "  postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b25\nexport")
-mutate("demo-pins-libdoc-release-differs", "the audit store's documentation runs another Postgres release", "crates/audit-postgres/src/lib.rs",
+# Only the tag changes in these two: the digest, which is what Docker pulls, is kept, so Docker
+# runs the same image under the name of another release.
+mutate("demo-pins-libdoc-release-differs", "the audit store's documentation names another Postgres release", "crates/audit-postgres/src/lib.rs",
        "//!   postgres:17.11-alpine@sha256:", "//!   postgres:17.10-alpine@sha256:")
-mutate("demo-pins-ci-release-differs", "CI's Postgres service is another release than the demo's", ".github/workflows/ci.yml",
+mutate("demo-pins-ci-release-differs", "CI's Postgres service names another release than the demo's", ".github/workflows/ci.yml",
        "        image: postgres:17.11@sha256:", "        image: postgres:17.10@sha256:")
 # Each docker run command is held to the pin, not only the file: the other command still names it.
 mutate("demo-pins-contributing-digest-dropped", "one docker run command in CONTRIBUTING.md names the Postgres tag without its digest", "CONTRIBUTING.md",

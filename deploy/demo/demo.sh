@@ -21,7 +21,7 @@
 # other cluster name (otto-dev included), drops KUBECONFIG from its environment, and names its
 # own kubeconfig file, .demo/kubeconfig, in every kubectl and kind call.
 #
-# Needs docker (with compose), kind, kubectl, jq and awk on the host.
+# Needs docker (with compose), kind, kubectl, jq, awk and tar on the host.
 #
 # What it reads, and where each comes from:
 #   - the gateway's JSON log lines (crates/gateway): one `"event":"boot"` line per gate, with
@@ -1006,34 +1006,45 @@ load_images() {
   rm -f "$DEMO_DIR/images.tar"
 }
 
-# check_postgres_image: the Postgres pod runs the pinned digest. Its image ID names the index
-# kind's load made, not the pinned multi-arch index, so this reads that index on the pod's node
-# and requires it to list the manifest the pinned index has for this platform (Docker's
-# containerd image store gives that as the ID of the image for one platform).
+# check_postgres_image: the Postgres pod runs the pinned digest. That digest names a multi-arch
+# index the node never sees: the archive kind loads holds this platform's manifest, which
+# Docker's classic image store writes anew when it saves the image, and kind's load wraps it in
+# an index of its own. What reaches the node unchanged is the image's config, and the config's
+# digest is the ID the node gives a container's image. Docker's own image ID cannot stand in for
+# it: the classic store gives the config's digest, the containerd store the manifest's. So this
+# reads the config's digest of the pinned image for this platform from what `docker save`
+# writes, which is the same on both stores, and requires the pod's container to run the image
+# with that ID.
 check_postgres_image() {
-  local arch want pods node ref got
+  local arch want pods node container got
   arch=$(docker version --format '{{.Server.Arch}}')
-  want=$(docker image inspect --platform "linux/$arch" --format '{{.Id}}' "$POSTGRES_IMAGE") || want=''
+  # manifest.json names the config blobs/sha256/<hex>, or <hex>.json before Docker 25.
+  want=$(docker save --platform "linux/$arch" "$POSTGRES_IMAGE" | tar -xOf - manifest.json |
+    jq -r '.[0].Config | capture("^(blobs/sha256/)?(?<hex>[0-9a-f]{64})(\\.json)?$").hex | "sha256:" + .') || want=''
   pods=$(k -n switchboard get pods -l app=postgres \
-    -o jsonpath='{range .items[*]}{.spec.nodeName} {.status.containerStatuses[0].imageID}{"\n"}{end}') || pods=''
+    -o jsonpath='{range .items[*]}{.spec.nodeName} {.status.containerStatuses[0].containerID}{"\n"}{end}') || pods=''
   if [ "$(count_lines . "$pods")" -ne 1 ]; then
     fail "Postgres runs the pinned digest (want one pod, got '$pods')"
+    return
+  fi
+  read -r node container <<<"$pods"
+  if [ -z "$container" ]; then
+    fail "Postgres runs the pinned digest (its pod on $node has no container yet)"
     return
   fi
   case "$want" in
     sha256:*) ;;
     *)
-      fail "Postgres runs the pinned digest (cannot read the manifest for linux/$arch of $POSTGRES_IMAGE: got '$want')"
+      fail "Postgres runs the pinned digest (cannot read the config of $POSTGRES_IMAGE for linux/$arch: got '$want')"
       return
       ;;
   esac
-  read -r node ref <<<"$pods"
-  got=$(docker exec "$node" ctr -n k8s.io content get "${ref##*@}" |
-    jq -r --arg ref "${ref##*@}" 'if .manifests then .manifests[].digest else $ref end') || got=''
-  if printf '%s\n' "$got" | grep -qxF "$want"; then
-    pass "Postgres runs the pinned digest (${POSTGRES_IMAGE#*@}: linux/$arch $want)"
+  # The CRI's imageRef for a listed container is its image's ID.
+  got=$(docker exec "$node" crictl ps -o json --id "${container#*://}" | jq -r '.containers[].imageRef') || got=''
+  if [ "$got" = "$want" ]; then
+    pass "Postgres runs the pinned digest (${POSTGRES_IMAGE#*@}: linux/$arch config $want)"
   else
-    fail "Postgres runs the pinned digest (its image $ref lists '$(printf '%s' "$got" | tr '\n' ' ')', want $want)"
+    fail "Postgres runs the pinned digest (its container ${container#*://} runs image '$(printf '%s' "$got" | tr '\n' ' ')', want $want)"
   fi
 }
 

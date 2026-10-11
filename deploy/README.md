@@ -12,7 +12,7 @@ deploy/demo/demo.sh down all       # both
 
 Every check prints PASS or FAIL. The last line counts them, and the script exits non-zero if
 any check failed or any step could not run. Nothing is retried. It needs docker with compose,
-kind, kubectl, jq and awk.
+kind, kubectl, jq, awk and tar.
 
 A run leaves what it started running, so it can be looked at afterwards. `down` takes down
 only what it names: stopping Compose never deletes the cluster.
@@ -205,11 +205,19 @@ names the tag alone, and the driver pulls the pinned digest, tags it with that t
 The pod has `imagePullPolicy: Never` too, so it never pulls whatever the tag names today. Its
 template carries the digest as the annotation `switchboard.io/image-digest`, which the driver
 fills in when it applies the manifests: a new digest under the same tag changes the template, and
-the pod is replaced. After the rollout the driver checks that the pod runs the pinned digest. The
-pod's image ID names the index kind's load made, not the pinned one, so the driver reads that
-index on the node and requires it to list the manifest the pinned index has for this platform.
-`crates/demo-checks/tests/pins.rs` holds every Postgres pin in the repository to one release and
-digest.
+the pod is replaced. After the rollout the driver checks that the pod runs the pinned digest.
+The node never has that digest, and with Docker's classic image store not even this platform's
+manifest: kind's load wraps the archive in an index of its own, and the classic store writes a
+new manifest when it saves the image. Nor can Docker's image ID stand in for it: that is the
+config's digest on the classic store and the manifest's on the containerd store. What reaches
+the node unchanged is the image's config. So
+the driver reads the config's digest of the pinned image for this platform from what
+`docker save` writes, the same on both stores, and requires the pod's container to run the image
+with that ID, as `crictl ps` lists it on the node.
+
+`crates/demo-checks/tests/pins.rs` holds every Postgres pin in the repository to one release,
+and every one but CI's to one digest. CI's service container runs the Debian variant of the same
+release, pinned by a digest of its own.
 
 ## What runs
 
