@@ -672,9 +672,13 @@ fn the_admin_credential_must_be_its_own_and_have_an_endpoint() {
 
     // The admin credential may not be a caller's, whichever line of a digest file holds it.
     let caller_file = token_file("admin-is-a-caller", &format!("{digest}\n"));
-    let digests = token_file(
+    let admin_first = token_file(
         "admin-in-digests",
         &format!("{} atlas\n{digest} borealis\n", sha256_hex(ADMIN_TOKEN)),
+    );
+    let admin_second = token_file(
+        "admin-second-in-digests",
+        &format!("{digest} atlas\n{} borealis\n", sha256_hex(ADMIN_TOKEN)),
     );
     for (credential, admin) in [
         (
@@ -682,7 +686,14 @@ fn the_admin_credential_must_be_its_own_and_have_an_endpoint() {
             caller_file.to_str().unwrap(),
         ),
         (
-            ("MOCK_DOCS_TOKEN_SHA256_FILE", digests.to_str().unwrap()),
+            ("MOCK_DOCS_TOKEN_SHA256_FILE", admin_first.to_str().unwrap()),
+            admin_file,
+        ),
+        (
+            (
+                "MOCK_DOCS_TOKEN_SHA256_FILE",
+                admin_second.to_str().unwrap(),
+            ),
             admin_file,
         ),
     ] {

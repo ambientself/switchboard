@@ -2451,7 +2451,8 @@ mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the cal
 mutate("mock-docs-admin-fallback-takes-callers", "an unknown path on the admin endpoint accepts the callers' bearers", MS,
        "            .fallback(admin_other_request)\n            .with_state(self.clone())",
        "            .fallback(other_request)\n            .with_state(self.clone())")
-# A caller's JWT with the admin credential's digest, and the route fallbacks (#137).
+# A caller's JWT with the admin credential's digest, the route fallbacks, and the digest file's
+# later lines (#137).
 mutate("mock-docs-admin-caller-jwt-accepted", "a caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
        "            accepted: token.is_some_and(|token| admin.accepts(token))\n                && !self.authenticate(headers).accepted,",
        "            accepted: token.is_some_and(|token| admin.accepts(token)),")
@@ -2461,6 +2462,9 @@ mutate("mock-docs-admin-callers-route-fallback-takes-callers", "another method o
 mutate("mock-docs-admin-definitions-route-fallback-takes-callers", "another method on /admin/definitions/{tool} accepts the callers' bearers", MS,
        "                    .delete(admin_delete_definition)\n                    .fallback(admin_other_request),",
        "                    .delete(admin_delete_definition)\n                    .fallback(other_request),")
+mutate("mock-docs-admin-is-a-caller-first-line-only", "only a digest file's first line is checked against the admin credential", MC,
+       "            && callers.iter().any(|caller| caller.same_token(admin))",
+       "            && callers.first().is_some_and(|caller| caller.same_token(admin))")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
