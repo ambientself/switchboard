@@ -2270,9 +2270,9 @@ mutate("mock-docs-mcp-body-read-before-auth", "POST /mcp waits for the whole bod
        '    let body = Body::from(read_body(body).await.unwrap_or_default());\n'
        '    let caller = server.authenticate(&headers);\n    let mut line = request_line("request", &method, &uri, &caller);\n')
 mutate("mock-docs-admin-body-read-before-auth", "PUT /admin/tools waits for the whole body before checking the caller", MS,
-       '    let caller = server.authenticate(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n',
+       '    let caller = server.authenticate_admin(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n',
        '    let body = Body::from(read_body(body).await.unwrap_or_default());\n'
-       '    let caller = server.authenticate(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n')
+       '    let caller = server.authenticate_admin(&headers);\n    let line = request_line("admin", &method, &uri, &caller);\n')
 mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice", MS,
        "                if tools.contains(&tool) {", "                if false {")
 # The JWT mode (decision 0010).
@@ -2320,7 +2320,8 @@ mutate("mock-docs-jwt-static-and-jwt-takes-jwt", "with a static credential and J
        "            (true, false) => Credential::Jwt(read_jwt(&var)?),",
        "            (true, _) => Credential::Jwt(read_jwt(&var)?),")
 mutate("mock-docs-jwt-empty-setting-accepted", "a JWT setting of only whitespace counts as set", MC,
-       "            .filter(|value| !value.is_empty())\n", "")
+       "            .find(|name| var(name).is_some_and(|value| value.trim().is_empty()))",
+       "            .find(|name| var(name).is_some_and(|value| value.is_empty()))")
 mutate("mock-docs-jwt-non-rsa-key-accepted", "a JWK set may hold an EC or symmetric key", MJ,
        "            if !matches!(jwk.algorithm, AlgorithmParameters::RSA(_)) {", "            if false {")
 mutate("mock-docs-jwt-key-alg-unchecked", "a key declared for another algorithm is accepted", MJ,
@@ -2354,6 +2355,28 @@ mutate("mock-docs-admin-projects-ignored", "the admin endpoint answers a change 
        "    if !server.set_projects(&target, projects.clone()) {", "    if server.projects(&target).is_none() {")
 mutate("mock-docs-admin-change-refusal-skipped", "the admin changes to definitions and callers answer a caller they did not accept", MS,
        "    if caller.accepted {\n        Some(line)", "    if true {\n        Some(line)")
+# Blank settings and the admin endpoint's reach (#121).
+mutate("mock-docs-blank-setting-accepted", "a setting that is set but empty is read as unset or as its value", MC,
+       "            return Err(ConfigError::Blank(blank));", "            let _ = blank;")
+mutate_all(
+    "mock-docs-blank-subjects-unchecked",
+    "MOCK_DOCS_JWT_SUBJECTS set but blank is not refused as blank",
+    (MC, "pub const VALUED_VARS: [&str; 12] = [", "pub const VALUED_VARS: [&str; 11] = ["),
+    (MC, "    JWT_SUBJECT_VAR,\n    JWT_SUBJECTS_VAR,\n    JWKS_FILE_VAR,\n    LISTEN_VAR,",
+     "    JWT_SUBJECT_VAR,\n    JWKS_FILE_VAR,\n    LISTEN_VAR,"),
+)
+mutate("mock-docs-admin-beyond-loopback-accepted", "the admin endpoint may listen beyond loopback without an admin credential", MC,
+       "            (Some(address), None) if !address.ip().is_loopback() => {",
+       "            (Some(address), None) if address.ip().is_multicast() => {")
+mutate("mock-docs-admin-credential-unused-accepted", "an admin credential without an admin endpoint is accepted", MC,
+       "            (None, Some(_)) => return Err(ConfigError::AdminCredentialUnused),", "            (None, Some(_)) => {}")
+mutate("mock-docs-admin-credential-is-a-caller", "the admin credential may also be a caller's", MC,
+       "            && callers.iter().any(|caller| caller.same_token(admin))", "            && callers.is_empty()")
+mutate("mock-docs-admin-callers-accepted", "with an admin credential, the admin endpoint still answers the callers", MS,
+       "            accepted: token.is_some_and(|token| admin.accepts(token)),",
+       "            accepted: token.is_some_and(|token| admin.accepts(token))\n                || self.authenticate(headers).accepted,")
+mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the callers and ignores the admin credential", MS,
+       "        let Some(admin) = &self.inner.admin else {", "        let Some(admin) = None::<&AcceptedCredential> else {")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
