@@ -7,7 +7,9 @@ use std::time::{Duration, SystemTime};
 use deadpool_postgres::{
     ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod,
 };
-use gateway_core::audit::{AuditRowId, Completion, ListRecord, RowCompletion, StoreError};
+use gateway_core::audit::{
+    AuditRowId, Completion, ErrorKind, ListRecord, RowCompletion, StoreError,
+};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -67,8 +69,8 @@ pub enum PgAuditError {
         /// The row finish named.
         row: String,
     },
-    /// The row was completed before, with a different outcome or latency. The first
-    /// completion stands.
+    /// The row was completed before, with a different outcome, sentence, error kind or
+    /// latency. The first completion stands.
     #[error("audit row {row} is already complete, with a different completion")]
     CompletedDifferently {
         /// The row finish named.
@@ -812,9 +814,9 @@ impl PgAuditStore {
         }
     }
 
-    /// Completes `row`, whose begin failed after its insert was executed, as `error` with a
-    /// latency of 0, on a task of its own on the finish pool, until the finish deadline.
-    /// Counted in flight until it ends.
+    /// Completes `row`, whose begin failed after its insert was executed, as `error` of the kind
+    /// `other` with a latency of 0, as the core gives up a guard, on a task of its own on the
+    /// finish pool, until the finish deadline. Counted in flight until it ends.
     fn complete_lost_begin(&self, row: AuditRowId) {
         let settle = Settle {
             in_flight: InFlight::start(&self.counters),
@@ -827,9 +829,11 @@ impl PgAuditStore {
             pool: self.finish.clone(),
             cancel: Arc::clone(&self.cancel),
             row: row.as_str().to_owned(),
+            // As the core gives up a guard: an error of the kind `other`.
             finish: FinishRow {
                 outcome: "error",
                 outcome_sentence: None,
+                error_kind: Some(FinishRow::error_kind_name(ErrorKind::Other)),
                 latency_ms: 0,
             },
             attempt: self.budgets.answer,
@@ -1046,6 +1050,7 @@ async fn complete_on(
                 &row,
                 &finish.outcome,
                 &finish.outcome_sentence,
+                &finish.error_kind,
                 &finish.latency_ms,
             ],
         )
@@ -1063,9 +1068,19 @@ async fn complete_on(
     };
     let outcome: Option<String> = existing.try_get(0)?;
     let outcome_sentence: Option<String> = existing.try_get(1)?;
-    let latency_ms: Option<i64> = existing.try_get(2)?;
+    let error_kind: Option<String> = existing.try_get(2)?;
+    let latency_ms: Option<i64> = existing.try_get(3)?;
     match outcome {
-        Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),
+        Some(outcome)
+            if finish.is(
+                &outcome,
+                outcome_sentence.as_deref(),
+                error_kind.as_deref(),
+                latency_ms,
+            ) =>
+        {
+            Ok(())
+        }
         Some(_) => Err(PgAuditError::CompletedDifferently {
             row: row.to_owned(),
         }),
@@ -1404,7 +1419,9 @@ mod unit {
             });
         let row = AuditRowId::new("00000000-0000-4000-8000-000000000000");
         let completion = Completion {
-            outcome: gateway_core::audit::Outcome::Error,
+            outcome: gateway_core::audit::Outcome::Error {
+                error_kind: ErrorKind::Other,
+            },
             latency_ms: 1,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()

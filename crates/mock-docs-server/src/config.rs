@@ -1,5 +1,6 @@
 //! Configuration, from environment variables.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -7,6 +8,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::documents::PROJECTS;
 use crate::jwt::JwtVerifier;
 use crate::tools::{DEFAULT_TOOLS, ToolName, parse_tool_list};
 
@@ -17,24 +19,34 @@ pub const DEFAULT_SLOW: Duration = Duration::from_secs(10);
 /// How many hex digits of a bearer's SHA-256 each log line carries.
 pub const LOGGED_PREFIX_HEX: usize = 12;
 
-/// The variable naming the file that holds the one accepted bearer credential.
+/// The variable naming the file that holds the one accepted bearer credential. It may name
+/// every project.
 pub const TOKEN_FILE_VAR: &str = "MOCK_DOCS_TOKEN_FILE";
-/// The variable holding the hex SHA-256 of the one accepted bearer credential.
+/// The variable holding the hex SHA-256 of the one accepted bearer credential. It may name
+/// every project.
 pub const TOKEN_SHA256_VAR: &str = "MOCK_DOCS_TOKEN_SHA256";
-/// The variable naming a file that holds the hex SHA-256 of the one accepted bearer
-/// credential, so a deployment can hand the server a secret file holding only the hash.
+/// The variable naming a file that holds the hex SHA-256 of each accepted bearer credential,
+/// so a deployment can hand the server a secret file holding only hashes. Each line is a
+/// digest, alone or followed by a space and the comma-separated projects that credential may
+/// name: `<hex> atlas,borealis`. A digest alone may name every project, so a file holding one
+/// digest reads as it always has.
 pub const TOKEN_SHA256_FILE_VAR: &str = "MOCK_DOCS_TOKEN_SHA256_FILE";
 /// The variable holding the issuer a JWT must name, in the JWT mode.
 pub const JWT_ISSUER_VAR: &str = "MOCK_DOCS_JWT_ISSUER";
 /// The variable holding the audience a JWT must name, in the JWT mode.
 pub const JWT_AUDIENCE_VAR: &str = "MOCK_DOCS_JWT_AUDIENCE";
 /// The variable holding the one subject accepted in the JWT mode, such as
-/// `system:serviceaccount:switchboard:gateway`.
+/// `system:serviceaccount:switchboard:gateway`. It may name every project.
 pub const JWT_SUBJECT_VAR: &str = "MOCK_DOCS_JWT_SUBJECT";
+/// The variable holding the subjects accepted in the JWT mode, in place of [`JWT_SUBJECT_VAR`],
+/// each with the projects it may name: `<subject>=<project>[,<project>]`, entries separated by
+/// `;`, as in `system:serviceaccount:team-a:agent=atlas;system:serviceaccount:team-b:agent=borealis`.
+pub const JWT_SUBJECTS_VAR: &str = "MOCK_DOCS_JWT_SUBJECTS";
 /// The variable naming the file that holds the JWK set a JWT must be signed by, in the shape a
 /// Kubernetes API server's `/openid/v1/jwks` returns.
 pub const JWKS_FILE_VAR: &str = "MOCK_DOCS_JWKS_FILE";
-/// The JWT mode's variables. All four are set together, or none is.
+/// The JWT mode's variables. All four are set together, or none is; [`JWT_SUBJECTS_VAR`] may
+/// stand in for [`JWT_SUBJECT_VAR`].
 pub const JWT_VARS: [&str; 4] = [
     JWT_ISSUER_VAR,
     JWT_AUDIENCE_VAR,
@@ -52,25 +64,102 @@ pub const TOOLS_VAR: &str = "MOCK_DOCS_TOOLS";
 /// The variable holding `slow-doc`'s delay in milliseconds.
 pub const SLOW_MS_VAR: &str = "MOCK_DOCS_SLOW_MS";
 
-/// The one bearer credential the server accepts, held only as its SHA-256.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AcceptedCredential {
-    digest: [u8; 32],
+/// The projects a caller may name in a tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Projects {
+    /// Every project: the one credential of the variables that name a single one.
+    Every,
+    /// Only these. A call naming any other gets a 403.
+    Only(BTreeSet<String>),
 }
 
-impl AcceptedCredential {
-    /// Accepts exactly `token`.
-    pub fn token(token: &str) -> Self {
-        Self {
-            digest: sha256(token),
+impl Projects {
+    /// Only `projects`.
+    pub fn only<'a>(projects: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::Only(projects.into_iter().map(str::to_owned).collect())
+    }
+
+    /// Whether a call may name `project`.
+    pub fn allows(&self, project: &str) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Only(projects) => projects.contains(project),
         }
     }
 
-    /// Accepts the token whose SHA-256 is `hex` (64 hex digits, either case).
+    /// As log lines and the admin endpoint show it: `"every"`, or the projects in order.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Every => serde_json::json!("every"),
+            Self::Only(projects) => serde_json::json!(projects),
+        }
+    }
+}
+
+/// Reads a comma-separated list of projects, as [`named_projects`] takes them.
+pub fn parse_projects(list: &str) -> Result<Projects, String> {
+    named_projects(list.split(',').map(str::trim))
+}
+
+/// The projects `names`. Each must be one the server holds and named once, and there must be at
+/// least one.
+pub fn named_projects<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Projects, String> {
+    let mut projects = BTreeSet::new();
+    for project in names {
+        if project.is_empty() {
+            return Err("a project name is empty".to_owned());
+        }
+        if !PROJECTS.contains(&project) {
+            return Err(format!(
+                "there is no project `{project}`; the projects are {}",
+                PROJECTS.join(", ")
+            ));
+        }
+        if !projects.insert(project.to_owned()) {
+            return Err(format!("project `{project}` is named twice"));
+        }
+    }
+    if projects.is_empty() {
+        return Err("no project is named".to_owned());
+    }
+    Ok(Projects::Only(projects))
+}
+
+/// A bearer credential the server accepts, held only as its SHA-256, and the projects it may
+/// name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AcceptedCredential {
+    digest: [u8; 32],
+    projects: Projects,
+}
+
+impl AcceptedCredential {
+    /// Accepts exactly `token`, for every project.
+    pub fn token(token: &str) -> Self {
+        Self {
+            digest: sha256(token),
+            projects: Projects::Every,
+        }
+    }
+
+    /// Accepts the token whose SHA-256 is `hex` (64 hex digits, either case), for every project.
     pub fn sha256_hex(hex: &str) -> Result<Self, ConfigError> {
         decode_digest(hex.trim())
-            .map(|digest| Self { digest })
+            .map(|digest| Self {
+                digest,
+                projects: Projects::Every,
+            })
             .ok_or(ConfigError::BadDigest)
+    }
+
+    /// The same credential, limited to `projects`.
+    pub fn limited_to(self, projects: Projects) -> Self {
+        Self { projects, ..self }
+    }
+
+    /// The projects this credential may name at start.
+    pub fn projects(&self) -> &Projects {
+        &self.projects
     }
 
     /// Whether `token` is the accepted credential.
@@ -85,19 +174,20 @@ impl AcceptedCredential {
     }
 
     /// The logged prefix of the accepted credential's SHA-256, for comparing with request logs.
+    /// It also names the credential on the admin endpoint.
     pub fn logged_prefix(&self) -> String {
         logged_prefix(&self.digest)
     }
 
     /// Reads the static mode's variables through `var`: exactly one must be set.
-    fn from_vars(var: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+    fn from_vars(var: &impl Fn(&str) -> Option<String>) -> Result<Vec<Self>, ConfigError> {
         let accepted = match (
             var(TOKEN_FILE_VAR),
             var(TOKEN_SHA256_VAR),
             var(TOKEN_SHA256_FILE_VAR),
         ) {
-            (Some(path), None, None) => read_token_file(Path::new(&path))?,
-            (None, Some(hex), None) => AcceptedCredential::sha256_hex(&hex)?,
+            (Some(path), None, None) => vec![read_token_file(Path::new(&path))?],
+            (None, Some(hex), None) => vec![AcceptedCredential::sha256_hex(&hex)?],
             (None, None, Some(path)) => read_digest_file(Path::new(&path))?,
             (None, None, None) => return Err(ConfigError::NoCredential),
             _ => return Err(ConfigError::TwoCredentials),
@@ -108,21 +198,46 @@ impl AcceptedCredential {
 
 impl fmt::Debug for AcceptedCredential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "AcceptedCredential({}…)", self.logged_prefix())
+        write!(
+            formatter,
+            "AcceptedCredential({}…, {:?})",
+            self.logged_prefix(),
+            self.projects
+        )
     }
 }
 
-/// What the server accepts: one static bearer credential, or one subject's signed tokens.
+/// What the server accepts: static bearer credentials, or the signed tokens of some subjects.
 #[derive(Clone, Debug)]
 pub enum Credential {
-    /// The static mode: one bearer credential, held as its SHA-256.
-    Static(AcceptedCredential),
-    /// The JWT mode: tokens from one issuer, for one audience, about one subject.
+    /// The static mode: bearer credentials, each held as its SHA-256.
+    Static(Vec<AcceptedCredential>),
+    /// The JWT mode: tokens from one issuer, for one audience, about one of some subjects.
     Jwt(JwtVerifier),
+}
+
+impl Credential {
+    /// Each accepted caller's name and the projects it may name at start. A caller is named by
+    /// its subject in the JWT mode and by its digest's logged prefix in the static mode.
+    pub fn callers(&self) -> BTreeMap<String, Projects> {
+        match self {
+            Self::Static(accepted) => accepted
+                .iter()
+                .map(|accepted| (accepted.logged_prefix(), accepted.projects.clone()))
+                .collect(),
+            Self::Jwt(verifier) => verifier.subjects().clone(),
+        }
+    }
 }
 
 impl From<AcceptedCredential> for Credential {
     fn from(accepted: AcceptedCredential) -> Self {
+        Self::Static(vec![accepted])
+    }
+}
+
+impl From<Vec<AcceptedCredential>> for Credential {
+    fn from(accepted: Vec<AcceptedCredential>) -> Self {
         Self::Static(accepted)
     }
 }
@@ -170,10 +285,14 @@ impl Settings {
     /// Reads the settings through `var`, which returns a variable's value or `None` if it is
     /// unset. The server runs in one of two modes. In the static mode exactly one of
     /// [`TOKEN_FILE_VAR`], [`TOKEN_SHA256_VAR`] and [`TOKEN_SHA256_FILE_VAR`] is set. In the
-    /// JWT mode all four of [`JWT_VARS`] are set, and none of the static ones. Anything
-    /// missing, contradictory or unreadable is an error, and the server does not start.
+    /// JWT mode all four of [`JWT_VARS`] are set, or [`JWT_SUBJECTS_VAR`] in place of
+    /// [`JWT_SUBJECT_VAR`], and none of the static ones. Anything missing, contradictory or
+    /// unreadable is an error, and the server does not start.
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let jwt_set = JWT_VARS.iter().any(|name| var(name).is_some());
+        let jwt_set = JWT_VARS
+            .iter()
+            .chain([&JWT_SUBJECTS_VAR])
+            .any(|name| var(name).is_some());
         let static_set = STATIC_VARS.iter().any(|name| var(name).is_some());
         let accepted = match (jwt_set, static_set) {
             (true, true) => return Err(ConfigError::StaticAndJwt),
@@ -237,6 +356,12 @@ pub enum ConfigError {
     JwtIncomplete(&'static str),
     /// The JWK set file could not be read, or does not hold a set of RS256 keys.
     Jwks(String),
+    /// Both [`JWT_SUBJECT_VAR`] and [`JWT_SUBJECTS_VAR`] are set.
+    SubjectAndSubjects,
+    /// [`JWT_SUBJECTS_VAR`] is malformed, names a subject twice or names an unknown project.
+    JwtSubjects(String),
+    /// A line of the digest file is malformed, repeats a digest or names an unknown project.
+    DigestFile(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -271,10 +396,17 @@ impl fmt::Display for ConfigError {
             ),
             Self::JwtIncomplete(var) => write!(
                 formatter,
-                "{var} is missing or empty: the JWT mode needs all of {}",
+                "{var} is missing or empty: the JWT mode needs all of {}, \
+                 or {JWT_SUBJECTS_VAR} in place of {JWT_SUBJECT_VAR}",
                 JWT_VARS.join(", ")
             ),
             Self::Jwks(reason) => write!(formatter, "{JWKS_FILE_VAR}: {reason}"),
+            Self::SubjectAndSubjects => write!(
+                formatter,
+                "set either {JWT_SUBJECT_VAR} or {JWT_SUBJECTS_VAR}, not both"
+            ),
+            Self::JwtSubjects(reason) => write!(formatter, "{JWT_SUBJECTS_VAR}: {reason}"),
+            Self::DigestFile(reason) => write!(formatter, "{TOKEN_SHA256_FILE_VAR}: {reason}"),
         }
     }
 }
@@ -282,16 +414,51 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn read_jwt(var: &impl Fn(&str) -> Option<String>) -> Result<JwtVerifier, ConfigError> {
-    let [issuer, audience, subject, jwks_file] = JWT_VARS.map(|name| {
+    let set = |name| {
         var(name)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .ok_or(ConfigError::JwtIncomplete(name))
-    });
-    let (issuer, audience, subject, jwks_file) = (issuer?, audience?, subject?, jwks_file?);
+    };
+    let [issuer, audience, subject, jwks_file] =
+        JWT_VARS.map(|name| set(name).ok_or(ConfigError::JwtIncomplete(name)));
+    let (issuer, audience) = (issuer?, audience?);
+    let subjects = match (subject, set(JWT_SUBJECTS_VAR)) {
+        (Ok(_), Some(_)) => return Err(ConfigError::SubjectAndSubjects),
+        (Ok(subject), None) => BTreeMap::from([(subject, Projects::Every)]),
+        (Err(_), Some(subjects)) => parse_subjects(&subjects).map_err(ConfigError::JwtSubjects)?,
+        (Err(missing), None) => return Err(missing),
+    };
+    let jwks_file = jwks_file?;
     let jwks = std::fs::read_to_string(&jwks_file)
         .map_err(|error| ConfigError::Jwks(format!("cannot read {jwks_file}: {error}")))?;
-    JwtVerifier::new(&issuer, &audience, &subject, &jwks).map_err(ConfigError::Jwks)
+    JwtVerifier::with_subjects(&issuer, &audience, subjects, &jwks).map_err(ConfigError::Jwks)
+}
+
+/// Reads [`JWT_SUBJECTS_VAR`]: `<subject>=<project>[,<project>]` entries separated by `;`.
+/// Space around each part is ignored, and so is an empty entry, such as after a last `;`.
+fn parse_subjects(value: &str) -> Result<BTreeMap<String, Projects>, String> {
+    let mut subjects = BTreeMap::new();
+    for entry in value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (subject, projects) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("`{entry}` is not <subject>=<project>[,<project>]"))?;
+        let subject = subject.trim();
+        if subject.is_empty() {
+            return Err(format!("`{entry}` names no subject"));
+        }
+        let projects = parse_projects(projects).map_err(|reason| format!("{subject}: {reason}"))?;
+        if subjects.insert(subject.to_owned(), projects).is_some() {
+            return Err(format!("subject `{subject}` is named twice"));
+        }
+    }
+    if subjects.is_empty() {
+        return Err("names no subject".to_owned());
+    }
+    Ok(subjects)
 }
 
 fn read_token_file(path: &Path) -> Result<AcceptedCredential, ConfigError> {
@@ -305,10 +472,31 @@ fn read_token_file(path: &Path) -> Result<AcceptedCredential, ConfigError> {
     Ok(AcceptedCredential::token(token))
 }
 
-fn read_digest_file(path: &Path) -> Result<AcceptedCredential, ConfigError> {
+/// Reads the digest file: one credential per line, a digest alone or followed by a space and
+/// its projects. Empty lines are skipped. No two lines may share a logged prefix, since that
+/// prefix names the credential on the admin endpoint; the same digest twice is refused so.
+fn read_digest_file(path: &Path) -> Result<Vec<AcceptedCredential>, ConfigError> {
     let text =
         std::fs::read_to_string(path).map_err(|error| ConfigError::TokenFile(error.to_string()))?;
-    AcceptedCredential::sha256_hex(&text)
+    let mut accepted: Vec<AcceptedCredential> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let credential = match line.split_once(char::is_whitespace) {
+            None => AcceptedCredential::sha256_hex(line)?,
+            Some((hex, projects)) => AcceptedCredential::sha256_hex(hex)?
+                .limited_to(parse_projects(projects.trim()).map_err(ConfigError::DigestFile)?),
+        };
+        let prefix = credential.logged_prefix();
+        if accepted.iter().any(|other| other.logged_prefix() == prefix) {
+            return Err(ConfigError::DigestFile(format!(
+                "the digest {prefix}… is given twice"
+            )));
+        }
+        accepted.push(credential);
+    }
+    if accepted.is_empty() {
+        return Err(ConfigError::BadDigest);
+    }
+    Ok(accepted)
 }
 
 fn address(var: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {

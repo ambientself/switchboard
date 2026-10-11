@@ -2,14 +2,14 @@
 //! start on missing or contradictory settings, and serves and logs when they are right.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use mock_docs_server::{
-    AcceptedCredential, ConfigError, Credential, DEFAULT_TOOLS, Settings, ToolName,
+    AcceptedCredential, ConfigError, Credential, DEFAULT_TOOLS, Projects, Settings, ToolName,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -32,12 +32,21 @@ fn settings(vars: &[(&str, &str)]) -> Result<Settings, ConfigError> {
     Settings::from_vars(|name| vars.get(name).cloned())
 }
 
-/// The static credential the settings accept. Panics on an error or in the JWT mode.
-fn accepted(settings: Result<Settings, ConfigError>) -> AcceptedCredential {
+/// The static credentials the settings accept. Panics on an error or in the JWT mode.
+fn all_accepted(settings: Result<Settings, ConfigError>) -> Vec<AcceptedCredential> {
     match settings.unwrap().config.accepted {
         Credential::Static(accepted) => accepted,
         Credential::Jwt(verifier) => panic!("expected the static mode, not {verifier:?}"),
     }
+}
+
+/// The one static credential the settings accept, which may name every project.
+fn accepted(settings: Result<Settings, ConfigError>) -> AcceptedCredential {
+    let mut accepted = all_accepted(settings);
+    assert_eq!(accepted.len(), 1, "{accepted:?}");
+    let accepted = accepted.remove(0);
+    assert_eq!(accepted.projects(), &Projects::Every);
+    accepted
 }
 
 /// A file holding `contents`, in a directory of its own for this test.
@@ -217,6 +226,71 @@ fn each_setting_is_read_and_a_bad_one_refused() {
     }
 }
 
+// --- Several static credentials, each limited to its projects ----------------------------
+
+const OTHER_TOKEN: &str = "dummy-workload-token-for-tests";
+
+#[test]
+fn a_digest_file_may_limit_each_credential_to_its_projects() {
+    let file = token_file(
+        "teams",
+        &format!(
+            "{} atlas\n\n  {}  borealis , atlas \n",
+            sha256_hex(TOKEN),
+            sha256_hex(OTHER_TOKEN).to_uppercase()
+        ),
+    );
+    let teams = all_accepted(settings(&[(
+        "MOCK_DOCS_TOKEN_SHA256_FILE",
+        file.to_str().unwrap(),
+    )]));
+    assert_eq!(teams.len(), 2, "{teams:?}");
+    assert!(teams[0].accepts(TOKEN));
+    assert_eq!(teams[0].projects(), &Projects::only(["atlas"]));
+    assert!(teams[1].accepts(OTHER_TOKEN));
+    assert_eq!(teams[1].projects(), &Projects::only(["atlas", "borealis"]));
+
+    // A digest alone, as the demos' files hold, may name every project.
+    let file = token_file("legacy", &format!("{}\n", sha256_hex(TOKEN)));
+    accepted(settings(&[(
+        "MOCK_DOCS_TOKEN_SHA256_FILE",
+        file.to_str().unwrap(),
+    )]));
+}
+
+#[test]
+fn a_digest_file_with_a_bad_project_list_or_a_digest_twice_is_refused() {
+    let digest = sha256_hex(TOKEN);
+    let other = sha256_hex(OTHER_TOKEN);
+    for (name, contents) in [
+        ("unknown-project", format!("{digest} atlas,cygnus")),
+        ("empty-project", format!("{digest} atlas,")),
+        ("project-twice", format!("{digest} atlas,atlas")),
+        ("digest-twice", format!("{digest} atlas\n{digest} borealis")),
+        (
+            "digest-twice-either-case",
+            format!("{digest}\n{}", digest.to_uppercase()),
+        ),
+    ] {
+        let path = token_file(name, &contents);
+        assert!(
+            matches!(
+                settings(&[("MOCK_DOCS_TOKEN_SHA256_FILE", path.to_str().unwrap())]),
+                Err(ConfigError::DigestFile(_))
+            ),
+            "{name}"
+        );
+    }
+    let path = token_file(
+        "bad-digest-line",
+        &format!("{other} atlas\n{TOKEN} borealis"),
+    );
+    assert_eq!(
+        settings(&[("MOCK_DOCS_TOKEN_SHA256_FILE", path.to_str().unwrap())]).unwrap_err(),
+        ConfigError::BadDigest
+    );
+}
+
 // --- The JWT mode's settings -------------------------------------------------------------
 
 const ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
@@ -274,10 +348,89 @@ fn the_jwt_settings_give_the_jwt_mode() {
     assert_eq!(verifier.issuer(), ISSUER);
     assert_eq!(verifier.audience(), "mock-docs");
     assert_eq!(
-        verifier.subject(),
-        "system:serviceaccount:switchboard:gateway"
+        verifier.subjects(),
+        &BTreeMap::from([(
+            "system:serviceaccount:switchboard:gateway".to_owned(),
+            Projects::Every
+        )])
     );
     assert_eq!(verifier.key_ids(), ["key-1", "key-2"]);
+}
+
+const ATLAS: &str = "system:serviceaccount:team-atlas:agent";
+const BOREALIS: &str = "system:serviceaccount:team-borealis:agent";
+
+/// The JWT variables with `MOCK_DOCS_JWT_SUBJECTS` in place of `MOCK_DOCS_JWT_SUBJECT`.
+fn subjects_settings(test: &str, subjects: &str) -> Result<Settings, ConfigError> {
+    let path = token_file(
+        &format!("jwks-{test}"),
+        &json!({"keys": [jwk(json!({}))]}).to_string(),
+    );
+    settings(&[
+        ("MOCK_DOCS_JWT_ISSUER", ISSUER),
+        ("MOCK_DOCS_JWT_AUDIENCE", "mock-docs"),
+        ("MOCK_DOCS_JWT_SUBJECTS", subjects),
+        ("MOCK_DOCS_JWKS_FILE", path.to_str().unwrap()),
+    ])
+}
+
+#[test]
+fn several_subjects_each_limited_to_their_projects_give_the_jwt_mode() {
+    let read = subjects_settings(
+        "subjects",
+        &format!(" {ATLAS}=atlas ;\n{BOREALIS} = borealis,atlas;"),
+    )
+    .unwrap();
+    let Credential::Jwt(verifier) = read.config.accepted else {
+        panic!("not the JWT mode");
+    };
+    assert_eq!(
+        verifier.subjects(),
+        &BTreeMap::from([
+            (ATLAS.to_owned(), Projects::only(["atlas"])),
+            (BOREALIS.to_owned(), Projects::only(["atlas", "borealis"])),
+        ])
+    );
+}
+
+#[test]
+fn malformed_subjects_or_a_subject_twice_are_refused() {
+    for (name, subjects) in [
+        ("no-equals", ATLAS.to_owned()),
+        ("no-subject", "=atlas".to_owned()),
+        ("no-project", format!("{ATLAS}=")),
+        ("unknown-project", format!("{ATLAS}=cygnus")),
+        ("project-twice", format!("{ATLAS}=atlas,atlas")),
+        ("subject-twice", format!("{ATLAS}=atlas;{ATLAS}=borealis")),
+        ("only-separators", " ; ;".to_owned()),
+    ] {
+        assert!(
+            matches!(
+                subjects_settings(name, &subjects),
+                Err(ConfigError::JwtSubjects(_))
+            ),
+            "{name}: {subjects}"
+        );
+    }
+    let mut both: Vec<(&str, &str)> = JWT_VARS.iter().map(|name| (*name, "x")).collect();
+    both.push(("MOCK_DOCS_JWT_SUBJECTS", "x=atlas"));
+    assert_eq!(
+        settings(&both).unwrap_err(),
+        ConfigError::SubjectAndSubjects
+    );
+    // The subjects variable alone starts the JWT mode, and so cannot sit beside a static one.
+    assert_eq!(
+        settings(&[
+            ("MOCK_DOCS_TOKEN_SHA256", &sha256_hex(TOKEN)),
+            ("MOCK_DOCS_JWT_SUBJECTS", "x=atlas"),
+        ])
+        .unwrap_err(),
+        ConfigError::StaticAndJwt
+    );
+    assert_eq!(
+        settings(&[("MOCK_DOCS_JWT_SUBJECTS", "x=atlas")]).unwrap_err(),
+        ConfigError::JwtIncomplete("MOCK_DOCS_JWT_ISSUER")
+    );
 }
 
 #[test]
@@ -422,7 +575,10 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
     assert_eq!(boot["event"], "boot");
     assert_eq!(boot["tools"], json!(["read_document"]));
     assert_eq!(boot["mode"], "static");
-    assert_eq!(boot["accepted_sha256"], sha256_hex(TOKEN)[..12]);
+    assert_eq!(
+        boot["callers"],
+        json!({ &sha256_hex(TOKEN)[..12]: "every" })
+    );
     assert_eq!(boot["admin_listen"], Value::Null);
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
 

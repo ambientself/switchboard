@@ -119,6 +119,7 @@ fn a_token_under_a_new_kid_is_refused_before_and_accepted_after() {
         KeysReplaced {
             added: kids(&[ROTATED.key_id()]),
             removed: kids(&[]),
+            changed: kids(&[]),
         }
     );
     assert_eq!(outcome(&gate, &token(&ROTATED)), Ok(()));
@@ -136,10 +137,70 @@ fn a_token_under_a_dropped_kid_is_accepted_before_and_refused_after() {
         KeysReplaced {
             added: kids(&[ROTATED.key_id()]),
             removed: kids(&[ec().key_id()]),
+            changed: kids(&[]),
         }
     );
     assert_eq!(outcome(&gate, &token(ec())), Err(VerifyError::UnknownKeyId));
     assert_eq!(outcome(&gate, &token(&ROTATED)), Ok(()));
+}
+
+/// The rotated key served under the EC issuer's own `kid`.
+fn rotated_under_old_kid() -> Jwk {
+    let mut replacement = key(&ROTATED);
+    replacement.common.key_id = Some(ec().key_id().to_owned());
+    replacement
+}
+
+/// A token signed with the rotated key, naming the EC issuer's own `kid`.
+fn token_under_old_kid() -> String {
+    ROTATED
+        .workload_token(SUBJECT, AUDIENCE, FixedClock::at(NOW).now())
+        .kid(ec().key_id())
+        .build()
+}
+
+#[test]
+fn a_new_key_under_a_kept_kid_is_changed_and_neither_added_nor_removed() {
+    let gate = gate();
+    assert!(outcome(&gate, &token_under_old_kid()).is_err());
+
+    let replaced = gate
+        .replace_keys(&name(ec()), set(&[&rotated_under_old_kid()]))
+        .unwrap();
+    assert_eq!(
+        replaced,
+        KeysReplaced {
+            added: kids(&[]),
+            removed: kids(&[]),
+            changed: kids(&[ec().key_id()]),
+        }
+    );
+    assert_eq!(outcome(&gate, &token_under_old_kid()), Ok(()));
+    assert!(outcome(&gate, &token(ec())).is_err());
+
+    // The same set again changes nothing.
+    assert_eq!(
+        gate.replace_keys(&name(ec()), set(&[&rotated_under_old_kid()])),
+        Ok(KeysReplaced::default())
+    );
+}
+
+/// A change is reported against the keys in force, not against the last set supplied: a set
+/// that was refused never becomes the one a later set is compared with.
+#[test]
+fn a_change_is_reported_against_the_keys_in_force_after_a_refused_set() {
+    let gate = gate();
+    let mut without_kid = key(&UNLISTED);
+    without_kid.common.key_id = None;
+    assert_eq!(
+        gate.replace_keys(&name(ec()), set(&[&rotated_under_old_kid(), &without_kid])),
+        Err(ConfigError::KeyWithoutId(name(ec())))
+    );
+    let replaced = gate
+        .replace_keys(&name(ec()), set(&[&rotated_under_old_kid()]))
+        .unwrap();
+    assert_eq!(replaced.changed, kids(&[ec().key_id()]));
+    assert!(replaced.added.is_empty() && replaced.removed.is_empty());
 }
 
 /// Each set the boot checks would refuse is refused with the error boot gives, and none of it

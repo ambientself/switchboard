@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::classification::Classification;
+pub use crate::connector::ErrorKind;
 use crate::connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
 use crate::decision::{
     CallContext, CallerContext, Decision, Reason, ReasonKind, ResourceProblem, Verdict,
@@ -134,7 +135,10 @@ pub enum Outcome {
     /// The tool ran and succeeded.
     Ok,
     /// The tool ran and failed.
-    Error,
+    Error {
+        /// What kind of failure. The caller's message is not recorded.
+        error_kind: ErrorKind,
+    },
     /// The connector refused the call because of what it names, such as a repository outside
     /// the team's scope. The only decision made outside the decision function, and it can only
     /// refuse.
@@ -147,7 +151,7 @@ pub enum Outcome {
 /// The second half of an allowed call's audit row, written after the tool returns.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Completion {
-    /// `ok`, `error` or `refused`.
+    /// `ok`, `error` with its kind, or `refused` with its sentence.
     #[serde(flatten)]
     pub outcome: Outcome,
     /// How long the tool took, measured by the caller of this crate: the core reads no clock.
@@ -316,9 +320,10 @@ pub trait AuditStore: Send + Sync {
     /// Takes a [`RowCompletion`], which only [`finish`] can make, from a call that ran, and
     /// only [`give_up`], as `error`, from a guard given up without running.
     ///
-    /// A repeat of the completion a row already has, the same outcome and latency, returns
-    /// `Ok`, so finish can be retried. A different completion of a row already complete
-    /// returns `Err`, and the first completion stands.
+    /// A repeat of the completion a row already has, the same outcome, with the same error kind
+    /// or sentence, and the same latency, returns `Ok`, so finish can be retried. A different
+    /// completion of a row already complete, an error of another kind included, returns `Err`,
+    /// and the first completion stands.
     fn finish<'a>(&'a self, completion: &'a RowCompletion)
     -> BoxFuture<'a, Result<(), StoreError>>;
 
@@ -736,7 +741,7 @@ pub async fn run_unless(
         tool,
         arguments,
     } = guard;
-    let cancelled = || ToolOutcome::Error(sentences::CALLER_DISCONNECTED.to_owned());
+    let cancelled = || ToolOutcome::error(ErrorKind::Other, sentences::CALLER_DISCONNECTED);
     let mut gone = pin!(gone);
     // A caller already gone is not called for.
     let already_gone = poll_fn(|context| Poll::Ready(gone.as_mut().poll(context).is_ready())).await;
@@ -803,7 +808,9 @@ pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finish
     let Ran { row, outcome } = ran;
     let (recorded, answer) = match outcome {
         ToolOutcome::Ok(result) => (Outcome::Ok, Answer::Ok(result)),
-        ToolOutcome::Error(message) => (Outcome::Error, Answer::Error(message)),
+        ToolOutcome::Error(error_kind, message) => {
+            (Outcome::Error { error_kind }, Answer::Error(message))
+        }
         ToolOutcome::Refused(sentence) => (
             Outcome::Refused {
                 sentence: sentence.clone(),
@@ -858,8 +865,9 @@ impl GaveUp {
 }
 
 /// Gives up a guard without running its call: consumes the guard, calls no connector, and
-/// completes the row as `error` with a latency of zero (decision 0009). A row can overstate
-/// what ran, never understate it, so a call that never ran is never recorded as `ok`.
+/// completes the row as `error`, of the kind [`ErrorKind::Other`], with a latency of zero
+/// (decision 0009). A row can overstate what ran, never understate it, so a call that never ran
+/// is never recorded as `ok`.
 ///
 /// The caller chooses its own reply, since nothing ran.
 pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
@@ -867,7 +875,9 @@ pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
     let completion = RowCompletion {
         row,
         completion: Completion {
-            outcome: Outcome::Error,
+            outcome: Outcome::Error {
+                error_kind: ErrorKind::Other,
+            },
             latency_ms: 0,
         },
     };

@@ -285,8 +285,15 @@ a refresh failed would turn an outage of the issuer's host into an outage of the
 issuer's key age is exported instead, as `switchboard_issuer_keys_age_seconds{issuer}` (#91),
 with an alert condition at four refresh intervals (Q12).
 
-This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
-is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
+An `https` keys URL is fetched over TLS (#88), and needs `keys_ca_file`: a PEM bundle, read at
+boot, whose CAs are the only ones trusted. No roots are compiled in and none are read from the
+system: in Kubernetes the bundle is `kube-root-ca.crt`, and for a public issuer it is the image's
+own CA bundle. The certificate is verified against the keys URL's host, a DNS name or an IP
+address. The client is rustls with ring, passed to the client itself and never installed as the
+process default; it offers HTTP/1.1 only, and the deadline covers the TLS handshake. An issuer
+whose keys need a bearer token takes `keys_token_file`, read again on every fetch because the
+kubelet rotates projected tokens, and sent to the keys URL only. Both are refused beside an
+`http` keys URL. The demo deployments still use keys files.
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
@@ -862,6 +869,17 @@ its tools on a surface refuses to start, rather than starting with that tool dro
 the policy serves is either served or loudly refused, never silently missing. A snapshot loaded
 later is held to the same rule.
 
+The Postgres store's boot check has a stated scope. It catches misconfiguration of a database
+whose roles, schema and grants come from the store's role script (`sql/roles.sql`) and its
+migrations: a grant, membership, setting or object that gives the gateway's role a way to read
+or change audit rows beyond its own. It is not a defence against a hostile superuser or table
+owner, who can defeat any check run from inside the database. Against that scope, the routes
+the first check's review left open (#43) are each closed or ruled out: ownership now counts
+wherever a privilege does; a definer function whose owner can set `session_replication_role`
+is refused; every trigger and enabled event trigger that runs a definer function is refused,
+whoever can fire it; functions in untrusted languages are refused; and the three below are out
+of scope.
+
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
 Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the audit
@@ -882,26 +900,36 @@ pooler may drop, so the check reads them back and refuses a session without them
 The grants on the audit table are not the only way to it, so the Postgres check also refuses,
 for the gateway's role and every role it can become, PUBLIC included: an audit table that is a
 view or foreign table, or has a rule; any privilege on a view, materialized view or table with
-a rule, in any schema, that reaches the audit table directly or through other views and rules;
-being able to run a `SECURITY DEFINER` function, in any schema, whose owner can read or change
-the audit table, by EXECUTE or by writing to a table whose trigger runs it; and EXECUTE on the
-catalog's functions that read or write the server's files (`lo_export`, `lo_import`,
-`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's
-`pg_file_*`).
+a rule, in any schema, that reaches the audit table directly or through other views and rules,
+or owning one outside the audit schema, since an owner that revoked its own grants can grant
+them back; being able to run, by EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
+owner can read or change the audit table or turn off its triggers; EXECUTE on the catalog's
+functions that read or write the server's files (`lo_export`, `lo_import`, `pg_read_file`,
+`pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's `pg_file_*`); and EXECUTE
+on any function in an untrusted language, such as `plpython3u`, which runs with the access of
+the server's operating-system user. A definer function's owner counts as able when it holds a
+privilege on the audit table or on a view or rule that reaches it, can act as the owner of any
+of those, of the schema, or of the functions the table's triggers run, can set
+`session_replication_role`, or can run another such function. A trigger runs its function
+without EXECUTE, for any write that reaches its table, through a view, a rule or a foreign
+key's cascade as well as directly, and an event trigger fires on statements any role may run,
+such as `CREATE TEMP TABLE`. So rather than follow each route, the check refuses every trigger
+on any table, and every enabled event trigger, that runs such a function, whoever can fire it.
+The migrations' trigger functions are not `SECURITY DEFINER`, so a database they built passes.
 
-What the Postgres check does not look for, which an administrator must keep from the gateway's
-role without its help:
+What the Postgres check does not look for, each out of scope because it needs an
+administrator's act rather than a misconfiguration of what the role script and the migrations
+make:
 
 - **Changes after boot.** It reads the catalog once. A grant, view, rule or function made
-  later is not seen until the next boot.
-- **Event triggers.** One fires on statements the gateway's role may be able to run, such as
-  `CREATE TEMP TABLE`, and its function may be `SECURITY DEFINER`.
-- **Other functions that leave the database.** Only the catalog's file functions above are
-  refused by name. A function in an untrusted language such as `plpython3u`, or in C from an
-  extension, runs with the access of the server's operating-system user.
+  later is not seen until the next boot. Making one needs a role the check refuses to the
+  gateway's.
+- **Functions in C from an extension.** Only a superuser installs C code, and the catalog
+  cannot say what it does.
 - **Other connections back in.** `postgres_fdw` or `dblink` can log in again as another role,
-  through a user mapping or a function holding that role's password. A foreign table in the
-  audit schema is refused; one elsewhere is not followed to where it connects.
+  through a user mapping or a function holding that role's password, which only an
+  administrator stores. A foreign table in the audit schema is refused; one elsewhere is not
+  followed to where it connects.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
@@ -1185,11 +1213,19 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 - Columns for the instance, the kind and the deadline: built. The gateway names its instance
   from `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, and refuses to start with neither. Rows
   written before the migration read as calls by the instance `before-0003`, due when they were
-  completed or begun. Not built, for decisions 0011 and 0012: how the resources were found,
-  with the reach by reference, the credential identity, the error kind, an unverified
-  delegation's failure kind, and a grant's digest, issuer, key ID, pod UID, egress setting and
-  currency answer. With #12, a column for the exception that allowed a call, since the row's
-  shape constraint rightly allows no reason on an allowed row.
+  completed or begun. The error kind: built (#56). An `error` outcome carries one of five
+  kinds from the core's closed `ErrorKind`, and migration 0006 adds `error_kind`, which a row
+  has exactly when its outcome is `error` (`error_kind_shape`), completed once with the rest of
+  the completion. Error rows written before it read `before-0006`. The argument check is
+  `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
+  refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
+  a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
+  begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
+  Not built, for decisions 0011 and 0012: how the resources were found, with the reach by
+  reference, the credential identity, an unverified delegation's failure kind, and a grant's
+  digest, issuer, key ID, pod UID, egress setting and currency answer. With #12, a column for
+  the exception that allowed a call, since the row's shape constraint rightly allows no reason
+  on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
@@ -1253,6 +1289,20 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   finish pool of its own, finish waiting at most the answer budget and then retrying on its
   own task until the deadline, an identical repeat finish accepted, column grants, and the
   report of each finish given up.
+
+**#11, the argument check against the approved schema.** Built (#94): the loader accepts a
+subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
+another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
+refuses another dialect rather than converting it. An enforced keyword must have the JSON type
+2020-12 gives it; an annotation's value, and whether the names in a `type` list or in
+`required` are unique, are not checked. The
+argument check enforces every keyword the loader accepts other than annotations: `type`,
+`properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, and the bounds on
+lengths, item counts and numbers. Numbers compare by value, so `1.0` is an integer, and the
+schema `false` admits nothing. A call that fails is outcome `error` of kind
+`invalid_arguments`, and nothing is sent. The exact rules are in the `adapter` module of
+`gateway-registry`. `pattern`, `$ref` and the composition keywords are refused at load, not
+checked; a schema that needs them cannot be approved yet.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's

@@ -3,6 +3,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use serde::{Deserialize, Serialize};
+
 use crate::decision::CallContext;
 use crate::policy::ApprovedTool;
 
@@ -68,9 +70,38 @@ impl ToolCall {
 pub enum ToolOutcome {
     /// The tool ran and succeeded; its result, for the caller.
     Ok(serde_json::Value),
-    /// The tool ran and failed; a message for the caller.
-    Error(String),
+    /// The tool ran and failed: the kind of failure, which the row records, and a message for
+    /// the caller, which it does not.
+    Error(ErrorKind, String),
     /// The connector refused because of what the call names. The sentence is returned to the
     /// caller and recorded on the row, and reaches the caller only after that row is finished.
     Refused(String),
+}
+
+impl ToolOutcome {
+    /// A failure of `kind`, with `message` for the caller.
+    pub fn error(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self::Error(kind, message.into())
+    }
+}
+
+/// The kind of an `error` outcome (decisions 0009 and 0011). A closed set, so each kind can be
+/// counted from the rows. The row records the kind, not the caller's message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// The call's arguments failed a check, so nothing was sent.
+    InvalidArguments,
+    /// A tool classified `read` gave an answer too large to accept, or none by its deadline.
+    /// From a tool of any other classification the same failure is [`Other`](Self::Other),
+    /// until the outcome `unknown` is built.
+    OversizedOrLateRead,
+    /// The credential custodian refused the credential an allowed call needed. Nothing reports
+    /// it yet: no connector asks a custodian.
+    CustodianRefusal,
+    /// The vendor refused the call, as each connector defines a refusal: for a proxied server,
+    /// its `403`.
+    VendorRefusal,
+    /// Any other failure.
+    Other,
 }

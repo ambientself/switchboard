@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use gateway_core::audit::{self, Begun, Outcome, RequestMetadata};
+use gateway_core::audit::{self, Begun, ErrorKind, Outcome, RequestMetadata};
 use gateway_core::{CallContext, RequestedTool, ToolUseId, decide};
 use gateway_testkit::{
     Caller, Fixture, FixtureConnector, READ_TOOL, SURFACE_ALL, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
@@ -338,7 +338,15 @@ async fn a_different_second_completion_is_counted_apart_from_a_deadline() {
     assert_eq!(store.stats().finishes_given_up, GivenUpCauses::default());
 
     let error = store
-        .finish_within_budget(&row, &completion(Outcome::Error, 5))
+        .finish_within_budget(
+            &row,
+            &completion(
+                Outcome::Error {
+                    error_kind: ErrorKind::Other,
+                },
+                5,
+            ),
+        )
         .await
         .unwrap_err();
     assert!(

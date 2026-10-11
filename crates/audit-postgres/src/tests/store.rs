@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use gateway_core::audit::{self, AuditRowId, Begun, Completion, Outcome, RequestMetadata};
+use gateway_core::audit::{
+    self, AuditRowId, Begun, Completion, ErrorKind, Outcome, RequestMetadata,
+};
 use gateway_core::audit::{
     ListRecord, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, RecordedResources, RowStart,
 };
@@ -106,8 +108,8 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
                     decision, reason, sentence, policy_revision,
                     proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                     proved_delegation_team, claimed_acting_person, claimed_team,
-                    outcome, outcome_sentence, latency_ms, resources, resources_omitted,
-                    instance, kind, allowance_ms,
+                    outcome, outcome_sentence, error_kind, latency_ms, resources,
+                    resources_omitted, instance, kind, allowance_ms,
                     deadline = begun_at + allowance_ms * interval '1 millisecond' AS on_time
              FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid",
             &[&row.as_str()],
@@ -130,6 +132,9 @@ pub(super) async fn read_back(admin: &Client, row: &AuditRowId) -> AuditRecord {
         });
         if let Some(sentence) = text("outcome_sentence") {
             completion["sentence"] = json!(sentence);
+        }
+        if let Some(error_kind) = text("error_kind") {
+            completion["error_kind"] = json!(error_kind);
         }
         completion
     });
@@ -222,7 +227,9 @@ async fn rows_read_back_exactly_as_the_core_wrote_them() {
         .map(|row| row.completion.map(|c| c.outcome))
         .collect();
     assert!(outcomes.contains(&Some(Outcome::Ok)));
-    assert!(outcomes.contains(&Some(Outcome::Error)));
+    assert!(outcomes.contains(&Some(Outcome::Error {
+        error_kind: ErrorKind::Other
+    })));
     assert!(
         outcomes
             .iter()
@@ -613,7 +620,12 @@ async fn a_different_second_completion_is_refused_and_the_first_stands() {
         .await
         .unwrap();
     for different in [
-        completion(Outcome::Error, 5),
+        completion(
+            Outcome::Error {
+                error_kind: ErrorKind::Other,
+            },
+            5,
+        ),
         completion(Outcome::Ok, 6),
         completion(
             Outcome::Refused {
@@ -629,6 +641,43 @@ async fn a_different_second_completion_is_refused_and_the_first_stands() {
     }
     let record = read_back(&admin, &row).await;
     assert_eq!(record.completion, Some(completion(Outcome::Ok, 5)));
+}
+
+/// An error is stored with its kind. The same error again is accepted; an error of another
+/// kind, or none, is refused, and the first stands.
+#[tokio::test]
+async fn an_error_is_stored_with_its_kind_and_a_repeat_must_have_the_same_kind() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let error = |error_kind| completion(Outcome::Error { error_kind }, 5);
+    let row = begun_row(&store, &fixture).await;
+    let refusal = error(ErrorKind::VendorRefusal);
+    store.complete(&row, &refusal).await.unwrap();
+    assert_eq!(
+        read_back(&admin, &row).await.completion,
+        Some(refusal.clone())
+    );
+    store.complete(&row, &refusal).await.unwrap();
+    for different in [
+        error(ErrorKind::Other),
+        error(ErrorKind::InvalidArguments),
+        error(ErrorKind::OversizedOrLateRead),
+        error(ErrorKind::CustodianRefusal),
+        completion(Outcome::Ok, 5),
+    ] {
+        assert!(
+            matches!(
+                store.complete(&row, &different).await,
+                Err(PgAuditError::CompletedDifferently { .. })
+            ),
+            "{different:?}"
+        );
+    }
+    assert_eq!(read_back(&admin, &row).await.completion, Some(refusal));
 }
 
 #[tokio::test]

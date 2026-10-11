@@ -4,7 +4,8 @@
 //! serves a [`LocalIssuer`]'s JWK set at `/keys`. A second counting server stands for an issuer
 //! the deployment does not list. The tests count every request each server gets, so they show
 //! that boot fetches once, that no token causes a fetch, whatever its `iss`, `jku`, `x5u`, `jwk`
-//! or `kid` says, and that a refresh which fails keeps the keys in use.
+//! or `kid` says, and that a refresh which fails keeps the keys in use. One issuer serves its
+//! keys over HTTPS, with a certificate from a CA made for the test (issue #88).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -497,6 +498,7 @@ async fn the_timer_logs_each_failure_once_and_each_change() {
     assert_eq!(refreshed[0]["issuer"], listed.url.as_str());
     assert_eq!(refreshed[0]["added"], next.key_id());
     assert_eq!(refreshed[0]["removed"], issuer.key_id());
+    assert_eq!(refreshed[0]["changed"], "");
     assert_eq!(outcome(prepared.gates.identity(), &token(&next)), Ok(()));
 
     // After a success, a cause seen before is logged again.
@@ -508,6 +510,47 @@ async fn the_timer_logs_each_failure_once_and_each_change() {
     assert_eq!(failed.len(), 3, "{failed:?}");
     assert_eq!(failed[1]["cause"], failed[2]["cause"]);
     assert_eq!(outcome(prepared.gates.identity(), &token(&next)), Ok(()));
+}
+
+/// An issuer that serves a new key under the `kid` it already had: the new key is put in force,
+/// and the change is logged once, at `WARN`, naming the `kid` as changed.
+#[tokio::test]
+async fn a_new_key_under_a_kept_kid_is_logged_once_as_a_warning() {
+    let captured = Captured::global();
+    let listed = Counting::start().await;
+    let issuer = issuer_at(&listed);
+    let next = LocalIssuer::new(&listed.url, SigningAlgorithm::Es256).unwrap();
+    listed.serve(issuer.jwks_document());
+    let prepared = boot(deployment(
+        "keys-changed-under-kid",
+        &fetched_issuer(&listed.url, &listed.keys_url(), ""),
+    ))
+    .await
+    .unwrap();
+    let identity = prepared.gates.identity();
+    let under_old_kid = next
+        .workload_token(TEAM_A_SA, AUDIENCE, SystemTime::now())
+        .kid(issuer.key_id())
+        .build();
+    assert!(outcome(identity, &under_old_kid).is_err());
+
+    // The new key, under the old `kid`.
+    let mut set = next.jwk_set();
+    set.keys[0].common.key_id = Some(issuer.key_id().to_owned());
+    listed.serve(serde_json::to_string(&set).unwrap());
+    for _ in 0..3 {
+        let refreshed = prepared.keys.refresh_all().await;
+        assert!(matches!(refreshed.as_slice(), [Ok(_)]), "{refreshed:?}");
+    }
+
+    let logged = captured.events(REFRESHED_EVENT, &listed.url);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged[0]["level"], "WARN");
+    assert_eq!(logged[0]["changed"], issuer.key_id());
+    assert_eq!(logged[0]["added"], "");
+    assert_eq!(logged[0]["removed"], "");
+    assert_eq!(outcome(identity, &under_old_kid), Ok(()));
+    assert!(outcome(identity, &token(&issuer)).is_err());
 }
 
 #[tokio::test]
@@ -547,7 +590,7 @@ async fn boot_refuses_a_keys_url_off_the_issuer_https_or_unreachable() {
     assert_eq!(listed.requests(), 0);
     assert_eq!(elsewhere.requests(), 0);
 
-    // https, which this build cannot fetch.
+    // https with no CA file, or with one that is not there.
     let said = refused(
         "keys-https",
         fetched_issuer(
@@ -559,9 +602,40 @@ async fn boot_refuses_a_keys_url_off_the_issuer_https_or_unreachable() {
     .await;
     assert_eq!(
         said,
-        "the keys URL for issuer `https://issuer.switchboard.test` is https, and this gateway \
-         cannot fetch keys over TLS yet (issue #88); give the issuer a keys_file instead"
+        "the keys URL for issuer `https://issuer.switchboard.test` is https and no CA file is \
+         given; name the CA bundle its certificate is verified against"
     );
+    let said = refused(
+        "keys-https-no-ca",
+        fetched_issuer(
+            "https://issuer.switchboard.test",
+            "https://issuer.switchboard.test/keys",
+            "keys_ca_file = \"missing-ca.pem\"\n",
+        ),
+    )
+    .await;
+    assert!(
+        said.starts_with("the CA file ")
+            && said.ends_with(
+                "missing-ca.pem for issuer `https://issuer.switchboard.test` could not be read"
+            ),
+        "{said}"
+    );
+    // A token would cross the network in the clear.
+    let said = refused(
+        "keys-http-token",
+        fetched_issuer(
+            &listed.url,
+            &listed.keys_url(),
+            "keys_token_file = \"issuer-token\"\n",
+        ),
+    )
+    .await;
+    assert!(
+        said.contains("is http, so it takes no token file"),
+        "{said}"
+    );
+    assert_eq!(listed.requests(), 0);
 
     // Nothing listening, and an answer that is not the keys.
     let said = refused(
@@ -589,4 +663,146 @@ async fn boot_refuses_a_keys_url_off_the_issuer_https_or_unreachable() {
         )
     );
     assert_eq!(listed.requests(), 1);
+}
+
+/// A loopback HTTPS issuer: a certificate for `127.0.0.1`, signed by a CA made for the test,
+/// and every request answered with the keys it is set to serve. It records the `Authorization`
+/// header of each request it reads.
+struct HttpsIssuer {
+    url: String,
+    ca_pem: String,
+    keys: Arc<Mutex<String>>,
+    authorizations: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl HttpsIssuer {
+    async fn start() -> Self {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::ServerConfig;
+        use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+        let signer = rcgen::Issuer::new(ca, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .unwrap()
+            .signed_by(&leaf_key, &signer)
+            .unwrap();
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        let keys = Arc::new(Mutex::new(String::new()));
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
+        let (serving, seen) = (Arc::clone(&keys), Arc::clone(&authorizations));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (acceptor, keys, seen) =
+                    (acceptor.clone(), Arc::clone(&serving), Arc::clone(&seen));
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut head = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => head.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let authorization = head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_owned())
+                    });
+                    seen.lock().unwrap().push(authorization);
+                    let body = keys.lock().unwrap().clone();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Self {
+            url,
+            ca_pem,
+            keys,
+            authorizations,
+        }
+    }
+
+    fn keys_url(&self) -> String {
+        format!("{}{KEYS_PATH}", self.url)
+    }
+}
+
+#[tokio::test]
+async fn boot_fetches_the_keys_of_an_https_issuer_trusting_only_its_ca() {
+    let server = HttpsIssuer::start().await;
+    let issuer = LocalIssuer::new(&server.url, SigningAlgorithm::Es256).unwrap();
+    *server.keys.lock().unwrap() = issuer.jwks_document();
+
+    let files = Files::new(
+        "keys-https-boot",
+        &cluster().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    files.write("issuer-ca.pem", &server.ca_pem);
+    files.write("issuer-token", "dummy-issuer-token-for-test\n");
+    let entry = fetched_issuer(
+        &server.url,
+        &server.keys_url(),
+        "keys_ca_file = \"issuer-ca.pem\"\nkeys_token_file = \"issuer-token\"\n",
+    );
+    files.write(
+        "gateway.toml",
+        &deployment_file(&format!("{entry}\n[audit]\nmode = \"disabled\"\n")),
+    );
+    let prepared = boot(files.load()).await.unwrap();
+    assert_eq!(outcome(prepared.gates.identity(), &token(&issuer)), Ok(()));
+    // The token went with the fetch, and is read again for the next one.
+    files.write("issuer-token", "dummy-issuer-token-rotated\n");
+    let refreshed = prepared.keys.refresh_all().await;
+    assert!(matches!(refreshed.as_slice(), [Ok(_)]), "{refreshed:?}");
+    assert_eq!(
+        *server.authorizations.lock().unwrap(),
+        [
+            Some("Bearer dummy-issuer-token-for-test".to_owned()),
+            Some("Bearer dummy-issuer-token-rotated".to_owned()),
+        ]
+    );
+
+    // The same issuer, trusting another CA: refused at boot, and nothing is read.
+    let other = HttpsIssuer::start().await;
+    files.write("issuer-ca.pem", &other.ca_pem);
+    let said = boot(files.load()).await.map(drop).unwrap_err().to_string();
+    assert_eq!(
+        said,
+        format!(
+            "cannot fetch the keys of issuer `{}` at boot: the keys URL could not be reached",
+            server.url
+        )
+    );
+    assert_eq!(server.authorizations.lock().unwrap().len(), 2);
 }

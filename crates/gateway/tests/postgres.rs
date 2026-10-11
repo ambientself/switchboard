@@ -201,7 +201,8 @@ async fn run(
         "{}",
         denied.body
     );
-    // An undeclared argument is a tool error, recorded as outcome `error`, with nothing sent.
+    // An undeclared argument is a tool error, recorded as outcome `error` of the kind
+    // `invalid_arguments`, with nothing sent.
     let failed = call(
         &path,
         &token,
@@ -249,7 +250,8 @@ async fn run(
     // read shows which project it read and a denial which one it refused.
     let rows = setup
         .query(
-            "SELECT tool, decision, coalesce(reason, ''), coalesce(outcome, ''), proved_subject,
+            "SELECT tool, decision, coalesce(reason, ''), concat_ws(':', outcome, error_kind),
+                    proved_subject,
                     proved_team, coalesce(sentence, ''), coalesce(outcome_sentence, ''),
                     policy_revision,
                     CASE WHEN jsonb_typeof(resources) = 'array' THEN
@@ -283,7 +285,7 @@ async fn run(
             LIST_TOOL,
             "allow",
             "",
-            "error",
+            "error:invalid_arguments",
             "",
             "",
             "docs/project/atlas",

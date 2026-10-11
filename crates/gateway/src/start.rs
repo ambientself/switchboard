@@ -13,9 +13,9 @@
 //! start, naming the reason, before anything is served.
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
-//! own origin, and plain `http`, since this build cannot fetch over TLS (issue #88). Then each
-//! issuer's keys are fetched once, and a fetch that fails refuses to start, naming the issuer
-//! and the cause. The [`KeyRefresher`] in [`Prepared`] fetches them again on a timer.
+//! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
+//! and an `http` one may have neither a CA file nor a token file. Then each issuer's keys are
+//! fetched once, and a fetch that fails refuses to start, naming the issuer and the cause. The [`KeyRefresher`] in [`Prepared`] fetches them again on a timer.
 //!
 //! It logs one `"event":"boot"` line per gate, which an operator (and the demo) reads to see
 //! how the gateway was started: identity enforced or disabled, with how many issuers and
@@ -44,7 +44,7 @@ use connector_proxy::{
 use gateway_core::{ConnectorName, InstanceName, Issuer};
 use gateway_identity::Clock;
 use gateway_registry::{Credential, Registry, RegistryError};
-use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError};
+use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
 use thiserror::Error;
 
 use crate::boot::{self, BootError, Gates, Settings, Wiring};
@@ -102,14 +102,8 @@ pub enum StartError {
     /// A server's connector could not be built.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
-    /// An issuer's keys URL is `https`, and this build cannot fetch over TLS.
-    #[error(
-        "the keys URL for issuer `{0}` is https, and this gateway cannot fetch keys over TLS \
-         yet (issue #88); give the issuer a keys_file instead"
-    )]
-    KeysOverTls(Issuer),
     /// An issuer's keys URL breaks a rule of the key source, such as being off the issuer's
-    /// origin.
+    /// origin, or its CA file cannot be used.
     #[error(transparent)]
     KeysUrl(SourceError),
     /// An issuer's keys could not be fetched at boot.
@@ -362,19 +356,25 @@ struct Fetched {
 }
 
 /// Checks every keys URL, then fetches each issuer's keys once and puts them in its entry in
-/// `identity`. Refuses a URL the key source refuses, an `https` one by name, and a fetch that
-/// fails.
+/// `identity`. Refuses a URL the key source refuses, with its CA and token files, and a fetch
+/// that fails.
 async fn fetch_keys(
     keys_urls: &[KeysUrl],
     identity: &mut IdentitySection,
 ) -> Result<Vec<Fetched>, StartError> {
     let mut sources = Vec::with_capacity(keys_urls.len());
     for keys_url in keys_urls {
-        let source = KeySource::new(&keys_url.issuer, &keys_url.url, FetchOptions::default())
-            .map_err(|error| match error {
-                SourceError::TlsUnavailable(issuer) => StartError::KeysOverTls(issuer),
-                other => StartError::KeysUrl(other),
-            })?;
+        let files = SourceFiles {
+            ca_file: keys_url.ca_file.clone(),
+            token_file: keys_url.token_file.clone(),
+        };
+        let source = KeySource::with_files(
+            &keys_url.issuer,
+            &keys_url.url,
+            &files,
+            FetchOptions::default(),
+        )
+        .map_err(StartError::KeysUrl)?;
         sources.push((source, keys_url.refresh));
     }
     let mut fetched = Vec::with_capacity(sources.len());

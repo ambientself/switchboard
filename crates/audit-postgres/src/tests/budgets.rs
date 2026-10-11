@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use gateway_core::audit::{self, Answer, AuditFailure, Begun, Outcome, Ran};
+use gateway_core::audit::{self, Answer, AuditFailure, Begun, ErrorKind, Outcome, Ran};
 use gateway_core::{CallContext, RequestedTool, decide};
 use gateway_testkit::{
     Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector, READ_TOOL,
@@ -650,7 +650,15 @@ async fn finish_does_not_retry_what_trying_again_cannot_fix() {
     // A second, different completion is refused at once, and the first stands.
     let started = Instant::now();
     let error = store
-        .finish_within_budget(&row, &completion(Outcome::Error, 5))
+        .finish_within_budget(
+            &row,
+            &completion(
+                Outcome::Error {
+                    error_kind: ErrorKind::Other,
+                },
+                5,
+            ),
+        )
         .await
         .unwrap_err();
     assert!(

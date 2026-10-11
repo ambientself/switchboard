@@ -952,7 +952,7 @@ mod tests {
     /// registered, so this is reached only by taking the connector out of gates that passed.
     #[test]
     fn an_allowed_call_whose_connector_is_not_registered_completes_its_row_as_error() {
-        use gateway_core::audit::{Completion, DecisionKind, Outcome};
+        use gateway_core::audit::{Completion, DecisionKind, ErrorKind, Outcome};
         use gateway_testkit::{
             AUDIENCE, CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector,
             InMemoryAuditStore, SCOPED_READ_TOOL, SURFACE_READ, TEAM_A, TEAM_A_SUBJECT,
@@ -1032,7 +1032,9 @@ mod tests {
         assert_eq!(
             rows[0].completion,
             Some(Completion {
-                outcome: Outcome::Error,
+                outcome: Outcome::Error {
+                    error_kind: ErrorKind::Other
+                },
                 latency_ms: 0,
             }),
             "the row was left open"

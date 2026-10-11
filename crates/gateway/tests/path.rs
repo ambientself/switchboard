@@ -21,7 +21,7 @@ use gateway::{
     boot,
 };
 use gateway_core::audit::{
-    AuditRowId, Completion, DecisionKind, Outcome, RecordedResources, RowKind,
+    AuditRowId, Completion, DecisionKind, ErrorKind, Outcome, RecordedResources, RowKind,
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, Classification, IDENTITY_FAILURE, InstanceName, ReasonKind,
@@ -877,7 +877,9 @@ fn a_tool_error_is_a_result_marked_as_an_error_and_recorded_as_one() {
     );
     assert_eq!(
         world.row(0).completion.map(|c| c.outcome),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
 
     world.credentials.refuse_next();
@@ -887,7 +889,9 @@ fn a_tool_error_is_a_result_marked_as_an_error_and_recorded_as_one() {
     assert_eq!(result["isError"], json!(true));
     assert_eq!(
         world.row(1).completion.map(|c| c.outcome),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
 }
 
@@ -1409,7 +1413,9 @@ fn a_tool_error_and_a_scope_refusal_name_their_rows() {
     let row = failed.row_in_meta().expect("the tool error names its row");
     assert_eq!(
         stored(&world, &row).completion.map(|c| c.outcome),
-        Some(Outcome::Error)
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
     );
 
     let refused = world.call(

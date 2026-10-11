@@ -11,7 +11,7 @@ mod support;
 
 use std::time::Duration;
 
-use gateway_core::audit::{DecisionKind, Outcome, RecordedResource, RecordedResources};
+use gateway_core::audit::{DecisionKind, ErrorKind, Outcome, RecordedResource, RecordedResources};
 use gateway_core::{ReasonKind, ToolUseId};
 use gateway_dev::{FixtureGateway, start_fixture_gateway};
 use gateway_mcp::{Era, TOOL_USE_ID_META};
@@ -876,7 +876,12 @@ async fn a_tool_that_fails_is_a_result_with_is_error_and_is_recorded_as_an_error
         json!([{"type": "text", "text": "the fixture connector was told to fail"}])
     );
     assert_eq!(result["resultType"], json!("complete"));
-    assert_eq!(outcome(&gateway, 0), Some(Outcome::Error));
+    assert_eq!(
+        outcome(&gateway, 0),
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
+    );
 
     // A credential the source refuses is the tool failing too, not a policy denial.
     gateway.credentials().refuse_next();
@@ -892,6 +897,11 @@ async fn a_tool_that_fails_is_a_result_with_is_error_and_is_recorded_as_an_error
     .tool_result();
     assert!(is_error, "{result}");
     assert_eq!(result.get("resultType"), None, "a legacy result: {result}");
-    assert_eq!(outcome(&gateway, 1), Some(Outcome::Error));
+    assert_eq!(
+        outcome(&gateway, 1),
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
+    );
     assert_eq!(gateway.connector().received().len(), 2);
 }

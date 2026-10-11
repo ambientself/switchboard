@@ -2,6 +2,10 @@
 # comment. When a newer release comes out, Dependabot opens a pull request that updates both.
 # It does not update the Postgres service image in ci.yml; that tag and digest are bumped by
 # hand (see the comment there).
+#
+# The demo's images are pinned by tag and digest. Dependabot reads deploy/Dockerfile's base
+# images and Compose's Postgres. It does not read the Dockerfile's syntax line, demo.sh's
+# POSTGRES_IMAGE or the kind manifests; those are bumped by hand (see the comments there).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -14,3 +18,27 @@ updates:
           - "*"
     commit-message:
       prefix: ci
+  # The Dockerfile's base images. The rust tag is rust-toolchain.toml's channel, and a new
+  # toolchain regenerates the compile-fail .stderr files (CONTRIBUTING.md), so Dependabot
+  # proposes only new digests for it, never a new version.
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+    commit-message:
+      prefix: deploy
+  # Compose's Postgres. demo.sh's POSTGRES_IMAGE and the kind manifest's tag must match it, and
+  # crates/demo-checks/tests/driver.rs fails until they do: change them by hand on the pull
+  # request's branch.
+  - package-ecosystem: docker-compose
+    directory: /deploy/compose
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deploy

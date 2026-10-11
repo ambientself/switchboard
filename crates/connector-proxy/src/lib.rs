@@ -13,11 +13,12 @@
 //! - **Bounds.** Each call is abandoned at its deadline, 5 s by default, and an answer larger
 //!   than its cap, 64 KiB by default, is discarded. Both are enforced here, inside the
 //!   connector, not by the core.
-//! - **Outcomes.** A failure, a timeout, or arguments that are not an object is
-//!   [`ToolOutcome::Error`](gateway_core::ToolOutcome); the server's `403`, and a call for a
-//!   tool the connector does not serve or has no credential for, is
+//! - **Outcomes.** A failure, a timeout, arguments that are not an object, or the server's
+//!   `403` is [`ToolOutcome::Error`](gateway_core::ToolOutcome), with an
+//!   [`ErrorKind`](gateway_core::ErrorKind) for the row: the `403` is a vendor refusal. A call
+//!   for a tool the connector does not serve or has no credential for is
 //!   [`ToolOutcome::Refused`](gateway_core::ToolOutcome). The [`outcome`] module lists each
-//!   sentence.
+//!   sentence and kind.
 //!
 //! The server is reached over session-less streamable HTTP, revision 2025-06-18, at an
 //! `http://` URL. An answer must be JSON; an event stream is not read.

@@ -9,22 +9,34 @@
 //!   read-only. A third, `search_documents {project, query}`, is offered only when configured.
 //!   The list can be set at start ([`config::TOOLS_VAR`]) and changed while running, through
 //!   the admin endpoint or [`MockDocs::set_tools`]. A tool not offered is an unknown tool.
+//!   Each tool's definition is [`ToolName::definition`], unless the admin endpoint or
+//!   [`MockDocs::set_description`] has set another description in its place, to play a
+//!   definition that drifts.
 //! - **Documents.** Projects `atlas` and `borealis`, each with a `plan` and the four documents
 //!   that misbehave on purpose: `slow-doc` answers after a delay (10 s by default), `hang-doc`
 //!   never answers, `fail-doc` answers with a JSON-RPC error, and `huge-doc` answers with
 //!   1 MiB of text. A document is found only by its project and name together. A missing
 //!   project or document is a tool result with `isError: true`.
-//! - **One credential.** Every request on every path must carry `Authorization: Bearer` with
+//! - **Credentials.** Every request on every path must carry `Authorization: Bearer` with
 //!   an accepted token, or it gets a 401 from its headers alone: its body is never read, nor
 //!   waited for. The server runs in one of two modes ([`Credential`]). In the static mode it
-//!   accepts one token and holds only its SHA-256. In the JWT mode it accepts the tokens of one subject, signed with RS256 by a key
-//!   in a fixed JWK set, from one issuer, for one audience, and in date; see [`JwtVerifier`].
+//!   accepts some tokens and holds only their SHA-256 digests. In the JWT mode it accepts the
+//!   tokens of some subjects, signed with RS256 by a key in a fixed JWK set, from one issuer,
+//!   for one audience, and in date; see [`JwtVerifier`].
+//! - **Projects per caller.** Each accepted caller may name every project, or only some
+//!   ([`Projects`]): a team's identity limited to its team's project. A `tools/call` naming a
+//!   project outside its caller's list gets a bare 403, with no JSON-RPC body, as a vendor
+//!   refuses a call its credential may not make. The variables that name one credential or one
+//!   subject allow every project. The admin endpoint or [`MockDocs::set_projects`] changes a
+//!   caller's projects while the server runs, to play a reach that changes.
 //! - **A log line per request.** Each line is a JSON object on standard output with
 //!   `bearer_sha256`, the first 12 hex digits of the SHA-256 of the bearer the request carried
 //!   (`null` if none), and `accepted`. A script can count these to show which credentials ever
 //!   reached the server. In the JWT mode each line also has `caller`, the verified subject of
 //!   an accepted token (`null` otherwise), and `refusal`, why a token was refused (`null` if it
-//!   was not; see [`Refusal`]). Nothing from a token that failed verification is logged.
+//!   was not; see [`Refusal`]). Nothing from a token that failed verification is logged. A
+//!   call refused for its project is logged with its `project` and `"refused": "project"`.
+//!   Each change made through the admin endpoint is logged too, as an `admin` line.
 //!
 //! The binary, `mock-docs-server`, reads its settings from environment variables; see
 //! [`Settings::from_vars`]. Tests can run the server on loopback with [`start`].
@@ -40,7 +52,10 @@ mod tools;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
-pub use config::{AcceptedCredential, Config, ConfigError, Credential, Settings};
+pub use config::{
+    AcceptedCredential, Config, ConfigError, Credential, Projects, Settings, named_projects,
+    parse_projects,
+};
 pub use documents::{
     FAIL_CODE, FAIL_DOC, HANG_DOC, HUGE_BYTES, HUGE_DOC, PLAN, PROJECTS, SLOW_DOC,
 };
@@ -91,6 +106,11 @@ impl Running {
     /// The admin endpoint's tool list, `http://127.0.0.1:<port>/admin/tools`.
     pub fn admin_url(&self) -> String {
         format!("http://{}/admin/tools", self.admin_address)
+    }
+
+    /// The address of the admin endpoint.
+    pub fn admin_address(&self) -> SocketAddr {
+        self.admin_address
     }
 
     /// The address of the MCP endpoint.
