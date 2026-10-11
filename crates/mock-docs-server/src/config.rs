@@ -283,7 +283,7 @@ pub struct Config {
     /// How long `slow-doc` takes to answer.
     pub slow: Duration,
     /// The one credential the admin endpoint accepts, in place of every caller's; its projects
-    /// mean nothing. `None`: the admin endpoint accepts the callers, as `POST /mcp` does, and
+    /// mean nothing. A bearer accepted as a caller is refused there even if it has this digest. `None`: the admin endpoint accepts the callers, as `POST /mcp` does, and
     /// the binary serves it only on loopback, where no caller can reach it.
     pub admin: Option<AcceptedCredential>,
 }

@@ -2467,13 +2467,33 @@ mutate("mock-docs-admin-credential-unused-accepted", "an admin credential withou
 mutate("mock-docs-admin-credential-is-a-caller", "the admin credential may also be a caller's", MC,
        "            && callers.iter().any(|caller| caller.same_token(admin))", "            && callers.is_empty()")
 mutate("mock-docs-admin-callers-accepted", "with an admin credential, the admin endpoint still answers the callers", MS,
-       "            accepted: token.is_some_and(|token| admin.accepts(token)),",
-       "            accepted: token.is_some_and(|token| admin.accepts(token))\n                || self.authenticate(headers).accepted,")
+       "                .is_some_and(|token| admin.accepts(token) && !self.is_callers_token(token)),",
+       "                .is_some_and(|token| admin.accepts(token) || self.is_callers_token(token)),")
 mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the callers and ignores the admin credential", MS,
        "        let Some(admin) = &self.inner.admin else {", "        let Some(admin) = None::<&AcceptedCredential> else {")
 mutate("mock-docs-admin-fallback-takes-callers", "an unknown path on the admin endpoint accepts the callers' bearers", MS,
        "            .fallback(admin_other_request)\n            .with_state(self.clone())",
        "            .fallback(other_request)\n            .with_state(self.clone())")
+# A caller's JWT with the admin credential's digest, the route fallbacks, and the digest file's
+# later lines (#137).
+mutate("mock-docs-admin-caller-jwt-accepted", "a caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "                .is_some_and(|token| admin.accepts(token) && !self.is_callers_token(token)),",
+       "                .is_some_and(|token| admin.accepts(token)),")
+mutate("mock-docs-admin-expired-caller-jwt-accepted", "an expired caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "                Ok(_) | Err(Refusal::Expired | Refusal::NotYetValid)",
+       "                Ok(_) | Err(Refusal::NotYetValid)")
+mutate("mock-docs-admin-premature-caller-jwt-accepted", "a not yet valid caller's token with the admin credential's digest is accepted on the admin endpoint", MS,
+       "                Ok(_) | Err(Refusal::Expired | Refusal::NotYetValid)",
+       "                Ok(_) | Err(Refusal::Expired)")
+mutate("mock-docs-admin-callers-route-fallback-takes-callers", "another method on /admin/callers/{caller} accepts the callers' bearers", MS,
+       "                put(admin_put_caller).fallback(admin_other_request),",
+       "                put(admin_put_caller).fallback(other_request),")
+mutate("mock-docs-admin-definitions-route-fallback-takes-callers", "another method on /admin/definitions/{tool} accepts the callers' bearers", MS,
+       "                    .delete(admin_delete_definition)\n                    .fallback(admin_other_request),",
+       "                    .delete(admin_delete_definition)\n                    .fallback(other_request),")
+mutate("mock-docs-admin-is-a-caller-first-line-only", "only a digest file's first line is checked against the admin credential", MC,
+       "            && callers.iter().any(|caller| caller.same_token(admin))",
+       "            && callers.first().is_some_and(|caller| caller.same_token(admin))")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",

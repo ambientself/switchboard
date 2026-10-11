@@ -672,9 +672,13 @@ fn the_admin_credential_must_be_its_own_and_have_an_endpoint() {
 
     // The admin credential may not be a caller's, whichever line of a digest file holds it.
     let caller_file = token_file("admin-is-a-caller", &format!("{digest}\n"));
-    let digests = token_file(
+    let admin_first = token_file(
         "admin-in-digests",
         &format!("{} atlas\n{digest} borealis\n", sha256_hex(ADMIN_TOKEN)),
+    );
+    let admin_second = token_file(
+        "admin-second-in-digests",
+        &format!("{digest} atlas\n{} borealis\n", sha256_hex(ADMIN_TOKEN)),
     );
     for (credential, admin) in [
         (
@@ -682,7 +686,14 @@ fn the_admin_credential_must_be_its_own_and_have_an_endpoint() {
             caller_file.to_str().unwrap(),
         ),
         (
-            ("MOCK_DOCS_TOKEN_SHA256_FILE", digests.to_str().unwrap()),
+            ("MOCK_DOCS_TOKEN_SHA256_FILE", admin_first.to_str().unwrap()),
+            admin_file,
+        ),
+        (
+            (
+                "MOCK_DOCS_TOKEN_SHA256_FILE",
+                admin_second.to_str().unwrap(),
+            ),
             admin_file,
         ),
     ] {
@@ -774,6 +785,7 @@ async fn the_binary_serves_and_logs_each_request_as_json() {
     );
     assert_eq!(boot["admin_listen"], Value::Null);
     assert_eq!(boot["admin_credential"], Value::Null);
+    assert_eq!(boot["admin_separation"], Value::Null);
     let url = format!("http://{}/mcp", boot["listen"].as_str().unwrap());
 
     let client = reqwest::Client::new();
@@ -878,6 +890,7 @@ async fn the_binary_admin_endpoint_answers_only_the_admin_credential() {
     let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
     let boot: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
     assert_eq!(boot["admin_credential"], sha256_hex(ADMIN_TOKEN)[..12]);
+    assert_eq!(boot["admin_separation"], "at_start");
     let url = format!(
         "http://{}/admin/tools",
         boot["admin_listen"].as_str().unwrap()
