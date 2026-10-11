@@ -197,55 +197,69 @@ const REACHING: &str = "reaching(oid) AS (
             JOIN pg_catalog.pg_rewrite rw ON rw.oid = d.objid
     )";
 
+/// The sets [`ABLE`] reads, each read from the catalog once and kept, so that asking [`ABLE`]
+/// of every role costs a few lookups per role, whatever plan the server picks: the relations
+/// [`REACHING`] finds, with their owners; the owner of the schema; the owners of the functions
+/// the table's triggers run; the roles in [`SERVER_ROLES`], named by `$3`; and the functions no
+/// owner may run, those in [`SERVER_FUNCTIONS`], named by `$4`, and those in an untrusted
+/// language, found by name and language before any privilege is asked.
+const ABLE_SETS: &str = "reached AS MATERIALIZED (
+        SELECT c.oid, c.relowner
+        FROM reaching x
+            JOIN pg_catalog.pg_class c ON c.oid = x.oid
+    ),
+    schema_owner AS MATERIALIZED (
+        SELECT s.nspowner FROM pg_catalog.pg_namespace s WHERE s.nspname = 'switchboard_audit'
+    ),
+    trigger_function_owners AS MATERIALIZED (
+        SELECT f.proowner
+        FROM pg_catalog.pg_trigger g
+            JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid
+        WHERE g.tgrelid = $1::oid
+    ),
+    server_roles AS MATERIALIZED (
+        SELECT s.oid FROM pg_catalog.pg_roles s WHERE s.rolname = ANY($3::text[])
+    ),
+    outside_functions AS MATERIALIZED (
+        SELECT f.oid
+        FROM pg_catalog.pg_proc f
+            JOIN pg_catalog.pg_namespace fs ON fs.oid = f.pronamespace
+            JOIN pg_catalog.pg_language l ON l.oid = f.prolang
+        WHERE (fs.nspname = 'pg_catalog' AND f.proname::text = ANY($4::text[]))
+            OR (l.lanispl AND NOT l.lanpltrusted)
+    )";
+
 /// A condition that the role `{owner}` is able: it can read or change `call_rows`, given as `$1`,
 /// or turn off its triggers. [`definers`] and [`cascade_actions`] say what counts. It reads
-/// [`REACHING`], and the parameters [`AbleParameters`] gives: `$2` the table-level privileges,
-/// `$3` the names of [`SERVER_ROLES`] and `$4` those of [`SERVER_FUNCTIONS`]. `{replication}` is
-/// [`replication_condition`]'s. It asks about `{owner}` with what it inherits; [`able`] asks it
-/// of every role a role is a member of.
-const ABLE: &str = "(EXISTS (SELECT FROM reaching x
-                                  JOIN pg_catalog.pg_class c ON c.oid = x.oid
-                              WHERE has_table_privilege({owner}, x.oid, $2)
-                                  OR has_any_column_privilege({owner}, x.oid,
-                                                              'SELECT, INSERT, UPDATE')
-                                  OR pg_has_role({owner}, c.relowner, 'USAGE'))
-                      OR EXISTS (SELECT FROM pg_catalog.pg_namespace s
-                                 WHERE s.nspname = 'switchboard_audit'
-                                     AND pg_has_role({owner}, s.nspowner, 'USAGE'))
-                      OR EXISTS (SELECT FROM pg_catalog.pg_trigger g
-                                     JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid
-                                 WHERE g.tgrelid = $1::oid
-                                     AND pg_has_role({owner}, f.proowner, 'USAGE'))
-                      OR EXISTS (SELECT FROM pg_catalog.pg_roles s
-                                 WHERE s.rolname = ANY($3::text[]) AND s.oid = {owner})
-                      OR EXISTS (SELECT FROM pg_catalog.pg_proc f
-                                     JOIN pg_catalog.pg_namespace fs ON fs.oid = f.pronamespace
-                                     JOIN pg_catalog.pg_language l ON l.oid = f.prolang
-                                 WHERE ((fs.nspname = 'pg_catalog'
-                                         AND f.proname::text = ANY($4::text[]))
-                                        OR (l.lanispl AND NOT l.lanpltrusted))
-                                     AND has_function_privilege({owner}, f.oid, 'EXECUTE'))
+/// [`ABLE_SETS`], and `$2`, the table-level privileges, from [`AbleParameters`]. `{replication}`
+/// is [`replication_condition`]'s. It asks about `{owner}` with what it inherits; [`able`] asks it
+/// of every role, and then counts every member of a role it holds for as able too.
+const ABLE: &str = "(EXISTS (SELECT FROM reached x
+                             WHERE has_table_privilege({owner}, x.oid, $2)
+                                 OR has_any_column_privilege({owner}, x.oid,
+                                                             'SELECT, INSERT, UPDATE')
+                                 OR pg_has_role({owner}, x.relowner, 'USAGE'))
+                      OR EXISTS (SELECT FROM schema_owner s
+                                 WHERE pg_has_role({owner}, s.nspowner, 'USAGE'))
+                      OR EXISTS (SELECT FROM trigger_function_owners f
+                                 WHERE pg_has_role({owner}, f.proowner, 'USAGE'))
+                      OR EXISTS (SELECT FROM server_roles s WHERE s.oid = {owner})
+                      OR EXISTS (SELECT FROM outside_functions f
+                                 WHERE has_function_privilege({owner}, f.oid, 'EXECUTE'))
                       {replication})";
 
-/// [`ABLE`] for the role `owner`, an expression naming one, or for any role it is a member of.
-fn able(owner: &str, version: i32) -> String {
-    by_any_member(
-        owner,
-        &ABLE.replace("{replication}", &replication_condition(version)),
-    )
-}
-
-/// `test`, a condition on the role `{owner}`, for the role `owner`, an expression naming one, or
-/// for any role it is a member of, whether or not it inherits that role. A member that does not
-/// inherit a role can still give an object it makes to that role, since `ALTER ... OWNER TO`
-/// asks only that it may `SET ROLE` to it, not that it does; and a definer function or a
-/// foreign key's action can do that though it cannot `SET ROLE` itself. So every membership
-/// counts here, as it does for the session's role.
-fn by_any_member(owner: &str, test: &str) -> String {
+/// A condition that the role `owner`, an expression naming one, is a member of one of `roles`,
+/// an `oid[]` parameter such as `$1`, whether or not it inherits that role. A member that does
+/// not inherit a role can still give an object it makes to that role, since `ALTER ... OWNER
+/// TO` asks only that it may `SET ROLE` to it, not that it does; and a definer function or a
+/// foreign key's action can do that though it cannot `SET ROLE` itself. A member granted a role
+/// with ADMIN OPTION alone, neither inheriting it nor able to `SET ROLE` to it, can grant the
+/// role to itself with SET, and then do the same. So every membership counts here, as it does
+/// for the session's role.
+fn by_any_member(owner: &str, roles: &str) -> String {
     format!(
-        "EXISTS (SELECT FROM pg_catalog.pg_roles mo
-                 WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})",
-        test.replace("{owner}", "mo.oid")
+        "EXISTS (SELECT FROM unnest({roles}::oid[]) AS a(oid)
+                 WHERE pg_has_role({owner}, a.oid, 'MEMBER'))"
     )
 }
 
@@ -259,7 +273,7 @@ fn replication_condition(version: i32) -> String {
     }
 }
 
-/// The parameters [`ABLE`] and [`definers_cte`] read.
+/// The parameters [`ABLE_SETS`] and [`ABLE`] read.
 struct AbleParameters {
     table: tokio_postgres::types::Oid,
     privileges: String,
@@ -285,32 +299,92 @@ impl AbleParameters {
     }
 }
 
-/// `definers(oid)`, every `SECURITY DEFINER` function whose owner is able ([`able`]), or can
-/// run another such function, itself or through a trigger on a table it can write, or is a
-/// member of a role that can. It follows [`REACHING`] in a `WITH RECURSIVE`.
-fn definers_cte(version: i32) -> String {
-    format!(
-        "definers(oid) AS (
-             SELECT p.oid FROM pg_catalog.pg_proc p
-             WHERE p.prosecdef
-                 AND {}
-             UNION
-             SELECT p.oid
-             FROM definers d
-                 JOIN pg_catalog.pg_proc p ON p.prosecdef
-                     AND {}
-         )",
-        able("p.proowner", version),
-        by_any_member(
-            "p.proowner",
-            "(has_function_privilege({owner}, d.oid, 'EXECUTE')
-              OR EXISTS (SELECT FROM pg_catalog.pg_trigger t
-                         WHERE t.tgfoid = d.oid
-                             AND (has_any_column_privilege({owner}, t.tgrelid, 'INSERT, UPDATE')
-                                  OR has_table_privilege({owner}, t.tgrelid,
-                                                         'DELETE, TRUNCATE'))))"
-        ),
-    )
+/// The roles that are able, and the definer functions that run as one, as [`able`] finds them.
+struct Able {
+    /// Every role that is able. A role that is a member of one, inherited or not, is able too,
+    /// and is asked about with [`by_any_member`] rather than listed.
+    roles: Vec<tokio_postgres::types::Oid>,
+    /// Every `SECURITY DEFINER` function whose owner is a member of one of [`Able::roles`].
+    definers: Vec<tokio_postgres::types::Oid>,
+}
+
+/// The roles, other than `$1`, that can run one of the definer functions `$2`: with EXECUTE on
+/// it, or by writing a table one of its triggers is on. The tables are found once.
+const RUNNERS: &str = "WITH fresh AS MATERIALIZED (
+                 SELECT d.oid FROM unnest($2::oid[]) AS d(oid)
+             ),
+             fired AS MATERIALIZED (
+                 SELECT DISTINCT t.tgrelid FROM pg_catalog.pg_trigger t
+                 WHERE t.tgfoid = ANY($2::oid[])
+             )
+             SELECT r.oid FROM pg_catalog.pg_roles r
+             WHERE r.oid <> ALL($1::oid[])
+                 AND (EXISTS (SELECT FROM fresh d
+                              WHERE has_function_privilege(r.oid, d.oid, 'EXECUTE'))
+                      OR EXISTS (SELECT FROM fired t
+                                 WHERE has_any_column_privilege(r.oid, t.tgrelid, 'INSERT, UPDATE')
+                                     OR has_table_privilege(r.oid, t.tgrelid, 'DELETE, TRUNCATE')))
+             ORDER BY 1";
+
+/// Every role that is able, and every definer function that runs as one, found once for
+/// [`definers`] and [`cascade_actions`] both.
+///
+/// A role is able when [`ABLE`] holds for it, or when it can run a definer function: one whose
+/// owner is a member, inherited or not, of an able role ([`by_any_member`]), with EXECUTE on it
+/// or through a trigger on a table it can write. [`ABLE`] is asked of each role once, and each
+/// later step asks of each function or role only whether it is a member of, or can run, one of
+/// a list found before. So the cost grows with functions plus roles, not with their product,
+/// whatever plan the server picks. The steps repeat until no role is added, as a definer chain
+/// may be long.
+async fn able(
+    client: &ClientWrapper,
+    table: tokio_postgres::types::Oid,
+    version: i32,
+) -> Result<Able, tokio_postgres::Error> {
+    let oids = |rows: Vec<tokio_postgres::Row>| -> Vec<tokio_postgres::types::Oid> {
+        rows.into_iter().map(|row| row.get(0)).collect()
+    };
+    let mut roles = oids(
+        client
+            .query(
+                &format!(
+                    "WITH RECURSIVE {REACHING}, {ABLE_SETS}
+                     SELECT r.oid FROM pg_catalog.pg_roles r
+                     WHERE {}
+                     ORDER BY 1",
+                    ABLE.replace("{replication}", &replication_condition(version))
+                        .replace("{owner}", "r.oid"),
+                ),
+                &able_parameters(table, version).as_params(),
+            )
+            .await?,
+    );
+    // Definer functions whose owner is a member, inherited or not, of one of `roles`.
+    let definers_of = format!(
+        "SELECT p.oid FROM pg_catalog.pg_proc p
+         WHERE p.prosecdef AND {}
+         ORDER BY 1",
+        by_any_member("p.proowner", "$1")
+    );
+    let mut definers: Vec<tokio_postgres::types::Oid> = Vec::new();
+    loop {
+        let found = oids(client.query(&definers_of, &[&roles]).await?);
+        let fresh: Vec<_> = found
+            .iter()
+            .filter(|oid| !definers.contains(oid))
+            .copied()
+            .collect();
+        definers = found;
+        if fresh.is_empty() {
+            break;
+        }
+        let runners = oids(client.query(RUNNERS, &[&roles, &fresh]).await?);
+        if runners.is_empty() {
+            break;
+        }
+        roles.extend(runners);
+    }
+    Ok(Able { roles, definers })
 }
 
 /// A condition, for [`by_any_role`], that the role `r.oid` may run the function `p.oid`.
@@ -985,7 +1059,10 @@ impl PgAuditStore {
     ///   that role. Only an administrator stores that password. A foreign table in
     ///   `switchboard_audit` is refused; one elsewhere is not followed to where it connects.
     ///
-    /// Has no time limit: wrap it in one if boot must not wait on the database.
+    /// It asks which roles are able once, and then asks of each function and each table only
+    /// whether its owner is a member of one, so its time grows with the number of roles plus
+    /// the number of functions, not with their product (#144). Has no time limit: wrap it in
+    /// one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {
         let client = self.begin.get().await?;
         check(&client).await
@@ -1086,8 +1163,9 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
     open_rows(client, &mut problems).await?;
     if let Some((table, _)) = table {
         reaching_privileges(client, table, version, &mut problems).await?;
-        definers(client, table, version, &mut problems).await?;
-        cascade_actions(client, table, version, &mut problems).await?;
+        let found = able(client, table, version).await?;
+        definers(client, &found, &mut problems).await?;
+        cascade_actions(client, table, &found, &mut problems).await?;
     }
     server_functions(client, &mut problems).await?;
     untrusted_functions(client, &mut problems).await?;
@@ -1774,20 +1852,15 @@ async fn reaching_privileges(
 /// checked as the session's own.
 async fn definers(
     client: &ClientWrapper,
-    table: tokio_postgres::types::Oid,
-    version: i32,
+    able: &Able,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let definers: Vec<tokio_postgres::types::Oid> = client
         .query(
-            &format!(
-                "WITH RECURSIVE {REACHING}, {}
-                 SELECT d.oid FROM definers d
-                     JOIN pg_catalog.pg_proc p ON p.oid = d.oid
-                 WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')",
-                definers_cte(version),
-            ),
-            &able_parameters(table, version).as_params(),
+            "SELECT d.oid FROM unnest($1::oid[]) AS d(oid)
+                 JOIN pg_catalog.pg_proc p ON p.oid = d.oid
+             WHERE NOT pg_has_role(current_user, p.proowner, 'MEMBER')",
+            &[&able.definers],
         )
         .await?
         .into_iter()
@@ -1867,8 +1940,8 @@ async fn definers(
 
 /// No table other than `call_rows` may hold a foreign key whose action on a delete or an
 /// update of the row it references writes that table (`CASCADE`, `SET NULL` or `SET DEFAULT`),
-/// when the table's owner is able ([`able`]) or can run a definer function [`definers`]
-/// refuses.
+/// when the table's owner is able ([`able`]: a member of an able role, or of one that can run
+/// a definer function [`definers`] counts).
 ///
 /// Postgres runs a foreign key's action as the owner of the table that holds the key, whether
 /// or not anything it sets off is `SECURITY DEFINER`, for any role that may delete or update a
@@ -1890,14 +1963,13 @@ async fn definers(
 async fn cascade_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
-    version: i32,
+    able: &Able,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let found = client
         .query(
             &format!(
-                "WITH RECURSIVE {REACHING}, {}
-                 SELECT tn.nspname || '.' || tbl.relname, o.rolname::text, k.conname::text,
+                "SELECT tn.nspname || '.' || tbl.relname, o.rolname::text, k.conname::text,
                         rn.nspname || '.' || r.relname
                  FROM pg_catalog.pg_constraint k
                      JOIN pg_catalog.pg_class tbl ON tbl.oid = k.conrelid
@@ -1908,18 +1980,11 @@ async fn cascade_actions(
                  WHERE k.contype = 'f' AND k.conparentid = 0
                      AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid
                      AND (k.confdeltype NOT IN ('a', 'r') OR k.confupdtype NOT IN ('a', 'r'))
-                     AND ({}
-                          OR {})
+                     AND {}
                  ORDER BY 1, 3",
-                definers_cte(version),
-                able("tbl.relowner", version),
-                by_any_member(
-                    "tbl.relowner",
-                    "EXISTS (SELECT FROM definers d
-                             WHERE has_function_privilege({owner}, d.oid, 'EXECUTE'))"
-                ),
+                by_any_member("tbl.relowner", "$2"),
             ),
-            &able_parameters(table, version).as_params(),
+            &[&table, &able.roles],
         )
         .await?;
     problems.extend(found.into_iter().map(|row| Problem::CascadeAction {
