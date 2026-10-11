@@ -2699,3 +2699,533 @@ async fn an_open_row_view_with_an_option_is_refused() {
     store.check_at_boot().await.unwrap();
     store.open_rows().await.unwrap();
 }
+
+fn cascade_action(table: &str, owner: &str) -> Problem {
+    Problem::CascadeAction {
+        table: table.into(),
+        owner: owner.into(),
+        constraint: "follow".into(),
+        referenced: "reports.parents".into(),
+    }
+}
+
+/// #138's reproduction. Postgres runs a foreign key's action, and the triggers it fires, as the
+/// owner of the table that holds the key. So a plain trigger on a table that holds a foreign
+/// key with `ON DELETE CASCADE` runs as that table's owner whenever a referenced row is
+/// deleted, by any role that may delete one. When the owner can write `call_rows`, the foreign
+/// key is refused. It passes when it only refuses a write, or when the table's owner can reach
+/// nothing.
+#[tokio::test]
+async fn a_foreign_key_whose_action_fires_a_trigger_is_refused_when_its_owner_is_able() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE
+             );
+             CREATE FUNCTION reports.on_child_delete() RETURNS trigger
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN OLD; END$$;
+             CREATE TRIGGER on_child_delete BEFORE DELETE ON reports.children
+                 FOR EACH ROW EXECUTE FUNCTION reports.on_child_delete();
+             INSERT INTO reports.parents VALUES ('00000000-0000-0000-0000-000000000001');
+             INSERT INTO reports.children VALUES ('00000000-0000-0000-0000-000000000001');
+             GRANT SELECT, DELETE ON reports.parents TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    let found = problems_of(&db).await;
+    assert_eq!(found, vec![cascade_action("reports.children", OWNER_ROLE)]);
+    assert_eq!(
+        found[0].to_string(),
+        "the table reports.children has the foreign key follow, whose action writes \
+         reports.children as its owner switchboard_owner, which can read or change \
+         switchboard_audit.call_rows or turn off its triggers: each delete or update on \
+         reports.parents, by any role that may make one, runs that action, and the triggers, \
+         rules, checks and defaults it sets off, as switchboard_owner"
+    );
+    // What the check refuses is real, as the issue found: the gateway's delete on the parent
+    // table empties call_rows.
+    a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+
+    // An action only on update is refused the same way.
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             ALTER TABLE reports.children DROP CONSTRAINT follow,
+                 ADD CONSTRAINT follow FOREIGN KEY (parent) REFERENCES reports.parents
+                     ON DELETE NO ACTION ON UPDATE SET NULL;
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![cascade_action("reports.children", OWNER_ROLE)]
+    );
+
+    // A foreign key that only refuses a write passes.
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             ALTER TABLE reports.children DROP CONSTRAINT follow,
+                 ADD CONSTRAINT follow FOREIGN KEY (parent) REFERENCES reports.parents
+                     ON DELETE RESTRICT ON UPDATE NO ACTION;
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+
+    // With the cascade back, a table whose owner can reach nothing passes.
+    let plain = db.new_role("NOLOGIN", &[]).await;
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             ALTER TABLE reports.children DROP CONSTRAINT follow,
+                 ADD CONSTRAINT follow FOREIGN KEY (parent) REFERENCES reports.parents
+                     ON DELETE CASCADE;
+             RESET ROLE;
+             ALTER TABLE reports.children OWNER TO {plain};"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+
+    // An owner that can run a definer function whose owner can write call_rows is able too,
+    // though the gateway cannot run that function itself.
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE FUNCTION reports.purge() RETURNS void
+                 LANGUAGE sql SECURITY DEFINER AS 'DELETE FROM switchboard_audit.call_rows';
+             REVOKE EXECUTE ON FUNCTION reports.purge() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.purge() TO {plain};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![cascade_action("reports.children", &plain)]
+    );
+}
+
+/// A foreign key's action writes its table as the table's owner, so whatever that write sets
+/// off runs as the owner too, not only a trigger: a rule on the table, a check that calls a
+/// function, a default that calls one. The catalog cannot say what any of them writes, so the
+/// foreign key is refused whatever its table has, when the table's owner is able.
+#[tokio::test]
+async fn a_foreign_key_whose_action_runs_a_rule_a_check_or_a_default_is_refused() {
+    let variants = [
+        (
+            "a rule",
+            "CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE
+             );
+             CREATE RULE purge AS ON DELETE TO reports.children
+                 DO ALSO DELETE FROM switchboard_audit.call_rows;",
+        ),
+        (
+            "a check",
+            "CREATE FUNCTION reports.purge() RETURNS boolean
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN true; END$$;
+             CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE SET NULL,
+                 CHECK (parent IS NOT NULL OR reports.purge())
+             );",
+        ),
+        (
+            "a default",
+            "CREATE FUNCTION reports.purge() RETURNS uuid
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN NULL; END$$;
+             CREATE TABLE reports.children (
+                 parent uuid DEFAULT reports.purge()
+                     CONSTRAINT follow REFERENCES reports.parents ON DELETE SET DEFAULT
+             );",
+        ),
+    ];
+    for (what, children) in variants {
+        let Some(db) = TestDatabase::create().await else {
+            return;
+        };
+        db.admin()
+            .await
+            .batch_execute(&format!(
+                "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+                 GRANT USAGE ON SCHEMA reports TO PUBLIC;
+                 SET ROLE {OWNER_ROLE};
+                 CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+                 {children}
+                 INSERT INTO reports.parents VALUES ('00000000-0000-0000-0000-000000000001');
+                 INSERT INTO reports.children VALUES ('00000000-0000-0000-0000-000000000001');
+                 GRANT SELECT, DELETE ON reports.parents TO {GATEWAY_ROLE};
+                 RESET ROLE;"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            problems_of(&db).await,
+            vec![cascade_action("reports.children", OWNER_ROLE)],
+            "{what}"
+        );
+        // What the check refuses is real: the gateway's delete on the parent table empties
+        // call_rows.
+        a_row(&db).await;
+        db.connect_as(GATEWAY_ROLE)
+            .await
+            .batch_execute("DELETE FROM reports.parents")
+            .await
+            .unwrap();
+        assert_eq!(rows(&db).await, 0, "{what}");
+    }
+}
+
+/// A partitioned table's foreign key is copied to each partition, but its action writes the
+/// partitioned table as that table's owner, and reaches a partition's triggers from there. So
+/// the partitioned table's owner is the one judged: a trigger on a partition given to a role
+/// that can reach nothing still runs as the partitioned table's owner, and the foreign key is
+/// refused. A partition's owner is not judged: when the partitioned table's owner can reach
+/// nothing, a partition owned by `switchboard_owner` passes, and its trigger runs as the
+/// partitioned table's owner.
+#[tokio::test]
+async fn a_partitioned_tables_foreign_key_is_judged_by_the_partitioned_tables_owner() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let plain = db.new_role("NOLOGIN", &[]).await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT CREATE ON SCHEMA reports TO {plain};
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE,
+                 k int
+             ) PARTITION BY LIST (k);
+             CREATE TABLE reports.children_a PARTITION OF reports.children FOR VALUES IN (1);
+             GRANT SELECT, DELETE ON reports.parents TO {GATEWAY_ROLE};
+             RESET ROLE;
+             ALTER TABLE reports.children_a OWNER TO {plain};
+             SET ROLE {plain};
+             CREATE FUNCTION reports.on_child_delete() RETURNS trigger
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN OLD; END$$;
+             CREATE TRIGGER on_child_delete BEFORE DELETE ON reports.children_a
+                 FOR EACH ROW EXECUTE FUNCTION reports.on_child_delete();
+             RESET ROLE;
+             INSERT INTO reports.parents VALUES ('00000000-0000-0000-0000-000000000001');
+             INSERT INTO reports.children VALUES ('00000000-0000-0000-0000-000000000001', 1);"
+        ))
+        .await
+        .unwrap();
+    // The partition's copy of the key, owned by a role that can reach nothing, is not what
+    // the action runs as.
+    assert_eq!(
+        problems_of(&db).await,
+        vec![cascade_action("reports.children", OWNER_ROLE)]
+    );
+    // What the check refuses is real: the partition's trigger runs as the partitioned table's
+    // owner, and the gateway's delete on the parent table empties call_rows.
+    a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+
+    // The other way round, the partition's owner can write call_rows and the partitioned
+    // table's cannot. It passes, and the trigger runs as the partitioned table's owner, which
+    // is refused.
+    admin
+        .batch_execute(&format!(
+            "ALTER TABLE reports.children OWNER TO {plain};
+             ALTER TABLE reports.children_a OWNER TO {OWNER_ROLE};
+             INSERT INTO reports.parents VALUES ('00000000-0000-0000-0000-000000000001');
+             INSERT INTO reports.children VALUES ('00000000-0000-0000-0000-000000000001', 1);"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+    a_row(&db).await;
+    let error = db
+        .connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap_err();
+    // 42501: insufficient privilege, the partitioned table's owner's.
+    assert_eq!(super::code(&error), Some("42501"), "{error:?}");
+    assert_eq!(rows(&db).await, 1);
+}
+
+/// A role granted another `WITH INHERIT FALSE, SET TRUE` holds none of that role's privileges
+/// until it changes to it, and a definer function or a foreign key's action cannot change
+/// role. But it can make a function and give it to that role, since `ALTER ... OWNER TO` asks
+/// only that it may `SET ROLE` to it. So a definer function's owner, or a cascading table's,
+/// counts as able when any role it is a member of is able, inherited or not: when it is a
+/// member of the owner of `call_rows`, or of a role that may run a definer function that is
+/// able.
+#[tokio::test]
+async fn an_owner_that_is_a_member_of_an_able_role_without_inheriting_it_is_able() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;"
+        ))
+        .await
+        .unwrap();
+
+    // A cascading table owned by a member of the owner of call_rows.
+    let cascader = db.new_role("NOLOGIN", &[]).await;
+    db.cluster_wide(&format!(
+        "GRANT {OWNER_ROLE} TO {cascader} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .await;
+    let usage: bool = admin
+        .query_one(
+            &format!("SELECT pg_has_role('{cascader}', '{OWNER_ROLE}', 'USAGE')"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!usage);
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE
+             );
+             RESET ROLE;
+             ALTER TABLE reports.children OWNER TO {cascader};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![cascade_action("reports.children", &cascader)]
+    );
+    admin
+        .batch_execute("DROP TABLE reports.children")
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+
+    // A definer function owned by a member of a role that may run an able definer function.
+    let runner = db.new_role("NOLOGIN", &[]).await;
+    let relay_owner = db.new_role("NOLOGIN", &[]).await;
+    db.cluster_wide(&format!(
+        "GRANT {runner} TO {relay_owner} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .await;
+    admin
+        .batch_execute(&format!(
+            "SET ROLE {OWNER_ROLE};
+             CREATE FUNCTION reports.purge() RETURNS void
+                 LANGUAGE sql SECURITY DEFINER AS 'DELETE FROM switchboard_audit.call_rows';
+             REVOKE EXECUTE ON FUNCTION reports.purge() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.purge() TO {runner};
+             RESET ROLE;
+             CREATE FUNCTION reports.relay() RETURNS int
+                 LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+             ALTER FUNCTION reports.relay() OWNER TO {relay_owner};
+             REVOKE EXECUTE ON FUNCTION reports.relay() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.relay() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer("reports.relay()", &relay_owner, "EXECUTE on it")]
+    );
+    admin
+        .batch_execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION reports.relay() FROM {GATEWAY_ROLE}"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+
+    // A definer function owned by a member of the owner of call_rows.
+    let member = db.new_role("NOLOGIN", &[]).await;
+    db.cluster_wide(&format!(
+        "GRANT {OWNER_ROLE} TO {member} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .await;
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA handed AUTHORIZATION {member};
+             GRANT USAGE ON SCHEMA handed TO PUBLIC;
+             CREATE FUNCTION handed.hand_over() RETURNS void
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN
+                     GRANT CREATE ON SCHEMA handed TO {OWNER_ROLE};
+                     CREATE FUNCTION handed.purge() RETURNS void
+                         LANGUAGE plpgsql SECURITY DEFINER
+                         AS $q$BEGIN DELETE FROM switchboard_audit.call_rows; END$q$;
+                     ALTER FUNCTION handed.purge() OWNER TO {OWNER_ROLE};
+                     PERFORM handed.purge();
+                 END$$;
+             ALTER FUNCTION handed.hand_over() OWNER TO {member};
+             REVOKE EXECUTE ON FUNCTION handed.hand_over() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION handed.hand_over() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer("handed.hand_over()", &member, "EXECUTE on it")]
+    );
+    // What the check refuses is real: the function makes another, gives it to the owner of
+    // call_rows, and runs it.
+    a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("SELECT handed.hand_over()")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+}
+
+/// A role granted a predefined server role `WITH INHERIT FALSE, SET TRUE` holds none of its
+/// privileges until it changes to it, so asking whether it may use the role says no. It is a
+/// member all the same, so a definer function it owns is refused when the gateway can run it.
+#[tokio::test]
+async fn a_definer_function_whose_owner_is_a_member_without_inheriting_a_server_role_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.new_role("NOLOGIN", &[]).await;
+    db.cluster_wide(&format!(
+        "GRANT pg_execute_server_program TO {owner} WITH INHERIT FALSE, SET TRUE"
+    ))
+    .await;
+    let admin = db.admin().await;
+    let usage: bool = admin
+        .query_one(
+            &format!("SELECT pg_has_role('{owner}', 'pg_execute_server_program', 'USAGE')"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!usage);
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE FUNCTION reports.member_only() RETURNS int
+                 LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+             ALTER FUNCTION reports.member_only() OWNER TO {owner};
+             REVOKE EXECUTE ON FUNCTION reports.member_only() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.member_only() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer("reports.member_only()", &owner, "EXECUTE on it")]
+    );
+
+    db.cluster_wide(&format!("REVOKE pg_execute_server_program FROM {owner}"))
+        .await;
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
+/// The gateway's role may not run `lo_export` and the catalog's other functions that reach the
+/// server's files, nor a function in an untrusted language. A definer function whose owner may
+/// run either reaches what they reach, so it is refused when the gateway can run it.
+#[tokio::test]
+async fn a_definer_function_whose_owner_can_run_a_server_or_untrusted_function_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let exporter = db.new_role("NOLOGIN", &[]).await;
+    let untrusted = db.new_role("NOLOGIN", &[]).await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE LANGUAGE plpgsql_untrusted HANDLER plpgsql_call_handler;
+             CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE FUNCTION reports.outside() RETURNS int
+                 LANGUAGE plpgsql_untrusted AS $$BEGIN RETURN 1; END$$;
+             REVOKE EXECUTE ON FUNCTION reports.outside() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.outside() TO {untrusted};
+             GRANT EXECUTE ON FUNCTION pg_catalog.lo_export(oid, text) TO {exporter};
+             CREATE FUNCTION reports.export() RETURNS int
+                 LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+             ALTER FUNCTION reports.export() OWNER TO {exporter};
+             CREATE FUNCTION reports.call_outside() RETURNS int
+                 LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+             ALTER FUNCTION reports.call_outside() OWNER TO {untrusted};
+             REVOKE EXECUTE ON FUNCTION reports.export(), reports.call_outside() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.export(), reports.call_outside()
+                 TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![
+            definer("reports.call_outside()", &untrusted, "EXECUTE on it"),
+            definer("reports.export()", &exporter, "EXECUTE on it"),
+        ]
+    );
+
+    admin
+        .batch_execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION pg_catalog.lo_export(oid, text) FROM {exporter};
+             REVOKE EXECUTE ON FUNCTION reports.outside() FROM {untrusted};"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
