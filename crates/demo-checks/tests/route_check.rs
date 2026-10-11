@@ -1502,6 +1502,9 @@ fn add_rbac(cluster: &mut Cluster, what: &str, namespace: Option<&str>, item: Va
     list.as_array_mut().unwrap().push(item);
 }
 
+/// An RBAC object to add: the list it goes in, its namespace, and the object.
+type RbacItem<'a> = (&'a str, Option<&'a str>, Value);
+
 /// The step's line for a row granted by RBAC rules, as `why`.
 fn rbac_granted(row: &str, why: &str) -> String {
     format!(
@@ -1518,7 +1521,7 @@ fn a_grant_limited_by_resource_names_fails_however_it_is_bound() {
     let user =
         json!([{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": WORKLOAD_USER}]);
     let mint = json!([{"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"], "resourceNames": ["gateway"]}]);
-    let cases: Vec<(&str, Vec<(&str, Option<&str>, Value)>, &str, String)> = vec![
+    let cases: Vec<(&str, Vec<RbacItem>, &str, String)> = vec![
         (
             "service-account",
             vec![
