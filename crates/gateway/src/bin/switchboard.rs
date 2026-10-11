@@ -144,7 +144,8 @@ async fn serve(config: PathBuf) -> ExitCode {
     let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let metrics = metrics_listener.map(|listener| {
-        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone());
+        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
+            .with_issuer_keys(prepared.keys.ages());
         tokio::spawn(serve_metrics(listener, metrics, async {
             let _ = metrics_stopped.await;
         }))

@@ -6,13 +6,18 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use axum::Router;
+use axum::extract::State;
+use axum::routing::get;
 use gateway::{Deployment, path::RequestPath};
 use gateway_identity::SigningAlgorithm;
 use gateway_testkit::LocalIssuer;
-use http::{HeaderMap, HeaderValue, Method};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 
 /// The kind demo's registry, as deployed.
 pub const KIND_REGISTRY: &str =
@@ -128,6 +133,76 @@ impl Files {
 pub fn registry(mock_url: &str) -> String {
     assert_eq!(KIND_REGISTRY.matches(KIND_ADDRESS).count(), 1);
     KIND_REGISTRY.replace(KIND_ADDRESS, mock_url)
+}
+
+/// The revision the kind registry is at.
+pub const KIND_REVISION: &str = "demo-1";
+
+/// The kind registry with the mock server at `mock_url`, under `revision` instead of
+/// [`KIND_REVISION`].
+pub fn registry_at_revision(mock_url: &str, revision: &str) -> String {
+    let line = format!("revision = \"{KIND_REVISION}\"\n");
+    let text = registry(mock_url);
+    assert_eq!(text.matches(&line).count(), 1);
+    text.replace(&line, &format!("revision = \"{revision}\"\n"))
+}
+
+/// The path [`KeysServer`] serves its keys at.
+pub const KEYS_PATH: &str = "/keys";
+
+/// An issuer's origin on loopback, serving a JWK set at [`KEYS_PATH`], or a failing status, as
+/// the test sets. Any other path is `404`. It runs on the test's Tokio runtime.
+pub struct KeysServer {
+    /// The origin, `http://127.0.0.1:PORT`: the issuer's name too.
+    pub url: String,
+    answer: Arc<Mutex<(StatusCode, String)>>,
+}
+
+impl KeysServer {
+    /// Starts a server answering `404` until told otherwise.
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let answer = Arc::new(Mutex::new((StatusCode::NOT_FOUND, String::new())));
+        let state = Arc::clone(&answer);
+        let router = Router::new()
+            .route(
+                KEYS_PATH,
+                get(
+                    |State(answer): State<Arc<Mutex<(StatusCode, String)>>>| async move {
+                        answer.lock().unwrap().clone()
+                    },
+                ),
+            )
+            .with_state(state);
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        Self { url, answer }
+    }
+
+    /// Answers `200` with `document`.
+    pub fn serve(&self, document: impl Into<String>) {
+        *self.answer.lock().unwrap() = (StatusCode::OK, document.into());
+    }
+
+    /// Answers with `status` and no body.
+    pub fn fail(&self, status: StatusCode) {
+        *self.answer.lock().unwrap() = (status, String::new());
+    }
+
+    /// The URL the keys are served at.
+    pub fn keys_url(&self) -> String {
+        format!("{}{KEYS_PATH}", self.url)
+    }
+}
+
+/// The `[[identity.issuers]]` entry for an ES256 user issuer named `issuer`, whose keys are
+/// fetched from `keys_url` every five minutes, the default.
+pub fn keys_url_issuer(issuer: &str, keys_url: &str) -> String {
+    format!(
+        "[[identity.issuers]]\nissuer = \"{issuer}\"\nkind = \"user\"\n\
+         audiences = [\"{AUDIENCE}\"]\nalgorithm = \"ES256\"\nkeys_url = \"{keys_url}\"\n\
+         max_lifetime_seconds = 3600\nleeway_seconds = 30\n"
+    )
 }
 
 /// A deployment file, relative paths and all, with `audit` as its audit table.

@@ -1076,6 +1076,9 @@ mutate("identity-replace-keys-drops-other-issuers", "a replacement rebuilds the 
        REPLACE_BUILD, "        let verifier = TokenVerifier::new(vec![next[index].clone()], Arc::clone(&self.clock))?;\n")
 mutate("identity-replace-keys-while-disabled", "keys supplied to a disabled gate are accepted", IDENTITY_SRC + "identity.rs",
        "            return Err(ConfigError::KeysWhileDisabled(issuer.clone()));", "            return Ok(KeysReplaced::default());")
+mutate("identity-replace-changed-never", "a key replaced under a kept kid is reported as no change", IDENTITY_SRC + "identity.rs",
+       "                .filter(|(kid, key)| before.get(*kid).is_some_and(|old| old != *key))\n",
+       "                .filter(|_| false)\n")
 
 # --- The identity gate and the opaque failure ----------------------------------------------
 
@@ -1683,8 +1686,8 @@ STALE_KEY = ('{"keys": [{"kty": "EC", "crv": "P-256", "kid": "stale", '
              '"x": "S8cWydNibCrzVUwFcMpa8CorM1ZTnJmxVTZWONUI_-o", '
              '"y": "0ziqidx7IOWX78hzezpoVuoCwdilEjtBLXKRwcxVbeo"}]}')
 mutate("gw-keys-refresh-never-runs", "the refresh timer ticks and fetches nothing", KEYS,
-       "        let _ = refresh(&identity, &refreshed.source, &mut last_failure).await;\n",
-       "        let _ = (&identity, &refreshed.source, &mut last_failure);\n")
+       "        let _ = refresh(&identity, &refreshed, &ages, &mut last_failure).await;\n",
+       "        let _ = (&identity, &refreshed, &ages, &mut last_failure);\n")
 mutate("gw-keys-refresh-failure-clears-keys", "a failed refresh drops the keys in use for a key the issuer does not sign with", KEYS,
        "        Err(error) => Err(RefreshError::from(error)),\n",
        "        Err(error) => {\n"
@@ -1705,6 +1708,30 @@ mutate("gw-keys-url-and-file-both-accepted", "an issuer with both a keys file an
        "        (Some(file), None) => {\n",
        "        (None, None) => return Err(DeploymentError::NoKeys(issuer.issuer)),\n"
        "        (Some(file), _) => {\n")
+# Issue #91: the 30 s floor and the refusal of an interval beside a keys file; a key replaced
+# under a kept kid is reported and logged; boot's and each refresh's fetch time is exported; and
+# the binary starts both the key refresher and the registry watcher.
+mutate("gw-keys-refresh-floor-removed", "any keys_refresh_seconds is accepted, 0 included", GW_DEPLOY,
+       "            if refresh < MIN_KEYS_REFRESH {\n", "            if false {\n")
+mutate("gw-keys-refresh-floor-inclusive", "keys_refresh_seconds = 30 is refused", GW_DEPLOY,
+       "            if refresh < MIN_KEYS_REFRESH {\n", "            if refresh <= MIN_KEYS_REFRESH {\n")
+mutate("gw-keys-refresh-beside-file-accepted", "keys_refresh_seconds beside a keys file is accepted and ignored", GW_DEPLOY,
+       "            if issuer.keys_refresh_seconds.is_some() {\n", "            if false {\n")
+mutate("gw-keys-changed-not-logged", "a key replaced under a kept kid is put in force with no line logged", KEYS,
+       "                || !replaced.removed.is_empty()\n                || !replaced.changed.is_empty();\n",
+       "                || !replaced.removed.is_empty();\n")
+mutate("gw-keys-age-not-reset", "a refresh that succeeds leaves the exported age of the keys growing", KEYS,
+       "            ages.fetched(refreshed.age);\n", "            let _ = (ages, refreshed.age);\n")
+mutate("gw-bin-key-ages-not-exported", "switchboard's metrics leave out the age of each issuer's keys", GW_BIN,
+       "        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())\n"
+       "            .with_issuer_keys(prepared.keys.ages());\n",
+       "        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone());\n")
+mutate("gw-bin-keys-refresher-not-spawned", "switchboard never refreshes the keys it fetched at boot", GW_BIN,
+       "    let refreshing = tokio::spawn(prepared.keys.run());\n",
+       "    let refreshing = tokio::spawn(async {});\n")
+mutate("gw-bin-registry-watch-not-spawned", "switchboard never reads the registry file again", GW_BIN,
+       "    let watching = tokio::spawn(prepared.watch.run());\n",
+       "    let watching = tokio::spawn(async {});\n")
 
 # Metrics. Every answer with the audit-failure sentence is counted, in one place; the open-row
 # poller starts with the metrics listener; the metrics listener never takes the MCP port. And
