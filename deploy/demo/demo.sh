@@ -87,6 +87,8 @@ OUTAGE_TO=0
 ROUTE_REPORT=""
 OPEN_ATTEMPTS=""
 GATEWAY_POD=""
+# What the last fetch read.
+FETCHED=""
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
@@ -118,17 +120,45 @@ check_at_most() {
 # count_lines PATTERN TEXT: how many lines of TEXT match the extended regex PATTERN.
 count_lines() { printf '%s\n' "$2" | awk -v pattern="$1" '$0 ~ pattern { n++ } END { print n + 0 }'; }
 
-# tally_workload LABEL STATUS OUTPUT: adds a workload's PASS and FAIL lines to the count. Its
-# exit status must agree with its lines, and it must have checked something.
+# fetch WHAT COMMAND...: runs COMMAND and keeps what it printed in FETCHED. If COMMAND fails,
+# fails the check "could not read WHAT" and returns non-zero, so the caller checks nothing from
+# a read that may be short or empty: a log cut short can look like a shorter run that passed.
+fetch() {
+  local what=$1 status=0
+  shift
+  FETCHED=$("$@") || status=$?
+  if [ "$status" -ne 0 ]; then
+    fail "could not read $what (exit $status)"
+    return 1
+  fi
+}
+
+# result_total LINE: how many checks a RESULT line counts, as workload.sh and route-check.sh
+# print it: `RESULT: PASS (P/T)` or `RESULT: FAIL (F of T failed)`. Nothing for any other line.
+result_total() {
+  printf '%s\n' "$1" | sed -nE 's/^RESULT: (PASS \([0-9]+\/([0-9]+)\)|FAIL \([0-9]+ of ([0-9]+) failed\))$/\2\3/p'
+}
+
+# tally_workload LABEL STATUS OUTPUT: adds a workload's PASS and FAIL lines to the count. It
+# must have checked something, and its last RESULT line must count exactly the PASS and FAIL
+# lines tallied, so a log cut short does not pass as a shorter run. That is the last RESULT
+# line, not the last line: `dc run --rm` may print after it. Its exit status must agree with
+# its lines.
 tally_workload() {
-  local label=$1 status=$2 output=$3 passed failed
+  local label=$1 status=$2 output=$3 passed failed result total
   printf '%s\n' "$output" | sed 's/^/    /'
   passed=$(count_lines '^PASS ' "$output")
   failed=$(count_lines '^FAIL ' "$output")
   PASSES=$((PASSES + passed))
   FAILS=$((FAILS + failed))
+  result=$(printf '%s\n' "$output" | awk '/^RESULT: / { last = $0 } END { print last }')
+  total=$(result_total "$result")
   if [ "$passed" -eq 0 ] && [ "$failed" -eq 0 ]; then
     fail "$label: the workload ran no checks (exit $status)"
+  elif [ -z "$result" ]; then
+    fail "$label: the workload printed no RESULT line (exit $status)"
+  elif [ "$total" != "$((passed + failed))" ]; then
+    fail "$label: the workload's RESULT counts ${total:-no number of} checks, but $((passed + failed)) PASS and FAIL lines were read ($result)"
   elif [ "$status" -ne 0 ] && [ "$failed" -eq 0 ]; then
     fail "$label: the workload exited $status without a FAIL line"
   elif [ "$status" -eq 0 ] && [ "$failed" -ne 0 ]; then
@@ -493,7 +523,9 @@ compose_run() {
   mark_start
 
   step "the gateway's boot lines"
-  check_boot "$(dc logs --no-log-prefix gateway)"
+  if fetch "the gateway's log" dc logs --no-log-prefix gateway; then
+    check_boot "$FETCHED"
+  fi
 
   step "team-a and team-b workloads"
   compose_workload "team-a workload" full team-a
@@ -501,8 +533,10 @@ compose_run() {
 
   step "the server never saw a workload token, and no denied call reached it"
   # Each team's full run is allowed two calls, its list and its read; its other calls are denied.
-  check_server_bearers "$(mock_docs_log)" \
-    "$(cat "$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256")" 4 all
+  if fetch "mock-docs' log" mock_docs_log; then
+    check_server_bearers "$FETCHED" \
+      "$(cat "$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256")" 4 all
+  fi
 
   step "database unavailable: the call is refused and nothing runs"
   local before after
@@ -532,7 +566,9 @@ compose_run() {
   sleep 4
 
   step "the gateway's metrics (GET /metrics on its own listener, loopback in the container, unpublished)"
-  check_metrics outage "$(dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics)"
+  if fetch "the gateway's metrics" dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics; then
+    check_metrics outage "$FETCHED"
+  fi
 
   # Three lists: each team's full run, and the run after the withdrawal.
   audit_rows 3
@@ -573,11 +609,15 @@ wait_job() {
   done
 }
 
-kind_workload() { # LABEL NAMESPACE CRONJOB MODE
+# kind_workload LABEL NAMESPACE CRONJOB MODE: runs the workload as a new Job and tallies its log.
+# A log that cannot be read fails as that, whatever part of it was printed.
+kind_workload() {
   local label=$1 ns=$2 cron=$3 mode=$4
   start_job "$ns" "$cron" "$mode"
   wait_job "$ns" "$JOB" 180
-  tally_workload "$label" "$JOB_STATUS" "$(k -n "$ns" logs "job/$JOB")"
+  if fetch "$label's log (job $ns/$JOB)" k -n "$ns" logs "job/$JOB"; then
+    tally_workload "$label" "$JOB_STATUS" "$FETCHED"
+  fi
 }
 
 # start_idle NAMESPACE: starts a new Job of the team's workload in its idle mode, a new pod with
@@ -947,7 +987,9 @@ kind_run() {
   step "the gateway's boot lines (its pod of the current ReplicaSet)"
   gateway_pod
   echo "    pod $GATEWAY_POD"
-  check_boot "$(k -n switchboard logs "pod/$GATEWAY_POD")"
+  if fetch "the gateway's log (pod $GATEWAY_POD)" k -n switchboard logs "pod/$GATEWAY_POD"; then
+    check_boot "$FETCHED"
+  fi
 
   step "before the policy: each team's direct call to mock-docs connects, the server refuses the workload's own token, and the gateway's call to mock-docs succeeds"
   before_policy_probes
@@ -982,7 +1024,9 @@ kind_run() {
   # refused (401) as wrong_audience. The route check's probe before the policy sent no
   # credential, and each attempt it found open was refused as no_bearer. After the policy no
   # direct call reaches the server.
-  check_server_callers "$(mock_docs_log)" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"
+  if fetch "mock-docs' log" mock_docs_log; then
+    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"
+  fi
 
   step "the gateway's view of identity failures (operators only; no audit rows)"
   local gateway_logs
@@ -995,8 +1039,10 @@ kind_run() {
 
   step "the gateway's metrics (GET /metrics on its own port, which the teams cannot reach)"
   # The kind run has no database outage.
-  check_metrics none "$(k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \
-    curl -sS --fail http://localhost:9090/metrics)"
+  if fetch "the gateway's metrics (pod $GATEWAY_POD)" k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \
+    curl -sS --fail http://localhost:9090/metrics; then
+    check_metrics none "$FETCHED"
+  fi
 
   # Two lists: each team's full run. The probes before the policy make none, and the
   # stranger's is refused for identity, which writes no row.
