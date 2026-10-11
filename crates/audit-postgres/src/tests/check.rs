@@ -2833,10 +2833,20 @@ async fn a_foreign_key_whose_action_fires_a_trigger_is_refused_when_its_owner_is
 
 /// A foreign key's action writes its table as the table's owner, so whatever that write sets
 /// off runs as the owner too, not only a trigger: a rule on the table, a check that calls a
-/// function, a default that calls one. The catalog cannot say what any of them writes, so the
-/// foreign key is refused whatever its table has, when the table's owner is able.
+/// function, directly or through an operator, a default or generated column that calls one, an
+/// index expression that calls one, or a column whose domain's check calls one, through
+/// another domain. The catalog cannot say what any of them writes, so the foreign key is
+/// refused when its table has one, and the table's owner is able.
 #[tokio::test]
 async fn a_foreign_key_whose_action_runs_a_rule_a_check_or_a_default_is_refused() {
+    // A function that empties call_rows, and an immutable one that calls it, as a generated
+    // column and an index expression require.
+    let purge = "CREATE FUNCTION reports.purge() RETURNS int
+                     LANGUAGE plpgsql
+                     AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN 1; END$$;
+                 CREATE FUNCTION reports.stamp(uuid) RETURNS int
+                     LANGUAGE plpgsql IMMUTABLE
+                     AS $$BEGIN RETURN reports.purge(); END$$;";
     let variants = [
         (
             "a rule",
@@ -2844,7 +2854,8 @@ async fn a_foreign_key_whose_action_runs_a_rule_a_check_or_a_default_is_refused(
                  parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE
              );
              CREATE RULE purge AS ON DELETE TO reports.children
-                 DO ALSO DELETE FROM switchboard_audit.call_rows;",
+                 DO ALSO DELETE FROM switchboard_audit.call_rows;"
+                .to_owned(),
         ),
         (
             "a check",
@@ -2854,7 +2865,22 @@ async fn a_foreign_key_whose_action_runs_a_rule_a_check_or_a_default_is_refused(
              CREATE TABLE reports.children (
                  parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE SET NULL,
                  CHECK (parent IS NOT NULL OR reports.purge())
-             );",
+             );"
+            .to_owned(),
+        ),
+        (
+            "a check through an operator",
+            "CREATE FUNCTION reports.purge(uuid, uuid) RETURNS boolean
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN true; END$$;
+             CREATE OPERATOR reports.=== (
+                 LEFTARG = uuid, RIGHTARG = uuid, FUNCTION = reports.purge
+             );
+             CREATE TABLE reports.children (
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE SET NULL,
+                 CHECK (parent OPERATOR(reports.===) parent OR parent IS NULL)
+             );"
+            .to_owned(),
         ),
         (
             "a default",
@@ -2864,7 +2890,41 @@ async fn a_foreign_key_whose_action_runs_a_rule_a_check_or_a_default_is_refused(
              CREATE TABLE reports.children (
                  parent uuid DEFAULT reports.purge()
                      CONSTRAINT follow REFERENCES reports.parents ON DELETE SET DEFAULT
-             );",
+             );"
+            .to_owned(),
+        ),
+        (
+            "a generated column",
+            format!(
+                "{purge}
+                 CREATE TABLE reports.children (
+                     parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE SET NULL,
+                     stamp int GENERATED ALWAYS AS (reports.stamp(parent)) STORED
+                 );"
+            ),
+        ),
+        (
+            "an index expression",
+            format!(
+                "{purge}
+                 CREATE TABLE reports.children (
+                     parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE SET NULL
+                 );
+                 CREATE INDEX stamped ON reports.children (reports.stamp(parent));"
+            ),
+        ),
+        (
+            "a domain's check",
+            "CREATE FUNCTION reports.purge(uuid) RETURNS boolean
+                 LANGUAGE plpgsql
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN true; END$$;
+             CREATE DOMAIN reports.checked AS uuid CHECK (reports.purge(VALUE));
+             CREATE DOMAIN reports.guarded AS reports.checked;
+             CREATE TABLE reports.children (
+                 parent reports.guarded
+                     CONSTRAINT follow REFERENCES reports.parents ON DELETE SET NULL
+             );"
+            .to_owned(),
         ),
     ];
     for (what, children) in variants {
@@ -2901,6 +2961,71 @@ async fn a_foreign_key_whose_action_runs_a_rule_a_check_or_a_default_is_refused(
             .unwrap();
         assert_eq!(rows(&db).await, 0, "{what}");
     }
+}
+
+/// #144: a cascading foreign key on a table that carries nothing that runs as its owner passes,
+/// whoever owns the table, as on a shared database whose applications' migrations run as a
+/// superuser. The action writes only the key's columns. A check, a default or an index that
+/// calls only what is built in, or what an extension provides in C, which the check does not
+/// look into, runs nothing the catalog cannot vouch for, and neither do the triggers Postgres
+/// makes to carry out a foreign key.
+#[tokio::test]
+async fn a_bare_cascading_foreign_key_passes_whoever_owns_its_table() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE EXTENSION \"uuid-ossp\";
+             CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             SET ROLE {OWNER_ROLE};
+             CREATE TABLE reports.parents (id uuid PRIMARY KEY);
+             CREATE TABLE reports.children (
+                 id serial PRIMARY KEY,
+                 made uuid DEFAULT public.uuid_generate_v4(),
+                 at timestamptz DEFAULT now(),
+                 name text CHECK (length(name) < 100),
+                 parent uuid CONSTRAINT follow REFERENCES reports.parents
+                     ON DELETE CASCADE ON UPDATE SET NULL
+             );
+             CREATE INDEX named ON reports.children (lower(name)) WHERE name IS NOT NULL;
+             CREATE TABLE reports.grandchildren (
+                 child int REFERENCES reports.children ON DELETE CASCADE
+             );
+             INSERT INTO reports.parents VALUES ('00000000-0000-0000-0000-000000000001');
+             INSERT INTO reports.children (name, parent)
+                 VALUES ('one', '00000000-0000-0000-0000-000000000001');
+             GRANT SELECT, DELETE ON reports.parents TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+    // The same, owned by the server's superuser.
+    admin
+        .batch_execute(
+            "ALTER TABLE reports.children OWNER TO CURRENT_USER;
+             ALTER TABLE reports.grandchildren OWNER TO CURRENT_USER;",
+        )
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+    // And what passes leaves call_rows alone.
+    a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("DELETE FROM reports.parents")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 1);
 }
 
 /// A partitioned table's foreign key is copied to each partition, but its action writes the
@@ -3009,7 +3134,7 @@ async fn an_owner_that_is_a_member_of_an_able_role_without_inheriting_it_is_able
         .await
         .unwrap();
 
-    // A cascading table owned by a member of the owner of call_rows.
+    // A cascading table with a trigger, owned by a member of the owner of call_rows.
     let cascader = db.new_role("NOLOGIN", &[]).await;
     db.cluster_wide(&format!(
         "GRANT {OWNER_ROLE} TO {cascader} WITH INHERIT FALSE, SET TRUE"
@@ -3031,6 +3156,10 @@ async fn an_owner_that_is_a_member_of_an_able_role_without_inheriting_it_is_able
              CREATE TABLE reports.children (
                  parent uuid CONSTRAINT follow REFERENCES reports.parents ON DELETE CASCADE
              );
+             CREATE FUNCTION reports.on_child_delete() RETURNS trigger
+                 LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$;
+             CREATE TRIGGER on_child_delete BEFORE DELETE ON reports.children
+                 FOR EACH ROW EXECUTE FUNCTION reports.on_child_delete();
              RESET ROLE;
              ALTER TABLE reports.children OWNER TO {cascader};"
         ))
