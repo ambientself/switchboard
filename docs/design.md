@@ -849,6 +849,17 @@ its tools on a surface refuses to start, rather than starting with that tool dro
 the policy serves is either served or loudly refused, never silently missing. A snapshot loaded
 later is held to the same rule.
 
+The Postgres store's boot check has a stated scope. It catches misconfiguration of a database
+whose roles, schema and grants come from the store's role script (`sql/roles.sql`) and its
+migrations: a grant, membership, setting or object that gives the gateway's role a way to read
+or change audit rows beyond its own. It is not a defence against a hostile superuser or table
+owner, who can defeat any check run from inside the database. Against that scope, the routes
+the first check's review left open (#43) are each closed or ruled out: ownership now counts
+wherever a privilege does; a definer function whose owner can set `session_replication_role`
+is refused; every trigger and enabled event trigger that runs a definer function is refused,
+whoever can fire it; functions in untrusted languages are refused; and the three below are out
+of scope.
+
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
 Postgres store also refuses to start with `fsync` or `full_page_writes` off, with the audit
@@ -869,26 +880,36 @@ pooler may drop, so the check reads them back and refuses a session without them
 The grants on the audit table are not the only way to it, so the Postgres check also refuses,
 for the gateway's role and every role it can become, PUBLIC included: an audit table that is a
 view or foreign table, or has a rule; any privilege on a view, materialized view or table with
-a rule, in any schema, that reaches the audit table directly or through other views and rules;
-being able to run a `SECURITY DEFINER` function, in any schema, whose owner can read or change
-the audit table, by EXECUTE or by writing to a table whose trigger runs it; and EXECUTE on the
-catalog's functions that read or write the server's files (`lo_export`, `lo_import`,
-`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's
-`pg_file_*`).
+a rule, in any schema, that reaches the audit table directly or through other views and rules,
+or owning one outside the audit schema, since an owner that revoked its own grants can grant
+them back; being able to run, by EXECUTE, a `SECURITY DEFINER` function, in any schema, whose
+owner can read or change the audit table or turn off its triggers; EXECUTE on the catalog's
+functions that read or write the server's files (`lo_export`, `lo_import`, `pg_read_file`,
+`pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`, and adminpack's `pg_file_*`); and EXECUTE
+on any function in an untrusted language, such as `plpython3u`, which runs with the access of
+the server's operating-system user. A definer function's owner counts as able when it holds a
+privilege on the audit table or on a view or rule that reaches it, can act as the owner of any
+of those, of the schema, or of the functions the table's triggers run, can set
+`session_replication_role`, or can run another such function. A trigger runs its function
+without EXECUTE, for any write that reaches its table, through a view, a rule or a foreign
+key's cascade as well as directly, and an event trigger fires on statements any role may run,
+such as `CREATE TEMP TABLE`. So rather than follow each route, the check refuses every trigger
+on any table, and every enabled event trigger, that runs such a function, whoever can fire it.
+The migrations' trigger functions are not `SECURITY DEFINER`, so a database they built passes.
 
-What the Postgres check does not look for, which an administrator must keep from the gateway's
-role without its help:
+What the Postgres check does not look for, each out of scope because it needs an
+administrator's act rather than a misconfiguration of what the role script and the migrations
+make:
 
 - **Changes after boot.** It reads the catalog once. A grant, view, rule or function made
-  later is not seen until the next boot.
-- **Event triggers.** One fires on statements the gateway's role may be able to run, such as
-  `CREATE TEMP TABLE`, and its function may be `SECURITY DEFINER`.
-- **Other functions that leave the database.** Only the catalog's file functions above are
-  refused by name. A function in an untrusted language such as `plpython3u`, or in C from an
-  extension, runs with the access of the server's operating-system user.
+  later is not seen until the next boot. Making one needs a role the check refuses to the
+  gateway's.
+- **Functions in C from an extension.** Only a superuser installs C code, and the catalog
+  cannot say what it does.
 - **Other connections back in.** `postgres_fdw` or `dblink` can log in again as another role,
-  through a user mapping or a function holding that role's password. A foreign table in the
-  audit schema is refused; one elsewhere is not followed to where it connects.
+  through a user mapping or a function holding that role's password, which only an
+  administrator stores. A foreign table in the audit schema is refused; one elsewhere is not
+  followed to where it connects.
 
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot

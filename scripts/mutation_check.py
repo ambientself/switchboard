@@ -3198,12 +3198,6 @@ mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that
 mutate("pg-check-definers-ignored", "a SECURITY DEFINER function that can reach the table passes the check", PG_CHECK,
        "                     WHERE p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x",
        "                     WHERE false AND p.prosecdef\n                         AND (EXISTS (SELECT FROM reaching x")
-mutate("pg-check-definer-trigger-ignored", "a write to a table whose trigger runs such a function passes the check", PG_CHECK,
-       "unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) AS w", "unnest(ARRAY[]::text[]) AS w")
-mutate("pg-check-definer-trigger-own-role-only", "the trigger route asks only of the session's role, for a privilege on the whole table", PG_CHECK,
-       "has_table_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_table_privilege(r.oid, c.oid, w)")
-mutate("pg-check-definer-trigger-column-own-role-only", "the trigger route asks only of the session's role, for a column privilege", PG_CHECK,
-       "has_any_column_privilege(r.oid, c.oid, w)", "r.rolname = current_user AND has_any_column_privilege(r.oid, c.oid, w)")
 mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner holds only column privileges passes the check", PG_CHECK,
        "OR has_any_column_privilege(p.proowner, x.oid,", "OR false AND has_any_column_privilege(p.proowner, x.oid,")
 mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
@@ -3217,6 +3211,26 @@ mutate("pg-check-definer-chain-execute-not-followed", "a definer function that r
        "AND (has_function_privilege(p.proowner, d.oid, 'EXECUTE')", "AND (false AND has_function_privilege(p.proowner, d.oid, 'EXECUTE')")
 mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
        "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
+# #43: ownership counts wherever a privilege does, a definer's owner that can silence the
+# triggers counts, every trigger and enabled event trigger that runs a definer is refused
+# whoever can fire it (this replaced the hunt for write paths), and so is EXECUTE on a
+# function in an untrusted language.
+mutate("pg-check-definer-ignores-table-owner", "a definer function whose owner owns the table, but holds no privilege on it, passes the check", PG_CHECK,
+       "OR pg_has_role(p.proowner, c.relowner, 'USAGE'))", "OR false AND pg_has_role(p.proowner, c.relowner, 'USAGE'))")
+mutate("pg-check-definer-ignores-trigger-function-owner", "a definer function whose owner owns a function the table's triggers run passes the check", PG_CHECK,
+       "AND pg_has_role(p.proowner, f.proowner, 'USAGE'))", "AND false AND pg_has_role(p.proowner, f.proowner, 'USAGE'))")
+mutate("pg-check-reaching-owner-ignored", "a view outside the schema that reaches the table, owned by the gateway's role, passes the check", PG_CHECK,
+       "                     AND pg_has_role(current_user, v.relowner, 'MEMBER')", "                     AND false")
+mutate("pg-check-replication-role-set-ignored", "a definer function whose owner can set session_replication_role passes the check", PG_CHECK,
+       "\"OR has_parameter_privilege(p.proowner, 'session_replication_role', 'SET')\"", "\"\"")
+mutate("pg-check-definer-trigger-allowed", "a trigger that runs a definer function passes the check", PG_CHECK,
+       "    problems.extend(triggered.into_iter().map(", "    problems.extend(triggered.into_iter().filter(|_| false).map(")
+mutate("pg-check-event-trigger-allowed", "an enabled event trigger that runs a definer function passes the check", PG_CHECK,
+       "WHERE p.oid = ANY($1::oid[]) AND e.evtenabled <> 'D'", "WHERE false AND p.oid = ANY($1::oid[]) AND e.evtenabled <> 'D'")
+mutate("pg-check-disabled-event-trigger-refused", "a disabled event trigger that runs a definer function is refused", PG_CHECK,
+       "AND e.evtenabled <> 'D'", "AND true")
+mutate("pg-check-untrusted-language-allowed", "a function in an untrusted language that the gateway can run passes the check", PG_CHECK,
+       "WHERE l.lanispl AND NOT l.lanpltrusted", "WHERE false AND l.lanispl AND NOT l.lanpltrusted")
 mutate("pg-check-server-functions-ignored", "a role that can run a function reaching the server's files passes the check", PG_CHECK,
        "    problems.extend(found.into_iter().map(|row| Problem::ServerFunction {",
        "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::ServerFunction {")

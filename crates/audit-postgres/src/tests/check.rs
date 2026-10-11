@@ -1508,6 +1508,15 @@ fn definer(function: &str, owner: &str, by: &str) -> Problem {
     }
 }
 
+fn definer_trigger(function: &str, owner: &str, trigger: &str, table: &str) -> Problem {
+    Problem::DefinerTrigger {
+        function: function.into(),
+        owner: owner.into(),
+        trigger: trigger.into(),
+        table: table.into(),
+    }
+}
+
 /// The problems the check finds for the gateway's own role.
 async fn problems_of(db: &TestDatabase) -> Vec<Problem> {
     problems(&db.store(PoolSizes::default())).await
@@ -1515,10 +1524,10 @@ async fn problems_of(db: &TestDatabase) -> Vec<Problem> {
 
 /// A `SECURITY DEFINER` function runs as its owner, and a trigger runs its function without
 /// asking for EXECUTE. So the gateway's role, or a role it can become, must not be able to run
-/// one whose owner can read or change `call_rows`, by EXECUTE or by writing to a table whose
-/// trigger runs it. The owner can when it holds a privilege on the table, or only on some of
-/// its columns, or only on a view over it, or can act as the schema's owner, which may drop
-/// it. A function whose owner can reach nothing, or that the gateway cannot run, is no
+/// one whose owner can read or change `call_rows` by EXECUTE, and no trigger may run one. The
+/// owner can when it holds a privilege on the table, or only on some of its columns, or only
+/// on a view over it, or can act as the schema's owner, which may drop it. A function whose
+/// owner can reach nothing, or that the gateway cannot run and no trigger runs, is no
 /// concern.
 #[tokio::test]
 async fn a_definer_function_that_can_reach_the_table_is_refused() {
@@ -1575,9 +1584,6 @@ async fn a_definer_function_that_can_reach_the_table_is_refused() {
         .unwrap();
     // harmless, which PUBLIC may run, runs as a role that can run none of the others. If it
     // could, it would be refused too.
-    let by_trigger = |privilege: &str| {
-        format!("{privilege} on reports.inbox, whose trigger purge_on_write runs it")
-    };
     let error = db.store_as(&role).check_at_boot().await.unwrap_err();
     let BootCheckError::Unfit { problems, .. } = &error else {
         panic!("{error}");
@@ -1587,17 +1593,13 @@ async fn a_definer_function_that_can_reach_the_table_is_refused() {
         &vec![
             definer("reports.peek()", &view_reader, "EXECUTE on it"),
             definer("reports.purge()", OWNER_ROLE, "EXECUTE on it"),
-            definer(
-                "reports.purge_on_write()",
-                OWNER_ROLE,
-                &by_trigger("DELETE")
-            ),
-            definer(
-                "reports.purge_on_write()",
-                OWNER_ROLE,
-                &by_trigger("INSERT")
-            ),
             definer("reports.subjects()", &column_reader, "EXECUTE on it"),
+            definer_trigger(
+                "reports.purge_on_write()",
+                OWNER_ROLE,
+                "purge_on_write",
+                "reports.inbox"
+            ),
         ]
     );
     assert!(
@@ -1629,13 +1631,14 @@ async fn a_definer_function_that_can_reach_the_table_is_refused() {
         assert_eq!(rows(&db).await, 0, "{purge}");
     }
 
-    // With nothing left that the role can run, it passes.
+    // With nothing left that the role can run, and no trigger running a definer, it passes.
     db.admin()
         .await
         .batch_execute(&format!(
             "REVOKE ALL ON FUNCTION reports.subjects(), reports.peek() FROM {GATEWAY_ROLE};
              REVOKE ALL ON FUNCTION reports.purge() FROM {reader};
-             REVOKE ALL ON reports.inbox FROM {reader};"
+             REVOKE ALL ON reports.inbox FROM {reader};
+             DROP TRIGGER purge_on_write ON reports.inbox;"
         ))
         .await
         .unwrap();
@@ -1713,6 +1716,12 @@ async fn a_definer_function_that_reaches_the_table_through_another_is_refused() 
         vec![
             definer("reports.fill_inbox()", &writer, "EXECUTE on it"),
             definer("reports.tidy()", &middle, "EXECUTE on it"),
+            definer_trigger(
+                "reports.purge_on_insert()",
+                OWNER_ROLE,
+                "purge_on_insert",
+                "reports.inbox"
+            ),
         ]
     );
 
@@ -1723,6 +1732,344 @@ async fn a_definer_function_that_reaches_the_table_through_another_is_refused() 
         gateway.batch_execute(purge).await.unwrap();
         assert_eq!(rows(&db).await, 0, "{purge}");
     }
+}
+
+/// A role that owns the table can grant itself anything on it, and one that owns a function the
+/// table's triggers run can drop the trigger with it, though neither holds a privilege. So a
+/// `SECURITY DEFINER` function of either is refused when the gateway can run it.
+#[tokio::test]
+async fn a_definer_function_whose_owner_owns_the_table_or_a_trigger_function_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let table_owner = db.new_role("NOLOGIN", &[]).await;
+    a_row(&db).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT USAGE ON SCHEMA switchboard_audit TO {table_owner};
+             ALTER TABLE switchboard_audit.call_rows OWNER TO {table_owner};
+             REVOKE ALL ON switchboard_audit.call_rows FROM {table_owner};
+             CREATE FUNCTION reports.take() RETURNS void
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN
+                     EXECUTE format('GRANT DELETE ON switchboard_audit.call_rows TO %I',
+                                    current_user);
+                     DELETE FROM switchboard_audit.call_rows;
+                 END$$;
+             ALTER FUNCTION reports.take() OWNER TO {table_owner};
+             REVOKE EXECUTE ON FUNCTION reports.take() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.take() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    let holds: bool = db
+        .admin()
+        .await
+        .query_one(
+            &format!(
+                "SELECT has_table_privilege('{table_owner}', 'switchboard_audit.call_rows',
+                                            'SELECT, INSERT, UPDATE, DELETE')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!holds, "the table's owner still holds a privilege on it");
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer("reports.take()", &table_owner, "EXECUTE on it")]
+    );
+    // What the check refuses is real.
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("SELECT reports.take()")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+
+    // The owner of complete_once can drop it, and the trigger with it.
+    let db = TestDatabase::create().await.unwrap();
+    let function_owner = db.new_role("NOLOGIN", &[]).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             GRANT USAGE ON SCHEMA switchboard_audit TO {function_owner};
+             ALTER FUNCTION switchboard_audit.complete_once() OWNER TO {function_owner};
+             CREATE FUNCTION reports.loosen() RETURNS void
+                 LANGUAGE sql SECURITY DEFINER
+                 AS 'DROP FUNCTION switchboard_audit.complete_once() CASCADE';
+             ALTER FUNCTION reports.loosen() OWNER TO {function_owner};
+             REVOKE EXECUTE ON FUNCTION reports.loosen() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.loosen() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer(
+            "reports.loosen()",
+            &function_owner,
+            "EXECUTE on it"
+        )]
+    );
+    // What the check refuses is real: the write-once trigger is gone.
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("SELECT reports.loosen()")
+        .await
+        .unwrap();
+    assert!(
+        problems_of(&db).await.contains(&missing("complete_once")),
+        "complete_once is still on the table"
+    );
+}
+
+/// A relation outside the schema that reaches `call_rows`, owned by the gateway's role or a
+/// role it can become, is refused even when its owner has revoked its own privileges on it:
+/// the owner can grant them back. A materialized view's owner then reads what it copied.
+#[tokio::test]
+async fn a_relation_that_reaches_the_table_owned_by_the_gateways_role_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let reader = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.cluster_wide(&format!("GRANT {reader} TO {role} WITH INHERIT FALSE"))
+        .await;
+    a_row(&db).await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE VIEW reports.calls AS SELECT * FROM switchboard_audit.call_rows;
+             ALTER VIEW reports.calls OWNER TO {GATEWAY_ROLE};
+             REVOKE ALL ON reports.calls FROM {GATEWAY_ROLE};
+             CREATE MATERIALIZED VIEW reports.calls_then AS
+                 SELECT id, proved_subject FROM switchboard_audit.call_rows;
+             ALTER MATERIALIZED VIEW reports.calls_then OWNER TO {reader};
+             REVOKE ALL ON reports.calls_then FROM {reader};"
+        ))
+        .await
+        .unwrap();
+    let owns = |relation: &str| Problem::Owns {
+        object: format!("the relation {relation}, which reaches switchboard_audit.call_rows"),
+    };
+    let found = problems(&db.store_as(&role)).await;
+    assert_eq!(
+        found,
+        vec![owns("reports.calls"), owns("reports.calls_then")]
+    );
+    assert_eq!(
+        found[0].to_string(),
+        "this session's role owns the relation reports.calls, which reaches \
+         switchboard_audit.call_rows, or is a member of the role that does"
+    );
+
+    // What the check refuses is real: the owner grants itself SELECT back and reads who
+    // called.
+    let session = db.connect_as(&role).await;
+    session
+        .batch_execute(&format!(
+            "SET ROLE {reader}; GRANT SELECT ON reports.calls_then TO {reader};"
+        ))
+        .await
+        .unwrap();
+    let subject: String = session
+        .query_one("SELECT proved_subject FROM reports.calls_then", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(subject, "secret-subject");
+}
+
+/// A `SECURITY DEFINER` function whose owner may set `session_replication_role` can put the
+/// gateway's session in replica mode, where neither of the table's triggers fires.
+#[tokio::test]
+async fn a_definer_function_whose_owner_can_set_session_replication_role_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let setter = db.new_role("NOLOGIN", &[]).await;
+    db.cluster_wide(&format!(
+        "GRANT SET ON PARAMETER session_replication_role TO {setter}"
+    ))
+    .await;
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE FUNCTION reports.quiet() RETURNS text
+                 LANGUAGE sql SECURITY DEFINER
+                 AS $$SELECT pg_catalog.set_config('session_replication_role', 'replica', false)$$;
+             ALTER FUNCTION reports.quiet() OWNER TO {setter};
+             REVOKE EXECUTE ON FUNCTION reports.quiet() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.quiet() TO {GATEWAY_ROLE};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![definer("reports.quiet()", &setter, "EXECUTE on it")]
+    );
+    // What the check refuses is real: the gateway's session is left in replica mode.
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    gateway
+        .batch_execute("SELECT reports.quiet()")
+        .await
+        .unwrap();
+    let mode: String = gateway
+        .query_one("SELECT current_setting('session_replication_role')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(mode, "replica");
+}
+
+/// A trigger runs its function without EXECUTE, for any write that reaches its table: here an
+/// insert through a view the gateway may write, which a hunt for direct writes misses. So a
+/// trigger running a `SECURITY DEFINER` function that can reach `call_rows` is refused,
+/// whoever can write its table. An enabled event trigger running one is refused too, since it
+/// fires on statements any role may run; a disabled one passes.
+#[tokio::test]
+async fn a_trigger_or_an_enabled_event_trigger_that_runs_a_definer_function_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             SET ROLE {OWNER_ROLE};
+             CREATE FUNCTION reports.purge_rows() RETURNS trigger
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; RETURN NEW; END$$;
+             REVOKE EXECUTE ON FUNCTION reports.purge_rows() FROM PUBLIC;
+             CREATE TABLE reports.notes (id uuid);
+             CREATE TRIGGER purge_rows BEFORE INSERT ON reports.notes
+                 FOR EACH ROW EXECUTE FUNCTION reports.purge_rows();
+             CREATE VIEW reports.note_box AS SELECT id FROM reports.notes;
+             GRANT INSERT ON reports.note_box TO {GATEWAY_ROLE};
+             RESET ROLE;"
+        ))
+        .await
+        .unwrap();
+    let found = problems_of(&db).await;
+    assert_eq!(
+        found,
+        vec![definer_trigger(
+            "reports.purge_rows()",
+            OWNER_ROLE,
+            "purge_rows",
+            "reports.notes"
+        )]
+    );
+    // What the check refuses is real: an insert through the view fires the trigger.
+    a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("INSERT INTO reports.note_box VALUES (NULL)")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+
+    db.admin()
+        .await
+        .batch_execute(&format!(
+            "DROP TRIGGER purge_rows ON reports.notes;
+             SET ROLE {OWNER_ROLE};
+             CREATE FUNCTION reports.purge_on_ddl() RETURNS event_trigger
+                 LANGUAGE plpgsql SECURITY DEFINER
+                 AS $$BEGIN DELETE FROM switchboard_audit.call_rows; END$$;
+             REVOKE EXECUTE ON FUNCTION reports.purge_on_ddl() FROM PUBLIC;
+             RESET ROLE;
+             CREATE EVENT TRIGGER purge_on_ddl ON ddl_command_start
+                 EXECUTE FUNCTION reports.purge_on_ddl();"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        problems_of(&db).await,
+        vec![Problem::DefinerEventTrigger {
+            function: "reports.purge_on_ddl()".into(),
+            owner: OWNER_ROLE.into(),
+            event_trigger: "purge_on_ddl".into(),
+        }]
+    );
+    // What the check refuses is real: the gateway makes a temporary table.
+    a_row(&db).await;
+    db.connect_as(GATEWAY_ROLE)
+        .await
+        .batch_execute("CREATE TEMP TABLE scratch (id int)")
+        .await
+        .unwrap();
+    assert_eq!(rows(&db).await, 0);
+
+    // Disabled, it fires on nothing, and passes.
+    db.admin()
+        .await
+        .batch_execute("ALTER EVENT TRIGGER purge_on_ddl DISABLE")
+        .await
+        .unwrap();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+}
+
+/// A function in an untrusted language runs with the server's operating-system user's access
+/// to its files. The test makes one by giving plpgsql's handler to a language not marked
+/// trusted, as `plpython3u` is not, so it needs no language the server lacks. EXECUTE on it is
+/// refused, whether PUBLIC holds it or a role the gateway can become.
+#[tokio::test]
+async fn a_function_in_an_untrusted_language_that_the_gateway_can_run_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let other = db.new_role("NOLOGIN", &[]).await;
+    let role = db.new_role("LOGIN", &[GATEWAY_ROLE]).await;
+    db.cluster_wide(&format!("GRANT {other} TO {role} WITH INHERIT FALSE"))
+        .await;
+    let admin = db.admin().await;
+    admin
+        .batch_execute(&format!(
+            "CREATE LANGUAGE plpgsql_untrusted HANDLER plpgsql_call_handler;
+             CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+             GRANT USAGE ON SCHEMA reports TO PUBLIC;
+             CREATE FUNCTION reports.outside() RETURNS int
+                 LANGUAGE plpgsql_untrusted AS 'BEGIN RETURN 1; END';"
+        ))
+        .await
+        .unwrap();
+    let untrusted = vec![Problem::UntrustedLanguage {
+        function: "reports.outside()".into(),
+        language: "plpgsql_untrusted".into(),
+    }];
+    let store = db.store_as(&role);
+    assert_eq!(problems(&store).await, untrusted);
+    admin
+        .batch_execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION reports.outside() FROM PUBLIC;
+             GRANT EXECUTE ON FUNCTION reports.outside() TO {other};"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(problems(&store).await, untrusted);
+    admin
+        .batch_execute(&format!(
+            "REVOKE EXECUTE ON FUNCTION reports.outside() FROM {other}"
+        ))
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
 }
 
 /// EXECUTE on `lo_export` writes any file the server's operating-system user can write, and
