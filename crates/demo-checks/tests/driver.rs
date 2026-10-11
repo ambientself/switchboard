@@ -2308,22 +2308,30 @@ fn the_metrics_check_counts_the_outage_and_bounds_the_open_rows() {
     let open = check_metrics("none", &metrics_text("0", "0", Some("2")));
     assert_eq!(open.status, Some(1), "{}", open.transcript());
     assert!(
-        open.failed("refused call's row open (got 2, want at most 1)"),
+        open.failed("found at most one row open (got 2, want at most 1)"),
         "{}",
         open.transcript()
+    );
+    let outage_open = check_metrics("outage", &metrics_text("1", "1", Some("2")));
+    assert!(
+        outage_open.failed("found at most the database outage's refused call's row open (got 2"),
+        "{}",
+        outage_open.transcript()
     );
     // A poll that never succeeded leaves no sample, which is not a count.
     let unpolled = check_metrics("none", &metrics_text("0", "0", None));
     assert!(
-        unpolled.failed("refused call's row open (got '', want a number of at most 1)"),
+        unpolled.failed("found at most one row open (got '', want a number of at most 1)"),
         "{}",
         unpolled.transcript()
     );
 
-    // Without the outage, only telemetry dropped and the open rows are checked.
+    // Without the outage, only telemetry dropped and the open rows are checked, and nothing
+    // speaks of an outage the run did not have.
     let kind = check_metrics("none", &metrics_text("0", "0", Some("0")));
     assert_eq!(kind.status, Some(0), "{}", kind.transcript());
     assert_eq!(kind.lines("PASS ").len(), 2, "{}", kind.transcript());
+    assert!(!kind.stdout.contains("outage"), "{}", kind.transcript());
 
     // A gateway that answered nothing fails every check.
     let silent = check_metrics("outage", "");

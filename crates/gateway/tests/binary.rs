@@ -563,6 +563,17 @@ async fn with_metrics_configured_it_serves_them_on_their_own_listener_only() {
         "{text}"
     );
 
+    // The metrics read the telemetry the MCP path counts in: one request with no token is
+    // counted once, on the metrics port.
+    let identity_failed = "switchboard_telemetry_events_total{event=\"identity_failed\"}";
+    assert!(text.contains(&format!("\n{identity_failed} 0\n")), "{text}");
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let (status, _) = tokio::task::block_in_place(|| running.post(None, &list));
+    assert_eq!(status, 401);
+    let (status, text) = tokio::task::block_in_place(|| get(metrics, "/metrics"));
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains(&format!("\n{identity_failed} 1\n")), "{text}");
+
     // The MCP listener does not serve them.
     let (status, _) = tokio::task::block_in_place(|| get(running.address, "/metrics"));
     assert_eq!(status, 404);

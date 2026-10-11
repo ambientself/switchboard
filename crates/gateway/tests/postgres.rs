@@ -1,6 +1,6 @@
 //! The gateway built from files with its audit rows in Postgres, as the demo runs it: the store
 //! passes its boot checks as the gateway's role, an allowed call, a denial and a refusal each
-//! leave their row, a `tools/list` leaves a row of kind `list`, a completion the database refuses is logged as given up, naming its row,
+//! leave their row, due by the call deadline the deployment file sets for the server, a `tools/list` leaves a row of kind `list`, a completion the database refuses is logged as given up, naming its row,
 //! and a connection as a superuser refuses to start.
 //!
 //! Runs only when `SWITCHBOARD_TEST_DATABASE_URL` names a superuser on a throwaway server, as
@@ -140,7 +140,10 @@ async fn run(
     let files = Files::new("postgres", &issuer.jwks_document(), &mock.url());
     files.write(
         "gateway.toml",
-        &files::deployment_file("[audit]\nmode = \"postgres\"\nurl_env = \"AUDIT_URL\"\n"),
+        &files::deployment_file(
+            "[audit]\nmode = \"postgres\"\nurl_env = \"AUDIT_URL\"\n\n\
+             [servers.mock-docs]\ndeadline_seconds = 7\n",
+        ),
     );
 
     // As a superuser the store's boot checks refuse, and the gateway does not start.
@@ -225,7 +228,9 @@ async fn run(
     assert!(failed.body.get("error").is_none(), "{}", failed.body);
 
     // Each row is a call begun by this instance, due when the database's time at begin plus
-    // the store's 2 s and 30 s and the proxied server's 5 s call deadline have passed.
+    // the store's 2 s and 30 s and the proxied server's call deadline have passed. That is the
+    // 7 s the deployment file sets for it, not the default 5 s: the deadline its connector was
+    // built with reaches its rows.
     let deadlines: Vec<(String, String, i64, f64)> = setup
         .query(
             "SELECT instance, kind, allowance_ms,
@@ -241,8 +246,8 @@ async fn run(
     let due = (
         "test-instance".to_owned(),
         "call".to_owned(),
-        37_000,
-        37_000.0,
+        39_000,
+        39_000.0,
     );
     assert_eq!(deadlines, vec![due.clone(), due.clone(), due]);
 

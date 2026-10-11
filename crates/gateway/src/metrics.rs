@@ -72,8 +72,9 @@
 //! while a row is open, as seconds since the Unix epoch. A scrape reads what the last poll
 //! found and never waits on the database.
 //!
-//! Shutting down stops the poller and the listener; the binary does it after the MCP listener
-//! has stopped and the store's finishes are done.
+//! Shutting down closes the listener, waits for the scrapes being answered, and then stops the
+//! poller (see [`serve_metrics`]). The binary shuts it down after the MCP listener has stopped
+//! and the store's finishes are done.
 
 use std::fmt::{Display, Write};
 use std::future::Future;
@@ -84,7 +85,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 use audit_postgres::{
-    LATENCY_BOUNDS_MS, LatencyHistogram, OpenRows, PgAuditStore, PoolStats, StoreStats,
+    LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram, OpenRows, PgAuditStore, PoolStats,
+    StoreStats,
 };
 use axum::Router;
 use axum::body::Body;
@@ -244,8 +246,8 @@ impl Drop for AbortOnDrop {
 }
 
 /// Serves `GET /metrics` on `listener` until `shutdown` completes, and, with audit in Postgres,
-/// polls the open rows while it does. Then it stops the poller, stops taking connections, and
-/// waits up to 5 s for a scrape still being answered.
+/// polls the open rows while it does. Then, in this order, it closes the listener, waits up to
+/// 5 s for the scrapes still being answered, and stops the poller as it returns.
 pub async fn serve_metrics<F>(
     listener: TcpListener,
     metrics: Metrics,
@@ -621,7 +623,9 @@ impl Text {
     }
 
     /// A histogram: a cumulative `_bucket` per bound and `+Inf`, then `_sum` in seconds and
-    /// `_count`.
+    /// `_count`. `+Inf` and `_count` are both the last cumulative bucket, so one scrape never
+    /// shows `+Inf` below a bound's bucket, even from a snapshot taken while a latency was being
+    /// counted.
     fn histogram(&mut self, name: &str, help: &str, histogram: &LatencyHistogram) {
         self.family(name, "histogram", help);
         self.histogram_samples(name, &[], histogram);
@@ -636,24 +640,25 @@ impl Text {
     ) {
         let bucket = format!("{name}_bucket");
         let cumulative = histogram.cumulative();
+        let total = cumulative[LATENCY_BUCKETS - 1];
         let bounds = LATENCY_BOUNDS_MS
             .iter()
             .map(|bound| Duration::from_millis(*bound).as_secs_f64().to_string())
             .zip(cumulative)
-            .chain(std::iter::once(("+Inf".to_owned(), histogram.count)));
+            .chain(std::iter::once(("+Inf".to_owned(), total)));
         for (le, count) in bounds {
             let mut with_le = labels.to_vec();
             with_le.push(("le", &le));
             self.sample(&bucket, &with_le, count);
         }
         self.sample(&format!("{name}_sum"), labels, histogram.sum.as_secs_f64());
-        self.sample(&format!("{name}_count"), labels, histogram.count);
+        self.sample(&format!("{name}_count"), labels, total);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use audit_postgres::{BeginFailures, LATENCY_BUCKETS};
+    use audit_postgres::BeginFailures;
 
     use super::*;
 
@@ -703,6 +708,40 @@ mod tests {
             ]
         );
         assert!(text.0.contains("# TYPE h_seconds histogram\n"));
+    }
+
+    /// A snapshot is read one atomic at a time, so one taken while a latency is being counted
+    /// can hold a count other than its buckets' total. `+Inf` and `_count` are that total all
+    /// the same: a scrape never shows `+Inf` below `le="30"`, nor a `_count` that disagrees.
+    #[test]
+    fn inf_and_the_count_are_the_buckets_total_whatever_count_was_read() {
+        let mut buckets = [0; LATENCY_BUCKETS];
+        buckets[0] = 1;
+        buckets[LATENCY_BUCKETS - 2] = 2;
+        for count in [2, 3, 4] {
+            let mut text = Text::default();
+            text.histogram(
+                "h_seconds",
+                "A histogram.",
+                &LatencyHistogram {
+                    buckets,
+                    count,
+                    sum: Duration::from_millis(30_005),
+                },
+            );
+            let samples = lines(&text.0);
+            for expected in [
+                "h_seconds_bucket{le=\"30\"} 3",
+                "h_seconds_bucket{le=\"+Inf\"} 3",
+                "h_seconds_count 3",
+            ] {
+                assert!(
+                    samples.contains(&expected),
+                    "{count}: {expected}\n{}",
+                    text.0
+                );
+            }
+        }
     }
 
     #[test]
