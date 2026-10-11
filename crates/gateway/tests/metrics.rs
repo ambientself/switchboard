@@ -1,6 +1,7 @@
 //! The metrics listener (design section 11's signals, decision 0009): `GET /metrics` on its own
 //! listener, in Prometheus text, with every signal named; a begin that fails counted as a begin
-//! failure and as an audit-failure answer; the open-row poll, which starts at once and counts a
+//! failure and as an audit-failure answer, and a finish that fails on a refused call counted as
+//! an audit-failure answer; the open-row poll, which starts at once and counts a
 //! failed poll; the open rows of a real database (with `SWITCHBOARD_TEST_DATABASE_URL`); and a
 //! `[metrics]` that would take the MCP listener's port refused.
 //!
@@ -25,8 +26,9 @@ use gateway_core::audit::{self, Begun, RowStart};
 use gateway_core::{CallContext, InstanceName, RequestedTool, decide};
 use gateway_identity::{SigningAlgorithm, SystemClock};
 use gateway_testkit::{
-    CONNECTOR, Caller, FakeCredentialSource, Fixture, FixtureConnector, LocalIssuer, READ_TOOL,
-    SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, row_start,
+    CONNECTOR, Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
+    InMemoryAuditStore, LocalIssuer, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ,
+    TEAM_A_DOCUMENT, row_start,
 };
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::{Value, json};
@@ -399,6 +401,61 @@ async fn a_failed_begin_counts_one_begin_failure_and_one_audit_failure_answer() 
     assert_eq!(
         total(&text, "switchboard_audit_begin_failures_total"),
         1.0,
+        "{text}"
+    );
+}
+
+/// A call that ran and was refused, whose row then cannot be completed, is answered with the
+/// audit-failure sentence from the finish, and counted. Nothing failed to begin.
+///
+/// The path writes its rows to the testkit's store, told to fail the finish; the metrics read
+/// the path's telemetry beside a Postgres store, which only lets the audit families be
+/// written. The answer's count comes from the telemetry, whatever the store.
+#[tokio::test]
+async fn a_finish_answered_with_the_audit_sentence_counts_one_audit_failure_answer() {
+    let fixture = Fixture::new().unwrap();
+    let rows = Arc::new(InMemoryAuditStore::new());
+    let connector = Arc::new(FixtureConnector::new(Arc::new(FakeCredentialSource::new())));
+    let config: gateway::Config = serde_json::from_value(support::config(&fixture)).unwrap();
+    let wiring = Wiring::new(Arc::new(fixture.clock.clone()))
+        .audit_store(rows.clone())
+        .connector(CONNECTOR, connector.clone(), Arc::new(FixtureResources));
+    let gates = boot::check(config, wiring).unwrap();
+    let (telemetry, _drain) = Telemetry::bounded(TELEMETRY_QUEUE);
+    let path = RequestPath::with_telemetry(gates, telemetry.clone());
+    let metrics = Metrics::new(telemetry, Some(unreachable_store()));
+    let token = fixture.token(Caller::TeamA);
+
+    // Before: nothing counted.
+    let text = metrics.render();
+    assert_eq!(
+        sample(&text, "switchboard_audit_failure_answers_total"),
+        Some(0.0),
+        "{text}"
+    );
+
+    rows.fail_next_finish();
+    let called = refusal(
+        &path,
+        &token,
+        "tools/call",
+        json!({"name": SCOPED_READ_TOOL, "arguments": {"document": FORBIDDEN_DOCUMENT}}),
+    )
+    .await;
+    assert_eq!(called, AUDIT_FAILURE);
+    assert_eq!(connector.received().len(), 1, "the tool ran, and refused");
+    let begun = rows.row(0).unwrap();
+    assert_eq!(begun.completion, None, "the finish failed");
+
+    let text = metrics.render();
+    assert_eq!(
+        sample(&text, "switchboard_audit_failure_answers_total"),
+        Some(1.0),
+        "{text}"
+    );
+    assert_eq!(
+        total(&text, "switchboard_audit_begin_failures_total"),
+        0.0,
         "{text}"
     );
 }
