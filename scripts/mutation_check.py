@@ -3306,7 +3306,21 @@ mutate("demo-driver-result-last-line", "the RESULT is read from the workload's l
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,
        '"127.0.0.1:18080:8080"', '"18080:8080"')
 mutate("demo-compose-postgres-published", "Postgres is published", COMPOSE,
-       "    image: postgres:17-alpine\n", "    image: postgres:17-alpine\n    ports:\n      - \"127.0.0.1:15433:5432\"\n")
+       "    image: postgres:17.11-alpine@sha256:", "    ports:\n      - \"127.0.0.1:15433:5432\"\n    image: postgres:17.11-alpine@sha256:")
+# #53: the demo's images are pinned by tag and digest, and the three Postgres places agree.
+mutate("demo-pins-digest-dropped", "Compose names the Postgres tag without demo.sh's digest", COMPOSE,
+       "    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24\n",
+       "    image: postgres:17.11-alpine\n")
+mutate("demo-pins-kind-tag-differs", "the kind manifest names another Postgres tag than the one demo.sh loads",
+       "deploy/kind/base/postgres.yaml", "          image: postgres:17.11-alpine\n", "          image: postgres:17-alpine\n")
+mutate("demo-pins-load-untagged", "demo.sh saves its Postgres tag without tagging it from the pinned digest", DRIVER,
+       '  docker tag "$POSTGRES_IMAGE" "$postgres_tag"\n', "")
+mutate("demo-pins-base-digest-dropped", "the Dockerfile's runtime image is pinned by tag only", "deploy/Dockerfile",
+       "FROM debian:trixie-slim@sha256:", "FROM debian:trixie-slim\n# @sha256:")
+mutate("demo-pins-frontend-unpinned", "the Dockerfile's syntax frontend is pinned by tag only", "deploy/Dockerfile",
+       "# syntax=docker/dockerfile:1@sha256:", "# syntax=docker/dockerfile:1\n# @sha256:")
+mutate("demo-pins-rust-not-toolchain", "the Dockerfile builds with another rust than rust-toolchain.toml's", "deploy/Dockerfile",
+       "FROM rust:1.99.0-slim-trixie@", "FROM rust:1.98.0-slim-trixie@")
 mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switchboard namespace", POLICY,
        "              kubernetes.io/metadata.name: switchboard\n          podSelector:\n            matchLabels:\n              app: gateway\n",
        "              kubernetes.io/metadata.name: switchboard\n")
