@@ -648,9 +648,15 @@ for field, old, new in [
     ("surface-constant", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),", '        surface: SurfaceName::new(sentences::escape(\n            "x",'),
 ]:
     mutate(f"record-{field}", f"the row's {field} is wrong", SRC + "audit.rs", old, new)
-for variant, renamed in [("Ok", "success"), ("Error", "failed")]:
-    mutate(f"outcome-{variant.lower()}-renamed", f"the {variant} outcome is written as `{renamed}`", SRC + "audit.rs",
-           f"    {variant},\n    /// The ", f"    #[serde(rename = \"{renamed}\")]\n    {variant},\n    /// The ")
+mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
+       "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
+mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
+       "    Error {\n        /// What kind of failure.", "    #[serde(rename = \"failed\")]\n    Error {\n        /// What kind of failure.")
+mutate("core-error-kind-field-renamed", "an error's kind is written under the name `kind`", SRC + "audit.rs",
+       "        /// What kind of failure. The caller's message is not recorded.\n        error_kind: ErrorKind,",
+       "        /// What kind of failure. The caller's message is not recorded.\n        #[serde(rename = \"kind\")]\n        error_kind: ErrorKind,")
+mutate("core-error-kind-names-changed", "the error kinds are written in kebab case, which the table's check does not hold", SRC + "connector.rs",
+       "#[serde(rename_all = \"snake_case\")]\npub enum ErrorKind {", "#[serde(rename_all = \"kebab-case\")]\npub enum ErrorKind {")
 mutate("outcome-refused-renamed", "the refused outcome is written as `rejected`", SRC + "audit.rs",
        "    Refused {\n        /// The connector's sentence", "    #[serde(rename = \"rejected\")]\n    Refused {\n        /// The connector's sentence")
 for variant in ("Allow", "Deny"):
@@ -720,9 +726,16 @@ mutate("finish-refusal-unrecorded-answered", "a refusal that could not be record
        "")
 mutate("finish-refusal-sentence-differs", "the refusal the caller reads is not the one recorded", SRC + "audit.rs",
        "            Answer::Refused(sentence),", "            Answer::Refused(sentence.to_uppercase()),")
-# A guard given up (decision 0009): its row is completed as error, never ok, through the store.
+mutate("core-finish-error-kind-dropped", "finish records every error as other, whatever its kind", SRC + "audit.rs",
+       "            (Outcome::Error { error_kind }, Answer::Error(message))",
+       "            (Outcome::Error { error_kind: { let _ = error_kind; ErrorKind::Other } }, Answer::Error(message))")
+# A guard given up (decision 0009): its row is completed as error, of the kind other, never ok,
+# through the store.
+GIVE_UP_OUTCOME = "            outcome: Outcome::Error {\n                error_kind: ErrorKind::Other,\n            },\n            latency_ms: 0,"
 mutate("core-give-up-completes-ok", "a guard given up records its call as ok", SRC + "audit.rs",
-       "            outcome: Outcome::Error,\n            latency_ms: 0,", "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+       GIVE_UP_OUTCOME, "            outcome: Outcome::Ok,\n            latency_ms: 0,")
+mutate("core-give-up-kind-not-other", "a guard given up records its error as a vendor refusal", SRC + "audit.rs",
+       GIVE_UP_OUTCOME, GIVE_UP_OUTCOME.replace("ErrorKind::Other", "ErrorKind::VendorRefusal"))
 mutate("core-give-up-skips-finish", "a guard given up leaves its row open and reports no failure", SRC + "audit.rs",
        "    let failure = store\n        .finish(&completion)\n        .await\n        .err()\n        .map(AuditFailure::from_store);",
        "    let failure: Option<AuditFailure> = None;")
@@ -740,7 +753,7 @@ mutate("core-read-not-cancelled-mid-run", "a read whose caller goes while it run
 mutate("core-read-gone-already-called", "a read whose caller has already gone is called all the same", SRC + "audit.rs",
        "    if already_gone {\n", "    if false && already_gone {\n")
 mutate("core-read-cancel-outcome-ok", "a cancelled read is recorded as ok", SRC + "audit.rs",
-       "    let cancelled = || ToolOutcome::Error(sentences::CALLER_DISCONNECTED.to_owned());",
+       "    let cancelled = || ToolOutcome::error(ErrorKind::Other, sentences::CALLER_DISCONNECTED);",
        "    let cancelled = || ToolOutcome::Ok(serde_json::Value::Null);")
 # A list row (decision 0009): the tools it names, its count, and the value only it can make.
 mutate("core-list-cap-removed", "a list row names every tool the answer lists", SRC + "audit.rs",
@@ -1179,7 +1192,17 @@ mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clo
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
        "                let _ = state.complete(row, &error);", "                let _ = &error;")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
-       "            if state.confirmation_lost.take() {\n                let error", "            if false {\n                let error")
+       "            if state.confirmation_lost.take() {\n                // As the Postgres store",
+       "            if false {\n                // As the Postgres store")
+# A repeated finish must match the completion stored, an error's kind included, as Postgres's does.
+mutate("fake-audit-error-kind-repeat-unchecked", "a repeated finish with an error of another kind is accepted", A,
+       "            Some(written) if written == completion => Ok(()),",
+       "            Some(written)\n"
+       "                if written == completion\n"
+       "                    || (matches!(written.outcome, Outcome::Error { .. })\n"
+       "                        && matches!(completion.outcome, Outcome::Error { .. })\n"
+       "                        && written.latency_ms == completion.latency_ms) =>\n"
+       "            {\n                Ok(())\n            }")
 mutate("testkit-lost-list-confirmation-ignored", "a list told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                return Err(lost());", "            if false {\n                return Err(lost());")
 mutate("testkit-lost-confirmation-before-write", "a lost confirmation writes no row", A,
@@ -1263,7 +1286,7 @@ mutate("fake-connector-scope-any-team", "a workload may reach any team's documen
 mutate("fake-connector-scope-any-group", "a user may reach any group's documents through the scoped tool", K,
        "                    .filter_map(|group| state.group_scopes.get(group))", "                    .flat_map(|_| state.group_scopes.values())")
 mutate("fake-connector-credential-refusal-ignored", "a refused credential does not stop the call", K,
-       "                Err(_) => {\n                    return ToolOutcome::Error(\n                        \"the fixture connector could not get a credential\".into(),\n                    );\n                }",
+       "                Err(_) => {\n                    return ToolOutcome::error(\n                        ErrorKind::Other,\n                        \"the fixture connector could not get a credential\",\n                    );\n                }",
        "                Err(_) => String::new(),")
 mutate("fake-connector-echo-drops-credential", "the echo does not carry the credential label", K,
        '    json!({"tool": tool, "echo": arguments, "credential": credential})', '    json!({"tool": tool, "echo": arguments, "credential": ""})')
@@ -2218,8 +2241,14 @@ PO = PROXY + "src/outcome.rs"
 PK = PROXY + "src/credentials.rs"
 # The bounds.
 mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
-       "        match tokio::time::timeout(self.deadline, self.exchange(request)).await {",
-       "        match Ok::<_, ()>(self.exchange(request).await) {")
+       "        match tokio::time::timeout(self.deadline, self.exchange(request, late)).await {",
+       "        match Ok::<_, ()>(self.exchange(request, late).await) {")
+# The kind of an answer too large, too late or broken off: its own from a read, other from any
+# other tool until `unknown` is built (decision 0011).
+mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
+       "            ErrorKind::OversizedOrLateRead\n        } else {", "            ErrorKind::Other\n        } else {")
+mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
+       "        } else {\n            ErrorKind::Other\n        };", "        } else {\n            ErrorKind::OversizedOrLateRead\n        };")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -2234,7 +2263,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| ToolOutcome::Error(outcome::BROKEN_OFF.to_owned()))?;",
+       "            let frame = frame.map_err(|_| ToolOutcome::error(late, outcome::BROKEN_OFF))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -2247,20 +2276,26 @@ mutate("proxy-unmapped-tool-sent-as-is", "a tool with no upstream name is sent u
        "        let upstream_name = self.tools.get(&tool.name).map_or(tool.name.as_str(), String::as_str);")
 mutate("proxy-exposed-name-sent", "the exposed name is sent instead of the upstream name", PC,
        "self.request(id, upstream_name, arguments, &secret)", "self.request(id, tool.name.as_str(), arguments, &secret)")
+PROXY_NOT_AN_OBJECT = ("            return ToolOutcome::error(\n                ErrorKind::InvalidArguments,\n"
+                       "                outcome::ARGUMENTS_NOT_AN_OBJECT,\n            );")
 mutate("proxy-arguments-unchecked", "arguments that are not an object are sent as an empty object", PC,
-       "        let Value::Object(arguments) = call.arguments() else {\n"
-       "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());\n        };",
+       "        let Value::Object(arguments) = call.arguments() else {\n" + PROXY_NOT_AN_OBJECT + "\n        };",
        "        let empty = Map::new();\n        let arguments = match call.arguments() {\n"
        "            Value::Object(arguments) => arguments,\n            _ => &empty,\n        };")
 mutate("proxy-arguments-not-object-refused", "arguments that are not an object are recorded as refused, not as an error", PC,
-       "            return ToolOutcome::Error(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());",
-       "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());")
+       PROXY_NOT_AN_OBJECT, "            return ToolOutcome::Refused(outcome::ARGUMENTS_NOT_AN_OBJECT.to_owned());")
+mutate("proxy-arguments-kind-other", "arguments that are not an object are recorded as another error, not invalid arguments", PC,
+       PROXY_NOT_AN_OBJECT, PROXY_NOT_AN_OBJECT.replace("ErrorKind::InvalidArguments", "ErrorKind::Other"))
 # Statuses.
 mutate("proxy-401-not-named", "a rejected credential is reported as a bare status", PC,
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
-mutate("proxy-403-is-an-error", "the server's refusal is recorded as an error", PC,
-       "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));",
-       "            return Err(ToolOutcome::Error(outcome::UPSTREAM_REFUSED.to_owned()));")
+# A 403 is the vendor's refusal (#61): an error of the kind vendor_refusal, not a connector's refusal.
+PROXY_403 = ("            return Err(ToolOutcome::error(\n                ErrorKind::VendorRefusal,\n"
+             "                outcome::UPSTREAM_REFUSED,\n            ));")
+mutate("proxy-403-is-refused", "the server's 403 is recorded as a connector's refusal, not as an error", PC,
+       PROXY_403, "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));")
+mutate("proxy-403-kind-other", "the server's 403 is recorded as another error, not a vendor refusal", PC,
+       PROXY_403, PROXY_403.replace("ErrorKind::VendorRefusal", "ErrorKind::Other"))
 mutate("proxy-any-status-read", "a body is read whatever the status", PC,
        "        if status != StatusCode::OK {", "        if false {")
 # Reading the answer.
@@ -2276,7 +2311,7 @@ mutate("proxy-result-and-error-accepted", "an answer with a result and an error 
        "        (Some(Value::Object(result)), _) => tool_result(result),")
 mutate("proxy-content-unchecked", "a result without content is accepted", PO,
        '    let Some(Value::Array(content)) = result.get("content") else {\n'
-       "        return ToolOutcome::Error(NOT_MCP.to_owned());\n    };",
+       "        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);\n    };",
        "    let empty = Vec::new();\n"
        '    let content = match result.get("content") {\n        Some(Value::Array(content)) => content,\n        _ => &empty,\n    };')
 mutate("proxy-tool-error-is-ok", "a tool result marked isError is passed on as success", PO,
@@ -2574,8 +2609,8 @@ mutate("pg-finish-uses-begin-pool", "finish waits on the begin pool", PG_STORE,
 mutate("pg-finish-overwrites", "finish does not skip a completed row", PG_COLUMNS,
        "WHERE id = ($1::text)::uuid AND outcome IS NULL", "WHERE id = ($1::text)::uuid")
 mutate("pg-finish-same-again-refused", "the same completion written again is an error", PG_STORE,
-       "        Some(outcome) if finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),",
-       "        Some(outcome) if false && finish.is(&outcome, outcome_sentence.as_deref(), latency_ms) => Ok(()),")
+       "        Some(outcome)\n            if finish.is(\n",
+       "        Some(outcome)\n            if false && finish.is(\n")
 mutate("pg-finish-different-accepted", "a different second completion is accepted", PG_STORE,
        "        Some(_) => Err(PgAuditError::CompletedDifferently {\n            row: row.to_owned(),\n        }),",
        "        Some(_) => Ok(()),")
@@ -2614,8 +2649,8 @@ mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is p
        '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
        "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
 mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
-       'Outcome::Refused { sentence } => Some(stored("outcome_sentence", sentence)?),',
-       "Outcome::Refused { sentence } => Some(sentence.clone()),")
+       'Outcome::Refused { sentence } => (Some(stored("outcome_sentence", sentence)?), None),',
+       "Outcome::Refused { sentence } => (Some(sentence.clone()), None),")
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
@@ -3098,6 +3133,31 @@ mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time lim
 mutate("pg-open-rows-not-cancelled", "an open-row query past its time limit is not cancelled, and its connection goes back to the pool", PG_STORE,
        "                abandon(client, &self.cancel);\n                Err(PgAuditError::OpenRowsTimedOut { budget })",
        "                drop(client);\n                Err(PgAuditError::OpenRowsTimedOut { budget })")
+# The error kind (#56, migration 0006): written with the completion, compared on a repeat, held to
+# the five kinds and to error rows alone, part of the completion for complete_once, granted to the
+# gateway, and `other` for a lost begin's completion, as for a guard given up.
+PG_ERROR_KIND = PG + "sql/migrations/0006_error_kind.sql"
+mutate("pg-error-kind-not-written", "an error is written without its kind", PG_COLUMNS,
+       "            Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),",
+       "            Outcome::Error { .. } => (None, None),")
+mutate("pg-error-kind-repeat-unchecked", "a repeated finish with an error of another kind is accepted", PG_COLUMNS,
+       "            && self.error_kind == error_kind\n", "")
+mutate("pg-error-kind-shape-removed", "a row may have an error kind without an error, or an error without a kind", PG_ERROR_KIND,
+       "        coalesce(outcome = 'error', false) = (error_kind IS NOT NULL)\n", "        true\n")
+mutate("pg-error-kind-known-removed", "an error kind may be any text", PG_ERROR_KIND,
+       "        'other', 'before-0006'\n    )),", "        'other', 'before-0006'\n    ) OR true),")
+mutate_all("pg-error-kind-not-in-complete-once", "complete_once refuses a completion that writes the error kind",
+           (PG_ERROR_KIND, "    IF to_jsonb(NEW) - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
+            "    IF to_jsonb(NEW) - ARRAY['outcome', 'outcome_sentence', 'latency_ms',"),
+           (PG_ERROR_KIND, "       to_jsonb(OLD) - ARRAY['outcome', 'outcome_sentence', 'error_kind', 'latency_ms',",
+            "       to_jsonb(OLD) - ARRAY['outcome', 'outcome_sentence', 'latency_ms',"))
+mutate("pg-error-kind-grant-missing", "the gateway's role cannot write the error kind", PG_ERROR_KIND,
+       "GRANT UPDATE (error_kind) ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-error-kind-backfill-skipped", "error rows written before 0006 are not given a kind", PG_ERROR_KIND,
+       "    WHERE outcome = 'error';", "    WHERE false;")
+mutate("pg-lost-begin-kind-differs", "a lost begin's row is completed as a vendor refusal, unlike a guard given up", PG_STORE,
+       "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::Other)),",
+       "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::VendorRefusal)),")
 
 
 # --- demo-checks ---------------------------------------------------------------------------
@@ -3413,9 +3473,12 @@ mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing",
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(outcome) => Box::pin(std::future::ready(outcome)),",
        "            Err(_outcome) => self.inner.run(call),")
+PROXIED_INVALID = ("                    ToolOutcome::error(\n                        ErrorKind::InvalidArguments,\n"
+                   "                        undeclared_argument(tool.as_str()),\n                    )")
 mutate("gw-proxied-invalid-arguments-refused", "a call that fails the argument check is recorded as refused, not as an error", PROXIED,
-       "                    ToolOutcome::Error(undeclared_argument(tool.as_str()))",
-       "                    ToolOutcome::Refused(undeclared_argument(tool.as_str()))")
+       PROXIED_INVALID, "                    ToolOutcome::Refused(undeclared_argument(tool.as_str()))")
+mutate("gw-proxied-invalid-arguments-kind-other", "a call that fails the argument check is recorded as another error, not invalid arguments", PROXIED,
+       PROXIED_INVALID, PROXIED_INVALID.replace("ErrorKind::InvalidArguments", "ErrorKind::Other"))
 mutate("gw-proxied-withdrawn-forwarded", "a tool withdrawn after its decision is sent anyway", PROXIED,
        "            Some(adapter) if !withdrawn => {", "            Some(adapter) => {")
 mutate("gw-proxied-checks-live-schema", "a call's arguments are checked against the policy served now, not the one it was decided under", PROXIED,
