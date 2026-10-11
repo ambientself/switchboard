@@ -3309,6 +3309,34 @@ mutate("pg-check-server-functions-ignored", "a role that can run a function reac
 for server_function in ["lo_export", "lo_import", "pg_ls_dir", "pg_read_binary_file", "pg_read_file", "pg_stat_file"]:
     mutate(f"pg-check-{server_function.replace('_', '-')}-ignored", f"a role that can run {server_function} passes the check", PG_CHECK,
            f'    "{server_function}",\n', "")
+# #126: a foreign key on the table whose action writes it, a trigger or enabled event trigger
+# that runs a function in an untrusted language, and a definer function whose owner can act as
+# a predefined role that reaches the server's files or programs.
+mutate("pg-check-referential-action-ignored", "a foreign key on the table with ON DELETE CASCADE passes the check", PG_CHECK,
+       "    problems.extend(found.into_iter().map(|row| Problem::ReferentialAction {",
+       "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::ReferentialAction {")
+mutate("pg-check-referential-update-ignored", "a foreign key on the table with an action only on update passes the check", PG_CHECK,
+       "('UPDATE', k.confupdtype::text)", "('UPDATE', 'a')")
+mutate("pg-check-referential-restrict-refused", "a foreign key on the table with ON DELETE RESTRICT is refused", PG_CHECK,
+       "AND a.action NOT IN ('a', 'r')", "AND a.action NOT IN ('a')")
+mutate("pg-check-referential-referenced-side-refused", "a foreign key on another table that references the table with an action is refused", PG_CHECK,
+       "WHERE k.contype = 'f' AND k.conrelid = $1::oid", "WHERE k.contype = 'f' AND (k.conrelid = $1::oid OR k.confrelid = $1::oid)")
+mutate("pg-check-untrusted-trigger-allowed", "a trigger that runs a function in an untrusted language passes the check", PG_CHECK,
+       "            .map(|row| Problem::UntrustedTrigger {",
+       "            .filter(|_| false)\n            .map(|row| Problem::UntrustedTrigger {")
+mutate("pg-check-untrusted-trigger-any-language", "a trigger that runs a function in a trusted language is refused", PG_CHECK,
+       "                         AND l.lanispl AND NOT l.lanpltrusted\n                     JOIN pg_catalog.pg_class c",
+       "                         AND l.lanispl\n                     JOIN pg_catalog.pg_class c")
+mutate("pg-check-untrusted-event-trigger-allowed", "an enabled event trigger that runs a function in an untrusted language passes the check", PG_CHECK,
+       "                 WHERE e.evtenabled <> 'D'\n", "                 WHERE false\n")
+mutate("pg-check-disabled-untrusted-event-trigger-refused", "a disabled event trigger that runs a function in an untrusted language is refused", PG_CHECK,
+       "                 WHERE e.evtenabled <> 'D'\n", "                 WHERE true\n")
+mutate("pg-check-definer-server-roles-ignored", "a definer function whose owner is a member of pg_read_server_files passes the check", PG_CHECK,
+       "                              OR EXISTS (SELECT FROM pg_catalog.pg_roles s\n",
+       "                              OR false AND EXISTS (SELECT FROM pg_catalog.pg_roles s\n")
+mutate("pg-check-definer-server-roles-direct-only", "a definer function whose owner inherits pg_execute_server_program through another role passes the check", PG_CHECK,
+       "AND pg_has_role(p.proowner, s.oid, 'USAGE'))",
+       "AND s.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = p.proowner))")
 # Open rows. The boot check compares the view with the definition it expects, so each change to
 # the view changes that definition as well, and the open-row tests must catch it themselves.
 PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"
