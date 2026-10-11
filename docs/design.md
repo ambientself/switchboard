@@ -291,7 +291,8 @@ force until a refresh succeeds, with no maximum age ([decision
 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Refusing every token because
 a refresh failed would turn an outage of the issuer's host into an outage of the gateway. Each
 issuer's key age is exported instead, as `switchboard_issuer_keys_age_seconds{issuer}` (#91),
-with an alert condition at four refresh intervals (Q12).
+with an alert condition at four refresh intervals
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 
 An `https` keys URL is fetched over TLS (#88), and needs `keys_ca_file`: a PEM bundle, read at
 boot, whose CAs are the only ones trusted. No roots are compiled in and none are read from the
@@ -307,10 +308,12 @@ kubelet rotates projected tokens, and sent to the keys URL only. Both are refuse
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
 was refused". For identity, "someone tried and was refused" is a telemetry event (section
 11); for a delegation, it is a deny row. "We were not checking" writes no row, and none is
-planned: with identity disabled, which only a development build allows, the path lists nothing
-and refuses every `tools/call`, with no row. Reads are not served with rows whose identity is
-`disabled`, and #69, which would have built them, is not planned
-([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
+planned: with identity disabled the path lists nothing and refuses every `tools/call`, with no
+row. Reads are not served with rows whose identity is `disabled`, and #69, which would have
+built them, is not planned
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). Decision 0014
+also makes identity disabled development-only: the release build refuses it once #11's
+fail-closed work lands (section 12), and until then starts with a warning.
 
 **A wrong guess costs the same as a right one.** An unknown subject pays for the signature
 check before it is refused, so response time does not reveal which subjects exist.
@@ -622,7 +625,7 @@ list names what others must still decide.
 | Record | Covers | Written | If it cannot be written |
 | --- | --- | --- | --- |
 | Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
-| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, which only a development build allows, nothing is listed and every `tools/call` is refused, with no row (section 7). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
+| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, nothing is listed and every `tools/call` is refused, with no row (section 7). Decision 0014 makes identity disabled development-only; the release build refuses it once #11's fail-closed work lands (section 12). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect: a call to any tool not classified `read`. | Postgres, in the same transaction as the call's begin. | The call is refused. |
 
 The exceptions to invariant 5 are the requests telemetry covers, which reach no decision, and
@@ -878,8 +881,8 @@ Checked before a socket is bound. Identity and audit each have four states:
 
 | | Configured | Explicit opt-out only | Neither | Both |
 | --- | --- | --- | --- | --- |
-| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start. | Refuses to start. | Refuses, as a contradiction. |
-| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start. | Refuses to start. | Refuses, as a contradiction. |
+| Identity | Starts; callers must prove themselves. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
+| Audit | Starts; every call recorded. | A development build starts with a loud warning; the release build refuses to start once #11 lands, and until then starts with the warning too (decision 0014). | Refuses to start. | Refuses, as a contradiction. |
 
 A partly configured gate is refused. A connector that is partly configured refuses to start. A
 connector that is not configured must be absent from every surface: a snapshot that puts one of
@@ -1212,10 +1215,11 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
   itself still carries nothing from the token. The `identity_failed` event records them (#26).
 - Not planned: a principal state for identity checking turned off, which a row could record
-  as `disabled`. With identity disabled, which only a development build allows, nothing is
-  listed and every `tools/call` is refused, with no row
-  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
-  not planned).
+  as `disabled`. With identity disabled, nothing is listed and every `tools/call` is refused,
+  with no row ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69
+  closes as not planned). Decision 0014 makes identity disabled development-only; the release
+  build refuses it once #11's fail-closed work lands (section 12), and until then starts with
+  a warning.
 
 **#10, audit and receipts** (the core, the Postgres store built for #10, and the test stores).
 
@@ -1405,10 +1409,10 @@ off only in a development build, with CI's check of the release artifact; and th
   reaches it.
 - The key read from its carriers, the tool-use identifier and the named `_meta` field.
 - Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
-  The path keeps refusing every `tools/call` and listing nothing, with no row, and only a
-  development build may disable identity
+  The path keeps refusing every `tools/call` and listing nothing, with no row
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
-  not planned).
+  not planned). Disabling identity becomes development-only when #11's fail-closed work lands
+  (section 12).
 - Already built and matching: identity failures write no row and keep the opaque sentence
   during an audit outage; begin, run and finish still run on a spawned task the client cannot
   cancel, though a read is now cancelled through the disconnect signal; shutdown waits for
@@ -1604,14 +1608,16 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9, Q10, Q17 and Q18, and Q12 and Q13, are in
+What remains of Q9, Q10, Q12, Q17 and Q18, and Q13, are in
 [open-questions.md](open-questions.md). Q9 is narrowed to what decision 0011 leaves to others,
 Q10 to what compliance requires of read auditing, Q17 to what decision 0010 leaves to others,
 and Q18 to what decision 0012 leaves to Otto's owners and to the owner; the rest of each is
-decided. Q11 is settled by decision 0013. Each of decisions 0009 to 0013 lists what it leaves
-to Otto's owners, IT, IT security, the security team, platform owners and others, with who
-decides and what holds meanwhile. Every request of Otto's owners goes to them as one list,
-raised by whoever the owner names (decision 0012). The milestone table says which each milestone
-must settle before it starts, and section 17 lists the changes the records need in code already
-built. Vendor feasibility remains research in [systems.md](systems.md). The independent
-review's findings that are not yet reflected here are listed at the end of that file.
+decided. Q11 is settled by decision 0013. Q12 is narrowed by decision 0014 to the per-user rate
+limit, which the owner left open until milestone 5, and what it leaves to others. Each of
+decisions 0009 to 0014 lists what it leaves to Otto's owners, IT, IT security, the security
+team, platform owners and others, with who decides and what holds meanwhile. Every request of
+Otto's owners goes to them as one list, raised by whoever the owner names (decision 0012). The
+milestone table says which each milestone must settle before it starts, and section 17 lists the
+changes the records need in code already built. Vendor feasibility remains research in
+[systems.md](systems.md). The independent review's findings that are not yet reflected here are
+listed at the end of that file.
