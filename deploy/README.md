@@ -94,18 +94,19 @@ can-i and a SubjectAccessReview name no resource, so neither sees a rule limited
 `resourceNames`: a workload able to mint tokens for one named ServiceAccount answers no (#60).
 So the checks also read the RBAC objects, with `route-check/rbac-match.jq`, the matcher the
 route check's operator step runs too. They read the ClusterRoles, the ClusterRoleBindings, and
-the Roles and RoleBindings in every namespace (`kubectl get -A`), not only in `mock-docs`,
-`switchboard` and each team's: a RoleBinding in `kube-system`, `default` or the other team's
-namespace can bind the workload too, and no can-i or review across the cluster counts it. A
-binding counts when a subject is the team's ServiceAccount, as a ServiceAccount or as the user
-`system:serviceaccount:<team>:mock-workload`, or one of its groups (`system:serviceaccounts`,
-`system:serviceaccounts:<team>`, `system:authenticated`). A RoleBinding counts the Role or
-ClusterRole it binds. A rule grants a row when its verbs, API groups and resources match the
-row's, `*` matching anything and `*/<sub>` any resource's subresource, whatever its
-`resourceNames`. A `namespaced` row counts the RoleBindings, in whatever namespace, and the
-ClusterRoleBindings; a `cluster` row only the ClusterRoleBindings. That is one more check per
-row, 55 per team. A list that cannot be read or parsed fails, and nothing is matched. No grant
-is allowed in code.
+the Roles and RoleBindings in every namespace (`kubectl get -A`), not only in those a team's
+can-i checks ask in: `mock-docs`, `switchboard`, the team's own, and `default` for across the
+cluster. A RoleBinding in `kube-system` or the other team's namespace can bind the workload
+too, and no can-i asks there. Where can-i does ask, in `default` among them, it still misses a
+rule limited by `resourceNames`. A binding counts when a subject is the team's ServiceAccount,
+as a ServiceAccount or as the user `system:serviceaccount:<team>:mock-workload`, or one of its
+groups (`system:serviceaccounts`, `system:serviceaccounts:<team>`, `system:authenticated`). A
+RoleBinding counts the Role or ClusterRole it binds. A rule grants a row when its verbs, API
+groups and resources match the row's, `*` matching anything and `*/<sub>` any resource's
+subresource, whatever its `resourceNames`. A `namespaced` row counts the RoleBindings, in
+whatever namespace, and the ClusterRoleBindings; a `cluster` row only the ClusterRoleBindings.
+That is one more check per row, 55 per team. A list that cannot be read or parsed fails, and
+nothing is matched. No grant is allowed in code.
 
 ## The route check in kind
 

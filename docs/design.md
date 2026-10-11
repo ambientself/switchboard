@@ -1382,10 +1382,11 @@ checked; a schema that needs them cannot be approved yet.
   `registry.max_age_seconds` is 60 unless given, and is refused below twice `poll_seconds`.
   Every successful read of the registry file counts, whether or not its bytes changed and
   whether or not it loads, and the age counts from boot's own read of the file, so a boot
-  slower than the maximum age starts stale. Past the maximum age, `/readyz` answers 503 and `tools/call` and
-  `tools/list` are refused with a fixed stale-policy sentence before anything is decided, with
-  no row; each refusal is a `policy_stale` telemetry event, counted under
-  `switchboard_telemetry_events_total`. `switchboard_policy_age_seconds` and
+  slower than the maximum age starts stale. The reloader reads the file as soon as it starts,
+  so a file that reads ends that at once, not a poll later. Past the maximum age, `/readyz`
+  answers 503 and `tools/call` and `tools/list` are refused with a fixed stale-policy sentence
+  before anything is decided, with no row; each refusal is a `policy_stale` telemetry event,
+  counted under `switchboard_telemetry_events_total`. `switchboard_policy_age_seconds` and
   `switchboard_policy_max_age_seconds` are exported. A file that reads but does not load keeps
   the last good policy and is not stale.
 

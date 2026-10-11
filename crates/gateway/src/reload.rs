@@ -1,9 +1,9 @@
 //! Reloading the registry file while the gateway runs (planDemo 14e).
 //!
-//! [`Reloader::watch`] reads the registry file every few seconds. When its bytes change, it
-//! loads the new file and, if it passes, serves its policy from the next request on. A file
-//! that fails keeps the policy served now, and the reason is logged once per version of the
-//! file, at error level.
+//! [`Reloader::watch`] reads the registry file as soon as it starts, and every few seconds
+//! after that. When its bytes change, it loads the new file and, if it passes, serves its
+//! policy from the next request on. A file that fails keeps the policy served now, and the
+//! reason is logged once per version of the file, at error level.
 //!
 //! A reload can change the policy: tools withdrawn, surfaces, profiles, limits, rules and
 //! definitions. It cannot change what the running connectors were built for, so a new file is
@@ -171,16 +171,17 @@ impl Reloader {
         Ok(revision)
     }
 
-    /// Reads `file` every `every`, records each read that succeeds in the gates' [`Freshness`],
-    /// and applies the file whenever its bytes differ from the last ones read. `loaded` is the
-    /// text the gateway started with. Never returns.
+    /// Reads `file` as soon as it starts and every `every` after that, records each read that
+    /// succeeds in the gates' [`Freshness`], and applies the file whenever its bytes differ
+    /// from the last ones read. `loaded` is the text the gateway started with. Never returns.
     pub async fn watch(self, file: PathBuf, every: Duration, loaded: Vec<u8>) {
         let mut seen = loaded;
         let mut last_read_error: Option<String> = None;
         let mut interval = tokio::time::interval(every);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick is immediate, and the file was just loaded.
-        interval.tick().await;
+        // The first tick is immediate, so the file is read as the watch starts. Boot read it
+        // too, but a boot slower than the maximum age starts stale, and this read ends that at
+        // once rather than a poll later. Unchanged bytes are not loaded again.
         loop {
             interval.tick().await;
             let bytes = match std::fs::read(&file) {
