@@ -84,7 +84,7 @@ pub use path::{
     IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, RequestPath, SERVER_NAME, Source,
 };
 pub use policy::{LivePolicy, ServedPolicy};
-pub use proxied::{undeclared_argument, withdrawn_while_deciding};
+pub use proxied::{invalid_argument, undeclared_argument, withdrawn_while_deciding};
 pub use reload::{ReloadError, Reloader};
 pub use resources::ResourceAdapter;
 pub use selector::{

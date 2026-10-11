@@ -1,7 +1,8 @@
 //! The boot gates for a policy from the registry file (`boot::check_registry`), called with
 //! wiring the binary would never build, and a reload racing a call: a tool withdrawn between
 //! the decision and the run is not sent, and a call is checked against the policy version it
-//! was decided under, not one served later.
+//! was decided under, not one served later. Also the row of a call whose arguments do not match
+//! the approved schema.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -16,7 +17,8 @@ use files::{
 use gateway::boot::{self, BootError, Settings, Wiring};
 use gateway::path::RequestPath;
 use gateway::{
-    AuditSection, NO_PROFILE, ResourceAdapter, undeclared_argument, withdrawn_while_deciding,
+    AuditSection, NO_PROFILE, ResourceAdapter, invalid_argument, undeclared_argument,
+    withdrawn_while_deciding,
 };
 use gateway_core::audit::{AuditRowId, ErrorKind, ListRecord, Outcome, RowCompletion, StoreError};
 use gateway_core::{
@@ -438,6 +440,58 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
         denied.body
     );
     assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mistyped_argument_completes_its_row_as_invalid_arguments_and_is_not_sent() {
+    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+        .await
+        .unwrap();
+    let files = Files::new("mistyped", &issuer().jwks_document(), &mock.url());
+    let (settings, registry) = parts(&files, false);
+    let store = Arc::new(InMemoryAuditStore::new());
+    let wiring = wiring().audit_store(store.clone()).proxied(
+        "mock-docs",
+        proxy(&mock.url(), &files.path("docs-credential")),
+    );
+    let (gates, _) = boot::check_registry(settings, registry, wiring).unwrap();
+    let path = RequestPath::new(gates);
+    let token = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
+
+    // `atlas` is within team-a's limit, so the call is allowed; `document` is typed as a
+    // string, so the argument check fails it.
+    let answered = call(
+        &path,
+        &token,
+        READ_TOOL,
+        json!({"project": "atlas", "document": 7}),
+    )
+    .await;
+    assert_eq!(
+        answered.body["result"]["content"][0]["text"],
+        json!(invalid_argument(READ_TOOL)),
+        "{}",
+        answered.body
+    );
+    assert_eq!(
+        answered.body["result"]["isError"],
+        json!(true),
+        "{}",
+        answered.body
+    );
+    assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
+    let rows = store.rows();
+    assert_eq!(rows.len(), 1);
+    let outcome = rows[0]
+        .completion
+        .as_ref()
+        .map(|completion| completion.outcome.clone());
+    assert_eq!(
+        outcome,
+        Some(Outcome::Error {
+            error_kind: ErrorKind::InvalidArguments
+        })
+    );
 }
 
 #[test]

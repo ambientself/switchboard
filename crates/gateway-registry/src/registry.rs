@@ -129,7 +129,8 @@ pub enum RegistryError {
     /// A tool's input schema is not an object schema.
     #[error("tool `{0}`'s input schema is not a JSON Schema with `type` `object`")]
     SchemaNotObject(ToolName),
-    /// A tool's input schema uses a keyword the argument check does not follow.
+    /// A tool's input schema uses a keyword outside the subset of JSON Schema 2020-12 the
+    /// argument check enforces or ignores as an annotation (see [`ArgumentAdapter`]).
     #[error(
         "tool `{tool}`'s input schema uses `{keyword}` at `{at}`, which the argument check does not follow"
     )]
@@ -138,13 +139,37 @@ pub enum RegistryError {
         tool: ToolName,
         /// The keyword.
         keyword: String,
-        /// Where, as a JSON Pointer into the schema.
+        /// Where, as a JSON Pointer into the schema: the schema that uses the keyword.
         at: JsonPointer,
     },
-    /// A tool's input schema has `properties` that is not an object, or a property or
-    /// `items` that is not a schema.
+    /// A tool's input schema has an enforced keyword whose value does not have the JSON type
+    /// JSON Schema 2020-12 gives it, such as `properties` that is not an object, `items` that is a list, or a
+    /// property that is not a schema.
     #[error("tool `{tool}`'s input schema is malformed at `{at}`")]
     SchemaMalformed {
+        /// The tool.
+        tool: ToolName,
+        /// Where, as a JSON Pointer into the schema: the value that is malformed.
+        at: JsonPointer,
+    },
+    /// A tool's input schema names, in `$schema`, a dialect other than JSON Schema 2020-12.
+    /// Decision 0011 lets such a schema be refused or converted at approval; this loader
+    /// refuses it.
+    #[error(
+        "tool `{tool}`'s input schema names the dialect `{dialect}`; only JSON Schema 2020-12 is approved, so convert it and approve it again"
+    )]
+    SchemaDialect {
+        /// The tool.
+        tool: ToolName,
+        /// The `$schema` value, as written.
+        dialect: String,
+    },
+    /// A tool's input schema has an `additionalProperties` that is neither a boolean nor a
+    /// schema (#94). Read loosely, a value such as `"false"` would leave the object open.
+    #[error(
+        "tool `{tool}`'s input schema has an `additionalProperties` at `{at}` that is neither true, false nor a schema"
+    )]
+    SchemaAdditionalPropertiesMalformed {
         /// The tool.
         tool: ToolName,
         /// Where, as a JSON Pointer into the schema.
@@ -485,6 +510,16 @@ fn check_tool(
                 tool: name.clone(),
                 at,
             },
+            SchemaProblem::Dialect { dialect } => RegistryError::SchemaDialect {
+                tool: name.clone(),
+                dialect,
+            },
+            SchemaProblem::AdditionalProperties { at } => {
+                RegistryError::SchemaAdditionalPropertiesMalformed {
+                    tool: name.clone(),
+                    at,
+                }
+            }
         }
     })?;
 
