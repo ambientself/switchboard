@@ -100,7 +100,7 @@ impl fmt::Debug for Identity {
 }
 
 /// What replacing an issuer's keys changed, for the log: the `kid`s in the new set that were not
-/// in the old one, the reverse, and the `kid`s in both whose key is not the same.
+/// in the old one, the reverse, and the `kid`s in both whose JWK is not the same.
 ///
 /// The old set is the one in force when the replacement began, not the one last supplied: a
 /// refused set never becomes the old set. Read from the sets as supplied, so a key left out
@@ -112,8 +112,10 @@ pub struct KeysReplaced {
     /// Key IDs in the old set that are not in the new one. A token naming one is refused from
     /// now on.
     pub removed: BTreeSet<String>,
-    /// Key IDs in both sets whose key differs. A token naming one is verified with the new key
-    /// from now on, and a token signed with the old key is refused.
+    /// Key IDs in both sets whose JWK differs in any field, key material or metadata (`use`,
+    /// `key_ops`, `alg`, `x5c`, `x5t`). A token naming one is checked against the new JWK from
+    /// now on: if the key material changed, a token signed with the old key no longer verifies;
+    /// if only metadata changed, it may still verify.
     pub changed: BTreeSet<String>,
 }
 

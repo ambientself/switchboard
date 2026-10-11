@@ -17,10 +17,12 @@
 //!   is a freshness bound, and open question Q11 owns it.
 //! - **A refresh that changes the keys** is logged as [`REFRESHED_EVENT`], with the `kid`s
 //!   added, removed and changed, each against the set in force before it. A `kid` is changed
-//!   when the issuer serves a different key under it: tokens signed with the old key are
-//!   refused from then on. Issuers rotate by publishing a new `kid`, so a changed one is logged
-//!   at `WARN`; a refresh that only adds or removes `kid`s is logged at `INFO`. A refresh that
-//!   serves the set in force again logs nothing.
+//!   when the issuer serves a different JWK under it, in any field: the new JWK is in force from
+//!   then on. If the key material changed, tokens signed with the old key no longer verify; a
+//!   change to metadata alone (`use`, `key_ops`, `alg`, `x5c`, `x5t`, such as a certificate
+//!   re-issued for the same key) can leave them verifying. Issuers rotate by publishing a new
+//!   `kid`, so a changed one is logged at `WARN`; a refresh that only adds or removes `kid`s is
+//!   logged at `INFO`. A refresh that serves the set in force again logs nothing.
 //! - **Each issuer's timer logs [`REFRESH_STARTED_EVENT`]** at `INFO` once, as it starts,
 //!   naming the issuer and the seconds between fetches.
 //! - **Tokens never cause a fetch.** Only the timer does. Nothing a token carries (`iss`,
@@ -267,8 +269,9 @@ async fn refresh(
                     added = %kids(&replaced.added),
                     removed = %kids(&replaced.removed),
                     changed = %kids(&replaced.changed),
-                    "the issuer served a different key under a kid it kept; the new key is in \
-                     force, and tokens signed with the old one are refused"
+                    "the issuer served a different JWK under a kid it kept; the new JWK is in \
+                     force, and if the key material changed, tokens signed with the old key no \
+                     longer verify"
                 );
             }
         }
