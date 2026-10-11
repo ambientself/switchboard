@@ -8,6 +8,7 @@
 # Every value here is a dummy. The credential reference is a label the gateway's credential
 # source resolves to a secret it holds; the secret is never in this file.
 
+# Recorded with every decision made from this file. Change it with every edit.
 revision = "demo-1"
 
 # --- Servers -------------------------------------------------------------------------------
