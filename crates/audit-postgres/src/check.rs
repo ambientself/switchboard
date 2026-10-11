@@ -1201,9 +1201,19 @@ async fn rules(
 /// writes `table`: `CASCADE` ('c'), `SET NULL` ('n') or `SET DEFAULT` ('d'). `NO ACTION` ('a')
 /// and `RESTRICT` ('r') only refuse the write. Postgres runs the action as the owner of the
 /// table that holds the key, whoever deleted or updated the referenced row, so one is a write
-/// path into `call_rows` as a rule on it is. A foreign key on another table that references
-/// `call_rows` writes only that table, whose triggers [`definers`] and [`untrusted_functions`]
-/// look at.
+/// path into `call_rows` as a rule on it is.
+///
+/// A foreign key on another table that references `call_rows` passes. Its action writes that
+/// other table, not `call_rows`, and the gateway's role cannot set it off. The action fires only
+/// when a referenced row is deleted or its referenced key changes from a value with no NULL in
+/// it. The role holds no DELETE, which [`other_privileges`] refuses, and its only UPDATE is the
+/// completion, which [`column_privileges`] holds it to. `complete_once` lets that write only the
+/// completion's columns, and only on a row whose `outcome` is NULL, and `completion_shape` and
+/// `error_kind_shape` keep every completion column NULL until then. So a referenced key holds
+/// none of those columns and never changes, or its old value has a NULL and Postgres takes no
+/// action. This is not because that table's triggers are checked: a plain `BEFORE` trigger on
+/// it, which [`definers`] and [`untrusted_functions`] do not refuse, runs as that table's owner
+/// during the action.
 async fn referential_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
