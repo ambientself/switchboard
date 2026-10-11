@@ -29,6 +29,13 @@
 #
 #     docker buildx imagetools inspect <image>:<tag>
 #
+# Postgres is not in this image, but the demo pins it the same way, and its pins are bumped
+# together, by hand: deploy/demo/demo.sh (POSTGRES_IMAGE), deploy/compose/compose.yaml, the
+# commands in CONTRIBUTING.md and in crates/audit-postgres/src/lib.rs's documentation, the tag in
+# deploy/kind/base/postgres.yaml, and CI's service container in .github/workflows/ci.yml, which
+# is the Debian variant of the same release and has a digest of its own.
+# crates/demo-checks/tests/pins.rs fails until they agree.
+#
 # The apt packages below are not pinned.
 
 FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS build

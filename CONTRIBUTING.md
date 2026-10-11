@@ -21,13 +21,17 @@ The demo's images are pinned by tag and by the digest of the tag's multi-arch in
 `deploy/Dockerfile`'s syntax frontend and its `rust` and `debian` base images, and Postgres in
 `deploy/compose/compose.yaml` and `deploy/demo/demo.sh` (`POSTGRES_IMAGE`). The kind manifest
 `deploy/kind/base/postgres.yaml` names the Postgres tag alone, because kind's image load does
-not keep the index digest (`deploy/README.md`). The `rust` tag is `rust-toolchain.toml`'s
-channel. `crates/demo-checks/tests/driver.rs` checks that every one is pinned, that the three
-Postgres places agree, and that the `rust` tag is the toolchain's. Dependabot proposes new
-digests for the base images, never a new `rust` version, and new Postgres tags or digests for
-Compose; it does not read the syntax line, `demo.sh` or the kind manifest. To bump one by hand,
-take the digest from `docker buildx imagetools inspect <image>:<tag>`, and change the three
-Postgres places together.
+not keep the index digest (`deploy/README.md`); `demo.sh` puts the digest on its pod template as
+an annotation, so a new digest rolls the pod. The `rust` tag is `rust-toolchain.toml`'s channel.
+`crates/demo-checks/tests/driver.rs` checks that every one is pinned and that the `rust` tag is
+the toolchain's. `crates/demo-checks/tests/pins.rs` checks that every Postgres pin agrees:
+Compose, `POSTGRES_IMAGE`, the two `docker run` commands below and the one in
+`crates/audit-postgres/src/lib.rs` name the same tag and digest, the kind manifest names that
+tag, and CI's service container (`.github/workflows/ci.yml`) names the same release. Dependabot
+proposes new digests for the base images, never a new `rust` version, and new Postgres tags or
+digests for Compose; it does not read the syntax line, `demo.sh`, the kind manifest or these
+commands. To bump one by hand, take the digest from `docker buildx imagetools inspect
+<image>:<tag>`, and change every Postgres pin together (`deploy/Dockerfile` lists them).
 
 ## Running the gateway on fixtures
 
