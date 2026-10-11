@@ -3177,6 +3177,8 @@ mutate("demo-driver-result-count-unchecked", "a workload's RESULT may count more
        '  elif [ "$total" != "$((passed + failed))" ]; then\n', "  elif false; then\n")
 mutate("demo-driver-result-line-optional", "a workload with no RESULT line fails only as a count that differs", DRIVER,
        '  elif [ -z "$result" ]; then\n', "  elif false; then\n")
+mutate("demo-driver-route-check-status-ignored", "the route check's exit status is read as 0, so a non-zero exit without a FAIL line passes", DRIVER,
+       '    status=$?\n  fi\n  tally_workload "route check in', '    status=0\n  fi\n  tally_workload "route check in')
 mutate("demo-driver-result-last-line", "the RESULT is read from the workload's last line, not its last RESULT line", DRIVER,
        """awk '/^RESULT: / { last = $0 } END { print last }'""", """awk 'NF { last = $0 } END { print last }'""")
 mutate("demo-compose-gateway-on-every-interface", "the gateway is published on every interface", COMPOSE,

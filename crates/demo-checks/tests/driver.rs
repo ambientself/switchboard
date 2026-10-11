@@ -285,10 +285,13 @@ fn a_workload_that_exits_zero_despite_a_fail_line_fails_the_run() {
 
 #[test]
 fn a_workload_that_checked_nothing_fails_the_run() {
-    let run = sourced("tally_workload w 0 'no checks here'\nFINISHED=1\nresult 0");
+    // Its RESULT counts the zero lines read, and it exits 0: only the missing checks fail it.
+    let run = sourced(
+        "tally_workload w 0 'no checks here\nRESULT: FAIL (0 of 0 failed)'\nFINISHED=1\nresult 0",
+    );
     assert_eq!(run.status, Some(1), "{}", run.transcript());
     assert!(
-        run.failed("w: the workload ran no checks"),
+        run.failed("w: the workload ran no checks (exit 0)"),
         "{}",
         run.transcript()
     );
@@ -1659,19 +1662,32 @@ fn the_route_check_runs_as_its_operator_against_the_idle_pod() {
 
 #[test]
 fn a_route_check_fail_fails_the_run() {
-    for (case, output, status) in [
+    // Each output ends in a RESULT line that counts its lines, so the run fails on the line or
+    // the exit status alone, not on a missing or short RESULT.
+    let label = "route check in team-a, every route refused";
+    for (case, output, status, message, last) in [
         (
             "fail-line",
-            "PASS one\nFAIL the probe passed: RESULT: FAIL",
+            "PASS one\nFAIL the probe passed: RESULT: FAIL\nRESULT: FAIL (1 of 2 failed)",
             "1",
+            None,
+            "RESULT: FAIL (1 of 3 failed)",
         ),
         // A FAIL with exit 0, or a non-zero exit with no FAIL, is caught too.
         (
             "fail-exit-0",
-            "PASS one\nFAIL the probe passed: RESULT: FAIL",
+            "PASS one\nFAIL the probe passed: RESULT: FAIL\nRESULT: FAIL (1 of 2 failed)",
             "0",
+            Some("the workload exited 0 despite 1 FAIL lines"),
+            "RESULT: FAIL (2 of 4 failed)",
         ),
-        ("exit-without-fail", "PASS one", "1"),
+        (
+            "exit-without-fail",
+            "PASS one\nRESULT: PASS (1/1)",
+            "1",
+            Some("the workload exited 1 without a FAIL line"),
+            "RESULT: FAIL (1 of 3 failed)",
+        ),
     ] {
         let (run, _) = with_route_check(
             case,
@@ -1679,12 +1695,17 @@ fn a_route_check_fail_fails_the_run() {
             "pass before\nroute_check team-a refused mock-workload-idle-1\nFINISHED=1\nresult 0",
         );
         assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
-        assert!(
-            run.stdout
-                .lines()
-                .last()
-                .unwrap_or_default()
-                .starts_with("RESULT: FAIL ("),
+        match message {
+            Some(message) => assert!(
+                run.failed(&format!("{label}: {message}")),
+                "{case}: {}",
+                run.transcript()
+            ),
+            None => assert!(!run.failed(label), "{case}: {}", run.transcript()),
+        }
+        assert_eq!(
+            run.stdout.lines().last(),
+            Some(last),
             "{case}: {}",
             run.transcript()
         );
