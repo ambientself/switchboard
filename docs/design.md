@@ -905,8 +905,8 @@ enabled event trigger that runs a definer function, or a function in an untruste
 refused, whoever can fire it; EXECUTE on a function in an untrusted language is refused; a
 foreign key on the audit table whose action writes it is refused, and so is a foreign key on
 another table whose action writes that table, when the table's owner could reach the audit
-table, whatever triggers, rules, checks or defaults the table has; and the three below are out
-of scope.
+table and the table carries something that runs code as that owner; and the three below are
+out of scope.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
@@ -957,14 +957,30 @@ or updated the row it references, and so does whatever its write sets off on tha
 triggers, rules, checks, and for `SET DEFAULT` the defaults. For a partitioned table the action
 writes the partitioned table, as its owner, and reaches each partition's triggers from there,
 whoever owns the partition. The catalog cannot say what any of those writes, so the check
-refuses the foreign key itself, on a table other than the audit table, when its action on
-delete or on update is `CASCADE`, `SET NULL` or `SET DEFAULT` and that table's owner counts as
-able as a definer function's owner does, or can run such a function. A partitioned table's key
-is judged by the partitioned table's owner, not by the owners of the partitions' copies. A
-foreign key that references the audit table passes: its action runs only when an audit row is
-deleted or its key changes, which the gateway's role cannot do. The migrations' trigger
-functions are in `plpgsql`, which is trusted, and are not `SECURITY DEFINER`, and the
-migrations make no foreign key, so a database they built passes.
+refuses a foreign key on a table other than the audit table when its action on delete or on
+update is `CASCADE`, `SET NULL` or `SET DEFAULT`, that table's owner counts as able as a
+definer function's owner does, or can run such a function, and the table, or any partition
+under it, carries something that runs code as that owner: any trigger but the internal ones
+Postgres makes to carry out a foreign key or a deferred unique or exclusion check; any rule; or
+a check constraint, column default, generated column, index expression or predicate, or a
+column's domain check, that names a function that is not built in, directly or through an
+operator or another domain, in any language but C and `internal`. Functions in C are out of
+scope, as below. A bare cascading key writes only its own columns and runs nothing as the
+owner, so it passes, and so do checks, defaults and indexes that call only what is built in or
+an extension's C functions, such as `uuid_generate_v4()`. In a database shared with other
+applications whose migrations run as a superuser, the check therefore refuses a superuser's
+cascading key only on a table that also carries one of those; the operator either gives that
+table to a role that cannot reach the audit table or moves the trigger, rule or function off it
+(#144). A partitioned table's key is judged by the partitioned table's owner, not by the owners
+of the partitions' copies. A foreign key that references the audit table passes: its action
+runs only when an audit row is deleted or its key changes, which the gateway's role cannot do.
+The migrations' trigger functions are in `plpgsql`, which is trusted, and are not
+`SECURITY DEFINER`, and the migrations make no foreign key, so a database they built passes.
+The check asks which roles are able once, and then asks of each definer function and each
+cascading table only whether its owner is a member of one, so its time grows with the number
+of roles plus the number of functions, not their product: 400 definer functions in a database
+nothing has analyzed stay well inside the 15-second budget the gateway gives the boot check
+(#144).
 
 What the Postgres check does not look for, each out of scope because it needs an
 administrator's act rather than a misconfiguration of what the role script and the migrations
