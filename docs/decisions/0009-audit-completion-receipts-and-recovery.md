@@ -62,6 +62,11 @@ What is already true:
 | Audit row | Every request that reaches a decision, from a proved principal or with identity checking explicitly disabled: each `tools/call`, allowed or denied, including one denied because its delegation could not be verified; and each `tools/list`. | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect (part 2). | Postgres, in the same transaction as the call's begin. | The same: the call is refused. |
 
+Noted on 2026-10-11 ([decision 0014](0014-rollout-safeguards-and-audit-operations.md)): a
+request refused at admission because its instance already has 256 requests in flight is a
+transport refusal too. It is answered HTTP 503 with a fixed sentence before its body is read,
+and is telemetry, with no row. The table's list of transport refusals did not name capacity.
+
 **Identity failures are telemetry.** If an unauthenticated request caused a synchronous database
 write, anyone who can reach the gateway could load the store that every call in the company
 depends on. During a database outage every 401 would also become the audit-failure sentence,
@@ -726,6 +731,10 @@ for 8.
    resources, for example by finding a key through a keyed hash. The security team and the
    storage owners decide. Until then the grants and triggers are the only protection, they do
    not stop a superuser, and the gateway's role can read receipts. (Proposal 8.)
+   Noted on 2026-10-11: who holds the database superuser login is asked in one place,
+   [decision 0014](0014-rollout-safeguards-and-audit-operations.md)'s Still open, with who runs
+   the audit database. Tamper evidence, and what the gateway's role may see of a receipt, stay
+   here.
 8. **Otto's key:** the carrier Otto's control plane uses, Otto's tool-use identifier as its key,
    and which grant fields scope a key. The session and the turn are recommended. Otto's owners
    are also asked whether the scope needs the execution; whether the control plane can send a

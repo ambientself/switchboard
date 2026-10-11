@@ -295,10 +295,12 @@ is refused at boot until #88 adds a TLS client. The demo deployments still use k
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
-was refused". "We were not checking" is a row with identity `disabled`. For identity, "someone
-tried and was refused" is a telemetry event (section 11); for a delegation, it is a deny row.
-The core cannot yet record a row with identity `disabled`, so until it can, the built path
-refuses every `tools/call` with identity disabled and lists nothing, with no row (section 17).
+was refused". For identity, "someone tried and was refused" is a telemetry event (section
+11); for a delegation, it is a deny row. "We were not checking" writes no row, and none is
+planned: with identity disabled, which only a development build allows, the path lists nothing
+and refuses every `tools/call`, with no row. Reads are not served with rows whose identity is
+`disabled`, and #69, which would have built them, is not planned
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 
 **A wrong guess costs the same as a right one.** An unknown subject pays for the signature
 check before it is refused, so response time does not reveal which subjects exist.
@@ -592,8 +594,8 @@ list names what others must still decide.
 
 | Record | Covers | Written | If it cannot be written |
 | --- | --- | --- | --- |
-| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host or origin), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
-| Audit row | Every request that reaches a decision, from a proved principal or with identity checking explicitly disabled: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
+| Telemetry | Requests that reach no decision: a token that does not prove a principal, a body that cannot be parsed, an accepted notification, a transport refusal (method, protocol headers, size, host, origin, or the instance's cap on requests in flight), `initialize`, `ping` and `server/discover`. Also every audit or receipt write that failed. | Structured events and counters, off the request path, through a bounded queue. Drops are counted. | Lost. Nothing waits for it. |
+| Audit row | Every request that reaches a decision, from a proved principal: each `tools/call`, allowed or denied, including one whose delegation could not be verified; and each `tools/list`. With identity disabled, which only a development build allows, nothing is listed and every `tools/call` is refused, with no row (section 7). | Postgres, before the tool runs and before any answer. | The call is refused with the audit-failure sentence. |
 | Receipt | Each allowed side effect: a call to any tool not classified `read`. | Postgres, in the same transaction as the call's begin. | The call is refused. |
 
 The exceptions to invariant 5 are the requests telemetry covers, which reach no decision, and
@@ -665,8 +667,10 @@ written complete, has no finish, and is never open.
   counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
   quotes again, so as JSON they reach 297,675 characters, or 298,059 bytes, since `…` takes 3
   bytes. Any call that gets a row can reach this, a denial included, and the row is written
-  before the tool runs. The size limits and audit latency targets in Q12 must cover a row this
-  large, counted as the store counts it.
+  before the tool runs. A row is at most 512 KiB, counted as the bytes of the values the
+  Postgres store sends, which holds this with room for the rest of the row; the bound and the
+  test that the largest row fits arrive with #11
+  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres
@@ -686,8 +690,10 @@ written complete, has no finish, and is never open.
   call, or the reach of the tool's connector entry. A reach is recorded by reference to the
   entry, not as a list, since it can hold more resources than a row keeps and the policy
   revision says exactly what it was.
-- **The credential identity used is recorded:** the mode and the vendor-side principal, never
-  the secret.
+- **The credential identity is recorded at begin, as configured:** the connector entry's stated
+  mode and vendor-side principal, never the secret. An entry has one credential and no
+  fallback, so it is the identity the call runs under until per-user grants arrive in
+  milestone 5 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
@@ -696,7 +702,7 @@ written complete, has no finish, and is never open.
   check 3 as an unverified delegation. Its row records which check failed and no claims, and,
   if its signature verified, its digest.
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
-  Otto adds them. Whether it does is part of the question about that table in Q12.
+  Otto adds them. Whether it does is part of the question about that table in Q18.
 
 **Open rows.** Nothing writes to a row except begin and finish, and nothing marks it
 afterwards. What a row of kind `call` means follows from its columns and the database's clock:
@@ -721,7 +727,9 @@ it cannot read who called what on the audit table. A trigger refuses any update 
 already set, so "at most once" holds in the database. The receipt table has grants and a
 trigger of its own. The same role reads receipts, which the reuse check needs, so it can read
 who caused each side effect, on which tool and where. Deletion for retention uses a separate
-role (Q12). None of this protects rows against a database superuser.
+role, created before the first production deployment; until it exists nothing is deleted
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). None of this
+protects rows against a database superuser.
 
 **Shutdown.** On termination an instance first fails its readiness check, then stops accepting
 calls, and lets running calls and their finishes complete. Its termination grace period is set
@@ -732,12 +740,14 @@ row, which is made at the finish deadline.
 **Signals,** counted and exported from milestone 2: begin failures and the audit-failure
 answers they cause; answers released before finish; finishes not written by their deadline;
 open rows; receipts in `unknown` and the age of the oldest; begin and finish latency;
-connections in use per pool; telemetry dropped. Alert thresholds and paging are set before the
-first production deployment.
+connections in use per pool; telemetry dropped. The alert conditions are written in
+[decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); nothing pages until
+a metrics sink and an on-call rotation exist.
 
-The provisional values are two seconds for the begin budget, two seconds for the answer budget
-(as in Otto) and thirty seconds for the finish deadline. Call deadlines are set per tool. Q12
-sets the final values.
+The values are two seconds for the begin budget, two seconds for the answer budget (as in Otto)
+and thirty seconds for the finish deadline, final for milestone 3 and revisited when measured
+against a networked Postgres. Call deadlines are set per proxied server in the deployment file,
+5 s by default and at most 60 s (decision 0014).
 
 This puts Postgres on the path of every call for the whole company. Its availability becomes
 the gateway's availability, and that is an accepted cost of the rule. The first slice
@@ -752,7 +762,7 @@ resource that caused it, as prose capped at 1,024 characters (`deny_reason`, `re
 `github_skill_body` also records the skill ref it was asked for (`skill_ref_requested`) and the
 repository and commit it read (`skill_repo`, `skill_commit`), but only on an allowed call, and
 those columns travel on the finish write, which Otto makes best-effort. Whether the table gains
-a general column, and who adds it, is open (Q12). The table's classification column allows only
+a general column, and who adds it, is open (Q18). The table's classification column allows only
 `read`, `write` and `destructive`, so Otto's adapter records a `propose` tool as `write` there,
 an explicit mapping like its tool names. The table has no `unknown` and no `duplicate`: the
 adapter writes `unknown` as an empty outcome, never `error`, and `duplicate` as `ok`, since
@@ -898,17 +908,20 @@ profile can change it. Only development builds are exempt.
 
 **A development build** is a build of the gateway with the `test-support` cargo feature, which
 the release build never enables. The harness's test builds and the Rust target of the
-conformance suite are development builds. A development build carries four exemptions: it may
+conformance suite are development builds. A development build carries five exemptions: it may
 serve a snapshot holding a tool not classified `read` with no receipt store, run with
-turn-grant checking off, run with identity disabled, and run with audit disabled
-([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). The release
-build refuses each at boot, before it makes any connection. `#[cfg(test)]` cannot provide
-them, because the harness runs the gateway from integration tests and other crates. Since a
-feature can be turned on in any build, CI checks the release artifact itself: started with a
-`propose` snapshot and no receipt store, with grant checking off, with identity disabled and
-with audit disabled, it must refuse each. The identity and audit refusals, and CI's steps for
-them, arrive in milestone 3 (#11). With identity disabled a development build lists nothing
-and refuses every `tools/call`, with no row.
+turn-grant checking off, run with identity disabled, run with audit disabled
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)), and connect to
+loopback destinations, for the tests' local servers
+([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). The release
+build refuses the first four at boot, before it makes any connection, and refuses a loopback
+destination when it connects. `#[cfg(test)]` cannot provide them, because the harness runs the
+gateway from integration tests and other crates. Since a feature can be turned on in any
+build, CI checks the release artifact itself: started with a `propose` snapshot and no receipt
+store, with grant checking off, with identity disabled and with audit disabled, it must refuse
+each, and it must refuse a loopback destination. The identity, audit and loopback refusals,
+and CI's steps for them, arrive in milestone 3 (#11). With identity disabled a development
+build lists nothing and refuses every `tools/call`, with no row.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if

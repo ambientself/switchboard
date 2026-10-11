@@ -80,8 +80,10 @@ for a `read` tool, `unknown` for any other, never cut short silently.
 There is no queue and no circuit breaker. Three caps hold in each gateway instance:
 
 - **256 requests in flight.** A request over it is refused at admission, before its body is
-  read: HTTP 503 with a fixed sentence, a telemetry event and no audit row. This is a transport
-  refusal, which decision 0009 makes telemetry, and it keeps overload away from Postgres.
+  read: HTTP 503 with a fixed sentence, a telemetry event and no audit row. It is a transport
+  refusal, which decision 0009 makes telemetry; a dated note on that record's table of three
+  records adds capacity to the transport refusals the table lists. Refusing it before the
+  body is read keeps overload away from Postgres.
 - **32 calls in flight to each proxied server.**
 - **8 calls in flight from each team to each proxied server,** by the caller's proved team.
 
@@ -174,7 +176,7 @@ of its own.
 
 - **Ownership.** The audit and receipt schema, its grants, triggers and migrations stay in
   this repository, under its code owners (#48). The Postgres instance belongs to whoever runs
-  Postgres, named with IT: its backups, failover, `max_connections`, and the superuser login.
+  Postgres, to be named with IT (Still open).
 - **Retention.** Rows, receipts, resolution records and the policy snapshots rows cite are
   kept for 400 days, provisional until compliance answers Q10. A receipt is never deleted
   before its row. Decision 0009 says a key is honored only while its receipt is kept.
@@ -191,7 +193,10 @@ Exported beside the counters of decision 0009:
   latency, deadline and size failures, drift polls and withdrawals, probe results and reach
   check results.
 - Calls shed, labelled by scope: instance, server or team.
-- The policy's age, and each issuer's key-refresh age, labelled by the issuer as configured.
+- The policy's age.
+- Each issuer's key age, labelled by the issuer as the deployment file names it. This one is
+  already built: #91 exports it as `switchboard_issuer_keys_age_seconds{issuer}` (pull request
+  #115), the seconds since that issuer's keys were last fetched and put in force.
 
 No label carries a value a caller chooses, a credential or a payload.
 
@@ -245,13 +250,15 @@ is no longer a question in Q12.
 - #11 builds sections 1 to 4, the row bound of section 7, and section 9: per-server limits in
   the deployment file and their ceilings, the three caps with the capacity sentence, the
   opt-out refusals and CI's checks of the release artifact, configurable pools, the row bound
-  and its test, the new signals, and a demo of overload and a hanging server. The grace check
-  moves to the largest configured deadline. The configured entry identity is one of the
-  columns #56 adds.
+  and its test, the new signals other than each issuer's key age, which #91 built, and a demo
+  of overload and a hanging server. The grace check moves to the largest configured deadline.
+  The configured entry identity is one of the columns #56 adds.
 - Decision 0009's `refused` covers a call refused by the per-server or per-team cap, and its
-  call deadlines are set per server. Its provisional values become final for milestone 3. Each
-  is a dated note on that record. Its Still open 6 is answered in part: the schema stays here,
-  and who runs the instance stays open.
+  call deadlines are set per server. Its provisional values become final for milestone 3. Its
+  table of three records counts the instance cap's 503 among the transport refusals. Each is a
+  dated note on that record. Its Still open 6 is answered in part: the schema stays here, and
+  who runs the instance stays open. Who holds the database superuser login moves from its
+  Still open 7 to this record's Still open, by a dated note there.
 - Decision 0011's list of parts that may refuse outside the decision function gains the
   capacity caps. None of them can allow. A dated note on its section 5 says so, and names the
   credential identity as the configured entry identity, recorded at begin.
@@ -289,9 +296,11 @@ open; each says what holds until it is answered.
   tool is approved.
 - **How long rows, receipts and resolution records are kept.** Compliance decides, with Q10.
   Until then 400 days, and nothing is deleted before the retention role exists.
-- **Who runs the audit database:** its backups, failover, `max_connections` and superuser
-  login. Whoever runs Postgres, named with IT. Until then the demos' databases are the only
-  ones, and no production deployment is made.
+- **Who runs the audit database,** and so who holds its superuser login: its backups,
+  failover, `max_connections` and that login. Whoever runs Postgres, named with IT, with the
+  security team agreeing who holds the superuser login. This is the one place the superuser
+  login is asked; decision 0009's Still open 7 keeps the rest of tamper evidence. Until then
+  the demos' databases are the only ones, and no production deployment is made.
 - **What "committed" means** (decision 0009, Still open 5). IT, or whoever runs Postgres.
   Until then a begin is committed on the primary.
 - **Who is paged, on whose rotation,** for the alert conditions in section 9. Whoever runs the

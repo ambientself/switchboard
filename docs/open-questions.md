@@ -169,7 +169,7 @@ record says what holds until each is answered. When they are answered, retire Q9
   the one list of Otto requests under Q18.
 - Whether a per-user rate limit must come before employee proposals is tracked in Q12, and
   how often the reach check runs in Q11. Whether Otto's `gateway_audit` table gains this
-  record's audit columns is part of the question about that table in Q12.
+  record's audit columns is part of the question about that table in Q18.
 - **Blocks:** every policy file, and so milestone 2, until the code owners and the branch rule
   exist; every employee read and any broad read, until the security reviewer is named, since
   no resource enters a group's limit before then; milestone 5's employee proposals; every Otto
@@ -196,8 +196,8 @@ compliance requires it for reads.
     system of record.
   - The security team: whether failed-authentication evidence may be dropped under load.
   - The owner with the security team: how a person records a resolution.
-  - The security team and the storage owners: tamper evidence for rows and receipts, and who
-    holds the superuser login.
+  - The security team and the storage owners: tamper evidence for rows and receipts. Who
+    holds the superuser login is asked under Q12.
   - Whoever runs Postgres, probably IT: what "committed" means.
   - Whoever runs Postgres, named with IT: who runs the audit database. The schema stays in
     this repository ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
@@ -250,8 +250,9 @@ retire Q12.
 - **Compliance:** how long rows, receipts and resolution records are kept, with Q10. Until
   then 400 days, and nothing is deleted before the retention role exists.
 - **Whoever runs Postgres, named with IT:** who runs the audit database, its backups,
-  failover, `max_connections` and superuser login; and what "committed" means (decision 0009,
-  Still open 5). Until then no production deployment is made.
+  failover, `max_connections` and superuser login, with the security team agreeing who holds
+  that login; and what "committed" means (decision 0009, Still open 5). Until then no
+  production deployment is made.
 - **Whoever runs the on-call rotation:** who is paged for the alert conditions in decision
   0014 (decision 0009, Still open 9). Until then nothing pages.
 - **The security team:** who may read the audit store through the read-only reviewer role,
@@ -323,8 +324,19 @@ Settled by [decision 0012](decisions/0012-what-a-turn-grant-binds.md), except th
   reading the new row fields back in Otto; minting a renamed deployment first; the
   audience of the sandbox's identity token for stage 1 copies; and whether Otto's
   `gateway_audit` table gains columns for the resources a call names, the credential identity
-  and the error kind, which moved here from Q12
+  and the error kind (below).
+- **Otto's audit table,** which moved here from Q12
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
+  `gateway_audit` has no column for the resources an allowed call names. A denial's or
+  refusal's sentence names the one resource that caused it, as prose capped at 1,024
+  characters. `github_skill_body` records its skill ref, repository and commit, but only on an
+  allowed call, on the best-effort finish write. Otto's owners decide whether the table gains
+  a general column, and who adds it.
+  [Decision 0002](decisions/0002-replace-ottos-mcp-gateway.md) makes the table's contract a
+  compatibility requirement, so adding a column changes it. Otto's rule for this table, stated
+  in its migration 0036, is typed columns and not one JSONB bag, so a new column must be
+  typed. Otto's writer bounds each text column in bytes. Until then those columns stay in
+  this gateway's own record.
 - **The on-call rotation, with whoever runs logging:** how audience and pod failures and the
   lifetime-failure rate reach a person, and the rate that alerts. Until then nothing pages and
   the counts are reviewed at each stage's go/no-go.
