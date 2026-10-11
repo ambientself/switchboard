@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{Run, repo, require, scratch, write};
+use common::{Run, read, repo, require, scratch, write};
 use serde_json::{Value, json};
 
 /// A directory of fake tools. Each appends one line per call to `calls.log`:
@@ -906,7 +906,7 @@ fn a_kind_run_tags_the_image_with_its_own_id() {
 #[test]
 fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
     // What kustomize renders: two pods on the demo image, one on Postgres.
-    let rendered = "      - image: switchboard-demo:dev\n      - image: postgres:17-alpine\n          image: switchboard-demo:dev\n";
+    let rendered = "      - image: switchboard-demo:dev\n      - image: postgres:17.11-alpine\n          image: switchboard-demo:dev\n";
     let run = sourced(&format!(
         "k() {{ case \"$1\" in kustomize) printf '%s' '{rendered}' ;; apply) echo \"applied: $*\"; cat ;; esac; }}\nIMG_RUN=switchboard-demo:90d73467ace7\napply_base"
     ));
@@ -930,9 +930,104 @@ fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
         run.transcript()
     );
     assert!(
-        run.stdout.contains("image: postgres:17-alpine\n"),
+        run.stdout.contains("image: postgres:17.11-alpine\n"),
         "{}",
         run.transcript()
+    );
+}
+
+/// The one line of `text` that starts, after its indentation, with `prefix`, without the prefix.
+fn only_line<'a>(text: &'a str, prefix: &str, what: &str) -> &'a str {
+    let found: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix(prefix))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "{what}: expected one `{prefix}` line, found {found:?}"
+    );
+    found[0].trim_end()
+}
+
+/// Splits `name:tag@sha256:<digest>` at the digest, failing unless there is a tag and the digest
+/// is 64 hex digits.
+fn pinned<'a>(reference: &'a str, what: &str) -> (&'a str, &'a str) {
+    let (tagged, digest) = reference
+        .split_once("@sha256:")
+        .unwrap_or_else(|| panic!("{what} is not pinned by digest: {reference}"));
+    assert!(
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{what} has no sha256 digest: {reference}"
+    );
+    assert!(
+        tagged.contains(':'),
+        "{what} names a digest with no tag: {reference}"
+    );
+    (tagged, digest)
+}
+
+#[test]
+fn the_demo_images_are_pinned_by_tag_and_digest() {
+    // Postgres: Compose names demo.sh's reference exactly. The kind manifest names its tag, and
+    // demo.sh loads the pinned digest into the cluster under that tag (load_images).
+    let driver = read("deploy/demo/demo.sh");
+    let script = only_line(&driver, "POSTGRES_IMAGE=", "demo.sh");
+    let (script_tag, _) = pinned(script, "demo.sh's POSTGRES_IMAGE");
+    let compose = read("deploy/compose/compose.yaml");
+    let compose = only_line(&compose, "image: postgres:", "compose.yaml");
+    assert_eq!(
+        format!("postgres:{compose}"),
+        script,
+        "Compose and demo.sh name different Postgres images"
+    );
+    let manifest = read("deploy/kind/base/postgres.yaml");
+    let manifest = only_line(&manifest, "image: postgres:", "the kind manifest");
+    assert_eq!(
+        format!("postgres:{manifest}"),
+        script_tag,
+        "the kind manifest names another tag than the one demo.sh loads"
+    );
+    let dir = scratch("load-images");
+    let run = sourced(&format!(
+        "docker() {{ echo \"docker $*\"; }}\nkind() {{ echo \"kind $*\"; }}\nDEMO_DIR='{}'\nIMG_RUN=switchboard-demo:90d73467ace7\nload_images",
+        dir.display()
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(
+        run.stdout
+            .contains(&format!("docker tag {script} {script_tag}\n")),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout
+            .lines()
+            .any(|line| line.starts_with("docker save ")
+                && line.ends_with(&format!(" switchboard-demo:90d73467ace7 {script_tag}"))),
+        "{}",
+        run.transcript()
+    );
+
+    // The Dockerfile: the frontend and both base images, and the rust tag is the toolchain's.
+    let dockerfile = read("deploy/Dockerfile");
+    let syntax = only_line(&dockerfile, "# syntax=", "the Dockerfile");
+    pinned(syntax, "the Dockerfile's frontend");
+    let from: Vec<&str> = dockerfile
+        .lines()
+        .filter_map(|line| line.strip_prefix("FROM "))
+        .collect();
+    assert_eq!(from.len(), 2, "the Dockerfile's stages: {from:?}");
+    for line in &from {
+        let image = line.split_whitespace().next().unwrap_or_default();
+        pinned(image, "a Dockerfile base image");
+    }
+    let toolchain = read("rust-toolchain.toml");
+    let channel = only_line(&toolchain, "channel = ", "rust-toolchain.toml").trim_matches('"');
+    assert!(
+        from[0].starts_with(&format!("rust:{channel}-slim-trixie@")),
+        "the build stage is not rust-toolchain.toml's channel {channel}: {}",
+        from[0]
     );
 }
 
