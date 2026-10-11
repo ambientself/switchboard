@@ -829,12 +829,25 @@ fn the_binary_refuses_to_start_with_a_static_credential_and_jwt_settings() {
 
 #[test]
 fn the_binary_refuses_an_admin_endpoint_beyond_loopback_without_an_admin_credential() {
-    let output = binary()
+    let mut child = binary()
         .env("MOCK_DOCS_TOKEN_SHA256", sha256_hex(TOKEN))
         .env("MOCK_DOCS_LISTEN", "127.0.0.1:0")
         .env("MOCK_DOCS_ADMIN_LISTEN", "0.0.0.0:0")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    // A binary that starts instead serves until killed, so it is not waited for without end.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the binary started with its admin endpoint on 0.0.0.0");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     let line: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(line["event"], "boot_refused");
