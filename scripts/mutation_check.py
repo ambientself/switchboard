@@ -3441,7 +3441,7 @@ mutate("pg-check-definer-server-roles-direct-only", "a definer function whose ow
 mutate("pg-check-definer-server-roles-inherited-only", "a definer function whose owner is a member of pg_execute_server_program without inheriting it passes the check", PG_CHECK,
        "AND pg_has_role({owner}, s.oid, 'MEMBER'))", "AND pg_has_role({owner}, s.oid, 'USAGE'))")
 mutate("pg-check-definer-owner-server-functions-ignored", "a definer function whose owner may run lo_export passes the check", PG_CHECK,
-       "AND f.proname::text = ANY($4::text[]))", "AND false)")
+       "AND f.proname::text = ANY($4::text[]))", "AND f.proname::text = ANY($4::text[]) AND false)")
 mutate("pg-check-definer-owner-untrusted-ignored", "a definer function whose owner may run a function in an untrusted language passes the check", PG_CHECK,
        "OR (l.lanispl AND NOT l.lanpltrusted))", "OR false)")
 mutate("pg-check-cascade-trigger-ignored", "a trigger on a table whose foreign key cascades, owned by a role that can write the table, passes the check", PG_CHECK,
