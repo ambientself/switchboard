@@ -936,6 +936,175 @@ fn a_kind_run_deploys_every_pod_of_the_demo_image_on_its_own_tag() {
     );
 }
 
+/// What kustomize renders of the Postgres Deployment, as far as apply_base reads it.
+const POSTGRES_RENDERED: &str = "  template:\n    metadata:\n      annotations:\n        switchboard.io/image-digest: set-by-demo-sh\n    spec:\n      containers:\n        - image: postgres:17.11-alpine\n";
+
+/// apply_base's output for the Postgres Deployment, with `POSTGRES_IMAGE` set to `postgres`, or
+/// left as demo.sh sets it when `None`.
+fn applied_postgres(postgres: Option<&str>) -> String {
+    let set = postgres
+        .map(|image| format!("POSTGRES_IMAGE='{image}'\n"))
+        .unwrap_or_default();
+    let run = sourced(&format!(
+        "k() {{ case \"$1\" in kustomize) printf '%s' '{POSTGRES_RENDERED}' ;; apply) cat ;; esac; }}\n{set}apply_base"
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    run.stdout
+}
+
+#[test]
+fn a_new_postgres_digest_under_the_same_tag_changes_its_pod_template() {
+    // The kind manifest names Postgres's tag alone. The digest goes on the pod template as an
+    // annotation, so a bump that changes only the digest still changes the template, and
+    // Kubernetes replaces the pod.
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let before = applied_postgres(Some(&format!("postgres:17.11-alpine@sha256:{a}")));
+    let after = applied_postgres(Some(&format!("postgres:17.11-alpine@sha256:{b}")));
+    assert!(
+        before.contains(&format!(
+            "      annotations:\n        switchboard.io/image-digest: sha256:{a}\n"
+        )),
+        "{before}"
+    );
+    assert!(
+        after.contains(&format!(
+            "      annotations:\n        switchboard.io/image-digest: sha256:{b}\n"
+        )),
+        "{after}"
+    );
+    assert!(after.contains("image: postgres:17.11-alpine\n"), "{after}");
+    assert_ne!(before, after);
+
+    // A run puts its own pin on the template.
+    let driver = read("deploy/demo/demo.sh");
+    let script = only_line(&driver, "POSTGRES_IMAGE=", "demo.sh");
+    let (_, digest) = pinned(script, "demo.sh's POSTGRES_IMAGE");
+    let applied = applied_postgres(None);
+    assert!(
+        applied.contains(&format!("switchboard.io/image-digest: sha256:{digest}\n")),
+        "{applied}"
+    );
+}
+
+/// Runs check_postgres_image against fakes: `pods` is what kubectl lists for the Postgres pods
+/// (a node and an image ID per line, as printf reads it), `index` what that node holds under the
+/// image ID's digest, and `platform` the ID Docker gives the pinned image for linux/arm64.
+fn postgres_image_check(pods: &str, index: &str, platform: &str) -> Run {
+    require(&["jq"]);
+    sourced(&format!(
+        "k() {{ echo \"kubectl $*\" >&2; printf '{pods}'; }}\n\
+         docker() {{\n\
+           echo \"docker $*\" >&2\n\
+           case \"$1 $2\" in\n\
+             'version --format') echo arm64 ;;\n\
+             'image inspect') [ \"$3 $4\" = '--platform linux/arm64' ] && printf '%s' '{platform}' ;;\n\
+             'exec kind-node') printf '%s' '{index}' ;;\n\
+             *) return 1 ;;\n\
+           esac\n\
+         }}\n\
+         PASSES=0 FAILS=0\ncheck_postgres_image\necho \"passes=$PASSES fails=$FAILS\""
+    ))
+}
+
+#[test]
+fn the_kind_run_fails_unless_postgres_runs_the_pinned_digest() {
+    let manifest = format!("sha256:{}", "c".repeat(64));
+    let other = format!("sha256:{}", "d".repeat(64));
+    let pod = format!(
+        "kind-node docker.io/library/import-2026-10-11@sha256:{}\\n",
+        "e".repeat(64)
+    );
+    // An index as kind's load leaves it: the image's manifest and its attestation.
+    let index = |listed: &str| {
+        format!(
+            r#"{{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"digest":"{listed}"}},{{"digest":"sha256:{}"}}]}}"#,
+            "f".repeat(64)
+        )
+    };
+
+    // The index the pod's image ID names lists the pinned digest's manifest for this platform.
+    let run = postgres_image_check(&pod, &index(&manifest), &manifest);
+    assert!(
+        run.stdout.contains("PASS Postgres runs the pinned digest"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains("passes=1 fails=0"),
+        "{}",
+        run.transcript()
+    );
+    // It asked for the Postgres pods and read the index on the pod's node, under the image ID's
+    // digest.
+    assert!(
+        run.stderr
+            .contains("kubectl -n switchboard get pods -l app=postgres"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stderr.contains(&format!(
+            "docker exec kind-node ctr -n k8s.io content get sha256:{}\n",
+            "e".repeat(64)
+        )),
+        "{}",
+        run.transcript()
+    );
+
+    // An image ID that names the manifest itself, with no index around it.
+    let bare = format!("kind-node docker.io/library/postgres@{manifest}\\n");
+    let run = postgres_image_check(
+        &bare,
+        r#"{"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#,
+        &manifest,
+    );
+    assert!(
+        run.stdout.contains("passes=1 fails=0"),
+        "{}",
+        run.transcript()
+    );
+
+    // The pod runs another digest: the old pod, after a bump that did not replace it.
+    let run = postgres_image_check(&pod, &index(&other), &manifest);
+    assert!(
+        run.stdout.contains("FAIL Postgres runs the pinned digest"),
+        "{}",
+        run.transcript()
+    );
+    assert!(
+        run.stdout.contains("passes=0 fails=1"),
+        "{}",
+        run.transcript()
+    );
+
+    // Nothing to compare fails too: no pod, two pods, a node without the image, or no manifest
+    // for this platform.
+    for (pods, index, platform) in [
+        (String::new(), index(&manifest), manifest.clone()),
+        (format!("{pod}{pod}"), index(&manifest), manifest.clone()),
+        (pod.clone(), String::new(), manifest.clone()),
+        (pod.clone(), index(&manifest), String::new()),
+    ] {
+        let run = postgres_image_check(&pods, &index, &platform);
+        assert!(
+            run.stdout.contains("passes=0 fails=1"),
+            "{pods:?} {index:?} {platform:?}: {}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn the_kind_run_checks_the_postgres_digest_after_its_rollout() {
+    let driver = read("deploy/demo/demo.sh");
+    assert!(
+        driver.contains(
+            "  k -n switchboard rollout status deploy/postgres --timeout=120s\n  check_postgres_image\n"
+        ),
+        "kind_run does not check Postgres's digest once its rollout is done"
+    );
+}
+
 /// The one line of `text` that starts, after its indentation, with `prefix`, without the prefix.
 fn only_line<'a>(text: &'a str, prefix: &str, what: &str) -> &'a str {
     let found: Vec<&str> = text

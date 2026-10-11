@@ -53,9 +53,9 @@ IMG=switchboard-demo:dev
 IMG_RUN=$IMG
 # Postgres, pinned by the digest of the tag's multi-arch index. Compose names the same reference;
 # the kind manifest names only the tag, and load_images loads this digest under it.
-# crates/demo-checks/tests/driver.rs holds the three to one tag and digest. Dependabot does not
-# read this file: bump it by hand with the other two, taking the digest from
-# `docker buildx imagetools inspect postgres:<tag>`.
+# crates/demo-checks/tests/pins.rs holds every Postgres pin in the repository to one version and
+# digest. Dependabot does not read this file: bump it by hand with the others (deploy/Dockerfile
+# lists them), taking the digest from `docker buildx imagetools inspect postgres:<tag>`.
 POSTGRES_IMAGE=postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
 COMPOSE_FILE=$ROOT/deploy/compose/compose.yaml
 KIND_ISSUER=https://kubernetes.default.svc.cluster.local
@@ -980,9 +980,14 @@ run_image() {
   docker tag "$IMG" "$IMG_RUN"
 }
 
-# apply_base: applies the base manifests with every pod that runs $IMG on this run's tag.
+# apply_base: applies the base manifests with every pod that runs $IMG on this run's tag, and
+# Postgres's pod template annotated with the digest it runs. The manifest names Postgres's tag
+# alone, so the annotation is what changes when only the digest does, and rolls the pod.
 apply_base() {
-  k kustomize "$ROOT/deploy/kind/base" | sed "s|image: $IMG\$|image: $IMG_RUN|" | k apply -f -
+  k kustomize "$ROOT/deploy/kind/base" \
+    | sed -e "s|image: $IMG\$|image: $IMG_RUN|" \
+      -e "s|switchboard.io/image-digest: .*|switchboard.io/image-digest: ${POSTGRES_IMAGE#*@}|" \
+    | k apply -f -
 }
 
 # load_images: loads this run's image and Postgres into the cluster. Postgres goes in under its
@@ -999,6 +1004,37 @@ load_images() {
   docker save --platform "linux/$arch" -o "$DEMO_DIR/images.tar" "$IMG_RUN" "$postgres_tag"
   kind load image-archive "$DEMO_DIR/images.tar" --name "$CLUSTER"
   rm -f "$DEMO_DIR/images.tar"
+}
+
+# check_postgres_image: the Postgres pod runs the pinned digest. Its image ID names the index
+# kind's load made, not the pinned multi-arch index, so this reads that index on the pod's node
+# and requires it to list the manifest the pinned index has for this platform (Docker's
+# containerd image store gives that as the ID of the image for one platform).
+check_postgres_image() {
+  local arch want pods node ref got
+  arch=$(docker version --format '{{.Server.Arch}}')
+  want=$(docker image inspect --platform "linux/$arch" --format '{{.Id}}' "$POSTGRES_IMAGE") || want=''
+  pods=$(k -n switchboard get pods -l app=postgres \
+    -o jsonpath='{range .items[*]}{.spec.nodeName} {.status.containerStatuses[0].imageID}{"\n"}{end}') || pods=''
+  if [ "$(count_lines . "$pods")" -ne 1 ]; then
+    fail "Postgres runs the pinned digest (want one pod, got '$pods')"
+    return
+  fi
+  case "$want" in
+    sha256:*) ;;
+    *)
+      fail "Postgres runs the pinned digest (cannot read the manifest for linux/$arch of $POSTGRES_IMAGE: got '$want')"
+      return
+      ;;
+  esac
+  read -r node ref <<<"$pods"
+  got=$(docker exec "$node" ctr -n k8s.io content get "${ref##*@}" |
+    jq -r --arg ref "${ref##*@}" 'if .manifests then .manifests[].digest else $ref end') || got=''
+  if printf '%s\n' "$got" | grep -qxF "$want"; then
+    pass "Postgres runs the pinned digest (${POSTGRES_IMAGE#*@}: linux/$arch $want)"
+  else
+    fail "Postgres runs the pinned digest (its image $ref lists '$(printf '%s' "$got" | tr '\n' ' ')', want $want)"
+  fi
 }
 
 kind_run() {
@@ -1042,6 +1078,7 @@ kind_run() {
   # The route check's operator: its ServiceAccount and only the access its step needs.
   k apply -f "$ROOT/deploy/kind/route-check/rbac.yaml"
   k -n switchboard rollout status deploy/postgres --timeout=120s
+  check_postgres_image
   wait_job switchboard migrate 180
   k -n switchboard logs job/migrate | sed 's/^/    /'
   check "$JOB_STATUS" 0 "the migration completed"

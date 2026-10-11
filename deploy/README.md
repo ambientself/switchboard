@@ -196,13 +196,20 @@ taken from its own ID (`switchboard-demo:<12 hex digits>`) and checks that the g
 mock-docs run that tag. With one fixed tag, a run on an existing cluster would leave the
 previous build's pods running, because `kubectl apply` sees no change.
 
-Postgres is pinned by tag and digest: `postgres:17.11-alpine@sha256:...` in
+Postgres is pinned by tag and digest (`postgres:<tag>@sha256:<digest>`) in
 `compose/compose.yaml` and in the driver's `POSTGRES_IMAGE`. The archive holds this platform's
 manifest, not the tag's multi-arch index, so a pod naming the index digest does not find the
 loaded image and pulls it from Docker Hub instead (checked on kind v0.32.0: with
 `imagePullPolicy: Never`, such a pod stops at `ErrImageNeverPull`). So `kind/base/postgres.yaml`
 names the tag alone, and the driver pulls the pinned digest, tags it with that tag and loads it.
-`crates/demo-checks/tests/driver.rs` holds the three places to one tag and digest.
+The pod has `imagePullPolicy: Never` too, so it never pulls whatever the tag names today. Its
+template carries the digest as the annotation `switchboard.io/image-digest`, which the driver
+fills in when it applies the manifests: a new digest under the same tag changes the template, and
+the pod is replaced. After the rollout the driver checks that the pod runs the pinned digest. The
+pod's image ID names the index kind's load made, not the pinned one, so the driver reads that
+index on the node and requires it to list the manifest the pinned index has for this platform.
+`crates/demo-checks/tests/pins.rs` holds every Postgres pin in the repository to one release and
+digest.
 
 ## What runs
 
