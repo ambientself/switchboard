@@ -1071,6 +1071,8 @@ async fn with_an_admin_credential_no_caller_may_use_the_admin_endpoint() {
                 .put(admin("/admin/definitions/read_document"))
                 .json(&drifted),
             client().delete(admin("/admin/definitions/read_document")),
+            client().post(admin("/admin/tools")),
+            client().get(admin("/admin/nothing")),
         ];
         for request in requests {
             let response = request.bearer_auth(token).send().await.unwrap();
@@ -1112,19 +1114,36 @@ async fn with_an_admin_credential_no_caller_may_use_the_admin_endpoint() {
         read_plan(&server, TOKEN, "borealis").await.status(),
         StatusCode::OK
     );
+    let missing = client()
+        .get(admin("/admin/nothing"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
     let admin_lines: Vec<Value> = server
         .log_lines()
         .into_iter()
         .filter(|line| line["event"] == "admin")
         .collect();
-    assert_eq!(admin_lines.len(), 13, "{admin_lines:?}");
+    assert_eq!(admin_lines.len(), 18, "{admin_lines:?}");
     assert!(
-        admin_lines[..12]
+        admin_lines[..16]
             .iter()
             .all(|line| line["accepted"] == false),
         "{admin_lines:?}"
     );
-    assert_eq!(admin_lines[12]["bearer_sha256"], prefix(ADMIN_TOKEN));
-    assert_eq!(admin_lines[12]["accepted"], true);
+    for line in &admin_lines[16..] {
+        assert_eq!(line["bearer_sha256"], prefix(ADMIN_TOKEN), "{line}");
+        assert_eq!(line["accepted"], true, "{line}");
+    }
+    // No caller was accepted anywhere on the admin endpoint.
+    assert!(
+        !server
+            .log_lines()
+            .iter()
+            .any(|line| line["event"] == "request"
+                && line["path"].as_str().unwrap().starts_with("/admin")),
+    );
 }

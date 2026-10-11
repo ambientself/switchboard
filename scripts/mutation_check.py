@@ -2377,6 +2377,9 @@ mutate("mock-docs-admin-callers-accepted", "with an admin credential, the admin 
        "            accepted: token.is_some_and(|token| admin.accepts(token))\n                || self.authenticate(headers).accepted,")
 mutate("mock-docs-admin-credential-ignored", "the admin endpoint answers the callers and ignores the admin credential", MS,
        "        let Some(admin) = &self.inner.admin else {", "        let Some(admin) = None::<&AcceptedCredential> else {")
+mutate("mock-docs-admin-fallback-takes-callers", "an unknown path on the admin endpoint accepts the callers' bearers", MS,
+       "            .fallback(admin_other_request)\n            .with_state(self.clone())",
+       "            .fallback(other_request)\n            .with_state(self.clone())")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",

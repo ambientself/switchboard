@@ -179,18 +179,23 @@ impl MockDocs {
     ///   one accepted caller may name, by its subject or its digest's logged prefix.
     pub fn admin_router(&self) -> Router {
         Router::new()
-            .route("/admin/tools", get(admin_get_tools).put(admin_put_tools))
+            .route(
+                "/admin/tools",
+                get(admin_get_tools)
+                    .put(admin_put_tools)
+                    .fallback(admin_other_request),
+            )
             .route(
                 "/admin/definitions/{tool}",
                 put(admin_put_definition)
                     .delete(admin_delete_definition)
-                    .fallback(other_request),
+                    .fallback(admin_other_request),
             )
             .route(
                 "/admin/callers/{caller}",
-                put(admin_put_caller).fallback(other_request),
+                put(admin_put_caller).fallback(admin_other_request),
             )
-            .fallback(other_request)
+            .fallback(admin_other_request)
             .with_state(self.clone())
     }
 
@@ -773,6 +778,17 @@ fn admin_accepted(server: &MockDocs, parts: &Parts) -> Option<Value> {
         server.log().write(line);
         None
     }
+}
+
+/// Any other method or path on the admin endpoint: its caller checked as the rest of the admin
+/// endpoint checks it, and logged, then refused.
+async fn admin_other_request(State(server): State<MockDocs>, request: Request) -> Response {
+    let (parts, _) = request.into_parts();
+    let Some(line) = admin_accepted(&server, &parts) else {
+        return unauthorized();
+    };
+    write_with(&server, line, json!({"refused": "not_found"}));
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// Writes `line` with `fields` added.
