@@ -273,6 +273,7 @@ async fn each_telemetry_event_names_the_surface_and_the_peer() {
             ping: 1,
             discover: 1,
             unparsable: 1,
+            policy_stale: 0,
             dropped: 0,
             audit_failure_answers: 0,
         }

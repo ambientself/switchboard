@@ -49,7 +49,7 @@ use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection};
 use crate::policy::{LivePolicy, ServedPolicy};
-use crate::reload::Reloader;
+use crate::reload::{Freshness, Reloader};
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
 
@@ -185,6 +185,9 @@ pub struct Settings {
     pub audit: AuditSection,
     /// What the HTTP endpoint accepts.
     pub http: HttpSection,
+    /// How long after the registry file was last read the policy is stale (decision 0013,
+    /// section 8), or `None` for never.
+    pub max_age: Option<Duration>,
 }
 
 /// What code supplies to the gateway, beside its configuration: the clock, the instance, the
@@ -331,6 +334,7 @@ pub struct Gates {
     http: HttpSection,
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
+    freshness: Freshness,
 }
 
 /// What the gateway was started with that a policy reload cannot change: the issuers, which
@@ -406,6 +410,11 @@ impl Gates {
     /// The `Origin` values served.
     pub fn allowed_origins(&self) -> &BTreeSet<String> {
         &self.http.allowed_origins
+    }
+
+    /// When the registry file was last read, and whether the policy is stale for it.
+    pub fn freshness(&self) -> &Freshness {
+        &self.freshness
     }
 
     /// The policy served now: its snapshot, definitions and profile rules, taken together.
@@ -548,6 +557,8 @@ fn check_with(config: Config, wiring: Wiring, receipt_exempt: bool) -> Result<Ga
             snapshot, catalog, selector,
         ))),
         connectors,
+        // No file is read again, so the policy never goes stale.
+        freshness: Freshness::new(None),
     })
 }
 
@@ -603,7 +614,8 @@ pub fn check_registry(
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
 
     warn_disabled(&settings.deployment, identity_state, audit_state);
-    let reloader = Reloader::new(live.clone(), basis);
+    let freshness = Freshness::new(settings.max_age);
+    let reloader = Reloader::new(live.clone(), basis, freshness.clone());
     let gates = Gates {
         deployment: settings.deployment,
         instance,
@@ -615,6 +627,7 @@ pub fn check_registry(
         http: settings.http,
         policy: live,
         connectors,
+        freshness,
     };
     Ok((gates, reloader))
 }

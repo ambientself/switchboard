@@ -73,7 +73,9 @@ pub use catalog::{CatalogError, ToolCatalog, ToolDefinition};
 pub use config::{
     Algorithm, AuditSection, Config, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
-pub use deployment::{AuditChoice, Deployment, DeploymentError, KeysUrl, MetricsSection};
+pub use deployment::{
+    AuditChoice, DEFAULT_MAX_AGE, Deployment, DeploymentError, KeysUrl, MetricsSection,
+};
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,
     RefreshError,
@@ -81,11 +83,12 @@ pub use keys::{
 pub use metrics::{METRICS_CONTENT_TYPE, Metrics, OPEN_ROWS_POLL, serve_metrics};
 pub use path::{
     AUDIT_DISABLED_NOTE, Admitted, DISCONNECTED_BEFORE_RUN, Disconnect, DisconnectOnDrop,
-    IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, RequestPath, SERVER_NAME, Source,
+    IDENTITY_DISABLED, IDENTITY_DISABLED_NOTE, MAX_TOOL_USE_ID, POLICY_STALE, RequestPath,
+    SERVER_NAME, Source,
 };
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{invalid_argument, undeclared_argument, withdrawn_while_deciding};
-pub use reload::{ReloadError, Reloader};
+pub use reload::{Freshness, ReloadError, Reloader};
 pub use resources::ResourceAdapter;
 pub use selector::{
     NO_PROFILE, ProfileSelector, SelectorError, SelectorRules, UserRule, WorkloadRule,

@@ -553,6 +553,15 @@ async fn with_metrics_configured_it_serves_them_on_their_own_listener_only() {
     );
     // Audit is disabled: there is no store to count.
     assert!(!text.contains("switchboard_audit_"), "{text}");
+    // The policy's age, and the default maximum it is held to (decision 0013, section 8).
+    assert!(
+        text.contains("# TYPE switchboard_policy_age_seconds gauge\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nswitchboard_policy_max_age_seconds 60\n"),
+        "{text}"
+    );
 
     // The MCP listener does not serve them.
     let (status, _) = tokio::task::block_in_place(|| get(running.address, "/metrics"));

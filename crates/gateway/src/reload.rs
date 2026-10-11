@@ -17,14 +17,21 @@
 //! stays. A file whose policy is the same as the one served (a comment edited, say) is fine
 //! with the same revision.
 //!
+//! Every read that succeeds is recorded in the [`Freshness`] the gates share, whether or not
+//! the bytes changed and whether or not they load. Past the deployment's maximum age since the
+//! last such read, the policy is stale (decision 0013, section 8): `/readyz` fails, and
+//! `tools/call` and `tools/list` are refused with [`POLICY_STALE`](crate::path::POLICY_STALE)
+//! and no row, until a read succeeds again. A file that reads but does not load keeps the last
+//! good policy, and is not stale.
+//!
 //! The file is read by path every time, never through a handle kept open, so an edit that
 //! replaces the file (`sed -i`, a rename, a ConfigMap update swapping a symlink) is seen. Mount
 //! the directory that holds the file, not the file itself: a bind mount of a single file keeps
 //! the old inode.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use gateway_core::{PolicyRevision, ToolName};
 use gateway_registry::{Registry, RegistryError};
@@ -59,10 +66,68 @@ pub enum ReloadError {
     Boot(#[from] BootError),
 }
 
+/// When the registry file was last read successfully, and how long after that the policy it
+/// holds is stale. Cheap to clone; clones share the time. The boot read counts as the first.
+#[derive(Clone)]
+pub struct Freshness(Arc<FreshnessState>);
+
+struct FreshnessState {
+    max_age: Option<Duration>,
+    last_read: Mutex<Instant>,
+}
+
+impl std::fmt::Debug for Freshness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Freshness")
+            .field("max_age", &self.0.max_age)
+            .field("age", &self.age())
+            .finish()
+    }
+}
+
+impl Freshness {
+    /// Read just now, and stale `max_age` after the last read; never, with `None`.
+    pub(crate) fn new(max_age: Option<Duration>) -> Self {
+        Self(Arc::new(FreshnessState {
+            max_age,
+            last_read: Mutex::new(Instant::now()),
+        }))
+    }
+
+    /// Records a successful read of the registry file, now.
+    pub(crate) fn read_now(&self) {
+        *self
+            .0
+            .last_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    /// How long ago the registry file was last read successfully.
+    pub fn age(&self) -> Duration {
+        self.0
+            .last_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed()
+    }
+
+    /// How long after a read the policy is stale, or `None` when it never is.
+    pub fn max_age(&self) -> Option<Duration> {
+        self.0.max_age
+    }
+
+    /// Whether the last successful read is older than the maximum age.
+    pub fn is_stale(&self) -> bool {
+        self.0.max_age.is_some_and(|max_age| self.age() > max_age)
+    }
+}
+
 /// Replaces the served policy with a new registry file's, if it passes.
 pub struct Reloader {
     live: Arc<LivePolicy>,
     basis: Basis,
+    freshness: Freshness,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -74,8 +139,12 @@ impl std::fmt::Debug for Reloader {
 }
 
 impl Reloader {
-    pub(crate) fn new(live: Arc<LivePolicy>, basis: Basis) -> Self {
-        Self { live, basis }
+    pub(crate) fn new(live: Arc<LivePolicy>, basis: Basis, freshness: Freshness) -> Self {
+        Self {
+            live,
+            basis,
+            freshness,
+        }
     }
 
     /// Serves `registry`'s policy from the next request on, or refuses it and keeps the policy
@@ -101,8 +170,9 @@ impl Reloader {
         Ok(revision)
     }
 
-    /// Reads `file` every `every`, and applies it whenever its bytes differ from the last ones
-    /// read. `loaded` is the text the gateway started with. Never returns.
+    /// Reads `file` every `every`, records each read that succeeds in the gates' [`Freshness`],
+    /// and applies the file whenever its bytes differ from the last ones read. `loaded` is the
+    /// text the gateway started with. Never returns.
     pub async fn watch(self, file: PathBuf, every: Duration, loaded: Vec<u8>) {
         let mut seen = loaded;
         let mut last_read_error: Option<String> = None;
@@ -129,6 +199,8 @@ impl Reloader {
                 }
             };
             last_read_error = None;
+            // Every read counts, changed or not, loading or not (decision 0013, section 8).
+            self.freshness.read_now();
             if bytes == seen {
                 continue;
             }
@@ -206,7 +278,7 @@ mod tests {
         let live = Arc::new(LivePolicy::new(
             ServedPolicy::from_registry(&started).unwrap(),
         ));
-        let reloader = Reloader::new(live.clone(), release_basis(started));
+        let reloader = Reloader::new(live.clone(), release_basis(started), Freshness::new(None));
 
         // The same tool reclassified `propose`, at r2: same server, same route.
         let proposed = registry_text("propose", true, "r2");

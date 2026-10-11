@@ -234,6 +234,7 @@ pub async fn prepare(
         identity,
         audit: deployment.audit.section(),
         http: deployment.http,
+        max_age: Some(deployment.max_age),
     };
     let revision = registry.snapshot().revision().clone();
     let tools = registry.routes().len();
@@ -306,6 +307,7 @@ pub async fn prepare(
         tools,
         servers,
         poll_seconds = deployment.poll.as_secs(),
+        max_age_seconds = deployment.max_age.as_secs(),
         "serving the registry file's policy"
     );
 

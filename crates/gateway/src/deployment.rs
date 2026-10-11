@@ -16,6 +16,7 @@
 //! [registry]
 //! file = "/etc/switchboard/registry/registry.toml"
 //! poll_seconds = 2
+//! max_age_seconds = 60        # 60 if left out; at least twice poll_seconds
 //!
 //! [identity]
 //! mode = "enforce"            # or "disabled", with nothing else in the table
@@ -77,6 +78,11 @@
 //!   "system:serviceaccount:team-a:mock-workload" = "team-a"
 //!   ```
 //!
+//! - **The maximum age** of the policy is `registry.max_age_seconds` since the registry file
+//!   was last read successfully, whether or not that version loaded (decision 0013, section 8):
+//!   [`DEFAULT_MAX_AGE`] if it is not given, and refused below twice `poll_seconds`, so one
+//!   slow or failed read never makes the policy stale. Past it, `/readyz` fails and
+//!   `tools/call` and `tools/list` are refused until a read succeeds.
 //! - **The database URL** is read from the environment variable `url_env` names, so no password
 //!   is written in the file.
 //! - **Credentials** map each registry server's credential reference to the file holding it.
@@ -86,9 +92,9 @@
 //!   the MCP listener's port on the same or an overlapping address: the two are never one
 //!   listener.
 //!
-//! Every table refuses fields it does not know. Only `listen` has a default, [`DEFAULT_LISTEN`],
-//! so a gateway not told where to listen is reachable from its own machine only. Any other
-//! missing field is an error, and so is a field that does not belong to the chosen mode or kind,
+//! Every table refuses fields it does not know. Only `listen` and `registry.max_age_seconds`
+//! have defaults, [`DEFAULT_LISTEN`] and [`DEFAULT_MAX_AGE`], so a gateway not told where to
+//! listen is reachable from its own machine only. Any other missing field is an error, and so is a field that does not belong to the chosen mode or kind,
 //! such as `subjects_file` on a user issuer.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,6 +114,10 @@ use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
 /// Where the gateway listens when the deployment file does not say: loopback only, never every
 /// interface.
 pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+
+/// How long after the registry file was last read the policy is stale, when the deployment file
+/// does not say (decision 0013, section 8).
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// The deployment file as written.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -153,6 +163,10 @@ pub struct RegistrySection {
     pub file: PathBuf,
     /// How often, in seconds, the file is read again for a new version. At least 1.
     pub poll_seconds: u64,
+    /// How long, in seconds, after the last successful read the policy is stale.
+    /// [`DEFAULT_MAX_AGE`] if it is not given, and at least twice `poll_seconds`.
+    #[serde(default)]
+    pub max_age_seconds: Option<u64>,
 }
 
 /// The identity gate.
@@ -269,6 +283,17 @@ pub enum DeploymentError {
     /// The registry is polled less than once a second, or never.
     #[error("`registry.poll_seconds` must be at least 1")]
     PollTooFast,
+    /// The maximum age is under two polls, so one late read would make the policy stale.
+    #[error(
+        "`registry.max_age_seconds` is {max_age}, and must be at least twice \
+         `registry.poll_seconds`, {least}"
+    )]
+    MaxAgeTooShort {
+        /// The maximum age, given or the default, in seconds.
+        max_age: u64,
+        /// Twice the poll interval, in seconds.
+        least: u64,
+    },
     /// A workload issuer has no team manifest.
     #[error("workload issuer `{0}` needs `subjects_file`, its team manifest")]
     NoManifest(Issuer),
@@ -352,6 +377,8 @@ pub struct Deployment {
     pub registry_file: PathBuf,
     /// How often the registry file is read again.
     pub poll: Duration,
+    /// How long after the registry file was last read successfully the policy is stale.
+    pub max_age: Duration,
     /// The identity gate, with every team manifest read and the keys of every issuer with a
     /// keys file. An issuer with a keys URL has `null` keys here until
     /// [`start::prepare`](crate::start::prepare) fetches them; it is listed in `keys_urls`.
@@ -463,6 +490,14 @@ impl Deployment {
         if file.registry.poll_seconds == 0 {
             return Err(DeploymentError::PollTooFast);
         }
+        let max_age = file
+            .registry
+            .max_age_seconds
+            .unwrap_or(DEFAULT_MAX_AGE.as_secs());
+        let least = file.registry.poll_seconds.saturating_mul(2);
+        if max_age < least {
+            return Err(DeploymentError::MaxAgeTooShort { max_age, least });
+        }
         if let Some(metrics) = &file.metrics
             && takes_port(metrics.listen, file.listen)
         {
@@ -500,6 +535,7 @@ impl Deployment {
             http: file.http,
             registry_file: base.join(file.registry.file),
             poll: Duration::from_secs(file.registry.poll_seconds),
+            max_age: Duration::from_secs(max_age),
             identity,
             keys_urls,
             audit,

@@ -26,8 +26,9 @@
 //!    is running is cancelled, each recorded as `error`; a side effect runs on (decision 0009).
 //!    An answer that completes disarms it.
 //!
-//! `GET /readyz` is the readiness check. It answers 200 `ready` while the gateway serves and 503
-//! once shutting down has begun; any other method is 405. It runs none of the steps above: a
+//! `GET /readyz` is the readiness check. It answers 200 `ready` while the gateway serves, and
+//! 503 once shutting down has begun or while the policy is stale (decision 0013, section 8:
+//! the registry file has not been read within the maximum age); any other method is 405. It runs none of the steps above: a
 //! kubelet probes it with the pod's IP as the host, and the answer says nothing about the
 //! deployment.
 //!
@@ -401,12 +402,13 @@ fn router(endpoint: Endpoint) -> Router {
         .with_state(endpoint)
 }
 
-/// The readiness check: 200 while serving, 503 once shutting down has begun. No host, origin or
-/// identity check runs, and the answer is one word.
+/// The readiness check: 200 while serving, 503 once shutting down has begun or while the policy
+/// is stale. No host, origin or identity check runs, and the answer is one word.
 async fn readyz(State(endpoint): State<Endpoint>, method: Method) -> Response {
     let (status, body) = if method != Method::GET {
         (StatusCode::METHOD_NOT_ALLOWED, "")
-    } else if endpoint.ready.load(Ordering::SeqCst) {
+    } else if endpoint.ready.load(Ordering::SeqCst) && !endpoint.path.gates().freshness().is_stale()
+    {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")

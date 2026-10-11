@@ -44,6 +44,7 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
         identity: deployment.identity,
         audit: AuditSection { disabled },
         http: deployment.http,
+        max_age: None,
     };
     (settings, Registry::load(&deployment.registry_file).unwrap())
 }

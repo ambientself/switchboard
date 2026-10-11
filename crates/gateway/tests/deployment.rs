@@ -407,6 +407,46 @@ fn the_registry_must_be_read_again_at_least_every_so_often() {
     assert!(said.contains("not a valid deployment file"), "{said}");
 }
 
+/// Decision 0013, section 8: the policy's maximum age is 60 s unless given, and never under two
+/// polls.
+#[test]
+fn the_maximum_age_defaults_to_a_minute_and_is_at_least_two_polls() {
+    let loaded = files("max-age-default").load();
+    assert_eq!(loaded.max_age, Duration::from_secs(60));
+    assert_eq!(loaded.max_age, gateway::DEFAULT_MAX_AGE);
+
+    let loaded = load_edited(
+        "max-age-given",
+        "poll_seconds = 1\n",
+        "poll_seconds = 1\nmax_age_seconds = 2\n",
+    )
+    .unwrap();
+    assert_eq!(loaded.max_age, Duration::from_secs(2));
+
+    let said = refused(
+        "max-age-one-poll",
+        "poll_seconds = 1\n",
+        "poll_seconds = 2\nmax_age_seconds = 3\n",
+    );
+    assert_eq!(
+        said,
+        "`registry.max_age_seconds` is 3, and must be at least twice `registry.poll_seconds`, 4"
+    );
+    // The default is held to the same floor.
+    let said = refused(
+        "max-age-slow-poll",
+        "poll_seconds = 1\n",
+        "poll_seconds = 31\n",
+    );
+    assert!(said.contains("`registry.max_age_seconds` is 60"), "{said}");
+    let said = refused(
+        "max-age-negative",
+        "poll_seconds = 1\n",
+        "poll_seconds = 1\nmax_age_seconds = -1\n",
+    );
+    assert!(said.contains("not a valid deployment file"), "{said}");
+}
+
 #[test]
 fn keys_and_manifests_that_cannot_be_read_are_refused() {
     let files = files("unreadable");
