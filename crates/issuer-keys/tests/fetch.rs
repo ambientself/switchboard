@@ -7,16 +7,17 @@
 //! no key is checked in.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use gateway_core::Issuer;
 use issuer_keys::{
-    DEFAULT_DEADLINE, DEFAULT_MAX_BODY_BYTES, FetchError, FetchOptions, KeySource, SourceError,
-    SourceFiles, TokenFault,
+    DEFAULT_DEADLINE, DEFAULT_MAX_BODY_BYTES, FetchError, FetchOptions, KeySource, MAX_TOKEN_BYTES,
+    SourceError, SourceFiles, TokenFault,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::ServerConfig;
@@ -597,6 +598,16 @@ fn a_ca_file_that_cannot_be_read_is_not_pem_or_holds_no_certificate_is_refused()
             "{name}: {refused:?}"
         );
     }
+    // A good certificate does not excuse a broken section after it.
+    let broken_after = format!(
+        "{}-----BEGIN CERTIFICATE-----\nZHVtbXk=\n",
+        TestCa::new().pem
+    );
+    let refused = with_ca(scratch.write("broken-after", &broken_after));
+    assert!(
+        matches!(refused, SourceError::CaNotPem { .. }),
+        "{refused:?}"
+    );
     let refused = with_ca(scratch.write(
         "public-key",
         "-----BEGIN PUBLIC KEY-----\nZHVtbXk=\n-----END PUBLIC KEY-----\n",
@@ -1117,6 +1128,76 @@ async fn a_token_file_that_holds_no_token_sends_no_request() {
         assert!(!failed.to_string().contains("dummy-token"), "{failed}");
     }
     assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_of_exactly_the_limit_is_sent() {
+    let scratch = Scratch::new("token-at-limit");
+    let ca = TestCa::new();
+    let server = Server::start_tls(ca.leaf(&["127.0.0.1"]).acceptor(), |_| Reply::ok(KEYS)).await;
+    let at_limit = "x".repeat(usize::try_from(MAX_TOKEN_BYTES).unwrap());
+    let token_file = scratch.write("token", &at_limit);
+    tls_source(&server, &ca.file(&scratch), Some(&token_file))
+        .fetch()
+        .await
+        .unwrap();
+    assert_eq!(
+        server.authorizations(),
+        vec![Some(format!("Bearer {at_limit}"))]
+    );
+}
+
+/// A token file that never ends: a pipe whose writer sends one byte past the limit and then
+/// holds it open. The source stops reading one byte past the limit and refuses the file; a read
+/// with no bound would wait for an end that never comes. Nothing is sent either way, so the keys
+/// URL names a host that is never reached.
+#[test]
+fn a_token_file_that_never_ends_is_refused_one_byte_past_the_limit() {
+    let scratch = Scratch::new("token-never-ends");
+    let ca_file = TestCa::new().file(&scratch);
+    let path = scratch.0.join("token");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+
+    let (release, held) = mpsc::channel::<()>();
+    let writer = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            let mut pipe = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let size = usize::try_from(MAX_TOKEN_BYTES).unwrap() + 1;
+            pipe.write_all(&vec![b'x'; size]).unwrap();
+            // Holds the pipe open, so the file has no end, until the test is done.
+            let _ = held.recv();
+        }
+    });
+    let source = KeySource::with_files(
+        &issuer("https://keys.example"),
+        "https://keys.example/jwks",
+        &SourceFiles {
+            ca_file: Some(ca_file),
+            token_file: Some(path),
+        },
+        FetchOptions::default(),
+    )
+    .unwrap();
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = done.send(runtime.block_on(source.fetch()));
+    });
+
+    let failed = finished.recv_timeout(Duration::from_secs(10));
+    drop(release);
+
+    let failed = failed.expect("the source is still waiting for the end of the token file");
+    assert_eq!(failed.unwrap_err(), FetchError::Token(TokenFault::TooLarge));
+    writer.join().unwrap();
 }
 
 // --- Over TLS, redirects are still never followed -----------------------------------------------
