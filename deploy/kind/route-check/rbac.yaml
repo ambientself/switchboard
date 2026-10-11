@@ -1,6 +1,8 @@
 # The route check's operator step, deploy/route-check/route-check.sh (decision 0010, "The route
 # check"), runs as route-check/operator. It reads the pod specs, the network plugin's agent and
-# the Services it checks, asks SubjectAccessReviews about the workload's ServiceAccount, and
+# the Services it checks, asks SubjectAccessReviews about the workload's ServiceAccount, reads
+# the Roles, ClusterRoles and their bindings in every namespace to find any rule bound to that
+# ServiceAccount whatever its resourceNames (#60; decision 0010's note from decision 0013), and
 # starts the probe as an ephemeral container in a team's pod. That is all it may do: no Secret
 # data, no exec, no impersonation, and no write but the ephemeral container.
 #
@@ -30,6 +32,9 @@ rules:
     verbs: [get, list]
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
+    verbs: [get, list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, clusterroles, rolebindings, clusterrolebindings]
     verbs: [get, list]
   - apiGroups: [authorization.k8s.io]
     resources: [subjectaccessreviews]
