@@ -12,8 +12,8 @@
 //! serves `POST /mcp/{surface}` on the address the file gives until interrupted. The registry
 //! file is read again every `registry.poll_seconds`, and a new version that passes is served
 //! from the next request. Each keys URL is fetched again every `keys_refresh_seconds` (see
-//! [`gateway::keys`]). Both stop when the gateway shuts down. Logs go to standard output as JSON lines; a refusal to start goes to standard
-//! error as well, as plain text. Shutting down waits for the answers still running, and for the
+//! [`gateway::keys`]). Both stop when the gateway shuts down. Logs go to standard output as
+//! JSON lines; a refusal to start goes to standard error as well, as plain text. Shutting down waits for the answers still running, and for the
 //! audit store to complete the rows it is still writing, up to its finish deadline. With
 //! `[metrics]`, `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it
 //! stops after the MCP listener, once those rows are done.
@@ -144,7 +144,8 @@ async fn serve(config: PathBuf) -> ExitCode {
     let (telemetry, drain) = Telemetry::bounded(TELEMETRY_QUEUE);
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let metrics = metrics_listener.map(|listener| {
-        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone());
+        let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
+            .with_issuer_keys(prepared.keys.ages());
         tokio::spawn(serve_metrics(listener, metrics, async {
             let _ = metrics_stopped.await;
         }))

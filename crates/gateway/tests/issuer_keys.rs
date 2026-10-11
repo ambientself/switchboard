@@ -497,6 +497,7 @@ async fn the_timer_logs_each_failure_once_and_each_change() {
     assert_eq!(refreshed[0]["issuer"], listed.url.as_str());
     assert_eq!(refreshed[0]["added"], next.key_id());
     assert_eq!(refreshed[0]["removed"], issuer.key_id());
+    assert_eq!(refreshed[0]["changed"], "");
     assert_eq!(outcome(prepared.gates.identity(), &token(&next)), Ok(()));
 
     // After a success, a cause seen before is logged again.
@@ -508,6 +509,47 @@ async fn the_timer_logs_each_failure_once_and_each_change() {
     assert_eq!(failed.len(), 3, "{failed:?}");
     assert_eq!(failed[1]["cause"], failed[2]["cause"]);
     assert_eq!(outcome(prepared.gates.identity(), &token(&next)), Ok(()));
+}
+
+/// An issuer that serves a new key under the `kid` it already had: the new key is put in force,
+/// and the change is logged once, at `WARN`, naming the `kid` as changed.
+#[tokio::test]
+async fn a_new_key_under_a_kept_kid_is_logged_once_as_a_warning() {
+    let captured = Captured::global();
+    let listed = Counting::start().await;
+    let issuer = issuer_at(&listed);
+    let next = LocalIssuer::new(&listed.url, SigningAlgorithm::Es256).unwrap();
+    listed.serve(issuer.jwks_document());
+    let prepared = boot(deployment(
+        "keys-changed-under-kid",
+        &fetched_issuer(&listed.url, &listed.keys_url(), ""),
+    ))
+    .await
+    .unwrap();
+    let identity = prepared.gates.identity();
+    let under_old_kid = next
+        .workload_token(TEAM_A_SA, AUDIENCE, SystemTime::now())
+        .kid(issuer.key_id())
+        .build();
+    assert!(outcome(identity, &under_old_kid).is_err());
+
+    // The new key, under the old `kid`.
+    let mut set = next.jwk_set();
+    set.keys[0].common.key_id = Some(issuer.key_id().to_owned());
+    listed.serve(serde_json::to_string(&set).unwrap());
+    for _ in 0..3 {
+        let refreshed = prepared.keys.refresh_all().await;
+        assert!(matches!(refreshed.as_slice(), [Ok(_)]), "{refreshed:?}");
+    }
+
+    let logged = captured.events(REFRESHED_EVENT, &listed.url);
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged[0]["level"], "WARN");
+    assert_eq!(logged[0]["changed"], issuer.key_id());
+    assert_eq!(logged[0]["added"], "");
+    assert_eq!(logged[0]["removed"], "");
+    assert_eq!(outcome(identity, &under_old_kid), Ok(()));
+    assert!(outcome(identity, &token(&issuer)).is_err());
 }
 
 #[tokio::test]

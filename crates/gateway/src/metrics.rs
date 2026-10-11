@@ -31,7 +31,13 @@
 //!     `switchboard_audit_pool_connections_open{pool}` and
 //!     `switchboard_audit_pool_connections_max{pool}`, `pool` one of `begin` and `finish`.
 //!
-//! With audit disabled only the telemetry counters are written: there is no store to count.
+//! - With an issuer whose keys are fetched from a keys URL, from [`KeyAges`]:
+//!   `switchboard_issuer_keys_age_seconds{issuer}`, the seconds since that issuer's keys were
+//!   last fetched and put in force (see [`crate::keys`]). `issuer` is the issuer as the
+//!   deployment file names it, so there is one series per configured issuer. An issuer with a
+//!   keys file has none, and with no keys URL the family is not written.
+//!
+//! With audit disabled the audit signals are not written: there is no store to count.
 //!
 //! Section 11 also names receipts in `unknown` and the age of the oldest. They are not
 //! exported: receipts arrive with #10 stage 2, and a constant 0 would say no receipt is
@@ -64,6 +70,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::get;
+use gateway_core::Issuer;
 use http::HeaderValue;
 use http::header::CONTENT_TYPE;
 use hyper::server::conn::http1;
@@ -73,6 +80,7 @@ use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+use crate::keys::KeyAges;
 use crate::server::{HEADER_READ_TIMEOUT, accept_failed};
 use crate::telemetry::{Telemetry, TelemetryCounts};
 
@@ -91,6 +99,7 @@ const SCRAPE_GRACE: Duration = Duration::from_secs(5);
 pub struct Metrics {
     telemetry: Telemetry,
     audit: Option<Arc<AuditSource>>,
+    issuer_keys: KeyAges,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -98,6 +107,7 @@ impl std::fmt::Debug for Metrics {
         f.debug_struct("Metrics")
             .field("telemetry", &self.telemetry)
             .field("audit", &self.audit.is_some())
+            .field("issuer_keys", &self.issuer_keys)
             .finish()
     }
 }
@@ -122,13 +132,22 @@ impl Metrics {
                     poll_failures: AtomicU64::new(0),
                 })
             }),
+            issuer_keys: KeyAges::default(),
         }
+    }
+
+    /// The same metrics, with the age of each issuer's keys from `ages`, which
+    /// [`KeyRefresher::ages`](crate::keys::KeyRefresher::ages) gives.
+    pub fn with_issuer_keys(mut self, ages: KeyAges) -> Self {
+        self.issuer_keys = ages;
+        self
     }
 
     /// Every signal as it stands, in Prometheus text. See the [module documentation](self).
     pub fn render(&self) -> String {
         let mut text = Text::default();
         telemetry_signals(&mut text, &self.telemetry.counts());
+        issuer_key_signals(&mut text, &self.issuer_keys.ages());
         if let Some(audit) = &self.audit {
             let open = *audit.open.lock().unwrap_or_else(PoisonError::into_inner);
             audit_signals(
@@ -274,6 +293,25 @@ fn telemetry_signals(text: &mut Text, counts: &TelemetryCounts) {
     );
 }
 
+fn issuer_key_signals(text: &mut Text, ages: &[(Issuer, Duration)]) {
+    if ages.is_empty() {
+        return;
+    }
+    text.family(
+        "switchboard_issuer_keys_age_seconds",
+        "gauge",
+        "Seconds since the issuer's keys were last fetched from its keys URL and put in force, \
+         at boot or by a refresh. A refresh that fails leaves the keys in use, and this grows.",
+    );
+    for (issuer, age) in ages {
+        text.sample(
+            "switchboard_issuer_keys_age_seconds",
+            &[("issuer", issuer.as_str())],
+            age.as_secs_f64(),
+        );
+    }
+}
+
 fn audit_signals(text: &mut Text, signals: &AuditSignals) {
     let stats = &signals.stats;
     let failures = &stats.begin_failures;
@@ -405,10 +443,19 @@ fn audit_signals(text: &mut Text, signals: &AuditSignals) {
     }
 }
 
-/// Prometheus text, written as it goes. Every name and label here is a constant of this module,
-/// so nothing needs escaping.
+/// Prometheus text, written as it goes. Every name and label name here is a constant of this
+/// module. Label values are escaped as the format requires, since an issuer's comes from the
+/// deployment file.
 #[derive(Default)]
 struct Text(String);
+
+/// A label value as Prometheus text writes it: backslash, double quote and newline escaped.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
 
 impl Text {
     /// A family's `HELP` and `TYPE` lines.
@@ -423,7 +470,7 @@ impl Text {
         if !labels.is_empty() {
             let labels: Vec<String> = labels
                 .iter()
-                .map(|(label, value)| format!("{label}=\"{value}\""))
+                .map(|(label, value)| format!("{label}=\"{}\"", escape_label(value)))
                 .collect();
             let _ = write!(self.0, "{{{}}}", labels.join(","));
         }
@@ -504,6 +551,27 @@ mod tests {
             ]
         );
         assert!(text.0.contains("# TYPE h_seconds histogram\n"));
+    }
+
+    #[test]
+    fn an_issuer_label_is_escaped_and_with_no_fetched_issuer_nothing_is_written() {
+        let mut text = Text::default();
+        issuer_key_signals(
+            &mut text,
+            &[(
+                Issuer::new("https://a.test/\"quoted\"\\path\nnext"),
+                Duration::from_millis(1500),
+            )],
+        );
+        assert_eq!(
+            lines(&text.0),
+            [
+                "switchboard_issuer_keys_age_seconds{issuer=\"https://a.test/\\\"quoted\\\"\\\\path\\nnext\"} 1.5"
+            ]
+        );
+        let mut none = Text::default();
+        issuer_key_signals(&mut none, &[]);
+        assert_eq!(none.0, "");
     }
 
     #[test]
