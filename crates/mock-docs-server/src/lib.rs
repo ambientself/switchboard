@@ -29,6 +29,10 @@
 //!   refuses a call its credential may not make. The variables that name one credential or one
 //!   subject allow every project. The admin endpoint or [`MockDocs::set_projects`] changes a
 //!   caller's projects while the server runs, to play a reach that changes.
+//! - **The admin endpoint.** With an admin credential ([`Config::admin`]) it answers only that
+//!   bearer, and no caller's, so no caller can widen its own projects or change a definition.
+//!   Without one it answers the callers, and the binary refuses to serve it anywhere but on
+//!   loopback, where no caller can reach it.
 //! - **A log line per request.** Each line is a JSON object on standard output with
 //!   `bearer_sha256`, the first 12 hex digits of the SHA-256 of the bearer the request carried
 //!   (`null` if none), and `accepted`. A script can count these to show which credentials ever
