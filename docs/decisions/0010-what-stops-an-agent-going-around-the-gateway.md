@@ -264,9 +264,11 @@ the governed route and leaves the open one.
 *Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):*
 milestone 3 has no registry workload. The probe runs in each gateway replica's drift pass, and
 registration is the approval pull request, which records a probe made by `switchboard probe`
-before the entry loads. The probe ServiceAccount's token, and each team service identity's, come
-by TokenRequest through a token-writer sidecar in the gateway pod. That sidecar is the only
-container holding a token the API server accepts.
+before the entry loads. In kind, the probe ServiceAccount's token, and each team service
+identity's, come by TokenRequest through a token-writer sidecar in the gateway pod. That sidecar
+is the only container holding a token the API server accepts. Compose has no API server and, as
+the table above says, no route claim: its probe's third call presents a static dummy credential
+instead, so its record shows only that the mock server checks its caller.
 
 A self-built server identifies the gateway by a token for one of the gateway's own workload
 identities, with the server as its audience. It accepts only those identities: one for each

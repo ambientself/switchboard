@@ -282,8 +282,8 @@ keys for an issuer that is not configured are refused. Keys that cannot be refre
 force until a refresh succeeds, with no maximum age ([decision
 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Refusing every token because
 a refresh failed would turn an outage of the issuer's host into an outage of the gateway. Each
-issuer's key age is to be exported instead, as `switchboard_issuer_keys_age_seconds{issuer}`
-(#91), with an alert condition at four refresh intervals (Q12).
+issuer's key age is exported instead, as `switchboard_issuer_keys_age_seconds{issuer}` (#91),
+with an alert condition at four refresh intervals (Q12).
 
 This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
 is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
@@ -978,7 +978,9 @@ leaves, bounds result sizes, and tags every result as external evidence.
    the registry is a service, registration is the approval pull request:
    `switchboard probe --config=FILE --server=NAME` sends the three calls, and the entry records
    `probe = { result = "refused", date = ... }`. The loader refuses a proxied entry without
-   it, and a probe that could not connect is never recorded as refused
+   it, and a probe that could not connect is never recorded as refused. Compose has no
+   TokenRequest and no route claim, so there the third call presents a static dummy
+   credential, and the record shows only that the server checks its caller
    ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
 3. The registry reads the server's tool list.
 4. A person assigns each tool a classification and approves it. A server is never trusted to
@@ -1011,8 +1013,12 @@ A withdrawal makes a snapshot of its own, with the revision `{base}+withdrawn:{n
 withdrawn tools' exposed names sorted and joined by commas. The loader refuses a registry
 revision containing `+`, so the derived form cannot be mistaken for a loaded one. It survives a
 reload while the tool's hashes and `approved_at` are unchanged; a new approval clears it. The
-first pass runs at boot, before `/readyz` passes. A poll that fails, by being unreachable, late
-or unparsable, is not drift: the tools stay served and the failure is counted and alerted on.
+first pass's tool lists and probes run at boot, before the replica binds the one listener that
+serves `/readyz` and every surface, so it serves nothing until they finish. Its reach checks
+are calls through that listener, so they run as soon as it is bound; until they finish, at
+most one call deadline, a reach that has widened is served, as between any two passes. A poll
+that fails, by being unreachable, late or unparsable, is not drift: the tools stay served and
+the failure is counted and alerted on.
 Each replica checks for itself, so a change that lasts one interval plus one call deadline,
 about 305 s at the defaults, is withdrawn on every replica whose polls succeed. While a
 replica's polls of an entry fail, a changed tool stays served on that replica, and the alert on
@@ -1113,7 +1119,7 @@ not Otto, then harden the proxy, then bring Otto over. Each milestone is usable 
 | --- | --- | --- |
 | 1. Kernel and harness | The policy core with no I/O and its table of cases; interfaces for audit, credentials, connectors and identity, each with an in-memory fake; a fake MCP server; a local token issuer; the thin HTTP adapter with a fixture tool. | Just enough of Q9 to shape the decision interface: what a call's context contains. The MCP revision and one client to test with (Q13). |
 | 2. First slice | A mock workload calling a mock read-only MCP server through the gateway, in a local Kubernetes cluster: identity from the cluster's issuer, one resource limit across two teams, approval from files, durable audit, bounded output, withdrawal shown to work, and a direct call around the gateway shown to fail, after the same call is first seen to connect and be refused by the server, with the gateway's call succeeding before and after the policy and the workload shown to hold no credential. The gateway presents a projected token for its own ServiceAccount to the mock server, which accepts only that identity ([decisions 0008](decisions/0008-mock-the-first-slice.md) and [0010](decisions/0010-what-stops-an-agent-going-around-the-gateway.md)). The same stack runs by hand under Docker Compose. The gateway refuses, at boot and at each snapshot swap, a snapshot serving a tool not classified `read` without a receipt store (decision 0009), and CI checks the release artifact for it. A real workload follows once a team volunteers one and its route check passes. | Decision 0009, part 1. The code owners of the policy files and the branch rule requiring their review, since no policy file lands before them (decision 0011). |
-| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds (Q11). Tool assurance and proxied exposure (decision 0011). |
+| 3. Proxy hardening | Approval bound to server identity and route; destination limits; request and result size limits, deadlines and bounded concurrency; isolation of a failing server; drift detection; the registration and drift probe of section 13; the gateway's identities per team service identity. Schema validation before forwarding; connector entries; the snapshot loader's rules; the scheduled reach check. The kind slice extended to show them. | Freshness and revocation bounds ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). Tool assurance and proxied exposure (decision 0011). |
 | 4. Otto | The Otto adapter: turn grants verified with a public key, the per-turn tool check, the resolver client. Before stage 3, the pod binding and the currency check (decision 0012). Built-in GitHub and Jira tools, and the exception list in check 5 for Otto's two comment tools (decision 0011, #12). Built-in tools that check their own scope report what they reached (decision 0011). Receipts and the key check before the first side effect reaches a real system (decision 0009, part 2). The conformance suite extended and run against both gateways. Cutover in stages: alongside and compared, then reads, then writes. Stage 2 does not wait for the only path. | Grant contents ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). Who the owner names to raise the one list of Otto requests from decisions 0009 to 0012 (Q18); nothing reaches Otto's owners before then. Otto's owners' answers to decision 0011: the review of the declarations for Otto's eighteen tools, team repositories moving into the snapshot's limits, and the proposal tools checked against the interim automation refusals; until then this gateway serves none of Otto's tools. Receipts and reconciliation (decision 0009, part 2) before the first side effect reaches a real system, with who settles a receipt by hand and how a resolution is recorded (its Still open 9 and 10). Otto's key, before Otto's writes are cut over (its Still open 8). The security owner named and the comment-tool exception's register entry signed, before Otto's two comment tools are served (decision 0011). The vendor actions Otto's control plane needs. Asked but not blocking: Otto's answers to decision 0010 (its proxy refusing target systems' hosts by address and name, the egress-check rows, the sandbox's Pod Identity association, and the turn's egress setting in the grant). Until they come, every Otto turn has the governed path. |
 | 5. Employees' agents | Okta as an issuer; user principals and group policy; client discovery; reachability from laptops; per-user grants where an integration requires them. The claim is the governed path. It does not roll out until IT security owns the laptop register entries and they are accepted. | Clients and access (Q13), including that each client sends a tool-use identifier or can set the named `_meta` field before it is served a `propose` tool (decision 0009). The security reviewer of data approvals, named by the security team, since no resource enters a group's limit, and so no employee read works, until then (decision 0011). Whether group limits and broad-read opt-ins expire (decision 0011). Per-user grants and receipts before any employee proposal for that system (decision 0011), and whether a per-user rate limit must come first (Q12). |
 | 6. Registry as a service | An API and then a UI for onboarding. | Only when onboarding by pull request has become the bottleneck. |
@@ -1429,8 +1435,10 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
     under such a profile is never allowed unless its currency is current. A mutation that
     applies the check to `propose` alone fails the excepted `write` case. In Otto: a
     superseded control plane that is still running answers superseded for its own turns.
-  - Revocation. A revoked turn's next proposal denied. A removed key, and a team removed from
-    the allowlist, each taking effect within one rollout until Q11 sets a bound.
+  - Revocation. A revoked turn's next proposal denied. A removed key taking effect within one
+    rollout. A team removed from the allowlist taking effect within the delivery bound plus one
+    registry poll, the bound [decision
+    0013](decisions/0013-registry-freshness-drift-and-withdrawal.md) sets.
   - Failures. A grant that fails verification denied at check 3 as an unverified delegation,
     under one reason kind, with a deny row that records which check failed and no claims. An
     audience or pod failure also recorded with the grant's digest; a bad signature recorded
@@ -1515,14 +1523,14 @@ Invariants 12 and 13 are watched by the rows for repeated keys and for `unknown`
 
 ## 19. Still open
 
-What remains of Q9, Q10, Q17 and Q18, and Q11 to Q13, are in
+What remains of Q9, Q10, Q17 and Q18, and Q12 and Q13, are in
 [open-questions.md](open-questions.md). Q9 is narrowed to what decision 0011 leaves to others,
 Q10 to what compliance requires of read auditing, Q17 to what decision 0010 leaves to others,
 and Q18 to what decision 0012 leaves to Otto's owners and to the owner; the rest of each is
-decided. Each of decisions 0009 to 0012 lists what it leaves to Otto's owners, IT, IT security,
-the security team, platform owners and others, with who decides and what holds meanwhile. Every
-request of Otto's owners goes to them as one list, raised by whoever the owner names
-(decision 0012). The milestone table says which each milestone must settle before it starts, and
-section 17 lists the changes the records need in code already built. Vendor feasibility remains
-research in [systems.md](systems.md). The independent review's findings that are not yet
-reflected here are listed at the end of that file.
+decided. Q11 is settled by decision 0013. Each of decisions 0009 to 0013 lists what it leaves
+to Otto's owners, IT, IT security, the security team, platform owners and others, with who
+decides and what holds meanwhile. Every request of Otto's owners goes to them as one list,
+raised by whoever the owner names (decision 0012). The milestone table says which each milestone
+must settle before it starts, and section 17 lists the changes the records need in code already
+built. Vendor feasibility remains research in [systems.md](systems.md). The independent
+review's findings that are not yet reflected here are listed at the end of that file.

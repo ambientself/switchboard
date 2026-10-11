@@ -319,8 +319,9 @@ snapshot's freshness bound is set. The team and surface levers are edits to the 
 take effect on a replica within the delivery bound plus one `registry.poll_seconds`: in kind, at
 most 120 s plus one poll once the ConfigMap is applied. A replica that cannot read its registry
 for longer than the maximum age, 60 s, refuses every call. The two levers are tested against
-that bound, not one rollout. The same holds for "Configuration levers take one rollout" under
-Decided by the owner.
+that bound, not one rollout. The same holds for the team lever under "Configuration levers take
+one rollout" in Decided by the owner. Removing a grant key is a change to the deployment's
+configuration, read at boot, and still takes one rollout.
 
 ### What Otto changes
 

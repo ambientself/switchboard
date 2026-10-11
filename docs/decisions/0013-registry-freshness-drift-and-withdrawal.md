@@ -1,13 +1,13 @@
 # 0013: Registry freshness, drift and withdrawal
 
-Date: 2026-10-10. Status: proposed, awaiting the owner. Would settle Q11 (#4), and the parts of
-#11 that depend on its answers: what an approval fingerprints, a proxied server's identity,
-where the gateway may connect, servers that need a session, the registration probe and the
-gateway's per-team identities. The recommendations are recorded here under the owner's
-standing instruction of 2026-10-10 to take them. Two answers are the owner's own and are
-written as recommendations only: how often the drift pass runs (section 5) and how long a
-withdrawal lasts (section 7). See For the owner. Written against decisions
-[0009](0009-audit-completion-receipts-and-recovery.md) to
+Date: 2026-10-10. Status: accepted on 2026-10-11, when the owner accepted every recommendation
+this record makes, including the three answers that were the owner's own: how often the drift
+pass runs (section 5), how long a withdrawal lasts (section 7), and #48 landing before the
+approval-binding work (Consequences). See The owner's answers. Settles Q11 (#4), except what
+others decide under Still open. Also settles the parts of #11 that depend on its answers: what
+an approval fingerprints, a proxied server's identity, where the gateway may connect, servers
+that need a session, the registration probe and the gateway's per-team identities. Written
+against decisions [0009](0009-audit-completion-receipts-and-recovery.md) to
 [0012](0012-what-a-turn-grant-binds.md) as accepted on 2026-10-07, with 0009's amendment of
 2026-10-10, and against the code at the end of milestone 2. Adds dated notes to decisions 0010,
 0011 and 0012. Their accepted text is unchanged.
@@ -151,17 +151,30 @@ workload, withdrawals file or channel between replicas until milestone 6.
 
 **A failed poll is not drift.** A server that cannot be reached, answers with a status other
 than 200, answers with something that cannot be parsed, or answers after the entry's call
-deadline keeps its tools served. The failure is logged, counted and alerted on. The first pass
-runs at boot, before `/readyz` passes, so a restarted replica checks before it serves. A failed
-first poll does not hold readiness back.
+deadline keeps its tools served. The failure is logged, counted and alerted on.
 
-**How often (for the owner).** The recommendation is every 300 s per proxied entry by default,
-set by an optional `[drift]` table in the deployment file, `interval_seconds`, refused below 5
-or above 900. The demos set 10. A changed definition or a widened reach can then still be served
-for one interval plus one call deadline on each replica whose polls succeed, about 305 s at the
-defaults. Decision 0011 left this question to the owner with no recommendation, so it is not
-adopted under the standing instruction. Until the owner answers, decision 0011 keeps every
-proxied entry to development and test deployments.
+**The first pass comes before serving.** As built, a replica binds one listener for `/readyz`
+and every surface together, once its boot checks pass, and `/readyz` answers 200 from the first
+request until shutdown. Readiness only tells Kubernetes when to route to the pod. Anything that
+reaches the listener directly is served as soon as it is bound, and in Compose nothing probes
+`/readyz` at all. So the first pass's tool lists and probes (steps 1 and 2) run during boot,
+after the registry loads and before the listener is bound. A replica serves nothing, `/readyz`
+included, until they have finished, and a tool they withdraw is never served by it. Boot waits
+for them, each call bounded by its entry's call deadline. A failed first poll does not stop
+boot: as with any failed poll, the entry's tools are served and the failure is alerted on. The
+reach check (step 3) is a call through the replica's own listener, so it runs as soon as the
+listener is bound. The residual: from then until that check finishes, at most one call
+deadline, a reach that has widened is served on that replica, as it would be between any two
+passes.
+
+**How often.** Every 300 s per proxied entry by default, set by an optional `[drift]` table in
+the deployment file, `interval_seconds`, refused below 5 or above 900. The demos set 10. The
+owner set this on 2026-10-11, answering the question decision 0011 had left to the owner with no
+recommendation. A changed definition or a widened reach can still be served for one interval
+plus one call deadline on each replica whose polls succeed, about 305 s at the defaults. With
+the interval set, decision 0011's hold on proxied entries for want of it ends. Its asks of IT
+and vendor administrators still hold every proxied entry back outside development and test
+deployments (Still open).
 
 **What every replica sees.** Each replica checks for itself, with nothing passed between them.
 A change that lasts at least one interval plus one call deadline is withdrawn on every replica
@@ -207,10 +220,10 @@ withdrawal. A version that removes the tool drops it.
 connector entry, the cause (a changed definition, a tool no longer listed, or a reach mismatch)
 and the base and derived revisions. It counts it, and it is alerted on.
 
-### 7. How long a withdrawal lasts (for the owner)
+### 7. How long a withdrawal lasts
 
-The recommendation is that in milestone 3 a withdrawal lives in each replica's memory. It lasts
-until the tool is approved again, or until that replica restarts.
+In milestone 3 a withdrawal lives in each replica's memory, as the owner decided on 2026-10-11.
+It lasts until the tool is approved again, or until that replica restarts.
 
 The residual, stated plainly. A restarted replica's first pass withdraws the tool again only if
 the server still serves the changed definition, or the reach is still wide. Suppose a server's
@@ -229,9 +242,9 @@ turns a withdrawal in one replica's memory into a decision that lasts.
 
 Persisting withdrawals, in a table in the audit database read at boot and on each poll, is
 deferred to milestone 6, with the registry service. It carries the hashed form of section 6 with
-it. The owner may instead ask for it now. That needs a migration, grants for the gateway's role,
-a write from every replica and a read at boot, and it brings the audit database into the drift
-pass.
+it. The owner chose that over persisting them now, which would need a migration, grants for the
+gateway's role, a write from every replica and a read at boot, and would bring the audit
+database into the drift pass.
 
 ### 8. Freshness
 
@@ -295,6 +308,15 @@ The drift pass repeats the three calls each interval. A server that dispatches o
 logged at ERROR, counted and alerted on, and recorded as open, as decision 0010 says. Its tools
 stay listed: withdrawing them would close the governed route and leave the open one.
 
+**In Compose** there is no Kubernetes API, so no TokenRequest, and no route check: decision 0010
+makes no route claim there, since the Compose demo is run by hand, serves no agent and puts
+every service on one network. Its mock server accepts static credentials, not tokens from an
+issuer. So the third call presents a static dummy probe credential, named in the deployment
+file like the per-team ones (section 10), which the server must refuse as it would a stranger's
+token. The Compose entry carries a probe record like any other, and the drift pass repeats the
+calls there. That record shows that the Compose mock server checks its caller. It is not
+evidence about any route.
+
 ### 10. Per-team identities, and which containers hold a Kubernetes API token
 
 **Per-team identities.** There is one ServiceAccount per team service identity: `docs-team-a`
@@ -303,8 +325,8 @@ Their tokens come by TokenRequest, under a Role limited by `resourceNames` to th
 token-writer sidecar in the gateway pod writes each token to a file, using the demo image's
 `curl` and `jq`. The gateway reads each file as it reads every credential today, so the gateway
 binary gains no API-server client in milestone 3. Compose uses static per-team dummy
-credentials. This lands after #60, so that the route check sees grants limited by
-`resourceNames`.
+credentials, and a static dummy probe credential (section 9). This lands after #60, so that the
+route check sees grants limited by `resourceNames`.
 
 **Only the token-writer sidecar holds a token the API server accepts.** It alone mounts a
 projected token with the API server's audience, and the cluster CA. The gateway container
@@ -340,7 +362,8 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
 - A restored server and a restarted replica: after a withdrawal, the server serves its approved
   definition again and the replica restarts. The replica serves the tool again, as section 7
   states, and the earlier `tool_withdrawn` line and count exist. With the server still changed,
-  the restarted replica withdraws the tool before `/readyz` passes.
+  the restarted replica withdraws the tool before it binds its listener, so neither `/readyz`
+  nor any call is answered until it has.
 - A standing withdrawal survives a reload that leaves its key unchanged, and the derived
   revision names the new base.
 - A server entry changed without its tools approved again is refused at boot and at reload.
@@ -396,35 +419,38 @@ Each is a test on fakes in the per-change loop, and the kind slice shows the dri
 - **The demo and deploy registries become policy files** under decision 0011 once approvals
   bind servers: the registries under `deploy/kind`, `deploy/compose` and `deploy/ci`, and the
   registry crate's demo file. Decision 0011 lets no policy file land before the code owners and
-  the branch rule requiring their review exist. So #48 (a `CODEOWNERS` entry and a code-owner
-  branch rule, set by the owner) must land before the approval-binding work of #11 merges, or
-  the owner rules that those files are fixtures, not policy files.
+  the branch rule requiring their review exist. The owner ruled on 2026-10-11 that those files
+  are policy files, not fixtures, so the approval-binding work of #11 merges only after #48's
+  `CODEOWNERS` entry and code-owner branch rule exist.
 - **Persisted withdrawals** get a home issue in milestone 6, with the hashed revision above
   the cap and the table that keeps its set.
 - **Q11 is settled,** except what others decide (Still open). Decisions 0010, 0011 and 0012
-  carry dated notes. Design sections 7, 8, 13 and 15 change to match.
+  carry dated notes. Design sections 7, 8, 13 and 15 change to match, sections 17 to 19 cite
+  this record where they cited Q11, and so does the key refresher's module documentation.
 - **Decision 0012's two levers** take effect within the delivery bound plus one poll, not one
   rollout, and are tested against that.
 
-## For the owner
+## The owner's answers
 
-These are the owner's own answers. The record holds the recommendation for each, and the owner
-answers by merging it or by asking for a change.
+The owner accepted every recommendation in this record on 2026-10-11. Three of the answers
+were the owner's own:
 
 - **How often the drift pass runs** (section 5): every 300 s by default, configurable from 5 s
-  to 900 s, and 10 s in the demos. It also sets how often the reach check runs (decision 0011,
-  Still open).
+  to 900 s, and 10 s in the demos. It also sets how often the reach check runs, which decision
+  0011 left to the owner under Still open.
 - **How long a withdrawal lasts** (section 7): in each replica's memory in milestone 3, until
-  approved again or until that replica restarts, with the residual stated and every withdrawal
-  alerted on; persisted in milestone 6.
-- **#48 before the approval-binding work** (Consequences), or a ruling that the demo and deploy
-  registries are fixtures.
+  the tool is approved again or until that replica restarts, with the residual stated there.
+  Every withdrawal is logged at ERROR and alerted on. Withdrawals are persisted in milestone 6.
+- **#48 before the approval-binding work** (Consequences): the demo and deploy registries are
+  policy files, not fixtures, so the approval-binding work of #11 merges only after #48's
+  `CODEOWNERS` entry and code-owner branch rule exist, as decision 0011 already says.
 
 ## Still open
 
-- **Platform owners** grant the probe ServiceAccount's TokenRequest permission outside kind
-  (Q17). Until then the probe runs only in kind, and no self-built server is registered
-  elsewhere.
+- **Platform owners** grant the probe ServiceAccount's TokenRequest permission in clusters
+  other than kind (Q17). Until then the probe's third call has a TokenRequest token only in
+  kind, and no self-built server is registered in any other cluster. Compose has no cluster and
+  no route check, and probes with a static dummy credential (section 9).
 - **IT and vendor administrators** (decision 0011): the narrow service accounts, and any
   administrative credential the reach check needs to read a vendor's report. Until then no
   proxied entry is exposed, and a vendor report check is not built.

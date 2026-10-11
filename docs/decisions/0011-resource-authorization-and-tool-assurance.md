@@ -718,8 +718,10 @@ while they are open: each says what holds until it is answered.
   exposed outside development and test deployments until it is set.
 
   *Note added 2026-10-10 by [decision 0013](0013-registry-freshness-drift-and-withdrawal.md):*
-  the reach check runs in the drift pass. That record recommends every 300 s by default,
-  configurable from 5 s to 900 s, as the owner's own answer, given by accepting it.
+  the reach check runs in the drift pass, every 300 s by default, configurable from 5 s to
+  900 s. The owner set that interval on 2026-10-11, in accepting that record, so this question
+  no longer holds proxied entries back. The asks of IT and vendor administrators, below, still
+  do.
 - **Asks of IT and vendor administrators:** who creates and owns the gateway's narrow service
   accounts in Atlassian, Sumo Logic, MongoDB Atlas and AWS; agreement that changes to them go
   through the tool's approval; any administrative credential the reach check needs to read a
