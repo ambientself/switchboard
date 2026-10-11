@@ -2136,7 +2136,7 @@ MC = MOCK + "src/config.rs"
 MD = MOCK + "src/documents.rs"
 MJ = MOCK + "src/jwt.rs"
 mutate("mock-any-bearer-accepted", "every bearer is accepted", MS,
-       "                accepted: accepted.accepts(token),", "                accepted: true,")
+       "                    accepted: found.is_some(),", "                    accepted: true,")
 mutate("mock-no-bearer-accepted", "a request without a bearer is accepted", MS,
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: false,",
        "            None => Caller {\n                bearer_sha256: None,\n                accepted: true,")
@@ -2157,7 +2157,8 @@ mutate("mock-admin-put-refusal-skipped", "the admin endpoint changes the tools f
        '    let line = request_line("admin", &method, &uri, &caller);\n    if !caller.accepted {',
        '    let line = request_line("admin", &method, &uri, &caller);\n    if false {')
 mutate("mock-log-names-accepted-credential", "the log names the accepted credential, not the one received", MS,
-       "                bearer_sha256: Some(logged_prefix(&sha256(token))),", "                bearer_sha256: Some(accepted.logged_prefix()),")
+       "                    bearer_sha256: Some(logged_prefix(&sha256(token))),",
+       "                    bearer_sha256: found.map(AcceptedCredential::logged_prefix),")
 mutate("mock-log-full-digest", "the log carries the whole digest, not its prefix", MC, "    hex.truncate(LOGGED_PREFIX_HEX);\n", "")
 mutate("mock-protocol-version-unchecked", "any MCP-Protocol-Version header is accepted", MS,
        "        if !ACCEPTED_PROTOCOL_VERSIONS.contains(&version) {", "        if ACCEPTED_PROTOCOL_VERSIONS.is_empty() {")
@@ -2180,7 +2181,7 @@ mutate("mock-fail-doc-succeeds", "fail-doc answers with a result", MS,
        "            Some(Content::Fail) => Err(RpcError::new(", "            Some(Content::Fail) => Ok(text_result(String::new())).map_err(|_: RpcError| RpcError::new(")
 mutate("mock-huge-doc-half-size", "huge-doc answers with half a mebibyte", MS, '"x".repeat(HUGE_BYTES)', '"x".repeat(HUGE_BYTES / 2)')
 mutate("mock-two-credentials-take-the-file", "with both credential variables set, the file wins", MC,
-       "            (Some(path), None, None) => read_token_file", "            (Some(path), _, _) => read_token_file")
+       "            (Some(path), None, None) => vec![read_token_file", "            (Some(path), _, _) => vec![read_token_file")
 mutate("mock-token-file-not-trimmed", "the token file's trailing newline is part of the token", MC,
        "    let token = text.trim();", "    let token = text.as_str();")
 mutate("mock-tool-list-repeat-accepted", "MOCK_DOCS_TOOLS may name a tool twice", MOCK + "src/tools.rs",
@@ -2197,7 +2198,7 @@ mutate("mock-admin-repeat-accepted", "the admin endpoint may name a tool twice",
        "                if tools.contains(&tool) {", "                if false {")
 # The JWT mode (decision 0010).
 mutate("mock-docs-jwt-subject-unchecked", "any subject from the trusted issuer is accepted", MJ,
-       "            Some(subject) if subject == self.subject => Ok(subject.to_owned()),",
+       "            Some(subject) if self.subjects.contains_key(subject) => Ok(subject.to_owned()),",
        "            Some(subject) => Ok(subject.to_owned()),")
 mutate("mock-docs-jwt-audience-off", "a token for any audience is accepted", MJ,
        "        validation.set_audience(&[&self.audience]);", "        validation.validate_aud = false;")
@@ -2216,7 +2217,7 @@ mutate("mock-docs-jwt-logs-unverified-sub", "a refused token's claimed subject i
        "        ),")
 mutate("mock-docs-jwt-subject-before-audience", "the subject is checked before the issuer and audience", MJ,
        "        validation.set_audience(&[&self.audience]);",
-       "        validation.set_audience(&[&self.audience]);\n        validation.sub = Some(self.subject.clone());")
+       "        validation.set_audience(&[&self.audience]);\n        validation.sub = self.subjects.keys().next().cloned();")
 mutate("mock-docs-jwt-issuer-array", "an array of issuers that includes the trusted one is accepted", MJ,
        "        if claims.get(\"iss\").and_then(Value::as_str) != Some(self.issuer.as_str()) {", "        if false {")
 # Without aud required, jsonwebtoken 11 accepts a token with no aud. Dropping iss from the list
@@ -2249,6 +2250,31 @@ mutate("mock-docs-jwt-key-use-unchecked", "a key declared for encryption is acce
        "                .is_some_and(|key_use| *key_use != PublicKeyUse::Signature)", "                .is_some_and(|_| false)")
 mutate("mock-docs-jwt-duplicate-kid-accepted", "two keys with one kid are accepted, the last one kept", MJ,
        "            if keys.insert(kid.clone(), key).is_some() {", "            if keys.insert(kid.clone(), key).is_some() && false {")
+# Each caller limited to its projects (#11), and the admin changes to definitions and callers.
+mutate("mock-docs-project-limit-ignored", "a caller may name a project outside its list", MS,
+       "        let allowed = server.allows(&caller, project.as_ref().and_then(Value::as_str));",
+       "        let allowed = true;")
+mutate("mock-docs-forbidden-carries-jsonrpc", "the 403 for a project outside the list carries a JSON-RPC error", MS,
+       "            return StatusCode::FORBIDDEN.into_response();",
+       "            return rpc_error(StatusCode::FORBIDDEN, id, INVALID_PARAMS, \"project not allowed\");")
+mutate("mock-docs-subject-map-first-only", "MOCK_DOCS_JWT_SUBJECTS keeps only its first subject", MC,
+       "        .filter(|entry| !entry.is_empty())\n    {", "        .filter(|entry| !entry.is_empty())\n        .take(1)\n    {")
+mutate("mock-docs-subject-twice-accepted", "MOCK_DOCS_JWT_SUBJECTS may name a subject twice, the last one kept", MC,
+       "        if subjects.insert(subject.to_owned(), projects).is_some() {",
+       "        if subjects.insert(subject.to_owned(), projects).is_some() && false {")
+mutate("mock-docs-static-project-ignored", "a digest file's projects are read and then ignored", MC,
+       "                .limited_to(parse_projects(projects.trim()).map_err(ConfigError::DigestFile)?),",
+       "                .limited_to(parse_projects(projects.trim()).map_err(ConfigError::DigestFile).map(|_| Projects::Every)?),")
+mutate("mock-docs-digest-twice-accepted", "a digest file may give one digest twice", MC,
+       "        if accepted.iter().any(|other| other.logged_prefix() == prefix) {", "        if false {")
+mutate("mock-docs-unknown-project-accepted", "a project list may name a project the server does not hold", MC,
+       "        if !PROJECTS.contains(&project) {", "        if false {")
+mutate("mock-docs-definition-override-ignored", "tools/list serves the default description after an override", MS,
+       "            definition[\"description\"] = json!(description);", "            let _ = description;")
+mutate("mock-docs-admin-projects-ignored", "the admin endpoint answers a change to a caller's projects without making it", MS,
+       "    if !server.set_projects(&target, projects.clone()) {", "    if server.projects(&target).is_none() {")
+mutate("mock-docs-admin-change-refusal-skipped", "the admin changes to definitions and callers answer a caller they did not accept", MS,
+       "    if caller.accepted {\n        Some(line)", "    if true {\n        Some(line)")
 # Moving a dev-dependency into the server's own dependencies leaves Cargo.lock as it is.
 mutate_all(
     "mock-dependency-added",
