@@ -11,15 +11,23 @@
 //! it rather than passing a test the real store would fail.
 //!
 //! It covers the suite's items 1 to 3; of item 4, that a call row's time at begin comes from
-//! the store's clock and its deadline is that time plus the budgets and the call deadline; and
-//! of item 5, that a list row is stored complete with no deadline. That the store overwrites
-//! times an insert carries cannot be tried through [`AuditStore`], whose callers pass no times:
-//! the Postgres schema tests try it. The open-row query and receipts are not here: the query is
-//! Postgres's alone for now, and receipts are not built.
+//! the store's clock and its deadline is that time plus the budgets and the call deadline, as
+//! Postgres works it out; and of item 5, that a list row is stored complete with no deadline,
+//! with its time at begin from the store's clock, and is never completed. That the store
+//! overwrites times an insert carries cannot be tried through [`AuditStore`], whose callers
+//! pass no times: the Postgres schema tests try it. The open-row query and receipts are not
+//! here: the query is Postgres's alone for now, and receipts are not built.
 //!
-//! The functions read no clock but the store's, through [`ContractStore::now`], and spawn nothing, so they run on whatever executor the runner
-//! has: [`block_on`](crate::block_on) for the in-memory store, a Tokio runtime for Postgres.
-//! They are tests: a broken expectation panics, as an assertion does.
+//! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
+//! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
+//! any time at begin after 1999 so is the deadline it gives, and a runner cannot set the
+//! database's clock, so the two refusals look alike. A call record of kind `list` handed to
+//! begin is refused by the Postgres table, and the in-memory store still keeps it.
+//!
+//! The functions read no clock but the store's, through [`ContractStore::now`], and spawn
+//! nothing, so they run on whatever executor the runner has: [`block_on`](crate::block_on)
+//! for the in-memory store, a Tokio runtime for Postgres. They are tests: a broken
+//! expectation panics, as an assertion does.
 
 #![allow(
     clippy::expect_used,
@@ -57,8 +65,8 @@ pub trait ContractStore {
     fn store(&self) -> &dyn AuditStore;
 
     /// The row stored under `row`, read back as the store holds it, or `None` if it holds none.
-    /// As strict as the store allows: the whole record, its completion and kind, and whether
-    /// the store's time at begin and whether it set a deadline. A store that holds two rows under one
+    /// As strict as the store allows: the whole record, its completion and kind, its time at
+    /// begin, and whether the store set a deadline. A store that holds two rows under one
     /// identifier, which Postgres's primary key forbids, makes this panic.
     fn stored(&self, row: &AuditRowId) -> impl Future<Output = Option<StoredRow>>;
 
@@ -491,8 +499,9 @@ pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
         assert_eq!(contract.stored(&row).await, None, "{record:?}");
     }
 
-    let uppercase = row_start().row.as_str().to_uppercase();
-    for id in ["not-a-row", uppercase.as_str(), ""] {
+    // A UUID with uppercase hex letters, where a store wants lowercase.
+    let uppercase = "6F9619FF-8B86-4D01-B42D-00C04FC964FF";
+    for id in ["not-a-row", uppercase, ""] {
         let row = AuditRowId::new(id);
         let begun = store.begin(&row, &base).await;
         assert!(begun.is_err(), "the store accepted the identifier {id:?}");
