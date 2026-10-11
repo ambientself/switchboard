@@ -1323,6 +1323,44 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   own task until the deadline, an identical repeat finish accepted, column grants, and the
   report of each finish given up.
 
+**#11, proxy hardening.** One bullet per box of the issue, each saying what is built. The
+argument check is described in the next entry.
+
+- Approval binding (the first box): built (#51). Each approval records `binding_sha256` beside
+  `definition_sha256`. It covers the constant dialect `"2020-12"` and the server's identity,
+  address, credential mode and credential reference, in the canonical JSON
+  `gateway_registry::binding_sha256` documents. The loader recomputes both hashes from the file
+  at boot and on every reload and refuses a registry in which either differs, so a changed
+  server entry needs its tools approved again. A server's identity must equal its address's
+  host. The demo approvals hash what the mock server serves, and the demos' identity is its
+  Service name ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)).
+  The destination class and connector entries' fields join the binding when they exist.
+- Drift detection and withdrawal: not built.
+- Destination limits, the server's identity verified and redirects refused: not built.
+- Size limits, deadlines, bounded concurrency and per-team and per-server limits: not built.
+- Isolating a failing server: not built.
+- Upstream sessions isolated by server, credential identity and authorization context: not
+  built.
+- Identity and audit opt-outs unavailable outside development builds: not built.
+- The agreed metrics and alerts: not built, beyond each issuer's key age (#115).
+- The overload, hanging-server and drift demonstrations: not built.
+- Decision 0011, sections 1 to 5: schema validation before forwarding is built (next entry);
+  connector entries, the snapshot loader's rules and the scheduled reach check are not built.
+- The kind slice extended to show them: not built.
+- The registration and drift probe and the gateway's per-team identities: not built.
+- Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the
+  address's host, the dialect and no `+` in the registry's revision are built (#51, and #94 for
+  the dialect). The destination rules and the probe record are not built.
+- The drift pass, its derived revisions and standing withdrawals: not built.
+- The maximum policy age and the stale-policy refusal: not built.
+- The 3600 s cap on user issuers' token lifetime: not built.
+- `switchboard probe` and the token writer: not built.
+- Decision 0013 section 11's acceptance scenarios: not built.
+- The identity and audit opt-outs refused by the release binary, with CI checks: not built.
+- Configurable audit pools and the `max_connections` sizing rule: not built.
+- The 512 KiB row bound and its test: not built.
+- The decision 0014 signals other than each issuer's key age: not built.
+
 **#11, the argument check against the approved schema.** Built (#94): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
 another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
