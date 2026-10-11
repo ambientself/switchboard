@@ -282,8 +282,15 @@ keys for an issuer that is not configured are refused. There is no maximum age: 
 cannot be refreshed stay in force until a refresh succeeds. A bound on how old they may get
 before tokens are refused is a freshness bound, and Q11 owns it.
 
-This build fetches over plain HTTP only, so an `https` keys URL, which an `https` issuer needs,
-is refused at boot until #88 adds a TLS client. The demo deployments still use keys files.
+An `https` keys URL is fetched over TLS (#88), and needs `keys_ca_file`: a PEM bundle, read at
+boot, whose CAs are the only ones trusted. No roots are compiled in and none are read from the
+system: in Kubernetes the bundle is `kube-root-ca.crt`, and for a public issuer it is the image's
+own CA bundle. The certificate is verified against the keys URL's host, a DNS name or an IP
+address. The client is rustls with ring, passed to the client itself and never installed as the
+process default; it offers HTTP/1.1 only, and the deadline covers the TLS handshake. An issuer
+whose keys need a bearer token takes `keys_token_file`, read again on every fetch because the
+kubelet rotates projected tokens, and sent to the keys URL only. Both are refused beside an
+`http` keys URL. The demo deployments still use keys files.
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
