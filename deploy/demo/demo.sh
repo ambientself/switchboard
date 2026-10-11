@@ -831,10 +831,12 @@ operator_checks() {
 # operator_rbac: for each team's workload, that no RBAC rule bound to its ServiceAccount or its
 # groups grants a row of permissions.tsv, whatever its resourceNames. It reads the ClusterRoles,
 # the ClusterRoleBindings, and the Roles and RoleBindings in every namespace, and runs
-# rbac-match.jq for each team. Every namespace, not only mock-docs, the gateway's and the team's:
-# a RoleBinding in kube-system, in default or in the other team's namespace can bind the
-# workload or its groups too, and no can-i or review across the cluster counts it. A list that
-# cannot be read or parsed fails the step, and nothing is matched.
+# rbac-match.jq for each team. Every namespace, not only those a team's can-i checks ask in
+# (mock-docs, the gateway's, the team's own, and default for across the cluster): a RoleBinding
+# in kube-system or in the other team's namespace can bind the workload or its groups too, and
+# no can-i asks there. Where can-i does ask, in default among them, it still misses a rule
+# limited by resourceNames. A list that cannot be read or parsed fails the step, and nothing
+# is matched.
 operator_rbac() {
   local lists what list team verdicts verdict row detail status
   lists=$(mktemp)
