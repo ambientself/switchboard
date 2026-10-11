@@ -31,8 +31,9 @@
 //!   caller's projects while the server runs, to play a reach that changes.
 //! - **The admin endpoint.** With an admin credential ([`Config::admin`]) it answers only that
 //!   bearer, and no caller's, so no caller can widen its own projects or change a definition.
-//!   A bearer that `POST /mcp` would accept is refused there even if its digest is the admin
-//!   credential's, since in the JWT mode no check at start can rule that out.
+//!   A caller's token is refused there even if its digest is the admin credential's, since in
+//!   the JWT mode no check at start can rule that out; in that mode, so is a caller's token
+//!   that has expired or is not yet valid.
 //!   Without one it answers the callers, and the binary refuses to serve it anywhere but on
 //!   loopback, where no caller can reach it.
 //! - **A log line per request.** Each line is a JSON object on standard output with

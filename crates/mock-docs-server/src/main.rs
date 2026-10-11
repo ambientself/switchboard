@@ -21,8 +21,8 @@
 //!   credential. The admin endpoint then answers only that bearer, and no caller's. It must
 //!   differ from every caller's, and needs `MOCK_DOCS_ADMIN_LISTEN`. The static mode checks
 //!   that at start. The JWT mode cannot, since a caller's token is not known in advance: it
-//!   refuses, on each admin request, a bearer that verifies as a caller's, and the boot line
-//!   says so with `"admin_separation": "per_request"`.
+//!   refuses, on each admin request, a bearer signed by a trusted key, even one expired or not
+//!   yet valid, and the boot line says so with `"admin_separation": "per_request"`.
 //! - `MOCK_DOCS_TOOLS`: the tools offered at start, comma-separated, default
 //!   `list_documents,read_document`. Empty, it offers none.
 //! - `MOCK_DOCS_SLOW_MS`: how long `slow-doc` takes, default 10000.

@@ -603,22 +603,48 @@ async fn with_an_admin_credential_a_subject_cannot_widen_its_projects() {
 
 /// A caller's token whose digest is the admin credential is still refused on the admin
 /// endpoint. Nothing at start can tell a JWT's digest from the admin credential's, so the
-/// separation is checked on each admin request (#137).
+/// separation is checked on each admin request (#137). It holds once the token has expired,
+/// and before its `nbf`, when `POST /mcp` refuses it too.
 #[tokio::test]
 async fn a_caller_token_with_the_admin_credentials_digest_is_refused_on_the_admin_endpoint() {
-    let jwks_file = file("caller-is-admin", "jwks.json", &jwks());
+    let cases = [
+        (
+            "valid",
+            claims_with(json!({"sub": ATLAS_SUBJECT})),
+            StatusCode::OK,
+        ),
+        (
+            "expired",
+            claims_with(json!({"sub": ATLAS_SUBJECT, "exp": now() - 3600})),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "not-yet-valid",
+            claims_with(json!({"sub": ATLAS_SUBJECT, "nbf": now() + 3600})),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (case, claims, on_mcp) in cases {
+        caller_token_is_refused_as_admin(case, &token(&claims), on_mcp).await;
+    }
+}
+
+/// Starts a server whose admin credential is `caller_token`'s digest, and checks that the
+/// token changes nothing there. `on_mcp` is what `POST /mcp` answers it.
+async fn caller_token_is_refused_as_admin(case: &str, caller_token: &str, on_mcp: StatusCode) {
+    let test = format!("caller-is-admin-{case}");
+    let jwks_file = file(&test, "jwks.json", &jwks());
     let mut vars = jwt_vars(jwks_file.to_str().unwrap());
     vars.remove("MOCK_DOCS_JWT_SUBJECT");
     vars.insert(
         "MOCK_DOCS_JWT_SUBJECTS".to_owned(),
         format!("{ATLAS_SUBJECT}=atlas;{BOREALIS_SUBJECT}=borealis"),
     );
-    let caller_token = token(&claims_with(json!({"sub": ATLAS_SUBJECT})));
     let digest: String = Sha256::digest(caller_token.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let admin_file = file("caller-is-admin", "admin-sha256", &digest);
+    let admin_file = file(&test, "admin-sha256", &digest);
     vars.insert(
         "MOCK_DOCS_ADMIN_TOKEN_SHA256_FILE".to_owned(),
         admin_file.to_str().unwrap().to_owned(),
@@ -649,32 +675,38 @@ async fn a_caller_token_with_the_admin_credentials_digest_is_refused_on_the_admi
     ];
     let count = requests.len();
     for request in requests {
-        let response = request.bearer_auth(&caller_token).send().await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = request.bearer_auth(caller_token).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
     }
     let admin_lines: Vec<Value> = server
         .log_lines()
         .into_iter()
         .filter(|line| line["event"] == "admin")
         .collect();
-    assert_eq!(admin_lines.len(), count, "{admin_lines:?}");
+    assert_eq!(admin_lines.len(), count, "{case}: {admin_lines:?}");
     for line in &admin_lines {
-        assert_eq!(line["bearer_sha256"], prefix(&caller_token), "{line}");
-        assert_eq!(line["accepted"], false, "{line}");
+        assert_eq!(
+            line["bearer_sha256"],
+            prefix(caller_token),
+            "{case}: {line}"
+        );
+        assert_eq!(line["accepted"], false, "{case}: {line}");
     }
 
-    // Nothing changed, and the token is still a caller on the MCP endpoint, limited as before.
-    assert_eq!(server.server().tools().len(), 2);
+    // Nothing changed, and the MCP endpoint answers the token as before: each subject is
+    // limited to its own project.
+    assert_eq!(server.server().tools().len(), 2, "{case}");
     for (subject, other) in [(ATLAS_SUBJECT, "borealis"), (BOREALIS_SUBJECT, "atlas")] {
         assert_eq!(
             list_project(&server, subject, other).await.status(),
             StatusCode::FORBIDDEN,
-            "{subject}"
+            "{case}: {subject}"
         );
     }
     assert_eq!(
-        list(&server, Some(&caller_token)).await.status(),
-        StatusCode::OK
+        list(&server, Some(caller_token)).await.status(),
+        on_mcp,
+        "{case}"
     );
 }
 
