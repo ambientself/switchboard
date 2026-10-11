@@ -938,18 +938,26 @@ fn list_records() -> Vec<ListRecord> {
 }
 
 /// A list row is stored exactly as the list record, of kind `list`, complete: with a time at
-/// begin, no completion and no deadline. A second list under its identifier returns `Ok` and
-/// changes nothing, whatever it records. A begin under a list row's identifier, and a list under
-/// a call row's, are refused, and the stored row stands.
+/// begin from the store's clock, no completion and no deadline. A second list under its
+/// identifier returns `Ok` and changes nothing, whatever it records. A begin under a list row's
+/// identifier, and a list under a call row's, are refused, and the stored row stands. A finish
+/// naming a list row is refused as `complete_once` refuses it, as a listing, and the row stands.
 pub async fn a_list_row_is_stored_complete_with_no_deadline(contract: &impl ContractStore) {
     let store = contract.store();
     let fixture = fixture();
     let records = list_records();
     for (position, written) in records.iter().enumerate() {
         let row = row_start().row;
+        let before = contract.now().await;
         store.list(&row, written).await.expect("list");
+        let after = contract.now().await;
         let first = stored(contract, &row).await;
-        assert!(first.begun_at.is_some(), "{first:?}");
+        let begun_at = first.begun_at.expect("the list row has no time at begin");
+        assert!(
+            before <= begun_at && begun_at <= after,
+            "the list row's time at begin is not from the store's clock: {begun_at:?} is not \
+             between {before:?} and {after:?}"
+        );
         let expected = StoredRow {
             record: StoredRecord::List(written.clone()),
             kind: RowKind::List,
@@ -992,4 +1000,23 @@ pub async fn a_list_row_is_stored_complete_with_no_deadline(contract: &impl Cont
         "a list was written under a call row's identifier"
     );
     assert_eq!(stored(contract, &start.row).await, call);
+
+    // A guard for an identifier the store then lists under. The store refuses a begin under a
+    // list row's identifier, so the guard is begun on another store, which only hands it out.
+    let start = row_start();
+    let guard = guard(&InMemoryAuditStore::new(), &fixture, &start, &ALLOWED).await;
+    store.list(&start.row, &records[0]).await.expect("list");
+    let listed = stored(contract, &start.row).await;
+    let ran = audit::run(&connector(), guard).await;
+    let failure = audit::finish(store, ran, 7)
+        .await
+        .failure()
+        .expect("a list row was completed")
+        .to_string();
+    // complete_once's words: the row is there, and records a listing.
+    assert!(
+        failure.contains("records a listing"),
+        "a finish naming a list row was refused for another reason: {failure}"
+    );
+    assert_eq!(stored(contract, &start.row).await, listed);
 }
