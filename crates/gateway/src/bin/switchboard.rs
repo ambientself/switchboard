@@ -15,7 +15,9 @@
 //! stale, readiness fails and tools are refused (see [`gateway::reload`]). The release build
 //! refuses the identity and audit opt-outs before it connects to anything (see
 //! [`gateway::start`]). Each keys URL is fetched again every `keys_refresh_seconds` (see
-//! [`gateway::keys`]). Both stop when the gateway shuts down. Requests in flight, and calls in
+//! [`gateway::keys`]). Each proxied server's tool list is read once before the listener is bound
+//! and again every `drift.interval_seconds`, and a tool that no longer matches its approval is
+//! withdrawn (see [`gateway::drift`]). All three stop when the gateway shuts down. Requests in flight, and calls in
 //! flight to each proxied server and from each team, are capped as `[limits]` says (see
 //! [`gateway::deployment`] and [`gateway::bulkhead`]). Logs go to standard output as JSON lines; a refusal to start goes to standard
 //! error as well, as plain text. Shutting down waits for the answers still running, and for the
@@ -150,17 +152,20 @@ async fn serve(config: PathBuf) -> ExitCode {
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let freshness = prepared.gates.freshness().clone();
     let proxied = prepared.proxied.clone();
+    let drift = prepared.drift.signals();
     let metrics = metrics_listener.map(|listener| {
         let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
             .with_issuer_keys(prepared.keys.ages());
         let metrics = metrics.with_policy(freshness);
         let metrics = metrics.with_proxied(proxied);
+        let metrics = metrics.with_drift(drift);
         tokio::spawn(serve_metrics(listener, metrics, async {
             let _ = metrics_stopped.await;
         }))
     });
     let watching = tokio::spawn(prepared.watch.run());
     let refreshing = tokio::spawn(prepared.keys.run());
+    let drifting = tokio::spawn(prepared.drift.run());
     let served = serve_with_telemetry(
         listener,
         prepared.gates,
@@ -173,6 +178,7 @@ async fn serve(config: PathBuf) -> ExitCode {
     .await;
     watching.abort();
     refreshing.abort();
+    drifting.abort();
     if let Some(store) = &prepared.store {
         finish_rows(store).await;
     }

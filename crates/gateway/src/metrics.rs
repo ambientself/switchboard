@@ -30,6 +30,13 @@
 //!     audit store's buckets;
 //!   - `switchboard_proxied_late_or_oversized_total{server}`, the calls that were an error of
 //!     the kind `oversized_or_late_read`: a `read` tool's answer too large or not in time.
+//! - With the drift pass, from its [`DriftSignals`], labelled `server` with each proxied
+//!   server's name in the registry (decision 0013, section 5):
+//!   - `switchboard_drift_polls_total{server,result}`, each read of the server's tool list,
+//!     `result` one of `ok` and `failed`. A failed poll keeps the server's tools served;
+//!   - `switchboard_drift_withdrawals_total{server}`, the tools withdrawn from the server;
+//!   - `switchboard_tools_withdrawn`, how many tools are withdrawn now. It falls when a reload
+//!     clears a withdrawal, and is 0 again after a restart.
 //! - With the registry's policy, from its [`Freshness`]: `switchboard_policy_age_seconds`, the
 //!   seconds since the registry file was last read successfully, and
 //!   `switchboard_policy_max_age_seconds`, the age past which the policy is stale (decision
@@ -104,6 +111,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::bulkhead::{ProxiedSignals, ServerCounts};
+use crate::drift::{DriftCounts, DriftSignals};
 use crate::keys::KeyAges;
 use crate::reload::Freshness;
 use crate::server::{HEADER_READ_TIMEOUT, accept_failed};
@@ -127,6 +135,7 @@ pub struct Metrics {
     issuer_keys: KeyAges,
     policy: Option<Freshness>,
     proxied: ProxiedSignals,
+    drift: Option<DriftSignals>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -137,6 +146,7 @@ impl std::fmt::Debug for Metrics {
             .field("issuer_keys", &self.issuer_keys)
             .field("policy", &self.policy)
             .field("proxied", &self.proxied)
+            .field("drift", &self.drift)
             .finish()
     }
 }
@@ -164,7 +174,15 @@ impl Metrics {
             issuer_keys: KeyAges::default(),
             policy: None,
             proxied: ProxiedSignals::default(),
+            drift: None,
         }
+    }
+
+    /// The same metrics, with the drift pass's counts, which
+    /// [`DriftPass::signals`](crate::drift::DriftPass::signals) gives.
+    pub fn with_drift(mut self, drift: DriftSignals) -> Self {
+        self.drift = Some(drift);
+        self
     }
 
     /// The same metrics, with what each proxied server's bulkhead counts, which
@@ -194,6 +212,9 @@ impl Metrics {
         let counts = self.telemetry.counts();
         telemetry_signals(&mut text, &counts);
         proxied_signals(&mut text, counts.calls_shed, &self.proxied.counts());
+        if let Some(drift) = &self.drift {
+            drift_signals(&mut text, &drift.counts(), drift.withdrawn());
+        }
         if let Some(freshness) = &self.policy {
             policy_signals(&mut text, freshness);
         }
@@ -412,6 +433,43 @@ fn proxied_signals(text: &mut Text, instance_shed: u64, servers: &[(ConnectorNam
             counts.late_or_oversized,
         );
     }
+}
+
+fn drift_signals(text: &mut Text, servers: &[(ConnectorName, DriftCounts)], withdrawn: u64) {
+    text.family(
+        "switchboard_drift_polls_total",
+        "counter",
+        "Reads of each proxied server's tool list by the drift pass, by result. A failed read \
+         keeps the server's tools served.",
+    );
+    for (server, counts) in servers {
+        for (result, count) in [("ok", counts.polls_ok), ("failed", counts.polls_failed)] {
+            text.sample(
+                "switchboard_drift_polls_total",
+                &[("server", server.as_str()), ("result", result)],
+                count,
+            );
+        }
+    }
+    text.family(
+        "switchboard_drift_withdrawals_total",
+        "counter",
+        "Tools the drift pass withdrew from each proxied server, because the server no longer \
+         served their approved definition or no longer listed them.",
+    );
+    for (server, counts) in servers {
+        text.sample(
+            "switchboard_drift_withdrawals_total",
+            &[("server", server.as_str())],
+            counts.withdrawals,
+        );
+    }
+    text.single(
+        "switchboard_tools_withdrawn",
+        "gauge",
+        "Tools withdrawn now in this replica, until they are approved again or it restarts.",
+        withdrawn,
+    );
 }
 
 fn policy_signals(text: &mut Text, freshness: &Freshness) {
