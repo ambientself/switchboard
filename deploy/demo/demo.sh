@@ -28,9 +28,10 @@
 #     `"identity":"enforce"` and `"audit":"postgres"`, and one `"event":"identity_failed"` line
 #     per caller refused for identity;
 #   - mock-docs' JSON log lines (crates/mock-docs-server): one per request, with
-#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, and `accepted`. In kind
-#     the server runs in its JWT mode, and each line also has `caller`, the verified subject of
-#     an accepted token, and `refusal`, why a token was refused;
+#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, and `accepted`, and for
+#     a tools/call its `rpc_method`, `project` and, if the server refused the project,
+#     `refused`. In kind the server runs in its JWT mode, and each line also has `caller`, the
+#     verified subject of an accepted token, and `refusal`, why a token was refused;
 #   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
 #     switchboard_reader;
 #   - the gateway's GET /metrics, Prometheus text on its own listener (crates/gateway,
@@ -59,15 +60,22 @@ IMG_RUN=$IMG
 POSTGRES_IMAGE=postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
 COMPOSE_FILE=$ROOT/deploy/compose/compose.yaml
 KIND_ISSUER=https://kubernetes.default.svc.cluster.local
-# The gateway's ServiceAccount: the one caller mock-docs accepts in kind (deploy/kind/base).
-KIND_GATEWAY_SUBJECT=system:serviceaccount:switchboard:gateway
+# The mock server is registered once per team (deploy/*/config/registry): each team's entry is
+# docs-<team>, which names its surface and the first part of its tools' names, and the gateway
+# presents that entry's own credential on the team's calls. In kind each entry's identity is its
+# ServiceAccount, whose token the gateway pod's token writer gets (deploy/kind/base); these are
+# the only callers mock-docs accepts there. In Compose it is the entry's dummy credential.
+KIND_ENTRY_SUBJECTS="system:serviceaccount:switchboard:docs-team-a system:serviceaccount:switchboard:docs-team-b"
+COMPOSE_CREDENTIALS=$ROOT/deploy/compose/dummy-credentials
+# The registries' revision, and the Compose withdrawal's (registry-withdrawn.toml).
+REVISION=demo-3
+WITHDRAWN_REVISION=demo-4
 AUDIT_TABLE=switchboard_audit.call_rows
 # The open-row query's view (crates/audit-postgres, sql/migrations/0005_open_rows.sql).
 OPEN_ROWS_VIEW=switchboard_audit.open_call_rows
-READ_TOOL=docs__read_document
-LIST_TOOL=docs__list_documents
-# The gateway's surface as the workloads reach it in kind (deploy/kind/base/workloads.yaml).
-KIND_GATEWAY_URL=http://gateway.switchboard.svc.cluster.local:8080/mcp/docs
+# The gateway's surfaces as the workloads reach them in kind, each at $KIND_GATEWAY_URL/<entry>
+# (deploy/kind/base/workloads.yaml).
+KIND_GATEWAY_URL=http://gateway.switchboard.svc.cluster.local:8080/mcp
 # The route check (decision 0010): its operator step, the routes its probe tries in kind, and the
 # one list of permissions that it and the operator checks ask about. The step runs as the
 # ServiceAccount of deploy/kind/route-check/rbac.yaml, with that access and no more.
@@ -100,6 +108,10 @@ GATEWAY_POD=""
 FETCHED=""
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
+# team_entry TEAM: TEAM's entry of the mock server, its surface. team_project TEAM: the project
+# TEAM may read.
+team_entry() { echo "docs-$1"; }
+team_project() { case $1 in team-a) echo atlas ;; team-b) echo borealis ;; esac; }
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 step() {
@@ -296,15 +308,19 @@ check_row_resources() {
 # check_list_rows ROWS EXPECTED: the rows of kind `list` are the workloads' tools/list calls,
 # exactly EXPECTED of them: one per tools/list a workload made (decision 0009). An identity
 # failure writes no row, so a refused caller's list leaves none. Each list row was made by
-# team-a or team-b and names the tools that caller was shown under the row's policy revision:
-# both tools under demo-1, and only $LIST_TOOL under demo-2, after $READ_TOOL is withdrawn.
-# None is left out. ROWS is what row_resources_json prints.
+# team-a or team-b and names the tools that caller was shown on its own surface under the row's
+# policy revision: its own entry's two tools under $REVISION, and only its list tool under
+# $WITHDRAWN_REVISION, after each team's read tool is withdrawn. None is left out. ROWS is what
+# row_resources_json prints.
 check_list_rows() {
   local rows=$1 expected=$2 lists wrong
   # shellcheck disable=SC2016 # jq's own variables
   if ! lists=$(printf '%s' "$rows" | jq -e '[.[] | select(.kind == "list")] | length') \
-    || ! wrong=$(printf '%s' "$rows" | jq -c --arg list "$LIST_TOOL" --arg read "$READ_TOOL" '
-        def shown: {"demo-1": [$list, $read], "demo-2": [$list]}[.revision // ""];
+    || ! wrong=$(printf '%s' "$rows" | jq -c --arg revision "$REVISION" --arg withdrawn "$WITHDRAWN_REVISION" '
+        def entry: {"team-a": "docs-team-a", "team-b": "docs-team-b"}[.team // ""];
+        def shown: if entry == null then null
+          else {($revision): [entry + "__list_documents", entry + "__read_document"],
+                ($withdrawn): [entry + "__list_documents"]}[.revision // ""] end;
         .[] | select(.kind == "list")
         | select(((.team == "team-a" or .team == "team-b")
             and shown != null and (.listed | type) == "array"
@@ -339,13 +355,14 @@ audit_rows() {
                                          else '[]'::jsonb end) as r), resources #>> '{}') as resources,
       decision, reason, outcome, latency_ms as ms, policy_revision as rev
     from $AUDIT_TABLE where begun_at >= to_timestamp($SINCE) order by begun_at"
-  local team own other
+  local team own other read
   for team in team-a team-b; do
     if [ "$team" = team-a ]; then own=atlas other=borealis; else own=borealis other=atlas; fi
-    check_at_least "$(audit_count "proved_team = '$team' and tool = '$READ_TOOL' and decision = 'allow'
+    read=$(team_entry "$team")__read_document
+    check_at_least "$(audit_count "proved_team = '$team' and tool = '$read' and decision = 'allow'
         and outcome = 'ok' and resources = '$(project_json "$own")'::jsonb")" 1 \
       "audit: $team's read of $own is an allow row naming $own, with outcome ok"
-    check_at_least "$(audit_count "proved_team = '$team' and tool = '$READ_TOOL' and decision = 'deny'
+    check_at_least "$(audit_count "proved_team = '$team' and tool = '$read' and decision = 'deny'
         and reason = 'resource_outside_limit' and resources = '$(project_json "$other")'::jsonb
         and sentence like '%\`$other\`%'")" 1 \
       "audit: $team's read of $other is a deny row naming $other and the resource limit"
@@ -433,55 +450,98 @@ check_metrics() {
   fi
 }
 
-# check_server_bearers LOGS SHA256 CALLS SCOPE: what mock-docs received this run. Every request it
-# accepted carried the gateway's credential, which is SHA256; with SCOPE=all, so did every request
+# check_server_bearers LOGS SHA256S CALLS SCOPE: what mock-docs received this run. Every request
+# it accepted carried one of the gateway's credentials, one for each entry of mock-docs in the
+# registry, whose SHA-256s are the space-separated SHA256S; with SCOPE=all, so did every request
 # carrying any bearer. CALLS is exactly how many calls the gateway allowed so far: one more means
 # a call it denied reached the server, one fewer that an allowed call did not, or that the log is
-# short. Requests with no bearer (the health checks) are not counted.
+# short. Requests with no bearer (the health checks) are not counted. check_server_entries checks
+# that each team's calls carried its own entry's credential.
 check_server_bearers() {
-  local logs=$1 sha=$2 calls=$3 scope=$4 lines
+  local logs=$1 shas=$2 calls=$3 scope=$4 lines sha shown=""
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.bearer_sha256 != null)
     | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256)"')
-  echo "    requests seen by mock-docs, by answer and bearer sha256 prefix (the gateway's is ${sha:0:12}...):"
+  for sha in $shas; do shown="$shown ${sha:0:12}..."; done
+  echo "    requests seen by mock-docs, by answer and bearer sha256 prefix (the gateway's are$shown):"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
-  local good bad stray
-  good=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "accepted" && length($2) >= 8 && index(sha, $2) == 1 { n++ } END { print n + 0 }')
-  bad=$(printf '%s\n' "$lines" | awk -v sha="$sha" '$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
-  stray=$(printf '%s\n' "$lines" | awk -v sha="$sha" 'NF == 2 && !(length($2) >= 8 && index(sha, $2) == 1) { n++ } END { print n + 0 }')
-  check "$good" "$calls" "mock-docs accepted the gateway's credential on exactly the $calls calls the gateway allowed"
+  local good bad stray ours
+  # shellcheck disable=SC2016 # awk's own variables
+  ours='function ours(prefix,  n, i, sha) {
+      n = split(shas, sha, " ")
+      for (i = 1; i <= n; i++) if (length(prefix) >= 8 && index(sha[i], prefix) == 1) return 1
+      return 0
+    }'
+  good=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && ours($2) { count++ } END { print count + 0 }')
+  bad=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && !ours($2) { count++ } END { print count + 0 }')
+  stray=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'NF == 2 && !ours($2) { count++ } END { print count + 0 }')
+  check "$good" "$calls" "mock-docs accepted the gateway's credentials on exactly the $calls calls the gateway allowed"
   check "$bad" 0 "mock-docs accepted no other bearer"
   if [ "$scope" = all ]; then
     check "$stray" 0 "mock-docs never received any bearer but the gateway's"
   fi
 }
 
-# check_server_callers LOGS SUBJECT CALLS REFUSALS PROBES: what mock-docs received this run in its
-# JWT mode, where each log line names the verified caller of an accepted token, or why a token
-# was refused. Every request it accepted came from SUBJECT, the gateway's ServiceAccount, and
-# CALLS is exactly how many calls the gateway allowed so far: one more means a call it denied
-# reached the server, one fewer that an allowed call did not, or that the log is short. A request
-# accepted with any other caller, or with none (a static token), fails the check. Exactly
+# check_server_callers LOGS SUBJECTS CALLS REFUSALS PROBES: what mock-docs received this run in
+# its JWT mode, where each log line names the verified caller of an accepted token, or why a token
+# was refused. Every request it accepted came from one of SUBJECTS, space-separated: the
+# ServiceAccounts of mock-docs' entries in the registry, whose tokens the gateway presents. CALLS
+# is exactly how many calls the gateway allowed so far: one more means a call it denied reached
+# the server, one fewer that an allowed call did not, or that the log is short. A request
+# accepted with any other caller, or with none (a static token), fails the check.
+# check_server_entries checks that each team's calls came under its own entry's. Exactly
 # REFUSALS requests were refused as wrong_audience: a token the cluster signed for another
 # audience, the workloads' own on their direct calls before the policy. Exactly PROBES were
 # refused as no_bearer: the route check's probe before the policy, which sends no credential,
 # one request per attempt it found open. Any other refusal fails.
 check_server_callers() {
-  local logs=$1 subject=$2 calls=$3 refusals=$4 probes=$5 lines
+  local logs=$1 subjects=$2 calls=$3 refusals=$4 probes=$5 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
     | if .accepted == true then "accepted \(.caller // "none")" else "refused \(.refusal // "none")" end')
   echo "    requests seen by mock-docs, by answer and verified caller or refusal:"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
   local gateway other audience bearerless refused
-  gateway=$(printf '%s\n' "$lines" | awk -v subject="$subject" '$1 == "accepted" && $2 == subject && NF == 2 { n++ } END { print n + 0 }')
-  other=$(printf '%s\n' "$lines" | awk -v subject="$subject" '$1 == "accepted" && !($2 == subject && NF == 2) { n++ } END { print n + 0 }')
+  # shellcheck disable=SC2016 # awk's own variables
+  local ours='BEGIN { n = split(subjects, list, " "); for (i = 1; i <= n; i++) entry[list[i]] = 1 }
+    '
+  gateway=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && ($2 in entry) && NF == 2 { count++ } END { print count + 0 }')
+  other=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && !(($2 in entry) && NF == 2) { count++ } END { print count + 0 }')
   audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
   bearerless=$(printf '%s\n' "$lines" | awk '$0 == "refused no_bearer" { n++ } END { print n + 0 }')
   refused=$(printf '%s\n' "$lines" | awk '$1 == "refused" { n++ } END { print n + 0 }')
-  check "$gateway" "$calls" "mock-docs accepted the gateway's own token ($subject) on exactly the $calls calls the gateway allowed"
+  check "$gateway" "$calls" "mock-docs accepted the entries' tokens ($subjects) on exactly the $calls calls the gateway allowed"
   check "$other" 0 "mock-docs accepted no other caller, and no token without one"
   check "$audience" "$refusals" "mock-docs refused the $refusals direct calls' tokens as meant for another audience"
   check "$bearerless" "$probes" "mock-docs refused the route check's $probes open attempts before the policy, which carried no bearer"
   check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"
+}
+
+# check_server_entries LOGS CALLS WHO...: each team's calls reached mock-docs under its own
+# entry's identity, and only for its own project. Each WHO is TEAM=IDENTITY, the identity of
+# TEAM's entry as mock-docs logs it: in kind the entry's ServiceAccount, the verified `caller`; in
+# Compose the SHA-256 of the entry's credential, whose prefix is logged as `bearer_sha256`. Of
+# the tools/call requests mock-docs accepted, exactly CALLS came under each team's identity, and
+# each of those named the team's own project and was answered: none named another project, which
+# mock-docs refuses for that identity.
+check_server_entries() {
+  local logs=$1 calls=$2 who team identity own lines mine other
+  shift 2
+  lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.accepted == true and .rpc_method == "tools/call")
+    | "\(.caller // .bearer_sha256 // "none") \(.project // "none" | tostring | gsub(" "; "_")) \(if has("refused") then "refused" else "answered" end)"')
+  echo "    tools/call requests mock-docs accepted, by identity, project and answer:"
+  printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
+  # shellcheck disable=SC2016 # awk's own variables
+  local under='function under(logged) {
+      if (length(identity) == 64 && identity !~ /[^0-9a-f]/) return length(logged) >= 8 && index(identity, logged) == 1
+      return logged == identity
+    }'
+  for who in "$@"; do
+    team=${who%%=*} identity=${who#*=}
+    own=$(team_project "$team")
+    mine=$(printf '%s\n' "$lines" | awk -v identity="$identity" -v own="$own" "$under"'under($1) && $2 == own && $3 == "answered" { count++ } END { print count + 0 }')
+    other=$(printf '%s\n' "$lines" | awk -v identity="$identity" -v own="$own" "$under"'NF == 3 && under($1) && !($2 == own && $3 == "answered") { count++ } END { print count + 0 }')
+    check "$mine" "$calls" "mock-docs answered $team's $calls allowed calls under $team's own entry's identity, each for $own"
+    check "$other" 0 "no call under $team's entry's identity named another project"
+  done
 }
 
 # --- Compose --------------------------------------------------------------------------------
@@ -543,11 +603,14 @@ compose_run() {
   compose_workload "team-a workload" full team-a
   compose_workload "team-b workload" full team-b
 
-  step "the server never saw a workload token, and no denied call reached it"
+  step "the server never saw a workload token, no denied call reached it, and each team's calls carried its own entry's credential"
   # Each team's full run is allowed two calls, its list and its read; its other calls are denied.
+  local sha_a sha_b
+  sha_a=$(cat "$COMPOSE_CREDENTIALS/docs-team-a-credential.sha256")
+  sha_b=$(cat "$COMPOSE_CREDENTIALS/docs-team-b-credential.sha256")
   if fetch "mock-docs' log" mock_docs_log; then
-    check_server_bearers "$FETCHED" \
-      "$(cat "$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256")" 4 all
+    check_server_bearers "$FETCHED" "$sha_a $sha_b" 4 all
+    check_server_entries "$FETCHED" 2 "team-a=$sha_a" "team-b=$sha_b"
   fi
 
   step "database unavailable: the call is refused and nothing runs"
@@ -564,16 +627,16 @@ compose_run() {
   # An insert the pause held commits as soon as the server runs again, well within 2 s.
   OUTAGE_TO=$(psql_superuser -Atc "select extract(epoch from now() + interval '2 seconds')")
 
-  step "withdraw $READ_TOOL from the registry (the gateway polls every 2 s)"
+  step "withdraw each team's read tool from the registry (the gateway polls every 2 s)"
   swap_registry "$ROOT/deploy/compose/config/registry-withdrawn.toml"
   sleep 4
   compose_workload "after the withdrawal" withdrawn team-a
   swap_registry "$ROOT/deploy/compose/config/registry/registry.toml"
   # The gateway no longer knows the tool, so no adapter read the call: its resources are
   # unknown, not none.
-  check_at_least "$(audit_count "tool = '$READ_TOOL' and decision = 'deny' and policy_revision = 'demo-2'
-      and reason = 'unknown_tool' and resources = '\"unknown\"'::jsonb")" 1 \
-    "audit: the call to the withdrawn tool is a deny row under revision demo-2, its resources unknown"
+  check_at_least "$(audit_count "tool = '$(team_entry team-a)__read_document' and decision = 'deny'
+      and policy_revision = '$WITHDRAWN_REVISION' and reason = 'unknown_tool' and resources = '\"unknown\"'::jsonb")" 1 \
+    "audit: the call to the withdrawn tool is a deny row under revision $WITHDRAWN_REVISION, its resources unknown"
   # Let the gateway load the restored registry before anything else runs against it.
   sleep 4
 
@@ -674,7 +737,7 @@ route_check() {
   if output=$("$ROUTE_CHECK" --kubeconfig "$KCFG" --context "kind-$CLUSTER" --as "$ROUTE_CHECK_OPERATOR" \
       --namespace "$ns" --selector "app=mock-workload,job-name=$job" --gateway-ns switchboard \
       --server-ns mock-docs --server-service mock-docs/mock-docs --server-audience mock-docs \
-      --routes "$ROUTE_CHECK_ROUTES" --gateway-url "$KIND_GATEWAY_URL" --expect "$expect" \
+      --routes "$ROUTE_CHECK_ROUTES" --gateway-url "$KIND_GATEWAY_URL/$(team_entry "$ns")" --expect "$expect" \
       --probe-image "$IMG_RUN" --report "$ROUTE_REPORT" --environment "first slice, kind" 2>&1); then
     status=0
   else
@@ -895,6 +958,22 @@ operator_ask() {
     *) args+=(-n "$where") ;;
   esac
   can_i_no "$team" "${args[@]}"
+}
+
+# token_grants: what ServiceAccount gateway may do with ServiceAccount tokens, the grant its
+# pod's token writer uses (deploy/kind/base/gateway-tokens.yaml): create them for docs-team-a and
+# docs-team-b, named, and for no other ServiceAccount, its own and a workload's among them, nor
+# without a name.
+token_grants() {
+  local gateway=system:serviceaccount:switchboard:gateway entry answer
+  for entry in docs-team-a docs-team-b; do
+    answer=$(k auth can-i create "serviceaccounts/$entry" --subresource=token -n switchboard --as="$gateway" 2>&1) || true
+    check "${answer##*$'\n'}" yes "the gateway may create tokens for $entry"
+  done
+  can_i_no_as "$gateway" "the gateway" create serviceaccounts/gateway --subresource=token -n switchboard
+  can_i_no_as "$gateway" "the gateway" create serviceaccounts/migrate --subresource=token -n switchboard
+  can_i_no_as "$gateway" "the gateway" create serviceaccounts --subresource=token -n switchboard
+  can_i_no_as "$gateway" "the gateway" create serviceaccounts/mock-workload --subresource=token -n team-a
 }
 
 # before_policy_probes: before the network policy, a new pod of each team calls mock-docs
@@ -1130,12 +1209,16 @@ kind_run() {
   step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
   route_checks_after_policy
 
+  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a and docs-team-b, and for no other ServiceAccount"
+  token_grants
+
   step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets or configuration; and no RBAC rule bound to either grants any of these, whatever its resourceNames"
   operator_checks
 
-  step "mock-docs accepted only the gateway's own identity, and no denied call reached it"
-  # Every request the server accepted carried the gateway's projected token, for audience
-  # mock-docs, and named its ServiceAccount. Each team is allowed four calls, so 2 x 4 = 8:
+  step "mock-docs accepted only the entries' identities, no denied call reached it, and each team's calls came under its own entry's identity"
+  # Every request the server accepted carried the token of one of its entries' ServiceAccounts,
+  # docs-team-a or docs-team-b, for audience mock-docs, which the gateway pod's token writer got.
+  # Each team's came under its own entry's. Each team is allowed four calls, so 2 x 4 = 8:
   # before the policy, the read through the gateway after its direct call; after it, its full
   # run's list and read, and the same pod's read after its direct call times out. Its other calls
   # are denied, and the stranger is refused. The two direct calls before the policy, one per
@@ -1144,7 +1227,8 @@ kind_run() {
   # credential, and each attempt it found open was refused as no_bearer. After the policy no
   # direct call reaches the server.
   if fetch "mock-docs' log" mock_docs_log; then
-    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"
+    check_server_callers "$FETCHED" "$KIND_ENTRY_SUBJECTS" 8 2 "$OPEN_ATTEMPTS"
+    check_server_entries "$FETCHED" 4 "team-a=${KIND_ENTRY_SUBJECTS%% *}" "team-b=${KIND_ENTRY_SUBJECTS##* }"
   fi
 
   step "the gateway's view of identity failures (operators only; no audit rows)"
@@ -1152,8 +1236,8 @@ kind_run() {
   # Only this run's lines: a run on an existing cluster may reuse the gateway's pod.
   gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" "pod/$GATEWAY_POD")
   printf '%s\n' "$gateway_logs" | grep 'identity_failed' | sed 's/^/    /' || echo "    (none)"
-  # Two teams refused three ways each (no token, not a token, the default API token), and the
-  # stranger once.
+  # Two teams refused three ways each (no token, not a token, a projected token for another
+  # audience), and the stranger once.
   check_at_least "$(count_lines '"event":"identity_failed"' "$gateway_logs")" 7 "the gateway logged every identity failure"
 
   step "the gateway's metrics (GET /metrics on its own port, which the teams cannot reach)"
