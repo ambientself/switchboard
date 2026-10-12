@@ -1,7 +1,8 @@
 # What the gateway pod's token writer (gateway.yaml, deploy/demo/token-writer.sh) may do in the
-# cluster API: create tokens for ServiceAccounts docs-team-a and docs-team-b, named, and nothing
-# else (decision 0013, section 10). Not for its own ServiceAccount, nor any workload's, nor any
-# other in the namespace. crates/demo-checks holds resourceNames to exactly these two.
+# cluster API: create tokens for ServiceAccounts docs-team-a, docs-team-b and registry-probe,
+# named, and nothing else (decision 0013, sections 9 and 10). Not for its own ServiceAccount,
+# nor any workload's, nor any other in the namespace. crates/demo-checks holds resourceNames to
+# exactly these three.
 #
 # Both of the pod's containers run as ServiceAccount gateway, so the grant belongs to the pod.
 # Only the token writer mounts a token the API server accepts; the gateway container mounts
@@ -15,7 +16,7 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
-    resourceNames: ["docs-team-a", "docs-team-b"]
+    resourceNames: ["docs-team-a", "docs-team-b", "registry-probe"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

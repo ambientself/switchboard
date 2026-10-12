@@ -303,11 +303,64 @@ fn compose_gives_each_entry_its_own_credential_and_mock_docs_their_digests() {
     );
 }
 
+/// Compose has no issuer for mock-docs, so the probe's third call presents a static dummy
+/// (decision 0013, section 9): a secret of the gateway's, given to no other service, which
+/// mock-docs does not accept and so must refuse as a stranger's.
+#[test]
+fn compose_gives_the_probe_a_dummy_mock_docs_does_not_accept() {
+    let dir = "deploy/compose/dummy-credentials";
+    let credential = read(&format!("{dir}/registry-probe-credential"));
+    assert!(credential.starts_with("dummy-"), "{credential}");
+    let digest = sha256_hex(credential.trim().as_bytes());
+    assert!(
+        !read(&format!("{dir}/mock-docs-callers")).contains(&digest),
+        "mock-docs would accept the probe's credential"
+    );
+    for entry in ["docs-team-a", "docs-team-b"] {
+        assert_ne!(read(&format!("{dir}/{entry}-credential")), credential);
+    }
+    let compose = read("deploy/compose/compose.yaml");
+    assert!(compose.contains(
+        "  registry-probe-credential:\n    file: ./dummy-credentials/registry-probe-credential\n"
+    ));
+    let gateway = compose_service(&compose, "gateway");
+    assert!(
+        gateway.contains("      - registry-probe-credential\n"),
+        "{gateway}"
+    );
+    for service in ["mock-docs", "dev-issuer", "workload", "migrate"] {
+        assert!(
+            !compose_service(&compose, service).contains("registry-probe-credential"),
+            "{service}"
+        );
+    }
+    let config = read("deploy/compose/config/gateway.toml");
+    assert_eq!(
+        probe_credential_entries(&config),
+        [
+            "docs-team-a = \"/run/secrets/registry-probe-credential\"",
+            "docs-team-b = \"/run/secrets/registry-probe-credential\"",
+        ]
+    );
+}
+
 /// The non-comment lines of a deployment file's `[credentials]` table.
 fn credential_entries(config: &str) -> Vec<&str> {
     config
         .split_once("[credentials]\n")
         .expect("a [credentials] section")
+        .1
+        .lines()
+        .take_while(|line| !line.starts_with('['))
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect()
+}
+
+/// The non-comment lines of a deployment file's `[drift.probe_credentials]` table.
+fn probe_credential_entries(config: &str) -> Vec<&str> {
+    config
+        .split_once("[drift.probe_credentials]\n")
+        .expect("a [drift.probe_credentials] section")
         .1
         .lines()
         .take_while(|line| !line.starts_with('['))
@@ -543,9 +596,10 @@ fn no_workload_mounts_an_api_token() {
 }
 
 /// What the token RBAC grants: ServiceAccount gateway may create tokens for the entries'
-/// ServiceAccounts, named, and nothing else; and no other Role or binding is in the base.
+/// ServiceAccounts and the probe's, registry-probe, named, and nothing else; and no other Role
+/// or binding is in the base.
 #[test]
-fn the_token_grant_names_exactly_the_entries_service_accounts() {
+fn the_token_grant_names_exactly_the_entries_and_the_probes_service_accounts() {
     let grant = read("deploy/kind/base/gateway-tokens.yaml");
     let documents: Vec<String> = grant
         .split("\n---\n")
@@ -568,7 +622,7 @@ rules:
   - apiGroups: [\"\"]
     resources: [\"serviceaccounts/token\"]
     verbs: [\"create\"]
-    resourceNames: [\"docs-team-a\", \"docs-team-b\"]",
+    resourceNames: [\"docs-team-a\", \"docs-team-b\", \"registry-probe\"]",
             "apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -588,11 +642,11 @@ subjects:
     // The names are the token writer's accounts, each a ServiceAccount in the namespace.
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
     assert!(gateway.contains(
-        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b\"}\n"
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe\"}\n"
     ));
     assert!(gateway.contains("            - {name: TOKEN_NAMESPACE, value: switchboard}\n"));
     let accounts = read("deploy/kind/base/serviceaccounts.yaml");
-    for account in ["docs-team-a", "docs-team-b"] {
+    for account in ["docs-team-a", "docs-team-b", "registry-probe"] {
         let found = documents_with(
             &accounts,
             &format!("  name: {account}\n  namespace: switchboard\n"),
@@ -660,9 +714,10 @@ fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
     assert!(
         writer.contains("            - {name: TOKEN_DIR, value: /var/run/switchboard/tokens}\n")
     );
-    // The gateway starts only once both tokens are written: it reads every credential at boot.
+    // The gateway starts only once the three tokens are written: it reads every credential,
+    // the probe's included, at boot.
     assert!(writer.contains(
-        "                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b\n"
+        "                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b && test -s /var/run/switchboard/tokens/registry-probe\n"
     ), "{writer}");
     assert!(gateway.contains(
         "        - name: entry-tokens\n          emptyDir: {medium: Memory, sizeLimit: 1Mi}"
@@ -686,6 +741,29 @@ fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
             "docs-team-b-credential = \"/var/run/switchboard/tokens/docs-team-b\"",
         ]
     );
+    // The probe presents ServiceAccount registry-probe's token on its third call, for each
+    // entry: the file the token writer writes for that account, which is a token for audience
+    // mock-docs, the entries' own audience (decision 0013, section 9).
+    assert_eq!(
+        probe_credential_entries(&config),
+        [
+            "docs-team-a = \"/var/run/switchboard/tokens/registry-probe\"",
+            "docs-team-b = \"/var/run/switchboard/tokens/registry-probe\"",
+        ]
+    );
+    let writer_env = |name: &str| {
+        value_after(&writer, &format!("            - {{name: {name}, value: "))
+            .trim_end_matches('}')
+            .trim_matches('"')
+            .to_owned()
+    };
+    assert!(
+        writer_env("TOKEN_SERVICE_ACCOUNTS")
+            .split(' ')
+            .any(|account| account == "registry-probe")
+    );
+    assert_eq!(writer_env("TOKEN_AUDIENCE"), "mock-docs");
+    assert_eq!(writer_env("TOKEN_DIR"), "/var/run/switchboard/tokens");
 
     // The dummy credentials and the Secrets made from them are not in kind.
     assert!(

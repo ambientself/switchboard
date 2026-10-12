@@ -36,9 +36,9 @@ revision = "demo-7"
 # reach in its limit.
 #
 # `probe` records the registration probe (decisions 0010 and 0013, section 9): the date
-# `switchboard probe` sent the entry decision 0010's three calls, with no credential, a malformed
-# one and a stranger's token, and found each refused. The loader refuses an entry without one.
-# The gateway repeats the probe on every drift poll.
+# `switchboard probe` sent the entry decision 0010's three calls, with no credential, a
+# malformed one and a stranger's token, and found each refused. The loader refuses an entry
+# without one. The gateway repeats the probe on every drift poll.
 
 [[servers]]
 name = "docs-team-a"

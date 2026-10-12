@@ -3233,7 +3233,7 @@ fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
     let gateway = common::read("deploy/kind/base/gateway.yaml");
     for line in [
         "          command: [\"token-writer.sh\"]\n",
-        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b\"}\n",
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe\"}\n",
         "            - {name: TOKEN_NAMESPACE, value: switchboard}\n",
         "            - {name: TOKEN_AUDIENCE, value: mock-docs}\n",
         "            - {name: TOKEN_EXPIRATION_SECONDS, value: \"600\"}\n",

@@ -68,18 +68,21 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
         # The token writer (deploy/demo/token-writer.sh), a native sidecar: it starts before the
-        # gateway and runs beside it. It writes each entry's token, for audience mock-docs and
-        # valid for 600 s, to /var/run/switchboard/tokens/<entry>, and writes it again every
-        # 300 s, each time to a new file renamed into place. The gateway starts only once both
-        # files exist (the startup probe), since it reads every credential file at boot. A token
-        # it cannot get leaves the previous file in place and is tried again in 5 s.
+        # gateway and runs beside it. It writes each entry's token, and the probe's, for audience
+        # mock-docs and valid for 600 s, to /var/run/switchboard/tokens/<ServiceAccount>, and
+        # writes it again every 300 s, each time to a new file renamed into place. The probe's is
+        # ServiceAccount registry-probe's: a valid token for mock-docs whose subject mock-docs
+        # does not accept, which the drift pass's probe presents on its third call (decision
+        # 0013, section 9). The gateway starts only once all three files exist (the startup
+        # probe), since it reads every credential file at boot. A token it cannot get leaves the
+        # previous file in place and is tried again in 5 s.
         - name: token-writer
           image: switchboard-demo:dev
           imagePullPolicy: Never
           restartPolicy: Always
           command: ["token-writer.sh"]
           env:
-            - {name: TOKEN_SERVICE_ACCOUNTS, value: "docs-team-a docs-team-b"}
+            - {name: TOKEN_SERVICE_ACCOUNTS, value: "docs-team-a docs-team-b registry-probe"}
             - {name: TOKEN_NAMESPACE, value: switchboard}
             - {name: TOKEN_AUDIENCE, value: mock-docs}
             - {name: TOKEN_EXPIRATION_SECONDS, value: "600"}
@@ -94,7 +97,7 @@ spec:
               command:
                 - sh
                 - -c
-                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b
+                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b && test -s /var/run/switchboard/tokens/registry-probe
             periodSeconds: 1
             failureThreshold: 120
           securityContext:
@@ -138,7 +141,7 @@ spec:
             # The cluster CA, which kube-root-ca.crt holds in every namespace: the only CA the
             # gateway trusts for the API server's keys URL (keys_ca_file in gateway.toml).
             - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}
-            # Each entry's token, which the token writer writes. Read-only here.
+            # Each entry's token and the probe's, which the token writer writes. Read-only here.
             - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}
       volumes:
         - name: config
@@ -164,7 +167,8 @@ spec:
                   name: kube-root-ca.crt
                   items:
                     - {key: ca.crt, path: ca.crt}
-        # The entries' tokens: the token writer writes them, the gateway reads them. In memory.
+        # The entries' tokens and the probe's: the token writer writes them, the gateway reads
+        # them. In memory.
         - name: entry-tokens
           emptyDir: {medium: Memory, sizeLimit: 1Mi}
 ---
