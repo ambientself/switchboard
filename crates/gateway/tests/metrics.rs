@@ -584,7 +584,7 @@ async fn the_open_rows_count_a_row_past_its_deadline() {
 async fn open_row(in_database: tokio_postgres::Config, setup: tokio_postgres::Client) {
     let mut as_gateway = in_database;
     as_gateway.user(GATEWAY_ROLE).password(DUMMY_PASSWORD);
-    // A row begun with no call deadline is open 2 s after it begins.
+    // A row begun with no call deadline is open 3 s after it begins: begin, finish and answer.
     let store = Arc::new(
         PgAuditStore::connect(as_gateway, tokio_postgres::NoTls, PoolSizes::default())
             .unwrap()
