@@ -28,10 +28,13 @@
 #     `"identity":"enforce"` and `"audit":"postgres"`, and one `"event":"identity_failed"` line
 #     per caller refused for identity;
 #   - mock-docs' JSON log lines (crates/mock-docs-server): one per request, with
-#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, and `accepted`, and for
-#     a tools/call its `rpc_method`, `project` and, if the server refused the project,
-#     `refused`. In kind the server runs in its JWT mode, and each line also has `caller`, the
-#     verified subject of an accepted token, and `refusal`, why a token was refused;
+#     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, `accepted` and, for a
+#     JSON-RPC request, its `rpc_method`, and for a tools/call its `project` and, if the server
+#     refused the project, `refused`. The gateway's own tools/list requests are its drift pass,
+#     which reads each entry's tool list every 10 s with that entry's credential; they are not
+#     calls, and the call counts leave them out. In kind the server runs in its JWT mode, and
+#     each line also has `caller`, the verified subject of an accepted token, and `refusal`, why
+#     a token was refused;
 #   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
 #     switchboard_reader;
 #   - the gateway's GET /metrics, Prometheus text on its own listener (crates/gateway,
@@ -476,14 +479,15 @@ check_metrics() {
 # registry, whose SHA-256s are the space-separated SHA256S; with SCOPE=all, so did every request
 # carrying any bearer. CALLS is exactly how many calls the gateway allowed so far: one more means
 # a call it denied reached the server, one fewer that an allowed call did not, or that the log is
-# short. Requests with no bearer (the health checks) are not counted. check_server_entries checks
-# that each team's calls carried its own entry's credential.
+# short. Requests with no bearer (the health checks) are not counted, and neither are the
+# gateway's drift polls: its own tools/list requests, with its own credentials.
+# check_server_entries checks that each team's calls carried its own entry's credential.
 check_server_bearers() {
   local logs=$1 shas=$2 calls=$3 scope=$4 lines sha shown=""
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.bearer_sha256 != null)
-    | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256)"')
+    | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256) \(.rpc_method // "none")"')
   for sha in $shas; do shown="$shown ${sha:0:12}..."; done
-  echo "    requests seen by mock-docs, by answer and bearer sha256 prefix (the gateway's are$shown):"
+  echo "    requests seen by mock-docs, by answer, bearer sha256 prefix and method (the gateway's are$shown):"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
   local good bad stray ours
   # shellcheck disable=SC2016 # awk's own variables
@@ -492,9 +496,9 @@ check_server_bearers() {
       for (i = 1; i <= n; i++) if (length(prefix) >= 8 && index(sha[i], prefix) == 1) return 1
       return 0
     }'
-  good=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && ours($2) { count++ } END { print count + 0 }')
+  good=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && ours($2) && $3 != "tools/list" { count++ } END { print count + 0 }')
   bad=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && !ours($2) { count++ } END { print count + 0 }')
-  stray=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'NF == 2 && !ours($2) { count++ } END { print count + 0 }')
+  stray=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'NF == 3 && !ours($2) { count++ } END { print count + 0 }')
   check "$good" "$calls" "mock-docs accepted the gateway's credentials on exactly the $calls calls the gateway allowed"
   check "$bad" 0 "mock-docs accepted no other bearer"
   if [ "$scope" = all ]; then
@@ -509,23 +513,24 @@ check_server_bearers() {
 # is exactly how many calls the gateway allowed so far: one more means a call it denied reached
 # the server, one fewer that an allowed call did not, or that the log is short. A request
 # accepted with any other caller, or with none (a static token), fails the check.
-# check_server_entries checks that each team's calls came under its own entry's. Exactly
-# REFUSALS requests were refused as wrong_audience: a token the cluster signed for another
-# audience, the workloads' own on their direct calls before the policy. Exactly PROBES were
-# refused as no_bearer: the route check's probe before the policy, which sends no credential,
-# one request per attempt it found open. Any other refusal fails.
+# The gateway's drift polls, its own tools/list requests under the entries' identities, are not
+# calls and are not counted. check_server_entries checks that each team's calls came under its
+# own entry's. Exactly REFUSALS requests were refused as wrong_audience: a token the cluster
+# signed for another audience, the workloads' own on their direct calls before the policy.
+# Exactly PROBES were refused as no_bearer: the route check's probe before the policy, which
+# sends no credential, one request per attempt it found open. Any other refusal fails.
 check_server_callers() {
   local logs=$1 subjects=$2 calls=$3 refusals=$4 probes=$5 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
-    | if .accepted == true then "accepted \(.caller // "none")" else "refused \(.refusal // "none")" end')
-  echo "    requests seen by mock-docs, by answer and verified caller or refusal:"
+    | if .accepted == true then "accepted \(.caller // "none") \(.rpc_method // "none")" else "refused \(.refusal // "none")" end')
+  echo "    requests seen by mock-docs, by answer and verified caller and method, or refusal:"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
   local gateway other audience bearerless refused
   # shellcheck disable=SC2016 # awk's own variables
   local ours='BEGIN { n = split(subjects, list, " "); for (i = 1; i <= n; i++) entry[list[i]] = 1 }
     '
-  gateway=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && ($2 in entry) && NF == 2 { count++ } END { print count + 0 }')
-  other=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && !(($2 in entry) && NF == 2) { count++ } END { print count + 0 }')
+  gateway=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ } END { print count + 0 }')
+  other=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ } END { print count + 0 }')
   audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
   bearerless=$(printf '%s\n' "$lines" | awk '$0 == "refused no_bearer" { n++ } END { print n + 0 }')
   refused=$(printf '%s\n' "$lines" | awk '$1 == "refused" { n++ } END { print n + 0 }')
@@ -584,10 +589,12 @@ compose_workload() { # LABEL MODE TEAM: runs the workload service once
   tally_workload "$label" "$status" "$output"
 }
 
-# mock_docs_requests: how many requests mock-docs has accepted. Its health checks carry no bearer
-# and are not accepted, so they do not count.
+# mock_docs_requests: how many requests mock-docs has accepted, other than tools/list. Its health
+# checks carry no bearer and are not accepted, so they do not count. The gateway's drift pass
+# reads each entry's tool list every 10 s whatever the database is doing, so its tools/list
+# requests do not count either: no call is a tools/list.
 mock_docs_requests() {
-  dc logs --no-log-prefix mock-docs | jq -cR 'fromjson? | select(.accepted == true)' | awk 'END { print NR }'
+  dc logs --no-log-prefix mock-docs | jq -cR 'fromjson? | select(.accepted == true and .rpc_method != "tools/list")' | awk 'END { print NR }'
 }
 
 swap_registry() { # FILE: replaces the mounted registry file in one rename
