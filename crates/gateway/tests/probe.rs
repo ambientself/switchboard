@@ -515,7 +515,7 @@ fn the_command_refuses_what_it_cannot_probe() {
 async fn the_command_holds_each_call_to_the_servers_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
-    let router = Router::new().route("/mcp", post(|| std::future::pending::<String>()));
+    let router = Router::new().route("/mcp", post(std::future::pending::<String>));
     tokio::spawn(async move { axum::serve(listener, router).await });
     let files = Files::new("probe-deadline", &issuer().jwks_document(), &url);
     let text = std::fs::read_to_string(files.path("gateway.toml")).unwrap();
