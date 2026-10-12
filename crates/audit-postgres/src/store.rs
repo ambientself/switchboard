@@ -1524,8 +1524,8 @@ mod unit {
     }
 
     /// Begins an allowed read through the core, as the gateway does, on a store that cannot
-    /// write it, and returns the begin failures the store counted. A begin that succeeds, or
-    /// does not end well past its budget, fails the test.
+    /// write it, and returns the begin failures the store counted. The test fails if the begin
+    /// succeeds, or has not ended by five times its budget.
     async fn failed_begin(store: &PgAuditStore) -> BeginFailures {
         use gateway_core::audit::{self, RequestMetadata};
         use gateway_core::{CallContext, RequestedTool, decide};
