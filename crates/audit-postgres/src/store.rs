@@ -173,10 +173,12 @@ pub(crate) fn describe(error: &tokio_postgres::Error) -> String {
     }
 }
 
-/// How many connections each pool may hold.
+/// How many connections the begin and finish pools may hold.
 ///
 /// Finish has a pool of its own, so a surge of begins cannot starve the writes that close
-/// rows. The defaults are provisional; decision 0009 leaves pool sizes to Q12.
+/// rows. The defaults are provisional; decision 0009 leaves pool sizes to Q12. The open-row
+/// query has a third pool, of [`OPEN_ROWS_POOL_SIZE`] connection, which is not set here. So a
+/// store opens at most `begin + finish + 1` connections: 21 with the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolSizes {
     /// Connections for begin.
@@ -357,7 +359,8 @@ impl Drop for Timed<'_> {
 }
 
 /// A begin or list that failed, with whether its last attempt had a connection: a budget that
-/// ran out without one ran out waiting for the pool.
+/// ran out without one ran out getting a connection from the pool, whether waiting for a
+/// permit or opening a new connection.
 struct InsertFailed {
     error: PgAuditError,
     connected: bool,
@@ -369,8 +372,11 @@ impl InsertFailed {
     }
 }
 
-/// Why a begin failed with `error`; `connected` tells a budget that ran out waiting for a
-/// connection from one that ran out with one in hand.
+/// Why a begin failed with `error`; `connected` tells a budget that ran out before the last
+/// attempt had a connection, whether waiting for a pool permit or opening a new connection,
+/// from one that ran out with one in hand. Those two ways of having no connection are not told
+/// apart, so a database that never answers counts as a pool timeout, as a pool too small for
+/// the load does (#155).
 fn begin_cause(error: &PgAuditError, connected: bool) -> BeginCause {
     match error {
         PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,
@@ -516,6 +522,12 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// How long [`PgAuditStore::open_rows`] has, from asking for a connection to its answer.
 pub(crate) const OPEN_ROWS_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The connections [`PgAuditStore::open_rows`] has, in a pool of its own, so a query held up
+/// for its whole time limit never takes a connection a finish could use. The gateway's poll
+/// asks one query at a time, so a second connection would never be used, and the size is
+/// fixed rather than a [`PoolSizes`] setting.
+pub const OPEN_ROWS_POOL_SIZE: usize = 1;
+
 /// The open rows (decision 0009, "Open rows"): allowed rows of kind `call` with no completion
 /// past their deadline, by the database's clock. A denial and a list row are never open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -590,6 +602,8 @@ pub struct OpenRows {
 pub struct PgAuditStore {
     pub(crate) begin: Pool,
     pub(crate) finish: Pool,
+    /// The open-row query's own pool, of [`OPEN_ROWS_POOL_SIZE`].
+    pub(crate) open_rows_pool: Pool,
     budgets: Budgets,
     cancel: Canceller,
     counters: Arc<Counters>,
@@ -601,8 +615,9 @@ impl PgAuditStore {
     /// needed, with the default [`Budgets`]. Nothing connects here, so a database that is down
     /// is found by the first call, or by [`check_at_boot`](Self::check_at_boot).
     ///
-    /// Each session sets `synchronous_commit` to `on` and `search_path` to
-    /// `pg_catalog, pg_temp`, after any options `config` carries.
+    /// It has three pools: begin's and finish's, of `sizes`, and the open-row query's, of
+    /// [`OPEN_ROWS_POOL_SIZE`]. Each session in each of them sets `synchronous_commit` to `on`
+    /// and `search_path` to `pg_catalog, pg_temp`, after any options `config` carries.
     pub fn connect<T>(
         config: tokio_postgres::Config,
         tls: T,
@@ -632,6 +647,7 @@ impl PgAuditStore {
         };
         let begin = pool(sizes.begin)?;
         let finish = pool(sizes.finish)?;
+        let open_rows_pool = pool(OPEN_ROWS_POOL_SIZE)?;
         let cancel: Canceller = Arc::new(move |token: CancelToken| {
             let tls = tls.clone();
             Box::pin(async move {
@@ -643,6 +659,7 @@ impl PgAuditStore {
         Ok(Self {
             begin,
             finish,
+            open_rows_pool,
             budgets: Budgets::default(),
             cancel,
             counters: Arc::default(),
@@ -687,9 +704,10 @@ impl PgAuditStore {
     /// What the store has counted since it was made, for the gateway's telemetry (decision
     /// 0009): begin failures by cause, answers released before their row was complete,
     /// finishes given up by cause, failed begins' rows never written, finishes in flight, the
-    /// latency of begin and of finish, and each pool's connections. The counts are atomics,
-    /// each read on its own; the pools' figures come from their status, which takes each
-    /// pool's lock for a moment. Nothing here waits on the database.
+    /// latency of begin and of finish, and the connections of the begin and finish pools. The
+    /// open-row query's pool is not among them. The counts are atomics, each read on its own;
+    /// the pools' figures come from their status, which takes each pool's lock for a moment.
+    /// Nothing here waits on the database.
     pub fn stats(&self) -> StoreStats {
         let finishes = self.finishes();
         StoreStats {
@@ -706,13 +724,15 @@ impl PgAuditStore {
     }
 
     /// Counts the open rows, and finds the earliest deadline among them, through the view
-    /// `switchboard_audit.open_call_rows`. Runs on the finish pool, within 2 s from asking for a
-    /// connection; past that, it asks the server to cancel the query and fails. Reads only:
-    /// nothing marks a row abandoned or writes its outcome.
+    /// `switchboard_audit.open_call_rows`. Runs on a pool of its own, of
+    /// [`OPEN_ROWS_POOL_SIZE`], so a query held up never delays a finish. It has 2 s in all,
+    /// from asking for its connection to the answer; past that, it fails, and if the query has
+    /// started, asks the server to cancel it. Reads only: nothing marks a row abandoned or
+    /// writes its outcome.
     pub async fn open_rows(&self) -> Result<OpenRows, PgAuditError> {
         let budget = OPEN_ROWS_TIMEOUT;
         let deadline = Instant::now() + budget;
-        let client = timeout_at(deadline, self.finish.get())
+        let client = timeout_at(deadline, self.open_rows_pool.get())
             .await
             .map_err(|_| PgAuditError::OpenRowsTimedOut { budget })??;
         let query = client.query_one(
@@ -1467,5 +1487,138 @@ mod unit {
             reports.lock().unwrap().clone(),
             vec![(row.as_str().to_owned(), "error", lost.to_string())]
         );
+    }
+
+    /// The begin budget of the stores below, which never write a row: long enough that an
+    /// attempt on a connection that breaks at once, and the pause after it, end well inside it.
+    const BEGIN_BUDGET: Duration = Duration::from_secs(1);
+
+    /// A server that takes each connection and never says anything, so opening a connection
+    /// to it never ends, as to a database behind a blackholed address. Told to, it first lets
+    /// one connection in, as [`server_that_lets_anyone_in`] does, and closes it when the client
+    /// first sends anything more, so that connection breaks. Counts the connections it took,
+    /// and holds the silent ones open.
+    async fn server_that_never_answers(break_one_first: bool) -> (u16, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let kept = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut silent = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let first = kept.fetch_add(1, Ordering::SeqCst) == 0;
+                if !(first && break_one_first) {
+                    silent.push(socket);
+                    continue;
+                }
+                let length = socket.read_u32().await.unwrap();
+                let mut startup = vec![0; usize::try_from(length).unwrap() - 4];
+                socket.read_exact(&mut startup).await.unwrap();
+                // AuthenticationOk, then ReadyForQuery.
+                socket
+                    .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                    .await
+                    .unwrap();
+                let _ = socket.read_u8().await;
+                drop(socket);
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A store whose pools connect to `port` on this machine, with [`BEGIN_BUDGET`].
+    fn store_at(port: u16) -> PgAuditStore {
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(port).user("nobody");
+        PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())
+            .unwrap()
+            .with_budgets(Budgets {
+                begin: BEGIN_BUDGET,
+                ..Budgets::default()
+            })
+    }
+
+    /// Begins an allowed read through the core, as the gateway does, on a store that cannot
+    /// write it, and returns the begin failures the store counted. The test fails if the begin
+    /// succeeds, or has not ended by five times its budget.
+    async fn failed_begin(store: &PgAuditStore) -> BeginFailures {
+        use gateway_core::audit::{self, RequestMetadata};
+        use gateway_core::{CallContext, RequestedTool, decide};
+        use gateway_testkit::{
+            Caller, Fixture, FixtureConnector, READ_TOOL, SURFACE_ALL, TEAM_A_DOCUMENT, row_start,
+        };
+        let fixture = Fixture::new().unwrap();
+        let arguments = serde_json::json!({ "document": TEAM_A_DOCUMENT });
+        let context = CallContext {
+            resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
+            caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
+            tool: RequestedTool::new(READ_TOOL),
+        };
+        let decision = decide(&fixture.policy, &context);
+        let begin = audit::begin(
+            store,
+            row_start(),
+            decision,
+            arguments,
+            RequestMetadata::default(),
+        );
+        let Ok(Err(_)) = tokio::time::timeout(BEGIN_BUDGET * 5, begin).await else {
+            panic!("the begin succeeded, or did not end");
+        };
+        store.stats().begin_failures
+    }
+
+    /// A begin against a database that never answers counts one pool timeout, the same as a
+    /// begin that waited for a pool permit: its budget ran out opening a new connection,
+    /// before it had one. Needs no server: the one here takes the connection and says nothing.
+    #[tokio::test]
+    async fn a_begin_against_a_database_that_never_answers_counts_one_pool_timeout() {
+        let (port, accepted) = server_that_never_answers(false).await;
+        let store = store_at(port);
+        assert_eq!(
+            failed_begin(&store).await,
+            BeginFailures {
+                pool_timeout: 1,
+                ..BeginFailures::default()
+            }
+        );
+        // The begin was opening a connection, not waiting for a permit: the server took one.
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A begin against a database that refuses each connection counts one database error, not
+    /// a pool timeout: each attempt failed at once, with an error. Needs no server: nothing
+    /// listens on the port.
+    #[tokio::test]
+    async fn a_begin_against_a_database_that_refuses_connections_counts_one_database_error() {
+        let store = store_at(closed_port());
+        assert_eq!(
+            failed_begin(&store).await,
+            BeginFailures {
+                database_error: 1,
+                ..BeginFailures::default()
+            }
+        );
+    }
+
+    /// A begin whose connection breaks, and whose next attempt then runs past the budget
+    /// opening a new one, counts one pool timeout: the connection that broke was taken out of
+    /// the pool, and what counts is whether the last attempt had a connection. Needs no
+    /// server: the one here lets the first connection in, breaks it at the begin's first
+    /// statement, and says nothing on the next.
+    #[tokio::test]
+    async fn a_begin_whose_reconnect_runs_past_its_budget_counts_one_pool_timeout() {
+        let (port, accepted) = server_that_never_answers(true).await;
+        let store = store_at(port);
+        assert_eq!(
+            failed_begin(&store).await,
+            BeginFailures {
+                pool_timeout: 1,
+                ..BeginFailures::default()
+            }
+        );
+        // The first connection broke, and the begin's second attempt opened another.
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 }

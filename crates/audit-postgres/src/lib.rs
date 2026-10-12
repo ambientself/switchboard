@@ -12,9 +12,11 @@
 //!   insert was executed, and so may have been written, is completed as `error` the same way.
 //! - [`PgAuditStore::stats`] reads what the store counts for telemetry, in [`StoreStats`]: why
 //!   begins failed, answers released before their row was complete, why finishes gave up, the
-//!   latency of begin and finish, and each pool's connections in use.
+//!   latency of begin and finish, and the connections of the begin and finish pools. The
+//!   open-row query's pool is not among them, so the gateway exports no figures for it.
 //! - [`PgAuditStore::open_rows`] counts the open rows, through the view `open_call_rows`:
-//!   allowed calls with no completion past their deadline, by the database's clock.
+//!   allowed calls with no completion past their deadline, by the database's clock. It has a
+//!   pool of its own, of one connection, so a slow count never takes a finish's connection.
 //! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
 //!   is as the store expects and the role it connects as can do no more than the store needs.
 //!
@@ -75,4 +77,7 @@ pub use stats::{
     BeginFailures, GivenUpCauses, LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram, PoolStats,
     StoreStats,
 };
-pub use store::{Budgets, FinishCounts, GivenUp, OpenRows, PgAuditError, PgAuditStore, PoolSizes};
+pub use store::{
+    Budgets, FinishCounts, GivenUp, OPEN_ROWS_POOL_SIZE, OpenRows, PgAuditError, PgAuditStore,
+    PoolSizes,
+};
