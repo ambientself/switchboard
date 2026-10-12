@@ -44,6 +44,12 @@ url_env = "SWITCHBOARD_DATABASE_URL"
 # curl`. Never the MCP port.
 listen = "127.0.0.1:9090"
 
+[drift]
+# How often the gateway reads each entry's tool list from mock-docs and withdraws a tool whose
+# definition no longer matches its approval. 10 s so a demo sees it; decision 0013 sets 300 s,
+# the default, for real deployments. 5 to 900.
+interval_seconds = 10
+
 [credentials]
 # A Compose secret for each entry, each holding a dummy value. The proxy sends the entry's own
 # upstream; the workload never sees either. mock-docs limits each to its team's project.
