@@ -1,0 +1,305 @@
+{
+  "about": "The snapshot loader's rules (decision 0011, section 3), one refusing case and at least one passing case for each. Every case starts from `base`, a proxied entry reaching one project with a read tool declared from its arguments, served to the one team whose limit holds it. `tool`, `entry` and `surface` change fields of the base's first tool, entry and surface (null removes a field); `tools`, `entries`, `surfaces` and `limits` replace the base's. `expect` is `loads`, `does not parse`, or the SnapshotError variant refused with, and `names` lists text the refusal's message must contain. tests/loader_rules.rs runs every case and reports every one that fails.",
+  "base": {
+    "revision": "rules-1",
+    "tools": [
+      { "name": "docs-a__list", "classification": "read", "connector": "docs-a", "resources": "declared", "declared_from": "arguments" }
+    ],
+    "surfaces": [
+      { "name": "docs-a", "tools": ["docs-a__list"], "teams": ["team-a"], "principals": "any_in_teams_and_groups" }
+    ],
+    "profiles": [],
+    "limits": {
+      "teams": {
+        "team-a": [{ "system": "docs", "kind": "project", "identifier": "atlas" }],
+        "team-b": [{ "system": "docs", "kind": "project", "identifier": "borealis" }]
+      },
+      "groups": {
+        "engineering": [{ "system": "docs", "kind": "project", "identifier": "atlas" }]
+      }
+    },
+    "entries": [
+      {
+        "name": "docs-a",
+        "kind": "proxied",
+        "credential": "team_service_identity",
+        "principal": "docs-team-a",
+        "narrowing": "none",
+        "permits": "read",
+        "reach": [{ "system": "docs", "kind": "project", "identifier": "atlas" }],
+        "reach_tested_on": "2026-10-12"
+      }
+    ]
+  },
+  "cases": [
+    { "name": "the base loads", "expect": "loads" },
+
+    {
+      "name": "rule 1: a proxied tool declared checks_own_scope is refused",
+      "tool": { "resources": "checks_own_scope", "declared_from": null },
+      "expect": "ProxiedChecksOwnScope", "names": ["`docs-a__list`", "`docs-a`", "rule 1"]
+    },
+    {
+      "name": "rule 1: a built-in tool may check its own scope",
+      "tool": { "resources": "checks_own_scope", "declared_from": null },
+      "entry": { "kind": "built_in" },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 2: a proxied propose tool is refused",
+      "tool": { "classification": "propose" },
+      "expect": "ProxiedNotRead", "names": ["`docs-a__list`", "`docs-a`", "`propose`", "rule 2"]
+    },
+    {
+      "name": "rule 2: a proxied write tool is refused",
+      "tool": { "classification": "write" },
+      "expect": "ProxiedNotRead", "names": ["`docs-a__list`", "`write`"]
+    },
+    {
+      "name": "rule 2: a built-in propose tool served to a team loads",
+      "tool": { "classification": "propose" },
+      "entry": { "kind": "built_in", "permits": "propose" },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 3: a proxied entry with a reach and no recorded test is refused",
+      "entry": { "reach_tested_on": null },
+      "expect": "ReachUntested", "names": ["`docs-a`", "`docs / project / atlas`", "rule 3"]
+    },
+    {
+      "name": "rule 3: a test recorded with something other than a date is no test",
+      "entry": { "reach_tested_on": "recently" },
+      "expect": "ReachUntested", "names": ["`docs-a`"]
+    },
+    {
+      "name": "rule 3: a proxied entry with no reach at all does not parse",
+      "entry": { "reach": null },
+      "expect": "does not parse"
+    },
+    {
+      "name": "rule 3: a proxied entry reaching nothing needs no test",
+      "tool": { "resources": "no_resources", "declared_from": null },
+      "entry": { "reach": [], "reach_tested_on": null },
+      "expect": "loads"
+    },
+    {
+      "name": "rule 3: a built-in entry's reach needs no test",
+      "entry": { "kind": "built_in", "reach_tested_on": null },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 4: a proxied entry whose credential permits more than its read tool is refused",
+      "entry": { "permits": "propose" },
+      "expect": "PermitsMoreThanTool", "names": ["`docs-a`", "`propose`", "`docs-a__list`", "`read`", "rule 4"]
+    },
+    {
+      "name": "rule 4: a built-in entry's permits is recorded, not compared",
+      "entry": { "kind": "built_in", "permits": "write" },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 5: one entry reaching both projects, served to both teams, is refused",
+      "entry": {
+        "reach": [
+          { "system": "docs", "kind": "project", "identifier": "atlas" },
+          { "system": "docs", "kind": "project", "identifier": "borealis" }
+        ]
+      },
+      "surface": { "teams": ["team-a", "team-b"] },
+      "expect": "ReachOutsideLimit", "names": ["`docs-a__list`", "`docs-a`", "team `team-a`", "`docs / project / borealis`", "rule 5"]
+    },
+    {
+      "name": "rule 5: a group whose limit lacks part of the reach is refused",
+      "entry": {
+        "reach": [
+          { "system": "docs", "kind": "project", "identifier": "atlas" },
+          { "system": "docs", "kind": "project", "identifier": "borealis" }
+        ]
+      },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "limits": {
+        "teams": {},
+        "groups": {
+          "engineering": [{ "system": "docs", "kind": "project", "identifier": "atlas" }]
+        }
+      },
+      "expect": "ReachOutsideLimit", "names": ["group `engineering`", "`docs / project / borealis`"]
+    },
+    {
+      "name": "rule 5: a team with no limit at all holds none of the reach",
+      "surface": { "teams": ["team-a", "team-c"] },
+      "expect": "ReachOutsideLimit", "names": ["team `team-c`", "`docs / project / atlas`"]
+    },
+    {
+      "name": "rule 5: the reach applies on a surface restricted to named principals too",
+      "surface": { "teams": ["team-b"], "principals": { "only": [{ "issuer": "https://issuer.example.test", "subject": "one" }] } },
+      "expect": "ReachOutsideLimit", "names": ["team `team-b`"]
+    },
+    {
+      "name": "rule 5: a tool declared as the reach on a built-in entry is held to it",
+      "tool": { "declared_from": "reach" },
+      "entry": {
+        "kind": "built_in",
+        "narrowing": "limit",
+        "reach": [
+          { "system": "docs", "kind": "project", "identifier": "atlas" },
+          { "system": "docs", "kind": "project", "identifier": "borealis" }
+        ]
+      },
+      "expect": "ReachOutsideLimit", "names": ["team `team-a`", "`docs / project / borealis`"]
+    },
+    {
+      "name": "rule 5: an entry narrowed to the caller's limit may reach both projects",
+      "entry": {
+        "narrowing": "limit",
+        "reach": [
+          { "system": "docs", "kind": "project", "identifier": "atlas" },
+          { "system": "docs", "kind": "project", "identifier": "borealis" }
+        ]
+      },
+      "surface": { "teams": ["team-a", "team-b"] },
+      "expect": "loads"
+    },
+    {
+      "name": "rule 5: an entry whose reach every admitted limit holds loads",
+      "entry": {
+        "reach": [
+          { "system": "docs", "kind": "project", "identifier": "atlas" },
+          { "system": "docs", "kind": "project", "identifier": "borealis" }
+        ]
+      },
+      "surface": { "teams": ["team-a", "team-b"] },
+      "limits": {
+        "teams": {
+          "team-a": [
+            { "system": "docs", "kind": "project", "identifier": "atlas" },
+            { "system": "docs", "kind": "project", "identifier": "borealis" }
+          ],
+          "team-b": [
+            { "system": "docs", "kind": "project", "identifier": "borealis" },
+            { "system": "docs", "kind": "project", "identifier": "atlas" }
+          ]
+        }
+      },
+      "expect": "loads"
+    },
+    {
+      "name": "rule 5: a tool on no surface is served to nobody",
+      "entry": {
+        "reach": [
+          { "system": "docs", "kind": "project", "identifier": "atlas" },
+          { "system": "docs", "kind": "project", "identifier": "borealis" }
+        ]
+      },
+      "surface": { "tools": [], "teams": ["team-a", "team-b"] },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 6: a proxied no_resources tool whose entry reaches something is refused",
+      "tool": { "resources": "no_resources", "declared_from": null },
+      "expect": "NoResourcesWithReach", "names": ["`docs-a__list`", "`docs-a`", "`docs / project / atlas`", "rule 6"]
+    },
+    {
+      "name": "rule 6: a built-in no_resources tool may sit on an entry with a reach",
+      "tool": { "resources": "no_resources", "declared_from": null },
+      "entry": { "kind": "built_in" },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 7: an entry narrowing per call serving a tool that does not say it reads its arguments is refused",
+      "tool": { "declared_from": null },
+      "entry": { "narrowing": "call" },
+      "expect": "CallNarrowingWithoutArguments", "names": ["`docs-a`", "`docs-a__list`", "rule 7"]
+    },
+    {
+      "name": "rule 7: an entry narrowing per call serving a no_resources tool is refused",
+      "tool": { "resources": "no_resources", "declared_from": null },
+      "entry": { "narrowing": "call", "reach": [], "reach_tested_on": null },
+      "expect": "CallNarrowingWithoutArguments", "names": ["`docs-a`", "`docs-a__list`"]
+    },
+    {
+      "name": "rule 7: an entry narrowing per call serving a tool declared from its arguments loads",
+      "entry": { "narrowing": "call" },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 8: a per-user entry's tool on a surface that admits a team is refused",
+      "entry": { "credential": "per_user_grant" },
+      "expect": "PerUserToTeam", "names": ["`docs-a__list`", "`docs-a`", "`team-a`", "rule 8"]
+    },
+    {
+      "name": "rule 8: a per-user entry's tool on a surface that admits only groups loads",
+      "entry": { "credential": "per_user_grant" },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "expect": "loads"
+    },
+
+    {
+      "name": "rule 9: a propose tool on a surface that admits a group, on a shared entry, is refused",
+      "tool": { "classification": "propose" },
+      "entry": { "kind": "built_in", "permits": "propose" },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "expect": "ProposeToGroup", "names": ["`docs-a__list`", "`docs-a`", "`engineering`", "rule 9"]
+    },
+    {
+      "name": "rule 9: a propose tool on a surface that admits a group, on a per-user entry, loads",
+      "tool": { "classification": "propose" },
+      "entry": { "kind": "built_in", "permits": "propose", "credential": "per_user_grant" },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "expect": "loads"
+    },
+
+    {
+      "name": "a tool declared as its entry's reach is refused, since it is not built",
+      "tool": { "declared_from": "reach" },
+      "entry": { "kind": "built_in" },
+      "expect": "DeclaredFromReach", "names": ["`docs-a__list`"]
+    },
+    {
+      "name": "a tool that is not declared cannot say where it is declared from",
+      "tool": { "resources": "no_resources" },
+      "entry": { "reach": [], "reach_tested_on": null },
+      "expect": "DeclaredFromWithoutDeclared", "names": ["`docs-a__list`"]
+    },
+    {
+      "name": "with entries, a tool whose connector has none is refused",
+      "tools": [
+        { "name": "docs-a__list", "classification": "read", "connector": "docs-a", "resources": "declared", "declared_from": "arguments" },
+        { "name": "other__list", "classification": "propose", "connector": "other", "resources": "checks_own_scope" }
+      ],
+      "expect": "ToolWithoutEntry", "names": ["`other__list`", "`other`"]
+    },
+    {
+      "name": "two entries of one name are refused",
+      "entries": [
+        { "name": "docs-a", "kind": "proxied", "credential": "team_service_identity", "principal": "docs-team-a", "narrowing": "none", "permits": "read", "reach": [] },
+        { "name": "docs-a", "kind": "built_in", "credential": "gateway_token", "principal": "docs-team-a", "narrowing": "none", "permits": "read", "reach": [] }
+      ],
+      "expect": "DuplicateEntry", "names": ["`docs-a`"]
+    },
+    {
+      "name": "an entry with a field the format does not know does not parse",
+      "entry": { "reach_test": "2026-10-12" },
+      "expect": "does not parse"
+    },
+    {
+      "name": "an entry with an unknown narrowing does not parse",
+      "entry": { "narrowing": "some" },
+      "expect": "does not parse"
+    },
+    {
+      "name": "with no entries, as the JSON configuration has, the rules do not apply",
+      "tool": { "classification": "propose", "resources": "checks_own_scope", "declared_from": null },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "entries": [],
+      "expect": "loads"
+    }
+  ]
+}

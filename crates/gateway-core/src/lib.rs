@@ -46,8 +46,9 @@ pub use names::{
     ToolUseId,
 };
 pub use policy::{
-    ApprovedTool, PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration,
-    ResourceLimits, Resources, SnapshotData, SnapshotError, Surface,
+    Admitted, ApprovedTool, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind, Narrowing,
+    PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration, ResourceLimits,
+    Resources, SnapshotData, SnapshotError, Surface,
 };
 pub use principal::{Delegation, Principal, PrincipalId, PrincipalKind};
 pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};

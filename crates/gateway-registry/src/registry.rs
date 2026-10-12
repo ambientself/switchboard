@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use gateway_core::{
-    ApprovedTool, ConnectorName, Issuer, PolicyRevision, PolicySnapshot, Principal, PrincipalId,
-    PrincipalRestriction, Profile, ProfileName, Resource, ResourceLimits, SnapshotData,
-    SnapshotError, Surface, ToolName,
+    ApprovedTool, ConnectorName, DeclaredFrom, Issuer, PolicyRevision, PolicySnapshot, Principal,
+    PrincipalId, PrincipalRestriction, Profile, ProfileName, Resource, ResourceDeclaration,
+    ResourceLimits, SnapshotData, SnapshotError, Surface, ToolName,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -380,6 +380,8 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
             classification: checked.classification,
             connector: checked.route.server.clone(),
             resources: checked.adapter.declaration(),
+            declared_from: (checked.adapter.declaration() == ResourceDeclaration::Declared)
+                .then_some(DeclaredFrom::Arguments),
         });
         definitions.insert(name.clone(), checked.definition);
         adapters.insert(name.clone(), checked.adapter);
@@ -427,6 +429,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         surfaces,
         profiles,
         limits,
+        entries: Vec::new(),
     })?;
 
     let mut covered = BTreeSet::new();

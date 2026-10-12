@@ -9,12 +9,14 @@ fn approve(text: &str) -> (ApprovedTool, ApprovedTool) {
         classification: text.parse::<Classification>(),
         connector: "github".into(),
         resources: ResourceDeclaration::Declared,
+        declared_from: None,
     };
     let unparsed = ApprovedTool {
         name: "github__get_file".parse().unwrap(),
         classification: text,
         connector: "github".into(),
         resources: ResourceDeclaration::Declared,
+        declared_from: None,
     };
     (unhandled, unparsed)
 }

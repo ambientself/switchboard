@@ -14,11 +14,11 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, Decision, Delegation, GroupId,
-    Issuer, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
-    ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
-    ResourceProblem, Resources, SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName,
-    Verdict, decide, list_tools,
+    ApprovedTool, CallContext, CallerContext, Classification, ConnectorEntry, CredentialMode,
+    Decision, DeclaredFrom, Delegation, EntryKind, GroupId, Issuer, Narrowing, PolicySnapshot,
+    Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, ProfileName, Reason,
+    ReasonKind, Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources,
+    SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName, Verdict, decide, list_tools,
 };
 
 use gateway_core::AuditRecord;
@@ -243,6 +243,7 @@ fn any_tool(name: &'static str) -> impl Strategy<Value = ApprovedTool> {
             classification,
             connector: "sys".into(),
             resources,
+            declared_from: None,
         },
     )
 }
@@ -345,6 +346,7 @@ fn any_world() -> impl Strategy<Value = World> {
                     surfaces: vec![a, b],
                     profiles: vec![profile.clone()],
                     limits,
+                    entries: Vec::new(),
                 },
                 principal,
                 delegation,
@@ -839,5 +841,219 @@ fn arbitrary_worlds_reach_every_outcome() {
     assert!(
         missing.is_empty(),
         "no arbitrary world was denied for {missing:?}"
+    );
+}
+
+// --- Connector entries and the loader's rules (decision 0011) ------------------------------
+
+const ENTRIES: [&str; 2] = ["entry-one", "entry-two"];
+
+fn any_entry(name: &'static str) -> impl Strategy<Value = ConnectorEntry> {
+    let kind = prop_oneof![3 => Just(EntryKind::Proxied), 1 => Just(EntryKind::BuiltIn)];
+    let credential = prop_oneof![
+        3 => Just(CredentialMode::TeamServiceIdentity),
+        1 => Just(CredentialMode::GatewayToken),
+        1 => Just(CredentialMode::PerUserGrant),
+    ];
+    let narrowing = prop_oneof![
+        2 => Just(Narrowing::None),
+        1 => Just(Narrowing::Limit),
+        1 => Just(Narrowing::Call),
+    ];
+    let permits =
+        prop_oneof![7 => Just(Classification::Read), 1 => select(Classification::ALL.to_vec())];
+    let tested = proptest::option::weighted(0.9, Just("2026-10-12".to_owned()));
+    (
+        kind,
+        credential,
+        narrowing,
+        permits,
+        subset(resource_pool()),
+        tested,
+    )
+        .prop_map(
+            move |(kind, credential, narrowing, permits, reach, reach_tested_on)| ConnectorEntry {
+                name: name.into(),
+                kind,
+                credential,
+                principal: name.into(),
+                narrowing,
+                permits,
+                reach: reach.into_iter().collect(),
+                reach_tested_on,
+            },
+        )
+}
+
+fn any_entry_tool(name: &'static str) -> impl Strategy<Value = ApprovedTool> {
+    let classification =
+        prop_oneof![7 => Just(Classification::Read), 1 => select(Classification::ALL.to_vec())];
+    let declaration = prop_oneof![
+        1 => Just(ResourceDeclaration::NoResources),
+        4 => Just(ResourceDeclaration::Declared),
+        1 => Just(ResourceDeclaration::ChecksOwnScope),
+    ];
+    let from = proptest::option::weighted(
+        0.75,
+        prop_oneof![6 => Just(DeclaredFrom::Arguments), 1 => Just(DeclaredFrom::Reach)],
+    );
+    (classification, declaration, from, select(ENTRIES.to_vec())).prop_map(
+        move |(classification, resources, from, connector)| ApprovedTool {
+            name: tool_name(name),
+            classification,
+            connector: connector.into(),
+            resources,
+            declared_from: from.filter(|_| resources == ResourceDeclaration::Declared),
+        },
+    )
+}
+
+/// Limits as [`any_limits`] draws them, or, half the time for each team and group, the whole
+/// pool, so that rule 5 often lets a whole reach be served.
+fn any_entry_limits() -> impl Strategy<Value = ResourceLimits> {
+    let whole: BTreeSet<Resource> = resource_pool().into_iter().collect();
+    (
+        any_limits(),
+        [any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()],
+    )
+        .prop_map(move |(mut limits, widen)| {
+            let mut widen = widen.into_iter();
+            for limit in limits.teams.values_mut().chain(limits.groups.values_mut()) {
+                if widen.next().unwrap_or(false) {
+                    limit.clone_from(&whole);
+                }
+            }
+            limits
+        })
+}
+
+/// Policy data with connector entries, which the loader may or may not accept.
+fn any_entry_data() -> impl Strategy<Value = SnapshotData> {
+    (
+        (
+            any_entry_tool(TOOLS[0]),
+            any_entry_tool(TOOLS[1]),
+            any_entry_tool(TOOLS[2]),
+        ),
+        (any_surface(SURFACES[0]), any_surface(SURFACES[1])),
+        any_entry_limits(),
+        (any_entry(ENTRIES[0]), any_entry(ENTRIES[1])),
+    )
+        .prop_map(
+            |((one, two, three), (a, b), limits, (first, second))| SnapshotData {
+                revision: "generated".into(),
+                tools: vec![one, two, three],
+                surfaces: vec![a, b],
+                profiles: Vec::new(),
+                limits,
+                entries: vec![first, second],
+            },
+        )
+}
+
+/// A limit, if there is one, and a reach it must hold.
+type Admission = (Option<BTreeSet<Resource>>, BTreeSet<Resource>);
+
+/// Each time a snapshot's surface serves a team or group a tool whose entry's whole reach any
+/// call can reach (decision 0011, Consequences): that team's or group's limit, and the reach.
+fn whole_reach_admissions(snapshot: &PolicySnapshot) -> Vec<Admission> {
+    let mut admissions = Vec::new();
+    for surface in snapshot.surfaces() {
+        for tool in surface.tools.iter().filter_map(|name| snapshot.tool(name)) {
+            let Some(entry) = snapshot.entry(&tool.connector) else {
+                continue;
+            };
+            let whole = tool.declared_from == Some(DeclaredFrom::Reach)
+                || (entry.kind == EntryKind::Proxied && entry.narrowing == Narrowing::None);
+            if !whole {
+                continue;
+            }
+            for team in &surface.teams {
+                let limit = snapshot.limits().teams.get(team).cloned();
+                admissions.push((limit, entry.reach.clone()));
+            }
+            for group in &surface.groups {
+                let limit = snapshot.limits().groups.get(group).cloned();
+                admissions.push((limit, entry.reach.clone()));
+            }
+        }
+    }
+    admissions
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+
+    /// For any snapshot that loads, every admitted team's and group's limit holds the whole
+    /// reach of every tool on its surfaces that is declared as the reach, or is proxied with
+    /// narrowing `none`.
+    #[test]
+    fn every_admitted_limit_holds_the_whole_reach_it_is_served(data in any_entry_data()) {
+        if let Ok(snapshot) = PolicySnapshot::new(data) {
+            for (limit, reach) in whole_reach_admissions(&snapshot) {
+                let limit = limit.unwrap_or_default();
+                prop_assert!(reach.is_subset(&limit), "reach {reach:?} outside limit {limit:?}");
+            }
+        }
+    }
+
+    /// A withdrawal only narrows: nothing it serves was not served before, every call it allows
+    /// was allowed before, and the withdrawn tools are on no surface.
+    #[test]
+    fn a_withdrawal_only_narrows(world in world(), withdrawn in subset(TOOLS.to_vec())) {
+        let withdrawn = tool_names(withdrawn);
+        let snapshot = world.snapshot();
+        let derived = snapshot.without(&withdrawn, "generated+withdrawn".into());
+        prop_assert_eq!(derived.revision().as_str(), "generated+withdrawn");
+        prop_assert_eq!(derived.limits(), snapshot.limits());
+        for surface in derived.surfaces() {
+            let before = snapshot.surface(&surface.name).unwrap();
+            prop_assert!(surface.tools.is_subset(&before.tools));
+            prop_assert!(surface.tools.is_disjoint(&withdrawn), "{surface:?}");
+            prop_assert_eq!(&surface.teams, &before.teams);
+            prop_assert_eq!(&surface.groups, &before.groups);
+        }
+        for name in &withdrawn {
+            prop_assert!(derived.tool(name).is_none());
+        }
+        let call = world.call();
+        if decide(&derived, &call).is_allowed() {
+            prop_assert!(decide(&snapshot, &call).is_allowed());
+        }
+        let caller = world.caller();
+        let before: BTreeSet<ToolName> =
+            list_tools(&snapshot, &caller).iter().map(|tool| tool.name.clone()).collect();
+        let after: BTreeSet<ToolName> =
+            list_tools(&derived, &caller).iter().map(|tool| tool.name.clone()).collect();
+        prop_assert!(after.is_subset(&before));
+        prop_assert!(after.is_disjoint(&withdrawn));
+    }
+}
+
+/// The reach property is not vacuous: arbitrary entry snapshots load, and some of them serve a
+/// whole reach that is not empty to a team or group.
+#[test]
+fn entry_snapshots_load_and_serve_a_whole_reach() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = any_entry_data();
+    let (mut loaded, mut served) = (0, 0);
+    for _ in 0..5_000 {
+        let data = strategy
+            .new_tree(&mut runner)
+            .expect("generate policy data")
+            .current();
+        if let Ok(snapshot) = PolicySnapshot::new(data) {
+            loaded += 1;
+            if whole_reach_admissions(&snapshot)
+                .iter()
+                .any(|(_, reach)| !reach.is_empty())
+            {
+                served += 1;
+            }
+        }
+    }
+    assert!(
+        loaded > 300 && served > 30,
+        "loaded {loaded}, served a whole reach {served}"
     );
 }

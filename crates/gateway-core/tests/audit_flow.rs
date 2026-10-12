@@ -63,6 +63,7 @@ fn tool(name: &str, classification: Classification) -> ApprovedTool {
         classification,
         connector: "fixture".into(),
         resources: ResourceDeclaration::NoResources,
+        declared_from: None,
     }
 }
 
@@ -105,6 +106,7 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
             },
         ],
         limits: limits(),
+        entries: Vec::new(),
     })
     .unwrap()
 }
