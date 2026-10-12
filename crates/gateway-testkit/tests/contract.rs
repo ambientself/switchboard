@@ -8,7 +8,9 @@ use gateway_core::AuditStore;
 use gateway_core::audit::AuditRowId;
 use gateway_identity::Clock;
 use gateway_testkit::contract::{ContractStore, StoredRow};
-use gateway_testkit::{FixedClock, InMemoryAuditStore, StoreBudgets, block_on, contract};
+use gateway_testkit::{
+    FIXTURE_NOW, FixedClock, InMemoryAuditStore, StoreBudgets, block_on, contract,
+};
 
 /// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
 /// each with a part millisecond, which the store drops as Postgres's does.
@@ -17,9 +19,11 @@ const BUDGETS: StoreBudgets = StoreBudgets {
     finish_deadline: Duration::from_micros(45_000_700),
 };
 
-/// The in-memory store given [`BUDGETS`] and a clock. It answers the suite with [`BUDGETS`]
-/// and that clock, not with anything the store holds, so a store that ignored either would
-/// fail the deadline and time cases.
+/// The in-memory store given [`BUDGETS`] and a clock a day past [`FIXTURE_NOW`], where the
+/// store's default clock reads. It answers the suite with [`BUDGETS`] and that clock, not with
+/// anything the store holds, so a store that ignored either would fail the deadline and time
+/// cases. The day is a whole multiple of 16 seconds, so the deadline-end case still lands
+/// exactly on the end of what a Postgres time holds.
 struct InMemory {
     store: InMemoryAuditStore,
     clock: Arc<FixedClock>,
@@ -27,7 +31,7 @@ struct InMemory {
 
 impl InMemory {
     fn new() -> Self {
-        let clock = Arc::new(FixedClock::default());
+        let clock = Arc::new(FixedClock::at(FIXTURE_NOW + 86_400));
         Self {
             store: InMemoryAuditStore::new()
                 .with_budgets(BUDGETS)
