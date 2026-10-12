@@ -11,15 +11,23 @@
 //! it rather than passing a test the real store would fail.
 //!
 //! It covers the suite's items 1 to 3; of item 4, that a call row's time at begin comes from
-//! the store's clock and its deadline is that time plus the budgets and the call deadline; and
-//! of item 5, that a list row is stored complete with no deadline. That the store overwrites
-//! times an insert carries cannot be tried through [`AuditStore`], whose callers pass no times:
-//! the Postgres schema tests try it. The open-row query and receipts are not here: the query is
-//! Postgres's alone for now, and receipts are not built.
+//! the store's clock and its deadline is that time plus the budgets and the call deadline, as
+//! Postgres works it out; and of item 5, that a list row is stored complete with no deadline,
+//! with its time at begin from the store's clock, and is never completed. That the store
+//! overwrites times an insert carries cannot be tried through [`AuditStore`], whose callers
+//! pass no times: the Postgres schema tests try it. The open-row query and receipts are not
+//! here: the query is Postgres's alone for now, and receipts are not built.
 //!
-//! The functions read no clock but the store's, through [`ContractStore::now`], and spawn nothing, so they run on whatever executor the runner
-//! has: [`block_on`](crate::block_on) for the in-memory store, a Tokio runtime for Postgres.
-//! They are tests: a broken expectation panics, as an assertion does.
+//! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
+//! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
+//! any time at begin after 1999 so is the deadline it gives, and a runner cannot set the
+//! database's clock, so the two refusals look alike. A call record of kind `list` handed to
+//! begin is refused by the Postgres table, and the in-memory store still keeps it.
+//!
+//! The functions read no clock but the store's, through [`ContractStore::now`], and spawn
+//! nothing, so they run on whatever executor the runner has: [`block_on`](crate::block_on)
+//! for the in-memory store, a Tokio runtime for Postgres. They are tests: a broken
+//! expectation panics, as an assertion does.
 
 #![allow(
     clippy::expect_used,
@@ -28,7 +36,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
@@ -57,8 +65,8 @@ pub trait ContractStore {
     fn store(&self) -> &dyn AuditStore;
 
     /// The row stored under `row`, read back as the store holds it, or `None` if it holds none.
-    /// As strict as the store allows: the whole record, its completion and kind, and whether
-    /// the store's time at begin and whether it set a deadline. A store that holds two rows under one
+    /// As strict as the store allows: the whole record, its completion and kind, its time at
+    /// begin, and whether the store set a deadline. A store that holds two rows under one
     /// identifier, which Postgres's primary key forbids, makes this panic.
     fn stored(&self, row: &AuditRowId) -> impl Future<Output = Option<StoredRow>>;
 
@@ -98,47 +106,35 @@ pub struct StoredRow {
     pub deadline_after_begin: Option<Duration>,
 }
 
-impl ContractStore for InMemoryAuditStore {
-    fn store(&self) -> &dyn AuditStore {
-        self
-    }
-
-    async fn stored(&self, row: &AuditRowId) -> Option<StoredRow> {
-        let mut found = self.stored_under(row);
-        assert!(
-            found.len() <= 1,
-            "the store holds {} rows under {}, where Postgres's primary key allows one",
-            found.len(),
-            row.as_str()
-        );
-        let (record, begun_at, deadline) = found.pop()?;
-        let (kind, completion) = match &record {
-            StoredRecord::Call(call) => (call.kind, call.completion.clone()),
-            StoredRecord::List(_) => (RowKind::List, None),
-        };
-        Some(StoredRow {
-            record,
-            kind,
-            completion,
-            begun_at: Some(begun_at),
-            deadline_set: deadline.is_some(),
-            deadline_after_begin: deadline.map(|deadline| {
-                deadline
-                    .duration_since(begun_at)
-                    .expect("the row's deadline is before its time at begin")
-            }),
-        })
-    }
-
-    /// The budgets the store holds. A runner that gave it budgets answers with those instead,
-    /// as `tests/contract.rs` does, or a store that ignored them would pass.
-    fn budgets(&self) -> StoreBudgets {
-        self.store_budgets()
-    }
-
-    async fn now(&self) -> SystemTime {
-        self.store_now()
-    }
+/// The row `store` holds under `row`, for a runner's [`ContractStore::stored`] over the
+/// in-memory store. The runner answers [`ContractStore::budgets`] and [`ContractStore::now`]
+/// with the budgets and the clock it gave the store, not with any the store holds, so a store
+/// that ignores them is caught.
+pub fn stored_in_memory(store: &InMemoryAuditStore, row: &AuditRowId) -> Option<StoredRow> {
+    let mut found = store.stored_under(row);
+    assert!(
+        found.len() <= 1,
+        "the store holds {} rows under {}, where Postgres's primary key allows one",
+        found.len(),
+        row.as_str()
+    );
+    let (record, begun_at, deadline) = found.pop()?;
+    let (kind, completion) = match &record {
+        StoredRecord::Call(call) => (call.kind, call.completion.clone()),
+        StoredRecord::List(_) => (RowKind::List, None),
+    };
+    Some(StoredRow {
+        record,
+        kind,
+        completion,
+        begun_at: Some(begun_at),
+        deadline_set: deadline.is_some(),
+        deadline_after_begin: deadline.map(|deadline| {
+            deadline
+                .duration_since(begun_at)
+                .expect("the row's deadline is before its time at begin")
+        }),
+    })
 }
 
 // --- Calls a function makes through the core ----------------------------------------------------
@@ -247,6 +243,8 @@ async fn stored(contract: &impl ContractStore, row: &AuditRowId) -> StoredRow {
         .unwrap_or_else(|| panic!("no row is stored under {}", row.as_str()))
 }
 
+/// A duration in whole milliseconds, as the Postgres store counts each budget: a part
+/// millisecond is dropped.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -501,8 +499,9 @@ pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
         assert_eq!(contract.stored(&row).await, None, "{record:?}");
     }
 
-    let uppercase = row_start().row.as_str().to_uppercase();
-    for id in ["not-a-row", uppercase.as_str(), ""] {
+    // A UUID with uppercase hex letters, where a store wants lowercase.
+    let uppercase = "6F9619FF-8B86-4D01-B42D-00C04FC964FF";
+    for id in ["not-a-row", uppercase, ""] {
         let row = AuditRowId::new(id);
         let begun = store.begin(&row, &base).await;
         assert!(begun.is_err(), "the store accepted the identifier {id:?}");
@@ -784,21 +783,41 @@ pub async fn an_error_is_stored_with_its_kind_and_a_repeat_must_match_it(
 
 // --- Item 4: the deadline -----------------------------------------------------------------------
 
+/// The span Postgres's `set_times` adds to a call row's time at begin for an allowance:
+/// `allowance_ms * interval '1 millisecond'`. The `bigint` is cast to `float8` and multiplied
+/// by the interval's 1000 microseconds in `float8`, so past 2^53 microseconds the span is the
+/// nearest `float8` to the exact one, a few microseconds off it.
+fn postgres_span(allowance_ms: u64) -> Duration {
+    // At these sizes the product is a whole number, and below 2^64.
+    Duration::from_micros((1000.0 * allowance_ms as f64) as u64)
+}
+
+/// The end of what a Postgres time holds, 294277-01-01 00:00:00 UTC, which is itself out of
+/// range: 9,223,371,331,200,000,000 microseconds after the Postgres epoch, 2000-01-01 UTC.
+fn postgres_end() -> SystemTime {
+    UNIX_EPOCH + Duration::from_micros(946_684_800_000_000 + 9_223_371_331_200_000_000)
+}
+
 /// Each row of kind `call`, allowed or denied, has a time at begin from the store's clock, and a
 /// deadline the store sets: its time at begin plus the begin budget, the call deadline and the
-/// finish deadline, each in whole milliseconds.
+/// finish deadline, each budget in whole milliseconds, added as Postgres adds them. A deadline
+/// at the end of what a Postgres time holds is refused, and leaves no row.
 pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline(
     contract: &impl ContractStore,
 ) {
     let store = contract.store();
     let fixture = fixture();
     let budgets = contract.budgets();
+    let budgets_ms = millis(budgets.begin) + millis(budgets.finish_deadline);
     for (call, call_deadline_ms) in [
         (&ALLOWED, crate::FIXTURE_CALL_DEADLINE_MS),
         (&DENIED, crate::FIXTURE_CALL_DEADLINE_MS),
         (&ALLOWED, 0),
         (&ALLOWED, 1),
         (&DENIED, 7 * 86_400_000 + 3),
+        // An odd allowance whose span in microseconds is past 2^56, where a `float8` holds
+        // only multiples of 16: Postgres's span is 8 microseconds off the exact one.
+        (&ALLOWED, 100_000_000_000_001 - budgets_ms),
     ] {
         let start = RowStart {
             call_deadline_ms,
@@ -817,13 +836,54 @@ pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_
              {before:?} and {after:?}"
         );
         assert!(stored.deadline_set, "{stored:?}");
-        let allowance = millis(budgets.begin) + call_deadline_ms + millis(budgets.finish_deadline);
+        let allowance = budgets_ms + call_deadline_ms;
         assert_eq!(
             stored.deadline_after_begin,
-            Some(Duration::from_millis(allowance)),
+            Some(postgres_span(allowance)),
             "{call:?} with a call deadline of {call_deadline_ms} ms"
         );
     }
+    assert_eq!(
+        postgres_span(100_000_000_000_001),
+        Duration::from_micros(100_000_000_000_000_992),
+        "Postgres's span is not the float8 product"
+    );
+
+    // The smallest allowance whose deadline, counted from a time read before the begin, is at
+    // or past the end. The row is begun at that time or later, so its deadline is too. On a
+    // clock that stands still, as the in-memory runner's does, the deadline is the end itself
+    // where some allowance reaches it exactly.
+    let before = contract.now().await;
+    let room = postgres_end()
+        .duration_since(before)
+        .expect("the store's clock is past the end of a Postgres time");
+    let (mut short, mut enough) = (0, u64::MAX / 1000);
+    while enough - short > 1 {
+        let middle = short + (enough - short) / 2;
+        if postgres_span(middle) >= room {
+            enough = middle;
+        } else {
+            short = middle;
+        }
+    }
+    let start = RowStart {
+        call_deadline_ms: enough - budgets_ms,
+        ..row_start()
+    };
+    let begun = begin(
+        store,
+        &fixture,
+        &start,
+        &ALLOWED,
+        RequestMetadata::default(),
+    )
+    .await;
+    assert!(
+        begun.is_err(),
+        "a deadline {:?} past the end of a Postgres time was written",
+        postgres_span(enough) - room
+    );
+    assert_eq!(contract.stored(&start.row).await, None);
 }
 
 // --- Item 5: list rows --------------------------------------------------------------------------
@@ -887,18 +947,26 @@ fn list_records() -> Vec<ListRecord> {
 }
 
 /// A list row is stored exactly as the list record, of kind `list`, complete: with a time at
-/// begin, no completion and no deadline. A second list under its identifier returns `Ok` and
-/// changes nothing, whatever it records. A begin under a list row's identifier, and a list under
-/// a call row's, are refused, and the stored row stands.
+/// begin from the store's clock, no completion and no deadline. A second list under its
+/// identifier returns `Ok` and changes nothing, whatever it records. A begin under a list row's
+/// identifier, and a list under a call row's, are refused, and the stored row stands. A finish
+/// naming a list row is refused as `complete_once` refuses it, as a listing, and the row stands.
 pub async fn a_list_row_is_stored_complete_with_no_deadline(contract: &impl ContractStore) {
     let store = contract.store();
     let fixture = fixture();
     let records = list_records();
     for (position, written) in records.iter().enumerate() {
         let row = row_start().row;
+        let before = contract.now().await;
         store.list(&row, written).await.expect("list");
+        let after = contract.now().await;
         let first = stored(contract, &row).await;
-        assert!(first.begun_at.is_some(), "{first:?}");
+        let begun_at = first.begun_at.expect("the list row has no time at begin");
+        assert!(
+            before <= begun_at && begun_at <= after,
+            "the list row's time at begin is not from the store's clock: {begun_at:?} is not \
+             between {before:?} and {after:?}"
+        );
         let expected = StoredRow {
             record: StoredRecord::List(written.clone()),
             kind: RowKind::List,
@@ -941,4 +1009,23 @@ pub async fn a_list_row_is_stored_complete_with_no_deadline(contract: &impl Cont
         "a list was written under a call row's identifier"
     );
     assert_eq!(stored(contract, &start.row).await, call);
+
+    // A guard for an identifier the store then lists under. The store refuses a begin under a
+    // list row's identifier, so the guard is begun on another store, which only hands it out.
+    let start = row_start();
+    let guard = guard(&InMemoryAuditStore::new(), &fixture, &start, &ALLOWED).await;
+    store.list(&start.row, &records[0]).await.expect("list");
+    let listed = stored(contract, &start.row).await;
+    let ran = audit::run(&connector(), guard).await;
+    let failure = audit::finish(store, ran, 7)
+        .await
+        .failure()
+        .expect("a list row was completed")
+        .to_string();
+    // complete_once's words: the row is there, and records a listing.
+    assert!(
+        failure.contains("records a listing"),
+        "a finish naming a list row was refused for another reason: {failure}"
+    );
+    assert_eq!(stored(contract, &start.row).await, listed);
 }

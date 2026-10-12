@@ -1192,6 +1192,11 @@ mutate("testkit-begin-compares-more-than-decision", "a begin with a known identi
        "                    && AuditRecord { completion: None, ..stored.clone() } == *record => {}")
 mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clock, not its own, for a row's times", A,
        "        let begun_at = self.clock.now();", "        let begun_at = SystemTime::now();")
+mutate("testkit-list-wrong-clock", "the in-memory store reads the system clock, not its own, for a list row's time at begin", A,
+       "                    .push((row.clone(), record.clone(), self.clock.now()));",
+       "                    .push((row.clone(), record.clone(), SystemTime::now()));")
+mutate("testkit-clock-ignored", "the in-memory store keeps its default clock, not the one it was given", A,
+       "        self.clock = clock;\n        self\n", "        let _ = clock;\n        self\n")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
        "                let _ = state.complete(row, &error);", "                let _ = &error;")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
