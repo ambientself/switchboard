@@ -4571,8 +4571,8 @@ mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for
        "    if finding != ProbeFinding::NotShown {\n")
 # Decision 0011, section 4: beside each poll, the reach check sends each entry's canary through
 # the gateway's own listener as the registry's workload. Only a successful canary withdraws the
-# entry's tools; a refusal holds and a failed check withdraws nothing. tests/reach.rs watches
-# each.
+# entry's tools; a refusal holds and a failed check withdraws nothing. The first check runs
+# beside the schedule, so it delays no poll. tests/reach.rs watches each.
 mutate("gw-reach-success-kept", "a canary the server answered withdraws nothing, so a widened reach stays served", DRIFT,
        "                self.withdraw(state, server, found);\n",
        "                let _ = (state, found);\n")
@@ -4587,6 +4587,10 @@ mutate("gw-reach-failure-withdraws", "a failed reach check withdraws the entry's
 mutate("gw-reach-never-runs", "no reach check is ever made, so a widened reach is never found", DRIFT,
        "    let Some((caller, deadline)) = &entry.reach else {\n",
        "    let Some((caller, deadline)) = entry.reach.as_ref().filter(|_| false) else {\n")
+mutate("gw-reach-first-check-delays-first-poll", "the first poll waits for the first reach check, so a check that hangs puts a changed definition past its withdrawal bound", DRIFT,
+       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
+       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
+       "    while first.join_next().await.is_some() {}\n    loop {\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------

@@ -66,8 +66,12 @@
 //! the registry's own workload identity, so it is decided and audited like any call. It goes
 //! through the listener, so it never runs in the boot pass, which comes before the listener is
 //! bound: [`DriftPass::run`] makes each entry's first check as soon as it starts, after the
-//! binary has bound the listener, and one more beside each poll after. What the answer means is
-//! [`reach::Verdict`](crate::reach::Verdict)'s:
+//! binary has bound the listener, and one more beside each poll after. That first check runs
+//! beside the entry's schedule, so it delays no poll. A check takes up to the call deadline
+//! plus [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE), and the next poll waits for the
+//! check beside the last, so with reach checked the bounds above hold when the interval is at
+//! least the deadline plus that allowance, as at the defaults and in the demos. What the answer
+//! means is [`reach::Verdict`](crate::reach::Verdict)'s:
 //!
 //! - **Held**, the server refused the canary: logged as [`REACH_HELD_EVENT`] at INFO and
 //!   counted in `switchboard_reach_checks_total{result="held"}`.
@@ -983,7 +987,8 @@ impl DriftPass {
     /// server delays no other server's polls. Each server's first poll is an interval from now:
     /// boot ran one already, before the listener was bound. With a reach caller, each server's
     /// reach is checked at once, since the binary starts this only once the listener is bound,
-    /// and again beside each poll.
+    /// and again beside each poll. That first check runs beside the schedule, so it delays no
+    /// poll.
     pub async fn run(self) {
         let mut entries = JoinSet::new();
         for (server, connector) in &self.servers {
@@ -1068,22 +1073,33 @@ async fn poll(withdrawals: Arc<Withdrawals>, entry: Entry) {
 /// within one interval plus that deadline, and with a shorter one, within about two call
 /// deadlines (#165). A poll whose task fails is logged, and the next runs as usual.
 ///
-/// Its reach is checked at once, and again beside each poll. A reach that has widened is then
-/// withdrawn within one interval plus the call deadline and the reach check's allowance.
+/// Its reach is checked at once, beside the schedule, and again beside each poll. The first
+/// check delays no poll: a poll that comes while it is still out makes no check of its own, so
+/// two checks of one entry never run together. A check takes up to the call deadline plus
+/// [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE), and the next poll waits for the check
+/// beside the last, so with reach checked the bounds above hold when the interval is at least
+/// the deadline plus that allowance, as at the defaults and in the demos. A reach that has
+/// widened is then withdrawn within one interval plus the call deadline and the allowance.
 async fn poll_every(withdrawals: Arc<Withdrawals>, entry: Entry, interval: Duration) {
-    // Each in its own task, so a panic ends that poll or check alone; dropped with the set
-    // when the pass is aborted.
-    let mut first = JoinSet::new();
-    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));
-    if let Some(Err(error)) = first.join_next().await {
-        tracing::error!(%error, server = %entry.server, "a reach check's task failed");
-    }
     let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Each in its own task, so a panic ends that poll or check alone; dropped with the set
+    // when the pass is aborted. The first check runs beside the schedule, not before it.
+    let mut first = JoinSet::new();
+    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));
     loop {
         every.tick().await;
+        while let Some(checked) = first.try_join_next() {
+            if let Err(error) = checked {
+                tracing::error!(%error, server = %entry.server, "a reach check's task failed");
+            }
+        }
         let mut one = JoinSet::new();
-        one.spawn(poll_and_check(Arc::clone(&withdrawals), entry.clone()));
+        if first.is_empty() {
+            one.spawn(poll_and_check(Arc::clone(&withdrawals), entry.clone()));
+        } else {
+            one.spawn(poll(Arc::clone(&withdrawals), entry.clone()));
+        }
         if let Some(Err(error)) = one.join_next().await {
             tracing::error!(%error, server = %entry.server, "a drift poll's task failed");
         }

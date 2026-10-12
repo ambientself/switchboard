@@ -1135,7 +1135,8 @@ reload while the tool's hashes and `approved_at` are unchanged; a new approval c
 first pass's tool lists and probes run at boot, before the replica binds the one listener that
 serves `/readyz` and every surface, so it serves nothing until they finish. Its reach checks
 are calls through that listener, so they run as soon as it is bound; until they finish, at
-most one call deadline, a reach that has widened is served, as between any two passes. A poll
+most one call deadline plus 5 s, a reach that has widened is served, as between any two
+passes. They run beside the first scheduled polls and delay none of them. A poll
 that fails, by being unreachable, late or unparsable, is not drift: the tools stay served and
 the failure is counted and alerted on.
 Each replica checks for itself, so a change that lasts one interval plus one call deadline,
@@ -1495,10 +1496,12 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   schedule of its own, so a server that answers late holds back no other server's polls. Each
   server is polled one poll at a time, so section 13's bound of one interval plus one call
   deadline holds when the interval is at least the entry's call deadline, as at the defaults
-  and in the demos. With a shorter interval, a list answered late but inside the deadline holds
-  back that server's next poll until it arrives, and the worst case is about two call deadlines
-  (#165). An approved tool whose served definition no longer hashes to its `definition_sha256`,
-  by the loader's own function, or that the server no longer lists, is withdrawn: the policy in
+  and in the demos. With the reach check (below), the next poll also waits for the check beside
+  the last, so the bound holds when the interval is at least the deadline plus 5 s, as there
+  too. With a shorter interval, a list answered late but inside the deadline holds back that
+  server's next poll until it arrives, and the worst case is about two call deadlines (#165).
+  An approved tool whose served definition no longer hashes to its `definition_sha256`, by the
+  loader's own function, or that the server no longer lists, is withdrawn: the policy in
   force less the tool, under the revision `{base}+withdrawn:{names}`, swapped in atomically,
   with `tool_withdrawn` logged at ERROR and counted. A poll is judged only against the
   approvals it began under, so a list read before a reload approved a tool again does not
@@ -1512,12 +1515,13 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   5, step 3). With `[drift] reach_token_file`, `reach_url` and `reach_host` set, given together
   or not at all, each entry with a `reach_check` is checked beside each poll, and once as soon
   as the drift pass starts, after the listener is bound; never in the boot pass, which comes
-  before it. The check sends the entry's canary as `tools/call` to the replica's own listener,
-  on the `registry-reach` surface, with the registry's own workload token: a principal the
-  surface admits alone, by issuer and subject, in team `registry`, whose limit holds each
-  entry's reach and canary, so the call is decided, audited and sent with the entry's
-  credential like any other. An error result whose text is the proxy's upstream-refused
-  sentence holds, logged as `reach_held`. A successful result is a mismatch: every tool of the
+  before it. That first check runs beside the entry's schedule and delays no poll; a poll that
+  comes while it is out makes no check of its own. The check sends the entry's canary as
+  `tools/call` to the replica's own listener, on the `registry-reach` surface, with the
+  registry's own workload token: a principal the surface admits alone, by issuer and subject,
+  in team `registry`, whose limit holds each entry's reach and canary, so the call is decided,
+  audited and sent with the entry's credential like any other. An error result whose text is
+  the proxy's upstream-refused sentence holds, logged as `reach_held`. A successful result is a mismatch: every tool of the
   entry is withdrawn with the cause `reach mismatch`, judged against the approvals the check
   began under, logged as `reach_mismatch` and `tool_withdrawn` at ERROR, and a new approval
   clears it. Anything else, a denial, an audit failure, a token that cannot be read or no

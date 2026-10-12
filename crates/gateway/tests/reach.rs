@@ -179,6 +179,12 @@ impl Replica {
     /// registry's ServiceAccount and `IMPOSTOR_SA` to team registry, and whose reach check
     /// presents the registry's token unless `with_token` is false.
     async fn new(name: &str, url: &str, with_token: bool) -> Self {
+        Self::reaching(name, url, with_token, None).await
+    }
+
+    /// As [`Replica::new`], with the reach check sent to `reach` in place of the replica's own
+    /// listener when it is given.
+    async fn reaching(name: &str, url: &str, with_token: bool, reach: Option<SocketAddr>) -> Self {
         let files = Files::new(name, &issuer().jwks_document(), url);
         files.write(
             "teams.toml",
@@ -195,7 +201,10 @@ impl Replica {
         let address = listener.local_addr().unwrap();
         let reach = ReachSettings::from_fields(
             Some(Path::new("registry-token")),
-            Some(&format!("http://{address}/mcp/{REACH_SURFACE}")),
+            Some(&format!(
+                "http://{}/mcp/{REACH_SURFACE}",
+                reach.unwrap_or(address)
+            )),
             Some("127.0.0.1"),
             &deployment.http.allowed_hosts,
             &files.dir,
@@ -453,6 +462,53 @@ async fn a_refused_canary_is_held_with_a_row_by_the_registry_principal() {
     // The registry's token is never logged.
     let presented = std::fs::read_to_string(replica.files.path("registry-token")).unwrap();
     assert!(!captured.text().contains(presented.trim()));
+}
+
+/// A first reach check that hangs does not hold back the first poll: each entry's schedule
+/// begins before its first check, so the first poll comes an interval after the pass starts
+/// while that check still waits for an answer (the call deadline plus the allowance).
+#[tokio::test]
+async fn a_hanging_first_check_does_not_delay_the_first_poll() {
+    let mock = mock().await;
+    // A listener that takes each connection and never answers.
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_address = silent.local_addr().unwrap();
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            open.push(stream);
+        }
+    });
+    let replica = Replica::reaching("reach-hang", &mock.url(), true, Some(silent_address)).await;
+
+    let signals = replica.drift.signals();
+    let started = Instant::now();
+    let running = tokio::spawn(replica.drift.run());
+    eventually("both entries' first polls", || {
+        signals
+            .counts()
+            .iter()
+            .all(|(_, counts)| counts.polls_ok >= 1)
+    })
+    .await;
+    let elapsed = started.elapsed();
+    let counts = signals.counts();
+    running.abort();
+    held.abort();
+    // About one interval, and far short of the hanging check's deadline and allowance.
+    assert!(elapsed < 3 * INTERVAL, "{elapsed:?}");
+    // The first checks were still waiting when the polls came.
+    for (server, counts) in &counts {
+        assert_eq!(
+            (
+                counts.reach_held,
+                counts.reach_mismatch,
+                counts.reach_failed
+            ),
+            (0, 0, 0),
+            "{server}: {counts:?}"
+        );
+    }
 }
 
 /// A widened caller is withdrawn: once the server answers docs-team-a's canary, every tool of
