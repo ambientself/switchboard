@@ -3806,6 +3806,33 @@ mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whicheve
        ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
        """      | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision)\n""", "")
+# #88, decision 0013 section 10: the kind gateway fetches the cluster's keys over TLS with no
+# token, under one binding of the issuer-discovery ClusterRole to unauthenticated callers.
+mutate("demo-kind-keys-file-still-used", "the kind gateway still reads its keys from a file the driver copies", "deploy/kind/base/config/gateway.toml",
+       'keys_url = "https://kubernetes.default.svc.cluster.local/openid/v1/jwks"\nkeys_ca_file = "/etc/switchboard/cluster-ca/ca.crt"\n',
+       'keys_file = "/etc/switchboard/issuer/jwks.json"\n')
+mutate("demo-kind-keys-fetch-unchecked", "the kind run never checks that the gateway fetched the issuer's keys", DRIVER,
+       '    check_keys_fetched "$FETCHED" "$KIND_ISSUER"\n', "")
+mutate("demo-kind-discovery-binding-widened", "the discovery binding gives unauthenticated callers a broader ClusterRole", "deploy/kind/base/issuer-discovery.yaml",
+       "  name: system:service-account-issuer-discovery\n", "  name: view\n")
+mutate("demo-kind-discovery-binding-extra-subject", "the discovery binding names a second subject", "deploy/kind/base/issuer-discovery.yaml",
+       "    name: system:unauthenticated\n",
+       "    name: system:unauthenticated\n  - apiGroup: rbac.authorization.k8s.io\n    kind: Group\n    name: system:authenticated\n")
+mutate_all("demo-kind-gateway-keys-token", "the gateway container mounts a projected token for the API server's audience",
+           ("deploy/kind/base/gateway.yaml",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n"
+            "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n"),
+           ("deploy/kind/base/gateway.yaml",
+            "          configMap: {name: kube-root-ca.crt}\n",
+            "          configMap: {name: kube-root-ca.crt}\n"
+            "        - name: api-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
+            "                  audience: https://kubernetes.default.svc.cluster.local\n                  expirationSeconds: 600\n                  path: token\n"))
+mutate("demo-kind-gateway-keys-token-unset-audience", "the gateway's CA volume also projects a token with no audience, which is the API server's",
+       "deploy/kind/base/gateway.yaml",
+       "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}\n",
+       "        - name: cluster-ca\n          projected:\n            sources:\n              - configMap: {name: kube-root-ca.crt}\n"
+       "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
        '    check "curl exit $code, ${connects:-no} connections"', '    check "curl exit $code, 0 connections"')
 mutate("demo-workload-idle-no-trap", "the idle workload has no trap, so SIGTERM kills it and it never passes", WORKLOAD,
@@ -4234,8 +4261,9 @@ mutate("demo-kind-gateway-token-long-lived", "the gateway's token for mock-docs 
        "                  expirationSeconds: 600\n", "                  expirationSeconds: 86400\n")
 mutate("demo-kind-mock-docs-any-subject", "mock-docs accepts a workload's ServiceAccount", KIND_MOCK_DOCS,
        '"system:serviceaccount:switchboard:gateway"', '"system:serviceaccount:team-a:mock-workload"')
-mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys only for the gateway", DRIVER,
-       "  for ns in switchboard mock-docs; do\n", "  for ns in switchboard; do\n")
+# #88: the gateway fetches its own keys; only mock-docs still reads the copy.
+mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys into the gateway's namespace, not mock-docs'", DRIVER,
+       "  k -n mock-docs create configmap cluster-issuer-keys ", "  k -n switchboard create configmap cluster-issuer-keys ")
 mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
            (DRIVER, """'$1 == "accepted" && $2 == subject && NF == 2 { n++ }""", """'$1 == "accepted" { n++ }"""),
            (DRIVER, """'$1 == "accepted" && !($2 == subject && NF == 2) { n++ }""", """'$1 == "accepted" && 0 { n++ }"""))
