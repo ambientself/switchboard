@@ -118,10 +118,10 @@ the workload's answers, the step's own audit rows, the gateway's log lines or me
    sentence and completed as `error` of the kind `oversized_or_late_read`, and each was held to
    the deadline and no longer, as in the hanging-server step: its row's latency is 5 s and less
    than a second more, and its client, by curl's clock, was answered no sooner than 50 ms before
-   the deadline and no more than 1.5 s after it. One is refused with the team-capacity sentence and completed
-   as `refused`, its row recording the sentence, and `switchboard_calls_shed_total{scope="team"}`
-   rises by one. Team-b's reads are answered meanwhile, and every one of them, 30 in Compose and
-   60 in kind, is allowed and answered `ok`.
+   the deadline and no more than 1.5 s after it. One is refused with the team-capacity sentence
+   and completed as `refused`, its row recording the sentence, and
+   `switchboard_calls_shed_total{scope="team"}` rises by one. Team-b's reads are answered
+   meanwhile, and every one of them, 30 in Compose and 60 in kind, is allowed and answered `ok`.
 5. **Drift** (decision 0013, sections 5 to 7). The driver has mock-docs serve another
    description of `list_documents`. Both entries list it from the one server, so the gateway
    withdraws both list tools, each within the 10 s interval plus the 5 s deadline of the change,
