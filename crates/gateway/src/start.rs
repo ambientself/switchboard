@@ -41,7 +41,7 @@
 //! tool the server no longer serves as approved. The binary binds its listener only after, so a
 //! tool withdrawn then is never served, and nothing is answered, `/readyz` included, until the
 //! pass ends. A poll that fails does not stop the start: the server's tools stay served.
-//! [`Prepared::drift`] runs the pass again every interval.
+//! [`Prepared::drift`] polls each server again every interval, each on its own schedule.
 //!
 //! It logs a boot line for metrics too: the address `GET /metrics` will be served on, or that
 //! none is, since `[metrics]` is optional. [`Prepared::metrics`] carries the address to the

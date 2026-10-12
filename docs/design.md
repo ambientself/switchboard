@@ -1465,18 +1465,23 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   each proxied server's `tools/list` with the entry's own credential, under its call deadline
   and answer cap, once during boot before the listener is bound and then every
   `[drift] interval_seconds` (300 s by default, 5 to 900; the demos set 10), each server on a
-  schedule of its own, so a server that answers late holds back no other server's polls. An
-  approved tool whose served definition no longer hashes to its `definition_sha256`, by the
-  loader's own function, or that the server no longer lists, is withdrawn: the policy in force
-  less the tool, under the revision `{base}+withdrawn:{names}`, swapped in atomically, with
-  `tool_withdrawn` logged at ERROR and counted. A poll is judged only against the approvals it
-  began under, so a list read before a reload approved a tool again does not withdraw it. A
-  failed poll, including a list that names a next page, keeps the tools served and is logged and
-  counted. A withdrawal is keyed by the tool's name, both hashes and `approved_at`, is applied
-  again to each reload that keeps its key, and is cleared by a new approval or by removing the
-  tool; it lives in the replica's memory, so a restart against a restored server serves the tool
-  again (decision 0013, section 7). `tests/drift.rs` has decision 0013's drift scenarios. Not
-  built: the probe calls and the reach check of the same pass.
+  schedule of its own, so a server that answers late holds back no other server's polls. Each
+  server is polled one poll at a time, so section 13's bound of one interval plus one call
+  deadline holds when the interval is at least the entry's call deadline, as at the defaults
+  and in the demos. With a shorter interval, a list answered late but inside the deadline holds
+  back that server's next poll until it arrives, and the worst case is about two call deadlines
+  (#165). An approved tool whose served definition no longer hashes to its `definition_sha256`,
+  by the loader's own function, or that the server no longer lists, is withdrawn: the policy in
+  force less the tool, under the revision `{base}+withdrawn:{names}`, swapped in atomically,
+  with `tool_withdrawn` logged at ERROR and counted. A poll is judged only against the
+  approvals it began under, so a list read before a reload approved a tool again does not
+  withdraw it. A failed poll, including a list that names a next page, keeps the tools served
+  and is logged and counted. A withdrawal is keyed by the tool's name, both hashes and
+  `approved_at`, is applied again to each reload that keeps its key, and is cleared by a new
+  approval or by removing the tool; it lives in the replica's memory, so a restart against a
+  restored server serves the tool again (decision 0013, section 7). `tests/drift.rs` has
+  decision 0013's drift scenarios. Not built: the probe calls and the reach check of the same
+  pass.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.

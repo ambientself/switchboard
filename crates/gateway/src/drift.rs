@@ -28,12 +28,15 @@
 //! is bound, so a tool it withdraws is never served and nothing, `/readyz` included, is
 //! answered until it ends. That first pass polls the servers together and ends when every poll
 //! has answered or failed. A failed first poll does not stop boot. [`DriftPass::run`] then
-//! polls each server every interval on a schedule of its own, beside the registry reloader,
-//! until the binary aborts it at shutdown. A server that answers slowly, or not at all until
-//! its call deadline, delays only its own next poll, so a changed definition is withdrawn
-//! within one interval plus its own server's call deadline whatever the other servers do. The
-//! interval is `[drift] interval_seconds` in the deployment file ([`DriftSection`]): 300 s
-//! unless given, and refused below 5 or above 900.
+//! polls each server every interval on a schedule of its own, one poll at a time, beside the
+//! registry reloader, until the binary aborts it at shutdown. A server that answers slowly, or
+//! not at all until its call deadline, delays only its own next poll, whatever the other
+//! servers do. When the interval is at least a server's call deadline, as at the defaults and
+//! in the demos, a changed definition on it is withdrawn within one interval plus that
+//! deadline. When the interval is shorter, a list that answers late but inside the deadline
+//! holds back the server's next poll until it arrives, so the worst case is about two call
+//! deadlines (#165). The interval is `[drift] interval_seconds` in the deployment file
+//! ([`DriftSection`]): 300 s unless given, and refused below 5 or above 900.
 //!
 //! **A withdrawal** ([`Withdrawals`]) makes a policy of its own: the loaded registry's, with
 //! the withdrawn tools removed from the snapshot, every surface, the definitions and the
@@ -583,8 +586,10 @@ async fn poll(
 }
 
 /// Polls `server` every `interval`, the first an interval from now, for ever. A poll that runs
-/// past the interval delays the next one; the next is never run beside it. A poll whose task
-/// fails is logged, and the next runs as usual.
+/// past the interval delays the next one, which starts when it ends; the next is never run
+/// beside it. So with an interval of at least the server's call deadline, a change is withdrawn
+/// within one interval plus that deadline, and with a shorter one, within about two call
+/// deadlines (#165). A poll whose task fails is logged, and the next runs as usual.
 async fn poll_every(
     withdrawals: Arc<Withdrawals>,
     server: ConnectorName,

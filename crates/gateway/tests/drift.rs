@@ -684,9 +684,10 @@ async fn silent_server() -> String {
 }
 
 /// Decision 0013, section 5: each server is polled on a schedule of its own, so a changed
-/// definition is withdrawn within one interval plus its own server's call deadline, however long
-/// another server's polls take. Team B's entry here is a server that never answers, under a 60 s
-/// deadline; team A's is the mock server, under a 1 s deadline.
+/// definition on a server whose call deadline is at most the interval is withdrawn within one
+/// interval plus that deadline, however long another server's polls take. Team B's entry here
+/// is a server that never answers, under a 60 s deadline; team A's is the mock server, under a
+/// 1 s deadline, equal to the interval.
 #[tokio::test]
 async fn a_server_that_never_answers_does_not_hold_back_another_servers_withdrawal() {
     let mock = mock().await;
