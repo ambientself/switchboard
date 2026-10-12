@@ -283,16 +283,22 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "connector-proxy"
 version = "0.1.0"
 dependencies = [
+ "connector-proxy",
  "gateway-core",
  "gateway-testkit",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "mock-docs-server",
+ "rcgen",
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "tokio-rustls",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]

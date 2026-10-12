@@ -238,7 +238,21 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
         .iter()
         .find(|package| package["name"] == json!("gateway"))
         .unwrap();
-    assert_eq!(gateway["features"]["test-support"], json!([]));
+    // It turns on only connector-proxy's own, which alone lets a connector reach loopback.
+    assert_eq!(
+        gateway["features"]["test-support"],
+        json!(["connector-proxy/test-support"])
+    );
+    let connector = packages
+        .iter()
+        .find(|package| package["name"] == json!("connector-proxy"))
+        .unwrap();
+    assert_eq!(connector["features"]["test-support"], json!([]));
+    let defaults = connector["features"]["default"].as_array();
+    assert!(
+        defaults.is_none_or(|defaults| defaults.is_empty()),
+        "connector-proxy has default features: {defaults:?}"
+    );
     let defaults = gateway["features"]["default"].as_array();
     assert!(
         defaults.is_none_or(|defaults| defaults.is_empty()),
@@ -249,6 +263,9 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
     for dependency in gateway["dependencies"].as_array().unwrap() {
         if dependency["kind"] != json!("dev") {
             assert_ne!(dependency["name"], json!("gateway"), "{dependency}");
+            if dependency["name"] == json!("connector-proxy") {
+                assert_eq!(dependency["features"], json!([]), "{dependency}");
+            }
         }
     }
 }

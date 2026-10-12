@@ -12,8 +12,8 @@ use common::{
     upstream,
 };
 use connector_proxy::{
-    CallVerdict, MALFORMED_CREDENTIAL, NotShown, PROBE_TOOL, PROTOCOL_VERSION, ProbeBounds,
-    ProbeCall, ProbeCredential, ProbeError, ProbeFinding, ProbeReport, probe,
+    CallVerdict, MALFORMED_CREDENTIAL, NotShown, PROBE_TOOL, PROTOCOL_VERSION, ProbeCall,
+    ProbeCredential, ProbeError, ProbeFinding, ProbeReport, Upstream, UpstreamError, probe,
 };
 use gateway_core::ConnectorName;
 use mock_docs_server::{AcceptedCredential, Config};
@@ -25,10 +25,12 @@ const FOREIGN: &str = "dummy-stranger-token-for-the-probe-tests";
 
 const DEADLINE: Duration = Duration::from_millis(500);
 
-fn bounds() -> ProbeBounds {
-    ProbeBounds {
+/// The server at `url`, with the probe tests' bounds.
+fn target(url: &str) -> Upstream {
+    Upstream {
         deadline: DEADLINE,
         max_response_bytes: 1000,
+        ..Upstream::new("docs", url)
     }
 }
 
@@ -91,7 +93,7 @@ async fn probed(
 ) -> (ProbeReport, Vec<Received>) {
     let server = Scripted::start_for(script).await;
     let (_file, credential) = foreign();
-    let report = probe(server.url(), bounds(), &credential).await.unwrap();
+    let report = probe(&target(server.url()), &credential).await.unwrap();
     (report, server.received())
 }
 
@@ -292,7 +294,7 @@ async fn a_refused_connection_is_not_shown_never_refused() {
     drop(listener);
     let (_file, credential) = foreign();
 
-    let report = probe(&url, bounds(), &credential).await.unwrap();
+    let report = probe(&target(&url), &credential).await.unwrap();
 
     assert_eq!(
         verdicts(&report),
@@ -307,7 +309,7 @@ async fn a_server_that_never_answers_is_not_shown_within_one_deadline() {
     let (_file, credential) = foreign();
     let started = Instant::now();
 
-    let report = probe(server.url(), bounds(), &credential).await.unwrap();
+    let report = probe(&target(server.url()), &credential).await.unwrap();
 
     assert_eq!(
         verdicts(&report),
@@ -339,7 +341,7 @@ async fn an_unreadable_probe_credential_sends_the_first_two_calls_and_shows_noth
     let (file, credential) = foreign();
     std::fs::write(file.path(), "").unwrap();
 
-    let report = probe(server.url(), bounds(), &credential).await.unwrap();
+    let report = probe(&target(server.url()), &credential).await.unwrap();
 
     assert!(matches!(
         report.calls()[2],
@@ -353,18 +355,24 @@ async fn an_unreadable_probe_credential_sends_the_first_two_calls_and_shows_noth
 }
 
 #[tokio::test]
-async fn a_url_that_is_not_plain_http_with_a_host_is_refused() {
+async fn a_url_that_is_not_http_or_https_with_a_host_is_refused() {
     let (_file, credential) = foreign();
-    for url in [
-        "https://docs.example/mcp",
-        "http://user:pw@docs/mcp",
-        "docs",
-    ] {
+    for url in ["ftp://docs/mcp", "http://user:pw@docs/mcp", "docs"] {
         assert_eq!(
-            probe(url, bounds(), &credential).await.unwrap_err(),
-            ProbeError::BadUrl(url.to_owned())
+            probe(&target(url), &credential).await.unwrap_err(),
+            ProbeError::Upstream(UpstreamError::BadUrl {
+                connector: ConnectorName::new("docs"),
+                url: url.to_owned()
+            })
         );
     }
+    // An https server is probed as a connector reaches it, so with its CA file only.
+    assert_eq!(
+        probe(&target("https://docs.example/mcp"), &credential)
+            .await
+            .unwrap_err(),
+        ProbeError::Upstream(UpstreamError::NoCaFile(ConnectorName::new("docs")))
+    );
 }
 
 /// The mock server checks its caller: it refuses all three calls, and none reaches a tool.
@@ -375,7 +383,7 @@ async fn the_mock_server_refuses_all_three() {
         .unwrap();
     let (_file, credential) = foreign();
 
-    let report = probe(&server.url(), ProbeBounds::default(), &credential)
+    let report = probe(&Upstream::new("docs", server.url()), &credential)
         .await
         .unwrap();
 

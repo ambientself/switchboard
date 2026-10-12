@@ -34,10 +34,10 @@ fn a_complete_configuration_is_accepted() {
 }
 
 #[test]
-fn only_a_plain_http_url_with_a_host_is_accepted() {
+fn only_an_http_or_https_url_with_a_host_is_accepted() {
     for url in [
-        "https://127.0.0.1:9/mcp",
         "ftp://127.0.0.1/mcp",
+        "wss://127.0.0.1/mcp",
         "/mcp",
         "127.0.0.1:9",
         "http://user:dummy-password@127.0.0.1:9/mcp",
