@@ -50,12 +50,18 @@ pub fn row_start() -> RowStart {
 }
 
 /// The store's own time budgets, which the deadline of each call row includes. The defaults
-/// are the Postgres store's: 2 s to begin and 30 s to finish (decision 0009 point 9). The
-/// testkit cannot use that store's type, so it has its own.
+/// are the Postgres store's: 2 s to begin, 2 s for the answer and 30 s to finish (decision
+/// 0009 point 9). The testkit cannot use that store's type, so it has its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreBudgets {
     /// Begin, from the call to begin to the written row.
     pub begin: Duration,
+    /// The most one attempt to complete a row may take. The Postgres store's last attempt to
+    /// complete a failed begin's row is made at the finish deadline and may take this long past
+    /// it. The in-memory store uses it only in the deadline: it answers past the answer budget
+    /// only when told to
+    /// ([`finish_past_answer_budget`](InMemoryAuditStore::finish_past_answer_budget)).
+    pub answer: Duration,
     /// How long, from the call to finish, a store keeps trying to complete the row.
     pub finish_deadline: Duration,
 }
@@ -64,20 +70,23 @@ impl Default for StoreBudgets {
     fn default() -> Self {
         Self {
             begin: Duration::from_secs(2),
+            answer: Duration::from_secs(2),
             finish_deadline: Duration::from_secs(30),
         }
     }
 }
 
 /// How long past its time at begin a call row's deadline is, in milliseconds, as the Postgres
-/// store works it out: the begin budget and the finish deadline each in whole milliseconds,
-/// and the call deadline, added without wrapping. A sum past what a Postgres `bigint` holds
-/// is refused at begin, and so is one whose deadline Postgres's `set_times` cannot work out:
-/// see [`postgres_deadline`].
+/// store works it out: the begin budget, the finish deadline and the answer budget each in
+/// whole milliseconds, and the call deadline, added without wrapping. The answer budget is for
+/// the last attempt to complete a failed begin's row, made at the finish deadline (decision
+/// 0009, as amended on 2026-10-11). A sum past what a Postgres `bigint` holds is refused at begin, and so is one
+/// whose deadline Postgres's `set_times` cannot work out: see [`postgres_deadline`].
 fn allowance_ms(budgets: &StoreBudgets, call_deadline_ms: u64) -> u64 {
     millis(budgets.begin)
         .saturating_add(call_deadline_ms)
         .saturating_add(millis(budgets.finish_deadline))
+        .saturating_add(millis(budgets.answer))
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -377,11 +386,11 @@ impl State {
 ///
 /// Like the Postgres store, it sets each row's time at begin and deadline itself, from its
 /// own clock and never from the record: the time at begin, plus the begin budget, the call
-/// deadline the record carries and the finish deadline, in whole milliseconds. It adds that
-/// allowance to the time at begin as Postgres's `set_times` does, through `float8`, and
-/// refuses a call row whose deadline Postgres would refuse: one at or past 294277-01-01 UTC,
-/// or an allowance of 2^63 microseconds or more. A row of kind
-/// `list` has no deadline. The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW)
+/// deadline the record carries, the finish deadline and the answer budget, in whole
+/// milliseconds. It adds that allowance to the time at begin as Postgres's `set_times` does,
+/// through `float8`, and refuses a call row whose deadline Postgres would refuse: one at or
+/// past 294277-01-01 UTC, or an allowance of 2^63 microseconds or more. A row of kind `list`
+/// has no deadline. The clock is a [`FixedClock`] at [`FIXTURE_NOW`](crate::FIXTURE_NOW)
 /// unless set.
 ///
 /// List rows, which `list` writes, are kept apart and read back with
@@ -431,8 +440,8 @@ impl InMemoryAuditStore {
     }
 
     /// The deadline the store gave the row `id`: its time at begin plus the begin budget, its
-    /// call deadline and the finish deadline. `None` if begin wrote no such row, or for a row
-    /// of kind `list`, which has none.
+    /// call deadline, the finish deadline and the answer budget. `None` if begin wrote no such
+    /// row, or for a row of kind `list`, which has none.
     pub fn deadline(&self, id: &AuditRowId) -> Option<SystemTime> {
         self.times(id).and_then(|times| times.deadline)
     }

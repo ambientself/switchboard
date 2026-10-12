@@ -20,8 +20,8 @@ use super::{GATEWAY_ROLE, TestDatabase};
 use crate::store::OPEN_ROWS_TIMEOUT;
 use crate::{Budgets, OpenRows, PgAuditError, PgAuditStore, PoolSizes};
 
-/// Budgets that give a row begun with no call deadline an allowance of 2 s, so a test waits
-/// that long, not the default 32 s, for a row's deadline to pass.
+/// Budgets that give a row begun with no call deadline an allowance of 3 s, so a test waits
+/// that long, not the default 34 s, for a row's deadline to pass.
 fn short() -> Budgets {
     Budgets {
         begin: Duration::from_secs(1),
