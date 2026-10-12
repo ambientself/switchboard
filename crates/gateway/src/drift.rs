@@ -224,8 +224,8 @@ impl DriftSignals {
 /// The standing withdrawals of one replica, over the policy the registry reloader loads.
 ///
 /// It holds the loaded registry's policy (the base) and serves it, less every standing
-/// withdrawal, in the [`LivePolicy`]. The reloader hands it each new version
-/// ([`load`](Self::load)) and the drift pass each tool list it reads.
+/// withdrawal, in the [`LivePolicy`]. The reloader hands it each new version it loads, and
+/// the drift pass each tool list it reads.
 pub struct Withdrawals {
     live: Arc<LivePolicy>,
     state: Mutex<State>,
