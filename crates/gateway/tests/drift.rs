@@ -793,7 +793,8 @@ impl Held {
 
 /// A poll is judged against the approvals it began under. Team A's read tool is approved again,
 /// for a new definition, while a poll that read the old one is outstanding: when the poll
-/// answers, it does not withdraw the new approval, which it never compared.
+/// answers, it does not withdraw the new approval, which it never compared. The polls' deadline
+/// is far past the test's patience, so each answers and is judged rather than timing out.
 #[tokio::test]
 async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
     let (captured, _logging) = Captured::start();
@@ -801,6 +802,18 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
     let files = Files::new("drift-stale", &issuer().jwks_document(), &held.url);
     let replica = Replica::new(&files, &held.url);
     let again = reapproved(&files::registry(&held.url), READ_TOOL, CHANGED, "demo-8");
+    let long = Duration::from_secs(600);
+    let drift_pass = DriftPass::new(
+        replica.drift.withdrawals().clone(),
+        ["docs-team-a", "docs-team-b"]
+            .into_iter()
+            .map(|entry| {
+                let connector = proxy_within(entry, &held.url, &files, long);
+                (ConnectorName::new(entry), connector)
+            })
+            .collect(),
+        INTERVAL,
+    );
 
     let approving = async {
         eventually("both entries' polls", || {
@@ -810,8 +823,26 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
         assert_eq!(replica.reload(&again), "demo-8");
         held.release.add_permits(2);
     };
-    tokio::join!(replica.drift.pass(), approving);
+    tokio::join!(drift_pass.pass(), approving);
 
+    // Each entry's one poll answered and was judged: none failed before the reload.
+    let polled: BTreeMap<String, (u64, u64)> = replica
+        .drift
+        .signals()
+        .counts()
+        .into_iter()
+        .map(|(server, counts)| {
+            let polled = (counts.polls_ok, counts.polls_failed);
+            (server.as_str().to_owned(), polled)
+        })
+        .collect();
+    assert_eq!(
+        polled,
+        BTreeMap::from([
+            ("docs-team-a".to_owned(), (1, 0)),
+            ("docs-team-b".to_owned(), (1, 0)),
+        ])
+    );
     assert!(replica.withdrawn().is_empty(), "{:?}", replica.withdrawn());
     assert!(captured.events("tool_withdrawn").is_empty());
     assert_eq!(replica.revision(), "demo-8");
