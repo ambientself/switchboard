@@ -979,6 +979,7 @@ narrowing = "none"
 permits = "read"
 reach = []
 destination = "in_cluster"
+probe = {{ result = "refused", date = 2026-10-06 }}
 
 [[tools]]
 name = "docs__list_documents"

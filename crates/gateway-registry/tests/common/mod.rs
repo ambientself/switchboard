@@ -41,6 +41,7 @@ narrowing = "limit"
 permits = "read"
 reach = []
 destination = "in_cluster"
+probe = { result = "refused", date = 2026-10-02 }
 
 [[tools]]
 name = "docs__read"

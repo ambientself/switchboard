@@ -172,7 +172,8 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
             "[[servers]]\nname = \"{name}\"\nsystem = \"{name}\"\nowner = \"platform\"\n\
              identity = \"{identity}\"\naddress = \"{url}\"\n\
              credential = {{ mode = \"gateway_token\", reference = \"{reference}\", principal = \"{name}\" }}\n\
-             narrowing = \"none\"\npermits = \"read\"\nreach = []\ndestination = \"in_cluster\"\n\n"
+             narrowing = \"none\"\npermits = \"read\"\nreach = []\ndestination = \"in_cluster\"\n\
+             probe = {{ result = \"refused\", date = 2026-10-06 }}\n\n"
         )
     };
     let tool = |name: &str, url: &str| {
