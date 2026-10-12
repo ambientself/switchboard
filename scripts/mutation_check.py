@@ -4315,8 +4315,12 @@ mutate("demo-driver-list-withdrawn-shown", "the list check expects the withdrawn
        '($withdrawn): [entry + "__list_documents"]}', '($withdrawn): [entry + "__list_documents", entry + "__read_document"]}')
 mutate("demo-driver-list-omitted-unchecked", "the list check passes a list row that left tools out", DRIVER,
        "            and .omitted == 0) | not)\n", "            and true) | not)\n")
-mutate("demo-driver-list-any-team", "the list check passes a list row from any team", DRIVER,
-       '        | select(((.team == "team-a" or .team == "team-b")\n', "        | select(((true)\n")
+# A team without an entry has no tools to be shown, so a row from one fails on that too: the
+# mutation takes away both, judging the row as team-a's.
+mutate_all("demo-driver-list-any-team", "the list check passes a list row from any team",
+           (DRIVER, '        | select(((.team == "team-a" or .team == "team-b")\n', "        | select(((true)\n"),
+           (DRIVER, '        def entry: {"team-a": "docs-team-a", "team-b": "docs-team-b"}[.team // ""];\n',
+            '        def entry: {"team-a": "docs-team-a", "team-b": "docs-team-b"}[.team // ""] // "docs-team-a";\n'))
 mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
        '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
 mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
