@@ -29,30 +29,64 @@ If the cluster exists but `.demo/kubeconfig` does not (another checkout created 
 writes it with `kind export kubeconfig`.
 
 Every password and static credential under `deploy/` is a dummy value for the demo. In kind the
-gateway holds no static credential for mock-docs: it presents a projected token of its own
-ServiceAccount.
+gateway holds no static credential for mock-docs: it presents a ServiceAccount token for each
+entry of mock-docs in the registry (below).
+
+## One entry of mock-docs per team
+
+The registry lists mock-docs twice, once per team (decisions 0010 and 0013, section 10):
+
+| Entry | Team | Surface | Tools | Credential reference | kind identity | Compose credential |
+| --- | --- | --- | --- | --- | --- | --- |
+| `docs-team-a` | `team-a` | `/mcp/docs-team-a` | `docs-team-a__list_documents`, `docs-team-a__read_document` | `docs-team-a-credential` | ServiceAccount `switchboard/docs-team-a` | `compose/dummy-credentials/docs-team-a-credential` |
+| `docs-team-b` | `team-b` | `/mcp/docs-team-b` | `docs-team-b__list_documents`, `docs-team-b__read_document` | `docs-team-b-credential` | ServiceAccount `switchboard/docs-team-b` | `compose/dummy-credentials/docs-team-b-credential` |
+
+Both entries have mock-docs' one address and identity. Each surface admits its own team only.
+The gateway presents an entry's own credential on every call to that entry's tools, and
+mock-docs limits each credential to its team's project, `docs-team-a`'s to `atlas` and
+`docs-team-b`'s to `borealis`. So a call through one team's entry cannot reach the other team's
+project at the server, whatever the gateway decided. Both demos read mock-docs' log to show
+that each team's calls came under its own entry's identity, for its own project.
+
+In kind each entry's identity is a ServiceAccount whose token comes by TokenRequest. The
+gateway pod runs a native sidecar, `token-writer` (`demo/token-writer.sh`), which asks the API
+server for each entry's token, for audience `mock-docs` and valid for 600 s, and writes it to
+`/var/run/switchboard/tokens/<entry>`, again every 300 s, always to a new file renamed into
+place. A token it cannot get leaves the previous file and is tried again in 5 s. It never
+prints a token. The gateway reads each file as that entry's credential on every call, so it
+has no API-server client. `kind/base/gateway-tokens.yaml` lets ServiceAccount `gateway` create
+tokens for `docs-team-a` and `docs-team-b`, by name, and for no other ServiceAccount. Both
+containers run as that ServiceAccount, but only the token writer mounts a token the API server
+accepts (a projected token with no audience) and the cluster's CA; the gateway container
+mounts only the tokens directory, read-only. No workload mounts an API token either. The kind
+run asks the API server that the gateway may create tokens for the two entries and for no
+other ServiceAccount, and `crates/demo-checks` holds the manifests to all of it.
 
 ## What is here
 
 | Path | What it is |
 | --- | --- |
-| `Dockerfile` | One image for every role: the workspace's binaries, `workload.sh`, `migrate.sh` and `roles.sql`. The audit migrations are inside `switchboard`. `BINS` lists the binaries; `REQUIRE_ALL_BINS=true` refuses to build without all of them. |
+| `Dockerfile` | One image for every role: the workspace's binaries, `workload.sh`, `migrate.sh`, `token-writer.sh` and `roles.sql`. The audit migrations are inside `switchboard`. `BINS` lists the binaries; `REQUIRE_ALL_BINS=true` refuses to build without all of them. |
 | `compose/compose.yaml` | `postgres` (not published), `migrate`, `dev-issuer`, `mock-docs`, `gateway` on `127.0.0.1:18080`, and `workload` under `profiles: [demo]`. |
-| `compose/config/` | The gateway's deployment file, the team manifest, the registry directory it polls, and the registry with `docs__read_document` withdrawn. |
+| `compose/config/` | The gateway's deployment file, the team manifest, the registry directory it polls, and the registry with each team's read tool withdrawn. |
+| `compose/dummy-credentials/` | Each entry's dummy credential and its SHA-256, and `mock-docs-callers`, the two SHA-256s each with its team's project, which mock-docs reads. |
 | `kind/cluster.yaml` | One node, kindnet, the node image kind v0.32.0 uses. |
-| `kind/base/` | Namespaces `switchboard`, `mock-docs`, `team-a`, `team-b`; ServiceAccounts; Postgres; the migration Job; mock-docs, which accepts only the gateway's ServiceAccount; the gateway, with a projected token for audience `mock-docs`; suspended CronJobs holding each workload's Job template. No network policy. |
+| `kind/base/` | Namespaces `switchboard`, `mock-docs`, `team-a`, `team-b`; ServiceAccounts, `docs-team-a` and `docs-team-b` among them; the token grant (`gateway-tokens.yaml`); Postgres; the migration Job; mock-docs, which accepts only the entries' ServiceAccounts, each for its team's project; the gateway, with the token writer beside it; suspended CronJobs holding each workload's Job template. No network policy. |
 | `kind/policy/` | The network policies: mock-docs admits only the gateway, Postgres only the gateway and the migration, the gateway only the two teams. |
 | `kind/route-check/rbac.yaml` | The route check's operator: ServiceAccount `route-check/operator`, `get` and `list` on what it reads, among them Roles, ClusterRoles, RoleBindings and ClusterRoleBindings across the cluster, `create` on SubjectAccessReviews, and `patch` on `pods/ephemeralcontainers` in `team-a` and `team-b` only. Not part of the base; the kind run applies it. |
 | `route-check/` | The route check (decision 0010): `route-check.sh`, its operator step; `probe.sh`, its probe, which the image installs as `route-probe.sh`; `permissions.tsv`, the one list of control 1's permissions; `rbac-match.jq`, which finds the RBAC rules bound to a ServiceAccount that grant a row of that list; `token-patterns.txt`; and `routes/kind.tsv`, the routes the probe tries in kind. |
 | `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn`, and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
+| `demo/token-writer.sh` | The kind gateway pod's token writer (above). `token-writer.sh once` writes each token once. |
 | `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, runs `switchboard migrate` as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
 | `demo/demo.sh` | The driver. |
 
 `crates/demo-checks` tests the scripts and manifests: the workload against a fake gateway that
 misbehaves one way at a time, the driver with fake docker, kind and kubectl, and the manifests'
 claims (only the gateway is published, the policy admits only the gateway, Compose's dummy
-credential's hash matches, and in kind the gateway mounts only a projected token for
-`mock-docs`, whose settings name only the gateway's ServiceAccount).
+credentials' hashes match, in kind only the token writer mounts an API token and the token grant
+names exactly the two entries' ServiceAccounts, mock-docs' settings name only those, each for
+its team's project, and each workload calls its own team's surface). It runs `token-writer.sh`
+against a fake API server too.
 
 ## Network policy in kind
 
@@ -230,10 +264,10 @@ check that the deployment files load.
 | Binaries | `switchboard` (crates/gateway), `switchboard-dev` (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server). `Dockerfile` builds `switchboard` on its own with `cargo build --release --locked -p gateway --bin switchboard`, then the other two with `cargo build --release --locked -p gateway-dev -p mock-docs-server --bins`. Build `switchboard` for deployment the same way: a workspace build turns on gateway-dev's `test-support` feature, which exempts the gateway from the receipt-store gate (decision 0009). `switchboard` links nothing from the testkit. |
 | Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with its keys file and team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server, and `[metrics] listen`, where `GET /metrics` is served (above). Missing, partial or unknown fields refuse to start, except `listen`, which is `127.0.0.1:8080` (loopback only) if left out, and `[metrics]`, which serves nothing if left out. |
 | Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); `"metrics"`, the address `GET /metrics` is served on, or `"off"`; and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. One `"event":"audit_row_given_up"` line at `ERROR` for each audit row whose completion the store stopped trying to write, with the `row`, the `outcome` not written and the `cause`. |
-| Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-1`; `compose/config/registry-withdrawn.toml` is revision `demo-2` without `docs__read_document`. A new version that changes a server or a tool's route is refused until a restart. |
+| Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-3`; `compose/config/registry-withdrawn.toml` is revision `demo-4` without either team's read tool. A new version that changes a server or a tool's route is refused until a restart. |
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
-| mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (the gateway credential's hash, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECT` (`system:serviceaccount:switchboard:gateway`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). The kind run checks that it accepted exactly the gateway's 8 allowed calls, all from the gateway's ServiceAccount, and refused only the two direct calls before the policy, as `wrong_audience`, and the route check's open attempts before the policy, as `no_bearer`. |
+| mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (each entry's credential's hash with its team's project, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECTS` (`docs-team-a`'s ServiceAccount for `atlas`, `docs-team-b`'s for `borealis`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). No admin endpoint, and `slow-doc`'s default delay: no step uses either. Each run checks that it accepted exactly the gateway's allowed calls (4 in Compose, 8 in kind), each team's under its own entry's credential or ServiceAccount and for its own project. The kind run checks that it refused only the two direct calls before the policy, as `wrong_audience`, and the route check's open attempts before the policy, as `no_bearer`. |
 | Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `kind`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms`, `policy_revision`, `listed_tools` and `listed_omitted`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row of kind `call` to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. A row of kind `list` records one workload's `tools/list`, with no tool or resources; the listing shows the tools it listed. The driver counts these apart, 3 in Compose and 2 in kind, and checks that each names the tools its caller was shown under its policy revision, with none left out. It reads the open rows through the view `switchboard_audit.open_call_rows` (migration 0005). |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
@@ -252,10 +286,11 @@ check that the deployment files load.
   The driver waits for the deadline of the run's last allowed call row, then checks through
   the view that no row outside the outage is open, and at most that one row inside it.
 - **Decisions 0009 and 0010 ask more of the slice than it has.** In kind the gateway presents
-  a projected token of its own ServiceAccount to mock-docs, which accepts only that identity.
+  each entry's ServiceAccount token to mock-docs, which accepts only those identities, each for
+  its team's project.
   The route check runs in every kind run (above). The signals of section 11 are exported
   (above), but no sink is chosen, and receipts in `unknown` wait for #10. Compose has no cluster
-  issuer, so there mock-docs still recognises the gateway by a static dummy credential checked
+  issuer, so there mock-docs still recognises each entry by a static dummy credential checked
   into this repository, compared by its SHA-256.
 
 ## Findings

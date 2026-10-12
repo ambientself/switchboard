@@ -1390,10 +1390,20 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - Decision 0011, sections 1 to 5: schema validation before forwarding is built (#122, in the
   argument check entry below); connector entries, the snapshot loader's rules and the
   scheduled reach check are not built.
-- The kind slice extended to show them: not built.
-- The registration and drift probe and the gateway's per-team identities: not built. The route
-  check now sees RBAC grants limited by `resourceNames` (#133), which decision 0013 lands
-  before the per-team TokenRequest grants.
+- The kind slice extended to show them: partly built. Both demos register the mock server
+  once per team and show each team's calls reaching it under its own entry's identity, for its
+  own project (the next entry). The overload, hanging-server and drift steps are not built.
+- The gateway's per-team identities: built in the demos (#11's kind slice), as decision 0013,
+  section 10, has them. The registry lists the mock server twice, `docs-team-a` and
+  `docs-team-b`, at one address, each with its own credential reference, tools and surface,
+  which admits its own team only. In kind each entry's identity is a ServiceAccount. A
+  token-writer sidecar in the gateway pod gets each one's token by TokenRequest, for the
+  server's audience, and writes it to the file the deployment file names for that entry; a
+  Role limited by `resourceNames` to the two ServiceAccounts is its only grant. Only the
+  sidecar mounts a token the API server accepts, and no workload mounts one. In Compose each
+  entry has a static dummy credential. The mock server limits each identity to its team's
+  project. The registration and drift probe is not built; its ServiceAccount, and the
+  registry's, join the Role when they are.
 - Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the
   address's host, the dialect and no `+` in the registry's revision are built (#131, and #122
   for the dialect). The destination rules and the probe record are not built.
