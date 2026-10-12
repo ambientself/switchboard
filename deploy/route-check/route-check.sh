@@ -23,13 +23,16 @@
 #       and no ConfigMap it reads holds a string in a format in token-patterns.txt, and that no
 #       projected ServiceAccount token in it is for a server's audience (--server-audience);
 #   (c) by SubjectAccessReview, that the pod's ServiceAccount holds none of the permissions in
-#       permissions.tsv, in the workload's, the gateway's and each server's namespace, and across
-#       the cluster. The reviews are SubjectAccessReview objects created with `kubectl create`,
-#       so the step needs no impersonation. Then, from the ClusterRoles, the ClusterRoleBindings,
-#       and the Roles and RoleBindings in every namespace, that no RBAC rule bound to the
-#       ServiceAccount or its groups grants a row, whatever its resourceNames (rbac-match.jq,
-#       #60). A review names no resource, so it cannot see a rule limited to one name, and one
-#       asked across the cluster counts no RoleBinding in any namespace;
+#       permissions.tsv, where each row's scope says: a `namespaced` row in the workload's, the
+#       gateway's and each server's namespace, and across the cluster; a `gateway` row in the
+#       gateway's and each server's namespace only; a `cluster` row across the cluster only. The
+#       reviews are SubjectAccessReview objects created with `kubectl create`, so the step needs
+#       no impersonation. Then, from the ClusterRoles, the ClusterRoleBindings, and the Roles and
+#       RoleBindings in every namespace, that no RBAC rule bound to the ServiceAccount or its
+#       groups grants a row, whatever its resourceNames (rbac-match.jq, #60), with the same
+#       scopes: a `gateway` row counts the RoleBindings in the gateway's and the servers'
+#       namespaces only. A review names no resource, so it cannot see a rule limited to one
+#       name, and one asked across the cluster counts no RoleBinding in any namespace;
 #   (d) the cloud identity annotations on the ServiceAccount. They are recorded for the owner to
 #       check and never fail the run;
 #   (e) the probe: route-probe.sh in --probe-image, started with `kubectl debug` as an ephemeral
@@ -545,20 +548,28 @@ token_audiences() {
 
 # --- (c) SubjectAccessReviews ------------------------------------------------------------------
 
-# asked_namespaces: the workload's, the gateway's and each server's namespace, as a JSON list.
+# asked_namespaces: the workload's, the gateway's and each server's namespace, as a JSON list,
+# where a `namespaced` row is asked.
 asked_namespaces() {
   printf '%s\n' "$NAMESPACE" "$GATEWAY_NS" "${SERVER_NS[@]}" | awk 'NF && !seen[$0]++' | jq -R . | jq -sc .
 }
 
+# gateway_namespaces: the gateway's and each server's namespace, as a JSON list, where a
+# `gateway` row is asked. The workload's own is in it only when it is one of these.
+gateway_namespaces() {
+  printf '%s\n' "$GATEWAY_NS" "${SERVER_NS[@]}" | awk 'NF && !seen[$0]++' | jq -R . | jq -sc .
+}
+
 permissions() {
   step "(c) what $SA may do through the cluster API (permissions.tsv)"
-  local namespaces requests answers verdicts verdict row
+  local namespaces gateway requests answers verdicts verdict row
   namespaces=$(asked_namespaces)
+  gateway=$(gateway_namespaces)
   # One review per row and scope, for the ServiceAccount's user and groups.
   if ! requests=$(jq -R -s -c --arg user "system:serviceaccount:$NAMESPACE:$SA_NAME" --arg sans "$NAMESPACE" \
-    --argjson namespaces "$namespaces" '
+    --argjson namespaces "$namespaces" --argjson gateway "$gateway" '
       split("\n") | map(select(length > 0 and (startswith("#") | not)) | split("\t"))
-      | map(if length == 4 and (.[3] == "namespaced" or .[3] == "cluster") then .
+      | map(if length == 4 and (.[3] == "namespaced" or .[3] == "gateway" or .[3] == "cluster") then .
             else error("bad row: \(join(" "))") end)
       | map(. as [$verb, $resource, $sub, $scope]
         | ($resource | index(".")) as $dot
@@ -567,7 +578,9 @@ permissions() {
            resource: (if $dot then $resource[:$dot] else $resource end),
            group: (if $dot then $resource[$dot + 1:] else "" end),
            subresource: (if $sub == "-" then "" else $sub end),
-           scopes: (if $scope == "namespaced" then $namespaces + [""] else [""] end)})
+           scopes: (if $scope == "namespaced" then $namespaces + [""]
+                    elif $scope == "gateway" then $gateway
+                    else [""] end)})
       | {rows: ., list: {apiVersion: "v1", kind: "List", items: [.[] as $row | $row.scopes[] as $ns
           | {apiVersion: "authorization.k8s.io/v1", kind: "SubjectAccessReview",
              spec: {user: $user,
@@ -642,7 +655,8 @@ rbac_rules() {
     fi
   done
   if ! verdicts=$(jq -n -r --rawfile permissions "$PERMISSIONS" --arg namespace "$NAMESPACE" \
-    --arg name "$SA_NAME" -f "$RBAC_MATCH" <"$lists" 2>"$TMP/rbac-match.err"); then
+    --arg name "$SA_NAME" --argjson gateway_namespaces "$(gateway_namespaces)" \
+    -f "$RBAC_MATCH" <"$lists" 2>"$TMP/rbac-match.err"); then
     why=$(head -n 1 "$TMP/rbac-match.err" | sed 's/^jq: error ([^)]*): //')
     fail "$SA is bound to no RBAC rule for a row of control 1: ${why:-rbac-match.jq failed}"
     return
