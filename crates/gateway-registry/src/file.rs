@@ -103,8 +103,8 @@ pub(crate) struct ToolFile {
 pub(crate) enum ResourcesFile {
     NoResources,
     FromArguments(Vec<SourceFile>),
-    /// Declared as the entry's whole reach (decision 0011, section 1). It parses, and the
-    /// snapshot refuses it until the audit row can record a reach by reference.
+    /// Declared as the entry's whole reach (decision 0011, section 1): every call names the
+    /// server's whole reach, whatever its arguments, and its row records the server's entry.
     AsReach,
 }
 

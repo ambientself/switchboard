@@ -912,7 +912,8 @@ fn check_tool(
 
     let (sources, declared_from) = match tool.resources {
         ResourcesFile::NoResources => (Vec::new(), None),
-        // The snapshot refuses it: the adapter that names the reach is not built.
+        // The gateway's one constant adapter names the entry's reach for it, so its argument
+        // adapter reads no resources; it still checks the arguments against the schema.
         ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),
         ResourcesFile::FromArguments(sources) => {
             if sources.is_empty() {
