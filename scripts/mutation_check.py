@@ -4247,14 +4247,14 @@ mutate("demo-token-writer-truncates-on-failure", "the token writer empties the t
        r""": >"$target"
   answer=$(printf 'Authorization: Bearer %s\n' "$api" |""")
 mutate("demo-token-writer-wrong-audience", "the token writer asks for tokens for another audience than the server's", TOKEN_WRITER,
-       "    spec: {audiences: [$audience], expirationSeconds: $seconds}}')",
-       """    spec: {audiences: ["switchboard"], expirationSeconds: $seconds}}')""")
+       "      spec: {audiences: [$audience], expirationSeconds: $seconds}}'\n",
+       """      spec: {audiences: ["switchboard"], expirationSeconds: $seconds}}'\n""")
 mutate("demo-kind-gateway-mounts-api-token", "the gateway container mounts the token writer's API token", "deploy/kind/base/gateway.yaml",
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n",
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
        "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n")
 mutate("demo-kind-token-rbac-unnamed", "the gateway may create a token for any ServiceAccount in its namespace", "deploy/kind/base/gateway-tokens.yaml",
-       '    resourceNames: ["docs-team-a", "docs-team-b", "registry-probe"]\n', "")
+       '    resourceNames: ["docs-team-a", "docs-team-b", "registry-probe", "registry"]\n', "")
 STRANGER = "  name: stranger\n  namespace: team-a\nautomountServiceAccountToken: false\n"
 mutate("demo-kind-other-file-binds-service-account", "another base file binds a ClusterRole to a team's ServiceAccount",
        "deploy/kind/base/serviceaccounts.yaml", STRANGER,
@@ -4308,6 +4308,15 @@ mutate("demo-compose-mock-docs-admin-off-loopback", "Compose's mock-docs serves 
 mutate("demo-kind-mock-docs-admin-service", "kind's mock-docs Service exposes the admin port", "deploy/kind/base/mock-docs.yaml",
        "    - name: http\n      port: 8080\n      targetPort: http\n",
        "    - name: http\n      port: 8080\n      targetPort: http\n    - name: admin\n      port: 9091\n      targetPort: 9091\n")
+# Decision 0011, section 4: both runs show the reach check, held after boot with each entry's
+# probe refused, and a widened reach withdrawing docs-team-a's tools until a new approval.
+# tests/driver.rs watches each.
+mutate("demo-reach-step-skipped", "the runs never widen a reach, so a mismatch is never shown", DRIVER,
+       "  drift_steps\n  reach_steps\n}\n", "  drift_steps\n}\n")
+mutate("demo-probe-result-unchecked", "the reach-held step passes whatever the probe of each entry found", DRIVER,
+       """    check_at_least "$(metric "switchboard_probe_results_total{server=\\"$entry\\",result=\\"refused\\"}" "$text")" 1 \\\n"""
+       """      "metrics: mock-docs refused the gateway's probe of $entry"\n""",
+       "")
 
 
 # --- gateway: the first slice from files ---------------------------------------------------
@@ -4452,16 +4461,18 @@ mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
        "\n**/target\n", "\n")
 mutate("demo-driver-health-checks-counted", "the outage step counts health checks as requests", DRIVER,
-       "select(.accepted == true and .rpc_method != \"tools/list\")' | awk 'END { print NR }'",
-       "select(.event == \"request\" and .rpc_method != \"tools/list\")' | awk 'END { print NR }'")
+       "select(.accepted == true and .rpc_method != \"tools/list\" and .refused != \"project\")' | awk 'END { print NR }'",
+       "select(.event == \"request\" and .rpc_method != \"tools/list\" and .refused != \"project\")' | awk 'END { print NR }'")
 # The gateway's drift polls are its own tools/list requests, not calls.
 mutate("demo-driver-drift-polls-counted-compose", "the Compose bearer check counts the gateway's drift polls as calls", DRIVER,
-       """'$1 == "accepted" && ours($2) && $3 != "tools/list" { count++ }""", """'$1 == "accepted" && ours($2) { count++ }""")
+       """'$1 == "accepted" && ours($2) && $3 != "tools/list" && $3 != "tools/call:refused" { count++ }""",
+       """'$1 == "accepted" && ours($2) && $3 != "tools/call:refused" { count++ }""")
 mutate("demo-driver-drift-polls-counted-kind", "the kind caller check counts the gateway's drift polls as calls", DRIVER,
-       """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ }""",
-       """'$1 == "accepted" && ($2 in entry) && NF == 3 { count++ }""")
+       """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" && $3 != "tools/call:refused" { count++ }""",
+       """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/call:refused" { count++ }""")
 mutate("demo-driver-drift-polls-counted-outage", "the outage step counts the gateway's drift polls as requests", DRIVER,
-       """select(.accepted == true and .rpc_method != "tools/list")""", """select(.accepted == true)""")
+       """select(.accepted == true and .rpc_method != "tools/list" and .refused != "project")""",
+       """select(.accepted == true and .refused != "project")""")
 mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,
        "      - issuer-keys:/shared/issuer\n    healthcheck:",
        "      - issuer-keys:/shared/issuer\n    ports:\n      - \"127.0.0.1:18090:8090\"\n    healthcheck:")
@@ -4558,6 +4569,24 @@ mutate("gw-probe-never-runs", "the drift pass never probes a server, so an open 
 mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for a server it finds open", GW + "bin/switchboard.rs",
        "    if finding == ProbeFinding::Refused {\n",
        "    if finding != ProbeFinding::NotShown {\n")
+# Decision 0011, section 4: beside each poll, the reach check sends each entry's canary through
+# the gateway's own listener as the registry's workload. Only a successful canary withdraws the
+# entry's tools; a refusal holds and a failed check withdraws nothing. tests/reach.rs watches
+# each.
+mutate("gw-reach-success-kept", "a canary the server answered withdraws nothing, so a widened reach stays served", DRIFT,
+       "                self.withdraw(state, server, found);\n",
+       "                let _ = (state, found);\n")
+mutate("gw-reach-refusal-withdraws", "a canary the server refused withdraws the entry's tools as a mismatch would", DRIFT,
+       "                self.signals.count(server, |counts| counts.reach_held += 1);\n",
+       "                self.signals.count(server, |counts| counts.reach_held += 1);\n"
+       "                self.judge_reach(server, tool, started, Verdict::Mismatch { row: None });\n")
+mutate("gw-reach-failure-withdraws", "a failed reach check withdraws the entry's tools as a mismatch would", DRIFT,
+       "                    .count(server, |counts| counts.reach_failed += 1);\n",
+       "                    .count(server, |counts| counts.reach_failed += 1);\n"
+       "                self.judge_reach(server, tool, started, Verdict::Mismatch { row: None });\n")
+mutate("gw-reach-never-runs", "no reach check is ever made, so a widened reach is never found", DRIFT,
+       "    let Some((caller, deadline)) = &entry.reach else {\n",
+       "    let Some((caller, deadline)) = entry.reach.as_ref().filter(|_| false) else {\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -4677,7 +4706,8 @@ mutate("demo-kind-mock-docs-any-subject", "mock-docs accepts a workload's Servic
 mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys into the gateway's namespace, not mock-docs'", DRIVER,
        "  k -n mock-docs create configmap cluster-issuer-keys ", "  k -n switchboard create configmap cluster-issuer-keys ")
 mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
-           (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ }""", """'$1 == "accepted" { count++ }"""),
+           (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" && $3 != "tools/call:refused" { count++ }""",
+            """'$1 == "accepted" && $3 != "tools/call:refused" { count++ }"""),
            (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
 mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls and the probe do not explain passes", DRIVER,
        '  check "$refused" "$((refusals + probes + 3 * drift_probes))" "mock-docs refused nothing else"\n', "")
