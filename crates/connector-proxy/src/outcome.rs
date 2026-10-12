@@ -142,7 +142,7 @@ fn tool_result(result: &Map<String, Value>) -> ToolOutcome {
 }
 
 /// `application/json`, with or without parameters, in any case.
-fn is_json(content_type: &str) -> bool {
+pub(crate) fn is_json(content_type: &str) -> bool {
     let media_type = content_type.split(';').next().unwrap_or_default().trim();
     media_type.eq_ignore_ascii_case("application/json")
 }

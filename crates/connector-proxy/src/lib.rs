@@ -19,6 +19,10 @@
 //!   for a tool the connector does not serve or has no credential for is
 //!   [`ToolOutcome::Refused`](gateway_core::ToolOutcome). The [`outcome`] module lists each
 //!   sentence and kind.
+//! - **The tool list.** [`ProxyConnector::list_tools`] reads the server's `tools/list` for the
+//!   gateway itself, for the drift pass, with the same credential and the same bounds. It
+//!   returns the tools as served, or a [`ListError`]; a list it could not read whole is never
+//!   returned in part.
 //!
 //! The server is reached over session-less streamable HTTP, revision 2025-06-18, at an
 //! `http://` URL. An answer must be JSON; an event stream is not read.
@@ -27,6 +31,7 @@
 
 mod connector;
 mod credentials;
+mod list;
 pub mod outcome;
 
 pub use connector::{
@@ -34,3 +39,4 @@ pub use connector::{
     UpstreamError,
 };
 pub use credentials::{CredentialFileError, FileCredentials, MAX_CREDENTIAL_BYTES};
+pub use list::{ListError, ListedTool};
