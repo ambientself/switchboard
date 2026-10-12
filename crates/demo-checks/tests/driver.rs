@@ -4007,10 +4007,16 @@ fn the_hanging_server_step_needs_a_late_read_at_the_deadline_and_team_b_answered
 /// The overload step's rows: `late` of team-a's reads held to the deadline, `refused` refused
 /// with `sentence`, and team-b's reads from `team_b_from`.
 fn overload_rows(late: usize, refused: usize, sentence: &str, team_b_from: f64) -> Value {
+    overload_rows_held(&vec![5.02; late], refused, sentence, team_b_from)
+}
+
+/// The overload step's rows, as `overload_rows`, with one of team-a's reads held for each of
+/// `held`, in seconds.
+fn overload_rows_held(held: &[f64], refused: usize, sentence: &str, team_b_from: f64) -> Value {
     let mut rows = Vec::new();
-    for i in 0..late {
+    for (i, seconds) in held.iter().enumerate() {
         let begun = 200.0 + i as f64 / 100.0;
-        let mut row = step_row("team-a", "read_document", "error", begun, 5.02);
+        let mut row = step_row("team-a", "read_document", "error", begun, *seconds);
         row["error_kind"] = json!("oversized_or_late_read");
         rows.push(row);
     }
@@ -4023,21 +4029,112 @@ fn overload_rows(late: usize, refused: usize, sentence: &str, team_b_from: f64) 
     json!(rows)
 }
 
+/// What workload.sh's overload mode prints when its client was answered after each of
+/// `elapsed` on the reads held to the deadline: a whole number of milliseconds, or `unknown`.
+fn overload_output(elapsed: &[&str]) -> String {
+    let mut output = String::from(
+        "PASS overload: one of 9 reads refused with the team-capacity sentence\n\
+         PASS overload: the other 8 held until the deadline and answered with the late-answer sentence\n\
+         PASS overload: no other answer\n",
+    );
+    for (i, ms) in elapsed.iter().enumerate() {
+        output.push_str(&format!(
+            "     read {} of slow-doc, held: answered after {ms} ms by the client's clock\n",
+            i + 2
+        ));
+    }
+    output.push_str("RESULT: PASS (3/3)\n");
+    output
+}
+
 #[test]
 fn the_overload_step_needs_one_call_over_the_team_cap_refused_and_team_b_answered_meanwhile() {
     let team = gateway::bulkhead::team_at_capacity("docs-team-a", "docs-team-a__read_document");
     let server = gateway::bulkhead::server_at_capacity("docs-team-a", "docs-team-a__read_document");
-    let run_on = |name: &str, rows: Value, shed: &str| {
+    let run_with = |name: &str, rows: Value, shed: &str, output: &str| {
         checked(
             name,
-            &format!("check_overload {{rows}} '{shed}'"),
-            &[("rows", &rows.to_string())],
+            &format!("check_overload {{rows}} '{shed}' {{output}}"),
+            &[("rows", &rows.to_string()), ("output", output)],
         )
     };
-    assert_all_passed(
-        "overload",
-        &run_on("overload", overload_rows(8, 1, &team, 199.5), "1"),
-        5,
+    let held = overload_output(&["5210"; 8]);
+    let run_on = |name: &str, rows: Value, shed: &str| run_with(name, rows, shed, &held);
+    let run = run_on("overload", overload_rows(8, 1, &team, 199.5), "1");
+    assert_all_passed("overload", &run, 7);
+    assert!(
+        run.stdout.contains(
+            "PASS team-a's client was answered on each of the 8 held reads between the 5 s deadline and 1500 ms after it, by its own clock (5210,5210,5210,5210,5210,5210,5210,5210 ms)"
+        ),
+        "{}",
+        run.transcript()
+    );
+    // Eight reads answered as late, but at 8 s: the deadline did not hold them. Their rows and
+    // their client's clock each show it.
+    const ROWS_LATE: &str = "audit: each was answered at the 5 s deadline, within a second";
+    const CLIENT: &str = "team-a's client was answered on each of the 8 held reads between the 5 s deadline and 1500 ms after it, by its own clock";
+    let run = run_with(
+        "all at 8 s",
+        overload_rows_held(&[8.0; 8], 1, &team, 199.5),
+        "1",
+        &overload_output(&["8000"; 8]),
+    );
+    assert_fails("all at 8 s", &run, ROWS_LATE);
+    assert_fails(
+        "all at 8 s",
+        &run,
+        &format!("{CLIENT} (got 8 times from the workload, 8 of them outside"),
+    );
+    // One read's row at 8 s, its client answered in time.
+    let mut one = vec![5.02; 8];
+    one[3] = 8.0;
+    let run = run_on(
+        "a row at 8 s",
+        overload_rows_held(&one, 1, &team, 199.5),
+        "1",
+    );
+    assert_fails(
+        "a row at 8 s",
+        &run,
+        &format!("{ROWS_LATE} (5020.0,5020.0,5020.0,8000.0,"),
+    );
+    assert!(
+        run.failed("ms) (got '7', want '8')"),
+        "{}",
+        run.transcript()
+    );
+    assert_eq!(run.lines("FAIL ").len(), 1, "{}", run.transcript());
+    // One read's client answered at 8 s, early or at an unknown time, its row in time.
+    let mut one = vec!["5210"; 8];
+    for (case, elapsed) in [
+        ("a client at 8 s", "8000"),
+        ("a client answered early", "4900"),
+        ("a client time unknown", "unknown"),
+    ] {
+        one[3] = elapsed;
+        let run = run_with(
+            case,
+            overload_rows(8, 1, &team, 199.5),
+            "1",
+            &overload_output(&one),
+        );
+        assert_fails(
+            case,
+            &run,
+            &format!("{CLIENT} (got 8 times from the workload, 1 of them outside"),
+        );
+        assert_eq!(run.lines("FAIL ").len(), 1, "{case}: {}", run.transcript());
+    }
+    let run = run_with(
+        "a client time missing",
+        overload_rows(8, 1, &team, 199.5),
+        "1",
+        &overload_output(&["5210"; 7]),
+    );
+    assert_fails(
+        "a client time missing",
+        &run,
+        &format!("{CLIENT} (got 7 times from the workload, 0 of them outside"),
     );
     const REFUSED: &str = "completed as refused with the team-capacity sentence (got '0'";
     for (case, rows, shed, failure) in [
@@ -4064,7 +4161,7 @@ fn the_overload_step_needs_one_call_over_the_team_cap_refused_and_team_b_answere
             "two refused",
             overload_rows(7, 2, &team, 199.5),
             "1",
-            "were held until the deadline and completed as error",
+            "audit: 8 completed as error of the kind oversized_or_late_read (got '7'",
         ),
         (
             "a call more",

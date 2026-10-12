@@ -954,14 +954,17 @@ check_hang() {
   check_meanwhile "$rows" "team-a's read was held until its deadline"
 }
 
-# check_overload ROWS SHED: team-a's TEAM_CAP + 1 reads of slow-doc at once (workload.sh
+# check_overload ROWS SHED OUTPUT: team-a's TEAM_CAP + 1 reads of slow-doc at once (workload.sh
 # overload). Of the step's rows, team-a's are those reads, each allowed: TEAM_CAP completed as
-# error of the kind oversized_or_late_read, held until the deadline, and one completed as
-# refused, its row recording the team-capacity sentence (decision 0014, section 2: refused, not
-# error, which keeps no sentence). SHED is how many calls the gateway counted shed with scope
-# team over the step: that one. Team-b's reads went on meanwhile.
+# error of the kind oversized_or_late_read, and one completed as refused, its row recording the
+# team-capacity sentence (decision 0014, section 2: refused, not error, which keeps no sentence).
+# Each of the TEAM_CAP was held until the deadline and no longer, as check_hang holds its one
+# read: its row's latency is within a second of the deadline, and OUTPUT, what the workload
+# printed, gives its client's answer between the deadline and HANG_ALLOWANCE_MS after it. SHED
+# is how many calls the gateway counted shed with scope team over the step: that one. Team-b's
+# reads went on meanwhile.
 check_overload() {
-  local rows=$1 shed=$2 entry read calls=$((TEAM_CAP + 1))
+  local rows=$1 shed=$2 output=$3 entry read calls=$((TEAM_CAP + 1)) deadline=$((CALL_DEADLINE * 1000))
   entry=$(team_entry team-a)
   read=${entry}__read_document
   local sentence="Your team already has as many calls in flight to server \`$entry\` from this gateway as it allows, so this call to tool \`$read\` was not sent. Try it again shortly."
@@ -969,7 +972,27 @@ check_overload() {
   check "$(jq -r --arg read "$read" '[.[] | select(.team == "team-a")] | "\(length) rows, \([.[] | select(.tool == $read and .decision == "allow")] | length) allowed reads"' <<<"$rows" 2>/dev/null)" \
     "$calls rows, $calls allowed reads" "audit: team-a's $calls reads each have a row, allowed, and the step has no other of team-a's"
   check "$(jq -r '[.[] | select(.team == "team-a" and .outcome == "error" and .error_kind == "oversized_or_late_read")] | length' <<<"$rows" 2>/dev/null)" \
-    "$TEAM_CAP" "audit: $TEAM_CAP were held until the deadline and completed as error of the kind oversized_or_late_read"
+    "$TEAM_CAP" "audit: $TEAM_CAP completed as error of the kind oversized_or_late_read"
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(jq -r --argjson ms "$deadline" '[.[] | select(.team == "team-a" and .error_kind == "oversized_or_late_read"
+      and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length' <<<"$rows" 2>/dev/null)" "$TEAM_CAP" \
+    "audit: each was answered at the $CALL_DEADLINE s deadline, within a second ($(jq -r '[.[] | select(.team == "team-a" and .error_kind == "oversized_or_late_read") | .latency_ms] | map(tostring) | join(",")' <<<"$rows" 2>/dev/null) ms)"
+  local times elapsed held=0 outside=0
+  local within="team-a's client was answered on each of the $TEAM_CAP held reads between the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
+  times=$(printf '%s\n' "$output" | sed -nE "s/^ *read [0-9]+ of slow-doc, held: answered after ([0-9]+|unknown) ms by the client's clock\$/\\1/p")
+  for elapsed in $times; do
+    held=$((held + 1))
+    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt "$deadline" ] ||
+      [ "$elapsed" -gt $((deadline + HANG_ALLOWANCE_MS)) ]; then
+      outside=$((outside + 1))
+    fi
+  done
+  times=$(printf '%s\n' "$times" | paste -sd, -)
+  if [ "$held" -eq "$TEAM_CAP" ] && [ "$outside" -eq 0 ]; then
+    pass "$within ($times ms)"
+  else
+    fail "$within (got $held times from the workload, $outside of them outside: '$times')"
+  fi
   # shellcheck disable=SC2016 # jq's own variables
   check "$(jq -r --arg sentence "$sentence" '[.[] | select(.team == "team-a" and .outcome == "refused" and .outcome_sentence == $sentence)] | length' <<<"$rows" 2>/dev/null)" \
     1 "audit: one was over the cap of $TEAM_CAP, completed as refused with the team-capacity sentence"
@@ -1157,6 +1180,7 @@ isolation_steps() {
   if fetch "the gateway's metrics" gateway_metrics; then
     before=$(metric 'switchboard_calls_shed_total{scope="team"}' "$FETCHED")
   fi
+  WORKLOAD_OUTPUT=""
   workload "team-a, overload" team-a overload $((TEAM_CAP + 1))
   if fetch "the gateway's metrics" gateway_metrics; then
     after=$(metric 'switchboard_calls_shed_total{scope="team"}' "$FETCHED")
@@ -1165,7 +1189,7 @@ isolation_steps() {
   if [ "$(number_or_none "${before:-}")" != none ] && [ "$(number_or_none "${after:-}")" != none ]; then
     shed=$((after - before))
   fi
-  check_overload "$(step_rows "$burst")" "$shed"
+  check_overload "$(step_rows "$burst")" "$shed" "$WORKLOAD_OUTPUT"
 
   step "team-b's steady reads: every one allowed and answered ok"
   finish_workload

@@ -726,6 +726,27 @@ fn one_call_over_the_team_cap_must_be_refused_and_the_rest_held_to_the_deadline(
         "{}",
         run.transcript()
     );
+    // It prints how long its client waited on each read held to the deadline, in the lines
+    // demo.sh's check_overload reads: the fake holds each a second.
+    let elapsed: Vec<u64> = run
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.strip_prefix("     read ")?;
+            let (number, rest) = line.split_once(' ')?;
+            number.parse::<u32>().ok()?;
+            rest.strip_prefix("of slow-doc, held: answered after ")?
+                .strip_suffix(" ms by the client's clock")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert_eq!(elapsed.len(), TEAM_CAP, "{}", run.transcript());
+    assert!(
+        elapsed.iter().all(|ms| (1000..5000).contains(ms)),
+        "{}",
+        run.transcript()
+    );
     let run = Workload::new("no-cap", serve(Fake::NoCap)).run_with(&["overload", &calls]);
     assert_failed(
         &run,

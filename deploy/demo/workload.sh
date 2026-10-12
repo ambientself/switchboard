@@ -25,7 +25,8 @@
 #                  long the answer took by curl's own clock, which demo.sh checks
 #   overload N     N reads of SLOW_DOCUMENT at once, N one more than the team's cap on calls in
 #                  flight to its server: exactly one is refused with the team-capacity
-#                  sentence, and every other is answered with the late-answer error
+#                  sentence, and every other is answered with the late-answer error. Prints
+#                  how long each of those took by curl's own clock, which demo.sh checks
 #   steady N       N reads of OWN_PROJECT, one a second; every one must be allowed
 #   idle          makes no call: sleeps until SIGTERM, at most IDLE_SECONDS, then prints
 #                  `PASS idle`. It holds a running pod with the workload's labels and
@@ -313,7 +314,9 @@ count() {
 
 # overload N: N reads of slow-doc at once, each its own curl, all started before any is waited
 # for. Every one is allowed; the team's cap lets all but one run, and those are held until the
-# deadline. The one over the cap is refused, with nothing sent, before the others end.
+# deadline. The one over the cap is refused, with nothing sent, before the others end. How long
+# each read answered with the late-answer error took is printed, in whole milliseconds by curl's
+# clock, or `unknown`, as hang does; demo.sh checks them against the deadline.
 overload() {
   count overload "$1"
   load_token
@@ -322,7 +325,7 @@ overload() {
     "$READ_TOOL" "$OWN_PROJECT" "$SLOW_DOCUMENT")
   i=1
   while [ "$i" -le "$1" ]; do
-    curl -sS -m 10 -o "$ANSWERS/$i.body" -w '%{http_code}' "$GW" -H "Authorization: Bearer $TOKEN" \
+    curl -sS -m 10 -o "$ANSWERS/$i.body" -w '%{http_code} %{time_total}' "$GW" -H "Authorization: Bearer $TOKEN" \
       -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
       -H "MCP-Protocol-Version: $PROTOCOL" -d "$message" >"$ANSWERS/$i.status" 2>/dev/null &
     i=$((i + 1))
@@ -333,13 +336,15 @@ overload() {
   i=1
   while [ "$i" -le "$1" ]; do
     BODY_FILE=$ANSWERS/$i.body
-    answer=$(cat "$ANSWERS/$i.status" 2>/dev/null)
+    answer=$(awk 'NR == 1 { print $1 }' "$ANSWERS/$i.status" 2>/dev/null)
     if [ "$answer" = 200 ] && [ "$(jq -r '.error.code' "$BODY_FILE" 2>/dev/null)" = -32001 ] &&
       [ "$(jq -r '.error.message' "$BODY_FILE" 2>/dev/null)" = "$refusal" ]; then
       refused=$((refused + 1))
     elif [ "$answer" = 200 ] && [ "$(jq -r '.result.isError' "$BODY_FILE" 2>/dev/null)" = true ] &&
       [ "$(jq -r '[(.result.content // [])[] | .text? // empty] | join("")' "$BODY_FILE" 2>/dev/null)" = "$LATE_ANSWER" ]; then
       late=$((late + 1))
+      elapsed=$(awk 'NR == 1 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%d\n", $2 * 1000 + 0.5; next } { print "unknown" }' "$ANSWERS/$i.status" 2>/dev/null)
+      note "read $i of $SLOW_DOCUMENT, held: answered after ${elapsed:-unknown} ms by the client's clock"
     else
       other=$((other + 1))
       note "read $i: HTTP ${answer:-none}: $(head -c 300 "$BODY_FILE" 2>/dev/null)"

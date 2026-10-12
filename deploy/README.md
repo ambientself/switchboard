@@ -114,9 +114,12 @@ metrics:
    row's two writes on a busy laptop, and far short of mock-docs' 10 s. Team-b's reads are
    answered meanwhile, by the rows' times.
 4. **Overload** (decision 0014, section 2). Team-a starts 9 reads of `slow-doc` at once, one
-   more than its cap of 8 calls in flight to its server. Eight are held to the deadline and
-   completed as `error`; one is refused with the team-capacity sentence and completed as
-   `refused`, its row recording the sentence; and `switchboard_calls_shed_total{scope="team"}`
+   more than its cap of 8 calls in flight to its server. Eight are answered with the late-answer
+   sentence and completed as `error` of the kind `oversized_or_late_read`, and each was held to
+   the deadline and no longer, as in the hanging-server step: its row's latency is 5 s and less
+   than a second more, and its client, by curl's clock, was answered no sooner than the deadline
+   and no more than 1.5 s after it. One is refused with the team-capacity sentence and completed
+   as `refused`, its row recording the sentence, and `switchboard_calls_shed_total{scope="team"}`
    rises by one. Team-b's reads are answered meanwhile, and every one of them, 30 in Compose and
    60 in kind, is allowed and answered `ok`.
 5. **Drift** (decision 0013, sections 5 to 7). The driver has mock-docs serve another
@@ -179,7 +182,7 @@ and are not calls. `crates/demo-checks` holds the manifests to all of this.
 | `kind/policy/` | The network policies: mock-docs admits only the gateway, Postgres only the gateway and the migration, the gateway only the two teams. |
 | `kind/route-check/rbac.yaml` | The route check's operator: ServiceAccount `route-check/operator`, `get` and `list` on what it reads, among them Roles, ClusterRoles, RoleBindings and ClusterRoleBindings across the cluster, `create` on SubjectAccessReviews, and `patch` on `pods/ephemeralcontainers` in `team-a` and `team-b` only. Not part of the base; the kind run applies it. |
 | `route-check/` | The route check (decision 0010): `route-check.sh`, its operator step; `probe.sh`, its probe, which the image installs as `route-probe.sh`; `permissions.tsv`, the one list of control 1's permissions; `rbac-match.jq`, which finds the RBAC rules bound to a ServiceAccount that grant a row of that list; `token-patterns.txt`; and `routes/kind.tsv`, the routes the probe tries in kind. |
-| `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn` (of the read tool, or with `list` the list tool), `served`, `undeclared`, `hang` (which prints how long its client waited for the answer), `overload N`, `steady N` (#11's demonstrations, above), and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
+| `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn` (of the read tool, or with `list` the list tool), `served`, `undeclared`, `hang` (which prints how long its client waited for the answer), `overload N` (which prints the same for each read held to the deadline), `steady N` (#11's demonstrations, above), and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
 | `demo/token-writer.sh` | The kind gateway pod's token writer (above). `token-writer.sh once` writes each token once. |
 | `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, runs `switchboard migrate` as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
 | `demo/demo.sh` | The driver. |
