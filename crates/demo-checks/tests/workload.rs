@@ -10,6 +10,8 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,24 +47,38 @@ enum Fake {
     AuditDown,
     /// Team A's read tool has been withdrawn.
     Withdrawn,
+    /// Team A's list tool has been withdrawn.
+    WithdrawnList,
+    /// Forwards a call with an argument the tool's approval does not declare, and the server
+    /// answers it.
+    ForwardsUndeclared,
+    /// Waits for slow-doc's answer past the deadline, and passes it on.
+    SlowDocAnswers,
+    /// Holds no cap on the team's calls in flight.
+    NoCap,
     /// The mock docs server reached directly: 401 for every request.
     Server401,
 }
+
+/// The team's cap on calls in flight to its server, as the fake holds it: decision 0014's.
+const TEAM_CAP: usize = 8;
 
 /// Starts the fake on a free loopback port and returns its `/mcp/docs-team-a` URL: team A's
 /// surface, whose name the workload's tool names start with.
 fn serve(fake: Fake) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            thread::spawn(move || handle(stream, fake));
+            let in_flight = Arc::clone(&in_flight);
+            thread::spawn(move || handle(stream, fake, &in_flight));
         }
     });
     format!("http://127.0.0.1:{port}/mcp/docs-team-a")
 }
 
-fn handle(mut stream: TcpStream, fake: Fake) {
+fn handle(mut stream: TcpStream, fake: Fake, in_flight: &AtomicUsize) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -95,7 +111,7 @@ fn handle(mut stream: TcpStream, fake: Fake) {
     let body: Value =
         serde_json::from_slice(&buffer[header_end..header_end + length]).unwrap_or(Value::Null);
     let bearer = header("authorization").and_then(|v| v.strip_prefix("Bearer ").map(str::to_owned));
-    let (status, answer) = answer(fake, bearer.as_deref(), &body);
+    let (status, answer) = answer(fake, bearer.as_deref(), &body, in_flight);
     let text = answer.map(|v| v.to_string()).unwrap_or_default();
     let reason = match status {
         200 => "OK",
@@ -145,7 +161,36 @@ fn outside_limit(project: &str) -> Value {
     )
 }
 
-fn answer(fake: Fake, bearer: Option<&str>, body: &Value) -> (u16, Option<Value>) {
+/// A tool result with `isError` true: the gateway's answer to a call that ran and failed.
+fn tool_error(message: &str) -> Value {
+    result(json!({"content": [{"type": "text", "text": message}], "isError": true}))
+}
+
+/// A read of slow-doc: held for a second and then answered as late, or, past the team's cap,
+/// refused with the team-capacity sentence, as the gateway answers it.
+fn slow_read(fake: Fake, in_flight: &AtomicUsize) -> Value {
+    if fake == Fake::SlowDocAnswers {
+        return read_ok(OWN);
+    }
+    let held = in_flight.fetch_add(1, Ordering::SeqCst);
+    if held >= TEAM_CAP && fake != Fake::NoCap {
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return error(
+            -32001,
+            &gateway::bulkhead::team_at_capacity("docs-team-a", READ_TOOL),
+        );
+    }
+    thread::sleep(Duration::from_secs(1));
+    in_flight.fetch_sub(1, Ordering::SeqCst);
+    tool_error(connector_proxy::outcome::TIMED_OUT)
+}
+
+fn answer(
+    fake: Fake,
+    bearer: Option<&str>,
+    body: &Value,
+    in_flight: &AtomicUsize,
+) -> (u16, Option<Value>) {
     if fake == Fake::Server401 {
         return (401, Some(json!({"error": "unauthorized"})));
     }
@@ -181,23 +226,39 @@ fn answer(fake: Fake, bearer: Option<&str>, body: &Value) -> (u16, Option<Value>
         "notifications/initialized" => (202, None),
         "ping" => (200, Some(result(json!({})))),
         "tools/list" if fake == Fake::Withdrawn => (200, Some(tools(&[LIST_TOOL]))),
+        "tools/list" if fake == Fake::WithdrawnList => (200, Some(tools(&[READ_TOOL]))),
         "tools/list" => (200, Some(tools(&[READ_TOOL, LIST_TOOL]))),
         "tools/call" => {
             let name = body["params"]["name"].as_str().unwrap_or_default();
-            let project = body["params"]["arguments"]["project"].as_str();
+            let arguments = &body["params"]["arguments"];
+            let project = arguments["project"].as_str();
             if fake == Fake::AuditDown {
                 return (200, Some(error(-32001, AUDIT_FAILURE)));
             }
-            if fake == Fake::Withdrawn && name == READ_TOOL {
+            if (fake == Fake::Withdrawn && name == READ_TOOL)
+                || (fake == Fake::WithdrawnList && name == LIST_TOOL)
+            {
                 return (
                     200,
                     Some(error(
                         -32001,
                         &format!(
-                            "Tool `{READ_TOOL}` is not available on surface `docs-team-a`. Call `tools/list` to see the tools this surface serves."
+                            "Tool `{name}` is not available on surface `docs-team-a`. Call `tools/list` to see the tools this surface serves."
                         ),
                     )),
                 );
+            }
+            // Only `project`, and `document` for the read tool, are declared.
+            let declared = arguments.as_object().is_none_or(|arguments| {
+                arguments
+                    .keys()
+                    .all(|key| key == "project" || (key == "document" && name == READ_TOOL))
+            });
+            if !declared && fake != Fake::ForwardsUndeclared {
+                return (200, Some(tool_error(&gateway::undeclared_argument(name))));
+            }
+            if project == Some(OWN) && arguments["document"] == "slow-doc" {
+                return (200, Some(slow_read(fake, in_flight)));
             }
             let answer = match project {
                 None => error(
@@ -280,6 +341,13 @@ impl Workload {
 
     fn run(&self, mode: &str) -> Run {
         Run::from(self.command(mode).output().unwrap())
+    }
+
+    /// Runs the workload with `args`: the mode and its own arguments.
+    fn run_with(&self, args: &[&str]) -> Run {
+        let mut command = self.command(args[0]);
+        command.args(&args[1..]);
+        Run::from(command.output().unwrap())
     }
 
     fn command(&self, mode: &str) -> Command {
@@ -580,7 +648,108 @@ fn a_withdrawn_tool_leaves_the_list_and_is_refused() {
 }
 
 #[test]
-fn the_workloads_sentences_are_the_cores() {
+fn a_withdrawn_list_tool_leaves_the_list_and_is_refused() {
+    assert_passed(
+        &Workload::new("withdrawn-list", serve(Fake::WithdrawnList))
+            .run_with(&["withdrawn", "list"]),
+    );
+    let run =
+        Workload::new("list-not-withdrawn", serve(Fake::Gateway)).run_with(&["withdrawn", "list"]);
+    assert_failed(&run, "tools/list after withdrawal: names");
+    assert_failed(&run, "call to the withdrawn tool: error code");
+    // The read tool's withdrawal does not pass for the list tool's.
+    let run =
+        Workload::new("read-withdrawn", serve(Fake::Withdrawn)).run_with(&["withdrawn", "list"]);
+    assert_failed(&run, "tools/list after withdrawal: names");
+    let run =
+        Workload::new("withdrawn-what", serve(Fake::Gateway)).run_with(&["withdrawn", "search"]);
+    assert_failed(&run, "setup: withdrawn takes read or list");
+}
+
+#[test]
+fn a_served_tool_is_listed_and_answered() {
+    assert_passed(&Workload::new("served", serve(Fake::Gateway)).run("served"));
+    let run = Workload::new("served-withdrawn", serve(Fake::WithdrawnList)).run("served");
+    assert_failed(&run, "tools/list: names");
+    assert_failed(&run, "list own project atlas: isError");
+}
+
+#[test]
+fn an_undeclared_argument_must_be_refused_before_forwarding() {
+    let run = Workload::new("undeclared", serve(Fake::Gateway)).run("undeclared");
+    assert_passed(&run);
+    assert!(
+        run.stdout
+            .contains("PASS read with an undeclared argument: the undeclared-argument sentence"),
+        "{}",
+        run.transcript()
+    );
+    let run = Workload::new("forwarded", serve(Fake::ForwardsUndeclared)).run("undeclared");
+    assert_failed(&run, "read with an undeclared argument: isError");
+    assert_failed(
+        &run,
+        "read with an undeclared argument: the undeclared-argument sentence",
+    );
+}
+
+#[test]
+fn a_read_past_its_deadline_must_be_answered_as_late() {
+    assert_passed(&Workload::new("hang", serve(Fake::Gateway)).run("hang"));
+    let run = Workload::new("hang-answered", serve(Fake::SlowDocAnswers)).run("hang");
+    assert_failed(&run, "read of slow-doc: isError");
+    assert_failed(&run, "read of slow-doc: the late-answer sentence");
+}
+
+#[test]
+fn one_call_over_the_team_cap_must_be_refused_and_the_rest_held_to_the_deadline() {
+    let calls = (TEAM_CAP + 1).to_string();
+    let run = Workload::new("overload", serve(Fake::Gateway)).run_with(&["overload", &calls]);
+    assert_passed(&run);
+    assert!(
+        run.stdout
+            .contains("PASS overload: one of 9 reads refused with the team-capacity sentence"),
+        "{}",
+        run.transcript()
+    );
+    let run = Workload::new("no-cap", serve(Fake::NoCap)).run_with(&["overload", &calls]);
+    assert_failed(
+        &run,
+        "overload: one of 9 reads refused with the team-capacity sentence (got '0', want '1')",
+    );
+    assert_failed(&run, "overload: the other 8 held until the deadline");
+    // Two over the cap: two are refused, one more than the step expects.
+    let run = Workload::new("two-over", serve(Fake::Gateway)).run_with(&["overload", "10"]);
+    assert_failed(
+        &run,
+        "overload: one of 10 reads refused with the team-capacity sentence (got '2', want '1')",
+    );
+    let run = Workload::new("overload-answered", serve(Fake::SlowDocAnswers))
+        .run_with(&["overload", &calls]);
+    assert_failed(&run, "overload: no other answer (got '9', want '0')");
+    for count in [None, Some("1"), Some("nine")] {
+        let mut args = vec!["overload"];
+        args.extend(count);
+        let run = Workload::new("overload-count", serve(Fake::Gateway)).run_with(&args);
+        assert_failed(&run, "setup: overload takes");
+        assert!(run.lines("PASS ").is_empty(), "{}", run.transcript());
+    }
+}
+
+#[test]
+fn every_steady_read_must_be_allowed() {
+    assert_passed(&Workload::new("steady", serve(Fake::Gateway)).run_with(&["steady", "2"]));
+    let run =
+        Workload::new("steady-denied", serve(Fake::DeniesOwnProject)).run_with(&["steady", "2"]);
+    assert_failed(
+        &run,
+        "steady reads of atlas: every one of 2 allowed (got '0', want '2')",
+    );
+    let run = Workload::new("steady-count", serve(Fake::Gateway)).run_with(&["steady"]);
+    assert_failed(&run, "setup: steady takes");
+}
+
+#[test]
+fn the_workloads_sentences_are_the_gateways() {
     let script = common::read("deploy/demo/workload.sh");
     assert!(
         script.contains(&format!("IDENTITY_FAILURE='{IDENTITY_FAILURE}'")),
@@ -590,6 +759,28 @@ fn the_workloads_sentences_are_the_cores() {
     assert!(
         script.contains(&format!("AUDIT_FAILURE='{AUDIT_FAILURE}'")),
         "workload.sh's audit sentence differs"
+    );
+    assert!(
+        script.contains(&format!(
+            "LATE_ANSWER=\"{}\"",
+            connector_proxy::outcome::TIMED_OUT
+        )),
+        "workload.sh's late-answer sentence differs from connector_proxy::outcome::TIMED_OUT"
+    );
+    // Each sentence that names a tool or a server is a printf format, `%s` in each place.
+    assert!(
+        script.contains(&format!(
+            "  printf '{}' \"$1\"\n",
+            gateway::undeclared_argument("%s")
+        )),
+        "workload.sh's undeclared-argument sentence differs from gateway::undeclared_argument"
+    );
+    assert!(
+        script.contains(&format!(
+            "  printf '{}' \"$1\" \"$2\"\n",
+            gateway::bulkhead::team_at_capacity("%s", "%s")
+        )),
+        "workload.sh's team-capacity sentence differs from gateway::bulkhead::team_at_capacity"
     );
 }
 
