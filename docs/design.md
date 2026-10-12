@@ -1463,10 +1463,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `PolicySnapshot::without` derives a withdrawal's snapshot for the drift pass. The gateway
   reads a team service identity's or gateway token's credential from its file and refuses a
   per-user grant at start, until milestone 5. The reach check's tool need not be approved, so
-  removing it, or an entry's last tool, still withdraws it on reload (section 8). Not built: a
-  tool `declared` as the reach (the loader refuses `as_reach`), the audit row's reach and
-  credential columns, the scheduled reach check, and narrowing a credential per call or to
-  the caller's limit. The gateway sends the same credential on every call to a server, so it
+  removing it, or an entry's last tool, still withdraws it on reload (section 8). Not built:
+  the scheduled reach check, and narrowing a credential per call or to the caller's limit. The
+  gateway sends the same credential on every call to a server, so it
   refuses an entry whose narrowing is not `none` at start, until the custodian client (#12).
 - The kind slice extended to show them: partly built. Both demos register the mock server
   once per team and show each team's calls reaching it under its own entry's identity, for its
