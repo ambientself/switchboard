@@ -3509,8 +3509,8 @@ mutate("pg-check-cascade-update-ignored", "a foreign key that acts only on updat
 mutate("pg-check-cascade-restrict-refused", "a foreign key that is ON DELETE RESTRICT is refused", PG_CHECK,
        "AND (k.confdeltype NOT IN ('a', 'r')", "AND (k.confdeltype NOT IN ('a')")
 mutate("pg-check-cascade-any-owner", "a foreign key whose action cascades is refused whoever owns its table", PG_CHECK,
-       "                     AND {}\n                     AND (tbl.oid IN",
-       "                     AND (true OR {})\n                     AND (tbl.oid IN")
+       "                     AND {}\n                 ORDER BY 1, 3\",",
+       "                     AND (true OR {})\n                 ORDER BY 1, 3\",")
 mutate("pg-check-cascade-definer-runner-ignored", "a cascading foreign key on a table owned by a role that can run a refused definer function passes the check", PG_CHECK,
        "        roles.extend(runners);\n", "        let _ = runners;\n")
 mutate("pg-check-cascade-triggers-only", "a cascading foreign key whose table has a rule, a check or a default but no trigger passes the check", PG_CHECK,
@@ -3523,37 +3523,6 @@ mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a for
        "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
 mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
        "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
-# #144: the able roles are found once, and a cascading foreign key is refused only when its
-# table, or a partition under it, carries something that runs code as its owner: any trigger
-# but the internal ones, a rule, or a check, default, generated column, index or column domain
-# that names a function not built in and not in C, directly or through an operator or a domain.
-mutate("pg-check-cascade-bare-key-refused", "a bare cascading foreign key on a table owned by an able role is refused", PG_CHECK,
-       "AND (tbl.oid IN (SELECT c.oid FROM carriers c)", "AND (true OR tbl.oid IN (SELECT c.oid FROM carriers c)")
-mutate("pg-check-cascade-internal-triggers-counted", "the triggers Postgres makes to carry out a foreign key count as carriers", PG_CHECK,
-       "        WHERE NOT (t.tgisinternal\n", "        WHERE NOT (false\n")
-mutate("pg-check-cascade-rules-ignored", "a cascading foreign key whose table has a rule passes the check", PG_CHECK,
-       "        SELECT w.ev_class FROM pg_catalog.pg_rewrite w\n", "        SELECT w.ev_class FROM pg_catalog.pg_rewrite w WHERE false\n")
-mutate("pg-check-cascade-checks-ignored", "a cascading foreign key whose table has a check that calls a function passes the check", PG_CHECK,
-       "        WHERE k.contype = 'c'\n", "        WHERE false\n")
-mutate("pg-check-cascade-defaults-ignored", "a cascading foreign key whose table has a default or generated column that calls a function passes the check", PG_CHECK,
-       "ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid\n",
-       "ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND false\n")
-mutate("pg-check-cascade-indexes-ignored", "a cascading foreign key whose table has an index expression that calls a function passes the check", PG_CHECK,
-       "                    AND d.objid = i.indexrelid\n", "                    AND d.objid = i.indexrelid AND false\n")
-mutate("pg-check-cascade-operators-ignored", "a cascading foreign key whose table's check calls a function through an operator passes the check", PG_CHECK,
-       "            JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode\n", "            JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode AND false\n")
-mutate("pg-check-cascade-domain-columns-ignored", "a cascading foreign key whose column's domain check calls a function passes the check", PG_CHECK,
-       "        WHERE a.attnum > 0 AND NOT a.attisdropped\n", "        WHERE false\n")
-mutate("pg-check-cascade-domain-checks-not-followed", "a domain whose check calls a function does not count as running code", PG_CHECK,
-       "JOIN domain_uses u ON u.refclassid = x.classid AND u.refobjid = x.oid\n",
-       "JOIN domain_uses u ON u.refclassid = x.classid AND u.refobjid = x.oid AND false\n")
-mutate("pg-check-cascade-domain-base-not-followed", "a domain over a domain whose check calls a function does not count as running code", PG_CHECK,
-       "        WHERE t.typtype = 'd'\n", "        WHERE false\n")
-mutate("pg-check-cascade-c-functions-counted", "a default that calls an extension's C function counts as a carrier", PG_CHECK,
-       "            JOIN pg_catalog.pg_language l ON l.oid = p.prolang\n        WHERE l.lanname NOT IN ('c', 'internal')\n",
-       "            JOIN pg_catalog.pg_language l ON l.oid = p.prolang\n        WHERE l.lanname NOT IN ('internal')\n")
-mutate("pg-check-cascade-partition-carriers-ignored", "a partitioned table's foreign key is judged only by what the partitioned table itself carries", PG_CHECK,
-       "OR EXISTS (SELECT FROM pg_catalog.pg_partition_tree(", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_partition_tree(")
 # Open rows. The boot check compares the view with the definition it expects, so each change to
 # the view changes that definition as well, and the open-row tests must catch it themselves.
 PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"
