@@ -18,7 +18,7 @@ use crate::{Budgets, PgAuditStore, PoolSizes};
 /// each with a part millisecond, which the store drops from the allowance.
 const BUDGETS: Budgets = Budgets {
     begin: Duration::from_micros(3_000_400),
-    answer: Duration::from_secs(2),
+    answer: Duration::from_micros(2_500_300),
     finish_deadline: Duration::from_micros(45_000_700),
 };
 
@@ -91,9 +91,12 @@ impl ContractStore for Postgres {
                 // The table holds the allowance, which is the store's budgets, each in whole
                 // milliseconds, and the call deadline. The budgets are worked out here, not
                 // with the store's own arithmetic, so a store that leaves one out is caught.
-                let budgets_ms =
-                    u64::try_from(BUDGETS.begin.as_millis() + BUDGETS.finish_deadline.as_millis())
-                        .unwrap();
+                let budgets_ms = u64::try_from(
+                    BUDGETS.begin.as_millis()
+                        + BUDGETS.finish_deadline.as_millis()
+                        + BUDGETS.answer.as_millis(),
+                )
+                .unwrap();
                 let allowance = row
                     .get::<_, Option<i64>>("allowance_ms")
                     .map(|allowance| u64::try_from(allowance).unwrap());
@@ -160,6 +163,7 @@ impl ContractStore for Postgres {
     fn budgets(&self) -> StoreBudgets {
         StoreBudgets {
             begin: BUDGETS.begin,
+            answer: BUDGETS.answer,
             finish_deadline: BUDGETS.finish_deadline,
         }
     }
@@ -208,6 +212,6 @@ contract!(
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
     an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,
-    the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline,
+    the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget,
     a_list_row_is_stored_complete_with_no_deadline,
 );

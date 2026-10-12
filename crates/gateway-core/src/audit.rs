@@ -171,9 +171,9 @@ pub struct AuditRecord {
     /// The gateway instance that began the row, escaped and capped at 128 characters.
     pub instance: InstanceName,
     /// The call deadline of the connector the call names, in milliseconds, as the gateway
-    /// supplied it in [`RowStart`]. A store adds its own begin budget and finish deadline to
-    /// it for the allowance it gives the database, which sets the row's deadline from its own
-    /// clock. The time at begin and the deadline are not fields here: the store sets them.
+    /// supplied it in [`RowStart`]. A store adds its own begin budget, finish deadline and
+    /// answer budget to it for the allowance it gives the database, which sets the row's
+    /// deadline from its own clock. The time at begin and the deadline are not fields here: the store sets them.
     pub call_deadline_ms: u64,
     /// The caller's identifier for this tool call, so its control plane can find the row.
     pub tool_use_id: Option<ToolUseId>,

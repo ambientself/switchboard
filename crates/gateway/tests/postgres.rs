@@ -228,9 +228,9 @@ async fn run(
     assert!(failed.body.get("error").is_none(), "{}", failed.body);
 
     // Each row is a call begun by this instance, due when the database's time at begin plus
-    // the store's 2 s and 30 s and the proxied server's call deadline have passed. That is the
-    // 7 s the deployment file sets for it, not the default 5 s: the deadline its connector was
-    // built with reaches its rows.
+    // the store's 2 s, 30 s and 2 s and the proxied server's call deadline have passed. That is
+    // the 7 s the deployment file sets for it, not the default 5 s: the deadline its connector
+    // was built with reaches its rows.
     let deadlines: Vec<(String, String, i64, f64)> = setup
         .query(
             "SELECT instance, kind, allowance_ms,
@@ -246,8 +246,8 @@ async fn run(
     let due = (
         "test-instance".to_owned(),
         "call".to_owned(),
-        39_000,
-        39_000.0,
+        41_000,
+        41_000.0,
     );
     assert_eq!(deadlines, vec![due.clone(), due.clone(), due]);
 

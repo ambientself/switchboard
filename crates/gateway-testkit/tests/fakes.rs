@@ -526,13 +526,15 @@ fn read_and_finish(
 }
 
 /// The store sets each row's time at begin and deadline from its own clock, as Postgres does:
-/// the time at begin plus the begin budget, the row's call deadline and the finish deadline.
+/// the time at begin plus the begin budget, the row's call deadline, the finish deadline and the
+/// answer budget.
 #[test]
 fn the_deadline_comes_from_the_stores_clock_and_includes_the_begin_budget() {
     let fixture = fixture();
     let clock = SteppableClock::at(FIXTURE_NOW);
     let budgets = StoreBudgets {
         begin: Duration::from_millis(1_500),
+        answer: Duration::from_millis(2_250),
         finish_deadline: Duration::from_secs(20),
     };
     let store = InMemoryAuditStore::new()
@@ -553,14 +555,14 @@ fn the_deadline_comes_from_the_stores_clock_and_includes_the_begin_budget() {
     assert_eq!(store.begun_at(&start.row), Some(begun_at));
     assert_eq!(
         store.deadline(&start.row),
-        Some(begun_at + Duration::from_millis(1_500 + 7_250 + 20_000))
+        Some(begun_at + Duration::from_millis(1_500 + 7_250 + 20_000 + 2_250))
     );
     // A denial is a call row too, begun a second later, with the fixture's call deadline.
     let begun_at = begun_at + Duration::from_secs(1);
     assert_eq!(store.begun_at(&denied.row), Some(begun_at));
     assert_eq!(
         store.deadline(&denied.row),
-        Some(begun_at + Duration::from_millis(1_500 + FIXTURE_CALL_DEADLINE_MS + 20_000))
+        Some(begun_at + Duration::from_millis(1_500 + FIXTURE_CALL_DEADLINE_MS + 20_000 + 2_250))
     );
 
     // The record carries the instance and the call deadline, and no time.
@@ -644,7 +646,7 @@ fn the_default_budgets_are_the_postgres_stores() {
     assert_eq!(store.begun_at(&start.row), Some(begun_at));
     assert_eq!(
         store.deadline(&start.row),
-        Some(begun_at + Duration::from_millis(2_000 + FIXTURE_CALL_DEADLINE_MS + 30_000))
+        Some(begun_at + Duration::from_millis(2_000 + FIXTURE_CALL_DEADLINE_MS + 30_000 + 2_000))
     );
 }
 
@@ -1265,14 +1267,15 @@ fn an_identifier_a_completion_or_a_shape_postgres_refuses_writes_no_row() {
     assert_eq!(store.list_rows().len(), 1);
 }
 
-/// The deadline is worked out as the Postgres store does: the begin budget and the finish
-/// deadline in whole milliseconds, added to the call deadline without wrapping, and refused
-/// past a `bigint` of milliseconds.
+/// The deadline is worked out as the Postgres store does: the begin budget, the finish deadline
+/// and the answer budget in whole milliseconds, added to the call deadline without wrapping,
+/// and refused past a `bigint` of milliseconds.
 #[test]
 fn the_deadline_is_counted_in_whole_milliseconds_and_never_wraps() {
     let fixture = fixture();
     let store = InMemoryAuditStore::new().with_budgets(StoreBudgets {
         begin: Duration::from_micros(1_500_999),
+        answer: Duration::from_micros(2_250_999),
         finish_deadline: Duration::from_nanos(20_000_999_999),
     });
     let start = RowStart {
@@ -1283,11 +1286,11 @@ fn the_deadline_is_counted_in_whole_milliseconds_and_never_wraps() {
     let begun_at = UNIX_EPOCH + Duration::from_secs(FIXTURE_NOW);
     assert_eq!(
         store.deadline(&start.row),
-        Some(begun_at + Duration::from_millis(1_500 + 7_250 + 20_000))
+        Some(begun_at + Duration::from_millis(1_500 + 7_250 + 20_000 + 2_250))
     );
 
     // An allowance one past a bigint, and one that would wrap round to a short one.
-    for call_deadline_ms in [i64::MAX.unsigned_abs() - 21_499, u64::MAX] {
+    for call_deadline_ms in [i64::MAX.unsigned_abs() - 23_749, u64::MAX] {
         let start = RowStart {
             call_deadline_ms,
             ..row_start()
@@ -1310,10 +1313,11 @@ fn the_deadline_is_counted_in_whole_milliseconds_and_never_wraps() {
 #[test]
 fn the_deadline_is_refused_where_postgres_cannot_work_it_out() {
     let fixture = fixture();
-    // The default budgets add 32,000 ms to the call deadline.
+    // The default budgets add 34,000 ms to the call deadline: 2 s to begin, 30 s to finish and a
+    // 2 s answer budget.
     let begin = |store: &InMemoryAuditStore, allowance_ms: u64| {
         let start = RowStart {
-            call_deadline_ms: allowance_ms - 32_000,
+            call_deadline_ms: allowance_ms - 34_000,
             ..row_start()
         };
         let begun = begin_as(&fixture, store, &start, READ_TOOL);
@@ -1336,7 +1340,7 @@ fn the_deadline_is_refused_where_postgres_cannot_work_it_out() {
     for allowance_ms in [
         9_222_518_015_999_999,
         9_222_518_016_000_000,
-        10_000_000_000_000_000 + 32_000,
+        10_000_000_000_000_000 + 34_000,
     ] {
         let (row, begun) = begin(&store, allowance_ms);
         assert!(!begun, "an allowance of {allowance_ms} ms was written");

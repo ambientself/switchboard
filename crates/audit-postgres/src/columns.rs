@@ -318,13 +318,19 @@ impl ListRow {
 }
 
 /// How long past the database's time at begin a row's deadline is, in milliseconds: the begin
-/// budget, the call's deadline and the finish deadline, so a row reads as open only once
-/// every step could have ended (decision 0009). Saturating, so a long deadline cannot wrap
-/// round to a short one; a sum past the column's range is then refused, not cut.
+/// budget, the call's deadline, the finish deadline and the answer budget, so a row reads as
+/// open only once every step could have ended (decision 0009, as amended on 2026-10-11). The
+/// answer budget is there because the last attempt to complete a failed begin's row is made at
+/// the finish deadline, counted from when the begin failed, and may take one answer budget
+/// past it. No call runs on such a row, so without the answer budget it could be completed
+/// after its deadline whenever the call deadline is shorter than the answer budget (#96).
+/// Saturating, so a long deadline cannot wrap round to a short one; a sum past the column's
+/// range is then refused, not cut.
 pub(crate) fn allowance_ms(budgets: &Budgets, call_deadline_ms: u64) -> u64 {
     millis(budgets.begin)
         .saturating_add(call_deadline_ms)
         .saturating_add(millis(budgets.finish_deadline))
+        .saturating_add(millis(budgets.answer))
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -496,7 +502,7 @@ mod tests {
     fn budgets() -> Budgets {
         Budgets {
             begin: Duration::from_millis(1_500),
-            answer: Duration::from_secs(2),
+            answer: Duration::from_millis(2_250),
             finish_deadline: Duration::from_secs(20),
         }
     }
@@ -597,7 +603,7 @@ mod tests {
                 claimed_team: Some("team-c".into()),
                 instance: "gateway-7f9c".into(),
                 kind: "call",
-                allowance_ms: 1_500 + 5_000 + 20_000,
+                allowance_ms: 1_500 + 5_000 + 20_000 + 2_250,
             }
         );
     }
@@ -705,23 +711,30 @@ mod tests {
         }
     }
 
-    /// The allowance is the begin budget, the call deadline and the finish deadline, and the
-    /// answer budget plays no part. A sum too large for the column is refused, not cut.
+    /// The allowance is the begin budget, the call deadline, the finish deadline and the
+    /// answer budget. A sum too large for the column is refused, not cut.
     #[test]
-    fn the_allowance_is_the_begin_budget_the_call_deadline_and_the_finish_deadline() {
+    fn the_allowance_is_the_begin_budget_call_deadline_finish_deadline_and_answer_budget() {
         let mut record = allowed_workload();
         record.call_deadline_ms = 7_250;
         let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
-        assert_eq!(row.allowance_ms, 1_500 + 7_250 + 20_000);
+        assert_eq!(row.allowance_ms, 1_500 + 7_250 + 20_000 + 2_250);
         let defaults = BeginRow::from_record(&id(), &record, &Budgets::default()).unwrap();
-        assert_eq!(defaults.allowance_ms, 2_000 + 7_250 + 30_000);
+        assert_eq!(defaults.allowance_ms, 2_000 + 7_250 + 30_000 + 2_000);
 
         assert_eq!(allowance_ms(&budgets(), u64::MAX), u64::MAX);
-        let huge = Budgets {
-            begin: Duration::MAX,
-            ..budgets()
-        };
-        assert_eq!(allowance_ms(&huge, 0), u64::MAX);
+        for huge in [
+            Budgets {
+                begin: Duration::MAX,
+                ..budgets()
+            },
+            Budgets {
+                answer: Duration::MAX,
+                ..budgets()
+            },
+        ] {
+            assert_eq!(allowance_ms(&huge, 0), u64::MAX);
+        }
         for call_deadline_ms in [u64::MAX, i64::MAX.unsigned_abs()] {
             record.call_deadline_ms = call_deadline_ms;
             assert!(matches!(
@@ -729,13 +742,33 @@ mod tests {
                 Err(PgAuditError::Column(_))
             ));
         }
-        record.call_deadline_ms = i64::MAX.unsigned_abs() - 21_500;
+        record.call_deadline_ms = i64::MAX.unsigned_abs() - 23_750;
         assert_eq!(
             BeginRow::from_record(&id(), &record, &budgets())
                 .unwrap()
                 .allowance_ms,
             i64::MAX
         );
+    }
+
+    /// A failed begin's row is completed by attempts that start when the begin fails, at most
+    /// the begin budget after the row's time at begin, and go on until the finish deadline,
+    /// the last one taking up to one answer budget more. That latest completion falls at or
+    /// before the row's deadline even when the call deadline is shorter than the answer
+    /// budget, which per-server call deadlines allow down to 1 s (#96).
+    #[test]
+    fn a_failed_begins_latest_completion_is_within_the_deadline_with_a_short_call_deadline() {
+        for budgets in [budgets(), Budgets::default()] {
+            let answer_ms = millis(budgets.answer);
+            let latest_completion =
+                millis(budgets.begin) + millis(budgets.finish_deadline) + answer_ms;
+            for call_deadline_ms in [0, 1, 1_000, answer_ms - 1, answer_ms] {
+                assert!(
+                    latest_completion <= allowance_ms(&budgets, call_deadline_ms),
+                    "{budgets:?} with a call deadline of {call_deadline_ms} ms"
+                );
+            }
+        }
     }
 
     #[test]
