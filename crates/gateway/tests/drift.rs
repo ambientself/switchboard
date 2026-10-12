@@ -12,6 +12,7 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,7 @@ use mock_docs_server::Config;
 use serde_json::{Value, json};
 use support::{Http, PATIENCE, eventually, exchange, legacy};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 /// The drift interval the running tests use.
 const INTERVAL: Duration = Duration::from_secs(1);
@@ -68,9 +70,14 @@ struct Replica {
 
 /// The connector for `entry`, one of the mock server's entries, as the binary builds it.
 fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
+    proxy_within(entry, url, files, connector_proxy::DEFAULT_DEADLINE)
+}
+
+/// [`proxy`], with `deadline` for its calls and its tool list.
+fn proxy_within(entry: &str, url: &str, files: &Files, deadline: Duration) -> Arc<ProxyConnector> {
     let credential = files.path(&format!("{entry}-credential"));
     let credentials = FileCredentials::load([(entry.into(), credential)]).unwrap();
-    let upstream = Upstream::new(entry, url)
+    let mut upstream = Upstream::new(entry, url)
         .tool(
             format!("{entry}__read_document").parse().unwrap(),
             "read_document",
@@ -79,6 +86,7 @@ fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
             format!("{entry}__list_documents").parse().unwrap(),
             "list_documents",
         );
+    upstream.deadline = deadline;
     Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap())
 }
 
@@ -662,6 +670,153 @@ async fn a_poll_that_fails_withdraws_nothing_and_is_counted() {
     );
 }
 
+/// A server that accepts connections and never answers on them.
+async fn silent_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    url
+}
+
+/// Decision 0013, section 5: each server is polled on a schedule of its own, so a changed
+/// definition is withdrawn within one interval plus its own server's call deadline, however long
+/// another server's polls take. Team B's entry here is a server that never answers, under a 60 s
+/// deadline; team A's is the mock server, under a 1 s deadline.
+#[tokio::test]
+async fn a_server_that_never_answers_does_not_hold_back_another_servers_withdrawal() {
+    let mock = mock().await;
+    let files = Files::new("drift-silent", &issuer().jwks_document(), &mock.url());
+    let replica = Replica::new(&files, &mock.url());
+    let silent = silent_server().await;
+    let own_deadline = Duration::from_secs(1);
+    let withdrawals = replica.drift.withdrawals().clone();
+    let signals = replica.drift.signals();
+    let drift_pass = DriftPass::new(
+        withdrawals.clone(),
+        BTreeMap::from([
+            (
+                ConnectorName::new("docs-team-a"),
+                proxy_within("docs-team-a", &mock.url(), &files, own_deadline),
+            ),
+            (
+                ConnectorName::new("docs-team-b"),
+                proxy_within("docs-team-b", &silent, &files, Duration::from_secs(60)),
+            ),
+        ]),
+        INTERVAL,
+    );
+    let running = tokio::spawn(drift_pass.run());
+    let polled = |server: &str| {
+        signals
+            .counts()
+            .into_iter()
+            .find(|(name, _)| name.as_str() == server)
+            .map(|(_, counts)| counts)
+            .unwrap()
+    };
+
+    // Team A's first poll has answered, unchanged; team B's is outstanding for a minute.
+    eventually("team A's first poll", || {
+        polled("docs-team-a").polls_ok >= 1
+    })
+    .await;
+    drift(&mock, Some(CHANGED));
+    let changed = Instant::now();
+    eventually("the withdrawal of team A's read tool", || {
+        !withdrawals.standing().is_empty()
+    })
+    .await;
+    running.abort();
+
+    // One interval and team A's own deadline, with room to spare, and far short of team B's.
+    assert!(
+        changed.elapsed() < INTERVAL + own_deadline + Duration::from_secs(5),
+        "{:?}",
+        changed.elapsed()
+    );
+    assert_eq!(replica.withdrawn(), BTreeSet::from([READ_TOOL.to_owned()]));
+    assert_eq!(
+        replica.revision(),
+        format!("{KIND_REVISION}+withdrawn:{READ_TOOL}")
+    );
+    let team_b = polled("docs-team-b");
+    assert_eq!((team_b.polls_ok, team_b.withdrawals), (0, 0), "{team_b:?}");
+}
+
+/// A server whose `tools/list` answers only once released, with the mock server's own
+/// definitions: the ones the kind registry approves.
+struct Held {
+    url: String,
+    arrived: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+impl Held {
+    async fn start() -> Self {
+        use mock_docs_server::ToolName as Mock;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (counted, gate) = (arrived.clone(), release.clone());
+        let router = Router::new().route(
+            "/mcp",
+            post(move |body: String| async move {
+                let request: Value = serde_json::from_str(&body).unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                gate.acquire().await.unwrap().forget();
+                let tools = [
+                    Mock::ListDocuments.definition(),
+                    Mock::ReadDocument.definition(),
+                ];
+                (
+                    [("content-type", "application/json")],
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": tools}})
+                        .to_string(),
+                )
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        Self {
+            url,
+            arrived,
+            release,
+        }
+    }
+}
+
+/// A poll is judged against the approvals it began under. Team A's read tool is approved again,
+/// for a new definition, while a poll that read the old one is outstanding: when the poll
+/// answers, it does not withdraw the new approval, which it never compared.
+#[tokio::test]
+async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
+    let (captured, _logging) = Captured::start();
+    let held = Held::start().await;
+    let files = Files::new("drift-stale", &issuer().jwks_document(), &held.url);
+    let replica = Replica::new(&files, &held.url);
+    let again = reapproved(&files::registry(&held.url), READ_TOOL, CHANGED, "demo-8");
+
+    let approving = async {
+        eventually("both entries' polls", || {
+            held.arrived.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert_eq!(replica.reload(&again), "demo-8");
+        held.release.add_permits(2);
+    };
+    tokio::join!(replica.drift.pass(), approving);
+
+    assert!(replica.withdrawn().is_empty(), "{:?}", replica.withdrawn());
+    assert!(captured.events("tool_withdrawn").is_empty());
+    assert_eq!(replica.revision(), "demo-8");
+    assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
+}
+
 /// A gateway started as the binary starts it, and served on a listener bound after.
 struct Booted {
     address: SocketAddr,
@@ -726,6 +881,7 @@ async fn first_list(address: SocketAddr) -> Vec<String> {
 /// section 7's stated residual.
 #[tokio::test]
 async fn a_definition_changed_at_boot_is_never_served_and_a_restart_detects_it_again() {
+    let (captured, _logging) = Captured::start();
     let mock = mock().await;
     let files = Files::new("drift-boot", &issuer().jwks_document(), &mock.url());
     drift(&mock, Some(CHANGED));
@@ -733,6 +889,18 @@ async fn a_definition_changed_at_boot_is_never_served_and_a_restart_detects_it_a
     let first = boot(&files).await;
     assert_eq!(first.withdrawn, 2);
     assert_eq!(first_list(first.address).await, [LIST_TOOL]);
+    // The boot line says what is served: the derived revision, and the two tools left.
+    let serving: Vec<Value> = captured
+        .events("boot")
+        .into_iter()
+        .map(|(_, fields)| fields)
+        .filter(|fields| fields.get("registry_revision").is_some())
+        .collect();
+    assert_eq!(serving.len(), 1, "{serving:?}");
+    assert_eq!(serving[0]["registry_revision"], KIND_REVISION);
+    assert_eq!(serving[0]["revision"], without_reads(KIND_REVISION));
+    assert_eq!(serving[0]["tools"], 2);
+    assert_eq!(serving[0]["withdrawn"], 2);
 
     // A restart with the server still changed: withdrawn again, before serving.
     let restarted = boot(&files).await;

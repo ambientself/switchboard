@@ -7,8 +7,13 @@
 //! server it hashes the served definition (upstream name, title, description and input schema)
 //! with [`definition_sha256`], the function the loader checks approvals with, and compares it
 //! with the approval's `definition_sha256`. A tool whose hash differs, or that the server no
-//! longer lists, is withdrawn. A tool the server lists that no approval names is ignored. The
-//! servers are polled together, and the pass ends when every poll has answered or failed.
+//! longer lists, is withdrawn. A tool the server lists that no approval names is ignored.
+//!
+//! **A poll is judged against the approvals it began under.** Each poll notes the key
+//! ([`WithdrawalKey`]) of every tool approved on its server when it starts. When it ends, a
+//! tool whose key has changed since, because a reload approved it again or removed it while the
+//! poll was outstanding, is not judged by that poll: the list it read may predate the new
+//! approval, and would withdraw it under a key it never compared. The next poll judges it.
 //!
 //! **A failed poll is not drift.** A server that cannot be reached, answers with a status other
 //! than 200, answers with something that is not a tool list, answers after its call deadline,
@@ -20,15 +25,19 @@
 //!
 //! **When it runs.** The first pass runs during boot, in
 //! [`start::prepare`](crate::start::prepare), after the registry loads and before the listener
-//! is bound, so a tool it withdraws is never served and nothing, `/readyz` included, is answered
-//! until it ends. A failed first poll does not stop boot. [`DriftPass::run`] then repeats the
-//! pass every interval, beside the registry reloader, until the binary aborts it at shutdown.
-//! The interval is `[drift] interval_seconds` in the deployment file ([`DriftSection`]): 300 s
+//! is bound, so a tool it withdraws is never served and nothing, `/readyz` included, is
+//! answered until it ends. That first pass polls the servers together and ends when every poll
+//! has answered or failed. A failed first poll does not stop boot. [`DriftPass::run`] then
+//! polls each server every interval on a schedule of its own, beside the registry reloader,
+//! until the binary aborts it at shutdown. A server that answers slowly, or not at all until
+//! its call deadline, delays only its own next poll, so a changed definition is withdrawn
+//! within one interval plus its own server's call deadline whatever the other servers do. The
+//! interval is `[drift] interval_seconds` in the deployment file ([`DriftSection`]): 300 s
 //! unless given, and refused below 5 or above 900.
 //!
-//! **A withdrawal** ([`Withdrawals`]) makes a policy of its own: the loaded registry's, with the
-//! withdrawn tools removed from the snapshot, every surface, the definitions and the argument
-//! adapters ([`ServedPolicy`]'s `without`). Its revision is [`withdrawn_revision`]:
+//! **A withdrawal** ([`Withdrawals`]) makes a policy of its own: the loaded registry's, with
+//! the withdrawn tools removed from the snapshot, every surface, the definitions and the
+//! argument adapters ([`ServedPolicy`]'s `without`). Its revision is [`withdrawn_revision`]:
 //! `{base}+withdrawn:{names}`, the withdrawn tools' exposed names sorted by byte and joined by
 //! commas, so a row decided under it says exactly what was in force. It replaces the policy
 //! served atomically, and the loader's rules are not run again. Each withdrawal is logged as
@@ -39,8 +48,8 @@
 //! `binding_sha256` and `approved_at` ([`WithdrawalKey`]). When the registry reloader serves a
 //! new version, every standing withdrawal whose key is unchanged is applied to it, and the
 //! derived revision names the new base. One whose tool was approved again (a new `approved_at`)
-//! or removed is dropped, and logged as [`WITHDRAWAL_CLEARED_EVENT`] at INFO. Withdrawals live in
-//! this replica's memory until then, or until it restarts (section 7): a restarted replica
+//! or removed is dropped, and logged as [`WITHDRAWAL_CLEARED_EVENT`] at INFO. Withdrawals live
+//! in this replica's memory until then, or until it restarts (section 7): a restarted replica
 //! withdraws a tool again only if its server still serves the changed definition. Each replica
 //! checks for itself; nothing is passed between them.
 
@@ -331,6 +340,17 @@ impl Withdrawals {
         self.signals.clone()
     }
 
+    /// The key of each tool approved on `server` now, which a poll starting now is judged
+    /// against.
+    fn keys_on(&self, server: &ConnectorName) -> BTreeMap<ToolName, WithdrawalKey> {
+        self.state()
+            .approved
+            .iter()
+            .filter(|(_, approved)| approved.server == *server)
+            .map(|(tool, approved)| (tool.clone(), approved.key.clone()))
+            .collect()
+    }
+
     /// Serves `policy`, `registry`'s, from now on, less every standing withdrawal whose key
     /// `registry` still approves. The rest are dropped and logged. Returns the revision served.
     pub(crate) fn load(&self, registry: &Registry, policy: ServedPolicy) -> PolicyRevision {
@@ -385,8 +405,14 @@ impl Withdrawals {
     }
 
     /// Judges what `server`'s poll read against the tools approved on it now, and withdraws
-    /// each that changed or is gone. A failed poll withdraws nothing.
-    fn judge(&self, server: &ConnectorName, listed: Result<Vec<ListedTool>, ListError>) {
+    /// each that changed or is gone. A tool whose key is not the one in `started`, the keys
+    /// when the poll began, is left for the next poll. A failed poll withdraws nothing.
+    fn judge(
+        &self,
+        server: &ConnectorName,
+        started: &BTreeMap<ToolName, WithdrawalKey>,
+        listed: Result<Vec<ListedTool>, ListError>,
+    ) {
         let tools = match listed {
             Ok(tools) => {
                 self.signals.count(server, |counts| counts.polls_ok += 1);
@@ -408,6 +434,11 @@ impl Withdrawals {
         let mut found = Vec::new();
         for (tool, approved) in &state.approved {
             if approved.server != *server || state.standing.contains_key(tool) {
+                continue;
+            }
+            // Approved again, or newly, while the poll was outstanding: what it read may be
+            // older than the approval.
+            if started.get(tool) != Some(&approved.key) {
                 continue;
             }
             let served: Vec<&ListedTool> = tools
@@ -509,30 +540,71 @@ impl DriftPass {
     pub async fn pass(&self) {
         let mut polls = JoinSet::new();
         for (server, connector) in &self.servers {
-            let server = server.clone();
-            let connector = Arc::clone(connector);
-            polls.spawn(async move {
-                let listed = connector.list_tools().await;
-                (server, listed)
-            });
+            polls.spawn(poll(
+                Arc::clone(&self.withdrawals),
+                server.clone(),
+                Arc::clone(connector),
+            ));
         }
         while let Some(polled) = polls.join_next().await {
-            match polled {
-                Ok((server, listed)) => self.withdrawals.judge(&server, listed),
-                Err(error) => tracing::error!(%error, "a drift poll's task failed"),
+            if let Err(error) = polled {
+                tracing::error!(%error, "a drift poll's task failed");
             }
         }
     }
 
-    /// Runs the pass every interval, for ever. The first runs an interval from now: boot ran
-    /// one already, before the listener was bound.
+    /// Polls each server every interval, for ever, each on a schedule of its own, so a slow
+    /// server delays no other server's polls. Each server's first poll is an interval from now:
+    /// boot ran one already, before the listener was bound.
     pub async fn run(self) {
-        let mut every =
-            tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);
-        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            every.tick().await;
-            self.pass().await;
+        let mut entries = JoinSet::new();
+        for (server, connector) in self.servers {
+            entries.spawn(poll_every(
+                Arc::clone(&self.withdrawals),
+                server,
+                connector,
+                self.interval,
+            ));
+        }
+        while entries.join_next().await.is_some() {}
+    }
+}
+
+/// Reads `server`'s tool list with `connector` and judges it against the approvals in force
+/// when it began.
+async fn poll(
+    withdrawals: Arc<Withdrawals>,
+    server: ConnectorName,
+    connector: Arc<ProxyConnector>,
+) {
+    let started = withdrawals.keys_on(&server);
+    let listed = connector.list_tools().await;
+    withdrawals.judge(&server, &started, listed);
+}
+
+/// Polls `server` every `interval`, the first an interval from now, for ever. A poll that runs
+/// past the interval delays the next one; the next is never run beside it. A poll whose task
+/// fails is logged, and the next runs as usual.
+async fn poll_every(
+    withdrawals: Arc<Withdrawals>,
+    server: ConnectorName,
+    connector: Arc<ProxyConnector>,
+    interval: Duration,
+) {
+    let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        // Its own task, so a panic ends this poll alone; dropped with the set when the pass is
+        // aborted.
+        let mut one = JoinSet::new();
+        one.spawn(poll(
+            Arc::clone(&withdrawals),
+            server.clone(),
+            Arc::clone(&connector),
+        ));
+        if let Some(Err(error)) = one.join_next().await {
+            tracing::error!(%error, %server, "a drift poll's task failed");
         }
     }
 }

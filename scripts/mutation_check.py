@@ -4376,8 +4376,9 @@ mutate("demo-compose-dev-issuer-published", "the development issuer is published
 # no longer listed. A failed poll withdraws nothing. A withdrawal's revision names the
 # withdrawn tools literally, it removes the tool from the definitions too, and it stands across
 # a reload that keeps its key until a new approval clears it. The first pass runs before the
-# listener is bound. tests/drift.rs watches each; drift.rs's own tests the revision, the
-# catalog and the interval; tests/deployment.rs the interval's ceiling.
+# listener is bound. After it, each server is polled on a schedule of its own, and a poll is
+# judged only against the approvals it began under. tests/drift.rs watches each; drift.rs's own
+# tests the revision, the catalog and the interval; tests/deployment.rs the interval's ceiling.
 DRIFT = GW + "drift.rs"
 mutate("gw-drift-never-compares", "a served definition is never compared with its approval, so a changed one stays served", DRIFT,
        "                served_sha256(listed).as_deref() != Some(approved.key.definition_sha256.as_str())\n",
@@ -4407,10 +4408,31 @@ mutate("gw-drift-catalog-still-lists", "a withdrawal leaves the tool's definitio
        "            catalog: self.catalog.without(withdrawn),\n", "            catalog: self.catalog.clone(),\n")
 mutate_all("gw-drift-first-pass-after-bind", "the first drift pass runs on the timer after the listener binds, not during boot",
            (START, "    drift.pass().await;\n", ""),
-           (DRIFT, "tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);",
-            "tokio::time::interval_at(tokio::time::Instant::now(), self.interval);"))
+           (DRIFT, "tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);",
+            "tokio::time::interval_at(tokio::time::Instant::now(), interval);"))
 mutate("gw-drift-interval-ceiling-unchecked", "a drift interval above 900 s loads", DRIFT,
        " || seconds > MAX_DRIFT_INTERVAL.as_secs() {", " {")
+mutate("gw-drift-entries-share-one-schedule", "the servers are polled together each interval, so a server that does not answer holds back every other server's next poll until its deadline", DRIFT,
+       "        let mut entries = JoinSet::new();\n"
+       "        for (server, connector) in self.servers {\n"
+       "            entries.spawn(poll_every(\n"
+       "                Arc::clone(&self.withdrawals),\n"
+       "                server,\n"
+       "                connector,\n"
+       "                self.interval,\n"
+       "            ));\n"
+       "        }\n"
+       "        while entries.join_next().await.is_some() {}\n",
+       "        let _ = poll_every;\n"
+       "        let mut every =\n"
+       "            tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);\n"
+       "        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);\n"
+       "        loop {\n"
+       "            every.tick().await;\n"
+       "            self.pass().await;\n"
+       "        }\n")
+mutate("gw-drift-stale-poll-judged", "a poll is judged against the approvals in force when it answers, so a list read before a new approval withdraws it", DRIFT,
+       "            if started.get(tool) != Some(&approved.key) {\n                continue;\n            }\n", "")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
