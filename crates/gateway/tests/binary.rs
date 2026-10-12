@@ -454,6 +454,9 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
     assert_eq!(field("instance"), [json!(INSTANCE)]);
     // No `[metrics]`, no metrics listener.
     assert_eq!(field("metrics"), [json!("off")]);
+    // No `[drift]`: the default interval. The first pass withdrew nothing.
+    assert_eq!(field("drift_interval_seconds"), [json!(300)]);
+    assert_eq!(field("withdrawn"), [json!(0)]);
 
     let team_a = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
     let read = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -473,13 +476,22 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
     assert_eq!(refused["fields"]["event"], json!("identity_failed"));
     assert_eq!(refused["level"], json!("WARN"));
 
-    // One request reached the server, with the gateway's credential.
-    let bearers: Vec<Value> = mock
-        .log_lines()
-        .iter()
-        .filter_map(|line| line.get("bearer_sha256").cloned())
-        .collect();
-    assert_eq!(bearers.len(), 1, "{bearers:?}");
+    // One call reached the server, with the gateway's credential. Beside it, the first drift
+    // pass read each entry's tool list once, before the listener was bound, with that entry's
+    // own credential; the next pass is five minutes away.
+    let lines = mock.log_lines();
+    let bearers = |lists: bool| -> Vec<Value> {
+        lines
+            .iter()
+            .filter(|line| (line["rpc_method"] == json!("tools/list")) == lists)
+            .filter_map(|line| line.get("bearer_sha256").cloned())
+            .collect()
+    };
+    assert_eq!(bearers(false).len(), 1, "{lines:?}");
+    let listed = bearers(true);
+    assert_eq!(listed.len(), 2, "{lines:?}");
+    assert_ne!(listed[0], listed[1], "{lines:?}");
+    assert!(listed.contains(&bearers(false)[0]), "{lines:?}");
     assert!(
         !running
             .seen
