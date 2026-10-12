@@ -31,8 +31,9 @@ algorithm = "RS256"
 keys_url = "https://kubernetes.default.svc.cluster.local/openid/v1/jwks"
 keys_ca_file = "/etc/switchboard/cluster-ca/ca.crt"
 # The cluster's keys do not change during a demo run, so this sets only how often the gateway
-# asks again and how old its keys may grow. 60 s keeps the key age metric under a minute and
-# costs the API server one small request a minute. The least the gateway accepts is 30.
+# asks again: one small request a minute to the API server. While refreshes succeed, the key age
+# metric stays near a minute. A failed refresh keeps the keys in use, so the age can grow past
+# that (decision 0013). The least the gateway accepts is 30.
 keys_refresh_seconds = 60
 subjects_file = "teams.toml"
 max_lifetime_seconds = 3600
