@@ -71,6 +71,20 @@ issuer's discovery document and keys, to the group `system:unauthenticated`, and
 trusts only the cluster CA in ConfigMap `kube-root-ca.crt`. The kind run checks that a caller
 with no token gets the keys from the gateway's pod and is refused a ConfigMap.
 
+## The drift pass
+
+The gateway reads each entry's tool list from mock-docs, with that entry's own credential, once
+during boot before it binds its listener and then every `[drift] interval_seconds` (decision
+0013, section 5). Both demos set 10 s, so a run sees it; decision 0013 sets 300 s, the default,
+for real deployments, and the gateway refuses an interval below 5 or above 900. An approved
+tool whose served definition no longer hashes to its approval's `definition_sha256`, or that
+mock-docs no longer lists, is withdrawn from every surface in that replica until it is approved
+again or the replica restarts, with a `"event":"tool_withdrawn"` line at `ERROR`. A poll that
+fails keeps the entry's tools served and logs `"event":"drift_poll_failed"` at `WARN`. These
+tools/list requests reach mock-docs every 10 s under the entries' identities; they are not calls,
+and the runs' call counts leave them out. Neither run changes a definition: the demos show that
+the pass runs and withdraws nothing while mock-docs serves what was approved.
+
 ## What is here
 
 | Path | What it is |
@@ -213,7 +227,10 @@ for `tools/call` and `tools/list`), answers released before finish, finishes giv
 failed begins never committed, finishes in flight, open rows and the oldest open row's deadline
 (polled every 15 s through the open-row view; a failed poll is counted and keeps the last
 count), begin and finish latency histograms, each pool's connections in use, open and maximum,
-and telemetry events and drops. Receipts in `unknown` arrive with receipts (#10 stage 2). The
+and telemetry events and drops. Each proxied server's drift polls by result, the tools the drift
+pass withdrew from it, and how many tools are withdrawn now
+(`switchboard_drift_polls_total{server,result}`, `switchboard_drift_withdrawals_total{server}`,
+`switchboard_tools_withdrawn`). Receipts in `unknown` arrive with receipts (#10 stage 2). The
 Compose run checks that its database outage counted a begin failure and an audit-failure
 answer; both runs check that telemetry dropped is exported and that at most one row is open.
 No alert thresholds or paging: those wait for the first production deployment (Still open 9).
@@ -279,8 +296,8 @@ check that the deployment files load.
 | Piece | How it runs |
 | --- | --- |
 | Binaries | `switchboard` (crates/gateway), `switchboard-dev` (crates/gateway-dev) and `mock-docs-server` (crates/mock-docs-server). `Dockerfile` builds `switchboard` on its own with `cargo build --release --locked -p gateway --bin switchboard`, then the other two with `cargo build --release --locked -p gateway-dev -p mock-docs-server --bins`. Build `switchboard` for deployment the same way: a workspace build turns on gateway-dev's `test-support` feature, which exempts the gateway from the receipt-store gate (decision 0009). `switchboard` links nothing from the testkit. |
-| Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with where its keys come from and its team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server, and `[metrics] listen`, where `GET /metrics` is served (above). Missing, partial or unknown fields refuse to start, except `listen`, which is `127.0.0.1:8080` (loopback only) if left out, and `[metrics]`, which serves nothing if left out. Compose's issuer has a keys file, which the dev issuer writes. kind's has `keys_url`, the API server's `/openid/v1/jwks` on the issuer's own origin, fetched at boot and every 60 s with no token and with `keys_ca_file` from ConfigMap `kube-root-ca.crt`; the gateway logs `fetched the issuer's keys from its keys URL` at boot, which the kind run checks. |
-| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); `"metrics"`, the address `GET /metrics` is served on, or `"off"`; and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. One `"event":"audit_row_given_up"` line at `ERROR` for each audit row whose completion the store stopped trying to write, with the `row`, the `outcome` not written and the `cause`. |
+| Gateway | `switchboard --config=<file>`. The deployment file (`compose/config/gateway.toml`, `kind/base/config/gateway.toml`; format in `crates/gateway/src/deployment.rs`) gives the listen address, the allowed hosts, the registry file and how often it is read again (2 s), each trusted issuer with where its keys come from and its team manifest (`teams.toml`), the audit store (`mode = "postgres"`, URL from `SWITCHBOARD_DATABASE_URL`) and the file holding the gateway's credential for each registry server, and `[metrics] listen`, where `GET /metrics` is served (above), and `[drift] interval_seconds`, how often each entry's tool list is read (10 s; the drift pass, above). Missing, partial or unknown fields refuse to start, except `listen`, which is `127.0.0.1:8080` (loopback only) if left out, `[metrics]`, which serves nothing if left out, and `[drift]`, 300 s if left out. Compose's issuer has a keys file, which the dev issuer writes. kind's has `keys_url`, the API server's `/openid/v1/jwks` on the issuer's own origin, fetched at boot and every 60 s with no token and with `keys_ca_file` from ConfigMap `kube-root-ca.crt`; the gateway logs `fetched the issuer's keys from its keys URL` at boot, which the kind run checks. |
+| Gateway logs | JSON lines. One `"event":"boot"` line per gate: `"identity":"enforce"` with `issuers` and `subjects`; `"audit":"postgres"` with `role` and `"role_check":"passed"` (the audit store's boot checks); `"metrics"`, the address `GET /metrics` is served on, or `"off"`; and the registry's `revision`. One `"event":"identity_failed"` line per caller refused for identity, with its `cause`. `"event":"policy_reloaded"` or `"policy_reload_refused"` when the registry file changes. A boot line with `drift_interval_seconds` and how many tools the first drift pass `withdrawn`; `"event":"tool_withdrawn"` at `ERROR` for each tool the drift pass withdraws, `"event":"drift_poll_failed"` at `WARN` for each tool list it could not read, and `"event":"policy_withdrawal_cleared"` when a reload drops a withdrawal. One `"event":"audit_row_given_up"` line at `ERROR` for each audit row whose completion the store stopped trying to write, with the `row`, the `outcome` not written and the `cause`. |
 | Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-5`; `compose/config/registry-withdrawn.toml` is revision `demo-6` without either team's read tool. A new version that changes a server or a tool's route is refused until a restart. |
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
