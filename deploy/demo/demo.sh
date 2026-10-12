@@ -112,6 +112,8 @@ k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
 # TEAM may read.
 team_entry() { echo "docs-$1"; }
 team_project() { case $1 in team-a) echo atlas ;; team-b) echo borealis ;; esac; }
+# entry_sha TEAM: the SHA-256 of TEAM's entry's dummy credential in Compose.
+entry_sha() { cat "$COMPOSE_CREDENTIALS/$(team_entry "$1")-credential.sha256"; }
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 step() {
@@ -551,6 +553,7 @@ compose_workload() { # LABEL MODE TEAM: runs the workload service once
   if [ "$team" = team-a ]; then own=atlas other=borealis; else own=borealis other=atlas; fi
   local issuer=http://dev-issuer:8090/token
   if output=$(dc run --rm --no-deps -T \
+      -e "GATEWAY_URL=http://gateway:8080/mcp/$(team_entry "$team")" \
       -e "TOKEN_URL=$issuer?subject=workload:$team:mock-workload&audience=switchboard" \
       -e "OWN_PROJECT=$own" -e "OTHER_PROJECT=$other" \
       -e "BAD_TOKEN_URLS=$issuer?subject=workload:$team:stranger&audience=switchboard $issuer?subject=workload:$team:mock-workload&audience=not-switchboard" \
@@ -605,12 +608,9 @@ compose_run() {
 
   step "the server never saw a workload token, no denied call reached it, and each team's calls carried its own entry's credential"
   # Each team's full run is allowed two calls, its list and its read; its other calls are denied.
-  local sha_a sha_b
-  sha_a=$(cat "$COMPOSE_CREDENTIALS/docs-team-a-credential.sha256")
-  sha_b=$(cat "$COMPOSE_CREDENTIALS/docs-team-b-credential.sha256")
   if fetch "mock-docs' log" mock_docs_log; then
-    check_server_bearers "$FETCHED" "$sha_a $sha_b" 4 all
-    check_server_entries "$FETCHED" 2 "team-a=$sha_a" "team-b=$sha_b"
+    check_server_bearers "$FETCHED" "$(entry_sha team-a) $(entry_sha team-b)" 4 all
+    check_server_entries "$FETCHED" 2 "team-a=$(entry_sha team-a)" "team-b=$(entry_sha team-b)"
   fi
 
   step "database unavailable: the call is refused and nothing runs"

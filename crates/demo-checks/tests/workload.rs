@@ -21,8 +21,8 @@ const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit
 const GOOD_TOKEN: &str = "good-team-a-token";
 const OWN: &str = "atlas";
 const OTHER: &str = "borealis";
-const LIST_TOOL: &str = "docs__list_documents";
-const READ_TOOL: &str = "docs__read_document";
+const LIST_TOOL: &str = "docs-team-a__list_documents";
+const READ_TOOL: &str = "docs-team-a__read_document";
 
 /// How the fake answers.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -43,13 +43,14 @@ enum Fake {
     WrongIdentitySentence,
     /// The audit database is down: every call gets the audit-failure sentence.
     AuditDown,
-    /// `docs__read_document` has been withdrawn.
+    /// Team A's read tool has been withdrawn.
     Withdrawn,
     /// The mock docs server reached directly: 401 for every request.
     Server401,
 }
 
-/// Starts the fake on a free loopback port and returns its `/mcp/docs` URL.
+/// Starts the fake on a free loopback port and returns its `/mcp/docs-team-a` URL: team A's
+/// surface, whose name the workload's tool names start with.
 fn serve(fake: Fake) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -58,7 +59,7 @@ fn serve(fake: Fake) -> String {
             thread::spawn(move || handle(stream, fake));
         }
     });
-    format!("http://127.0.0.1:{port}/mcp/docs")
+    format!("http://127.0.0.1:{port}/mcp/docs-team-a")
 }
 
 fn handle(mut stream: TcpStream, fake: Fake) {
@@ -193,7 +194,7 @@ fn answer(fake: Fake, bearer: Option<&str>, body: &Value) -> (u16, Option<Value>
                     Some(error(
                         -32001,
                         &format!(
-                            "Tool `{READ_TOOL}` is not available on surface `docs`. Call `tools/list` to see the tools this surface serves."
+                            "Tool `{READ_TOOL}` is not available on surface `docs-team-a`. Call `tools/list` to see the tools this surface serves."
                         ),
                     )),
                 );
