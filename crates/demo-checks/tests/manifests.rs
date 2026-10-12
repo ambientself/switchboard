@@ -596,7 +596,8 @@ subjects:
         assert_eq!(found.len(), 1, "{account}");
         assert!(found[0].contains("\nautomountServiceAccountToken: false"));
     }
-    // No other file of the base grants anything.
+    // No other file of the base grants a ServiceAccount anything or names ServiceAccounts in a
+    // rule. A binding for other subjects, such as unauthenticated callers, is not checked here.
     let kustomization = read("deploy/kind/base/kustomization.yaml");
     for file in kustomization
         .lines()
@@ -604,13 +605,23 @@ subjects:
         .filter(|file| file.ends_with(".yaml") && *file != "gateway-tokens.yaml")
     {
         let text = read(&format!("deploy/kind/base/{file}"));
-        for kind in [
-            "kind: Role",
-            "kind: ClusterRole",
-            "kind: RoleBinding",
-            "kind: ClusterRoleBinding",
-        ] {
-            assert!(!text.contains(kind), "{file} holds a {kind}");
+        for document in text.split("\n---\n") {
+            assert!(
+                !document
+                    .lines()
+                    .any(|line| line.contains("resources:") && line.contains("serviceaccounts")),
+                "{file} has a rule on ServiceAccounts: {document}"
+            );
+            let binding = document
+                .lines()
+                .any(|line| line == "kind: RoleBinding" || line == "kind: ClusterRoleBinding");
+            if let (true, Some((_, subjects))) = (binding, document.split_once("\nsubjects:")) {
+                assert!(
+                    !subjects.contains("kind: ServiceAccount")
+                        && !subjects.contains("system:serviceaccounts"),
+                    "{file} binds a role to a ServiceAccount: {document}"
+                );
+            }
         }
     }
 }

@@ -57,8 +57,8 @@ prints a token. The gateway reads each file as that entry's credential on every 
 has no API-server client. `kind/base/gateway-tokens.yaml` lets ServiceAccount `gateway` create
 tokens for `docs-team-a` and `docs-team-b`, by name, and for no other ServiceAccount. Both
 containers run as that ServiceAccount, but only the token writer mounts a token the API server
-accepts (a projected token with no audience) and the cluster's CA; the gateway container
-mounts only the tokens directory, read-only. No workload mounts an API token either. The kind
+accepts (a projected token with no audience); the gateway container mounts no API token and
+reads the tokens directory read-only. No workload mounts an API token either. The kind
 run asks the API server that the gateway may create tokens for the two entries and for no
 other ServiceAccount, and `crates/demo-checks` holds the manifests to all of it.
 

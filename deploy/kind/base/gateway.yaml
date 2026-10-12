@@ -7,9 +7,8 @@
 #
 # The token writer, a sidecar, asks the API server for each entry's token and writes it to a
 # file the gateway container reads again on every call. Only the token writer mounts a token
-# the API server accepts, and the cluster's CA. The gateway container mounts neither, so it
-# cannot use the pod's grant to create tokens (gateway-tokens.yaml). crates/demo-checks holds
-# both to that.
+# the API server accepts. The gateway container does not, so it cannot use the pod's grant to
+# create tokens (gateway-tokens.yaml). crates/demo-checks holds both containers to that.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

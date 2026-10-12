@@ -4026,6 +4026,16 @@ mutate("demo-kind-gateway-mounts-api-token", "the gateway container mounts the t
        "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n")
 mutate("demo-kind-token-rbac-unnamed", "the gateway may create a token for any ServiceAccount in its namespace", "deploy/kind/base/gateway-tokens.yaml",
        '    resourceNames: ["docs-team-a", "docs-team-b"]\n', "")
+STRANGER = "  name: stranger\n  namespace: team-a\nautomountServiceAccountToken: false\n"
+mutate("demo-kind-other-file-binds-service-account", "another base file binds a ClusterRole to a team's ServiceAccount",
+       "deploy/kind/base/serviceaccounts.yaml", STRANGER,
+       STRANGER + "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: stranger-edit\n"
+       "  namespace: team-a\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: edit\n"
+       "subjects:\n  - kind: ServiceAccount\n    name: stranger\n    namespace: team-a\n")
+mutate("demo-kind-other-file-token-rule", "another base file holds a Role that may create ServiceAccount tokens",
+       "deploy/kind/base/serviceaccounts.yaml", STRANGER,
+       STRANGER + "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: tokens\n"
+       "  namespace: team-a\nrules:\n  - apiGroups: [\"\"]\n    resources: [\"serviceaccounts/token\"]\n    verbs: [\"create\"]\n")
 mutate("demo-workload-shared-surface", "team-b's workload calls team-a's surface", "deploy/kind/base/workloads.yaml",
        '8080/mcp/docs-team-b"}', '8080/mcp/docs-team-a"}')
 mutate("demo-compose-workload-default-surface", "every Compose workload run calls the service's default surface, team-a's", DRIVER,
