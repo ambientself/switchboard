@@ -1,7 +1,7 @@
 # The gateway's deployment file for the kind demo: `switchboard --config=<this file>`. The format
 # is in crates/gateway/src/deployment.rs. Relative paths are read from this file's directory.
-# Keep it in step with deploy/compose/config/gateway.toml; only the issuer, its keys, the team
-# manifest, the hosts, the credential's path and the metrics address differ.
+# Keep it in step with deploy/compose/config/gateway.toml; only the issuer, where its keys come
+# from, the team manifest, the hosts, the credential's path and the metrics address differ.
 
 deployment = "kind-demo"
 listen = "0.0.0.0:8080"
@@ -19,14 +19,21 @@ poll_seconds = 2
 mode = "enforce"
 
 # The cluster's own ServiceAccount issuer. demo.sh checks that the cluster reports exactly this
-# issuer and copies its keys into ConfigMap cluster-issuer-keys at deploy time. The keys are
-# copied once: they are not fetched, and not rotated.
+# issuer. The gateway fetches its keys from the API server, on the issuer's own origin, at boot
+# and on a timer. It sends no token: the kind base binds system:service-account-issuer-discovery
+# to system:unauthenticated (issuer-discovery.yaml; decision 0013, section 10). It trusts only
+# the cluster CA, from ConfigMap kube-root-ca.crt (gateway.yaml).
 [[identity.issuers]]
 issuer = "https://kubernetes.default.svc.cluster.local"
 kind = "workload"
 audiences = ["switchboard"]
 algorithm = "RS256"
-keys_file = "/etc/switchboard/issuer/jwks.json"
+keys_url = "https://kubernetes.default.svc.cluster.local/openid/v1/jwks"
+keys_ca_file = "/etc/switchboard/cluster-ca/ca.crt"
+# The cluster's keys do not change during a demo run, so this sets only how often the gateway
+# asks again and how old its keys may grow. 60 s keeps the key age metric under a minute and
+# costs the API server one small request a minute. The least the gateway accepts is 30.
+keys_refresh_seconds = 60
 subjects_file = "teams.toml"
 max_lifetime_seconds = 3600
 leeway_seconds = 30

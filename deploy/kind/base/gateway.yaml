@@ -1,5 +1,7 @@
 # The gateway. It verifies projected ServiceAccount tokens against the cluster's own issuer
-# keys (ConfigMap cluster-issuer-keys, which demo.sh creates), writes audit rows to Postgres as
+# keys, which it fetches from the API server's /openid/v1/jwks with no token, trusting only the
+# cluster CA in ConfigMap kube-root-ca.crt (decision 0013, section 10; issuer-discovery.yaml
+# lets an unauthenticated caller read them). It writes audit rows to Postgres as
 # switchboard_gateway, and forwards allowed calls to mock-docs with a projected token of its
 # own ServiceAccount, for audience mock-docs (decision 0010). The kubelet replaces that token
 # before it expires and the gateway reads it again on every call. There is no static
@@ -91,15 +93,20 @@ spec:
             - {name: config, mountPath: /etc/switchboard/config, readOnly: true}
             # No subPath, so ConfigMap edits reach the running gateway.
             - {name: registry, mountPath: /etc/switchboard/registry, readOnly: true}
-            - {name: issuer-keys, mountPath: /etc/switchboard/issuer, readOnly: true}
+            # The cluster CA, which kube-root-ca.crt holds in every namespace: the only CA the
+            # gateway trusts for the API server's keys URL (keys_ca_file in gateway.toml).
+            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}
             - {name: mock-docs-token, mountPath: /var/run/secrets/switchboard/mock-docs, readOnly: true}
       volumes:
         - name: config
           configMap: {name: gateway-config}
         - name: registry
           configMap: {name: registry}
-        - name: issuer-keys
-          configMap: {name: cluster-issuer-keys}
+        # The cluster CA alone, with no token beside it. Every projected token authenticates as
+        # the pod's ServiceAccount, so the gateway reads the keys with none (decision 0013,
+        # section 10).
+        - name: cluster-ca
+          configMap: {name: kube-root-ca.crt}
         # The gateway's identity for mock-docs. automountServiceAccountToken stays false: a
         # projected volume does not need it, and the default API token is not mounted. 600 s is
         # the kubelet's minimum, so the token is replaced about every 8 minutes.
