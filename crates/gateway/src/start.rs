@@ -11,7 +11,8 @@
 //! section 4), so that a refusal of either comes before any connection is made. Then it loads
 //! each proxied server's credential, builds a [`ProxyConnector`] per server with the deadline
 //! and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each in a
-//! [`Bulkhead`] holding it to the caps of `[limits]`, fetches the keys of each issuer
+//! [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
+//! ([`probe_credentials`]), fetches the keys of each issuer
 //! configured with a keys URL, connects the Postgres audit store and runs its
 //! boot checks (or, in a development build, takes audit as explicitly disabled), and then runs
 //! the boot gates ([`boot::check_registry`]). Any failure refuses to start, naming the reason,
@@ -67,7 +68,7 @@ use crate::boot::{self, BootError, Gates, Settings, Wiring};
 use crate::bulkhead::{Bulkhead, ProxiedSignals};
 use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
-use crate::drift::DriftPass;
+use crate::drift::{DriftPass, ProbeCredentialError, probe_credentials};
 use crate::keys::KeyRefresher;
 use crate::reload::Reloader;
 
@@ -137,6 +138,9 @@ pub enum StartError {
     /// A credential file could not be loaded.
     #[error(transparent)]
     Credentials(#[from] CredentialFileError),
+    /// A proxied server has no probe credential, or its file could not be loaded.
+    #[error(transparent)]
+    ProbeCredentials(#[from] ProbeCredentialError),
     /// A server's connector could not be built.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
@@ -280,6 +284,7 @@ async fn prepare_with(
     )?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
+    let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
     let (wiring, proxied_signals, connectors) = proxied(
         &registry,
         &credentials,
@@ -395,6 +400,7 @@ async fn prepare_with(
     let drift = DriftPass::new(
         reloader.withdrawals(),
         connectors,
+        probes,
         deployment.drift_interval,
     );
     drift.pass().await;
@@ -769,6 +775,8 @@ mod tests {
         std::fs::write(&registry_file, registry_text).unwrap();
         let credential = directory.join("docs-credential");
         std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
+        let probe = directory.join("probe-credential");
+        std::fs::write(&probe, "dummy-probe-credential-for-tests-only\n").unwrap();
         let issuer = format!("http://{}", counted.address);
         let identity = if identity_disabled {
             IdentitySection {
@@ -829,6 +837,7 @@ mod tests {
             limits: Limits::default(),
             servers: BTreeMap::new(),
             drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
+            probe_credentials: BTreeMap::from([(ConnectorName::new("mock-docs"), probe)]),
             credentials: BTreeMap::from([("docs-credential".to_owned(), credential)]),
         }
     }

@@ -23,6 +23,11 @@
 //!   gateway itself, for the drift pass, with the same credential and the same bounds. It
 //!   returns the tools as served, or a [`ListError`]; a list it could not read whole is never
 //!   returned in part.
+//! - **The probe.** [`probe()`] and [`ProxyConnector::probe`] send decision 0010's three calls
+//!   for a tool that does not exist: with no credential, a malformed one, and a stranger's
+//!   [`ProbeCredential`]. The [`ProbeReport`] says whether the server refused all three,
+//!   dispatched one (open), or showed neither. A call that could not be made is never counted
+//!   as refused.
 //!
 //! The server is reached over session-less streamable HTTP, revision 2025-06-18, at an
 //! `http://` URL. An answer must be JSON; an event stream is not read.
@@ -33,10 +38,17 @@ mod connector;
 mod credentials;
 mod list;
 pub mod outcome;
+mod probe;
 
 pub use connector::{
     DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION, ProxyConnector, Upstream,
     UpstreamError,
 };
-pub use credentials::{CredentialFileError, FileCredentials, MAX_CREDENTIAL_BYTES};
+pub use credentials::{
+    CredentialFileError, FileCredentials, MAX_CREDENTIAL_BYTES, ProbeCredential,
+};
 pub use list::{ListError, ListedTool};
+pub use probe::{
+    CallVerdict, MALFORMED_CREDENTIAL, NotShown, PROBE_TOOL, ProbeBounds, ProbeCall, ProbeError,
+    ProbeFinding, ProbeReport, probe,
+};

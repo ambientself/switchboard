@@ -55,6 +55,14 @@ listen = "0.0.0.0:9090"
 # the default, for real deployments. 5 to 900.
 interval_seconds = 10
 
+[drift.probe_credentials]
+# What each poll's probe presents on its third call (decision 0013, section 9): ServiceAccount
+# registry-probe's token for audience mock-docs, which the token writer writes beside the
+# entries' tokens. A valid token for mock-docs from the cluster's issuer, for a subject outside
+# the gateway's identities, so mock-docs must refuse it.
+docs-team-a = "/var/run/switchboard/tokens/registry-probe"
+docs-team-b = "/var/run/switchboard/tokens/registry-probe"
+
 [credentials]
 # Each entry's token: ServiceAccount docs-team-a's and docs-team-b's, for audience mock-docs,
 # which the gateway pod's token writer writes and replaces every 300 s (gateway.yaml). The proxy

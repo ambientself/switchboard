@@ -17,7 +17,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["macros", "time"] }
 # Why a call was refused for its credential reaches the gateway's log, not the caller.
 tracing = "0.1"
 

@@ -27,8 +27,8 @@ use gateway::boot::{self, Settings, Wiring};
 use gateway::path::RequestPath;
 use gateway::reload::{ReloadError, Reloader};
 use gateway::{
-    AuditSection, DriftPass, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, serve_with_telemetry,
-    start,
+    AuditSection, DriftPass, Metrics, ProbeCredentials, TELEMETRY_QUEUE, Telemetry, Timeouts,
+    probe_credentials, serve_with_telemetry, start,
 };
 use gateway_core::{ConnectorName, InstanceName, ToolName};
 use gateway_identity::SystemClock;
@@ -65,6 +65,7 @@ struct Replica {
     path: RequestPath,
     reloader: Reloader,
     drift: DriftPass,
+    probes: ProbeCredentials,
     store: Arc<InMemoryAuditStore>,
 }
 
@@ -103,6 +104,7 @@ impl Replica {
             read_at: Instant::now(),
         };
         let registry = Registry::load(&deployment.registry_file).unwrap();
+        let probes = probe_credentials(&registry, &deployment.probe_credentials).unwrap();
         let store = Arc::new(InMemoryAuditStore::new());
         let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
         let mut connectors = BTreeMap::new();
@@ -112,11 +114,12 @@ impl Replica {
             wiring = wiring.proxied(entry, connector);
         }
         let (gates, reloader) = boot::check_registry(settings, registry, wiring).unwrap();
-        let drift = DriftPass::new(reloader.withdrawals(), connectors, INTERVAL);
+        let drift = DriftPass::new(reloader.withdrawals(), connectors, probes.clone(), INTERVAL);
         Self {
             path: RequestPath::new(gates),
             reloader,
             drift,
+            probes,
             store,
         }
     }
@@ -366,6 +369,7 @@ async fn a_changed_description_is_withdrawn_within_one_interval() {
                 proxy("docs-team-b", &mock.url(), &files),
             ),
         ]),
+        replica.probes.clone(),
         INTERVAL,
     );
     let running = tokio::spawn(drift_pass.run());
@@ -523,24 +527,24 @@ async fn a_reload_keeps_a_withdrawal_and_a_new_approval_clears_it() {
     assert_eq!(replica.revision(), without_reads(KIND_REVISION));
 
     let original = files::registry(&mock.url());
-    let same = at_revision(&original, "demo-7");
-    assert_eq!(replica.reload(&same), without_reads("demo-7"));
-    assert_eq!(replica.revision(), without_reads("demo-7"));
+    let same = at_revision(&original, "demo-9");
+    assert_eq!(replica.reload(&same), without_reads("demo-9"));
+    assert_eq!(replica.revision(), without_reads("demo-9"));
     assert_eq!(replica.listed().await, [LIST_TOOL]);
     let (_, revision) = replica.read().await;
-    assert_eq!(revision, without_reads("demo-7"));
+    assert_eq!(revision, without_reads("demo-9"));
     assert!(captured.events("policy_withdrawal_cleared").is_empty());
 
     // Team A's read tool approved again as served now; team B's is not.
-    let again = reapproved(&same, READ_TOOL, CHANGED, "demo-8");
+    let again = reapproved(&same, READ_TOOL, CHANGED, "demo-10");
     assert_eq!(
         replica.reload(&again),
-        format!("demo-8+withdrawn:{TEAM_B_READ_TOOL}")
+        format!("demo-10+withdrawn:{TEAM_B_READ_TOOL}")
     );
     assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
     let (answer, revision) = replica.read().await;
     assert_eq!(answer["result"]["isError"], json!(false), "{answer}");
-    assert_eq!(revision, format!("demo-8+withdrawn:{TEAM_B_READ_TOOL}"));
+    assert_eq!(revision, format!("demo-10+withdrawn:{TEAM_B_READ_TOOL}"));
     let cleared = captured.events("policy_withdrawal_cleared");
     assert_eq!(cleared.len(), 1, "{cleared:?}");
     assert_eq!(cleared[0].0, "INFO");
@@ -709,6 +713,7 @@ async fn a_server_that_never_answers_does_not_hold_back_another_servers_withdraw
                 proxy_within("docs-team-b", &silent, &files, Duration::from_secs(60)),
             ),
         ]),
+        replica.probes.clone(),
         INTERVAL,
     );
     let running = tokio::spawn(drift_pass.run());
@@ -801,7 +806,7 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
     let held = Held::start().await;
     let files = Files::new("drift-stale", &issuer().jwks_document(), &held.url);
     let replica = Replica::new(&files, &held.url);
-    let again = reapproved(&files::registry(&held.url), READ_TOOL, CHANGED, "demo-8");
+    let again = reapproved(&files::registry(&held.url), READ_TOOL, CHANGED, "demo-10");
     let long = Duration::from_secs(600);
     let drift_pass = DriftPass::new(
         replica.drift.withdrawals().clone(),
@@ -812,6 +817,8 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
                 (ConnectorName::new(entry), connector)
             })
             .collect(),
+        // No probe: the held server would hold its calls too. Each poll's list alone is judged.
+        ProbeCredentials::new(),
         INTERVAL,
     );
 
@@ -820,7 +827,7 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
             held.arrived.load(Ordering::SeqCst) == 2
         })
         .await;
-        assert_eq!(replica.reload(&again), "demo-8");
+        assert_eq!(replica.reload(&again), "demo-10");
         held.release.add_permits(2);
     };
     tokio::join!(drift_pass.pass(), approving);
@@ -845,7 +852,7 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
     );
     assert!(replica.withdrawn().is_empty(), "{:?}", replica.withdrawn());
     assert!(captured.events("tool_withdrawn").is_empty());
-    assert_eq!(replica.revision(), "demo-8");
+    assert_eq!(replica.revision(), "demo-10");
     assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
 }
 

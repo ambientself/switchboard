@@ -301,6 +301,14 @@ impl Scripted {
     where
         F: Fn(&Value) -> Vec<Step> + Send + Sync + 'static,
     {
+        Self::start_for(move |request: &Received| script(&request.body)).await
+    }
+
+    /// [`start`](Self::start), with `script` given the whole request, its headers included.
+    pub async fn start_for<F>(script: F) -> Self
+    where
+        F: Fn(&Received) -> Vec<Step> + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -317,7 +325,7 @@ impl Scripted {
                     let Some(request) = read_request(&mut stream).await else {
                         return;
                     };
-                    let steps = script(&request.body);
+                    let steps = script(&request);
                     record.lock().unwrap().push(request);
                     for step in steps {
                         match step {

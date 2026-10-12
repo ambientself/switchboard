@@ -49,11 +49,15 @@
 //!   timer, from the issuer's own origin, and keeps the keys in use when a fetch fails.
 //! - [`DriftPass`] reads each proxied server's tool list, once during boot before the listener
 //!   is bound and then on a timer, and withdraws each approved tool whose served definition no
-//!   longer hashes to its approval, or that the server no longer lists ([`drift`]).
+//!   longer hashes to its approval, or that the server no longer lists ([`drift`]). Each poll
+//!   also probes the server; an open server is logged and counted, and its tools stay listed.
+//! - [`probe`] is `switchboard probe`: decision 0010's three calls to one registry entry, and
+//!   the probe record they make.
 //!
-//! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves, and
-//! `switchboard migrate` brings the audit schema up to date. Nothing in it comes from the
-//! testkit; `tests/dependencies.rs` holds the crate's dependencies to an allowlist.
+//! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves,
+//! `switchboard probe` probes one entry, and `switchboard migrate` brings the audit schema up
+//! to date. Nothing in it comes from the testkit; `tests/dependencies.rs` holds the crate's
+//! dependencies to an allowlist.
 
 #![forbid(unsafe_code)]
 
@@ -68,6 +72,7 @@ pub mod keys;
 pub mod metrics;
 pub mod path;
 mod policy;
+pub mod probe;
 mod proxied;
 pub mod reload;
 mod resources;
@@ -92,7 +97,8 @@ pub use deployment::{
 };
 pub use drift::{
     DEFAULT_DRIFT_INTERVAL, DriftCounts, DriftPass, DriftSection, DriftSignals, MAX_DRIFT_INTERVAL,
-    MIN_DRIFT_INTERVAL, Withdrawals, withdrawn_revision,
+    MIN_DRIFT_INTERVAL, PROBE_NOT_SHOWN_EVENT, ProbeCredentialError, ProbeCredentials,
+    SERVER_OPEN_EVENT, Withdrawals, probe_credentials, withdrawn_revision,
 };
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,

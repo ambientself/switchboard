@@ -54,8 +54,11 @@ pub struct Server {
     pub reach_test: Option<ReachTest>,
     /// Which class of destination the address is (decision 0013, section 3).
     pub destination: Destination,
-    /// The registration probe's record (decision 0013, section 9). Optional for now. Not in
-    /// the binding: the drift pass repeats the probe.
+    /// The registration probe's record (decision 0013, section 9). The loader refuses an entry
+    /// without one, or with a result other than `refused`, so every server of a loaded
+    /// registry has one; only [`Registry::server_entry`], which `switchboard probe` reads an
+    /// entry with before it has a record, returns a server without. Not in the binding: the
+    /// drift pass repeats the probe.
     pub probe: Option<Probe>,
     /// The call outside the reach that the scheduled reach check makes (decision 0011,
     /// section 4). Required when the reach is not empty and the credential is not per-user.
@@ -105,12 +108,28 @@ pub struct ReachTest {
     pub record: String,
 }
 
-/// What the registration probe found.
+/// What the registration probe found, as `switchboard probe` prints its record. Only `refused`
+/// loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeResult {
     /// The server refused each of the probe's calls.
     Refused,
+    /// The server dispatched at least one of them: it does not check its caller.
+    Open,
+    /// Neither was shown: a call could not be made, or its answer was not a refusal.
+    NotShown,
+}
+
+impl ProbeResult {
+    /// The result's name, as a probe record writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Open => "open",
+            Self::NotShown => "not_shown",
+        }
+    }
 }
 
 /// A recorded registration probe (decision 0013, section 9).
@@ -216,6 +235,24 @@ pub enum RegistryError {
         "server `{0}` has a reach and no `reach_check`, the call outside it the reach check makes"
     )]
     ReachCheckMissing(ConnectorName),
+    /// A server has no probe record (decision 0013, section 9).
+    #[error(
+        "server `{0}` has no `probe` record; run `switchboard probe` and record its result and date"
+    )]
+    ProbeMissing(ConnectorName),
+    /// A server's probe record does not say it refused all three calls.
+    #[error(
+        "server `{server}` has a `probe` record whose result is `{result}`; only a server that refused all three probe calls is registered"
+    )]
+    ProbeNotRefused {
+        /// The server.
+        server: ConnectorName,
+        /// The recorded result.
+        result: &'static str,
+    },
+    /// The registry has no server of the name asked for.
+    #[error("the registry has no server `{0}`")]
+    NoSuchServer(ConnectorName),
     /// Two tools share an exposed name.
     #[error("tool `{0}` is approved more than once")]
     DuplicateTool(ToolName),
@@ -403,6 +440,35 @@ impl Registry {
         build(file)
     }
 
+    /// The entry of server `name` in a registry file's text, read and checked alone: what
+    /// `switchboard probe` reads (decision 0013, section 9). It is checked as the loader checks
+    /// a server entry, except that it need not have a probe record, so an entry can be probed
+    /// before it is registered. Nothing else in the file is read beyond what TOML needs to parse
+    /// it.
+    pub fn server_entry(text: &str, name: &ConnectorName) -> Result<Server, RegistryError> {
+        let parse = |error: toml::de::Error| RegistryError::Parse(error.to_string());
+        let file: toml::Table = toml::from_str(text).map_err(parse)?;
+        let Some(toml::Value::Array(entries)) = file.get("servers") else {
+            return Err(RegistryError::Parse(
+                "`servers` is missing or not an array of tables".to_owned(),
+            ));
+        };
+        let mut named = entries.iter().filter(|server| {
+            server.get("name").and_then(toml::Value::as_str) == Some(name.as_str())
+        });
+        let Some(entry) = named.next() else {
+            return Err(RegistryError::NoSuchServer(name.clone()));
+        };
+        if named.next().is_some() {
+            return Err(RegistryError::DuplicateServer(name.clone()));
+        }
+        let entry: ServerFile = entry.clone().try_into().map_err(parse)?;
+        servers(vec![entry], ProbeRule::NotApplied)?
+            .into_values()
+            .next()
+            .ok_or_else(|| RegistryError::NoSuchServer(name.clone()))
+    }
+
     /// The policy snapshot.
     pub fn snapshot(&self) -> &PolicySnapshot {
         &self.snapshot
@@ -464,7 +530,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
     if file.revision.contains('+') {
         return Err(RegistryError::RevisionReserved(file.revision));
     }
-    let servers = servers(file.servers)?;
+    let servers = servers(file.servers, ProbeRule::Applied)?;
 
     let mut definitions = BTreeMap::new();
     let mut adapters = BTreeMap::new();
@@ -577,7 +643,18 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
     })
 }
 
-fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, RegistryError> {
+/// Whether [`servers`] applies the probe rule: the loader does, and
+/// [`Registry::server_entry`] does not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeRule {
+    Applied,
+    NotApplied,
+}
+
+fn servers(
+    files: Vec<ServerFile>,
+    probe_rule: ProbeRule,
+) -> Result<BTreeMap<ConnectorName, Server>, RegistryError> {
     let mut servers = BTreeMap::new();
     for server in files {
         let place = || format!("server `{}`", server.name);
@@ -639,6 +716,20 @@ fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, Re
             }),
             None => None,
         };
+        // Registration is the approval pull request, which records a probe the server refused
+        // (decision 0013, section 9).
+        if probe_rule == ProbeRule::Applied {
+            match &probe {
+                None => return Err(RegistryError::ProbeMissing(server.name)),
+                Some(probe) if probe.result != ProbeResult::Refused => {
+                    return Err(RegistryError::ProbeNotRefused {
+                        server: server.name,
+                        result: probe.result.as_str(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
         let checked = Server {
             name: server.name.clone(),
             system: server.system,

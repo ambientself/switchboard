@@ -35,6 +35,9 @@
 //!   - `switchboard_drift_polls_total{server,result}`, each read of the server's tool list,
 //!     `result` one of `ok` and `failed`. A failed poll keeps the server's tools served;
 //!   - `switchboard_drift_withdrawals_total{server}`, the tools withdrawn from the server;
+//!   - `switchboard_probe_results_total{server,result}`, each probe of the server (decision
+//!     0013, section 9), `result` one of `refused`, `open` and `not_shown`. An open server
+//!     dispatched a call for a tool that does not exist; its tools stay listed;
 //!   - `switchboard_tools_withdrawn`, how many tools are withdrawn now. It falls when a reload
 //!     clears a withdrawal, and is 0 again after a restart.
 //! - With the registry's policy, from its [`Freshness`]: `switchboard_policy_age_seconds`, the
@@ -463,6 +466,26 @@ fn drift_signals(text: &mut Text, servers: &[(ConnectorName, DriftCounts)], with
             &[("server", server.as_str())],
             counts.withdrawals,
         );
+    }
+    text.family(
+        "switchboard_probe_results_total",
+        "counter",
+        "Probes of each proxied server by the drift pass, by result: refused, open (the server \
+         dispatched a call it should have refused, so it can be reached around the gateway), or \
+         not_shown.",
+    );
+    for (server, counts) in servers {
+        for (result, count) in [
+            ("refused", counts.probes_refused),
+            ("open", counts.probes_open),
+            ("not_shown", counts.probes_not_shown),
+        ] {
+            text.sample(
+                "switchboard_probe_results_total",
+                &[("server", server.as_str()), ("result", result)],
+                count,
+            );
+        }
     }
     text.single(
         "switchboard_tools_withdrawn",

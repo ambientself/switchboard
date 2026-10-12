@@ -10,7 +10,7 @@
 # file holding that entry's credential.
 
 # Recorded with every decision made from this file. Change it with every edit.
-revision = "demo-5"
+revision = "demo-7"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed
@@ -34,6 +34,11 @@ revision = "demo-5"
 # which alone may use http. The loader refuses a snapshot that breaks one of decision 0011's
 # nine rules: here, with narrowing "none", every team its surface admits must hold the whole
 # reach in its limit.
+#
+# `probe` records the registration probe (decisions 0010 and 0013, section 9): the date
+# `switchboard probe` sent the entry decision 0010's three calls, with no credential, a
+# malformed one and a stranger's token, and found each refused. The loader refuses an entry
+# without one. The gateway repeats the probe on every drift poll.
 
 [[servers]]
 name = "docs-team-a"
@@ -46,6 +51,7 @@ narrowing = "none"
 permits = "read"
 reach = [{ system = "docs", kind = "project", identifier = "atlas" }]
 destination = "in_cluster"
+probe = { result = "refused", date = 2026-10-12 }
 
 [servers.reach_test]
 date = 2026-10-12
@@ -66,6 +72,7 @@ narrowing = "none"
 permits = "read"
 reach = [{ system = "docs", kind = "project", identifier = "borealis" }]
 destination = "in_cluster"
+probe = { result = "refused", date = 2026-10-12 }
 
 [servers.reach_test]
 date = 2026-10-12
