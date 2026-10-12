@@ -3312,12 +3312,12 @@ fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
 }
 
 #[test]
-fn the_gateways_token_grant_must_name_only_the_entries() {
+fn the_gateways_token_grant_must_name_only_the_entries_and_the_probe() {
     // A fake `k` answering can-i as RBAC would for gateway-tokens.yaml, or as it would with
     // the grant widened to every ServiceAccount.
     let fake = |widened: bool| {
         format!(
-            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
+            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *|*serviceaccounts/registry-probe\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
             if widened {
                 "echo yes"
             } else {
@@ -3330,7 +3330,13 @@ fn the_gateways_token_grant_must_name_only_the_entries() {
         fake(false)
     ));
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 6, "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 7, "{}", run.transcript());
+    assert!(
+        run.transcript()
+            .contains("the gateway may create tokens for registry-probe"),
+        "{}",
+        run.transcript()
+    );
     let run = sourced(&format!("{}token_grants\nFINISHED=1\nresult 0", fake(true)));
     assert_eq!(run.lines("FAIL ").len(), 4, "{}", run.transcript());
     assert!(

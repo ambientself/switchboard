@@ -1004,12 +1004,12 @@ operator_ask() {
 }
 
 # token_grants: what ServiceAccount gateway may do with ServiceAccount tokens, the grant its
-# pod's token writer uses (deploy/kind/base/gateway-tokens.yaml): create them for docs-team-a and
-# docs-team-b, named, and for no other ServiceAccount, its own and a workload's among them, nor
-# without a name.
+# pod's token writer uses (deploy/kind/base/gateway-tokens.yaml): create them for docs-team-a,
+# docs-team-b and registry-probe, the drift probe's, named, and for no other ServiceAccount, its
+# own and a workload's among them, nor without a name.
 token_grants() {
   local gateway=system:serviceaccount:switchboard:gateway entry answer
-  for entry in docs-team-a docs-team-b; do
+  for entry in docs-team-a docs-team-b registry-probe; do
     answer=$(k auth can-i create "serviceaccounts/$entry" --subresource=token -n switchboard --as="$gateway" 2>&1) || true
     check "${answer##*$'\n'}" yes "the gateway may create tokens for $entry"
   done
@@ -1273,7 +1273,7 @@ kind_run() {
   step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
   route_checks_after_policy
 
-  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a and docs-team-b, and for no other ServiceAccount"
+  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a, docs-team-b and registry-probe, and for no other ServiceAccount"
   token_grants
 
   step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets, or ConfigMaps in mock-docs or the gateway's namespace; and no RBAC rule bound to either grants any of these, whatever its resourceNames"

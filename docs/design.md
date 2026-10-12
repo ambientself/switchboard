@@ -1450,8 +1450,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   which admits its own team only. In kind each entry's identity is a ServiceAccount. A
   token-writer sidecar in the gateway pod gets each one's token by TokenRequest, for the
   server's audience, and writes it to the file the deployment file names for that entry; a
-  Role limited by `resourceNames` to the two ServiceAccounts is its only grant. Only the
-  sidecar mounts a token the API server accepts, and no workload mounts one. In Compose each
+  Role limited by `resourceNames` to those two ServiceAccounts and the probe's (below) is its
+  only grant. Only the sidecar mounts a token the API server accepts, and no workload mounts
+  one. In Compose each
   entry has a static dummy credential. The mock server limits each identity to its team's
   project. The probe's ServiceAccount, `registry-probe`, is the Role's third name: the token
   writer writes its token for the mock server's audience beside the entries', and the drift
@@ -1493,8 +1494,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `Bearer not-a-token` and with the probe credential, held to the server's call deadline and
   answer cap, following no redirect and reading no proxy from the environment. A call is
   refused on `401` with a `WWW-Authenticate` challenge, or for the third call `401` or `403`,
-  with no JSON-RPC response in the answer; any JSON-RPC result or error, whatever the status,
-  shows it was dispatched, and the server is open; anything else, a connection that failed
+  with no JSON-RPC response in the answer; a JSON-RPC result or error, whatever the status,
+  as one JSON message, a batch, or a stream event however many `data` lines it spans, shows
+  it was dispatched, and the server is open; anything else, a connection that failed
   included, is not shown and never counted as refused. `switchboard probe --config=FILE
   --server=NAME` reads the deployment file and that one entry, without the loader's probe
   rule, and prints each call, the result and the record line, exiting 0 only when all three
