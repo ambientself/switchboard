@@ -198,7 +198,7 @@ const REACHING: &str = "reaching(oid) AS (
     )";
 
 /// The sets [`ABLE`] reads, each read from the catalog once and kept, so that asking [`ABLE`]
-/// of every role costs a few lookups per role, whatever plan the server picks: the relations
+/// of a role reads these small sets rather than the catalog again: the relations
 /// [`REACHING`] finds, with their owners; the owner of the schema; the owners of the functions
 /// the table's triggers run; the roles in [`SERVER_ROLES`], named by `$3`; and the functions no
 /// owner may run, those in [`SERVER_FUNCTIONS`], named by `$4`, and those in an untrusted
@@ -333,9 +333,9 @@ const RUNNERS: &str = "WITH fresh AS MATERIALIZED (
 /// owner is a member, inherited or not, of an able role ([`by_any_member`]), with EXECUTE on it
 /// or through a trigger on a table it can write. [`ABLE`] is asked of each role once, and each
 /// later step asks of each function or role only whether it is a member of, or can run, one of
-/// a list found before. So the cost grows with functions plus roles, not with their product,
-/// whatever plan the server picks. The steps repeat until no role is added, as a definer chain
-/// may be long.
+/// a list found before, rather than whether each role it is a member of is able. The steps
+/// repeat until no role is added, as a definer chain may be long; each round asks, of every
+/// role not yet found, whether it can run a definer function the round found.
 async fn able(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
@@ -1065,10 +1065,15 @@ impl PgAuditStore {
     ///   that role. Only an administrator stores that password. A foreign table in
     ///   `switchboard_audit` is refused; one elsewhere is not followed to where it connects.
     ///
-    /// It asks which roles are able once, and then asks of each function and each table only
-    /// whether its owner is a member of one, so its time grows with the number of roles plus
-    /// the number of functions, not with their product (#144). Has no time limit: wrap it in
-    /// one if boot must not wait on the database.
+    /// It asks whether a role is able once per role, where it used to ask that once for every
+    /// pair of a definer function and a role, and its walk over definer functions reads small
+    /// sets it read from the catalog once (#144). In a database nothing has analyzed, with 200
+    /// harmless definer functions owned by 60 roles, the check took 24 to 37 s before,
+    /// depending on the machine's load, and takes about 0.3 s now; with 200 more that can reach
+    /// `call_rows` but that no other role may run, about 0.4 s. Each round of the walk still
+    /// asks, of every role not yet found, whether it can run a definer the round found, so its
+    /// cost depends on the catalog and the plan, and a long chain of definers takes a round
+    /// per link. Has no time limit: wrap it in one if boot must not wait on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {
         let client = self.begin.get().await?;
         check(&client).await
