@@ -27,7 +27,8 @@
 //! how the gateway was started: identity enforced or disabled, with how many issuers and
 //! subjects; each issuer whose keys were fetched, with how many keys and how often they are
 //! fetched again; audit in Postgres, with the role and its check, or disabled; and the
-//! registry's revision.
+//! registry's revision, with the revision, tools and withdrawals actually served once the first
+//! drift pass has run.
 //!
 //! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
@@ -400,18 +401,22 @@ async fn prepare_with(
     tracing::info!(
         event = "boot",
         drift_interval_seconds = deployment.drift_interval.as_secs(),
-        withdrawn = drift.withdrawals().standing().len(),
         "read each proxied server's tool list before serving, and again every interval"
     );
+    // What is served: the registry file's policy, less what the first pass withdrew.
+    let withdrawn = drift.withdrawals().standing().len();
+    let served = gates.policy().revision().clone();
     tracing::info!(
         event = "boot",
         registry = %deployment.registry_file.display(),
-        %revision,
-        tools,
+        registry_revision = %revision,
+        revision = %served,
+        tools = tools.saturating_sub(withdrawn),
+        withdrawn,
         servers,
         poll_seconds = deployment.poll.as_secs(),
         max_age_seconds = deployment.max_age.as_secs(),
-        "serving the registry file's policy"
+        "serving the registry file's policy, less any tool the first drift pass withdrew"
     );
 
     Ok(Prepared {

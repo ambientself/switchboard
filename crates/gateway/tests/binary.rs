@@ -451,12 +451,15 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
     assert_eq!(field("subjects"), [json!(2)]);
     assert_eq!(field("audit"), [json!("disabled")]);
     assert_eq!(field("revision"), [json!(files::KIND_REVISION)]);
+    assert_eq!(field("registry_revision"), [json!(files::KIND_REVISION)]);
     assert_eq!(field("instance"), [json!(INSTANCE)]);
     // No `[metrics]`, no metrics listener.
     assert_eq!(field("metrics"), [json!("off")]);
-    // No `[drift]`: the default interval. The first pass withdrew nothing.
+    // No `[drift]`: the default interval. The first pass withdrew nothing, so every tool is
+    // served under the registry's own revision.
     assert_eq!(field("drift_interval_seconds"), [json!(300)]);
     assert_eq!(field("withdrawn"), [json!(0)]);
+    assert_eq!(field("tools"), [json!(4)]);
 
     let team_a = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
     let read = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
