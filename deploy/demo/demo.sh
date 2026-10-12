@@ -3,9 +3,10 @@
 #
 #   demo.sh compose   build the image; start Postgres, the migration, the dev issuer, mock-docs
 #                     and the gateway under Compose; run both teams' workloads; show a database
-#                     outage and a withdrawn tool; show #11's demonstrations (an undeclared
-#                     argument, a registry refused at load, a hanging server, an overload and
-#                     drift); check the audit rows
+#                     outage and a withdrawn tool; show #11's demonstrations (the probe and the
+#                     reach check after boot, an undeclared argument, a registry refused at load,
+#                     a hanging server, an overload, drift and a widened reach); check the audit
+#                     rows
 #   demo.sh kind      the same in the kind cluster switchboard-demo, with projected
 #                     ServiceAccount tokens, network policy, the operator's permission checks,
 #                     and the route check (deploy/route-check) before and after the policy, and
@@ -30,8 +31,9 @@
 #   - the gateway's JSON log lines (crates/gateway): one `"event":"boot"` line per gate, with
 #     `"identity":"enforce"` and `"audit":"postgres"`, and the caps, deadlines and drift
 #     interval; one `"event":"identity_failed"` line per caller refused for identity; and the
-#     registry's reloads (`policy_reloaded`, `policy_reload_refused`) and the drift pass's
-#     withdrawals (`tool_withdrawn`, `policy_withdrawal_cleared`), each with its fields;
+#     registry's reloads (`policy_reloaded`, `policy_reload_refused`), the drift pass's
+#     withdrawals (`tool_withdrawn`, `policy_withdrawal_cleared`) and its reach checks
+#     (`reach_held`, `reach_mismatch`, `reach_check_failed`), each with its fields;
 #   - mock-docs' JSON log lines (crates/mock-docs-server): one per request, with
 #     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, `accepted` and, for a
 #     JSON-RPC request, its `rpc_method`, and for a tools/call its `project` and, if the server
@@ -39,7 +41,10 @@
 #     which reads each entry's tool list every 10 s with that entry's credential; they are not
 #     calls, and the call counts leave them out. In kind the server runs in its JWT mode, and
 #     each line also has `caller`, the verified subject of an accepted token, and `refusal`, why
-#     a token was refused. Its admin endpoint's requests are logged as `"event":"admin"`;
+#     a token was refused. Its admin endpoint's requests are logged as `"event":"admin"`. The
+#     gateway's reach check sends each entry's canary, a call naming the other team's project,
+#     with the entry's own credential, which mock-docs refuses with `"refused":"project"`; the
+#     call counts leave those out too;
 #   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
 #     switchboard_reader;
 #   - the gateway's GET /metrics, Prometheus text on its own listener (crates/gateway,
@@ -85,12 +90,12 @@ COMPOSE_CREDENTIALS=$ROOT/deploy/compose/dummy-credentials
 # (connector_proxy::MALFORMED_CREDENTIAL).
 PROBE_MALFORMED_SHA=ce6f21ae951df0ba38d6ce0e0175465bf5e9882edcf2ba677bca63b296f17ce7
 # The registries' revision, and the Compose withdrawal's (registry-withdrawn.toml).
-REVISION=demo-7
-WITHDRAWN_REVISION=demo-8
+REVISION=demo-10
+WITHDRAWN_REVISION=demo-11
 # The revisions of the registry variants the demonstrations make from the registry served, at
 # run time, start with this one, above every revision a file names, so a row or log line under
 # a variant is never taken for one under a file's revision. Each adds what it is and when.
-VARIANT_REVISION=demo-9
+VARIANT_REVISION=demo-12
 # #11's demonstrations (demonstrations, below) rely on the gateway's defaults for the caps and
 # the call deadline, which the demos' deployment files leave alone, and on the drift interval
 # they set. TEAM_CAP is decision 0014's cap on calls in flight from one team to one proxied
@@ -117,6 +122,19 @@ CLIENT_EARLY_MS=50
 # served is then this one, the literal derived revision of decision 0013, section 6.
 DRIFTED_DESCRIPTION="List the names of the documents in one project, and whatever else it holds."
 DRIFTED_REVISION="$REVISION+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents"
+# The reach check (decision 0011, section 4; deploy/*/config/gateway.toml): beside each poll, the
+# gateway calls its own listener's registry-reach surface as the registry's own workload, in team
+# REACH_TEAM, naming each entry's canary, the other team's project, which mock-docs must refuse.
+# REACH_ALLOWANCE is how long past the call deadline it waits for its own listener (crates/gateway,
+# reach.rs). The reach step widens docs-team-a's caller to both projects: the gateway then
+# withdraws both of docs-team-a's tools, and serves REACH_WITHDRAWN_REVISION, the literal derived
+# revision.
+REACH_TEAM=registry
+REACH_SURFACE=registry-reach
+COMPOSE_REACH_SUBJECT=workload:registry:reach-check
+KIND_REACH_SUBJECT=system:serviceaccount:switchboard:registry
+REACH_ALLOWANCE=5
+REACH_WITHDRAWN_REVISION="$REVISION+withdrawn:docs-team-a__list_documents,docs-team-a__read_document"
 # mock-docs' admin endpoint (deploy/compose/compose.yaml, deploy/kind/base/mock-docs.yaml). It
 # listens on loopback in mock-docs' own container, so only an exec into that container reaches
 # it: no Service, published port or other pod can.
@@ -168,14 +186,16 @@ WORKLOAD_OUTPUT=""
 BACKGROUND=""
 BACKGROUND_LABEL=""
 BACKGROUND_OUTPUT=""
-# While a demonstration has changed what the gateway serves: the registry file to put back, and
-# whether mock-docs serves the drifted description. on_exit undoes both if the run stops early.
+# While a demonstration has changed what the gateway serves: the registry file to put back,
+# whether mock-docs serves the drifted description, and whether it lets docs-team-a's credential
+# read both projects. on_exit undoes each if the run stops early.
 RESTORE_REGISTRY=""
 DRIFTED=""
-# Set from the drift step's change until the gateway serves the re-approval: the gateway may hold
-# withdrawals of both list tools in its memory, which only a new approval or a restart clears.
-# on_exit says so and how to clear them, and restarts nothing: the gateway is left as it was, to
-# be looked at.
+WIDENED=""
+# Set from the drift step's or the reach step's change until the gateway serves the re-approval,
+# to the withdrawals the gateway may hold in its memory, which only a new approval or a restart
+# clears. on_exit says so and how to clear them, and restarts nothing: the gateway is left as it
+# was, to be looked at.
 WITHDRAWAL_HELD=""
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
@@ -185,6 +205,22 @@ team_entry() { echo "docs-$1"; }
 team_project() { case $1 in team-a) echo atlas ;; team-b) echo borealis ;; esac; }
 # entry_sha TEAM: the SHA-256 of TEAM's entry's dummy credential in Compose.
 entry_sha() { cat "$COMPOSE_CREDENTIALS/$(team_entry "$1")-credential.sha256"; }
+# entry_caller TEAM: how mock-docs' admin endpoint names TEAM's entry's caller: in kind its
+# ServiceAccount, the verified subject; in Compose its credential's SHA-256 as mock-docs logs it,
+# the first 12 hex digits.
+entry_caller() {
+  case "$MODE" in
+    compose) entry_sha "$1" | cut -c1-12 ;;
+    kind) echo "system:serviceaccount:switchboard:$(team_entry "$1")" ;;
+  esac
+}
+# reach_subject: the registry's own workload identity, which the reach check calls as.
+reach_subject() {
+  case "$MODE" in
+    compose) echo "$COMPOSE_REACH_SUBJECT" ;;
+    kind) echo "$KIND_REACH_SUBJECT" ;;
+  esac
+}
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 step() {
@@ -213,6 +249,8 @@ check_at_most() {
 }
 # count_lines PATTERN TEXT: how many lines of TEXT match the extended regex PATTERN.
 count_lines() { printf '%s\n' "$2" | awk -v pattern="$1" '$0 ~ pattern { n++ } END { print n + 0 }'; }
+# note_line TEXT: prints TEXT, indented, as information: neither a PASS nor a FAIL.
+note_line() { echo "    $1"; }
 
 # fetch WHAT COMMAND...: runs COMMAND and keeps what it printed in FETCHED. If COMMAND fails,
 # fails the check "could not read WHAT" and returns non-zero, so the caller checks nothing from
@@ -288,12 +326,16 @@ on_exit() {
     echo "serving list_documents' approved description again after the interrupted drift step" >&2
     mock_admin DELETE /admin/definitions/list_documents >&2 || echo "could not; mock-docs still serves the drifted description" >&2
   fi
+  if [ -n "$WIDENED" ]; then
+    echo "limiting docs-team-a's credential to atlas again after the interrupted reach step" >&2
+    mock_admin PUT "/admin/callers/$(entry_caller team-a)" '{"projects": ["atlas"]}' >&2 || echo "could not; mock-docs still lets docs-team-a's credential read borealis" >&2
+  fi
   if [ -n "$RESTORE_REGISTRY" ]; then
     echo "putting back the registry the gateway served before the interrupted step" >&2
     install_registry "$RESTORE_REGISTRY" >&2 || echo "could not; the next run puts it back" >&2
   fi
   if [ -n "$WITHDRAWAL_HELD" ]; then
-    echo "the gateway may still hold the drift step's withdrawals of docs-team-a__list_documents and docs-team-b__list_documents in memory; until it restarts, a run against it fails" >&2
+    echo "the gateway may still hold $WITHDRAWAL_HELD in memory; until it restarts, a run against it fails" >&2
     case "$MODE" in
       compose) echo "to clear them, stop Compose and start afresh: $0 down compose" >&2 ;;
       kind) echo "to clear them, restart the gateway: kubectl --kubeconfig $KCFG --context kind-$CLUSTER -n switchboard rollout restart deploy/gateway" >&2 ;;
@@ -358,20 +400,23 @@ row_resources_json() {
 #   - an allowed call: its team's own project (team-a atlas, team-b borealis);
 #   - a call denied for naming no project: none, [];
 #   - a call denied for its project: the other team's project;
-#   - a call to a tool the gateway does not know: "unknown", since no adapter read the call.
+#   - a call to a tool the gateway does not know: "unknown", since no adapter read the call;
+#   - a reach check's call, by team registry: its entry's canary, the other team's project.
 # A row of kind `list` records a tools/list, which names no resources: its resources are null.
 # check_list_rows counts those rows and checks what they name. A row that matches none of the
 # demo's calls or lists fails the check too.
 check_row_resources() {
   local rows=$1 total lists wrong
   # shellcheck disable=SC2016 # jq's own variables
-  if ! wrong=$(printf '%s' "$rows" | jq -c '
+  if ! wrong=$(printf '%s' "$rows" | jq -c --arg reach "$REACH_TEAM" '
       def project($name): [{system: "docs", kind: "project", identifier: $name}];
       def own: {"team-a": "atlas", "team-b": "borealis"}[.team // ""];
       def other: {"team-a": "borealis", "team-b": "atlas"}[.team // ""];
+      def canary: {"docs-team-a__list_documents": "borealis", "docs-team-b__list_documents": "atlas"}[.tool // ""];
       def named:
         if .kind == "list" then null
         elif .kind != "call" then "no call of the demo makes this row"
+        elif .team == $reach then (if canary == null then "no call of the demo makes this row" else project(canary) end)
         elif .decision == "allow" then project(own)
         elif .reason == "unknown_tool" then "unknown"
         elif .reason == "resource_outside_limit" and (.sentence // "" | contains("named none of them")) then []
@@ -400,9 +445,9 @@ check_row_resources() {
 # team-a or team-b and names the tools that caller was shown on its own surface under the row's
 # policy revision: its own entry's two tools under $REVISION, and only its list tool under
 # $WITHDRAWN_REVISION, after each team's read tool is withdrawn. Under a revision the drift pass
-# derived from $REVISION, `$REVISION+withdrawn:` and the withdrawn tools, they are its two tools
-# less those; and under a re-approval's, `$VARIANT_REVISION-reapproved-` and the time, its two
-# tools.
+# derived from $REVISION, `$REVISION+withdrawn:` and the withdrawn tools, by the drift step or the
+# reach step, they are its two tools less those; and under a re-approval's,
+# `$VARIANT_REVISION-reapproved-` and the time, its two tools.
 # None is left out. ROWS is what row_resources_json prints.
 check_list_rows() {
   local rows=$1 expected=$2 lists wrong
@@ -567,12 +612,14 @@ check_metrics() {
 # short. Requests with no bearer (the health checks) are not counted, and neither are the
 # gateway's drift polls: its own tools/list requests, with its own credentials. Nor are its drift
 # probes' bearers (decision 0013, section 9), the malformed one and the probe's dummy, which are
-# no workload's; mock-docs must refuse them, so one it accepted still fails.
-# check_server_entries checks that each team's calls carried its own entry's credential.
+# no workload's; mock-docs must refuse them, so one it accepted still fails. Nor are the reach
+# check's canaries, tools/call requests with an entry's credential that mock-docs refused for their
+# project, shown as tools/call:refused. check_server_entries checks that each team's calls carried
+# its own entry's credential, and that each canary named the other team's project.
 check_server_bearers() {
   local logs=$1 shas=$2 calls=$3 scope=$4 lines sha shown=""
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(.bearer_sha256 != null)
-    | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256) \(.rpc_method // "none")"')
+    | "\(if .accepted == true then "accepted" else "refused" end) \(.bearer_sha256) \(.rpc_method // "none")\(if .refused == "project" then ":refused" else "" end)"')
   for sha in $shas; do shown="$shown ${sha:0:12}..."; done
   echo "    requests seen by mock-docs, by answer, bearer sha256 prefix and method (the gateway's are$shown):"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
@@ -583,7 +630,7 @@ check_server_bearers() {
       for (i = 1; i <= n; i++) if (length(prefix) >= 8 && index(sha[i], prefix) == 1) return 1
       return 0
     }'
-  good=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && ours($2) && $3 != "tools/list" { count++ } END { print count + 0 }')
+  good=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && ours($2) && $3 != "tools/list" && $3 != "tools/call:refused" { count++ } END { print count + 0 }')
   bad=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && !ours($2) { count++ } END { print count + 0 }')
   local probe_shas
   probe_shas="$PROBE_MALFORMED_SHA $(cat "$COMPOSE_CREDENTIALS/registry-probe-credential.sha256")"
@@ -603,8 +650,10 @@ check_server_bearers() {
 # the server, one fewer that an allowed call did not, or that the log is short. A request
 # accepted with any other caller, or with none (a static token), fails the check.
 # The gateway's drift polls, its own tools/list requests under the entries' identities, are not
-# calls and are not counted. check_server_entries checks that each team's calls came under its
-# own entry's. Exactly REFUSALS requests were refused as wrong_audience: a token the cluster
+# calls and are not counted, and neither are the reach check's canaries, tools/call requests under
+# an entry's identity that mock-docs refused for their project. check_server_entries checks that
+# each team's calls came under its own entry's, and that each canary named the other team's
+# project. Exactly REFUSALS requests were refused as wrong_audience: a token the cluster
 # signed for another audience, the workloads' own on their direct calls before the policy.
 # Exactly PROBES were refused as no_bearer: the route check's probe before the policy, which
 # sends no credential, one request per attempt it found open. Each drift poll's probe of an entry
@@ -616,7 +665,7 @@ check_server_bearers() {
 check_server_callers() {
   local logs=$1 subjects=$2 calls=$3 refusals=$4 probes=$5 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
-    | if .accepted == true then "accepted \(.caller // "none") \(.rpc_method // "none")" else "refused \(.refusal // "none")" end')
+    | if .accepted == true then "accepted \(.caller // "none") \(.rpc_method // "none")\(if .refused == "project" then ":refused" else "" end)" else "refused \(.refusal // "none")" end')
   echo "    requests seen by mock-docs, by answer and verified caller and method, or refusal:"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
   local gateway other audience bearerless third refused drift_probes
@@ -624,7 +673,7 @@ check_server_callers() {
   # shellcheck disable=SC2016 # awk's own variables
   local ours='BEGIN { n = split(subjects, list, " "); for (i = 1; i <= n; i++) entry[list[i]] = 1 }
     '
-  gateway=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ } END { print count + 0 }')
+  gateway=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" && $3 != "tools/call:refused" { count++ } END { print count + 0 }')
   other=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ } END { print count + 0 }')
   audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
   bearerless=$(printf '%s\n' "$lines" | awk '$0 == "refused no_bearer" { n++ } END { print n + 0 }')
@@ -643,8 +692,9 @@ check_server_callers() {
 # TEAM's entry as mock-docs logs it: in kind the entry's ServiceAccount, the verified `caller`; in
 # Compose the SHA-256 of the entry's credential, whose prefix is logged as `bearer_sha256`. Of
 # the tools/call requests mock-docs accepted, exactly CALLS came under each team's identity, and
-# each of those named the team's own project and was answered: none named another project, which
-# mock-docs refuses for that identity.
+# each of those named the team's own project and was answered. The only others under it are the
+# reach check's canaries, each naming the other team's project, which mock-docs refused for that
+# identity; their number depends on when the gateway made them, so it is shown, not checked.
 check_server_entries() {
   local logs=$1 calls=$2 who team identity own lines mine other
   shift 2
@@ -657,13 +707,17 @@ check_server_entries() {
       if (length(identity) == 64 && identity !~ /[^0-9a-f]/) return length(logged) >= 8 && index(identity, logged) == 1
       return logged == identity
     }'
+  local canary canaries
   for who in "$@"; do
     team=${who%%=*} identity=${who#*=}
     own=$(team_project "$team")
+    if [ "$team" = team-a ]; then canary=$(team_project team-b); else canary=$(team_project team-a); fi
     mine=$(printf '%s\n' "$lines" | awk -v identity="$identity" -v own="$own" "$under"'under($1) && $2 == own && $3 == "answered" { count++ } END { print count + 0 }')
-    other=$(printf '%s\n' "$lines" | awk -v identity="$identity" -v own="$own" "$under"'NF == 3 && under($1) && !($2 == own && $3 == "answered") { count++ } END { print count + 0 }')
+    canaries=$(printf '%s\n' "$lines" | awk -v identity="$identity" -v canary="$canary" "$under"'NF == 3 && under($1) && $2 == canary && $3 == "refused" { count++ } END { print count + 0 }')
+    other=$(printf '%s\n' "$lines" | awk -v identity="$identity" -v own="$own" -v canary="$canary" "$under"'NF == 3 && under($1) && !($2 == own && $3 == "answered") && !($2 == canary && $3 == "refused") { count++ } END { print count + 0 }')
     check "$mine" "$calls" "mock-docs answered $team's $calls allowed calls under $team's own entry's identity, each for $own"
-    check "$other" 0 "no call under $team's entry's identity named another project"
+    note_line "the reach check's canaries under $team's entry's identity so far, each for $canary and refused: $canaries"
+    check "$other" 0 "no call under $team's entry's identity named another project, but the reach check's canaries, which mock-docs refused"
   done
 }
 
@@ -746,14 +800,27 @@ step_mark() {
 }
 
 # step_rows SINCE: every row begun since SINCE (epoch seconds), as one JSON array in the order
-# begun, with what the demonstrations' checks read. `begun` and `finished` are epoch seconds.
+# begun, with what the demonstrations' checks read. `begun` and `finished` are epoch seconds. The
+# reach check's rows, by team REACH_TEAM, are left out: they come on the gateway's own schedule,
+# whatever the step does, and reach_rows reads them.
 step_rows() {
   psql_reader -Atc "select coalesce(json_agg(json_build_object('kind', kind, 'team', proved_team,
       'tool', tool, 'decision', decision, 'reason', reason, 'outcome', outcome,
       'error_kind', error_kind, 'outcome_sentence', outcome_sentence, 'latency_ms', latency_ms,
       'revision', policy_revision, 'listed', listed_tools,
       'begun', extract(epoch from begun_at), 'finished', extract(epoch from finished_at))
-      order by begun_at), '[]') from $AUDIT_TABLE where begun_at >= to_timestamp($1)"
+      order by begun_at), '[]') from $AUDIT_TABLE where begun_at >= to_timestamp($1)
+      and proved_team is distinct from '$REACH_TEAM'"
+}
+
+# reach_rows SINCE: the reach check's rows begun since SINCE (epoch seconds), by team REACH_TEAM,
+# as one JSON array in the order begun.
+reach_rows() {
+  psql_reader -Atc "select coalesce(json_agg(json_build_object('subject', proved_subject,
+      'team', proved_team, 'surface', surface, 'tool', tool, 'decision', decision,
+      'outcome', outcome, 'error_kind', error_kind, 'resources', resources,
+      'revision', policy_revision) order by begun_at), '[]')
+    from $AUDIT_TABLE where begun_at >= to_timestamp($1) and proved_team = '$REACH_TEAM'"
 }
 
 # gateway_log SINCE: the gateway's log lines from SINCE, an RFC 3339 time.
@@ -824,9 +891,10 @@ mock_admin() {
 }
 
 # accepted_calls LOG: how many tools/call requests mock-docs accepted in LOG, its log lines. Its
-# admin requests and the gateway's drift polls are not calls.
+# admin requests and the gateway's drift polls are not calls, and neither are the reach check's
+# canaries, which mock-docs refuses for their project.
 accepted_calls() {
-  printf '%s\n' "$1" | jq -cR 'fromjson? | select(.event == "request" and .accepted == true and .rpc_method == "tools/call")' \
+  printf '%s\n' "$1" | jq -cR 'fromjson? | select(.event == "request" and .accepted == true and .rpc_method == "tools/call" and .refused != "project")' \
     | awk 'END { print NR }'
 }
 
@@ -1067,17 +1135,26 @@ check_drift_rows() {
     "$want" "audit: team-a's list and call are recorded under revision $revision, listing $listed, the call $call"
 }
 
-# check_reapproval EVENTS REVISION: the gateway's lines since the registry approving both list
-# tools again, under REVISION, was installed (policy_reloaded, policy_withdrawal_cleared and
-# tool_withdrawn). It served REVISION itself, with no withdrawal derived from it, and dropped
-# both list tools' withdrawals as approved again; it withdrew nothing.
+# check_reapproval EVENTS REVISION [WHAT TOOL...]: the gateway's lines since the registry
+# approving TOOLs again, under REVISION, was installed (policy_reloaded, policy_withdrawal_cleared
+# and tool_withdrawn). It served REVISION itself, with no withdrawal derived from it, and dropped
+# the TOOLs' withdrawals, and no other, as approved again; it withdrew nothing. WHAT names the
+# TOOLs in the check. With no TOOL, they are both list tools, as the drift step approves them.
 check_reapproval() {
-  local events=$1 revision=$2
+  local events=$1 revision=$2 what="both list tools'" want tool
+  shift 2
+  if [ $# -gt 0 ]; then
+    what=$1
+    shift
+  else
+    set -- docs-team-a__list_documents docs-team-b__list_documents
+  fi
+  want=$(for tool in "$@"; do echo "$tool: approved again"; done | sort | paste -sd ';' -)
   check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_reloaded") | .revision' 2>/dev/null | head -n 1)" \
     "$revision" "the gateway serves revision $revision, with no withdrawal"
   check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\(.tool): \(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \
-    "docs-team-a__list_documents: approved again;docs-team-b__list_documents: approved again" \
-    "both list tools' withdrawals cleared as approved again"
+    "$want" \
+    "$what withdrawals cleared as approved again"
   check "$(printf '%s\n' "$events" | jq -c 'select(.event == "tool_withdrawn")' 2>/dev/null | awk 'END { print NR }')" 0 \
     "the drift pass withdrew nothing since"
 }
@@ -1215,7 +1292,7 @@ drift_steps() {
   step_mark
   local changed=$MARK_EPOCH changed_at=$MARK_TIME
   DRIFTED=1
-  WITHDRAWAL_HELD=1
+  WITHDRAWAL_HELD="the drift step's withdrawals of docs-team-a__list_documents and docs-team-b__list_documents"
   mock_admin PUT /admin/definitions/list_documents "{\"description\": \"$DRIFTED_DESCRIPTION\"}" | sed 's/^/    mock-docs: /'
   if wait_for_events "the gateway withdrew both list tools" $((DRIFT_INTERVAL + CALL_DEADLINE + 30)) 2 "$changed_at" \
     'select(.event == "tool_withdrawn")'; then
@@ -1277,12 +1354,193 @@ drift_steps() {
   check_drift_rows "$(step_rows "$MARK_EPOCH")" "$REVISION" "$list,$(team_entry team-a)__read_document" "allow ok"
 }
 
+# check_reach_held EVENTS: the gateway's reach_held lines in EVENTS: each entry's reach check held
+# at least once.
+check_reach_held() {
+  local entry
+  for entry in docs-team-a docs-team-b; do
+    # shellcheck disable=SC2016 # jq's own variables
+    check_at_least "$(printf '%s\n' "$1" | jq -r --arg entry "$entry" 'select(.event == "reach_held" and .server == $entry) | .server' 2>/dev/null | awk 'END { print NR }')" 1 \
+      "the reach check of $entry held: mock-docs refused its canary"
+  done
+}
+
+# check_probe_and_reach TEXT: the gateway's metrics TEXT count, for each entry, a probe that
+# mock-docs refused and none it dispatched (decision 0013, section 9), and a reach check that held
+# and none it answered (decision 0011, section 4).
+check_probe_and_reach() {
+  local text=$1 entry
+  for entry in docs-team-a docs-team-b; do
+    check_at_least "$(metric "switchboard_probe_results_total{server=\"$entry\",result=\"refused\"}" "$text")" 1 \
+      "metrics: mock-docs refused the gateway's probe of $entry"
+    check "$(metric "switchboard_probe_results_total{server=\"$entry\",result=\"open\"}" "$text")" 0 \
+      "metrics: no probe of $entry found mock-docs open"
+    check_at_least "$(metric "switchboard_reach_checks_total{server=\"$entry\",result=\"held\"}" "$text")" 1 \
+      "metrics: the reach check of $entry held"
+    check "$(metric "switchboard_reach_checks_total{server=\"$entry\",result=\"mismatch\"}" "$text")" 0 \
+      "metrics: no reach check of $entry found its reach wider than recorded"
+  done
+}
+
+# check_reach_rows ROWS SUBJECT: the reach check's rows (reach_rows) since the step began. For each
+# entry, at least one is a held check's: by SUBJECT, the registry's own workload, on the
+# registry-reach surface, a call to the entry's list tool naming its canary, the other team's
+# project, allowed and completed as error of the kind vendor_refusal: mock-docs' 403. Every row is
+# such a row.
+check_reach_rows() {
+  local rows=$1 subject=$2 entry canary
+  for entry in docs-team-a docs-team-b; do
+    if [ "$entry" = docs-team-a ]; then canary=borealis; else canary=atlas; fi
+    # shellcheck disable=SC2016 # jq's own variables
+    check_at_least "$(jq -r --arg subject "$subject" --arg surface "$REACH_SURFACE" --arg tool "${entry}__list_documents" --arg canary "$canary" \
+      '[.[] | select(.subject == $subject and .surface == $surface and .tool == $tool
+        and .decision == "allow" and .outcome == "error" and .error_kind == "vendor_refusal"
+        and .resources == [{system: "docs", kind: "project", identifier: $canary}])] | length' <<<"$rows" 2>/dev/null)" 1 \
+      "audit: $entry's reach check is a row by $subject on $REACH_SURFACE, its canary $canary allowed and refused by mock-docs"
+  done
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(jq -r --arg subject "$subject" --arg surface "$REACH_SURFACE" \
+    '[.[] | select((.subject == $subject and .surface == $surface and .decision == "allow"
+        and .outcome == "error" and .error_kind == "vendor_refusal") | not)] | length' <<<"$rows" 2>/dev/null)" 0 \
+    "audit: every reach check row since is a held check's"
+}
+
+# check_reach_mismatch EVENTS WIDENED: the gateway's reach_mismatch and tool_withdrawn lines since
+# mock-docs began letting docs-team-a's credential read borealis, at WIDENED (epoch seconds). The
+# reach check of docs-team-a found it once, and withdrew both of its tools, each once, for a reach
+# mismatch, from base REVISION, within the drift interval plus the call deadline and the reach
+# check's allowance; docs-team-b's were not withdrawn. The revision served after is
+# REACH_WITHDRAWN_REVISION, the literal derived one.
+check_reach_mismatch() {
+  local events=$1 widened=${2%.*} tool at
+  check "$(printf '%s\n' "$events" | jq -r 'select(.event == "reach_mismatch") | "\(.server) withdrew \(.withdrawn)"' 2>/dev/null | paste -sd ';' -)" \
+    "docs-team-a withdrew 2" "the reach check of docs-team-a found its reach wider than recorded, once, and withdrew both its tools"
+  for tool in docs-team-a__list_documents docs-team-a__read_document; do
+    # shellcheck disable=SC2016 # jq's own variables
+    check "$(printf '%s\n' "$events" | jq -r --arg tool "$tool" 'select(.event == "tool_withdrawn" and .tool == $tool) | "\(.cause) from \(.base)"' 2>/dev/null | sort | uniq -c | awk '{ $1 = $1 " x"; print }')" \
+      "1 x reach mismatch from $REVISION" "the gateway withdrew $tool once, for a reach mismatch, from revision $REVISION"
+  done
+  check "$(printf '%s\n' "$events" | jq -c 'select(.event == "tool_withdrawn" and (.tool | startswith("docs-team-b__")))' 2>/dev/null | awk 'END { print NR }')" 0 \
+    "the gateway withdrew none of docs-team-b's tools"
+  at=$(printf '%s\n' "$events" | jq -r 'select(.event == "reach_mismatch") | .timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null | head -n 1)
+  case "$at:$widened" in
+    [0-9]*:[0-9]*) check_at_most "$((at - widened))" $((DRIFT_INTERVAL + CALL_DEADLINE + REACH_ALLOWANCE)) \
+      "it was found within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline and the $REACH_ALLOWANCE s allowance of the change (seconds)" ;;
+    *) fail "it was found within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline and the $REACH_ALLOWANCE s allowance of the change (got '$at' and '$widened')" ;;
+  esac
+  check "$(printf '%s\n' "$events" | jq -r 'select(.event == "tool_withdrawn") | .revision' 2>/dev/null | tail -n 1)" \
+    "$REACH_WITHDRAWN_REVISION" "the revision served after both withdrawals is the literal derived one"
+}
+
+# check_mismatch_row ROWS SUBJECT: the reach check's rows (reach_rows) since the widening hold the
+# mismatch's own: by SUBJECT, docs-team-a's canary, borealis, allowed and answered ok.
+check_mismatch_row() {
+  # shellcheck disable=SC2016 # jq's own variables
+  check_at_least "$(jq -r --arg subject "$2" --arg surface "$REACH_SURFACE" \
+    '[.[] | select(.subject == $subject and .surface == $surface and .tool == "docs-team-a__list_documents"
+      and .decision == "allow" and .outcome == "ok"
+      and .resources == [{system: "docs", kind: "project", identifier: "borealis"}])] | length' <<<"$1" 2>/dev/null)" 1 \
+    "audit: the mismatch is a row by $2, docs-team-a's canary borealis allowed and answered ok"
+}
+
+# reach_held_step: decision 0011, section 4 and decision 0013, sections 5 and 9, after boot: each
+# entry's probe found mock-docs refusing, and each entry's reach check held: a call by the
+# registry's own workload, on its own surface, naming the entry's canary, which the gateway
+# allowed and audited and mock-docs refused for the entry's credential.
+reach_held_step() {
+  step "the probe and the reach check: mock-docs refused each entry's probe, and each entry's reach check, a call by the registry's own workload naming the other team's project"
+  step_mark
+  local since=$MARK_EPOCH since_at=$MARK_TIME entry
+  for entry in docs-team-a docs-team-b; do
+    wait_for_events "the reach check of $entry held" $((DRIFT_INTERVAL + CALL_DEADLINE + REACH_ALLOWANCE + 10)) 1 "$since_at" \
+      "select(.event == \"reach_held\" and .server == \"$entry\")" || true
+  done
+  if fetch "the gateway's log" gateway_log "$since_at"; then
+    check_reach_held "$(events "$FETCHED" 'select(.event == "reach_held")')"
+  fi
+  if fetch "the gateway's metrics" gateway_metrics; then
+    check_probe_and_reach "$FETCHED"
+  fi
+  check_reach_rows "$(reach_rows "$since")" "$(reach_subject)"
+}
+
+# reach_steps: decision 0011, section 4: a reach widened outside the gateway, by letting
+# docs-team-a's credential read borealis in mock-docs, is found by the next reach check, whose
+# canary mock-docs now answers, and every tool of the entry is withdrawn within the interval plus
+# the deadline and the allowance. They return only through a new approval, once the credential is
+# narrowed again.
+reach_steps() {
+  local entry list read caller
+  entry=$(team_entry team-a)
+  list=${entry}__list_documents
+  read=${entry}__read_document
+  caller=$(entry_caller team-a)
+  step "reach: mock-docs lets docs-team-a's credential read borealis too, outside its recorded reach; the next reach check's canary is answered, and the gateway withdraws both of docs-team-a's tools within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline and the $REACH_ALLOWANCE s allowance"
+  step_mark
+  local widened=$MARK_EPOCH widened_at=$MARK_TIME
+  WIDENED=1
+  WITHDRAWAL_HELD="the reach step's withdrawals of $list and $read"
+  mock_admin PUT "/admin/callers/$caller" '{"projects": ["atlas", "borealis"]}' | sed 's/^/    mock-docs: /'
+  if wait_for_events "the gateway found docs-team-a's reach wider than recorded and withdrew its tools" \
+    $((DRIFT_INTERVAL + CALL_DEADLINE + REACH_ALLOWANCE + 30)) 3 "$widened_at" \
+    'select(.event == "reach_mismatch" or .event == "tool_withdrawn")'; then
+    printf '%s\n' "$EVENTS" | sed 's/^/    /'
+    check_reach_mismatch "$EVENTS" "$widened"
+  fi
+  check_mismatch_row "$(reach_rows "$widened")" "$(reach_subject)"
+  step_mark
+  workload "team-a after the reach mismatch" team-a withdrawn all
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$REACH_WITHDRAWN_REVISION" "" "deny unknown_tool"
+
+  local served=$DEMO_DIR/registry-served.toml variant=$DEMO_DIR/registry-variant.toml stamp revision
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  revision=$VARIANT_REVISION-reapproved-$stamp
+  step "reach: docs-team-a's credential limited to atlas again, and both its tools approved again, unchanged, with a new approved_at, under revision $revision; the withdrawals clear and the next reach check holds"
+  mock_admin PUT "/admin/callers/$caller" '{"projects": ["atlas"]}' | sed 's/^/    mock-docs: /'
+  WIDENED=""
+  served_registry >"$served"
+  if ! reapproval_variant "$revision" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$list" "$read" <"$served" >"$variant"; then
+    fail "the registry served approves both of docs-team-a's tools, so the variant can be made from it"
+    return 0
+  fi
+  step_mark
+  local approved_at=$MARK_TIME
+  RESTORE_REGISTRY=$served
+  install_registry "$variant"
+  if wait_for_events "the gateway served revision $revision" "$(reload_wait)" 1 "$approved_at" \
+    "select(.event == \"policy_reloaded\" and (.revision | startswith(\"$revision\")))"; then
+    # A new approval clears a standing withdrawal (decision 0013, section 6).
+    WITHDRAWAL_HELD=""
+  fi
+  wait_for_events "the reach check of docs-team-a held again" $((DRIFT_INTERVAL + CALL_DEADLINE + REACH_ALLOWANCE + 10)) 1 "$approved_at" \
+    'select(.event == "reach_held" and .server == "docs-team-a")' || true
+  if fetch "the gateway's log" gateway_log "$approved_at"; then
+    check_reapproval "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared" or .event == "tool_withdrawn")')" \
+      "$revision" "both of docs-team-a's tools'" "$list" "$read"
+  fi
+  step_mark
+  workload "team-a after the new approval" team-a served
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$revision" "$list,$read" "allow ok"
+
+  step "reach: the registry served before, revision $REVISION, back in place; both of docs-team-a's tools served"
+  step_mark
+  install_registry "$served"
+  wait_for_events "the gateway served revision $REVISION" "$(reload_wait)" 1 "$MARK_TIME" \
+    "select(.event == \"policy_reloaded\" and .revision == \"$REVISION\")" || true
+  RESTORE_REGISTRY=""
+  step_mark
+  workload "team-a under revision $REVISION" team-a served
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$REVISION" "$list,$read" "allow ok"
+}
+
 # demonstrations: #11's demonstrations, in order, in whichever deployment is running.
 demonstrations() {
+  reach_held_step
   undeclared_step
   refused_at_load_step
   isolation_steps
   drift_steps
+  reach_steps
 }
 
 # --- Compose --------------------------------------------------------------------------------
@@ -1314,9 +1572,10 @@ compose_workload() { # LABEL MODE TEAM [ARGS...]: runs the workload service once
 # mock_docs_requests: how many requests mock-docs has accepted, other than tools/list. Its health
 # checks carry no bearer and are not accepted, so they do not count. The gateway's drift pass
 # reads each entry's tool list every 10 s whatever the database is doing, so its tools/list
-# requests do not count either: no call is a tools/list.
+# requests do not count either: no call is a tools/list. Nor do the reach check's canaries,
+# which mock-docs refuses for their project: they come on the gateway's own schedule.
 mock_docs_requests() {
-  dc logs --no-log-prefix mock-docs | jq -cR 'fromjson? | select(.accepted == true and .rpc_method != "tools/list")' | awk 'END { print NR }'
+  dc logs --no-log-prefix mock-docs | jq -cR 'fromjson? | select(.accepted == true and .rpc_method != "tools/list" and .refused != "project")' | awk 'END { print NR }'
 }
 
 swap_registry() { # FILE: replaces the mounted registry file in one rename
@@ -1396,9 +1655,9 @@ compose_run() {
     check_metrics outage "$FETCHED"
   fi
 
-  # Seven lists: each team's full run, the run after the withdrawal, and team-a's four in the
-  # drift steps.
-  audit_rows 7
+  # Ten lists: each team's full run, the run after the withdrawal, team-a's four in the drift
+  # steps and its three in the reach steps.
+  audit_rows 10
   FINISHED=1
 }
 
@@ -1723,11 +1982,11 @@ operator_ask() {
 
 # token_grants: what ServiceAccount gateway may do with ServiceAccount tokens, the grant its
 # pod's token writer uses (deploy/kind/base/gateway-tokens.yaml): create them for docs-team-a,
-# docs-team-b and registry-probe, the drift probe's, named, and for no other ServiceAccount, its
-# own and a workload's among them, nor without a name.
+# docs-team-b, registry-probe, the drift probe's, and registry, the reach check's, named, and for
+# no other ServiceAccount, its own and a workload's among them, nor without a name.
 token_grants() {
   local gateway=system:serviceaccount:switchboard:gateway entry answer
-  for entry in docs-team-a docs-team-b registry-probe; do
+  for entry in docs-team-a docs-team-b registry-probe registry; do
     answer=$(k auth can-i create "serviceaccounts/$entry" --subresource=token -n switchboard --as="$gateway" 2>&1) || true
     check "${answer##*$'\n'}" yes "the gateway may create tokens for $entry"
   done
@@ -1992,7 +2251,7 @@ kind_run() {
   step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
   route_checks_after_policy
 
-  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a, docs-team-b and registry-probe, and for no other ServiceAccount"
+  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a, docs-team-b, registry-probe and registry, and for no other ServiceAccount"
   token_grants
 
   step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets, or ConfigMaps in mock-docs or the gateway's namespace; and no RBAC rule bound to either grants any of these, whatever its resourceNames"
@@ -2032,9 +2291,10 @@ kind_run() {
     check_metrics none "$FETCHED"
   fi
 
-  # Six lists: each team's full run, and team-a's four in the drift steps. The probes before
-  # the policy make none, and the stranger's is refused for identity, which writes no row.
-  audit_rows 6
+  # Nine lists: each team's full run, team-a's four in the drift steps and its three in the
+  # reach steps. The probes before the policy make none, and the stranger's is refused for
+  # identity, which writes no row.
+  audit_rows 9
   FINISHED=1
 }
 

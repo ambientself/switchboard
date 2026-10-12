@@ -606,10 +606,10 @@ fn no_workload_mounts_an_api_token() {
 }
 
 /// What the token RBAC grants: ServiceAccount gateway may create tokens for the entries'
-/// ServiceAccounts and the probe's, registry-probe, named, and nothing else; and no other Role
-/// or binding is in the base.
+/// ServiceAccounts, the probe's, registry-probe, and the registry's own workload identity,
+/// registry, named, and nothing else; and no other Role or binding is in the base.
 #[test]
-fn the_token_grant_names_exactly_the_entries_and_the_probes_service_accounts() {
+fn the_token_grant_names_exactly_the_entries_the_probes_and_the_registrys_service_accounts() {
     let grant = read("deploy/kind/base/gateway-tokens.yaml");
     let documents: Vec<String> = grant
         .split("\n---\n")
@@ -632,7 +632,7 @@ rules:
   - apiGroups: [\"\"]
     resources: [\"serviceaccounts/token\"]
     verbs: [\"create\"]
-    resourceNames: [\"docs-team-a\", \"docs-team-b\", \"registry-probe\"]",
+    resourceNames: [\"docs-team-a\", \"docs-team-b\", \"registry-probe\", \"registry\"]",
             "apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -649,14 +649,16 @@ subjects:
         ],
         "the token grant must be exactly this"
     );
-    // The names are the token writer's accounts, each a ServiceAccount in the namespace.
+    // The names are the token writer's accounts, each a ServiceAccount in the namespace. The
+    // registry's token is for the gateway's own audience, switchboard; the rest are for
+    // mock-docs'.
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
     assert!(gateway.contains(
-        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe\"}\n"
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe registry:switchboard\"}\n"
     ));
     assert!(gateway.contains("            - {name: TOKEN_NAMESPACE, value: switchboard}\n"));
     let accounts = read("deploy/kind/base/serviceaccounts.yaml");
-    for account in ["docs-team-a", "docs-team-b", "registry-probe"] {
+    for account in ["docs-team-a", "docs-team-b", "registry-probe", "registry"] {
         let found = documents_with(
             &accounts,
             &format!("  name: {account}\n  namespace: switchboard\n"),
@@ -724,10 +726,10 @@ fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
     assert!(
         writer.contains("            - {name: TOKEN_DIR, value: /var/run/switchboard/tokens}\n")
     );
-    // The gateway starts only once the three tokens are written: it reads every credential,
-    // the probe's included, at boot.
+    // The gateway starts only once the four tokens are written: it reads every credential,
+    // the probe's included, at boot, and the reach check presents the registry's at once.
     assert!(writer.contains(
-        "                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b && test -s /var/run/switchboard/tokens/registry-probe\n"
+        "                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b && test -s /var/run/switchboard/tokens/registry-probe && test -s /var/run/switchboard/tokens/registry\n"
     ), "{writer}");
     assert!(gateway.contains(
         "        - name: entry-tokens\n          emptyDir: {medium: Memory, sizeLimit: 1Mi}"
@@ -773,6 +775,15 @@ fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
             .any(|account| account == "registry-probe")
     );
     assert_eq!(writer_env("TOKEN_AUDIENCE"), "mock-docs");
+    // The reach check presents ServiceAccount registry's token, for the gateway's own audience,
+    // to the gateway's own listener: the file the token writer writes for that account.
+    assert!(
+        writer_env("TOKEN_SERVICE_ACCOUNTS")
+            .split(' ')
+            .any(|account| account == "registry:switchboard")
+    );
+    assert!(config.contains("\nreach_token_file = \"/var/run/switchboard/tokens/registry\"\n"));
+    assert!(config.contains("\naudiences = [\"switchboard\"]\n"));
     assert_eq!(writer_env("TOKEN_DIR"), "/var/run/switchboard/tokens");
 
     // The dummy credentials and the Secrets made from them are not in kind.
@@ -1399,13 +1410,21 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     let kind_issuer = "issuer = \"https://kubernetes.default.svc.cluster.local\"";
     let kind_identity = "identity = \"mock-docs.mock-docs.svc.cluster.local\"";
     let kind_address = "address = \"http://mock-docs.mock-docs.svc.cluster.local:8080/mcp\"";
-    assert_eq!(kind.matches(kind_issuer).count(), 1);
+    // The reach check's surface admits one principal, the registry's own workload identity,
+    // which is the issuer's and its subject.
+    let kind_reach = "principals = { only = [{ issuer = \"https://kubernetes.default.svc.cluster.local\", subject = \"system:serviceaccount:switchboard:registry\" }] }";
+    let compose_reach = "principals = { only = [{ issuer = \"https://dev-issuer.switchboard.test\", subject = \"workload:registry:reach-check\" }] }";
+    assert_eq!(kind.matches(kind_reach).count(), 1);
+    assert_eq!(compose.matches(compose_reach).count(), 1);
+    // The profile rule names the issuer once more.
+    assert_eq!(kind.replace(kind_reach, "").matches(kind_issuer).count(), 1);
     // The mock server is registered once per team, both entries at the one address.
     for line in [kind_identity, kind_address] {
         assert_eq!(kind.matches(line).count(), 2, "{line}");
     }
     // Each binding differs because the identity and address do; the loader checks each file's.
     let mut as_compose = kind
+        .replace(kind_reach, compose_reach)
         .replace(
             kind_issuer,
             "issuer = \"https://dev-issuer.switchboard.test\"",
@@ -1425,8 +1444,8 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     // The withdrawn copy is the Compose registry less each team's read tool, at a new
     // revision.
     let withdrawn = registry_body("deploy/compose/config/registry-withdrawn.toml");
-    assert!(compose.contains("revision = \"demo-7\""));
-    assert!(withdrawn.contains("revision = \"demo-8\""));
+    assert!(compose.contains("revision = \"demo-10\""));
+    assert!(withdrawn.contains("revision = \"demo-11\""));
     for entry in ["docs-team-a", "docs-team-b"] {
         assert!(!withdrawn.contains(&format!("name = \"{entry}__read_document\"")));
         assert!(withdrawn.contains(&format!("tools = [\"{entry}__list_documents\"]\n")));
@@ -1438,7 +1457,7 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     );
     // demo.sh names the same revisions.
     let driver = read("deploy/demo/demo.sh");
-    assert!(driver.contains("\nREVISION=demo-7\nWITHDRAWN_REVISION=demo-8\n"));
+    assert!(driver.contains("\nREVISION=demo-10\nWITHDRAWN_REVISION=demo-11\n"));
 }
 
 #[test]
@@ -1524,4 +1543,122 @@ fn the_image_build_context_leaves_out_worktrees_targets_and_transcripts() {
             "{pattern} is not in .dockerignore"
         );
     }
+}
+
+/// Decision 0011, section 4: the reach check is a gateway call by the registry's own workload
+/// identity, admitted only to a surface restricted to that one subject. In each registry the
+/// registry-reach surface serves each entry's reach check's tool, and nothing else, to team
+/// registry and, of it, that one principal; no other surface admits team registry; the team
+/// manifest maps that subject, and no other, to team registry; and the deployment file's reach
+/// check calls the gateway's own listener on that surface, with a Host it serves.
+#[test]
+fn the_registry_reach_surface_admits_only_the_registrys_own_principal() {
+    use std::collections::BTreeSet;
+
+    for (dir, issuer, subject) in [
+        (
+            "deploy/compose/config",
+            "https://dev-issuer.switchboard.test",
+            "workload:registry:reach-check",
+        ),
+        (
+            "deploy/kind/base/config",
+            KIND_ISSUER,
+            "system:serviceaccount:switchboard:registry",
+        ),
+    ] {
+        let registry = gateway_registry::Registry::from_toml_str(&read(&format!(
+            "{dir}/registry/registry.toml"
+        )))
+        .unwrap();
+        let snapshot = registry.snapshot();
+        let reach = snapshot.surface(&"registry-reach".into()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reach.principals).unwrap(),
+            serde_json::json!({"only": [{"issuer": issuer, "subject": subject}]}),
+            "{dir}"
+        );
+        assert_eq!(
+            reach.teams,
+            ["registry".into()].into_iter().collect(),
+            "{dir}"
+        );
+        assert!(reach.groups.is_empty(), "{dir}");
+        let checked: BTreeSet<_> = registry
+            .servers()
+            .values()
+            .map(|server| server.reach_check.clone().unwrap().tool)
+            .collect();
+        assert_eq!(reach.tools, checked, "{dir}");
+        for surface in snapshot.surfaces() {
+            if surface.name != reach.name {
+                assert!(
+                    !surface.teams.contains(&"registry".into()),
+                    "{dir}: {}",
+                    surface.name
+                );
+            }
+        }
+
+        let manifest: toml::Table = toml::from_str(&read(&format!("{dir}/teams.toml"))).unwrap();
+        let in_registry: Vec<&String> = manifest["subjects"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .filter(|(_, team)| team.as_str() == Some("registry"))
+            .map(|(subject, _)| subject)
+            .collect();
+        assert_eq!(in_registry, [subject], "{dir}");
+
+        let file: DeploymentFile = toml::from_str(&read(&format!("{dir}/gateway.toml"))).unwrap();
+        let drift = file.drift.unwrap();
+        assert_eq!(
+            drift.reach_url,
+            Some(format!(
+                "http://127.0.0.1:{}/mcp/registry-reach",
+                file.listen.port()
+            )),
+            "{dir}"
+        );
+        assert!(
+            file.http
+                .allowed_hosts
+                .contains(drift.reach_host.as_deref().unwrap()),
+            "{dir}"
+        );
+    }
+}
+
+/// In Compose the registry's workload token comes from the dev issuer, which signs for its
+/// subject, into a volume only the reach-token service writes and the gateway reads, read-only.
+/// It is not in the image or a secret, and no other service mounts it.
+#[test]
+fn compose_writes_the_registrys_token_where_only_the_gateway_reads_it() {
+    let compose = read("deploy/compose/compose.yaml");
+    assert!(
+        compose_service(&compose, "dev-issuer")
+            .contains("      - --subject=workload:registry:reach-check\n")
+    );
+    let writer = compose_service(&compose, "reach-token");
+    assert!(writer.contains(
+        "'http://dev-issuer:8090/token?subject=workload:registry:reach-check&audience=switchboard'"
+    ));
+    assert!(
+        writer.contains("      - reach-token:/shared/reach\n"),
+        "{writer}"
+    );
+    let gateway = compose_service(&compose, "gateway");
+    assert!(
+        gateway.contains("      - reach-token:/shared/reach:ro\n"),
+        "{gateway}"
+    );
+    assert!(gateway.contains("      reach-token:\n        condition: service_healthy\n"));
+    for service in ["postgres", "migrate", "dev-issuer", "mock-docs", "workload"] {
+        assert!(
+            !compose_service(&compose, service).contains("reach-token"),
+            "{service}"
+        );
+    }
+    let config = read("deploy/compose/config/gateway.toml");
+    assert!(config.contains("\nreach_token_file = \"/shared/reach/registry\"\n"));
 }
