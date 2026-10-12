@@ -89,9 +89,8 @@ and what clears it, in the drift steps below.
 ## #11's demonstrations
 
 Both runs end with #11's demonstrations, after the checks of mock-docs' log and before the
-metrics and the audit rows (`demonstrations` in `demo/demo.sh`). Each step checks the
-workload's answers, the step's own audit rows and, where it says so, the gateway's log lines and
-metrics:
+metrics and the audit rows (`demonstrations` in `demo/demo.sh`). Each step checks, as it says,
+the workload's answers, the step's own audit rows, the gateway's log lines or metrics:
 
 1. **An undeclared argument** (decision 0011, section 1). Team-a reads its project with an
    extra argument, `note`, which the tool's approved schema does not declare. The answer is an

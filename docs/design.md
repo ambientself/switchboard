@@ -1455,8 +1455,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The kind slice extended to show them: partly built. Both demos register the mock server
   once per team and show each team's calls reaching it under its own entry's identity, for its
   own project (the next entry), and both show the undeclared argument, the registry refused at
-  load, the hanging server, overload and drift (the demonstrations entry above). The probe and
-  the reach check are not shown.
+  load, the hanging server, overload and drift (the demonstrations entry above). The probe is
+  shown only by mock-docs refusing each probe's three calls in the kind run; no step shows it
+  finding an open server. The reach check is not shown.
 - The gateway's per-team identities: built in the demos (#11's kind slice), as decision 0013,
   section 10, has them. The registry lists the mock server twice, `docs-team-a` and
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
