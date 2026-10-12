@@ -906,15 +906,50 @@ fn rules_name_configured_issuers(
 pub(crate) mod tests {
     //! The receipt-store gate as a release build runs it. These tests are in a development
     //! build, which is exempt, so each passes the exemption itself.
+    //!
+    //! Every tool a registry approves is proxied, and the snapshot loader refuses a proxied tool
+    //! not classified `read` (decision 0011, rule 2) before this gate runs. So the gate's own
+    //! tests run it on snapshots whose tool has an in-process connector and no connector entry,
+    //! as the JSON configuration's do, until built-in connectors exist.
     #![allow(clippy::unwrap_used)]
 
+    use gateway_core::{
+        ApprovedTool, CredentialMode, Narrowing, PrincipalRestriction, ResourceDeclaration,
+        SnapshotData, Surface,
+    };
     use gateway_identity::SystemClock;
     use serde_json::json;
 
     use super::*;
+    use crate::catalog::ToolDefinition;
+
+    /// The server every test registry here registers: on loopback, never connected to, with a
+    /// gateway token and a reach of nothing.
+    pub(crate) fn server() -> gateway_registry::Server {
+        gateway_registry::Server {
+            name: "mock-docs".into(),
+            system: "docs".into(),
+            owner: "platform".into(),
+            identity: "127.0.0.1".into(),
+            address: "http://127.0.0.1:9/mcp".into(),
+            credential: gateway_registry::Credential {
+                mode: CredentialMode::GatewayToken,
+                reference: "docs-credential".into(),
+                principal: "docs-reader".into(),
+            },
+            narrowing: Narrowing::None,
+            permits: Classification::Read,
+            reach: BTreeSet::new(),
+            reach_test: None,
+            destination: gateway_registry::Destination::InCluster,
+            probe: None,
+            reach_check: None,
+        }
+    }
 
     /// A registry file with one server and one tool of `classification`, on the `docs` surface
-    /// when `on_surface`, at `revision`.
+    /// when `on_surface`, at `revision`. Only `read` loads: the loader refuses a proxied tool
+    /// classified anything else (rule 2).
     pub(crate) fn registry_text(classification: &str, on_surface: bool, revision: &str) -> String {
         let sha = gateway_registry::definition_sha256(
             "list_documents",
@@ -922,16 +957,7 @@ pub(crate) mod tests {
             "Lists the documents.",
             &json!({"type": "object"}),
         );
-        let binding = gateway_registry::binding_sha256(&gateway_registry::Server {
-            name: "mock-docs".into(),
-            system: "docs".into(),
-            owner: "platform".into(),
-            identity: "127.0.0.1".into(),
-            address: "http://127.0.0.1:9/mcp".into(),
-            credential: gateway_registry::Credential::Bearer {
-                reference: "docs-credential".into(),
-            },
-        });
+        let binding = gateway_registry::binding_sha256(&server());
         let served = if on_surface {
             "\"docs__list_documents\""
         } else {
@@ -948,7 +974,11 @@ system = "docs"
 owner = "platform"
 identity = "127.0.0.1"
 address = "http://127.0.0.1:9/mcp"
-credential = {{ mode = "bearer", reference = "docs-credential" }}
+credential = {{ mode = "gateway_token", reference = "docs-credential", principal = "docs-reader" }}
+narrowing = "none"
+permits = "read"
+reach = []
+destination = "in_cluster"
 
 [[tools]]
 name = "docs__list_documents"
@@ -980,6 +1010,50 @@ principals = "any_in_teams_and_groups"
         Registry::from_toml_str(&registry_text(classification, on_surface, "r1")).unwrap()
     }
 
+    /// A snapshot with one tool of `classification` on an in-process connector, with no
+    /// connector entry, on the `docs` surface when `on_surface`.
+    fn in_process(classification: Classification, on_surface: bool) -> PolicySnapshot {
+        let name = ToolName::parse("docs__list_documents").unwrap();
+        PolicySnapshot::new(SnapshotData {
+            revision: "r1".into(),
+            tools: vec![ApprovedTool {
+                name: name.clone(),
+                classification,
+                connector: "mock-docs".into(),
+                resources: ResourceDeclaration::NoResources,
+                declared_from: None,
+            }],
+            surfaces: vec![Surface {
+                name: "docs".into(),
+                tools: if on_surface {
+                    [name].into()
+                } else {
+                    BTreeSet::new()
+                },
+                teams: ["team-a".into()].into(),
+                groups: BTreeSet::new(),
+                principals: PrincipalRestriction::AnyInTeamsAndGroups,
+            }],
+            profiles: Vec::new(),
+            limits: Default::default(),
+            entries: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    /// [`in_process`] served, with its tool's definition and no profile rules.
+    fn served_in_process(classification: Classification) -> ServedPolicy {
+        let catalog = ToolCatalog::new(vec![ToolDefinition {
+            name: ToolName::parse("docs__list_documents").unwrap(),
+            title: None,
+            description: "Lists the documents.".into(),
+            input_schema: json!({"type": "object"}),
+        }])
+        .unwrap();
+        let selector = ProfileSelector::new(SelectorRules::default()).unwrap();
+        ServedPolicy::from_config(in_process(classification, true), catalog, selector)
+    }
+
     /// What a release build of `registry` starts with: no issuers, its one server connected,
     /// and no exemption from the receipt-store gate.
     pub(crate) fn release_basis(registry: Registry) -> Basis {
@@ -1006,13 +1080,14 @@ principals = "any_in_teams_and_groups"
 
     #[test]
     fn a_read_only_snapshot_passes_the_receipt_gate() {
+        assert!(receipt_gate(&in_process(Classification::Read, true), false).is_ok());
         assert!(receipt_gate(registry("read", true).snapshot(), false).is_ok());
     }
 
     #[test]
     fn a_served_propose_tool_is_refused_without_a_receipt_store() {
         refused_as(
-            receipt_gate(registry("propose", true).snapshot(), false),
+            receipt_gate(&in_process(Classification::Propose, true), false),
             Classification::Propose,
         );
     }
@@ -1020,17 +1095,20 @@ principals = "any_in_teams_and_groups"
     #[test]
     fn a_served_write_tool_is_refused_without_a_receipt_store() {
         refused_as(
-            receipt_gate(registry("write", true).snapshot(), false),
+            receipt_gate(&in_process(Classification::Write, true), false),
             Classification::Write,
         );
     }
 
     #[test]
     fn a_tool_not_classified_read_but_on_no_surface_is_not_served_and_passes() {
-        for classification in ["propose", "write", "destructive"] {
-            let registry = registry(classification, false);
+        for classification in [
+            Classification::Propose,
+            Classification::Write,
+            Classification::Destructive,
+        ] {
             assert!(
-                receipt_gate(registry.snapshot(), false).is_ok(),
+                receipt_gate(&in_process(classification, false), false).is_ok(),
                 "{classification}"
             );
         }
@@ -1038,12 +1116,12 @@ principals = "any_in_teams_and_groups"
 
     #[test]
     fn only_a_development_build_is_exempt() {
-        assert!(receipt_gate(registry("propose", true).snapshot(), true).is_ok());
+        assert!(receipt_gate(&in_process(Classification::Propose, true), true).is_ok());
     }
 
     #[test]
     fn the_refusal_names_the_tool_its_classification_and_the_reason() {
-        let error = receipt_gate(registry("propose", true).snapshot(), false).unwrap_err();
+        let error = receipt_gate(&in_process(Classification::Propose, true), false).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("`docs__list_documents`"), "{message}");
         assert!(message.contains("classified `propose`"), "{message}");
@@ -1051,6 +1129,23 @@ principals = "any_in_teams_and_groups"
             message.contains("no receipt store is configured"),
             "{message}"
         );
+    }
+
+    /// A registry cannot reach the gate: the loader refuses its proxied `propose` tool first.
+    #[test]
+    fn a_registry_serving_a_propose_tool_is_refused_by_rule_2_as_it_loads() {
+        for classification in ["propose", "write"] {
+            let loaded = Registry::from_toml_str(&registry_text(classification, false, "r1"));
+            assert!(
+                matches!(
+                    loaded,
+                    Err(gateway_registry::RegistryError::Snapshot(
+                        SnapshotError::ProxiedNotRead { .. }
+                    ))
+                ),
+                "{classification}: {loaded:?}"
+            );
+        }
     }
 
     #[test]
@@ -1110,11 +1205,17 @@ principals = "any_in_teams_and_groups"
         );
     }
 
+    /// The gates a registry's policy meets at boot and on every reload run the receipt-store
+    /// gate on the policy given, whatever the registry holds.
     #[test]
     fn the_registry_path_runs_the_receipt_gate_at_boot_and_on_every_reload() {
-        for (classification, refused) in [("read", false), ("propose", true), ("write", true)] {
-            let registry = registry(classification, true);
-            let policy = ServedPolicy::from_registry(&registry).unwrap();
+        let registry = registry("read", true);
+        for (classification, refused) in [
+            (Classification::Read, false),
+            (Classification::Propose, true),
+            (Classification::Write, true),
+        ] {
+            let policy = served_in_process(classification);
             let checked =
                 check_registry_policy(&registry, &policy, &release_basis(registry.clone()));
             assert_eq!(

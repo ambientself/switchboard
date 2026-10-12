@@ -44,12 +44,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The release artifact itself (decisions 0009 and 0014, design section 12). A `test-support`
-  # build is exempt from the receipt-store gate and may disable identity or audit, and a feature
-  # can be turned on in any build, so this builds `switchboard` with exactly deploy/Dockerfile's
-  # command and checks that it refuses a `propose` tool with no receipt store, and each opt-out.
-  # crates/demo-checks/tests/release.rs holds the commands, the configurations and the
-  # refusals to each other.
+  # The release artifact itself (decisions 0009, 0011 and 0014, design section 12). A
+  # `test-support` build is exempt from the receipt-store gate and may disable identity or audit,
+  # and a feature can be turned on in any build, so this builds `switchboard` with exactly
+  # deploy/Dockerfile's command and checks that it refuses each opt-out, which shows it is not a
+  # development build, and a proxied `propose` tool as its registry loads. The receipt-store gate
+  # cannot be reached from a registry until built-in connectors exist (milestone 4): the loader
+  # refuses every proxied tool not classified `read` first. crates/demo-checks/tests/release.rs
+  # holds the commands, the configurations and the refusals to each other.
   release:
     name: Release build refuses unreceipted tools
     runs-on: ubuntu-24.04
@@ -69,24 +71,25 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build switchboard as deploy/Dockerfile does
         run: cargo build --release --locked -p gateway --bin switchboard
-      # deploy/ci/receipt-gate/ serves one `propose` tool, with identity enforced against a
-      # checked-in public key and audit naming a database that is never reached. The binary must
-      # exit 1 and name the receipt-store gate, not any other refusal. If it started instead, the
-      # timeout stops it with status 124.
-      - name: The release switchboard refuses a propose tool with no receipt store
+      # deploy/ci/proxied-propose/ serves one proxied `propose` tool, with identity enforced
+      # against a checked-in public key and audit naming a database that is never reached. The
+      # binary must exit 1 and name the loader's rule 2, not any other refusal: it applies the
+      # snapshot loader's rules as the registry loads, before it reads a credential or connects.
+      # If it started instead, the timeout stops it with status 124.
+      - name: The release switchboard refuses a proxied propose tool as its registry loads
         run: |
           set +e
           SWITCHBOARD_INSTANCE=ci timeout 60 target/release/switchboard \
-            --config=deploy/ci/receipt-gate/gateway.toml 2> receipt-gate-stderr.txt
+            --config=deploy/ci/proxied-propose/gateway.toml 2> proxied-propose-stderr.txt
           status=$?
           set -e
-          cat receipt-gate-stderr.txt
+          cat proxied-propose-stderr.txt
           if [ "$status" -ne 1 ]; then
             echo "expected switchboard to refuse to start with exit status 1, got $status"
             exit 1
           fi
-          if ! grep -qF 'refused to start: tool `docs__propose_document` is classified `propose` and served on a surface, but no receipt store is configured' receipt-gate-stderr.txt; then
-            echo "switchboard refused to start, but not for the receipt-store gate"
+          if ! grep -qF 'refused to start: rule 2: tool `docs__propose_document` is proxied through entry `mock-docs` and classified `propose`' proxied-propose-stderr.txt; then
+            echo "switchboard refused to start, but not for the loader's rule 2"
             exit 1
           fi
       # deploy/ci/identity-disabled/ disables identity, which only a development build accepts

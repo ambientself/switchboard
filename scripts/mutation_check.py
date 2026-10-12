@@ -504,6 +504,7 @@ for path, struct in [
     (SRC + "policy.rs", "Profile"),
     (SRC + "policy.rs", "ResourceLimits"),
     (SRC + "policy.rs", "Resource"),
+    (SRC + "policy.rs", "ConnectorEntry"),
     (SRC + "principal.rs", "PrincipalId"),
     (SRC + "audit.rs", "AuditRecord"),
     (SRC + "audit.rs", "RecordedResource"),
@@ -522,6 +523,59 @@ mutate_all(
     (SRC + "policy.rs", "    pub resources: ResourceDeclaration,", '    #[serde(default = "self_checked")]\n    pub resources: ResourceDeclaration,'),
     (SRC + "policy.rs", "impl Surface {", "fn self_checked() -> ResourceDeclaration {\n    ResourceDeclaration::ChecksOwnScope\n}\n\nimpl Surface {"),
 )
+
+# --- The snapshot loader's rules -----------------------------------------------------------
+#
+# Decision 0011, section 3: the nine rules PolicySnapshot::new checks for tools with a connector
+# entry, the refusal of a tool declared as the reach, and the withdrawal's derived snapshot
+# (section 4). tests/loader_rules.json has a refusing and a passing case for each rule, and
+# tests/properties.rs the reach property and that a withdrawal only narrows.
+
+mutate("snapshot-rule-1-removed", "a proxied tool may check its own scope", SRC + "policy.rs",
+       "        if proxied && tool.resources == ResourceDeclaration::ChecksOwnScope {", "        if false {")
+mutate("snapshot-rule-2-removed", "a proxied tool may be classified other than read", SRC + "policy.rs",
+       "        if proxied && tool.classification != Classification::Read {", "        if false {")
+mutate("snapshot-rule-3-removed", "a proxied entry may have a reach and no recorded test", SRC + "policy.rs",
+       "        if entry.kind == EntryKind::Proxied\n            && !tested\n",
+       "        if false\n            && !tested\n")
+mutate("snapshot-rule-4-removed", "a proxied entry's credential may permit more than its tools", SRC + "policy.rs",
+       "        if proxied && entry.permits > tool.classification {", "        if false {")
+mutate("snapshot-rule-5-removed", "a whole reach may be served to a team or group whose limit lacks part of it", SRC + "policy.rs",
+       "            if whole_reach {\n", "            if false {\n")
+mutate("snapshot-rule-6-removed", "a proxied no_resources tool may sit on an entry with a reach", SRC + "policy.rs",
+       "        if proxied\n            && tool.resources == ResourceDeclaration::NoResources\n",
+       "        if false\n            && tool.resources == ResourceDeclaration::NoResources\n")
+mutate("snapshot-rule-7-removed", "an entry narrowing per call may serve a tool not declared from its arguments", SRC + "policy.rs",
+       "        if entry.narrowing == Narrowing::Call && tool.declared_from != Some(DeclaredFrom::Arguments)",
+       "        if false && tool.declared_from != Some(DeclaredFrom::Arguments)")
+mutate("snapshot-rule-8-removed", "a per-user entry's tool may be served to a team", SRC + "policy.rs",
+       "            if entry.credential == CredentialMode::PerUserGrant\n                && let Some(team)",
+       "            if false\n                && let Some(team)")
+mutate("snapshot-rule-9-removed", "a propose tool on a shared entry may be served to a group", SRC + "policy.rs",
+       "            if tool.classification == Classification::Propose\n",
+       "            if false\n")
+mutate("snapshot-rule-3-any-text-a-date", "anything recorded as a reach test's date counts as a test", SRC + "policy.rs",
+       "        let tested = entry.reach_tested_on.as_deref().is_some_and(is_date);",
+       "        let tested = entry.reach_tested_on.is_some();")
+mutate("snapshot-as-reach-accepted", "a tool declared as its entry's reach loads, though it is not built", SRC + "policy.rs",
+       "            .find(|tool| tool.declared_from == Some(DeclaredFrom::Reach))", "            .find(|_| false)")
+mutate("snapshot-declared-from-without-declared", "a tool not declared may say where it is declared from", SRC + "policy.rs",
+       "            if tool.declared_from.is_some() && tool.resources != ResourceDeclaration::Declared {",
+       "            if false {")
+mutate("snapshot-duplicate-entry", "a second connector entry of one name replaces the first", SRC + "policy.rs",
+       "                return Err(SnapshotError::DuplicateEntry(previous.name));", "                let _ = previous;")
+mutate("snapshot-tool-without-entry", "with entries, a tool with none escapes every rule", SRC + "policy.rs",
+       "                .find(|tool| !entries.contains_key(&tool.connector))", "                .find(|_| false)")
+mutate_all(
+    "snapshot-entry-reach-default",
+    "an entry with no reach written reads as reaching nothing",
+    (SRC + "policy.rs", "    pub reach: BTreeSet<Resource>,", "    #[serde(default)]\n    pub reach: BTreeSet<Resource>,"),
+)
+mutate("snapshot-without-keeps-surface-tool", "a withdrawn tool stays on its surfaces", SRC + "policy.rs",
+       "            surface.tools.retain(|name| !withdrawn.contains(name));\n", "")
+mutate("snapshot-without-touches-limits", "a withdrawal also empties the resource limits", SRC + "policy.rs",
+       "        derived.revision = revision;\n",
+       "        derived.revision = revision;\n        derived.limits = ResourceLimits::default();\n")
 
 # --- Principals and proof ------------------------------------------------------------------
 
@@ -2686,18 +2740,19 @@ RA = REGISTRY + "src/adapter.rs"
 RS = REGISTRY + "src/selection.rs"
 RD = REGISTRY + "src/definition.rs"
 
-for struct in ["RegistryFile", "ServerFile", "ToolFile", "SourceFile", "SurfaceFile", "PrincipalIdFile",
-               "ProfileFile", "RuleFile", "LimitsFile", "ResourceFile"]:
+for struct in ["RegistryFile", "ServerFile", "CredentialFile", "ReachTestFile", "ProbeFile", "ReachCheckFile",
+               "ToolFile", "SourceFile", "SurfaceFile", "PrincipalIdFile", "ProfileFile", "RuleFile", "LimitsFile",
+               "ResourceFile"]:
     mutate(f"registry-unknown-field-{struct}", f"{struct} ignores fields it does not know", RF,
            f"#[serde(deny_unknown_fields)]\npub(crate) struct {struct} {{", f"pub(crate) struct {struct} {{")
-mutate("registry-unknown-field-CredentialFile", "a credential ignores fields it does not know", RF,
-       '#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]', '#[serde(tag = "mode", rename_all = "snake_case")]')
 mutate("registry-empty-text-accepted", "required text may be empty", RR,
        "    if value.is_empty() {\n        Err(RegistryError::EmptyField {", "    if false {\n        Err(RegistryError::EmptyField {")
-mutate("registry-limit-identifier-empty", "a limit may name the empty identifier", RR,
-       '            require(&resource.identifier, "identifier", place)?;\n', "")
+mutate("registry-limit-identifier-empty", "a limit or a reach may name the empty identifier", RR,
+       '        require(&resource.identifier, "identifier", &place)?;\n', "")
 mutate("registry-credential-reference-empty", "a credential may have no reference", RR,
-       '                require(&reference, "credential.reference", place)?;\n', "")
+       '        require(&server.credential.reference, "credential.reference", place)?;\n', "")
+mutate("registry-credential-principal-empty", "a credential may name no principal", RR,
+       '        require(&server.credential.principal, "credential.principal", place)?;\n', "")
 mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
        "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
 mutate("registry-address-unchecked", "any address is accepted", RR,
@@ -2729,12 +2784,50 @@ mutate("registry-binding-ignores-address", "the binding does not cover the addre
 mutate("registry-binding-ignores-identity", "the binding does not cover the identity", RD,
        '    binding.insert("identity".into(), Value::String(server.identity.clone()));\n', "")
 mutate("registry-binding-ignores-credential-reference", "the binding does not cover the credential reference", RD,
-       '    binding.insert(\n        "credential_reference".into(),\n        Value::String(reference.clone()),\n    );\n',
-       "    let _ = reference;\n")
+       '    binding.insert(\n        "credential_reference".into(),\n        Value::String(credential.reference.clone()),\n    );\n',
+       "")
 mutate("registry-binding-ignores-credential-mode", "the binding does not cover the credential mode", RD,
        '    binding.insert("credential_mode".into(), Value::String(mode.into()));\n', "    let _ = mode;\n")
 mutate("registry-binding-ignores-dialect", "the binding does not cover the schema dialect", RD,
        '    binding.insert("dialect".into(), Value::String(SCHEMA_DIALECT.into()));\n', "")
+# Connector entries (decision 0011, section 1): the fields each server states, the binding over
+# them (decision 0013, section 1), and each server made a proxied entry of the snapshot, whose
+# rules then apply.
+mutate("registry-binding-ignores-reach", "the binding does not cover the reach", RD,
+       '    binding.insert("reach".into(), Value::Array(reach));\n', "    let _ = reach;\n")
+mutate("registry-binding-ignores-narrowing", "the binding does not cover the narrowing", RD,
+       '    binding.insert("narrowing".into(), Value::String(narrowing.into()));\n', "    let _ = narrowing;\n")
+mutate("registry-binding-ignores-destination", "the binding does not cover the destination", RD,
+       '    binding.insert(\n        "destination".into(),\n        Value::String(server.destination.as_str().into()),\n    );\n',
+       "")
+mutate("registry-binding-ignores-principal", "the binding does not cover the credential's principal", RD,
+       '    binding.insert(\n        "credential_principal".into(),\n        Value::String(credential.principal.clone()),\n    );\n',
+       "")
+mutate("registry-binding-ignores-permits", "the binding does not cover what the credential permits", RD,
+       '    binding.insert(\n        "permits".into(),\n        Value::String(server.permits.as_str().into()),\n    );\n',
+       "")
+mutate("registry-binding-ignores-reach-test-date", "the binding does not cover the reach test's date", RD,
+       '    binding.insert("reach_test_date".into(), tested);\n', "    let _ = tested;\n")
+mutate("registry-reach-test-not-required", "a server may have a reach and no reach test", RR,
+       "        if !reach.is_empty() && reach_test.is_none() {", "        if false {")
+mutate("registry-reach-check-not-required", "a server may have a reach and no reach check", RR,
+       "            && server.reach_check.is_none()\n", "            && false\n")
+mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file", RR,
+       "    let surfaces = file\n",
+       "    if servers.values().any(|server| server.reach_check.as_ref().is_some_and(|check| !routes.contains_key(&check.tool))) {\n"
+       "        return Err(RegistryError::ReachCheckMissing(servers.keys().next().unwrap().clone()));\n"
+       "    }\n    let surfaces = file\n")
+mutate("registry-destination-scheme-unchecked", "a public destination may use plain http", RR,
+       '        if server.address.starts_with("http://") && server.destination != Destination::InCluster {',
+       "        if false {")
+mutate("registry-date-any-datetime", "a date with a time or an offset is taken as a date", RR,
+       "            time: None,\n            offset: None,\n        } => Ok(date.to_string()),",
+       "            ..\n        } => Ok(date.to_string()),")
+mutate("registry-entry-kind-built-in", "each server becomes a built-in entry, which most rules skip", RR,
+       "        kind: EntryKind::Proxied,", "        kind: EntryKind::BuiltIn,")
+mutate("registry-as-reach-from-arguments", "a tool declared as the reach is approved as declared from its arguments", RR,
+       "        ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),",
+       "        ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Arguments)),")
 mutate("registry-identity-not-host-accepted", "a server's identity need not be its address's host", RR,
        "        if server.identity != host {", "        if false {")
 mutate("registry-identity-host-keeps-port", "the host compared with the identity keeps the address's port", RR,
@@ -4165,6 +4258,13 @@ mutate("gw-start-credential-any-file", "a server whose reference has no file tak
 mutate("gw-start-credential-unused", "a credential file no server uses is accepted", START,
        "    if let Some(unused) = files.keys().find(|reference| !used.contains(*reference)) {",
        "    if let Some(unused) = files.keys().find(|reference| !used.contains(*reference)).filter(|_| false) {")
+mutate("gw-start-per-user-grant-accepted", "a per-user grant is read from a file like a token", START,
+       "            CredentialMode::PerUserGrant => {\n                return Err(StartError::PerUserGrant(server.name.clone()));\n            }\n",
+       "            CredentialMode::PerUserGrant => &server.credential.reference,\n")
+mutate("gw-start-narrowing-accepted", "an entry narrowed per call or to the limit starts with one credential", START,
+       "        if server.narrowing != Narrowing::None {", "        if false {")
+mutate("gw-start-narrowing-call-accepted", "an entry narrowed per call starts with one credential", START,
+       "        if server.narrowing != Narrowing::None {", "        if server.narrowing == Narrowing::Limit {")
 mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")

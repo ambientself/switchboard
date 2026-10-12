@@ -3,14 +3,15 @@
 //! hashes.
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
+use gateway_core::Resource;
 use gateway_registry::{
-    Credential, Registry, RegistryError, Server, binding_sha256, definition_sha256,
+    Credential, ReachTest, Registry, RegistryError, Server, binding_sha256, definition_sha256,
 };
 use toml::{Table, Value};
 
-/// A registry file that loads: two servers, three tools (one per kind of resource
-/// declaration, one of them `write`), two surfaces, two profiles, a rule for workloads and one
-/// for a group, and limits for a team and a group.
+/// A registry file that loads: two servers, one reaching a project and one reaching nothing,
+/// three read tools (two declared from their arguments, one with no resources), two surfaces,
+/// two profiles, a rule for workloads and one for a group, and limits for a team and a group.
 pub const BASE: &str = r#"
 revision = "r1"
 
@@ -20,7 +21,14 @@ system = "docs"
 owner = "team-docs"
 identity = "docs.internal.example.test"
 address = "https://docs.internal.example.test/mcp"
-credential = { mode = "bearer", reference = "docs-credential" }
+credential = { mode = "team_service_identity", reference = "docs-credential", principal = "docs-reader" }
+narrowing = "none"
+permits = "read"
+reach = [{ system = "docs", kind = "project", identifier = "atlas" }]
+reach_test = { date = 2026-10-01, record = "a caller limited to atlas was refused borealis" }
+destination = "public"
+probe = { result = "refused", date = 2026-10-01 }
+reach_check = { tool = "docs__read", arguments = { project = "borealis", document = "plan" } }
 
 [[servers]]
 name = "wiki-server"
@@ -28,7 +36,11 @@ system = "wiki"
 owner = "team-wiki"
 identity = "wiki.internal.example.test"
 address = "http://wiki.internal.example.test:8080/mcp"
-credential = { mode = "bearer", reference = "wiki-credential" }
+credential = { mode = "gateway_token", reference = "wiki-credential", principal = "wiki-reader" }
+narrowing = "limit"
+permits = "read"
+reach = []
+destination = "in_cluster"
 
 [[tools]]
 name = "docs__read"
@@ -72,11 +84,11 @@ type = "object"
 type = "string"
 
 [[tools]]
-name = "wiki__edit"
+name = "wiki__page"
 server = "wiki-server"
-upstream_name = "edit"
-classification = "write"
-description = "Edits a page."
+upstream_name = "page"
+classification = "read"
+description = "Reads a page."
 approved_by = "approver@example.test"
 approved_at = 2026-10-01T12:00:00Z
 definition_sha256 = ""
@@ -101,7 +113,7 @@ principals = "any_in_teams_and_groups"
 
 [[surfaces]]
 name = "control"
-tools = ["wiki__edit"]
+tools = ["wiki__page"]
 teams = ["team-a"]
 principals = { only = [{ issuer = "https://workloads.example.test", subject = "system:serviceaccount:team-a:control" }] }
 
@@ -181,19 +193,42 @@ pub fn rehash(table: &mut Table) {
 }
 
 /// A server entry of the file as the loader would read it, if it has the fields the binding
-/// needs.
+/// needs. The probe and the reach check are not in the binding, and are left out.
 fn server(entry: &Value) -> Option<Server> {
     let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+    let parsed = |key: &str| entry.get(key).cloned();
     let credential = entry.get("credential")?;
+    let credential_text = |key: &str| {
+        credential
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let reach: Vec<Resource> = parsed("reach")?.try_into().ok()?;
+    let reach_test = entry.get("reach_test").and_then(|test| {
+        Some(ReachTest {
+            date: test.get("date")?.as_datetime()?.to_string(),
+            record: test.get("record")?.as_str()?.to_owned(),
+        })
+    });
     Some(Server {
         name: text("name")?.as_str().into(),
         system: text("system").unwrap_or_default(),
         owner: text("owner").unwrap_or_default(),
         identity: text("identity").unwrap_or_default(),
         address: text("address").unwrap_or_default(),
-        credential: Credential::Bearer {
-            reference: credential.get("reference")?.as_str()?.to_owned(),
+        credential: Credential {
+            mode: credential.get("mode")?.clone().try_into().ok()?,
+            reference: credential_text("reference")?,
+            principal: credential_text("principal")?,
         },
+        narrowing: parsed("narrowing")?.try_into().ok()?,
+        permits: parsed("permits")?.try_into().ok()?,
+        reach: reach.into_iter().collect(),
+        reach_test,
+        destination: parsed("destination")?.try_into().ok()?,
+        probe: None,
+        reach_check: None,
     })
 }
 

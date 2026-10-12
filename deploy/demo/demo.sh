@@ -74,8 +74,8 @@ KEYS_FETCHED_MESSAGE="fetched the issuer's keys from its keys URL"
 KIND_ENTRY_SUBJECTS="system:serviceaccount:switchboard:docs-team-a system:serviceaccount:switchboard:docs-team-b"
 COMPOSE_CREDENTIALS=$ROOT/deploy/compose/dummy-credentials
 # The registries' revision, and the Compose withdrawal's (registry-withdrawn.toml).
-REVISION=demo-3
-WITHDRAWN_REVISION=demo-4
+REVISION=demo-5
+WITHDRAWN_REVISION=demo-6
 AUDIT_TABLE=switchboard_audit.call_rows
 # The open-row query's view (crates/audit-postgres, sql/migrations/0005_open_rows.sql).
 OPEN_ROWS_VIEW=switchboard_audit.open_call_rows

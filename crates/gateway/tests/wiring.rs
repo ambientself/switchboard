@@ -484,18 +484,20 @@ async fn a_new_registry_file_that_changes_the_policy_but_not_its_revision_is_ref
     let team_a = token(TEAM_A_SA);
     let original = registry(&world.mock.url());
 
-    // The read tool withdrawn and a limit narrowed, both still under the kind registry's
-    // revision.
+    // The read tool withdrawn and a limit changed, both still under the kind registry's
+    // revision. The limit is widened: narrowed below team B's entry's reach, rule 5 would
+    // refuse it first.
     let withdrawn = withdraw_read_tool(&original).replace(
         "revision = \"demo-2\"",
         &format!("revision = \"{KIND_REVISION}\""),
     );
-    let narrowed = original.replace(
+    let widened = original.replace(
         "team-b = [{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
-        "team-b = []",
+        "team-b = [{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }, \
+         { system = \"docs\", kind = \"project\", identifier = \"cygnus\" }]",
     );
-    assert_ne!(narrowed, original);
-    for changed in [withdrawn, narrowed] {
+    assert_ne!(widened, original);
+    for changed in [withdrawn, widened] {
         let refused = reloader
             .apply(&Registry::from_toml_str(&changed).unwrap())
             .unwrap_err();
@@ -585,6 +587,65 @@ async fn wait_for(path: &RequestPath, token: &str, tools: &[&str]) {
         "tools/list never became {tools:?}: {:?}",
         listed(path, token).await
     );
+}
+
+/// Decision 0013, section 8: removing an approval withdraws the tool on reload. That holds for
+/// the tool team A's reach check names, and for the entry's last tool, with the entry and its
+/// reach check left as they are.
+#[tokio::test]
+async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() {
+    let world = World::new("reload-last").await;
+    let prepared = world.prepare().await.unwrap();
+    let path = RequestPath::new(prepared.gates);
+    let reloader = prepared.watch.reloader;
+    let team_a = token(TEAM_A_SA);
+    let original = registry(&world.mock.url());
+    let check = format!("[servers.reach_check]\ntool = \"{LIST_TOOL}\"");
+    assert_eq!(
+        original.matches(&check).count(),
+        1,
+        "the reach check names the list tool"
+    );
+
+    // The list tool, which the reach check names: the approval and the surface entry removed.
+    let without_list = without_tool(&original, LIST_TOOL)
+        .replace(
+            &format!("revision = \"{KIND_REVISION}\""),
+            "revision = \"demo-2\"",
+        )
+        .replace(
+            &format!("tools = [\"{LIST_TOOL}\", \"{READ_TOOL}\"]"),
+            &format!("tools = [\"{READ_TOOL}\"]"),
+        );
+    let revision = reloader
+        .apply(&Registry::from_toml_str(&without_list).unwrap())
+        .unwrap();
+    assert_eq!(revision.as_str(), "demo-2");
+    assert_eq!(listed(&path, &team_a).await, [READ_TOOL]);
+
+    // Then the entry's last tool too, leaving the entry registered with nothing to serve.
+    let without_both = without_tool(&without_list, READ_TOOL)
+        .replace("revision = \"demo-2\"", "revision = \"demo-3-empty\"")
+        .replace(&format!("tools = [\"{READ_TOOL}\"]"), "tools = []");
+    let revision = reloader
+        .apply(&Registry::from_toml_str(&without_both).unwrap())
+        .unwrap();
+    assert_eq!(revision.as_str(), "demo-3-empty");
+    assert_eq!(listed(&path, &team_a).await, Vec::<String>::new());
+    assert_eq!(
+        listed_on(&path, TEAM_B_SURFACE, &token(TEAM_B_SA)).await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
+    assert_eq!(world.calls(), 0);
+}
+
+/// The registry without the approval of `tool`, which is followed by another approval.
+fn without_tool(registry: &str, tool: &str) -> String {
+    let start = registry
+        .find(&format!("[[tools]]\nname = \"{tool}\""))
+        .unwrap();
+    let end = start + 1 + registry[start + 1..].find("[[tools]]").unwrap();
+    format!("{}{}", &registry[..start], &registry[end..])
 }
 
 /// The registry without team A's read tool, at revision demo-2.

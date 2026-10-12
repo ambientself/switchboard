@@ -6,9 +6,12 @@
 //! crates/gateway-dev turns `test-support` on, so a workspace build of `switchboard` would be
 //! one. deploy/Dockerfile builds it on its own, with `-p gateway` and no features, and copies it
 //! out before anything else is built; CI builds it with the same command and checks that the
-//! binary refuses a `propose` tool and each opt-out. These tests pin the command in both
-//! places, the three configurations CI starts it with and the refusal each must name, and the
-//! feature's absence from the gateway's defaults.
+//! binary refuses each opt-out, which only a development build accepts, and a proxied `propose`
+//! tool as its registry loads (decision 0011, rule 2). The receipt-store gate cannot be reached
+//! from a registry until built-in connectors exist: rule 2 refuses every proxied tool not
+//! classified `read` first. These tests pin the command in both places, the three
+//! configurations CI starts it with and the refusal each must name, and the feature's absence
+//! from the gateway's defaults.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -93,14 +96,14 @@ fn ci_checks_the_binary_the_dockerfile_builds() {
     );
     assert!(ci.contains("target/release/switchboard \\\n"), "{ci}");
     assert!(
-        ci.contains("--config=deploy/ci/receipt-gate/gateway.toml"),
+        ci.contains("--config=deploy/ci/proxied-propose/gateway.toml"),
         "{ci}"
     );
     assert!(
-        ci.contains("no receipt store is configured' receipt-gate-stderr.txt"),
-        "CI does not check the refusal is the receipt-store gate's"
+        ci.contains("classified `propose`' proxied-propose-stderr.txt"),
+        "CI does not check the refusal is rule 2's"
     );
-    let registry = read("deploy/ci/receipt-gate/registry/registry.toml");
+    let registry = read("deploy/ci/proxied-propose/registry/registry.toml");
     assert!(
         registry.contains("classification = \"propose\""),
         "{registry}"
@@ -115,10 +118,10 @@ fn ci_checks_the_binary_the_dockerfile_builds() {
 /// the start of the refusal it must name.
 const REFUSALS: [(&str, &str, &str); 3] = [
     (
-        "receipt-gate",
-        "receipt-gate-stderr.txt",
-        "refused to start: tool `docs__propose_document` is classified `propose` and served on a \
-         surface, but no receipt store is configured",
+        "proxied-propose",
+        "proxied-propose-stderr.txt",
+        "refused to start: rule 2: tool `docs__propose_document` is proxied through entry \
+         `mock-docs` and classified `propose`",
     ),
     (
         "identity-disabled",
@@ -161,14 +164,14 @@ fn ci_checks_each_refusal_of_the_release_binary() {
 fn the_configurations_differ_only_in_what_ci_expects_refused() {
     let file = |config: &str| read(&format!("deploy/ci/{config}/gateway.toml"));
     // Each opts out of exactly one gate, or none, and names the database CI never reaches.
-    let receipt = file("receipt-gate");
+    let proxied = file("proxied-propose");
     assert!(
-        receipt.contains("[identity]\nmode = \"enforce\"\n"),
-        "{receipt}"
+        proxied.contains("[identity]\nmode = \"enforce\"\n"),
+        "{proxied}"
     );
     assert!(
-        receipt.contains("[audit]\nmode = \"postgres\"\n"),
-        "{receipt}"
+        proxied.contains("[audit]\nmode = \"postgres\"\n"),
+        "{proxied}"
     );
     let identity = file("identity-disabled");
     assert!(
@@ -185,7 +188,7 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
         "{audit}"
     );
     assert!(audit.contains("[audit]\nmode = \"disabled\"\n"), "{audit}");
-    for text in [&receipt, &identity] {
+    for text in [&proxied, &identity] {
         assert!(
             text.contains("url_env = \"SWITCHBOARD_CI_DATABASE_URL\""),
             "{text}"
@@ -199,7 +202,7 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
         }
     }
     // The keys are public only: no private parameter of an EC or RSA key.
-    for config in ["receipt-gate", "audit-disabled"] {
+    for config in ["proxied-propose", "audit-disabled"] {
         let keys: Value =
             serde_json::from_str(&read(&format!("deploy/ci/{config}/jwks.json"))).unwrap();
         for key in keys["keys"].as_array().unwrap() {

@@ -1,0 +1,68 @@
+# CI's check of the release artifact (decision 0011, section 3, rule 2): one proxied tool
+# classified `propose` on a surface, which the release `switchboard` must refuse as the registry
+# loads, before it reads a credential, fetches a key or connects to anything. Every other field
+# satisfies the loader, so rule 2 is the only refusal. Nothing is reached. Every value here is a
+# dummy.
+#
+# This file used to check the receipt-store gate (decision 0009). Rule 2 now refuses a proxied
+# tool not classified `read` before that gate runs, and every tool a registry approves is
+# proxied, so the gate cannot be reached from a registry until built-in connectors exist
+# (milestone 4). Its own tests run it on snapshots with in-process connectors.
+
+revision = "proxied-propose-1"
+
+# No profiles or rules: the loader refuses before any caller could be given one.
+profiles = []
+profile_rules = []
+
+[[servers]]
+name = "mock-docs"
+system = "docs"
+owner = "platform"
+# Port 9 (discard) on loopback. Never connected to. The identity is the address's host.
+identity = "127.0.0.1"
+address = "http://127.0.0.1:9/mcp"
+credential = { mode = "team_service_identity", reference = "docs-credential", principal = "docs-team-a" }
+narrowing = "none"
+permits = "read"
+reach = [{ system = "docs", kind = "project", identifier = "atlas" }]
+destination = "in_cluster"
+
+[servers.reach_test]
+date = 2026-10-12
+record = "a dummy: nothing is reached"
+
+[servers.reach_check]
+tool = "docs__propose_document"
+arguments = { project = "borealis" }
+
+[[tools]]
+name = "docs__propose_document"
+server = "mock-docs"
+upstream_name = "propose_document"
+classification = "propose"
+title = "Propose a document"
+description = "Opens a draft document in one project for a person to review."
+approved_by = "ci-approver@example.test"
+approved_at = 2026-10-11T00:00:00Z
+definition_sha256 = "9b55679f29a51538416c9ef29344343ce59c87690cfe9fa34c46e0f11c252489"
+binding_sha256 = "1652b446ad82a051916a72396ca2f0e68e6d72221d47baa489709852407b7a40"
+resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+
+[tools.input_schema]
+type = "object"
+required = ["project"]
+additionalProperties = false
+
+[tools.input_schema.properties.project]
+type = "string"
+description = "The project, such as `atlas`."
+
+[[surfaces]]
+name = "docs"
+tools = ["docs__propose_document"]
+teams = ["team-a"]
+principals = "any_in_teams_and_groups"
+
+[limits.teams]
+team-a = [{ system = "docs", kind = "project", identifier = "atlas" }]

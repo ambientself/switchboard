@@ -10,7 +10,7 @@
 # source resolves to a secret it holds; the secret is never in this file.
 
 # Recorded with every decision made from this file. Change it with every edit.
-revision = "demo-3"
+revision = "demo-5"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed
@@ -22,6 +22,18 @@ revision = "demo-3"
 # server limits each credential to its team's project: docs-team-a's to atlas, docs-team-b's to
 # borealis. So a call through one team's entry cannot reach the other team's project, even if
 # the gateway's own resource check were wrong.
+#
+# Each server is a connector entry (decision 0011, section 1). `credential` is its one
+# credential: its mode, the label of its secret, and the identity it acts as, the same in kind
+# and Compose. `narrowing` is what the credential is narrowed to per call ("call", "limit" or
+# "none"; only "none" starts until the gateway can narrow a credential). `permits` is the
+# highest classification a call with it could have; `reach`, every resource it can reach,
+# which is exactly the project mock-docs lets that identity read.
+# `reach_test` records the test that showed a call outside the reach fails, and `reach_check`
+# the call outside it that the scheduled reach check makes. `destination` is "in_cluster",
+# which alone may use http. The loader refuses a snapshot that breaks one of decision 0011's
+# nine rules: here, with narrowing "none", every team its surface admits must hold the whole
+# reach in its limit.
 
 [[servers]]
 name = "docs-team-a"
@@ -29,7 +41,19 @@ system = "docs-team-a"
 owner = "platform"
 identity = "mock-docs.mock-docs.svc.cluster.local"
 address = "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"
-credential = { mode = "bearer", reference = "docs-team-a-credential" }
+credential = { mode = "team_service_identity", reference = "docs-team-a-credential", principal = "docs-team-a" }
+narrowing = "none"
+permits = "read"
+reach = [{ system = "docs", kind = "project", identifier = "atlas" }]
+destination = "in_cluster"
+
+[servers.reach_test]
+date = 2026-10-12
+record = "mock-docs-server tests a_static_token_reaches_only_its_own_project and each_subject_reaches_only_its_own_project: a caller limited to atlas is refused borealis with 403"
+
+[servers.reach_check]
+tool = "docs-team-a__list_documents"
+arguments = { project = "borealis" }
 
 [[servers]]
 name = "docs-team-b"
@@ -37,17 +61,29 @@ system = "docs-team-b"
 owner = "platform"
 identity = "mock-docs.mock-docs.svc.cluster.local"
 address = "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"
-credential = { mode = "bearer", reference = "docs-team-b-credential" }
+credential = { mode = "team_service_identity", reference = "docs-team-b-credential", principal = "docs-team-b" }
+narrowing = "none"
+permits = "read"
+reach = [{ system = "docs", kind = "project", identifier = "borealis" }]
+destination = "in_cluster"
+
+[servers.reach_test]
+date = 2026-10-12
+record = "mock-docs-server tests a_static_token_reaches_only_its_own_project and each_subject_reaches_only_its_own_project: a caller limited to borealis is refused atlas with 403"
+
+[servers.reach_check]
+tool = "docs-team-b__list_documents"
+arguments = { project = "atlas" }
 
 # --- Tools ---------------------------------------------------------------------------------
 # Each tool is approved by a person, who assigns its classification and records two hashes.
 # `definition_sha256` covers the tool's upstream name, title, description and input schema,
 # written here exactly as the server serves them: the mock server's `tools/list`, which has no
 # title (see `gateway_registry::definition_sha256`). `binding_sha256` covers its server's
-# identity, address and credential, and the schema dialect (see
-# `gateway_registry::binding_sha256`). The loader recomputes both and refuses a file in which
-# either differs from what was approved, so a changed server entry needs its tools approved
-# again.
+# identity, address, destination, credential and connector entry, and the schema dialect, but
+# not the reach test's record or the reach check (see `gateway_registry::binding_sha256`). The
+# loader recomputes both and refuses a file in which either differs from what was approved, so
+# a changed server entry needs its tools approved again.
 #
 # `resources` is either "no_resources" or { from_arguments = [...] }: each entry names a string
 # argument whose value is the identifier of a resource of that system and kind. There is no
@@ -62,7 +98,7 @@ description = "List the names of the documents in one project."
 approved_by = "demo-approver@example.test"
 approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a"
-binding_sha256 = "9870f4a12f8ab50bc9343705665a33edeb0d7a3506e0c0e815a8f77a198cfaf5"
+binding_sha256 = "d96b1b4e8eca5fa81abdf8227d52763a87c7fdce1cb87ccec8fff835c91c76e6"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -82,7 +118,7 @@ description = "Read one document of one project."
 approved_by = "demo-approver@example.test"
 approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "88523168357c2c86447effa74bcc7b2224d52b9eef69fc4b4f314e169bf2e28a"
-binding_sha256 = "9870f4a12f8ab50bc9343705665a33edeb0d7a3506e0c0e815a8f77a198cfaf5"
+binding_sha256 = "d96b1b4e8eca5fa81abdf8227d52763a87c7fdce1cb87ccec8fff835c91c76e6"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -105,7 +141,7 @@ description = "List the names of the documents in one project."
 approved_by = "demo-approver@example.test"
 approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a"
-binding_sha256 = "808578ebf84de4b06707a7a2b4ab30b904bdc5e3a210e5f9361d9f76d04d7b29"
+binding_sha256 = "d7aa8a685cace66b09e874a7fcfd866181e9a01263e3668c886ba3fd7fd4480a"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -125,7 +161,7 @@ description = "Read one document of one project."
 approved_by = "demo-approver@example.test"
 approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "88523168357c2c86447effa74bcc7b2224d52b9eef69fc4b4f314e169bf2e28a"
-binding_sha256 = "808578ebf84de4b06707a7a2b4ab30b904bdc5e3a210e5f9361d9f76d04d7b29"
+binding_sha256 = "d7aa8a685cace66b09e874a7fcfd866181e9a01263e3668c886ba3fd7fd4480a"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]

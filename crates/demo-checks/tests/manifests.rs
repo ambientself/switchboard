@@ -244,8 +244,11 @@ fn each_dummy_credentials_hash_matches_it() {
             digest,
             "{dir}: demo.sh would look for another digest in mock-docs' log"
         );
-        // mock-docs accepts the credential for its team's project alone.
+        // mock-docs accepts the credential for its team's project alone, which is the entry's
+        // whole recorded reach.
         digests.push(format!("{digest} {project}"));
+        let registry = read("deploy/compose/config/registry/registry.toml");
+        assert_eq!(entry_reach(&registry, entry), [project]);
     }
     assert_eq!(
         callers.lines().collect::<Vec<_>>(),
@@ -764,8 +767,10 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
             "{team} = [{{ system = \"docs\", kind = \"project\", identifier = \"{project}\" }}]\n"
         )));
         assert!(registry.contains(&format!(
-            "credential = {{ mode = \"bearer\", reference = \"{entry}-credential\" }}\n"
+            "credential = {{ mode = \"team_service_identity\", reference = \"{entry}-credential\", principal = \"{entry}\" }}\n"
         )));
+        // The entry's recorded reach is exactly what mock-docs lets its identity read.
+        assert_eq!(entry_reach(&registry, entry), [project]);
     }
     // Neither the admin endpoint nor slow-doc's delay is set: no demo step uses them.
     for name in config::STATIC_VARS.into_iter().chain([
@@ -1172,6 +1177,30 @@ fn the_kind_cluster_is_never_otto_dev() {
     assert!(!cluster.contains("otto-dev"));
 }
 
+/// The identifiers in the reach of the server `entry` in `registry`, each a `docs` project.
+/// The reach must be written on one `reach = [...]` line.
+fn entry_reach(registry: &str, entry: &str) -> Vec<String> {
+    let start = registry
+        .find(&format!("[[servers]]\nname = \"{entry}\"\n"))
+        .unwrap_or_else(|| panic!("no server `{entry}`"));
+    let line = registry[start..]
+        .lines()
+        .find_map(|line| line.strip_prefix("reach = "))
+        .expect("a reach line");
+    let prefix = "{ system = \"docs\", kind = \"project\", identifier = \"";
+    let identifiers: Vec<String> = line
+        .split(prefix)
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        line.matches("identifier").count(),
+        identifiers.len(),
+        "{line}"
+    );
+    identifiers
+}
+
 /// The registry without its leading comment lines.
 fn registry_body(path: &str) -> String {
     read(path)
@@ -1234,8 +1263,8 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     // The withdrawn copy is the Compose registry less each team's read tool, at a new
     // revision.
     let withdrawn = registry_body("deploy/compose/config/registry-withdrawn.toml");
-    assert!(compose.contains("revision = \"demo-3\""));
-    assert!(withdrawn.contains("revision = \"demo-4\""));
+    assert!(compose.contains("revision = \"demo-5\""));
+    assert!(withdrawn.contains("revision = \"demo-6\""));
     for entry in ["docs-team-a", "docs-team-b"] {
         assert!(!withdrawn.contains(&format!("name = \"{entry}__read_document\"")));
         assert!(withdrawn.contains(&format!("tools = [\"{entry}__list_documents\"]\n")));
@@ -1247,7 +1276,7 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     );
     // demo.sh names the same revisions.
     let driver = read("deploy/demo/demo.sh");
-    assert!(driver.contains("\nREVISION=demo-3\nWITHDRAWN_REVISION=demo-4\n"));
+    assert!(driver.contains("\nREVISION=demo-5\nWITHDRAWN_REVISION=demo-6\n"));
 }
 
 #[test]

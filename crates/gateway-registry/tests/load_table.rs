@@ -6,8 +6,11 @@
 mod common;
 
 use common::{at, base, load, rehash, remove, set, table_at, value};
-use gateway_core::{Classification, ResourceDeclaration, SnapshotError, ToolName};
-use gateway_registry::{RegistryError, RulePrincipal};
+use gateway_core::{
+    Admitted, Classification, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind, Narrowing,
+    Resource, ResourceDeclaration, SnapshotError, ToolName,
+};
+use gateway_registry::{Destination, Probe, ProbeResult, RegistryError, RulePrincipal};
 use toml::Table;
 
 fn tool(name: &str) -> ToolName {
@@ -605,9 +608,12 @@ fn cases() -> Vec<Case> {
             Want::Matches(|e| matches!(e, E::DefinitionChanged { .. })),
         ),
         unapproved(
-            "a classification changed after approval needs no new hash",
+            "a classification changed after approval is in neither hash: rule 2 refuses it",
             |t| set(t, "tools.1", "classification", value("\"write\"")),
-            Want::Loads,
+            Want::Matches(|e| {
+                matches!(e, E::Snapshot(SnapshotError::ProxiedNotRead { tool, .. })
+                    if tool.as_str() == "wiki__search")
+            }),
         ),
         // The binding: the server entry each approval was made against.
         unapproved(
@@ -675,8 +681,102 @@ fn cases() -> Vec<Case> {
                     if tool.as_str() == "wiki__search" && server.as_str() == "wiki-server")
             }),
         ),
-        // The credential mode is in the binding too, but `bearer` is the only mode, so no file
-        // can change it; the binding's own tests show the mode is hashed.
+        // The connector entry's fields are in the binding too (decision 0013, section 1), and the
+        // records that describe it are not.
+        unapproved(
+            "a credential mode changed after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.0.credential",
+                    "mode",
+                    value("\"gateway_token\""),
+                )
+            },
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "a credential principal changed after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.0.credential",
+                    "principal",
+                    value("\"docs-writer\""),
+                )
+            },
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "a narrowing changed after approval",
+            |t| set(t, "servers.0", "narrowing", value("\"limit\"")),
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "what the credential permits changed after approval",
+            |t| set(t, "servers.1", "permits", value("\"propose\"")),
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { server, .. } if server.as_str() == "wiki-server"),
+            ),
+        ),
+        unapproved(
+            "a reach widened after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "reach",
+                    value(
+                        "[{ system = \"docs\", kind = \"project\", identifier = \"atlas\" }, { system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
+                    ),
+                )
+            },
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "a reach test run again after approval",
+            |t| set(t, "servers.0.reach_test", "date", value("2026-10-02")),
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "a destination changed after approval",
+            |t| set(t, "servers.0", "destination", value("\"in_cluster\"")),
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "a reach test's record reworded is not in the binding",
+            |t| set(t, "servers.0.reach_test", "record", value("\"atlas only\"")),
+            Want::Loads,
+        ),
+        unapproved(
+            "a probe run again is not in the binding",
+            |t| set(t, "servers.0.probe", "date", value("2026-10-05")),
+            Want::Loads,
+        ),
+        unapproved(
+            "a reach check's arguments changed are not in the binding",
+            |t| {
+                set(
+                    t,
+                    "servers.0.reach_check",
+                    "arguments",
+                    value("{ project = \"cygnus\", document = \"plan\" }"),
+                )
+            },
+            Want::Loads,
+        ),
         unapproved(
             "a binding hash in capitals",
             |t| {
@@ -702,6 +802,370 @@ fn cases() -> Vec<Case> {
             "a server's owner is not in the binding",
             |t| set(t, "servers.0", "owner", value("\"team-other\"")),
             Want::Loads,
+        ),
+        // Connector entries (decision 0011, section 1): every field required where stated, and
+        // values the format does not know refused.
+        case(
+            "a server with no narrowing",
+            |t| remove(t, "servers.0", "narrowing"),
+            Want::Parse("missing field `narrowing`"),
+        ),
+        case(
+            "a server with no permits",
+            |t| remove(t, "servers.0", "permits"),
+            Want::Parse("missing field `permits`"),
+        ),
+        case(
+            "a server with no reach",
+            |t| remove(t, "servers.1", "reach"),
+            Want::Parse("missing field `reach`"),
+        ),
+        case(
+            "a server with no destination",
+            |t| remove(t, "servers.1", "destination"),
+            Want::Parse("missing field `destination`"),
+        ),
+        case(
+            "a credential with no principal",
+            |t| remove(t, "servers.0.credential", "principal"),
+            Want::Parse("missing field `principal`"),
+        ),
+        case(
+            "a reach test with no date",
+            |t| remove(t, "servers.0.reach_test", "date"),
+            Want::Parse("missing field `date`"),
+        ),
+        case(
+            "a reach test with no record",
+            |t| remove(t, "servers.0.reach_test", "record"),
+            Want::Parse("missing field `record`"),
+        ),
+        case(
+            "a reach check with no tool",
+            |t| remove(t, "servers.0.reach_check", "tool"),
+            Want::Parse("missing field `tool`"),
+        ),
+        case(
+            "a reach check with no arguments",
+            |t| remove(t, "servers.0.reach_check", "arguments"),
+            Want::Parse("missing field `arguments`"),
+        ),
+        case(
+            "a probe with no result",
+            |t| remove(t, "servers.0.probe", "result"),
+            Want::Parse("missing field `result`"),
+        ),
+        case(
+            "a probe with no date",
+            |t| remove(t, "servers.0.probe", "date"),
+            Want::Parse("missing field `date`"),
+        ),
+        case(
+            "a credential with an empty principal",
+            |t| set(t, "servers.0.credential", "principal", value("\"\"")),
+            empty("credential.principal", "server `docs-server`"),
+        ),
+        case(
+            "the old bearer mode",
+            |t| set(t, "servers.0.credential", "mode", value("\"bearer\"")),
+            Want::Parse("unknown variant `bearer`"),
+        ),
+        case(
+            "an unknown narrowing",
+            |t| set(t, "servers.0", "narrowing", value("\"some\"")),
+            Want::Parse("unknown variant `some`"),
+        ),
+        case(
+            "an unknown permits",
+            |t| set(t, "servers.0", "permits", value("\"admin\"")),
+            Want::Parse("`admin` is not a classification"),
+        ),
+        case(
+            "an unknown destination",
+            |t| set(t, "servers.0", "destination", value("\"internal\"")),
+            Want::Parse("unknown variant `internal`"),
+        ),
+        case(
+            "an unknown probe result",
+            |t| set(t, "servers.0.probe", "result", value("\"open\"")),
+            Want::Parse("unknown variant `open`"),
+        ),
+        case(
+            "an unknown reach field",
+            |t| set(t, "servers.0.reach.0", "scope", value("\"x\"")),
+            Want::Parse("unknown field `scope`"),
+        ),
+        case(
+            "an unknown reach test field",
+            |t| set(t, "servers.0.reach_test", "by", value("\"x\"")),
+            Want::Parse("unknown field `by`"),
+        ),
+        case(
+            "an unknown probe field",
+            |t| set(t, "servers.0.probe", "by", value("\"x\"")),
+            Want::Parse("unknown field `by`"),
+        ),
+        case(
+            "an unknown reach check field",
+            |t| set(t, "servers.0.reach_check", "by", value("\"x\"")),
+            Want::Parse("unknown field `by`"),
+        ),
+        case(
+            "a reach resource with an empty identifier",
+            |t| set(t, "servers.0.reach.0", "identifier", value("\"\"")),
+            empty("identifier", "the reach of server `docs-server`"),
+        ),
+        case(
+            "a reach test with an empty record",
+            |t| set(t, "servers.0.reach_test", "record", value("\"\"")),
+            empty("reach_test.record", "server `docs-server`"),
+        ),
+        case(
+            "a reach test dated with a time",
+            |t| {
+                set(
+                    t,
+                    "servers.0.reach_test",
+                    "date",
+                    value("2026-10-01T00:00:00Z"),
+                )
+            },
+            Want::Error(E::NotADate {
+                field: "reach_test.date",
+                place: "server `docs-server`".into(),
+            }),
+        ),
+        case(
+            "a probe dated with a local time",
+            |t| set(t, "servers.0.probe", "date", value("2026-10-01T09:00:00")),
+            Want::Error(E::NotADate {
+                field: "probe.date",
+                place: "server `docs-server`".into(),
+            }),
+        ),
+        case(
+            "a reach with no reach test",
+            |t| remove(t, "servers.0", "reach_test"),
+            Want::Error(E::ReachTestMissing("docs-server".into())),
+        ),
+        case(
+            "a reach test on an entry that reaches nothing",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_test",
+                    value("{ date = 2026-10-01, record = \"nothing to reach\" }"),
+                )
+            },
+            Want::Loads,
+        ),
+        case(
+            "no probe record, for now",
+            |t| remove(t, "servers.0", "probe"),
+            Want::Loads,
+        ),
+        case(
+            "a reach with no reach check",
+            |t| remove(t, "servers.0", "reach_check"),
+            Want::Error(E::ReachCheckMissing("docs-server".into())),
+        ),
+        case(
+            "a reach narrowed to the limit with no reach check",
+            |t| {
+                set(t, "servers.0", "narrowing", value("\"limit\""));
+                remove(t, "servers.0", "reach_check");
+            },
+            Want::Error(E::ReachCheckMissing("docs-server".into())),
+        ),
+        case(
+            "a reach narrowed per call with no reach check",
+            |t| {
+                set(t, "servers.0", "narrowing", value("\"call\""));
+                remove(t, "servers.0", "reach_check");
+            },
+            Want::Error(E::ReachCheckMissing("docs-server".into())),
+        ),
+        case(
+            "a per-user entry needs no reach check, served to a group only",
+            |t| {
+                set(
+                    t,
+                    "servers.0.credential",
+                    "mode",
+                    value("\"per_user_grant\""),
+                );
+                remove(t, "servers.0", "reach_check");
+                set(t, "surfaces.0", "teams", value("[]"));
+            },
+            Want::Loads,
+        ),
+        // Withdrawal removes a tool's approval (decision 0013, section 8). The reach check's
+        // tool, and an entry's last tool, can be withdrawn without touching the reach check.
+        case(
+            "withdrawing the reach check's tool, the entry's last, loads",
+            |t| {
+                at(t, "tools").as_array_mut().unwrap().remove(0);
+                set(t, "surfaces.0", "tools", value("[\"wiki__search\"]"));
+            },
+            Want::Loads,
+        ),
+        // The destination against the address's scheme (decision 0013, section 3).
+        case(
+            "an http address with a public destination",
+            |t| set(t, "servers.1", "destination", value("\"public\"")),
+            Want::Error(E::DestinationScheme {
+                server: "wiki-server".into(),
+                address: "http://wiki.internal.example.test:8080/mcp".into(),
+            }),
+        ),
+        case(
+            "an https address with an in-cluster destination",
+            |t| set(t, "servers.0", "destination", value("\"in_cluster\"")),
+            Want::Loads,
+        ),
+        // Tools declared as the reach parse, and the snapshot refuses them until they are
+        // built.
+        case(
+            "a tool declared as its entry's reach",
+            |t| set(t, "tools.0", "resources", value("\"as_reach\"")),
+            Want::Error(E::Snapshot(SnapshotError::DeclaredFromReach(tool(
+                "docs__read",
+            )))),
+        ),
+        // The snapshot loader's rules (decision 0011, section 3), through the registry. Rule 1
+        // cannot be written here: `checks_own_scope` does not parse. Rule 3 is the registry's
+        // own `ReachTestMissing` above, which comes first.
+        case(
+            "rule 2: a proxied tool classified propose",
+            |t| set(t, "tools.0", "classification", value("\"propose\"")),
+            Want::Error(E::Snapshot(SnapshotError::ProxiedNotRead {
+                tool: tool("docs__read"),
+                entry: "docs-server".into(),
+                classification: Classification::Propose,
+            })),
+        ),
+        case(
+            "rule 2: a proxied tool classified write",
+            |t| set(t, "tools.1", "classification", value("\"write\"")),
+            Want::Error(E::Snapshot(SnapshotError::ProxiedNotRead {
+                tool: tool("wiki__search"),
+                entry: "wiki-server".into(),
+                classification: Classification::Write,
+            })),
+        ),
+        case(
+            "rule 4: a credential that permits more than its read tools",
+            |t| set(t, "servers.0", "permits", value("\"propose\"")),
+            Want::Error(E::Snapshot(SnapshotError::PermitsMoreThanTool {
+                entry: "docs-server".into(),
+                permits: Classification::Propose,
+                tool: tool("docs__read"),
+                classification: Classification::Read,
+            })),
+        ),
+        case(
+            "rule 5: one entry reaching both projects, served to both teams",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "reach",
+                    value(
+                        "[{ system = \"docs\", kind = \"project\", identifier = \"atlas\" }, { system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
+                    ),
+                );
+                set(t, "surfaces.0", "teams", value("[\"team-a\", \"team-b\"]"));
+                set(
+                    t,
+                    "limits.teams",
+                    "team-b",
+                    value("[{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }]"),
+                );
+            },
+            Want::Error(E::Snapshot(SnapshotError::ReachOutsideLimit {
+                tool: tool("docs__read"),
+                surface: "docs".into(),
+                admitted: Admitted::Team("team-a".into()),
+                resource: Box::new(Resource {
+                    system: "docs".into(),
+                    kind: "project".into(),
+                    identifier: "borealis".into(),
+                }),
+            })),
+        ),
+        case(
+            "rule 5: the same entry narrowed to each caller's limit",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "reach",
+                    value(
+                        "[{ system = \"docs\", kind = \"project\", identifier = \"atlas\" }, { system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
+                    ),
+                );
+                set(t, "servers.0", "narrowing", value("\"limit\""));
+                set(t, "surfaces.0", "teams", value("[\"team-a\", \"team-b\"]"));
+            },
+            Want::Loads,
+        ),
+        case(
+            "rule 6: a no_resources tool on an entry that reaches a space",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach",
+                    value("[{ system = \"wiki\", kind = \"space\", identifier = \"eng\" }]"),
+                );
+                set(
+                    t,
+                    "servers.1",
+                    "reach_test",
+                    value("{ date = 2026-10-01, record = \"other spaces refused\" }"),
+                );
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                );
+            },
+            Want::Error(E::Snapshot(SnapshotError::NoResourcesWithReach {
+                tool: tool("wiki__search"),
+                entry: "wiki-server".into(),
+                resource: Box::new(Resource {
+                    system: "wiki".into(),
+                    kind: "space".into(),
+                    identifier: "eng".into(),
+                }),
+            })),
+        ),
+        case(
+            "rule 7: an entry narrowing per call serving a no_resources tool",
+            |t| set(t, "servers.1", "narrowing", value("\"call\"")),
+            Want::Error(E::Snapshot(SnapshotError::CallNarrowingWithoutArguments {
+                entry: "wiki-server".into(),
+                tool: tool("wiki__search"),
+            })),
+        ),
+        case(
+            "rule 8: a per-user entry's tool served to a team",
+            |t| {
+                set(
+                    t,
+                    "servers.0.credential",
+                    "mode",
+                    value("\"per_user_grant\""),
+                )
+            },
+            Want::Error(E::Snapshot(SnapshotError::PerUserToTeam {
+                tool: tool("docs__read"),
+                entry: "docs-server".into(),
+                surface: "docs".into(),
+                team: "team-a".into(),
+            })),
         ),
         // Input schemas.
         case(
@@ -1057,16 +1521,67 @@ fn the_base_file_becomes_the_snapshot_definitions_and_adapters_it_states() {
     assert_eq!(read.classification, Classification::Read);
     assert_eq!(read.connector.as_str(), "docs-server");
     assert_eq!(read.resources, ResourceDeclaration::Declared);
+    assert_eq!(read.declared_from, Some(DeclaredFrom::Arguments));
     let search = snapshot.tool(&tool("wiki__search")).unwrap();
     assert_eq!(search.resources, ResourceDeclaration::NoResources);
+    assert_eq!(search.declared_from, None);
+
+    // Each server is a proxied connector entry, as its file states it.
+    let atlas = Resource {
+        system: "docs".into(),
+        kind: "project".into(),
+        identifier: "atlas".into(),
+    };
+    assert_eq!(
+        snapshot.entry(&"docs-server".into()),
+        Some(&ConnectorEntry {
+            name: "docs-server".into(),
+            kind: EntryKind::Proxied,
+            credential: CredentialMode::TeamServiceIdentity,
+            principal: "docs-reader".into(),
+            narrowing: Narrowing::None,
+            permits: Classification::Read,
+            reach: [atlas.clone()].into(),
+            reach_tested_on: Some("2026-10-01".into()),
+        })
+    );
+    let wiki = snapshot.entry(&"wiki-server".into()).unwrap();
+    assert_eq!(
+        (wiki.kind, wiki.credential, wiki.narrowing, wiki.reach.len()),
+        (
+            EntryKind::Proxied,
+            CredentialMode::GatewayToken,
+            Narrowing::Limit,
+            0
+        )
+    );
+    assert_eq!(wiki.reach_tested_on, None);
+    let docs = &registry.servers()[&"docs-server".into()];
+    assert_eq!(docs.destination, Destination::Public);
+    assert_eq!(
+        docs.reach_test.as_ref().map(|test| test.record.as_str()),
+        Some("a caller limited to atlas was refused borealis")
+    );
+    assert_eq!(
+        docs.probe,
+        Some(Probe {
+            result: ProbeResult::Refused,
+            date: "2026-10-01".into()
+        })
+    );
+    let check = docs.reach_check.as_ref().unwrap();
+    assert_eq!(check.tool, tool("docs__read"));
+    assert_eq!(
+        serde_json::Value::Object(check.arguments.clone()),
+        serde_json::json!({"project": "borealis", "document": "plan"})
+    );
+    let wiki = &registry.servers()[&"wiki-server".into()];
+    assert_eq!(wiki.destination, Destination::InCluster);
+    assert_eq!((&wiki.probe, &wiki.reach_check), (&None, &None));
 
     let definitions = registry.definitions();
     assert_eq!(definitions.len(), 3);
     assert!(definitions[&tool("docs__read")].read_only);
-    assert!(
-        !definitions[&tool("wiki__edit")].read_only,
-        "a write tool was shown as read-only"
-    );
     assert_eq!(
         definitions[&tool("docs__read")].title.as_deref(),
         Some("Read")
@@ -1078,7 +1593,7 @@ fn the_base_file_becomes_the_snapshot_definitions_and_adapters_it_states() {
     );
 
     assert_eq!(registry.adapters().len(), 3);
-    assert_eq!(registry.routes()[&tool("wiki__edit")].upstream_name, "edit");
+    assert_eq!(registry.routes()[&tool("wiki__page")].upstream_name, "page");
     let approval = &registry.approvals()[&tool("docs__read")];
     assert_eq!(approval.approved_by, "approver@example.test");
     assert_eq!(approval.approved_at, "2026-10-01T12:00:00+01:00");
