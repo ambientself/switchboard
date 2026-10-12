@@ -1,6 +1,7 @@
 # 0009: What an audit row guarantees, recovery, and receipts for side effects
 
-Date: 2026-10-06, accepted 2026-10-07, amended 2026-10-10 (the amendment is at the end).
+Date: 2026-10-06, accepted 2026-10-07, amended 2026-10-10, amended 2026-10-11 (the amendments
+are at the end).
 Status: accepted. The owner accepted both parts on 2026-10-07, taking the recommendation on
 every question that was the owner's to answer (see The owner's answers). Settles Q10, except
 what compliance requires of read auditing, which stays open (Still open 1); Q10 is narrowed to
@@ -128,12 +129,13 @@ quote it.
   durability.
 - Besides what it holds today, the row records the instance that began it, the database's time
   at begin, and the row's deadline: that time plus the begin budget, the call deadline and the
-  finish deadline. The gateway supplies the allowance. A `BEFORE INSERT` trigger sets both
+  finish deadline, and one answer budget more (see the amendment of 2026-10-11 at the end). The
+  gateway supplies the allowance. A `BEFORE INSERT` trigger sets both
   times from the database's clock and the supplied allowance, overwriting anything the insert
   carried, and the gateway's role cannot write them. A generated column cannot do this, because
   Postgres requires its expression to be immutable, and a default cannot read the allowance.
   A row of kind `call` cannot be stored without a deadline, so none drops out of the open-row
-  query. A row of kind `list` has none (see the amendment at the end).
+  query. A row of kind `list` has none (see the amendment of 2026-10-10 at the end).
 - No tool runs, and no decision is returned, before begin succeeds. This is unchanged.
 - Begin has a budget, which includes waiting for a connection. Within it, begin is retried by
   identifier. A retry that finds its own row returns what the first attempt decided, receipt
@@ -771,3 +773,33 @@ empty, and a constraint does that work instead.
   them has a deadline.
 
 The owner accepted this on 2026-10-10, in #10. Design section 17 already says the same.
+
+## Amended 2026-10-11: the answer budget in the deadline
+
+Until this amendment, a call row's deadline was its time at begin plus the begin budget, the call
+deadline and the finish deadline. It is now its time at begin plus the begin budget, the call
+deadline, the finish deadline and the answer budget. The gateway supplies that sum as the row's
+allowance, and the trigger `set_times` adds it to the time at begin as before.
+
+- **Why (#96):** a begin reported as failed may still have committed. The instance completes
+  such a row as `error`, trying until the finish deadline counted from when the begin failed,
+  and its last attempt, made at that deadline, may take one answer budget more ("What begin
+  guarantees"). The begin fails at most the begin budget after the row's time at begin, and no
+  call runs, so the completion can commit as late as the time at begin plus the begin budget,
+  the finish deadline and the answer budget. Under the old formula that was past the row's
+  deadline whenever the answer budget was longer than the call deadline, by up to the
+  difference. For that window the row read as open, and was then completed, so "Only a row it
+  could not complete by then reads as open once its deadline passes" did not hold strictly. It
+  did not happen with the defaults, a 5 s call deadline against a 2 s answer budget, but
+  [decision 0014](0014-rollout-safeguards-and-audit-operations.md) allows per-server call
+  deadlines down to 1 s.
+- **What does not change:** when the store stops trying to complete a row, the finish's retry
+  timing, the shutdown wait and the open-row query. With the default budgets a row the gateway
+  never completes reads as open 2 s later than before. There is no migration: rows already
+  stored keep the deadlines they were given.
+- **The termination grace period still holds.** "Shutdown" above already counts one answer
+  budget: the readiness-removal delay plus the begin budget, the call deadline, the finish
+  deadline and one answer budget is the readiness-removal delay plus the new allowance.
+
+The owner chose this on 2026-10-11, taking the recommendation in #96 ("go with what you
+recommend").

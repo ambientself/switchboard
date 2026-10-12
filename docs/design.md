@@ -640,9 +640,10 @@ written complete, has no finish, and is never open.
   finish are idempotent on it. When begin returns, the row is committed. Begin has a budget,
   which includes waiting for a connection, and is retried by identifier within it. The row
   records the instance, the database's time at begin, and a deadline: that time plus the
-  begin budget, the call deadline and the finish deadline. A `BEFORE INSERT` trigger sets both
-  times from the database's clock and the allowance the gateway supplies, and the deadline
-  cannot be empty. For a denial, the row is the complete record. A begin reported as failed may
+  begin budget, the call deadline, the finish deadline and the answer budget, the last for the
+  final attempt to complete a failed begin's row (decision 0009, amended on 2026-10-11). A
+  `BEFORE INSERT` trigger sets both times from the database's clock and the allowance the
+  gateway supplies, and the deadline cannot be empty. For a denial, the row is the complete record. A begin reported as failed may
   still have committed. The instance knows nothing ran, so it completes such a row as `error`,
   retrying until the finish deadline; only one it cannot complete reads as open. A row can
   overstate what ran, never understate it.
@@ -1266,9 +1267,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   Built: `set_times` sets the time at begin, the deadline (that time plus the row's
   `allowance_ms`) and, for a row inserted complete, the completion time, overwriting whatever
   the insert carried, for every role. The Postgres store's allowance is its begin budget, the
-  call deadline and its finish deadline. The deadline column is not `NOT NULL`, because a row
-  of kind `list` has none; the constraint `deadline_shape` requires one exactly when the kind
-  is `call`. The in-memory store sets the same times from its own clock. The open-row query
+  call deadline, its finish deadline and its answer budget (#96). The deadline column is not
+  `NOT NULL`, because a row of kind `list` has none; the constraint `deadline_shape` requires
+  one exactly when the kind is `call`. The in-memory store sets the same times from its own clock. The open-row query
   reads the deadline: the view `open_call_rows` (migration 0005) shows the allowed rows of
   kind `call` with no completion past their deadline, by the database's clock, and
   `PgAuditStore::open_rows` counts them. The boot check requires the view as the migration
@@ -1717,8 +1718,8 @@ that can do what Postgres cannot tests nothing.
    on every attempt leaves its row completed as `error` and its receipt `not_performed`.
 
 Items 1 to 3 are built. Of item 4, the suite checks that a call row's time at begin comes from
-the store's clock and that its deadline is that time plus the begin budget, the call deadline
-and the finish deadline. That times an insert carries are overwritten cannot be tried through
+the store's clock and that its deadline is that time plus the begin budget, the call deadline,
+the finish deadline and the answer budget. That times an insert carries are overwritten cannot be tried through
 the store's interface, whose callers pass no times, so it stays in the Postgres schema tests. Of
 item 5, a `tools/list` row stored complete with no deadline is built. The test functions are in
 `crates/gateway-testkit/src/contract.rs`. Each takes a `ContractStore`: the store, a read-back
