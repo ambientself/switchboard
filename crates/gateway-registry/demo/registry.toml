@@ -10,7 +10,7 @@
 # source resolves to a secret it holds; the secret is never in this file.
 
 # Recorded with every decision made from this file. Change it with every edit.
-revision = "demo-3"
+revision = "demo-5"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed

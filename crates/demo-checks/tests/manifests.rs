@@ -1263,8 +1263,8 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     // The withdrawn copy is the Compose registry less each team's read tool, at a new
     // revision.
     let withdrawn = registry_body("deploy/compose/config/registry-withdrawn.toml");
-    assert!(compose.contains("revision = \"demo-3\""));
-    assert!(withdrawn.contains("revision = \"demo-4\""));
+    assert!(compose.contains("revision = \"demo-5\""));
+    assert!(withdrawn.contains("revision = \"demo-6\""));
     for entry in ["docs-team-a", "docs-team-b"] {
         assert!(!withdrawn.contains(&format!("name = \"{entry}__read_document\"")));
         assert!(withdrawn.contains(&format!("tools = [\"{entry}__list_documents\"]\n")));
@@ -1276,7 +1276,7 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     );
     // demo.sh names the same revisions.
     let driver = read("deploy/demo/demo.sh");
-    assert!(driver.contains("\nREVISION=demo-3\nWITHDRAWN_REVISION=demo-4\n"));
+    assert!(driver.contains("\nREVISION=demo-5\nWITHDRAWN_REVISION=demo-6\n"));
 }
 
 #[test]

@@ -1,11 +1,11 @@
 # The Compose demo registry after each team's read tool, docs-team-a__read_document and
-# docs-team-b__read_document, is withdrawn: revision demo-4, the tools' approvals removed and the
+# docs-team-b__read_document, is withdrawn: revision demo-6, the tools' approvals removed and the
 # surfaces no longer serving them. demo.sh copies this file over the registry file in the
 # mounted directory to show the withdrawal, and copies the original back afterwards. It sits
 # outside the registry directory, so the gateway never loads it directly.
 
 # Recorded with every decision made from this file. Change it with every edit.
-revision = "demo-4"
+revision = "demo-6"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed

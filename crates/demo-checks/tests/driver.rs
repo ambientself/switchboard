@@ -1459,7 +1459,7 @@ fn row(
         "kind": "call", "team": team, "tool": format!("docs-{team}__read_document"),
         "decision": decision, "reason": reason,
         "sentence": if sentence.is_empty() { Value::Null } else { json!(sentence) },
-        "resources": resources, "revision": "demo-3", "listed": null, "omitted": null,
+        "resources": resources, "revision": "demo-5", "listed": null, "omitted": null,
     })
 }
 
@@ -1533,9 +1533,9 @@ fn demo_rows() -> Vec<Value> {
             json!("unknown"),
         ),
         // Each team's list, and team-a's after the withdrawal, under the next revision.
-        list_row("team-a", "demo-3", &both_tools("team-a")),
-        list_row("team-b", "demo-3", &both_tools("team-b")),
-        list_row("team-a", "demo-4", &["docs-team-a__list_documents"]),
+        list_row("team-a", "demo-5", &both_tools("team-a")),
+        list_row("team-b", "demo-5", &both_tools("team-b")),
+        list_row("team-a", "demo-6", &["docs-team-a__list_documents"]),
     ]
 }
 

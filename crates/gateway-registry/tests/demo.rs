@@ -44,7 +44,7 @@ fn the_demo_registry_loads_from_its_file() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/registry.toml");
     let registry = Registry::load(&path).unwrap();
     let snapshot = registry.snapshot();
-    assert_eq!(snapshot.revision().as_str(), "demo-3");
+    assert_eq!(snapshot.revision().as_str(), "demo-5");
     assert_eq!(registry.servers().len(), 2);
 
     for (entry, team, own, other) in ENTRIES {
