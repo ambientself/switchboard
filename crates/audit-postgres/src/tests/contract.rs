@@ -214,4 +214,5 @@ contract!(
     an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,
     the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget,
     a_list_row_is_stored_complete_with_no_deadline,
+    a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row,
 );

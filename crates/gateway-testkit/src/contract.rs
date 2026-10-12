@@ -13,16 +13,16 @@
 //! It covers the suite's items 1 to 3; of item 4, that a call row's time at begin comes from
 //! the store's clock and its deadline is that time plus the budgets and the call deadline, as
 //! Postgres works it out; and of item 5, that a list row is stored complete with no deadline,
-//! with its time at begin from the store's clock, and is never completed. That the store
-//! overwrites times an insert carries cannot be tried through [`AuditStore`], whose callers
-//! pass no times: the Postgres schema tests try it. The open-row query and receipts are not
+//! with its time at begin from the store's clock, and is never completed, and that a call
+//! record of kind `list` is refused at begin. That the store overwrites times an insert
+//! carries cannot be tried through [`AuditStore`], whose callers pass no times: the Postgres
+//! schema tests try it. The open-row query and receipts are not
 //! here: the query is Postgres's alone for now, and receipts are not built.
 //!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
 //! any time at begin after 1999 so is the deadline it gives, and a runner cannot set the
-//! database's clock, so the two refusals look alike. A call record of kind `list` handed to
-//! begin is refused by the Postgres table, and the in-memory store still keeps it.
+//! database's clock, so the two refusals look alike.
 //!
 //! The functions read no clock but the store's, through [`ContractStore::now`], and spawn
 //! nothing, so they run on whatever executor the runner has: [`block_on`](crate::block_on)
@@ -1038,4 +1038,48 @@ pub async fn a_list_row_is_stored_complete_with_no_deadline(contract: &impl Cont
         "a finish naming a list row was refused for another reason: {failure}"
     );
     assert_eq!(stored(contract, &start.row).await, listed);
+}
+
+/// A call record of kind `list` handed to begin is refused, as the Postgres table's
+/// `kind_shape` refuses a row of kind `list` with a call's columns, and leaves no row. That
+/// holds for an allowed record and a denied one, and under the identifier of a call row already
+/// stored with the same decision, which stands: Postgres checks the row before it looks for
+/// one stored under its identifier.
+pub async fn a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    for written in records() {
+        let record = AuditRecord {
+            kind: RowKind::List,
+            ..written.clone()
+        };
+        let row = row_start().row;
+        let failure = store
+            .begin(&row, &record)
+            .await
+            .expect_err("a call record of kind list was begun")
+            .to_string();
+        assert!(
+            failure.contains("kind_shape"),
+            "a call record of kind list was refused for another reason: {failure}"
+        );
+        assert_eq!(contract.stored(&row).await, None, "{record:?}");
+
+        store
+            .begin(&row, &written)
+            .await
+            .expect("the store refused a record it can hold");
+        let first = stored(contract, &row).await;
+        let failure = store
+            .begin(&row, &record)
+            .await
+            .expect_err("a call record of kind list was begun under a call row's identifier")
+            .to_string();
+        assert!(
+            failure.contains("kind_shape"),
+            "a call record of kind list was refused for another reason: {failure}"
+        );
+        assert_eq!(stored(contract, &row).await, first);
+    }
 }
