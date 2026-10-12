@@ -82,7 +82,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
-    ApprovedTool, CallContext, CallerContext, Classification, Connector, Decision,
+    ApprovedTool, CallContext, CallerContext, Classification, Connector, Decision, DeclaredFrom,
     IDENTITY_FAILURE, Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide,
     list_tools,
 };
@@ -100,6 +100,7 @@ use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
 use crate::policy::ServedPolicy;
 use crate::proxied::{CheckedArguments, registry_resources};
+use crate::resources::{ReachAdapter, ResourceAdapter};
 use crate::telemetry::{Event, Surface, Telemetry};
 
 /// The longest tool-use identifier written to an audit row, in bytes. A longer one is dropped.
@@ -513,11 +514,13 @@ impl RequestPath {
         let policy = gates.policy();
         let caller = self.caller_context(&policy, principal, surface);
         let tools = list_tools(policy.snapshot(), &caller);
-        // One identifier per list, made here. A list row has no deadline, so none is given.
+        // One identifier per list, made here. A list row has no deadline and names no tool's
+        // credential, so neither is given.
         let start = RowStart {
             row: AuditRowId::new(Uuid::now_v7().to_string()),
             instance: gates.instance().clone(),
             call_deadline_ms: 0,
+            credential: None,
         };
         let writing = Instant::now();
         let written = audit::listed(
@@ -629,11 +632,13 @@ impl RequestPath {
 
         let store = gates.audit_store().as_ref();
         // One identifier per call, made here and nowhere else (decision 0009). A retry of
-        // begin, when there is one, reuses it; it is never made again for the same call.
+        // begin, when there is one, reuses it; it is never made again for the same call. The
+        // credential identity is the entry's, from the snapshot the decision was made from.
         let start = RowStart {
             row: AuditRowId::new(Uuid::now_v7().to_string()),
             instance: gates.instance().clone(),
             call_deadline_ms: millis(self.call_deadline(&decision)),
+            credential: audit::credential_identity(snapshot, &decision),
         };
         let begun = Instant::now();
         let begin = audit::begin(store, start, decision, arguments, metadata).await;
@@ -766,6 +771,10 @@ impl RequestPath {
     /// The resources the call names, from the adapter registered with the connector of the
     /// approved tool the call names. Never chosen by anything else in the request.
     ///
+    /// A tool declared as its connector entry's reach is read by the one constant
+    /// [`ReachAdapter`] instead, whatever its connector, from the request's own policy version:
+    /// every call names the entry's whole reach, whatever its arguments.
+    ///
     /// For a name that is not an approved tool there is no adapter, so nobody can say what the
     /// call names: [`Resources::Unknown`], which its row records as `unknown`. Recording none
     /// would read as a call that named nothing. The decision denies the call before it looks.
@@ -786,6 +795,9 @@ impl RequestPath {
         else {
             return Resources::Unknown;
         };
+        if approved.declared_from == Some(DeclaredFrom::Reach) {
+            return ReachAdapter::new(policy.snapshot()).resources(approved, arguments);
+        }
         match gates
             .registered(&approved.connector)
             .map(|registered| &registered.reads)

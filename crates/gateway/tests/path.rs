@@ -1774,6 +1774,86 @@ fn a_call_to_a_tool_the_gateway_does_not_know_records_its_resources_as_unknown()
     assert_eq!(world.row(2).resources, RecordedResources::Named(Vec::new()));
 }
 
+// --- A tool declared as the reach -----------------------------------------------------------
+
+/// A tool declared as its connector entry's reach names the entry's whole reach on every call,
+/// whatever its arguments: the gateway's one constant adapter reads it from the policy the
+/// call is decided from, and the connector's own adapter is never asked. The row records the
+/// entry, not the list, with the entry's credential identity.
+#[test]
+fn a_tool_declared_as_the_reach_names_its_entrys_reach_whatever_the_arguments() {
+    let world = World::with(
+        |config| {
+            let policy = &mut config["policy"];
+            assert_eq!(policy["tools"][0]["name"], json!(READ_TOOL));
+            policy["tools"][0]["declared_from"] = json!("reach");
+            // Only team A is served, so every limit admitted holds the whole reach (rule 5).
+            for surface in policy["surfaces"].as_array_mut().unwrap() {
+                surface["teams"] = json!([TEAM_A]);
+                surface["groups"] = json!([]);
+            }
+            policy["entries"] = json!([{
+                "name": CONNECTOR,
+                "kind": "built_in",
+                "credential": "team_service_identity",
+                "principal": "fixture-team-a-service",
+                "narrowing": "none",
+                "permits": "propose",
+                "reach": [document(TEAM_A_DOCUMENT)],
+            }]);
+        },
+        |wiring| wiring,
+    );
+    // Arguments naming nothing, and naming another team's document: neither is read.
+    for (position, arguments) in [json!({}), own(Caller::TeamB)].into_iter().enumerate() {
+        world.call(Caller::TeamA, SURFACE_ALL, READ_TOOL, arguments.clone());
+        let row = world.row(position);
+        assert_eq!(row.decision, DecisionKind::Allow, "{arguments}");
+        assert_eq!(row.resources, RecordedResources::Reach(CONNECTOR.into()));
+        assert_eq!(row.resources_omitted, 0);
+        assert_eq!(
+            row.credential,
+            Some(gateway_core::CredentialIdentity {
+                mode: gateway_core::CredentialMode::TeamServiceIdentity,
+                principal: "fixture-team-a-service".into(),
+            })
+        );
+    }
+    assert!(
+        world.resources.asked().is_empty(),
+        "{:?}",
+        world.resources.asked()
+    );
+
+    // A tool not declared as the reach is still read by its connector's adapter, and records
+    // what its call named, under the same entry's identity.
+    world
+        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA))
+        .result();
+    let row = world.row(2);
+    assert_eq!(
+        row.resources,
+        RecordedResources::Named(vec![gateway_core::audit::RecordedResource {
+            system: "fixture".into(),
+            kind: "document".into(),
+            identifier: TEAM_A_DOCUMENT.into(),
+        }])
+    );
+    assert!(row.credential.is_some());
+    assert_eq!(world.resources.asked(), [DRAFT_TOOL]);
+}
+
+/// With no connector entries, as the JSON configuration's in-process connectors have, a row
+/// records no credential identity.
+#[test]
+fn a_tool_with_no_connector_entry_records_no_credential_identity() {
+    let world = World::new();
+    world
+        .call(Caller::TeamA, SURFACE_ALL, READ_TOOL, own(Caller::TeamA))
+        .result();
+    assert_eq!(world.row(0).credential, None);
+}
+
 // --- What writes no row ---------------------------------------------------------------------
 
 #[test]
