@@ -59,6 +59,7 @@ pub(crate) struct ToolFile {
     pub approved_by: String,
     pub approved_at: Datetime,
     pub definition_sha256: String,
+    pub binding_sha256: String,
     pub resources: ResourcesFile,
 }
 

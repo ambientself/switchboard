@@ -2,8 +2,8 @@
 #
 # Written for the kind run. The issuer is the cluster's own ServiceAccount issuer and the
 # address is the mock server's in-cluster Service. For Compose, change `issuer` under
-# [[profile_rules]] to the dev issuer's and `address` under [[servers]] to the Compose
-# service; nothing else differs.
+# [[profile_rules]] to the dev issuer's, `identity` and `address` under [[servers]] to the
+# Compose service, and each tool's `binding_sha256` to match; nothing else differs.
 #
 # Every value here is a dummy. The credential reference is a label the gateway's credential
 # source resolves to a secret it holds; the secret is never in this file.
@@ -13,21 +13,26 @@ revision = "demo-1"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed
-# name of its tools: docs__list_documents, docs__read_document.
+# name of its tools: docs__list_documents, docs__read_document. `identity` is the DNS name the
+# connection proves, and must be the host in `address`.
 
 [[servers]]
 name = "mock-docs"
 system = "docs"
 owner = "platform"
-identity = "mock-docs"
+identity = "mock-docs.mock-docs.svc.cluster.local"
 address = "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"
 credential = { mode = "bearer", reference = "docs-credential" }
 
 # --- Tools ---------------------------------------------------------------------------------
-# Each tool is approved by a person, who assigns its classification and records the SHA-256
-# of its definition (upstream name, title, description, input schema; see
-# `gateway_registry::definition_sha256`). The loader refuses a definition that no longer
-# hashes to what was approved.
+# Each tool is approved by a person, who assigns its classification and records two hashes.
+# `definition_sha256` covers the tool's upstream name, title, description and input schema,
+# written here exactly as the server serves them: the mock server's `tools/list`, which has no
+# title (see `gateway_registry::definition_sha256`). `binding_sha256` covers its server's
+# identity, address and credential, and the schema dialect (see
+# `gateway_registry::binding_sha256`). The loader recomputes both and refuses a file in which
+# either differs from what was approved, so a changed server entry needs its tools approved
+# again.
 #
 # `resources` is either "no_resources" or { from_arguments = [...] }: each entry names a string
 # argument whose value is the identifier of a resource of that system and kind. There is no
@@ -38,11 +43,11 @@ name = "docs__list_documents"
 server = "mock-docs"
 upstream_name = "list_documents"
 classification = "read"
-title = "List documents"
-description = "Lists the documents in one project."
+description = "List the names of the documents in one project."
 approved_by = "demo-approver@example.test"
-approved_at = 2026-10-06T00:00:00Z
-definition_sha256 = "453ea692bdf92bc95d262085a1f6b3a54c25ac3d132e844029a49ff5ffaf536d"
+approved_at = 2026-10-11T00:00:00Z
+definition_sha256 = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a"
+binding_sha256 = "7ae517f03f83dbb13069c6764a723709c3185b5813636a0569652253859e7884"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -52,18 +57,17 @@ additionalProperties = false
 
 [tools.input_schema.properties.project]
 type = "string"
-description = "The project, such as `atlas`."
 
 [[tools]]
 name = "docs__read_document"
 server = "mock-docs"
 upstream_name = "read_document"
 classification = "read"
-title = "Read a document"
-description = "Reads one document from one project."
+description = "Read one document of one project."
 approved_by = "demo-approver@example.test"
-approved_at = 2026-10-06T00:00:00Z
-definition_sha256 = "933716f7c43f229c6a246bfa2114812f8c24855b9d38afe28e9c90a04b743cb9"
+approved_at = 2026-10-11T00:00:00Z
+definition_sha256 = "88523168357c2c86447effa74bcc7b2224d52b9eef69fc4b4f314e169bf2e28a"
+binding_sha256 = "7ae517f03f83dbb13069c6764a723709c3185b5813636a0569652253859e7884"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -73,11 +77,9 @@ additionalProperties = false
 
 [tools.input_schema.properties.project]
 type = "string"
-description = "The project, such as `atlas`."
 
 [tools.input_schema.properties.document]
 type = "string"
-description = "The document's name within the project."
 
 # --- Surfaces ------------------------------------------------------------------------------
 # Served at /mcp/{name}. Who may use it is an allowlist of teams and groups.

@@ -118,7 +118,8 @@ impl Scripted {
 }
 
 /// A registry of the two servers, each with one read tool that takes one string argument and
-/// names no resources, served on the surface `docs` to team-a and team-b.
+/// names no resources, served on the surface `docs` to team-a and team-b. Each server's
+/// identity is its address's host, and its tool's approval binds that entry.
 fn registry_text(slow_url: &str, other_url: &str) -> String {
     let schema = json!({
         "type": "object",
@@ -126,19 +127,32 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
         "properties": {"n": {"type": "string"}},
     });
     let sha = gateway_registry::definition_sha256("read", None, "Reads.", &schema);
+    let entry = |name: &str, url: &str| gateway_registry::Server {
+        name: name.into(),
+        system: name.into(),
+        owner: "platform".into(),
+        identity: gateway_registry::address_host(url).unwrap().to_owned(),
+        address: url.to_owned(),
+        credential: gateway_registry::Credential::Bearer {
+            reference: "docs-credential".into(),
+        },
+    };
     let server = |name: &str, url: &str| {
+        let identity = entry(name, url).identity;
         format!(
             "[[servers]]\nname = \"{name}\"\nsystem = \"{name}\"\nowner = \"platform\"\n\
-             identity = \"{name}\"\naddress = \"{url}\"\n\
+             identity = \"{identity}\"\naddress = \"{url}\"\n\
              credential = {{ mode = \"bearer\", reference = \"docs-credential\" }}\n\n"
         )
     };
-    let tool = |name: &str| {
+    let tool = |name: &str, url: &str| {
+        let binding = gateway_registry::binding_sha256(&entry(name, url));
         format!(
             "[[tools]]\nname = \"{name}__read\"\nserver = \"{name}\"\nupstream_name = \"read\"\n\
              classification = \"read\"\ndescription = \"Reads.\"\n\
              approved_by = \"approver@example.test\"\napproved_at = 2026-10-06T00:00:00Z\n\
-             definition_sha256 = \"{sha}\"\nresources = \"no_resources\"\n\n\
+             definition_sha256 = \"{sha}\"\nbinding_sha256 = \"{binding}\"\n\
+             resources = \"no_resources\"\n\n\
              [tools.input_schema]\ntype = \"object\"\nadditionalProperties = false\n\n\
              [tools.input_schema.properties.n]\ntype = \"string\"\n\n"
         )
@@ -153,8 +167,8 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
          [limits]\n",
         server(SLOW, slow_url),
         server(OTHER, other_url),
-        tool(SLOW),
-        tool(OTHER),
+        tool(SLOW, slow_url),
+        tool(OTHER, other_url),
         files::CLUSTER_ISSUER,
     )
 }

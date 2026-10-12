@@ -579,20 +579,41 @@ fn registry_body(path: &str) -> String {
         .join("\n")
 }
 
+/// The one `binding_sha256` every tool in `registry` records, which holds one server.
+fn binding(registry: &str) -> String {
+    let bindings: std::collections::BTreeSet<&str> = registry
+        .lines()
+        .filter_map(|line| line.strip_prefix("binding_sha256 = "))
+        .collect();
+    assert_eq!(bindings.len(), 1, "{bindings:?}");
+    let binding = bindings.into_iter().next().unwrap().to_owned();
+    assert_eq!(
+        registry.matches(&binding).count(),
+        registry.matches("\n[[tools]]\n").count(),
+        "a tool without the binding"
+    );
+    binding
+}
+
 #[test]
-fn the_compose_and_kind_registries_differ_only_in_issuer_and_address() {
+fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_binding() {
     let kind = registry_body("deploy/kind/base/config/registry/registry.toml");
     let compose = registry_body("deploy/compose/config/registry/registry.toml");
     let kind_issuer = "issuer = \"https://kubernetes.default.svc.cluster.local\"";
+    let kind_identity = "identity = \"mock-docs.mock-docs.svc.cluster.local\"";
     let kind_address = "address = \"http://mock-docs.mock-docs.svc.cluster.local:8080/mcp\"";
-    assert_eq!(kind.matches(kind_issuer).count(), 1);
-    assert_eq!(kind.matches(kind_address).count(), 1);
+    for line in [kind_issuer, kind_identity, kind_address] {
+        assert_eq!(kind.matches(line).count(), 1, "{line}");
+    }
+    // The binding differs because the identity and address do; the loader checks each file's.
     let as_compose = kind
         .replace(
             kind_issuer,
             "issuer = \"https://dev-issuer.switchboard.test\"",
         )
-        .replace(kind_address, "address = \"http://mock-docs:8080/mcp\"");
+        .replace(kind_identity, "identity = \"mock-docs\"")
+        .replace(kind_address, "address = \"http://mock-docs:8080/mcp\"")
+        .replace(&binding(&kind), &binding(&compose));
     assert_eq!(as_compose, compose);
     // The kind registry is the registry crate's own demo file.
     assert_eq!(
@@ -607,7 +628,7 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_and_address() {
     assert!(withdrawn.contains("tools = [\"docs__list_documents\"]\n"));
     assert_eq!(
         compose.lines().count() - withdrawn.lines().count(),
-        25,
+        23,
         "the withdrawn copy differs by more than the read tool"
     );
 }

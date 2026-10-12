@@ -1,6 +1,7 @@
 //! A deployment written to files, as the `switchboard` binary reads it: the deployment file, the
-//! kind demo's registry (with the mock server's address swapped for one on loopback), the
-//! issuer's keys, the team manifest and the gateway's credential for the mock server.
+//! kind demo's registry (with the mock server moved to an address on loopback, and its tools'
+//! approvals bound to it again), the issuer's keys, the team manifest and the gateway's
+//! credential for the mock server.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
@@ -132,7 +133,49 @@ impl Files {
 /// The kind registry with the mock server at `mock_url`.
 pub fn registry(mock_url: &str) -> String {
     assert_eq!(KIND_REGISTRY.matches(KIND_ADDRESS).count(), 1);
-    KIND_REGISTRY.replace(KIND_ADDRESS, mock_url)
+    rebind(KIND_REGISTRY, mock_url)
+}
+
+/// `text`, a registry whose one server is the mock server, with that server moved to
+/// `address`, as its owner would register it and a person would approve it again: the address,
+/// the identity (the address's host) and every tool's `binding_sha256`, through
+/// [`gateway_registry::binding_sha256`].
+pub fn rebind(text: &str, address: &str) -> String {
+    let loaded = gateway_registry::Registry::from_toml_str(text).unwrap();
+    let [before] = loaded.servers().values().collect::<Vec<_>>()[..] else {
+        panic!("the registry has more than one server");
+    };
+    let mut after = before.clone();
+    after.address = address.to_owned();
+    after.identity = gateway_registry::address_host(address).unwrap().to_owned();
+    let replace = |text: &str, from: String, to: String, count: usize| {
+        assert_eq!(text.matches(&from).count(), count, "{from}");
+        text.replace(&from, &to)
+    };
+    let text = replace(
+        text,
+        format!("address = \"{}\"\n", before.address),
+        format!("address = \"{}\"\n", after.address),
+        1,
+    );
+    let text = replace(
+        &text,
+        format!("identity = \"{}\"\n", before.identity),
+        format!("identity = \"{}\"\n", after.identity),
+        1,
+    );
+    replace(
+        &text,
+        format!(
+            "binding_sha256 = \"{}\"\n",
+            gateway_registry::binding_sha256(before)
+        ),
+        format!(
+            "binding_sha256 = \"{}\"\n",
+            gateway_registry::binding_sha256(&after)
+        ),
+        loaded.approvals().len(),
+    )
 }
 
 /// The revision the kind registry is at.

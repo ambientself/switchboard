@@ -8,7 +8,8 @@ revision = "demo-2"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed
-# name of its tools: docs__list_documents, docs__read_document.
+# name of its tools: docs__list_documents, docs__read_document. `identity` is the DNS name the
+# connection proves, and must be the host in `address`.
 
 [[servers]]
 name = "mock-docs"
@@ -19,10 +20,14 @@ address = "http://mock-docs:8080/mcp"
 credential = { mode = "bearer", reference = "docs-credential" }
 
 # --- Tools ---------------------------------------------------------------------------------
-# Each tool is approved by a person, who assigns its classification and records the SHA-256
-# of its definition (upstream name, title, description, input schema; see
-# `gateway_registry::definition_sha256`). The loader refuses a definition that no longer
-# hashes to what was approved.
+# Each tool is approved by a person, who assigns its classification and records two hashes.
+# `definition_sha256` covers the tool's upstream name, title, description and input schema,
+# written here exactly as the server serves them: the mock server's `tools/list`, which has no
+# title (see `gateway_registry::definition_sha256`). `binding_sha256` covers its server's
+# identity, address and credential, and the schema dialect (see
+# `gateway_registry::binding_sha256`). The loader recomputes both and refuses a file in which
+# either differs from what was approved, so a changed server entry needs its tools approved
+# again.
 #
 # `resources` is either "no_resources" or { from_arguments = [...] }: each entry names a string
 # argument whose value is the identifier of a resource of that system and kind. There is no
@@ -33,11 +38,11 @@ name = "docs__list_documents"
 server = "mock-docs"
 upstream_name = "list_documents"
 classification = "read"
-title = "List documents"
-description = "Lists the documents in one project."
+description = "List the names of the documents in one project."
 approved_by = "demo-approver@example.test"
-approved_at = 2026-10-06T00:00:00Z
-definition_sha256 = "453ea692bdf92bc95d262085a1f6b3a54c25ac3d132e844029a49ff5ffaf536d"
+approved_at = 2026-10-11T00:00:00Z
+definition_sha256 = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a"
+binding_sha256 = "2e33078cbde0a3069f28d00b2f53091b8503c6799d219e0531dd8c082f3f6840"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -47,7 +52,6 @@ additionalProperties = false
 
 [tools.input_schema.properties.project]
 type = "string"
-description = "The project, such as `atlas`."
 
 # --- Surfaces ------------------------------------------------------------------------------
 # Served at /mcp/{name}. Who may use it is an allowlist of teams and groups.

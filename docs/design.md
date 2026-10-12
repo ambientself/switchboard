@@ -1353,7 +1353,66 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   own task until the deadline, an identical repeat finish accepted, column grants, and the
   report of each finish given up.
 
-**#11, the argument check against the approved schema.** Built (#94): the loader accepts a
+**#11, proxy hardening.** One bullet per box of the issue, each saying what is built and in
+which pull request. The three entries after this one describe the argument check (#122), the
+opt-outs and the policy's maximum age (#132), and the limits, caps and isolation (#139).
+
+- Approval binding (the first box): built (#131, for #51). Each approval records
+  `binding_sha256` beside `definition_sha256`. It covers the constant dialect `"2020-12"` and
+  the server's identity, address, credential mode and credential reference, in the canonical
+  JSON `gateway_registry::binding_sha256` documents. The loader recomputes both hashes from the
+  file at boot and on every reload and refuses a registry in which either differs, so a
+  changed server entry needs its tools approved again. A server's identity must equal its
+  address's host. The demo approvals hash what the mock server serves, and the demos' identity
+  is its Service name
+  ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). The
+  destination class and connector entries' fields join the binding when they exist.
+- Drift detection and withdrawal: not built.
+- Destination limits, the server's identity verified and redirects refused: not built.
+- Size limits, deadlines, bounded concurrency and per-team and per-server limits: built
+  (#139). Each server's deadline and result size, and the caps on calls in flight in the
+  instance, to each server and from each team to each server, are in the limits entry below.
+  The request's size was already bounded: the transport answers 413 to a body over 1 MiB
+  (`MAX_BODY_BYTES`).
+- Isolating a failing server: built (#139). A hanging server holds at most its own caps of
+  slots until its calls' deadline (the limits entry below).
+- Upstream sessions isolated by server, credential identity and authorization context: not
+  built.
+- Identity and audit opt-outs unavailable outside development builds: built (#132), in the
+  opt-outs entry below.
+- The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
+  issuer's key age (#115), the policy's age and maximum age (#132), and the calls shed and
+  each proxied server's calls, latency and late or oversized answers (#139). The drift, probe
+  and reach-check signals wait for what they count. Decision 0014 writes the alert conditions
+  down, and there are no rules until a metrics sink exists.
+- The overload, hanging-server and drift demonstrations: not built. `tests/limits.rs` shows
+  overload and a hanging server in a test (#139), not in a demo.
+- Decision 0011, sections 1 to 5: schema validation before forwarding is built (#122, in the
+  argument check entry below); connector entries, the snapshot loader's rules and the
+  scheduled reach check are not built.
+- The kind slice extended to show them: not built.
+- The registration and drift probe and the gateway's per-team identities: not built. The route
+  check now sees RBAC grants limited by `resourceNames` (#133), which decision 0013 lands
+  before the per-team TokenRequest grants.
+- Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the
+  address's host, the dialect and no `+` in the registry's revision are built (#131, and #122
+  for the dialect). The destination rules and the probe record are not built.
+- The drift pass, its derived revisions and standing withdrawals: not built.
+- The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
+  below.
+- The 3600 s cap on user issuers' token lifetime: not built.
+- `switchboard probe` and the token writer: not built.
+- Decision 0013 section 11's acceptance scenarios: not built.
+- The identity and audit opt-outs refused by the release binary, with CI checks: built (#132),
+  in the opt-outs entry below.
+- Configurable audit pools and the `max_connections` sizing rule: not built.
+- The 512 KiB row bound and its test: not built.
+- The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
+  each proxied server's calls, latency and late or oversized answers (#139), and the policy's
+  age (#132), are exported. Each server's drift polls and withdrawals, probe results and
+  reach-check results are not built.
+
+**#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
 another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
 refuses another dialect rather than converting it. An enforced keyword must have the JSON type

@@ -13,7 +13,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::adapter::{self, ArgumentAdapter, JsonPointer, ResourceSource, SchemaProblem};
-use crate::definition::{Approval, Route, ToolDefinition, definition_sha256};
+use crate::definition::{Approval, Route, ToolDefinition, binding_sha256, definition_sha256};
 use crate::file::{
     CredentialFile, PrincipalsFile, RegistryFile, ResourceFile, ResourcesFile, RulePrincipalFile,
     ServerFile, ToolFile,
@@ -30,10 +30,12 @@ pub struct Server {
     pub system: String,
     /// The team that owns the server and answers for it.
     pub owner: String,
-    /// The identity the server is expected to present, recorded with its approvals, such as
-    /// the `serverInfo.name` of its `initialize` answer. Nothing compares it yet.
+    /// The server's identity: the DNS name the connection proves, which is the host in its
+    /// address (decision 0013). The loader refuses an identity that is not that host, as
+    /// [`address_host`] reads it. Each approval's [`binding_sha256`](crate::binding_sha256)
+    /// covers it. `serverInfo.name` is only the server's claim about itself and is not used.
     pub identity: String,
-    /// Where the gateway sends its calls: an `http` or `https` URL.
+    /// Where the gateway sends its calls: an `http` or `https` URL with a host.
     pub address: String,
     /// The credential the gateway presents to it.
     pub credential: Credential,
@@ -73,16 +75,34 @@ pub enum RegistryError {
         /// What it belongs to.
         place: String,
     },
+    /// The registry's revision contains `+`, which is reserved for the revisions a withdrawal
+    /// derives from it (decision 0013).
+    #[error(
+        "the registry's revision `{0}` contains `+`, which only a withdrawal's derived revision may"
+    )]
+    RevisionReserved(String),
     /// Two servers share a name.
     #[error("server `{0}` is registered more than once")]
     DuplicateServer(ConnectorName),
-    /// A server's address is not an `http` or `https` URL.
+    /// A server's address is not an `http` or `https` URL with a host.
     #[error("server `{server}` has address `{address}`, which is not an http or https URL")]
     AddressNotHttp {
         /// The server.
         server: ConnectorName,
         /// Its address.
         address: String,
+    },
+    /// A server's identity is not the host in its address (decision 0013).
+    #[error(
+        "server `{server}` has identity `{identity}`, which is not `{host}`, the host in its address"
+    )]
+    IdentityNotHost {
+        /// The server.
+        server: ConnectorName,
+        /// Its identity, as written.
+        identity: String,
+        /// The host in its address.
+        host: String,
     },
     /// Two tools share an exposed name.
     #[error("tool `{0}` is approved more than once")]
@@ -124,6 +144,21 @@ pub enum RegistryError {
         /// The hash the approval recorded.
         recorded: String,
         /// The hash of the definition in the file.
+        computed: String,
+    },
+    /// A tool's server entry does not hash to the binding that was approved: the server's
+    /// identity, address or credential changed after approval.
+    #[error(
+        "tool `{tool}`'s binding to server `{server}` hashes to {computed}, not the approved {recorded}; approve it again"
+    )]
+    BindingChanged {
+        /// The tool.
+        tool: ToolName,
+        /// Its server.
+        server: ConnectorName,
+        /// The hash the approval recorded.
+        recorded: String,
+        /// The hash of the server entry in the file.
         computed: String,
     },
     /// A tool's input schema is not an object schema.
@@ -301,6 +336,9 @@ fn require(
 
 fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
     require(&file.revision, "revision", || "the registry".into())?;
+    if file.revision.contains('+') {
+        return Err(RegistryError::RevisionReserved(file.revision));
+    }
     let servers = servers(file.servers)?;
 
     let mut definitions = BTreeMap::new();
@@ -426,16 +464,17 @@ fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, Re
                 Credential::Bearer { reference }
             }
         };
-        let http = ["http://", "https://"].iter().any(|scheme| {
-            server
-                .address
-                .strip_prefix(scheme)
-                .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
-        });
-        if !http {
+        let Some(host) = address_host(&server.address) else {
             return Err(RegistryError::AddressNotHttp {
                 server: server.name,
                 address: server.address,
+            });
+        };
+        if server.identity != host {
+            return Err(RegistryError::IdentityNotHost {
+                host: host.to_owned(),
+                server: server.name,
+                identity: server.identity,
             });
         }
         let checked = Server {
@@ -451,6 +490,24 @@ fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, Re
         }
     }
     Ok(servers)
+}
+
+/// The host in an `http` or `https` address, as written: what follows the scheme, up to the
+/// first `/`, `?` or `#`, after any user information and without the port. An IPv6 literal
+/// keeps its brackets. `None` when the address has another scheme or no host. The loader
+/// requires a server's identity to equal it.
+pub fn address_host(address: &str) -> Option<&str> {
+    let rest = address
+        .strip_prefix("http://")
+        .or_else(|| address.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = if host_and_port.starts_with('[') {
+        &host_and_port[..=host_and_port.find(']')?]
+    } else {
+        host_and_port.split(':').next().unwrap_or_default()
+    };
+    (!host.is_empty()).then_some(host)
 }
 
 struct CheckedTool {
@@ -536,6 +593,15 @@ fn check_tool(
             computed,
         });
     }
+    let computed = binding_sha256(server);
+    if computed != tool.binding_sha256 {
+        return Err(RegistryError::BindingChanged {
+            tool: name,
+            server: tool.server,
+            recorded: tool.binding_sha256,
+            computed,
+        });
+    }
 
     let sources = match tool.resources {
         ResourcesFile::NoResources => Vec::new(),
@@ -587,6 +653,7 @@ fn check_tool(
             approved_by: tool.approved_by,
             approved_at: at.to_string(),
             definition_sha256: tool.definition_sha256,
+            binding_sha256: tool.binding_sha256,
         },
         classification: tool.classification,
     })

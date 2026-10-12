@@ -237,6 +237,16 @@ fn cases() -> Vec<Case> {
             empty("revision", "the registry"),
         ),
         case(
+            "a revision in the form a withdrawal derives",
+            |t| set(t, "", "revision", value("\"r1+withdrawn:docs__read\"")),
+            Want::Error(E::RevisionReserved("r1+withdrawn:docs__read".into())),
+        ),
+        case(
+            "a revision with a plus anywhere",
+            |t| set(t, "", "revision", value("\"+\"")),
+            Want::Error(E::RevisionReserved("+".into())),
+        ),
+        case(
             "a server with no system",
             |t| set(t, "servers.0", "system", value("\"\"")),
             empty("system", "server `docs-server`"),
@@ -371,6 +381,99 @@ fn cases() -> Vec<Case> {
                 address: "http://".into(),
             }),
         ),
+        case(
+            "an address whose host is empty after its user information",
+            |t| set(t, "servers.0", "address", value("\"https://user@/mcp\"")),
+            Want::Error(E::AddressNotHttp {
+                server: "docs-server".into(),
+                address: "https://user@/mcp".into(),
+            }),
+        ),
+        // A server's identity is the host in its address.
+        case(
+            "an identity that is not the address's host",
+            |t| set(t, "servers.0", "identity", value("\"docs-server\"")),
+            Want::Error(E::IdentityNotHost {
+                server: "docs-server".into(),
+                identity: "docs-server".into(),
+                host: "docs.internal.example.test".into(),
+            }),
+        ),
+        case(
+            "an identity that carries the address's port",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "identity",
+                    value("\"wiki.internal.example.test:8080\""),
+                )
+            },
+            Want::Error(E::IdentityNotHost {
+                server: "wiki-server".into(),
+                identity: "wiki.internal.example.test:8080".into(),
+                host: "wiki.internal.example.test".into(),
+            }),
+        ),
+        case(
+            "an identity in another case than the host",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "identity",
+                    value("\"Docs.internal.example.test\""),
+                )
+            },
+            Want::Matches(|e| matches!(e, E::IdentityNotHost { .. })),
+        ),
+        case(
+            "an address moved to another host with the identity left behind",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "address",
+                    value("\"https://docs.elsewhere.example.test/mcp\""),
+                )
+            },
+            Want::Error(E::IdentityNotHost {
+                server: "docs-server".into(),
+                identity: "docs.internal.example.test".into(),
+                host: "docs.elsewhere.example.test".into(),
+            }),
+        ),
+        case(
+            "an identity and address moved together, and approved again",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "address",
+                    value("\"https://docs.elsewhere.example.test/mcp\""),
+                );
+                set(
+                    t,
+                    "servers.0",
+                    "identity",
+                    value("\"docs.elsewhere.example.test\""),
+                );
+            },
+            Want::Loads,
+        ),
+        case(
+            "an IPv6 literal identity keeps its brackets",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "address",
+                    value("\"http://[fd00::1]:8080/mcp\""),
+                );
+                set(t, "servers.1", "identity", value("\"[fd00::1]\""));
+            },
+            Want::Loads,
+        ),
         // Tools: names, servers, collisions.
         case(
             "a tool approved twice under one name",
@@ -504,6 +607,100 @@ fn cases() -> Vec<Case> {
         unapproved(
             "a classification changed after approval needs no new hash",
             |t| set(t, "tools.1", "classification", value("\"write\"")),
+            Want::Loads,
+        ),
+        // The binding: the server entry each approval was made against.
+        unapproved(
+            "a tool with no binding hash",
+            |t| remove(t, "tools.0", "binding_sha256"),
+            Want::Parse("missing field `binding_sha256`"),
+        ),
+        unapproved(
+            "an address changed after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "address",
+                    value("\"https://docs.internal.example.test:8443/mcp\""),
+                )
+            },
+            Want::Matches(|e| {
+                matches!(e, E::BindingChanged { tool, server, .. }
+                    if tool.as_str() == "docs__read" && server.as_str() == "docs-server")
+            }),
+        ),
+        unapproved(
+            "an address's path changed after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "address",
+                    value("\"https://docs.internal.example.test/other\""),
+                )
+            },
+            Want::Matches(|e| matches!(e, E::BindingChanged { .. })),
+        ),
+        unapproved(
+            "an identity and address changed together after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.0",
+                    "address",
+                    value("\"https://docs.elsewhere.example.test/mcp\""),
+                );
+                set(
+                    t,
+                    "servers.0",
+                    "identity",
+                    value("\"docs.elsewhere.example.test\""),
+                );
+            },
+            Want::Matches(|e| matches!(e, E::BindingChanged { .. })),
+        ),
+        unapproved(
+            "a credential reference changed after approval",
+            |t| {
+                set(
+                    t,
+                    "servers.1.credential",
+                    "reference",
+                    value("\"other-credential\""),
+                )
+            },
+            Want::Matches(|e| {
+                matches!(e, E::BindingChanged { tool, server, .. }
+                    if tool.as_str() == "wiki__search" && server.as_str() == "wiki-server")
+            }),
+        ),
+        // The credential mode is in the binding too, but `bearer` is the only mode, so no file
+        // can change it; the binding's own tests show the mode is hashed.
+        unapproved(
+            "a binding hash in capitals",
+            |t| {
+                let hash = at(t, "tools.0.binding_sha256")
+                    .as_str()
+                    .unwrap()
+                    .to_uppercase();
+                set(t, "tools.0", "binding_sha256", toml::Value::String(hash));
+            },
+            Want::Matches(|e| matches!(e, E::BindingChanged { .. })),
+        ),
+        unapproved(
+            "one server's binding approved for another server's tool",
+            |t| {
+                let hash = at(t, "tools.1.binding_sha256").clone();
+                set(t, "tools.0", "binding_sha256", hash);
+            },
+            Want::Matches(
+                |e| matches!(e, E::BindingChanged { tool, .. } if tool.as_str() == "docs__read"),
+            ),
+        ),
+        unapproved(
+            "a server's owner is not in the binding",
+            |t| set(t, "servers.0", "owner", value("\"team-other\"")),
             Want::Loads,
         ),
         // Input schemas.
@@ -886,6 +1083,14 @@ fn the_base_file_becomes_the_snapshot_definitions_and_adapters_it_states() {
     assert_eq!(approval.approved_by, "approver@example.test");
     assert_eq!(approval.approved_at, "2026-10-01T12:00:00+01:00");
     assert_eq!(approval.definition_sha256.len(), 64);
+    assert_eq!(
+        approval.binding_sha256,
+        gateway_registry::binding_sha256(&registry.servers()[&"docs-server".into()])
+    );
+    assert_ne!(
+        approval.binding_sha256,
+        registry.approvals()[&tool("wiki__search")].binding_sha256
+    );
     assert_eq!(registry.profile_rules().rules().len(), 2);
 }
 
