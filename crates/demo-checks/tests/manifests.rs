@@ -311,10 +311,20 @@ fn compose_gives_the_probe_a_dummy_mock_docs_does_not_accept() {
     let dir = "deploy/compose/dummy-credentials";
     let credential = read(&format!("{dir}/registry-probe-credential"));
     assert!(credential.starts_with("dummy-"), "{credential}");
-    let digest = sha256_hex(credential.trim().as_bytes());
+    let digest = sha256_hex(credential.as_bytes());
     assert!(
         !read(&format!("{dir}/mock-docs-callers")).contains(&digest),
         "mock-docs would accept the probe's credential"
+    );
+    // demo.sh tells the probe's bearers, this one and the malformed one, from a workload's by
+    // their digests.
+    assert_eq!(
+        read(&format!("{dir}/registry-probe-credential.sha256")).trim(),
+        digest
+    );
+    assert_eq!(
+        value_after(&read("deploy/demo/demo.sh"), "PROBE_MALFORMED_SHA="),
+        sha256_hex(b"not-a-token")
     );
     for entry in ["docs-team-a", "docs-team-b"] {
         assert_ne!(read(&format!("{dir}/{entry}-credential")), credential);

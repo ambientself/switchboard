@@ -767,6 +767,67 @@ fn the_server_caller_check_admits_only_the_entries_identities() {
     );
 }
 
+/// The gateway's drift probe sends mock-docs three calls it must refuse on every poll: no
+/// bearer, a malformed one, and the probe's own. Neither server check counts them as a
+/// workload's, and each still fails a probe bearer mock-docs accepted or a refusal they do not
+/// explain.
+#[test]
+fn the_server_checks_leave_out_the_gateways_probe_calls() {
+    // Compose: the malformed bearer's and the probe dummy's digests, refused.
+    let team_a = static_line("88a0f2ba13fc", true);
+    let team_b = static_line("d20bf481167c", true);
+    let malformed = static_line("ce6f21ae951d", false);
+    let dummy = static_line("f4441730e377", false);
+    let bearers = |extra: &[&String]| {
+        let mut lines = vec![team_a.as_str(), team_b.as_str()];
+        lines.extend(extra.iter().map(|line| line.as_str()));
+        sourced(&format!(
+            "check_server_bearers '{}' \"{SHA_A} {SHA_B}\" 2 all\nFINISHED=1\nresult 0",
+            lines.join("\n")
+        ))
+    };
+    let run = bearers(&[&malformed, &dummy, &malformed, &dummy]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let run = bearers(&[&static_line("f4441730e377", true)]);
+    assert!(
+        run.failed("mock-docs accepted no other bearer"),
+        "{}",
+        run.transcript()
+    );
+
+    // kind: each probe is one refusal each of no_bearer, malformed and wrong_subject.
+    let mut lines = vec![
+        jwt_line(false, None, Some("wrong_audience")),
+        jwt_line(false, None, Some("wrong_audience")),
+    ];
+    lines.extend(std::iter::repeat_n(
+        jwt_line(false, None, Some("no_bearer")),
+        3,
+    ));
+    lines.extend(std::iter::repeat_n(
+        jwt_line(true, Some(SUBJECT_A), None),
+        4,
+    ));
+    lines.extend(std::iter::repeat_n(
+        jwt_line(true, Some(SUBJECT_B), None),
+        4,
+    ));
+    for _ in 0..2 {
+        for refusal in ["no_bearer", "malformed", "wrong_subject"] {
+            lines.push(jwt_line(false, None, Some(refusal)));
+        }
+    }
+    let run = check_callers(&lines);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    lines.push(jwt_line(false, None, Some("wrong_subject")));
+    let run = check_callers(&lines);
+    assert!(
+        run.failed("mock-docs refused nothing else"),
+        "{}",
+        run.transcript()
+    );
+}
+
 /// A tools/call line of mock-docs, accepted under `identity` and naming `project`: in the JWT
 /// mode when `identity` is a subject, as its verified caller, and in the static mode otherwise,
 /// as its bearer's prefix. `refused` marks a project mock-docs refused for that identity.
