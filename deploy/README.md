@@ -86,20 +86,23 @@ port-forward, ephemeral containers, and the pod, Service and node proxy routes. 
 checks ask about each team's workload and require `no` (decision 0010, control 1). They ask
 every row of `route-check/permissions.tsv`, the list the route check's operator step asks too,
 so there is one list. A `namespaced` row is asked in `mock-docs`, `switchboard`, the team's own
-namespace and across the cluster; a `cluster` row across the cluster only. Across the cluster
-is a can-i with no namespace: it asks in the kubeconfig's namespace, `default`, so RBAC counts
-that namespace's RoleBindings as well as ClusterRoleBindings. The list covers reading Secrets
-and ConfigMaps (`get`, `list` and `watch`, since list and watch return the data too); creating
-pods and `create`, `update` and `patch` on Deployments, ReplicaSets, StatefulSets, DaemonSets,
-Jobs and CronJobs; `create` and `get` on exec, attach, port-forward and the pod, Service and
-node proxies; `patch` and `update` on ephemeral containers; minting a ServiceAccount's token;
+namespace and across the cluster; a `gateway` row in `mock-docs` and `switchboard` only; a
+`cluster` row across the cluster only. Across the cluster is a can-i with no namespace: it asks
+in the kubeconfig's namespace, `default`, so RBAC counts that namespace's RoleBindings as well
+as ClusterRoleBindings. The list covers reading Secrets (`get`, `list` and `watch`, since list
+and watch return the data too), and the same on ConfigMaps as `gateway` rows: the gateway's
+ConfigMap names the file that holds its credential, not the credential, so a team may read its
+own namespace's ConfigMaps (#104), but not the gateway's or a server's; creating pods and
+`create`, `update` and `patch` on Deployments, ReplicaSets, StatefulSets, DaemonSets, Jobs and
+CronJobs; `create` and `get` on exec, attach, port-forward and the pod, Service and node
+proxies; `patch` and `update` on ephemeral containers; minting a ServiceAccount's token;
 impersonating users, groups, ServiceAccounts, UIDs and extras (`userextras/scopes`); `bind` and
 `escalate` on roles and cluster roles; and `create`, `update` and `patch` on role and cluster
-role bindings. That is 45 namespaced rows and 10 cluster rows, 190 checks per team. They are
-asked with `kubectl auth can-i --as`, except UIDs and extras, which the API server checks in
-`authentication.k8s.io` though it serves no such resource: can-i cannot name them, so those are
-asked as SubjectAccessReviews. A query kubectl cannot answer is a FAIL with kubectl's message,
-and the run goes on.
+role bindings. That is 42 namespaced rows, 3 gateway rows and 10 cluster rows, 184 checks per
+team. They are asked with `kubectl auth can-i --as`, except UIDs and extras, which the API
+server checks in `authentication.k8s.io` though it serves no such resource: can-i cannot name
+them, so those are asked as SubjectAccessReviews. A query kubectl cannot answer is a FAIL with
+kubectl's message, and the run goes on.
 
 can-i and a SubjectAccessReview name no resource, so neither sees a rule limited by
 `resourceNames`: a workload able to mint tokens for one named ServiceAccount answers no (#60).
@@ -107,18 +110,19 @@ So the checks also read the RBAC objects, with `route-check/rbac-match.jq`, the 
 route check's operator step runs too. They read the ClusterRoles, the ClusterRoleBindings, and
 the Roles and RoleBindings in every namespace (`kubectl get -A`), not only in those a team's
 can-i checks ask in: `mock-docs`, `switchboard`, the team's own, and `default` for across the
-cluster. A RoleBinding in `kube-system` or the other team's namespace can bind the workload
-too, and no can-i asks there. Where can-i does ask, in `default` among them, it still misses a
-rule limited by `resourceNames`. A binding counts when a subject is the team's ServiceAccount,
-as a ServiceAccount or as the user `system:serviceaccount:<team>:mock-workload`, or one of its
-groups (`system:serviceaccounts`, `system:serviceaccounts:<team>`, `system:authenticated`). A
+cluster. A RoleBinding in `kube-system` or the other team's namespace can bind the workload too,
+and no can-i asks there. Where can-i does ask, in `default` among them, it still misses a rule
+limited by `resourceNames`. A binding counts when a subject is the team's ServiceAccount, as a
+ServiceAccount or as the user `system:serviceaccount:<team>:mock-workload`, or one of its groups
+(`system:serviceaccounts`, `system:serviceaccounts:<team>`, `system:authenticated`). A
 RoleBinding counts the Role or ClusterRole it binds. A rule grants a row when its verbs, API
 groups and resources match the row's, `*` matching anything and `*/<sub>` any resource's
 subresource, whatever its `resourceNames`. A `namespaced` row counts the RoleBindings, in
-whatever namespace, and the ClusterRoleBindings; a `cluster` row only the ClusterRoleBindings.
-That is one more check per row, 55 per team. A list that cannot be read or parsed fails, and
-nothing is matched. No grant is allowed in code. The issuer-discovery binding to
-`system:unauthenticated` is read too and counts for no team: a workload's token is
+whatever namespace, and the ClusterRoleBindings; a `gateway` row the RoleBindings in `mock-docs`
+and `switchboard`, to a Role or a ClusterRole, and the ClusterRoleBindings; a `cluster` row only
+the ClusterRoleBindings. That is one more check per row, 55 per team. A list that cannot be read
+or parsed fails, and nothing is matched. No grant is allowed in code. The issuer-discovery
+binding to `system:unauthenticated` is read too and counts for no team: a workload's token is
 authenticated, so that group is not one of its groups, and the ClusterRole names only URLs,
 which grant no row.
 
