@@ -192,6 +192,11 @@ for the load. The count does not say which, so a rise in it does not by itself m
 too small. A database that refuses connections counts as `database_error` instead. A signal
 that tells an unreachable database from a small pool is #155.
 
+Each gateway instance opens at most 21 connections to the audit database: 16 for begins and list
+rows, 4 for finishes, and 1 for the open-row poll. The poll has its connection to itself, so a
+poll held up for its full 2 s never takes a connection a finish could use (#140). The pool
+metrics cover the begin and finish pools; the poll's connection is not among them.
+
 ## Stopping the gateway
 
 Decision 0009 says an instance that is told to stop first fails its readiness check, then stops
