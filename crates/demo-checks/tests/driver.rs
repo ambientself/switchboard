@@ -4626,7 +4626,7 @@ fn the_reach_held_step_needs_each_entrys_probe_refused_and_reach_check_held_with
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
-            "check_reach_held \"$(events {log} 'select(.event == \"reach_held\")')\"",
+            "check_reach_held \"$(events {log} 'select(.event == \"reach_held\" or .event == \"reach_mismatch\")')\"",
             &[("log", &lines.join("\n"))],
         )
     };
@@ -4646,6 +4646,22 @@ fn the_reach_held_step_needs_each_entrys_probe_refused_and_reach_check_held_with
         ),
         "the reach check of docs-team-b held: mock-docs refused its canary",
     );
+    let mismatch = log_line(
+        "2026-10-12T10:00:05.000000Z",
+        json!({"event": "reach_mismatch", "server": "docs-team-a", "withdrawn": 2}),
+    );
+    assert_fails(
+        "a mismatch",
+        &run_on(
+            "held-mismatch",
+            &[
+                held_line("docs-team-a", 1),
+                held_line("docs-team-b", 2),
+                mismatch,
+            ],
+        ),
+        "no reach check found a reach wider than recorded (got '1'",
+    );
 
     // The metrics: each entry's probe refused and none open, each reach check held and none a
     // mismatch.
@@ -4655,7 +4671,17 @@ fn the_reach_held_step_needs_each_entrys_probe_refused_and_reach_check_held_with
     assert_all_passed(
         "metrics",
         &metrics("reach-metrics", reach_metrics([3, 0, 2, 0], [3, 0, 2, 0])),
-        8,
+        6,
+    );
+    // A mismatch an earlier run's reach step left in the counts does not fail a later run
+    // against the same gateway: the log since the step began is what shows none.
+    assert_all_passed(
+        "an earlier mismatch",
+        &metrics(
+            "reach-metrics-earlier",
+            reach_metrics([3, 0, 2, 1], [3, 0, 2, 0]),
+        ),
+        6,
     );
     for (case, text, failure) in [
         (
@@ -4672,11 +4698,6 @@ fn the_reach_held_step_needs_each_entrys_probe_refused_and_reach_check_held_with
             "reach never held",
             reach_metrics([3, 0, 0, 0], [3, 0, 2, 0]),
             "metrics: the reach check of docs-team-a held (got 0",
-        ),
-        (
-            "a mismatch",
-            reach_metrics([3, 0, 2, 1], [3, 0, 2, 0]),
-            "metrics: no reach check of docs-team-a found its reach wider than recorded",
         ),
         (
             "no reach metrics",

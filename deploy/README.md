@@ -133,8 +133,10 @@ own rows leave out the reach check's, which come on the gateway's schedule:
 
 1. **The probe and the reach check** (decision 0011, section 4; decision 0013, sections 5 and
    9). Each entry's reach check logs `reach_held` within the interval plus the deadline and the
-   allowance; the metrics count, for each entry, a probe mock-docs refused and none open, and a
-   reach check held and none a mismatch; and the step's reach rows include, for each entry, one
+   allowance, and none logs `reach_mismatch`; the metrics count, for each entry, a probe
+   mock-docs refused and none open, and a reach check held (they count from the gateway's
+   start, so a rerun against the same gateway counts the earlier run's mismatch, and the log is
+   what shows none since); and the step's reach rows include, for each entry, one
    by the registry's principal on `registry-reach`, its list tool naming the other team's
    project, allowed and completed as `error` of the kind `vendor_refusal`, mock-docs' 403. Every
    reach row of the step is such a row.

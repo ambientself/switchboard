@@ -1359,8 +1359,10 @@ drift_steps() {
   check_drift_rows "$(step_rows "$MARK_EPOCH")" "$REVISION" "$list,$(team_entry team-a)__read_document" "allow ok"
 }
 
-# check_reach_held EVENTS: the gateway's reach_held lines in EVENTS: each entry's reach check held
-# at least once.
+# check_reach_held EVENTS: the gateway's reach_held and reach_mismatch lines in EVENTS, since the
+# step began: each entry's reach check held at least once, and none found a mismatch. The
+# metrics' counts cannot show the second: they count from the gateway's start, and a rerun
+# against the same gateway carries the earlier run's reach step.
 check_reach_held() {
   local entry
   for entry in docs-team-a docs-team-b; do
@@ -1368,11 +1370,14 @@ check_reach_held() {
     check_at_least "$(printf '%s\n' "$1" | jq -r --arg entry "$entry" 'select(.event == "reach_held" and .server == $entry) | .server' 2>/dev/null | awk 'END { print NR }')" 1 \
       "the reach check of $entry held: mock-docs refused its canary"
   done
+  check "$(printf '%s\n' "$1" | jq -c 'select(.event == "reach_mismatch")' 2>/dev/null | awk 'END { print NR }')" 0 \
+    "no reach check found a reach wider than recorded"
 }
 
 # check_probe_and_reach TEXT: the gateway's metrics TEXT count, for each entry, a probe that
 # mock-docs refused and none it dispatched (decision 0013, section 9), and a reach check that held
-# and none it answered (decision 0011, section 4).
+# (decision 0011, section 4). A mismatch is checked in the log (check_reach_held): the reach step
+# of an earlier run against the same gateway counts one.
 check_probe_and_reach() {
   local text=$1 entry
   for entry in docs-team-a docs-team-b; do
@@ -1382,8 +1387,6 @@ check_probe_and_reach() {
       "metrics: no probe of $entry found mock-docs open"
     check_at_least "$(metric "switchboard_reach_checks_total{server=\"$entry\",result=\"held\"}" "$text")" 1 \
       "metrics: the reach check of $entry held"
-    check "$(metric "switchboard_reach_checks_total{server=\"$entry\",result=\"mismatch\"}" "$text")" 0 \
-      "metrics: no reach check of $entry found its reach wider than recorded"
   done
 }
 
@@ -1461,7 +1464,7 @@ reach_held_step() {
       "select(.event == \"reach_held\" and .server == \"$entry\")" || true
   done
   if fetch "the gateway's log" gateway_log "$since_at"; then
-    check_reach_held "$(events "$FETCHED" 'select(.event == "reach_held")')"
+    check_reach_held "$(events "$FETCHED" 'select(.event == "reach_held" or .event == "reach_mismatch")')"
   fi
   if fetch "the gateway's metrics" gateway_metrics; then
     check_probe_and_reach "$FETCHED"
