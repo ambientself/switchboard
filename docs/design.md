@@ -1417,7 +1417,8 @@ subset of JSON Schema 2020-12 and refuses anything else at load, including a `$s
 another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
 refuses another dialect rather than converting it. An enforced keyword must have the JSON type
 2020-12 gives it, and the names in a `type` list or in `required` must be unique (#127); an
-annotation's value is not checked. The argument check enforces every keyword the loader accepts other
+annotation's value is not checked. The root must be an object schema, so a root `true` or
+`false` is refused at load. The argument check enforces every keyword the loader accepts other
 than annotations: `type`, `properties`, `required`, `additionalProperties`, `items`, `enum`,
 `const`, and the bounds on lengths, item counts and numbers. Numbers compare by value, so `1.0` is an integer, and the
 schema `false` admits nothing. A call that fails is outcome `error` of kind

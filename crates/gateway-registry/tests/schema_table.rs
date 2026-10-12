@@ -33,6 +33,7 @@ fn refused(schema: &str) -> RegistryError {
                     | RegistryError::SchemaDialect { tool, .. }
                     | RegistryError::SchemaAdditionalPropertiesMalformed { tool, .. }
                     | RegistryError::SchemaRepeatedName { tool, .. }
+                    | RegistryError::SchemaNotObject(tool)
                     if tool.as_str() == "wiki__search"),
                 "{schema}: {error:?}"
             );
@@ -350,6 +351,21 @@ fn a_list_not_of_names_is_malformed_before_it_is_checked_for_repeats() {
         let schema = property(inner);
         match refused(&schema) {
             RegistryError::SchemaMalformed { at: got, .. } => assert_eq!(got.as_str(), at),
+            other => panic!("{schema}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_boolean_schema_is_refused_at_the_root_though_it_loads_below_it() {
+    // #94's third case, #127. Below the root, `false` and `true` load (see
+    // `every_enforced_keyword_and_annotation_loads`). At the root an input schema must have
+    // `type` `object`, so neither can be approved: `false` would refuse every call, and `true`
+    // would let every call through unchecked. The check's own answer to a root `false` is in
+    // the `adapter` module's unit tests.
+    for schema in ["false", "true"] {
+        match refused(schema) {
+            RegistryError::SchemaNotObject(tool) => assert_eq!(tool.as_str(), "wiki__search"),
             other => panic!("{schema}: {other:?}"),
         }
     }

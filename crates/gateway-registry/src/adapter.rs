@@ -35,6 +35,8 @@
 //!   nor a schema has an error of its own, and so does a `type` list or a `required` list that
 //!   names one name twice: 2020-12 says those names must be unique (#127).
 //! - **Not checked at load:** an annotation's value, which nothing reads.
+//! - **The root:** an input schema must be an object schema with `type` `object`, so the
+//!   schemas `true` and `false` are refused at the root, though they load anywhere below it.
 //!
 //! A call's arguments then pass only if they meet every enforced keyword, at every depth:
 //!
@@ -615,6 +617,35 @@ mod tests {
     fn a_pointer_escapes_its_tokens() {
         let at = JsonPointer::default().child("a/b").child("c~d");
         assert_eq!(at.as_str(), "/a~1b/c~0d");
+    }
+
+    #[test]
+    fn a_root_false_schema_refuses_any_arguments_object() {
+        // #94's third case, #127. The loader refuses a root `false` (it is not an object
+        // schema), so this builds the adapter directly: if that rule were ever relaxed, the
+        // check would still admit nothing, and say so at the root.
+        let tool = ToolName::parse("wiki__search").unwrap();
+        let adapter = ArgumentAdapter::new(tool.clone(), Vec::new(), json!(false));
+        for arguments in [
+            json!({}),
+            json!({ "q": "text" }),
+            json!({ "q": { "deep": [1, 2] } }),
+        ] {
+            assert_eq!(
+                adapter.check_arguments(&arguments),
+                Err(ArgumentError::Invalid {
+                    tool: tool.clone(),
+                    path: JsonPointer::default(),
+                    keyword: "false",
+                }),
+                "{arguments}"
+            );
+        }
+        // Arguments that are not an object are refused as that, before the schema is read.
+        assert_eq!(
+            adapter.check_arguments(&json!([])),
+            Err(ArgumentError::NotAnObject { tool })
+        );
     }
 
     #[test]

@@ -2865,13 +2865,16 @@ mutate("schema-invalid-says-undeclared", "a call that fails a schema keyword is 
        "crates/gateway/src/proxied.rs",
        "                            invalid_argument(tool.as_str())\n", "                            undeclared_argument(tool.as_str())\n")
 # #127: the names in a `type` list and in `required` are unique, as 2020-12 says, and the error
-# names the list's pointer.
+# names the list's pointer. A root `true` or `false` is refused, though either loads below it.
 mutate("schema-type-repeat-loads", "a `type` list may name one type twice", RA,
        '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value),')
 mutate("schema-required-repeat-loads", "a `required` list may name one property twice", RA,
        "                    && unique(value, &here)?\n            }", "            }")
 mutate("schema-repeat-pointer-is-schema", "a repeated name is reported at the schema, not at its list", RA,
        '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value) && unique(value, at)?,')
+mutate("registry-schema-boolean-root-loads", "a root input schema of `true` or `false` loads", RR,
+       '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {',
+       '    if tool.input_schema.is_object() && tool.input_schema.get("type") != Some(&Value::String("object".into())) {')
 
 
 # --- audit-postgres ------------------------------------------------------------------------
