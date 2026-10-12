@@ -2698,6 +2698,21 @@ mutate("proxy-credential-failure-not-logged", "a call refused for its credential
        "                    reason = %reason,\n"
        "                    \"the gateway's credential could not be read; the call was refused and nothing was sent\"\n"
        "                );\n", "                let _ = reason;\n")
+# The drift pass's tool list (decision 0013, section 5): the call's bounds and credential, and
+# only one page.
+PL = PROXY + "src/list.rs"
+mutate("proxy-list-deadline-not-applied", "the tool list is never abandoned", PC,
+       "        let listed = tokio::time::timeout(self.deadline, self.list_exchange(request))\n"
+       "            .await\n            .map_err(|_elapsed| ListError::TimedOut)??;\n",
+       "        let listed = self.list_exchange(request).await?;\n")
+mutate_all("proxy-list-cap-not-applied", "a tool list of any size is read",
+           (PC, "if declared_length(response.headers()).is_some_and(|declared| declared > cap as u64) {",
+            "if declared_length(response.headers()).is_some_and(|_| false) {"),
+           (PC, "                if listed.len() + data.len() > cap {", "                if false {"))
+mutate("proxy-list-credential-not-sent", "the tool list request carries no credential", PC,
+       "        request.headers_mut().insert(AUTHORIZATION, bearer);\n", "")
+mutate("proxy-list-next-page-read-as-whole", "a tool list that names a next page is read as the whole list", PL,
+       "        .is_some_and(|cursor| !cursor.is_null())\n", "        .is_some_and(|_| false)\n")
 mutate("proxy-credential-failure-reason-dropped", "a call refused for its credential is logged without the reason", PC,
        "                    reason = %reason,\n", "")
 mutate("proxy-duplicate-credential-accepted", "two files for one connector are accepted", PK,
@@ -4340,10 +4355,59 @@ mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
        "\n**/target\n", "\n")
 mutate("demo-driver-health-checks-counted", "the outage step counts health checks as requests", DRIVER,
-       "select(.accepted == true)' | awk 'END { print NR }'", "select(.event == \"request\")' | awk 'END { print NR }'")
+       "select(.accepted == true and .rpc_method != \"tools/list\")' | awk 'END { print NR }'",
+       "select(.event == \"request\" and .rpc_method != \"tools/list\")' | awk 'END { print NR }'")
+# The gateway's drift polls are its own tools/list requests, not calls.
+mutate("demo-driver-drift-polls-counted-compose", "the Compose bearer check counts the gateway's drift polls as calls", DRIVER,
+       """'$1 == "accepted" && ours($2) && $3 != "tools/list" { count++ }""", """'$1 == "accepted" && ours($2) { count++ }""")
+mutate("demo-driver-drift-polls-counted-kind", "the kind caller check counts the gateway's drift polls as calls", DRIVER,
+       """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ }""",
+       """'$1 == "accepted" && ($2 in entry) && NF == 3 { count++ }""")
+mutate("demo-driver-drift-polls-counted-outage", "the outage step counts the gateway's drift polls as requests", DRIVER,
+       """select(.accepted == true and .rpc_method != "tools/list")""", """select(.accepted == true)""")
 mutate("demo-compose-dev-issuer-published", "the development issuer is published", COMPOSE,
        "      - issuer-keys:/shared/issuer\n    healthcheck:",
        "      - issuer-keys:/shared/issuer\n    ports:\n      - \"127.0.0.1:18090:8090\"\n    healthcheck:")
+
+
+# --- gateway: drift and withdrawal ---------------------------------------------------------
+# Decision 0013, sections 5 to 7: the drift pass compares each approved tool's served
+# definition with its approval, by the loader's own hash, and withdraws one that changed or is
+# no longer listed. A failed poll withdraws nothing. A withdrawal's revision names the
+# withdrawn tools literally, it removes the tool from the definitions too, and it stands across
+# a reload that keeps its key until a new approval clears it. The first pass runs before the
+# listener is bound. tests/drift.rs watches each; drift.rs's own tests the revision, the
+# catalog and the interval; tests/deployment.rs the interval's ceiling.
+DRIFT = GW + "drift.rs"
+mutate("gw-drift-never-compares", "a served definition is never compared with its approval, so a changed one stays served", DRIFT,
+       "                served_sha256(listed).as_deref() != Some(approved.key.definition_sha256.as_str())\n",
+       "                {\n                    let _ = listed;\n                    false\n                }\n")
+mutate("gw-drift-missing-tool-kept", "a tool the server no longer lists stays served", DRIFT,
+       "            let cause = if served.is_empty() {\n                Cause::NoLongerListed\n",
+       "            let cause = if served.is_empty() {\n                continue;\n")
+mutate("gw-drift-poll-failure-withdraws", "a failed poll is read as an empty tool list, so every tool on the server is withdrawn", DRIFT,
+       "        let tools = match listed {\n",
+       "        let listed = Ok::<_, ListError>(listed.unwrap_or_default());\n        let tools = match listed {\n")
+mutate("gw-drift-withdrawal-not-reapplied", "a reload drops every standing withdrawal, so a withdrawn tool is served again unapproved", DRIFT,
+       "            let keep = approved\n                .get(tool)\n                .is_some_and(|now| now.key == standing.key);\n",
+       "            let keep = false && approved.contains_key(tool);\n")
+mutate("gw-drift-reapproval-not-cleared", "a withdrawal is keyed by the tool's name alone, so approving it again does not clear it", DRIFT,
+       "                .is_some_and(|now| now.key == standing.key);\n",
+       "                .is_some_and(|now| now.key.tool == standing.key.tool);\n")
+mutate("gw-drift-revision-is-base", "a withdrawal's policy keeps the base revision, so its rows cannot tell it from the base", DRIFT,
+       "            let revision = withdrawn_revision(state.base.revision(), &withdrawn);\n",
+       "            let revision = state.base.revision().clone();\n")
+mutate("gw-drift-revision-not-literal", "the derived revision counts the withdrawn tools instead of naming them", DRIFT,
+       '    PolicyRevision::new(format!("{base}+withdrawn:{}", names.join(",")))\n',
+       '    PolicyRevision::new(format!("{base}+withdrawn:{}", names.len()))\n')
+mutate("gw-drift-catalog-still-lists", "a withdrawal leaves the tool's definition in the catalog", POLICY_RS,
+       "            catalog: self.catalog.without(withdrawn),\n", "            catalog: self.catalog.clone(),\n")
+mutate_all("gw-drift-first-pass-after-bind", "the first drift pass runs on the timer after the listener binds, not during boot",
+           (START, "    drift.pass().await;\n", ""),
+           (DRIFT, "tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);",
+            "tokio::time::interval_at(tokio::time::Instant::now(), self.interval);"))
+mutate("gw-drift-interval-ceiling-unchecked", "a drift interval above 900 s loads", DRIFT,
+       " || seconds > MAX_DRIFT_INTERVAL.as_secs() {", " {")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -4463,8 +4527,8 @@ mutate("demo-kind-mock-docs-any-subject", "mock-docs accepts a workload's Servic
 mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys into the gateway's namespace, not mock-docs'", DRIVER,
        "  k -n mock-docs create configmap cluster-issuer-keys ", "  k -n switchboard create configmap cluster-issuer-keys ")
 mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
-           (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 2 { count++ }""", """'$1 == "accepted" { count++ }"""),
-           (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 2) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
+           (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ }""", """'$1 == "accepted" { count++ }"""),
+           (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
 mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls and the probe do not explain passes", DRIVER,
        '  check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"\n', "")
 mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure count reads the gateway's whole log", DRIVER,
