@@ -477,6 +477,16 @@ mutate("limit-user-falls-back-to-team", "a user's group falls back to the limit 
 mutate("limit-team-falls-back-to-group", "a workload's team falls back to the limit of a group with its name", SRC + "policy.rs",
        ".teams\n                .get(team)", ".teams\n                .get(team).or_else(|| self.groups.get(&GroupId::new(team.as_str())))")
 
+# A tool declared as its entry's reach names the entry's whole reach, from the gateway's one
+# constant adapter (crates/gateway/src/resources.rs), whatever its arguments.
+mutate("reach-not-named", "the reach adapter names its entry with an empty reach", "crates/gateway/src/resources.rs",
+       "                resources: entry.reach.iter().cloned().collect(),",
+       "                resources: Vec::new(),")
+mutate("reach-from-arguments", "a tool declared as the reach is read by its connector's adapter, from its arguments",
+       "crates/gateway/src/path.rs",
+       "        if approved.declared_from == Some(DeclaredFrom::Reach) {",
+       "        if false && approved.declared_from == Some(DeclaredFrom::Reach) {")
+
 # --- tools/list ----------------------------------------------------------------------------
 
 LIST = "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())"
@@ -527,7 +537,7 @@ mutate_all(
 # --- The snapshot loader's rules -----------------------------------------------------------
 #
 # Decision 0011, section 3: the nine rules PolicySnapshot::new checks for tools with a connector
-# entry, the refusal of a tool declared as the reach, and the withdrawal's derived snapshot
+# entry, the refusal of a tool declared as the reach with no entry, and the withdrawal's derived snapshot
 # (section 4). tests/loader_rules.json has a refusing and a passing case for each rule, and
 # tests/properties.rs the reach property and that a withdrawal only narrows.
 
@@ -557,8 +567,8 @@ mutate("snapshot-rule-9-removed", "a propose tool on a shared entry may be serve
 mutate("snapshot-rule-3-any-text-a-date", "anything recorded as a reach test's date counts as a test", SRC + "policy.rs",
        "        let tested = entry.reach_tested_on.as_deref().is_some_and(is_date);",
        "        let tested = entry.reach_tested_on.is_some();")
-mutate("snapshot-as-reach-accepted", "a tool declared as its entry's reach loads, though it is not built", SRC + "policy.rs",
-       "            .find(|tool| tool.declared_from == Some(DeclaredFrom::Reach))", "            .find(|_| false)")
+mutate("snapshot-reach-without-entry-accepted", "a tool declared as the reach loads with no entry to name", SRC + "policy.rs",
+       "                && !snapshot.entries.contains_key(&tool.connector)", "                && false")
 mutate("snapshot-declared-from-without-declared", "a tool not declared may say where it is declared from", SRC + "policy.rs",
        "            if tool.declared_from.is_some() && tool.resources != ResourceDeclaration::Declared {",
        "            if false {")
@@ -735,7 +745,8 @@ mutate("record-resources-omitted-miscounted", "the row's omitted count is off by
 mutate("record-resources-omitted-counts-repeats", "the row's omitted count includes repeats", SRC + "audit.rs",
        OMITTED, "    let omitted = named.len().saturating_sub(kept.len());")
 mutate("record-resources-unknown-as-none", "unknown resources are recorded as an empty list", SRC + "audit.rs",
-       "        return (RecordedResources::Unknown, 0);", "        return (RecordedResources::Named(Vec::new()), 0);")
+       "        Resources::Unknown => return (RecordedResources::Unknown, 0),",
+       "        Resources::Unknown => return (RecordedResources::Named(Vec::new()), 0),")
 DENIED_KEPT = (
     "    if let Some(denied) = denied\n"
     "        && !kept.contains(&denied)\n"
@@ -1355,6 +1366,10 @@ mutate("fake-connector-credential-refusal-ignored", "a refused credential does n
 mutate("fake-connector-echo-drops-credential", "the echo does not carry the credential label", K,
        '    json!({"tool": tool, "echo": arguments, "credential": credential})', '    json!({"tool": tool, "echo": arguments, "credential": ""})')
 mutate("fake-connector-time-not-taken", "a connector told to take time does not", K, "                clock.advance(duration);", "                let _ = (clock, duration);")
+
+mutate("fake-audit-credential-dropped", "the in-memory store drops a row's credential identity", A,
+       "                    state.rows.push((row.clone(), record.clone(), times));",
+       "                    state.rows.push((row.clone(), AuditRecord { credential: None, ..record.clone() }, times));")
 
 # --- The testkit's issuer, clocks and gate -------------------------------------------------
 
@@ -2964,6 +2979,10 @@ mutate("registry-links-testkit", "the registry, and so the gateway, links the te
        'toml = "1"\ngateway-testkit = { path = "../gateway-testkit" }\n\n[dev-dependencies]\n')
 
 
+mutate("registry-as-reach-still-refused", "a tool declared as its entry's reach is refused at load", RR,
+       "        ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),",
+       "        ResourcesFile::AsReach => return Err(RegistryError::AdapterWithoutSources(name)),")
+
 # --- gateway-registry: schema validation ---------------------------------------------------
 #
 # The argument check against the approved schema's subset of JSON Schema 2020-12 (#11, #94), and
@@ -3149,7 +3168,7 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
-       '$24, $25\n        ) ON CONFLICT (id) DO NOTHING";', '$24, $25\n        )";')
+       '$26, $27\n        ) ON CONFLICT (id) DO NOTHING";', '$26, $27\n        )";')
 mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
        "    if decision == row.decision {", "    if true {")
 mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
@@ -3804,6 +3823,21 @@ mutate("pg-lost-begin-kind-differs", "a lost begin's row is completed as a vendo
        "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::Other)),",
        "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::VendorRefusal)),")
 
+
+# Migration 0007: a reach recorded by its entry, and the configured entry's credential identity.
+PG_REACH = PG + "sql/migrations/0007_reach_and_credential.sql"
+mutate("pg-reach-check-allows-any-object", "the resources column takes any object as a reach", PG_REACH,
+       "        OR coalesce(\n            jsonb_typeof(resources) = 'object'\n            AND resources - 'reach' = '{}'::jsonb\n"
+       "            AND jsonb_typeof(resources -> 'reach') = 'string'\n            AND resources ->> 'reach' <> '',\n"
+       "            false\n        )",
+       "        OR jsonb_typeof(resources) = 'object'")
+mutate("pg-credential-columns-unshaped", "a credential mode may be stored without its principal, or the reverse", PG_REACH,
+       "        (credential_mode IS NULL) = (credential_principal IS NULL)", "        true")
+mutate("pg-credential-grant-missing", "the gateway's role may not insert the credential identity", PG_REACH,
+       "GRANT INSERT (credential_mode, credential_principal)\n    ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-credential-not-written", "begin writes no credential identity", PG_COLUMNS,
+       "            credential_mode,\n            credential_principal,\n        })",
+       "            credential_mode: None,\n            credential_principal: None,\n        })")
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
@@ -4573,6 +4607,10 @@ mutate("demo-driver-down-unnamed-takes-all", "down with nothing named takes down
 mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes the cluster too", DRIVER,
        "      compose) down_compose ;;", "      compose) down_compose && down_kind ;;")
 
+
+mutate("reach-recorded-as-list", "a reach is recorded as the list of its resources, not by its entry", SRC + "audit.rs",
+       "        Resources::Reach { entry, .. } => return (RecordedResources::Reach(entry.clone()), 0),",
+       "        Resources::Reach { resources, .. } => resources,")
 
 # --- first slice: the kind run's image ---------------------------------------------------------
 # A kind run deploys its image under a tag taken from the image's ID, so a run on an existing
