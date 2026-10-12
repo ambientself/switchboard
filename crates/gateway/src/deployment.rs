@@ -59,6 +59,9 @@
 //! deadline_seconds = 5        # 5 if left out; 1 to 60
 //! max_result_bytes = 65536    # 64 KiB if left out; 1 to 1 MiB
 //!
+//! [drift]                     # optional
+//! interval_seconds = 300      # 300 if left out; 5 to 900
+//!
 //! [credentials]
 //! docs-credential = "/run/secrets/docs-credential"
 //! ```
@@ -113,9 +116,13 @@
 //!   answer's HTTP body. Zero, or a value past [`MAX_SERVER_DEADLINE`] or
 //!   [`MAX_SERVER_RESULT_BYTES`], is refused. The deployment's termination grace must cover
 //!   the longest deadline set (decision 0014, section 1).
+//! - **The drift pass** reads each proxied server's tool list every `drift.interval_seconds`,
+//!   and withdraws a tool whose served definition no longer matches its approval (see
+//!   [`crate::drift`]): [`DEFAULT_DRIFT_INTERVAL`](crate::drift::DEFAULT_DRIFT_INTERVAL) if it
+//!   is not given, and refused below 5 or above 900 (decision 0013, section 5).
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
-//! limits and each server's bounds have defaults, so a gateway not told where to listen is
+//! limits, each server's bounds and the drift interval have defaults, so a gateway not told where to listen is
 //! reachable from its own machine only. Any other missing field is an error, and so is a field that does not belong to the chosen mode or kind,
 //! such as `subjects_file` on a user issuer.
 
@@ -132,6 +139,7 @@ use thiserror::Error;
 use crate::config::{
     Algorithm, AuditSection, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
+use crate::drift::{DriftError, DriftSection};
 use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
 
 /// Where the gateway listens when the deployment file does not say: loopback only, never every
@@ -186,6 +194,9 @@ pub struct DeploymentFile {
     /// Each proxied server's bounds, where they differ from the defaults.
     #[serde(default)]
     pub servers: BTreeMap<ConnectorName, ServerSection>,
+    /// How often the drift pass runs, where it differs from the default.
+    #[serde(default)]
+    pub drift: Option<DriftSection>,
     /// Each credential reference the registry's servers name, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -502,6 +513,9 @@ pub enum DeploymentError {
         /// The cap given, in bytes.
         bytes: usize,
     },
+    /// The drift interval is out of range.
+    #[error(transparent)]
+    Drift(#[from] DriftError),
     /// The metrics listener would take the MCP listener's port.
     #[error(
         "`metrics.listen` ({metrics}) takes the port the gateway listens on for MCP ({listen}); \
@@ -546,6 +560,8 @@ pub struct Deployment {
     /// The bounds of each server the file gives an entry, within their ceilings. Every other
     /// server has [`ServerLimits::default`].
     pub servers: BTreeMap<ConnectorName, ServerLimits>,
+    /// How often the drift pass runs.
+    pub drift_interval: Duration,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -560,6 +576,7 @@ impl std::fmt::Debug for Deployment {
             .field("metrics", &self.metrics)
             .field("limits", &self.limits)
             .field("servers", &self.servers)
+            .field("drift_interval", &self.drift_interval)
             .finish_non_exhaustive()
     }
 }
@@ -666,6 +683,7 @@ impl Deployment {
             });
         }
         let limits = limits(file.limits.unwrap_or_default())?;
+        let drift_interval = DriftSection::interval(file.drift.as_ref())?;
         let servers = file
             .servers
             .into_iter()
@@ -710,6 +728,7 @@ impl Deployment {
             metrics: file.metrics.map(|metrics| metrics.listen),
             limits,
             servers,
+            drift_interval,
             credentials: file
                 .credentials
                 .into_iter()

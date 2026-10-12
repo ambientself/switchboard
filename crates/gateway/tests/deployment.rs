@@ -451,6 +451,48 @@ fn the_maximum_age_defaults_to_a_minute_and_is_at_least_two_polls() {
     assert!(said.contains("not a valid deployment file"), "{said}");
 }
 
+/// Decision 0013, section 5: `[drift]` is optional, its interval 300 s unless given, and
+/// refused below 5 or above 900.
+#[test]
+fn the_drift_interval_defaults_to_five_minutes_and_is_5_to_900_seconds() {
+    let loaded = files("drift-default").load();
+    assert_eq!(loaded.drift_interval, Duration::from_secs(300));
+    assert_eq!(loaded.drift_interval, gateway::DEFAULT_DRIFT_INTERVAL);
+    let table = |seconds: &str| format!("[drift]\ninterval_seconds = {seconds}\n\n[credentials]\n");
+    let loaded = load_edited(
+        "drift-empty",
+        "[credentials]\n",
+        "[drift]\n\n[credentials]\n",
+    );
+    assert_eq!(loaded.unwrap().drift_interval, Duration::from_secs(300));
+    for seconds in [5, 10, 900] {
+        let loaded = load_edited(
+            &format!("drift-{seconds}"),
+            "[credentials]\n",
+            &table(&seconds.to_string()),
+        )
+        .unwrap();
+        assert_eq!(loaded.drift_interval, Duration::from_secs(seconds));
+    }
+    for seconds in [0, 4, 901] {
+        let said = refused(
+            &format!("drift-{seconds}"),
+            "[credentials]\n",
+            &table(&seconds.to_string()),
+        );
+        assert_eq!(
+            said,
+            format!("`drift.interval_seconds` is {seconds}; it must be from 5 to 900")
+        );
+    }
+    let said = refused(
+        "drift-unknown-field",
+        "[credentials]\n",
+        "[drift]\ninterval = 10\n\n[credentials]\n",
+    );
+    assert!(said.contains("not a valid deployment file"), "{said}");
+}
+
 #[test]
 fn keys_and_manifests_that_cannot_be_read_are_refused() {
     let files = files("unreadable");
@@ -495,6 +537,11 @@ fn the_demo_deployment_files_are_valid_deployment_files() {
         let file: DeploymentFile = toml::from_str(&read("gateway.toml"))
             .unwrap_or_else(|error| panic!("{place}/gateway.toml: {error}"));
         assert_eq!(file.registry.poll_seconds, 2, "{place}");
+        assert_eq!(
+            file.drift.and_then(|drift| drift.interval_seconds),
+            Some(10),
+            "{place}"
+        );
         let manifest: TeamManifest = toml::from_str(&read("teams.toml"))
             .unwrap_or_else(|error| panic!("{place}/teams.toml: {error}"));
         assert_eq!(manifest.subjects.len(), 2, "{place}");
