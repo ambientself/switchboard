@@ -1304,8 +1304,8 @@ mutate("testkit-denial-completed", "the in-memory store completes a denial, whic
        "        if row.decision != DecisionKind::Allow {", "        if false {")
 mutate("testkit-list-row-completed", "the in-memory store finds no row, rather than a listing, when finish names a list row", A,
        "        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {", "        if false {")
-mutate("testkit-list-kind-completed", "the in-memory store completes a call row of kind list, which complete_once refuses", A,
-       "        if row.kind != RowKind::Call {", "        if false {")
+mutate("testkit-list-kind-begun", "the in-memory store begins a call record of kind list, which kind_shape refuses", A,
+       "    if record.kind != RowKind::Call {", "    if false {")
 mutate("testkit-deadline-past-postgres-end", "the in-memory store writes a deadline past what a Postgres time holds", A,
        "    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {", "    if false {")
 mutate("testkit-deadline-end-accepted", "the in-memory store writes a deadline at the end of what a Postgres time holds", A,
@@ -2985,7 +2985,9 @@ mutate("registry-schema-boolean-root-loads", "a root input schema of `true` or `
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
 # pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
 # pg-retry-socket-failure-final, pg-finish-dropped-task-not-reported,
-# pg-finish-pause-past-deadline, pg-finish-pause-uncapped and pg-stats-histogram-off-by-one-bucket.
+# pg-finish-pause-past-deadline, pg-finish-pause-uncapped, pg-stats-histogram-off-by-one-bucket,
+# pg-stats-pool-timeout-as-budget, pg-stats-silent-database-not-pool-timeout and
+# pg-stats-connected-kept-across-attempts.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
@@ -3382,6 +3384,14 @@ mutate("pg-stats-histogram-off-by-one-bucket", "a latency at a bucket's bound is
        "nanos <= u128::from(*bound)", "nanos < u128::from(*bound)")
 mutate("pg-stats-pool-timeout-as-budget", "a begin that waited past its budget for a connection counts as its insert running out", PG_STORE,
        "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n", "")
+# #105: `pool_timeout` is any begin whose budget ran out before its last attempt had a
+# connection, whether waiting for a pool permit or opening a new connection.
+mutate("pg-stats-silent-database-not-pool-timeout", "a begin whose budget ran out opening a connection to a database that never answers counts as a database error", PG_STORE,
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n",
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::DatabaseError,\n")
+mutate("pg-stats-connected-kept-across-attempts", "a begin whose reconnect ran past its budget counts as its insert running out, because an earlier attempt had a connection", PG_STORE,
+       "        let failed = loop {\n            let mut sent = false;\n            let mut connected = false;\n",
+       "        let mut connected = false;\n        let failed = loop {\n            let mut sent = false;\n")
 mutate("pg-stats-late-answer-not-counted", "an answer released at the answer budget is not counted", PG_STORE,
        "                self.counters\n                    .answers_released\n                    .fetch_add(1, Ordering::SeqCst);\n", "")
 mutate("pg-stats-completed-differently-as-deadline", "a finish refused for a different completion counts as given up at the deadline", PG_STORE,
@@ -3694,7 +3704,10 @@ mutate("pg-check-open-rows-grant-option-own-role-only", "a grant option on the o
 mutate("pg-check-open-rows-options-ignored", "an open-row view with security_invoker passes the check", PG_CHECK,
        "    if !options.is_empty() {", "    if false {")
 mutate("pg-open-rows-begin-pool", "the open-row query runs on the begin pool", PG_STORE,
-       "timeout_at(deadline, self.finish.get())", "timeout_at(deadline, self.begin.get())")
+       "timeout_at(deadline, self.open_rows_pool.get())", "timeout_at(deadline, self.begin.get())")
+# #140: the open-row query has a pool of its own, so one held up never takes a finish's connection.
+mutate("pg-open-rows-uses-finish-pool", "the open-row query takes a connection from the finish pool again", PG_STORE,
+       "timeout_at(deadline, self.open_rows_pool.get())", "timeout_at(deadline, self.finish.get())")
 mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time limit", PG_STORE,
        "        match timeout_at(deadline, query).await {",
        "        match timeout_at(deadline + Duration::from_secs(3600), query).await {")
