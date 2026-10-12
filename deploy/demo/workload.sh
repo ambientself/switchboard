@@ -14,9 +14,21 @@
 #                  team manifest)
 #   audit-down     one allowed read while the audit database is unavailable; the gateway must
 #                  refuse it with the audit-failure sentence
-#   withdrawn      after the team's read tool is withdrawn from the registry: tools/list drops it
-#                  and a call to it is refused
-#   idle           makes no call: sleeps until SIGTERM, at most IDLE_SECONDS, then prints
+#   withdrawn [read|list]
+#                  after the team's read tool, or with `list` its list tool, is withdrawn:
+#                  tools/list drops it and a call to it is refused
+#   served         both of the team's tools are listed, and a call to its list tool is allowed
+#   undeclared     one read of OWN_PROJECT with an argument the tool's approval does not
+#                  declare; the gateway must answer with the undeclared-argument error
+#   hang           one read of SLOW_DOCUMENT, which the server answers only after the call's
+#                  deadline; the gateway must answer with the late-answer error. Prints how
+#                  long the answer took by curl's own clock, which demo.sh checks
+#   overload N     N reads of SLOW_DOCUMENT at once, N one more than the team's cap on calls in
+#                  flight to its server: exactly one is refused with the team-capacity
+#                  sentence, and every other is answered with the late-answer error. Prints
+#                  how long each of those took by curl's own clock, which demo.sh checks
+#   steady N       N reads of OWN_PROJECT, one a second; every one must be allowed
+#   idle          makes no call: sleeps until SIGTERM, at most IDLE_SECONDS, then prints
 #                  `PASS idle`. It holds a running pod with the workload's labels and
 #                  ServiceAccount, for the route check to start its probe in
 #
@@ -35,9 +47,11 @@
 # The tool names and their arguments are the demo registry's (deploy/*/config/registry). Each
 # team's surface is named for its entry of the mock server, docs-team-a or docs-team-b, and serves
 # that entry's tools, named <entry>__list_documents and <entry>__read_document. The
-# `plan` document and the projects `atlas` and `borealis` are the mock server's
-# (crates/mock-docs-server). The sentences are the core's (crates/gateway-core/src/sentences.rs);
-# crates/demo-checks tests that they still match.
+# `plan` and `slow-doc` documents and the projects `atlas` and `borealis` are the mock server's
+# (crates/mock-docs-server). The sentences are the gateway's: the core's
+# (crates/gateway-core/src/sentences.rs), the argument check's (crates/gateway/src/proxied.rs),
+# the team cap's (crates/gateway/src/bulkhead.rs) and the proxy's
+# (crates/connector-proxy/src/outcome.rs). crates/demo-checks tests that they still match.
 set -u
 
 MODE=${1:-full}
@@ -47,14 +61,31 @@ PROTOCOL=2025-06-18
 LIST_TOOL=${SURFACE}__list_documents
 READ_TOOL=${SURFACE}__read_document
 DOCUMENT=plan
+SLOW_DOCUMENT=slow-doc
 
 IDENTITY_FAILURE='The gateway could not verify who is calling, so the call was refused.'
 AUDIT_FAILURE='The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.'
+LATE_ANSWER="This tool's server did not answer before the call's deadline, so the call was abandoned."
+# undeclared_sentence TOOL and team_capacity_sentence SERVER TOOL: the gateway's answers to a
+# call with an argument its tool's approval does not declare, and to a call over the caller's
+# team's cap on calls in flight to SERVER. Each team's entry, the server, is named for its surface.
+# shellcheck disable=SC2016 # the backquotes are the sentences' own
+undeclared_sentence() {
+  printf 'Tool `%s` was called with an argument its approved definition does not declare, so the call was not sent. Call `tools/list` to see the arguments it takes.' "$1"
+}
+# shellcheck disable=SC2016 # the backquotes are the sentences' own
+team_capacity_sentence() {
+  printf 'Your team already has as many calls in flight to server `%s` from this gateway as it allows, so this call to tool `%s` was not sent. Try it again shortly.' "$1" "$2"
+}
 
 PASSES=0
 FAILS=0
 BODY=$(mktemp) || { echo "FAIL setup: cannot create a temporary file"; exit 1; }
-trap 'rm -f "$BODY"' EXIT
+# The seconds the last request took, from curl starting it to the answer's last byte.
+ELAPSED=$BODY.elapsed
+# overload's answers, a directory of their own.
+ANSWERS=""
+trap 'rm -f "$BODY" "$ELAPSED"; if [ -n "$ANSWERS" ]; then rm -rf "$ANSWERS"; fi' EXIT
 
 pass() { PASSES=$((PASSES + 1)); echo "PASS $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "FAIL $1"; }
@@ -88,8 +119,9 @@ load_token() {
   [ -n "$TOKEN" ] || setup_failed "the workload's token is empty"
 }
 
-# rpc TOKEN METHOD PARAMS: prints the HTTP status, or `curl exit N`; the body is in $BODY.
-# An empty TOKEN sends no Authorization header.
+# rpc TOKEN METHOD PARAMS: prints the HTTP status, or `curl exit N`; the body is in $BODY, and
+# the seconds the request took, by curl's clock, in $ELAPSED. An empty TOKEN sends no
+# Authorization header.
 rpc() {
   : >"$BODY"
   if [ -n "$1" ]; then
@@ -105,11 +137,12 @@ rpc() {
   else
     payload="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}"
   fi
-  status=$(curl -sS -m 10 -o "$BODY" -w '%{http_code}' "$GW" "$@" \
+  answer=$(curl -sS -m 10 -o "$BODY" -w '%{http_code} %{time_total}' "$GW" "$@" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
     -H "MCP-Protocol-Version: $PROTOCOL" -d "$payload")
   code=$?
-  if [ "$code" -ne 0 ]; then echo "curl exit $code"; else echo "$status"; fi
+  echo "${answer#* }" >"$ELAPSED"
+  if [ "$code" -ne 0 ]; then echo "curl exit $code"; else echo "${answer%% *}"; fi
 }
 call() { rpc "$1" tools/call "{\"name\":\"$2\",\"arguments\":$3}"; }
 # body FILTER: applies a jq filter to the last body; prints `invalid JSON` if it is not JSON.
@@ -217,15 +250,130 @@ audit_down() {
   check "$(body '.error.message')" "$AUDIT_FAILURE" "read while the audit database is down: the audit-failure sentence"
 }
 
+# withdrawn WHICH: the team's read tool (`read`) or list tool (`list`) is withdrawn, and the other
+# is still served.
 withdrawn() {
+  case $1 in
+    read) gone=$READ_TOOL kept=$LIST_TOOL args="{\"project\":\"$OWN_PROJECT\",\"document\":\"$DOCUMENT\"}" ;;
+    list) gone=$LIST_TOOL kept=$READ_TOOL args="{\"project\":\"$OWN_PROJECT\"}" ;;
+    *) setup_failed "withdrawn takes read or list, not '$1'" ;;
+  esac
   load_token
   status=$(rpc "$TOKEN" tools/list '{}')
   check "$status" 200 "tools/list after withdrawal: HTTP status"
-  check "$(body '[.result.tools[].name] | sort | join(",")')" "$LIST_TOOL" "tools/list after withdrawal: names"
-  expect_denied "$(call "$TOKEN" "$READ_TOOL" "{\"project\":\"$OWN_PROJECT\",\"document\":\"$DOCUMENT\"}")" "call to the withdrawn tool"
+  check "$(body '[.result.tools[].name] | sort | join(",")')" "$kept" "tools/list after withdrawal: names"
+  expect_denied "$(call "$TOKEN" "$gone" "$args")" "call to the withdrawn tool"
   check "$(body '.error.message')" \
-    "Tool \`$READ_TOOL\` is not available on surface \`$SURFACE\`. Call \`tools/list\` to see the tools this surface serves." \
+    "Tool \`$gone\` is not available on surface \`$SURFACE\`. Call \`tools/list\` to see the tools this surface serves." \
     "call to the withdrawn tool: the not-available sentence"
+}
+
+# served: both of the team's tools are served, after a withdrawal is cleared.
+served() {
+  load_token
+  status=$(rpc "$TOKEN" tools/list '{}')
+  check "$status" 200 "tools/list: HTTP status"
+  check "$(body '[.result.tools[].name] | sort | join(",")')" "$LIST_TOOL,$READ_TOOL" "tools/list: names"
+  expect_allowed "$(call "$TOKEN" "$LIST_TOOL" "{\"project\":\"$OWN_PROJECT\"}")" "list own project $OWN_PROJECT"
+}
+
+# The text of the last body's tool result: its text blocks joined.
+result_text() { body '[(.result.content // [])[] | .text? // empty] | join("")'; }
+
+# undeclared: the read tool's approved schema declares `project` and `document` and nothing else
+# (additionalProperties false), so `note` is an argument nobody approved. The gateway checks the
+# arguments before forwarding and answers with an error result, and sends nothing.
+undeclared() {
+  load_token
+  status=$(call "$TOKEN" "$READ_TOOL" "{\"project\":\"$OWN_PROJECT\",\"document\":\"$DOCUMENT\",\"note\":\"not declared\"}")
+  check "$status" 200 "read with an undeclared argument: HTTP status"
+  check "$(body '.result.isError')" true "read with an undeclared argument: isError"
+  check "$(result_text)" "$(undeclared_sentence "$READ_TOOL")" "read with an undeclared argument: the undeclared-argument sentence"
+}
+
+# hang: the server answers slow-doc only after its delay, longer than the call's deadline, so
+# the gateway abandons the call at the deadline and answers with an error result. How long the
+# answer took is printed, in whole milliseconds by curl's clock, or `unknown`; the workload does
+# not know the deadline, and demo.sh checks it.
+hang() {
+  load_token
+  status=$(call "$TOKEN" "$READ_TOOL" "{\"project\":\"$OWN_PROJECT\",\"document\":\"$SLOW_DOCUMENT\"}")
+  elapsed=$(awk '$1 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%d\n", $1 * 1000 + 0.5; next } { print "unknown" }' "$ELAPSED" 2>/dev/null)
+  note "read of $SLOW_DOCUMENT: answered after ${elapsed:-unknown} ms by the client's clock"
+  check "$status" 200 "read of $SLOW_DOCUMENT: HTTP status"
+  check "$(body '.result.isError')" true "read of $SLOW_DOCUMENT: isError"
+  check "$(result_text)" "$LATE_ANSWER" "read of $SLOW_DOCUMENT: the late-answer sentence"
+}
+
+# count MODE VALUE: VALUE, MODE's number of calls, is a whole number of at least 2, or the run
+# ends with a setup failure.
+count() {
+  case $2 in '' | *[!0-9]*) setup_failed "$1 takes a number of calls, not '$2'" ;; esac
+  [ "$2" -ge 2 ] || setup_failed "$1 takes at least 2 calls, not $2"
+}
+
+# overload N: N reads of slow-doc at once, each its own curl, all started before any is waited
+# for. Every one is allowed; the team's cap lets all but one run, and those are held until the
+# deadline. The one over the cap is refused, with nothing sent, before the others end. How long
+# each read answered with the late-answer error took is printed, in whole milliseconds by curl's
+# clock, or `unknown`, as hang does; demo.sh checks them against the deadline.
+overload() {
+  count overload "$1"
+  load_token
+  ANSWERS=$(mktemp -d) || setup_failed "cannot create a temporary directory"
+  message=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":{"project":"%s","document":"%s"}}}' \
+    "$READ_TOOL" "$OWN_PROJECT" "$SLOW_DOCUMENT")
+  i=1
+  while [ "$i" -le "$1" ]; do
+    curl -sS -m 10 -o "$ANSWERS/$i.body" -w '%{http_code} %{time_total}' "$GW" -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+      -H "MCP-Protocol-Version: $PROTOCOL" -d "$message" >"$ANSWERS/$i.status" 2>/dev/null &
+    i=$((i + 1))
+  done
+  wait
+  refusal=$(team_capacity_sentence "$SURFACE" "$READ_TOOL")
+  refused=0 late=0 other=0
+  i=1
+  while [ "$i" -le "$1" ]; do
+    BODY_FILE=$ANSWERS/$i.body
+    answer=$(awk 'NR == 1 { print $1 }' "$ANSWERS/$i.status" 2>/dev/null)
+    if [ "$answer" = 200 ] && [ "$(jq -r '.error.code' "$BODY_FILE" 2>/dev/null)" = -32001 ] &&
+      [ "$(jq -r '.error.message' "$BODY_FILE" 2>/dev/null)" = "$refusal" ]; then
+      refused=$((refused + 1))
+    elif [ "$answer" = 200 ] && [ "$(jq -r '.result.isError' "$BODY_FILE" 2>/dev/null)" = true ] &&
+      [ "$(jq -r '[(.result.content // [])[] | .text? // empty] | join("")' "$BODY_FILE" 2>/dev/null)" = "$LATE_ANSWER" ]; then
+      late=$((late + 1))
+      elapsed=$(awk 'NR == 1 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%d\n", $2 * 1000 + 0.5; next } { print "unknown" }' "$ANSWERS/$i.status" 2>/dev/null)
+      note "read $i of $SLOW_DOCUMENT, held: answered after ${elapsed:-unknown} ms by the client's clock"
+    else
+      other=$((other + 1))
+      note "read $i: HTTP ${answer:-none}: $(head -c 300 "$BODY_FILE" 2>/dev/null)"
+    fi
+    i=$((i + 1))
+  done
+  check "$refused" 1 "overload: one of $1 reads refused with the team-capacity sentence"
+  check "$late" $(($1 - 1)) "overload: the other $(($1 - 1)) held until the deadline and answered with the late-answer sentence"
+  check "$other" 0 "overload: no other answer"
+}
+
+# steady N: N reads of the team's own project, a second apart. Another team's overload or
+# hanging read does not hold them up: every one is allowed.
+steady() {
+  count steady "$1"
+  load_token
+  allowed=0
+  i=1
+  while [ "$i" -le "$1" ]; do
+    status=$(call "$TOKEN" "$READ_TOOL" "{\"project\":\"$OWN_PROJECT\",\"document\":\"$DOCUMENT\"}")
+    if [ "$status" = 200 ] && [ "$(body '.result.isError')" = false ]; then
+      allowed=$((allowed + 1))
+    else
+      note "read $i: HTTP $status: $(head -c 300 "$BODY")"
+    fi
+    i=$((i + 1))
+    if [ "$i" -le "$1" ]; then sleep 1; fi
+  done
+  check "$allowed" "$1" "steady reads of $OWN_PROJECT: every one of $1 allowed"
 }
 
 # idle: the route check's pod. It makes no call and holds no state; it waits in the background so
@@ -252,8 +400,13 @@ case "$MODE" in
   before-policy) : "${OWN_PROJECT:?}"; before_policy ;;
   refused) refused ;;
   audit-down) : "${OWN_PROJECT:?}"; audit_down ;;
-  withdrawn) : "${OWN_PROJECT:?}"; withdrawn ;;
+  withdrawn) : "${OWN_PROJECT:?}"; withdrawn "${2:-read}" ;;
+  served) : "${OWN_PROJECT:?}"; served ;;
+  undeclared) : "${OWN_PROJECT:?}"; undeclared ;;
+  hang) : "${OWN_PROJECT:?}"; hang ;;
+  overload) : "${OWN_PROJECT:?}"; overload "${2:-}" ;;
+  steady) : "${OWN_PROJECT:?}"; steady "${2:-}" ;;
   idle) idle ;;
-  *) echo "usage: $0 [full|before-policy|refused|audit-down|withdrawn|idle]" >&2; exit 2 ;;
+  *) echo "usage: $0 [full|before-policy|refused|audit-down|withdrawn [read|list]|served|undeclared|hang|overload N|steady N|idle]" >&2; exit 2 ;;
 esac
 finish

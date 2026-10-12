@@ -833,6 +833,7 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
     let callers = format!("{}=atlas;{}=borealis", subjects[0], subjects[1]);
     let want: Vec<(String, String)> = [
         (config::LISTEN_VAR, "0.0.0.0:8080"),
+        (config::ADMIN_LISTEN_VAR, "127.0.0.1:9091"),
         (config::JWT_ISSUER_VAR, issuer.as_str()),
         (config::JWT_AUDIENCE_VAR, audience.as_str()),
         (config::JWT_SUBJECTS_VAR, callers.as_str()),
@@ -860,10 +861,11 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
         // The entry's recorded reach is exactly what mock-docs lets its identity read.
         assert_eq!(entry_reach(&registry, entry), [project]);
     }
-    // Neither the admin endpoint nor slow-doc's delay is set: no demo step uses them.
+    // slow-doc keeps its default delay, past the call deadline, and the admin endpoint has no
+    // credential of its own: on loopback it needs none (the next test).
     for name in config::STATIC_VARS.into_iter().chain([
         config::JWT_SUBJECT_VAR,
-        config::ADMIN_LISTEN_VAR,
+        config::ADMIN_TOKEN_SHA256_FILE_VAR,
         config::SLOW_MS_VAR,
     ]) {
         assert!(
@@ -901,6 +903,78 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
     assert!(driver.contains(
         "\n  k -n switchboard delete configmap cluster-issuer-keys --ignore-not-found\n"
     ));
+}
+
+/// mock-docs' admin endpoint changes what it serves, and is for demo.sh's drift step alone. In
+/// Compose and in kind it listens on its container's loopback, which the binary allows with no
+/// admin credential only because no caller can reach it there, and demo.sh reaches it from inside
+/// that container. No published port, containerPort, Service or network policy names its port,
+/// so no workload, and not the gateway either, can reach it.
+#[test]
+fn mock_docs_admin_endpoint_is_reached_only_from_inside_its_container() {
+    use mock_docs_server::config;
+
+    let driver = read("deploy/demo/demo.sh");
+    let address = value_after(&driver, "MOCK_ADMIN_URL=")
+        .strip_prefix("http://")
+        .expect("an http URL")
+        .to_owned();
+    let (host, port) = address.rsplit_once(':').expect("a host and a port");
+    assert_eq!(host, "127.0.0.1", "the admin endpoint is on loopback");
+
+    let compose = read("deploy/compose/compose.yaml");
+    let mock_docs = compose_service(&compose, "mock-docs");
+    assert!(
+        mock_docs.contains(&format!("      {}: {address}\n", config::ADMIN_LISTEN_VAR)),
+        "{mock_docs}"
+    );
+    for exposed in ["ports:", "expose:", config::ADMIN_TOKEN_SHA256_FILE_VAR] {
+        assert!(!mock_docs.contains(exposed), "{exposed}:\n{mock_docs}");
+    }
+    assert_eq!(compose.matches(config::ADMIN_LISTEN_VAR).count(), 1);
+
+    let kind = read("deploy/kind/base/mock-docs.yaml");
+    assert!(kind.contains(&format!(
+        "            - {{name: {}, value: \"{address}\"}}\n",
+        config::ADMIN_LISTEN_VAR
+    )));
+    let mut manifests: Vec<String> = read("deploy/kind/base/kustomization.yaml")
+        .lines()
+        .filter_map(|line| line.strip_prefix("  - "))
+        .filter(|file| file.ends_with(".yaml"))
+        .map(|file| format!("deploy/kind/base/{file}"))
+        .collect();
+    manifests.push("deploy/kind/policy/networkpolicies.yaml".to_owned());
+    manifests.push("deploy/kind/route-check/rbac.yaml".to_owned());
+    for path in manifests {
+        for line in read(&path).lines() {
+            let line = line.trim_start().trim_start_matches("- ");
+            for key in [
+                "port:",
+                "containerPort:",
+                "targetPort:",
+                "nodePort:",
+                "hostPort:",
+            ] {
+                if let Some(value) = line.strip_prefix(key) {
+                    assert_ne!(
+                        value.trim(),
+                        port,
+                        "{path} names mock-docs' admin port: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    // demo.sh reaches it only by an exec into mock-docs' own container.
+    assert_eq!(driver.matches("$MOCK_ADMIN_URL").count(), 1, "one request");
+    for exec in [
+        "    compose) dc exec -T mock-docs \"${request[@]}\" ;;\n",
+        "    kind) k -n mock-docs exec deploy/mock-docs -c mock-docs -- \"${request[@]}\" ;;\n",
+    ] {
+        assert!(driver.contains(exec), "{exec}");
+    }
 }
 
 /// The lines of the container `name` in a Deployment: from its `- name:` line to the next

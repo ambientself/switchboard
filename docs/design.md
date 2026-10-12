@@ -1420,8 +1420,17 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   server's drift polls, withdrawals and probe results (the drift pass entry below). The
   reach-check signals wait for what they count. Decision 0014 writes the alert conditions
   down, and there are no rules until a metrics sink exists.
-- The overload, hanging-server and drift demonstrations: not built. `tests/limits.rs` shows
-  overload and a hanging server in a test (#139), not in a demo.
+- The overload, hanging-server and drift demonstrations: built in both demos, Compose and kind
+  (deploy/README.md, "#11's demonstrations"). A hanging server: team-a's read of mock-docs'
+  `slow-doc` is answered at the 5 s deadline, its row `error` of the kind
+  `oversized_or_late_read`. Overload: team-a's 9 reads at once, one over its cap of 8, give
+  eight such rows and one `refused` with the team-capacity sentence, and the calls shed with
+  scope `team` rise by one. Team-b's reads are answered throughout. Drift: mock-docs serves
+  another description of `list_documents`, and both entries' list tools are withdrawn within
+  the interval plus the deadline, with rows under the literal derived revision; they stay
+  withdrawn once the description is restored, and a new approval of the same definition, with
+  a new `approved_at`, clears them. `tests/limits.rs` shows overload and a hanging server in a
+  test too (#139).
 - Decision 0011, sections 1 to 5: schema validation before forwarding is built (#122, in the
   argument check entry below). Connector entries and the snapshot loader's nine rules are
   built. Each registry server is a proxied connector entry, stating its credential's mode,
@@ -1432,8 +1441,10 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   resource; `tests/loader_rules.json` has a refusing and a passing case for each, and the
   properties include the reach property of decision 0011's Consequences. The rules apply to
   tools whose connector has an entry; the JSON configuration's in-process connectors have
-  none. The demos' entries reach exactly the project mock-docs lets each identity read, and
-  one entry reaching both projects, served to both teams, is refused at load (rule 5).
+  none. The demos' entries reach exactly the project mock-docs lets each identity read. Both
+  demos show at run time a registry refused at load for rule 5, one admitting team-b to
+  `docs-team-a`'s surface, whose entry reaches `atlas`, which team-b's limit does not hold, and
+  an undeclared argument refused before forwarding.
   `PolicySnapshot::without` derives a withdrawal's snapshot for the drift pass. The gateway
   reads a team service identity's or gateway token's credential from its file and refuses a
   per-user grant at start, until milestone 5. The reach check's tool need not be approved, so
@@ -1444,7 +1455,10 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   refuses an entry whose narrowing is not `none` at start, until the custodian client (#12).
 - The kind slice extended to show them: partly built. Both demos register the mock server
   once per team and show each team's calls reaching it under its own entry's identity, for its
-  own project (the next entry). The overload, hanging-server and drift steps are not built.
+  own project (the next entry), and both show the undeclared argument, the registry refused at
+  load, the hanging server, overload and drift (the demonstrations entry above). The probe is
+  shown only by mock-docs refusing each probe's three calls in the kind run; no step shows it
+  finding an open server. The reach check is not shown.
 - The gateway's per-team identities: built in the demos (#11's kind slice), as decision 0013,
   section 10, has them. The registry lists the mock server twice, `docs-team-a` and
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
@@ -1587,8 +1601,8 @@ checked; a schema that needs them cannot be approved yet.
   `switchboard_proxied_call_seconds{server}` and
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
   `oversized_or_late_read`, so a tool not classified `read` is not counted there until
-  `unknown` is built. Not built yet in #11: a demo of overload and a hanging server,
-  configurable audit pools, and the row's size bound.
+  `unknown` is built. Both demos show overload and a hanging server (the demonstrations entry
+  under #11 above). Not built yet in #11: configurable audit pools, and the row's size bound.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's

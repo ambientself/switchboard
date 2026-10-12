@@ -3818,7 +3818,7 @@ mutate("demo-workload-check-always-passes", "every workload check passes whateve
 mutate("demo-workload-exits-zero-on-failure", "the workload exits 0 after a FAIL", WORKLOAD,
        """  echo "RESULT: FAIL ($FAILS of $total failed)"\n  exit 1\n""", """  echo "RESULT: FAIL ($FAILS of $total failed)"\n  exit 0\n""")
 mutate("demo-workload-iserror-defaults-false", "an answer with no result reads as isError false", WORKLOAD,
-       """body '.result.isError')""", """body '.result.isError // false')""")
+       '''check "$(body '.result.isError')" false "$2: isError"''', '''check "$(body '.result.isError // false')" false "$2: isError"''')
 mutate("demo-workload-limit-sentence-unchecked", "any denial sentence passes as the resource-limit one", WORKLOAD,
        """grep -c "^Tool \\`$READ_TOOL\\` names docs project \\`$OTHER_PROJECT\\`, which is outside what .*\\. Name only resources within that limit\\.$")" 1""",
        """grep -c ".")" 1""")
@@ -4273,6 +4273,41 @@ mutate("demo-kind-mock-docs-entry-any-project", "mock-docs lets team-a's entry n
        "docs-team-a=atlas;", "docs-team-a=atlas,borealis;")
 mutate("demo-driver-entry-check-any-identity", "the entry check counts a kind call under any entry's identity as each team's", DRIVER,
        "      return logged == identity\n", "      return 1\n")
+# #11's demonstrations in both demos: an undeclared argument, a registry refused at load, a
+# hanging server, an overload and drift, each checked from the rows, the gateway's log lines and
+# its metrics; and mock-docs' admin endpoint, reached only from inside its own container.
+mutate_all("demo-undeclared-row-kind-unchecked", "the undeclared-argument step passes a row of any error kind",
+           (DRIVER, "'[.[] | {team, tool, decision, outcome, error_kind}]' <<<\"$rows\"", "'[.[] | {team, tool, decision, outcome}]' <<<\"$rows\""),
+           (DRIVER, r'''\"outcome\":\"error\",\"error_kind\":\"invalid_arguments\"}]"''', r'''\"outcome\":\"error\"}]"'''))
+mutate("demo-refused-at-load-unchecked", "the refused-at-load step passes a refusal for any reason", DRIVER,
+       """    *"rule 5: surface \\`docs-team-a\\` serves tool \\`docs-team-a__"*"\\`, whose entry reaches \\`docs / project / atlas\\`, to team \\`team-b\\`, whose limit does not hold it"*)\n""",
+       "    *)\n")
+mutate("demo-hang-deadline-unchecked", "the hanging-server step passes a late read answered at any time", DRIVER,
+       """'[.[] | select(.team == "team-a" and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length'""",
+       """'[.[] | select(.team == "team-a")] | length'""")
+mutate("demo-hang-client-time-unchecked", "the hanging-server step passes a client answered any time after the deadline, as long as the row is at it", DRIVER,
+       """  elif [ "$elapsed" -ge $((deadline - CLIENT_EARLY_MS)) ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then\n""",
+       """  elif [ "$elapsed" -ge $((deadline - CLIENT_EARLY_MS)) ]; then\n""")
+mutate("demo-drift-held-withdrawal-unsaid", "a run stopped with the drift step's withdrawals held says nothing of them", DRIVER,
+       '  if [ -n "$WITHDRAWAL_HELD" ]; then\n', '  if false; then\n')
+mutate("demo-overload-other-team-unchecked", "the overload step does not check that team-b's reads went on meanwhile", DRIVER,
+       """  check_meanwhile "$rows" "team-a's reads filled its cap"\n""", "")
+mutate_all("demo-overload-latency-unchecked", "the overload step passes reads answered as late at any time, by their rows and by their client's clock",
+           (DRIVER, """ .error_kind == "oversized_or_late_read"\n      and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length'""",
+            """ .error_kind == "oversized_or_late_read")] | length'"""),
+           (DRIVER, """    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt $((deadline - CLIENT_EARLY_MS)) ] ||\n      [ "$elapsed" -gt $((deadline + HANG_ALLOWANCE_MS)) ]; then\n""",
+            """    if [ "$(number_or_none "$elapsed")" = none ]; then\n"""))
+mutate("demo-drift-withdrawal-unchecked", "the drift step passes a withdrawal however long after the change it came", DRIVER,
+       """      [0-9]*:[0-9]*) check_at_most "$((at - changed))" $((DRIFT_INTERVAL + CALL_DEADLINE)) \\\n""",
+       """      [0-9]*:[0-9]*) check_at_most 0 $((DRIFT_INTERVAL + CALL_DEADLINE)) \\\n""")
+mutate("demo-drift-reapproval-unchecked", "the re-approval step passes without the withdrawals cleared", DRIVER,
+       """  check "$(printf '%s\\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\\(.tool): \\(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \\\n""",
+       """  check "docs-team-a__list_documents: approved again;docs-team-b__list_documents: approved again" \\\n""")
+mutate("demo-compose-mock-docs-admin-off-loopback", "Compose's mock-docs serves its admin endpoint to every container", COMPOSE,
+       "      MOCK_DOCS_ADMIN_LISTEN: 127.0.0.1:9091\n", "      MOCK_DOCS_ADMIN_LISTEN: 0.0.0.0:9091\n")
+mutate("demo-kind-mock-docs-admin-service", "kind's mock-docs Service exposes the admin port", "deploy/kind/base/mock-docs.yaml",
+       "    - name: http\n      port: 8080\n      targetPort: http\n",
+       "    - name: http\n      port: 8080\n      targetPort: http\n    - name: admin\n      port: 9091\n      targetPort: 9091\n")
 
 
 # --- gateway: the first slice from files ---------------------------------------------------
@@ -4591,7 +4626,7 @@ mutate("demo-driver-list-count-unchecked", "the list check passes whatever numbe
 mutate("demo-driver-list-check-counts-nothing", "the list check passes whatever list rows were wrong", DRIVER,
        '  check "$(count_lines . "$wrong")" 0 "audit: each list row', '  check 0 0 "audit: each list row')
 mutate("demo-driver-list-withdrawn-shown", "the list check expects the withdrawn tool after the withdrawal too", DRIVER,
-       '($withdrawn): [entry + "__list_documents"]}', '($withdrawn): [entry + "__list_documents", entry + "__read_document"]}')
+       'elif .revision == $withdrawn then [entry + "__list_documents"]\n', 'elif .revision == $withdrawn then [entry + "__list_documents", entry + "__read_document"]\n')
 mutate("demo-driver-list-omitted-unchecked", "the list check passes a list row that left tools out", DRIVER,
        "            and .omitted == 0) | not)\n", "            and true) | not)\n")
 # A team without an entry has no tools to be shown, so a row from one fails on that too: the

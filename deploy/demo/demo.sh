@@ -3,10 +3,13 @@
 #
 #   demo.sh compose   build the image; start Postgres, the migration, the dev issuer, mock-docs
 #                     and the gateway under Compose; run both teams' workloads; show a database
-#                     outage and a withdrawn tool; check the audit rows
+#                     outage and a withdrawn tool; show #11's demonstrations (an undeclared
+#                     argument, a registry refused at load, a hanging server, an overload and
+#                     drift); check the audit rows
 #   demo.sh kind      the same in the kind cluster switchboard-demo, with projected
 #                     ServiceAccount tokens, network policy, the operator's permission checks,
-#                     and the route check (deploy/route-check) before and after the policy
+#                     and the route check (deploy/route-check) before and after the policy, and
+#                     with no database outage or withdrawn registry file
 #   demo.sh down compose   stop Compose and delete its volumes; the cluster is left alone
 #   demo.sh down kind      delete the kind cluster switchboard-demo; Compose is left alone
 #   demo.sh down all       both
@@ -25,8 +28,10 @@
 #
 # What it reads, and where each comes from:
 #   - the gateway's JSON log lines (crates/gateway): one `"event":"boot"` line per gate, with
-#     `"identity":"enforce"` and `"audit":"postgres"`, and one `"event":"identity_failed"` line
-#     per caller refused for identity;
+#     `"identity":"enforce"` and `"audit":"postgres"`, and the caps, deadlines and drift
+#     interval; one `"event":"identity_failed"` line per caller refused for identity; and the
+#     registry's reloads (`policy_reloaded`, `policy_reload_refused`) and the drift pass's
+#     withdrawals (`tool_withdrawn`, `policy_withdrawal_cleared`), each with its fields;
 #   - mock-docs' JSON log lines (crates/mock-docs-server): one per request, with
 #     `bearer_sha256`, the first 12 hex digits of the bearer's SHA-256, `accepted` and, for a
 #     JSON-RPC request, its `rpc_method`, and for a tools/call its `project` and, if the server
@@ -34,7 +39,7 @@
 #     which reads each entry's tool list every 10 s with that entry's credential; they are not
 #     calls, and the call counts leave them out. In kind the server runs in its JWT mode, and
 #     each line also has `caller`, the verified subject of an accepted token, and `refusal`, why
-#     a token was refused;
+#     a token was refused. Its admin endpoint's requests are logged as `"event":"admin"`;
 #   - the audit table switchboard_audit.call_rows (crates/audit-postgres), read as
 #     switchboard_reader;
 #   - the gateway's GET /metrics, Prometheus text on its own listener (crates/gateway,
@@ -82,6 +87,40 @@ PROBE_MALFORMED_SHA=ce6f21ae951df0ba38d6ce0e0175465bf5e9882edcf2ba677bca63b296f1
 # The registries' revision, and the Compose withdrawal's (registry-withdrawn.toml).
 REVISION=demo-7
 WITHDRAWN_REVISION=demo-8
+# The revisions of the registry variants the demonstrations make from the registry served, at
+# run time, start with this one, above every revision a file names, so a row or log line under
+# a variant is never taken for one under a file's revision. Each adds what it is and when.
+VARIANT_REVISION=demo-9
+# #11's demonstrations (demonstrations, below) rely on the gateway's defaults for the caps and
+# the call deadline, which the demos' deployment files leave alone, and on the drift interval
+# they set. TEAM_CAP is decision 0014's cap on calls in flight from one team to one proxied
+# server, CALL_DEADLINE its call deadline in seconds, and DRIFT_INTERVAL the deployment files'
+# `[drift] interval_seconds`. Each run checks the gateway's boot lines give these
+# (check_bounds), and crates/demo-checks holds them to the code and the files.
+TEAM_CAP=8
+CALL_DEADLINE=5
+DRIFT_INTERVAL=10
+# How long past CALL_DEADLINE the hanging-server step's client may wait for its answer, in ms.
+# The deadline holds the call to the server; the client also waits for what comes before and
+# after it: the token check, the policy, the audit row's begin and finish, each one Postgres
+# write, and the hops through Docker's or the cluster's network. 1.5 s covers those on a busy
+# laptop, and is far short of the 10 s after which mock-docs answers slow-doc, so a gateway that
+# waits for the server, or holds the call 2 s past its deadline, fails.
+HANG_ALLOWANCE_MS=1500
+# How long before CALL_DEADLINE the client may be answered, in ms, by its own clock. The
+# gateway's timer and curl's clock are read apart, each to the millisecond, and in kind a client
+# has been seen answered 1 ms before the deadline its row holds. 50 ms covers that, and still
+# fails an answer that came well before the deadline.
+CLIENT_EARLY_MS=50
+# The drift step has mock-docs serve this description of list_documents in place of the one
+# approved. Both entries list it, so both entries' list tools are withdrawn, and the revision
+# served is then this one, the literal derived revision of decision 0013, section 6.
+DRIFTED_DESCRIPTION="List the names of the documents in one project, and whatever else it holds."
+DRIFTED_REVISION="$REVISION+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents"
+# mock-docs' admin endpoint (deploy/compose/compose.yaml, deploy/kind/base/mock-docs.yaml). It
+# listens on loopback in mock-docs' own container, so only an exec into that container reaches
+# it: no Service, published port or other pod can.
+MOCK_ADMIN_URL=http://127.0.0.1:9091
 AUDIT_TABLE=switchboard_audit.call_rows
 # The open-row query's view (crates/audit-postgres, sql/migrations/0005_open_rows.sql).
 OPEN_ROWS_VIEW=switchboard_audit.open_call_rows
@@ -118,6 +157,26 @@ OPEN_ATTEMPTS=""
 GATEWAY_POD=""
 # What the last fetch read.
 FETCHED=""
+# The last step_mark, in epoch seconds and as an RFC 3339 time; and the gateway's log lines the
+# last wait_for_events selected.
+MARK_EPOCH=""
+MARK_TIME=""
+EVENTS=""
+# What the last workload tallied printed.
+WORKLOAD_OUTPUT=""
+# The workload start_workload started, its label, and in Compose the file its output goes to.
+BACKGROUND=""
+BACKGROUND_LABEL=""
+BACKGROUND_OUTPUT=""
+# While a demonstration has changed what the gateway serves: the registry file to put back, and
+# whether mock-docs serves the drifted description. on_exit undoes both if the run stops early.
+RESTORE_REGISTRY=""
+DRIFTED=""
+# Set from the drift step's change until the gateway serves the re-approval: the gateway may hold
+# withdrawals of both list tools in its memory, which only a new approval or a restart clears.
+# on_exit says so and how to clear them, and restarts nothing: the gateway is left as it was, to
+# be looked at.
+WITHDRAWAL_HELD=""
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
 # team_entry TEAM: TEAM's entry of the mock server, its surface. team_project TEAM: the project
@@ -181,6 +240,7 @@ result_total() {
 # its lines.
 tally_workload() {
   local label=$1 status=$2 output=$3 passed failed result total
+  WORKLOAD_OUTPUT=$output
   printf '%s\n' "$output" | sed 's/^/    /'
   passed=$(count_lines '^PASS ' "$output")
   failed=$(count_lines '^FAIL ' "$output")
@@ -223,6 +283,21 @@ on_exit() {
   if [ -n "$PAUSED" ]; then
     echo "unpausing postgres after the interrupted outage step" >&2
     dc unpause postgres >&2 || echo "could not unpause postgres; run: docker compose -f $COMPOSE_FILE unpause postgres" >&2
+  fi
+  if [ -n "$DRIFTED" ]; then
+    echo "serving list_documents' approved description again after the interrupted drift step" >&2
+    mock_admin DELETE /admin/definitions/list_documents >&2 || echo "could not; mock-docs still serves the drifted description" >&2
+  fi
+  if [ -n "$RESTORE_REGISTRY" ]; then
+    echo "putting back the registry the gateway served before the interrupted step" >&2
+    install_registry "$RESTORE_REGISTRY" >&2 || echo "could not; the next run puts it back" >&2
+  fi
+  if [ -n "$WITHDRAWAL_HELD" ]; then
+    echo "the gateway may still hold the drift step's withdrawals of docs-team-a__list_documents and docs-team-b__list_documents in memory; until it restarts, a run against it fails" >&2
+    case "$MODE" in
+      compose) echo "to clear them, stop Compose and start afresh: $0 down compose" >&2 ;;
+      kind) echo "to clear them, restart the gateway: kubectl --kubeconfig $KCFG --context kind-$CLUSTER -n switchboard rollout restart deploy/gateway" >&2 ;;
+    esac
   fi
   result "$status"
 }
@@ -324,17 +399,24 @@ check_row_resources() {
 # failure writes no row, so a refused caller's list leaves none. Each list row was made by
 # team-a or team-b and names the tools that caller was shown on its own surface under the row's
 # policy revision: its own entry's two tools under $REVISION, and only its list tool under
-# $WITHDRAWN_REVISION, after each team's read tool is withdrawn. None is left out. ROWS is what
-# row_resources_json prints.
+# $WITHDRAWN_REVISION, after each team's read tool is withdrawn. Under a revision the drift pass
+# derived from $REVISION, `$REVISION+withdrawn:` and the withdrawn tools, they are its two tools
+# less those; and under a re-approval's, `$VARIANT_REVISION-reapproved-` and the time, its two
+# tools.
+# None is left out. ROWS is what row_resources_json prints.
 check_list_rows() {
   local rows=$1 expected=$2 lists wrong
   # shellcheck disable=SC2016 # jq's own variables
   if ! lists=$(printf '%s' "$rows" | jq -e '[.[] | select(.kind == "list")] | length') \
-    || ! wrong=$(printf '%s' "$rows" | jq -c --arg revision "$REVISION" --arg withdrawn "$WITHDRAWN_REVISION" '
+    || ! wrong=$(printf '%s' "$rows" | jq -c --arg revision "$REVISION" --arg withdrawn "$WITHDRAWN_REVISION" --arg variant "$VARIANT_REVISION" '
         def entry: {"team-a": "docs-team-a", "team-b": "docs-team-b"}[.team // ""];
+        def both: [entry + "__list_documents", entry + "__read_document"];
         def shown: if entry == null then null
-          else {($revision): [entry + "__list_documents", entry + "__read_document"],
-                ($withdrawn): [entry + "__list_documents"]}[.revision // ""] end;
+          elif .revision == $revision or ((.revision // "") | test("^" + $variant + "-reapproved-[0-9]{8}T[0-9]{6}Z$")) then both
+          elif .revision == $withdrawn then [entry + "__list_documents"]
+          elif ((.revision // "") | startswith($revision + "+withdrawn:")) then
+            ((.revision | ltrimstr($revision + "+withdrawn:") | split(",")) as $gone | both - $gone)
+          else null end;
         .[] | select(.kind == "list")
         | select(((.team == "team-a" or .team == "team-b")
             and shown != null and (.listed | type) == "array"
@@ -585,18 +667,643 @@ check_server_entries() {
   done
 }
 
+# --- #11's demonstrations, in both runs -------------------------------------------------------
+
+# check_bounds LOGS: the gateway's boot lines in LOGS give what the demonstrations rely on: a cap
+# of TEAM_CAP calls in flight from each team to each server, the default CALL_DEADLINE s
+# deadline on each entry's calls, and a DRIFT_INTERVAL s drift interval. The gateway logs a
+# server's bounds only when the deployment file sets them, so an entry with no such line has
+# the default. A gateway that started more than once (a Compose container started again) is
+# read at its last start.
+check_bounds() {
+  local boot entry
+  boot=$(printf '%s\n' "$1" | jq -cR 'fromjson? | .fields? // empty | select(.event == "boot")' 2>/dev/null) || boot=""
+  check "$(jq -rs '[.[] | .per_team_per_server_in_flight // empty] | last // empty' <<<"$boot")" "$TEAM_CAP" \
+    "the gateway caps each team at $TEAM_CAP calls in flight to each server (decision 0014)"
+  for entry in docs-team-a docs-team-b; do
+    # shellcheck disable=SC2016 # jq's own variables
+    check "$(jq -rs --arg entry "$entry" '[.[] | select(.server == $entry) | .deadline_seconds // empty] | last // "the default"' <<<"$boot")" \
+      "the default" "entry $entry's calls have the default deadline, $CALL_DEADLINE s: the deployment file sets none (decision 0014)"
+  done
+  check "$(jq -rs '[.[] | .drift_interval_seconds // empty] | last // empty' <<<"$boot")" "$DRIFT_INTERVAL" \
+    "the drift pass reads each entry's tool list every $DRIFT_INTERVAL s"
+}
+
+# workload LABEL TEAM MODE [ARGS...]: runs TEAM's workload once in MODE, in whichever
+# deployment is running, and tallies it.
+workload() {
+  local label=$1 team=$2 mode=$3
+  shift 3
+  case "$MODE" in
+    compose) compose_workload "$label" "$mode" "$team" "$@" ;;
+    kind) kind_workload "$label" "$team" mock-workload "$mode" "$@" ;;
+  esac
+}
+
+# start_workload LABEL TEAM MODE [ARGS...]: starts TEAM's workload in MODE and returns at once.
+# finish_workload waits for it and tallies it. One runs at a time.
+start_workload() {
+  local team=$2 mode=$3
+  BACKGROUND_LABEL=$1
+  shift 3
+  case "$MODE" in
+    compose)
+      BACKGROUND_OUTPUT=$DEMO_DIR/background-workload.log
+      compose_workload_output "$mode" "$team" "$@" >"$BACKGROUND_OUTPUT" 2>&1 &
+      BACKGROUND=$!
+      ;;
+    kind)
+      start_job "$team" mock-workload "$mode" "$@"
+      BACKGROUND=$team/$JOB
+      ;;
+  esac
+}
+finish_workload() {
+  local status=0
+  case "$MODE" in
+    compose)
+      wait "$BACKGROUND" || status=$?
+      tally_workload "$BACKGROUND_LABEL" "$status" "$(cat "$BACKGROUND_OUTPUT")"
+      ;;
+    kind)
+      wait_job "${BACKGROUND%%/*}" "${BACKGROUND#*/}" 300
+      if fetch "$BACKGROUND_LABEL's log (job $BACKGROUND)" k -n "${BACKGROUND%%/*}" logs "job/${BACKGROUND#*/}"; then
+        tally_workload "$BACKGROUND_LABEL" "$JOB_STATUS" "$FETCHED"
+      fi
+      ;;
+  esac
+  BACKGROUND=""
+}
+
+# step_mark: sets MARK_EPOCH and MARK_TIME to now by the database's clock, as mark_start sets
+# SINCE and LOG_SINCE, so a step reads only its own rows and log lines.
+step_mark() {
+  local mark
+  mark=$(psql_superuser -AtF ' ' -c "select extract(epoch from now()),
+    to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')")
+  MARK_EPOCH=${mark% *}
+  MARK_TIME=${mark#* }
+}
+
+# step_rows SINCE: every row begun since SINCE (epoch seconds), as one JSON array in the order
+# begun, with what the demonstrations' checks read. `begun` and `finished` are epoch seconds.
+step_rows() {
+  psql_reader -Atc "select coalesce(json_agg(json_build_object('kind', kind, 'team', proved_team,
+      'tool', tool, 'decision', decision, 'reason', reason, 'outcome', outcome,
+      'error_kind', error_kind, 'outcome_sentence', outcome_sentence, 'latency_ms', latency_ms,
+      'revision', policy_revision, 'listed', listed_tools,
+      'begun', extract(epoch from begun_at), 'finished', extract(epoch from finished_at))
+      order by begun_at), '[]') from $AUDIT_TABLE where begun_at >= to_timestamp($1)"
+}
+
+# gateway_log SINCE: the gateway's log lines from SINCE, an RFC 3339 time.
+gateway_log() {
+  case "$MODE" in
+    compose) dc logs --no-log-prefix --since "$1" gateway ;;
+    kind) k -n switchboard logs --since-time "$1" -c gateway "pod/$GATEWAY_POD" ;;
+  esac
+}
+
+# gateway_metrics: what the gateway's GET /metrics answers now.
+gateway_metrics() {
+  case "$MODE" in
+    compose) dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics ;;
+    kind) k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- curl -sS --fail http://localhost:9090/metrics ;;
+  esac
+}
+
+# events LOG FILTER: the gateway's JSON log lines in LOG that the jq FILTER selects, each as its
+# fields with its `timestamp` beside them, one compact JSON object a line.
+events() {
+  printf '%s\n' "$1" | jq -cR "fromjson? | . as \$line | (.fields? // empty) | . + {timestamp: \$line.timestamp} | $2"
+}
+
+# wait_for_events WHAT TIMEOUT COUNT SINCE FILTER: reads the gateway's log from SINCE every 2 s
+# until FILTER selects at least COUNT of its lines, for at most TIMEOUT seconds, and passes WHAT,
+# or fails it if they did not come in time. Sets EVENTS to the lines selected.
+wait_for_events() {
+  local what=$1 timeout=$2 count=$3 since=$4 filter=$5 waited=0 log
+  EVENTS=""
+  while :; do
+    if log=$(gateway_log "$since" 2>/dev/null); then
+      EVENTS=$(events "$log" "$filter" 2>/dev/null) || EVENTS=""
+    fi
+    if [ "$(count_lines . "$EVENTS")" -ge "$count" ]; then
+      pass "$what (seen within $waited s)"
+      return 0
+    fi
+    if [ "$waited" -ge "$timeout" ]; then
+      fail "$what (not seen within $timeout s: $(count_lines . "$EVENTS") of $count log lines)"
+      return 1
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+# mock_admin METHOD PATH [BODY]: one request to mock-docs' admin endpoint, MOCK_ADMIN_URL, from
+# inside mock-docs' own container: the endpoint listens on that container's loopback and nowhere
+# else. It has no credential of its own, so it accepts mock-docs' callers (crates/mock-docs-server):
+# the request carries docs-team-a's credential, in Compose its dummy credential and in kind a
+# short-lived token of its ServiceAccount for audience mock-docs, which the demo's own
+# kubeconfig asks the cluster for.
+mock_admin() {
+  local method=$1 path=$2 bearer request
+  case "$MODE" in
+    compose) bearer=$(cat "$COMPOSE_CREDENTIALS/docs-team-a-credential") ;;
+    kind) bearer=$(k -n switchboard create token docs-team-a --audience mock-docs --duration 10m) ;;
+  esac
+  request=(curl -sS --fail -w '\n' -X "$method" -H "Authorization: Bearer $bearer" "$MOCK_ADMIN_URL$path")
+  if [ $# -ge 3 ]; then
+    request+=(-H 'Content-Type: application/json' -d "$3")
+  fi
+  case "$MODE" in
+    compose) dc exec -T mock-docs "${request[@]}" ;;
+    kind) k -n mock-docs exec deploy/mock-docs -c mock-docs -- "${request[@]}" ;;
+  esac
+}
+
+# accepted_calls LOG: how many tools/call requests mock-docs accepted in LOG, its log lines. Its
+# admin requests and the gateway's drift polls are not calls.
+accepted_calls() {
+  printf '%s\n' "$1" | jq -cR 'fromjson? | select(.event == "request" and .accepted == true and .rpc_method == "tools/call")' \
+    | awk 'END { print NR }'
+}
+
+# served_registry: the registry file the gateway serves now: Compose's copy under .demo, or kind's
+# ConfigMap `registry`.
+served_registry() {
+  case "$MODE" in
+    compose) cat "$DEMO_DIR/compose-registry/registry.toml" ;;
+    kind) k -n switchboard get configmap registry -o jsonpath='{.data.registry\.toml}' ;;
+  esac
+}
+
+# install_registry FILE: puts FILE where the gateway reads its registry. In kind the kubelet
+# updates the mounted ConfigMap when it next syncs the gateway's pod, up to a minute or more
+# away; a change to the pod's annotations makes it sync now.
+install_registry() {
+  case "$MODE" in
+    compose) swap_registry "$1" ;;
+    kind)
+      k -n switchboard create configmap registry --from-file=registry.toml="$1" --dry-run=client -o yaml \
+        | k apply -f - >/dev/null
+      k -n switchboard annotate --overwrite "pod/$GATEWAY_POD" "switchboard.io/registry-installed=$(date +%s)" >/dev/null
+      ;;
+  esac
+}
+
+# reload_wait: how long a registry change may take to reach the gateway: its 2 s poll in
+# Compose, and the kubelet's update of the ConfigMap in kind as well.
+reload_wait() {
+  case "$MODE" in
+    compose) echo 30 ;;
+    kind) echo 240 ;;
+  esac
+}
+
+# reach_variant REVISION: the registry on standard input, with revision REVISION and team-b
+# admitted to docs-team-a's surface beside team-a. docs-team-a's entry narrows nothing and
+# reaches atlas, which team-b's limit does not hold, so the loader must refuse it (decision 0011,
+# rule 5). Fails, and the output is not to be used, unless it changed exactly those two lines.
+reach_variant() {
+  awk -v revision="$1" '
+    /^\[/ { table = $0; surface = "" }
+    table == "" && /^revision = "/ { print "revision = \"" revision "\""; revised++; next }
+    table == "[[surfaces]]" && $0 == "name = \"docs-team-a\"" { surface = "docs-team-a" }
+    surface == "docs-team-a" && $0 == "teams = [\"team-a\"]" { print "teams = [\"team-a\", \"team-b\"]"; widened++; next }
+    { print }
+    END { exit !(revised == 1 && widened == 1) }'
+}
+
+# reapproval_variant REVISION APPROVED_AT TOOL...: the registry on standard input, with revision
+# REVISION and each TOOL approved again at APPROVED_AT. Nothing else changes: not the definition
+# approved, its hash or the binding. A new approved_at is a new approval, which clears a
+# standing withdrawal of the tool (decision 0013, section 6). Fails, and the output is not to be
+# used, unless it changed the revision and one approved_at for each TOOL.
+reapproval_variant() {
+  local revision=$1 approved_at=$2
+  shift 2
+  awk -v revision="$revision" -v approved_at="$approved_at" -v tools="$*" '
+    BEGIN { n = split(tools, list, " "); for (i = 1; i <= n; i++) wanted["name = \"" list[i] "\""] = 1 }
+    /^\[/ { table = $0; tool = "" }
+    table == "" && /^revision = "/ { print "revision = \"" revision "\""; revised++; next }
+    table == "[[tools]]" && ($0 in wanted) { tool = $0 }
+    tool != "" && /^approved_at = / { print "approved_at = " approved_at; approved++; tool = ""; next }
+    { print }
+    END { exit !(revised == 1 && approved == n && n > 0) }'
+}
+
+# number_or_none VALUE: VALUE if it is a whole number, or `none`.
+number_or_none() {
+  case "$1" in
+    '' | *[!0-9]*) echo none ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# check_undeclared ROWS BEFORE AFTER: team-a's read with an argument its approval does not
+# declare (workload.sh undeclared). ROWS are the step's rows (step_rows): exactly one, team-a's
+# read, allowed and completed as error of the kind invalid_arguments, since the argument check
+# runs inside the audited run and sends nothing. BEFORE and AFTER are how many tools/call
+# requests mock-docs had accepted before and after the step: the same.
+check_undeclared() {
+  local rows=$1 read
+  read=$(team_entry team-a)__read_document
+  case "$(number_or_none "$2") $(number_or_none "$3")" in
+    *none*) fail "mock-docs received no call for the read with an undeclared argument (its calls could not be counted: '$2' before, '$3' after)" ;;
+    *) check "$3" "$2" "mock-docs received no call for the read with an undeclared argument (its calls before and after)" ;;
+  esac
+  check "$(jq -c '[.[] | {team, tool, decision, outcome, error_kind}]' <<<"$rows" 2>/dev/null)" \
+    "[{\"team\":\"team-a\",\"tool\":\"$read\",\"decision\":\"allow\",\"outcome\":\"error\",\"error_kind\":\"invalid_arguments\"}]" \
+    "audit: the step's one row is team-a's read, allowed and completed as error of the kind invalid_arguments"
+}
+
+# check_meanwhile ROWS WHAT: team-b's steady reads went on while team-a's calls in ROWS were held:
+# at least one of team-b's rows began after the first of team-a's began, and finished, ok,
+# before the last of team-a's finished. Team-b's calls go to its own entry, so neither cap of
+# docs-team-a's holds them; this shows the gateway answered them meanwhile.
+check_meanwhile() {
+  check_at_least "$(jq -r '[.[] | select(.team == "team-a")] as $a
+      | ($a | map(.begun) | min) as $from | ($a | map(.finished) | max) as $to
+      | [.[] | select(.team == "team-b" and .decision == "allow" and .outcome == "ok"
+          and $from != null and $to != null and .begun > $from and .finished != null
+          and .finished < $to)] | length' <<<"$1" 2>/dev/null)" 1 \
+    "audit: team-b's reads were answered while $2"
+}
+
+# check_hang ROWS OUTPUT: team-a's read of slow-doc (workload.sh hang). Of the step's rows,
+# team-a's is exactly one: that read, allowed and completed as error of the kind
+# oversized_or_late_read, its connector abandoned at the call deadline, within a second of it.
+# The row's latency ends before its audit completes, so it does not show when the caller was
+# answered: OUTPUT, what the workload printed, does. Its client got the answer no sooner than
+# CLIENT_EARLY_MS before the deadline and no later than HANG_ALLOWANCE_MS after it. Team-b's
+# reads went on meanwhile.
+check_hang() {
+  local rows=$1 output=$2 read deadline=$((CALL_DEADLINE * 1000)) elapsed
+  read=$(team_entry team-a)__read_document
+  check "$(jq -c '[.[] | select(.team == "team-a") | {tool, decision, outcome, error_kind}]' <<<"$rows" 2>/dev/null)" \
+    "[{\"tool\":\"$read\",\"decision\":\"allow\",\"outcome\":\"error\",\"error_kind\":\"oversized_or_late_read\"}]" \
+    "audit: team-a's one row is its read, allowed and completed as error of the kind oversized_or_late_read"
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(jq -r --argjson ms "$deadline" '[.[] | select(.team == "team-a" and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length' <<<"$rows" 2>/dev/null)" 1 \
+    "audit: it was answered at the $CALL_DEADLINE s deadline, within a second ($(jq -r '[.[] | select(.team == "team-a") | .latency_ms] | map(tostring) | join(",")' <<<"$rows" 2>/dev/null) ms)"
+  elapsed=$(printf '%s\n' "$output" | sed -nE "s/^ *read of slow-doc: answered after ([0-9]+|unknown) ms by the client's clock\$/\\1/p" | tail -n 1)
+  local within="team-a's client was answered between $CLIENT_EARLY_MS ms before the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
+  if [ "$(number_or_none "$elapsed")" = none ]; then
+    fail "$within (got '${elapsed:-no time}' from the workload)"
+  elif [ "$elapsed" -ge $((deadline - CLIENT_EARLY_MS)) ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then
+    pass "$within ($elapsed ms)"
+  else
+    fail "$within (got $elapsed ms)"
+  fi
+  check_meanwhile "$rows" "team-a's read was held until its deadline"
+}
+
+# check_overload ROWS SHED OUTPUT: team-a's TEAM_CAP + 1 reads of slow-doc at once (workload.sh
+# overload). Of the step's rows, team-a's are those reads, each allowed: TEAM_CAP completed as
+# error of the kind oversized_or_late_read, and one completed as refused, its row recording the
+# team-capacity sentence (decision 0014, section 2: refused, not error, which keeps no sentence).
+# Each of the TEAM_CAP was held until the deadline and no longer, as check_hang holds its one
+# read: its row's latency is within a second of the deadline, and OUTPUT, what the workload
+# printed, gives its client's answer between CLIENT_EARLY_MS before the deadline and
+# HANG_ALLOWANCE_MS after it. SHED is how many calls the gateway counted shed with scope team
+# over the step: that one. Team-b's reads went on meanwhile.
+check_overload() {
+  local rows=$1 shed=$2 output=$3 entry read calls=$((TEAM_CAP + 1)) deadline=$((CALL_DEADLINE * 1000))
+  entry=$(team_entry team-a)
+  read=${entry}__read_document
+  local sentence="Your team already has as many calls in flight to server \`$entry\` from this gateway as it allows, so this call to tool \`$read\` was not sent. Try it again shortly."
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(jq -r --arg read "$read" '[.[] | select(.team == "team-a")] | "\(length) rows, \([.[] | select(.tool == $read and .decision == "allow")] | length) allowed reads"' <<<"$rows" 2>/dev/null)" \
+    "$calls rows, $calls allowed reads" "audit: team-a's $calls reads each have a row, allowed, and the step has no other of team-a's"
+  check "$(jq -r '[.[] | select(.team == "team-a" and .outcome == "error" and .error_kind == "oversized_or_late_read")] | length' <<<"$rows" 2>/dev/null)" \
+    "$TEAM_CAP" "audit: $TEAM_CAP completed as error of the kind oversized_or_late_read"
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(jq -r --argjson ms "$deadline" '[.[] | select(.team == "team-a" and .error_kind == "oversized_or_late_read"
+      and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length' <<<"$rows" 2>/dev/null)" "$TEAM_CAP" \
+    "audit: each was answered at the $CALL_DEADLINE s deadline, within a second ($(jq -r '[.[] | select(.team == "team-a" and .error_kind == "oversized_or_late_read") | .latency_ms] | map(tostring) | join(",")' <<<"$rows" 2>/dev/null) ms)"
+  local times elapsed held=0 outside=0
+  local within="team-a's client was answered on each of the $TEAM_CAP held reads between $CLIENT_EARLY_MS ms before the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
+  times=$(printf '%s\n' "$output" | sed -nE "s/^ *read [0-9]+ of slow-doc, held: answered after ([0-9]+|unknown) ms by the client's clock\$/\\1/p")
+  for elapsed in $times; do
+    held=$((held + 1))
+    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt $((deadline - CLIENT_EARLY_MS)) ] ||
+      [ "$elapsed" -gt $((deadline + HANG_ALLOWANCE_MS)) ]; then
+      outside=$((outside + 1))
+    fi
+  done
+  times=$(printf '%s\n' "$times" | paste -sd, -)
+  if [ "$held" -eq "$TEAM_CAP" ] && [ "$outside" -eq 0 ]; then
+    pass "$within ($times ms)"
+  else
+    fail "$within (got $held times from the workload, $outside of them outside: '$times')"
+  fi
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(jq -r --arg sentence "$sentence" '[.[] | select(.team == "team-a" and .outcome == "refused" and .outcome_sentence == $sentence)] | length' <<<"$rows" 2>/dev/null)" \
+    1 "audit: one was over the cap of $TEAM_CAP, completed as refused with the team-capacity sentence"
+  check "$shed" 1 "metrics: the gateway counted one call shed with scope team"
+  check_meanwhile "$rows" "team-a's reads filled its cap"
+}
+
+# check_refused_at_load EVENTS VARIANT: the gateway's reload lines (policy_reloaded and
+# policy_reload_refused) since the variant of revision VARIANT was installed. The first refuses
+# it for rule 5, naming docs-team-a's surface, the atlas it reaches and team-b, and says the
+# policy served is still REVISION's; no line says the variant was served.
+check_refused_at_load() {
+  local events=$1 variant=$2 first reason
+  first=$(printf '%s\n' "$events" | head -n 1)
+  check "$(jq -r '.event' <<<"$first" 2>/dev/null)" policy_reload_refused "the gateway refused the registry that admits team-b to docs-team-a's surface"
+  reason=$(jq -r '.reason' <<<"$first" 2>/dev/null) || reason=""
+  case "$reason" in
+    *"rule 5: surface \`docs-team-a\` serves tool \`docs-team-a__"*"\`, whose entry reaches \`docs / project / atlas\`, to team \`team-b\`, whose limit does not hold it"*)
+      pass "its reason is rule 5: the entry reaches atlas, which team-b's limit does not hold" ;;
+    *) fail "its reason is rule 5: the entry reaches atlas, which team-b's limit does not hold (got '$reason')" ;;
+  esac
+  check "$(jq -r '.served' <<<"$first" 2>/dev/null)" "$REVISION" "the policy served is still revision $REVISION"
+  # shellcheck disable=SC2016 # jq's own variables
+  check "$(printf '%s\n' "$events" | jq -c --arg variant "$variant" 'select(.event == "policy_reloaded" and (.revision | startswith($variant)))' 2>/dev/null | awk 'END { print NR }')" \
+    0 "the gateway never served revision $variant"
+}
+
+# check_withdrawal EVENTS CHANGED: the tool_withdrawn lines since mock-docs began serving the
+# drifted description at CHANGED (epoch seconds). Each list tool, docs-team-a's and
+# docs-team-b's, was withdrawn once, for a changed definition, from base REVISION, within the
+# drift interval plus the call deadline of CHANGED (decision 0013, section 5); and the revision
+# served after the last withdrawal is DRIFTED_REVISION, the literal derived one (section 6).
+check_withdrawal() {
+  local events=$1 changed=${2%.*} tool at
+  for tool in docs-team-a__list_documents docs-team-b__list_documents; do
+    # shellcheck disable=SC2016 # jq's own variables
+    check "$(printf '%s\n' "$events" | jq -r --arg tool "$tool" 'select(.tool == $tool) | "\(.cause) from \(.base)"' 2>/dev/null | sort | uniq -c | awk '{ $1 = $1 " x"; print }')" \
+      "1 x definition changed from $REVISION" "the gateway withdrew $tool once, for a changed definition, from revision $REVISION"
+    # shellcheck disable=SC2016 # jq's own variables
+    at=$(printf '%s\n' "$events" | jq -r --arg tool "$tool" 'select(.tool == $tool) | .timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null | head -n 1)
+    case "$at:$changed" in
+      [0-9]*:[0-9]*) check_at_most "$((at - changed))" $((DRIFT_INTERVAL + CALL_DEADLINE)) \
+        "it was withdrawn within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline of the change (seconds)" ;;
+      *) fail "it was withdrawn within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline of the change (got '$at' and '$changed')" ;;
+    esac
+  done
+  check "$(printf '%s\n' "$events" | tail -n 1 | jq -r '.revision' 2>/dev/null)" "$DRIFTED_REVISION" \
+    "the revision served after both withdrawals is the literal derived one"
+}
+
+# check_drift_rows ROWS REVISION LISTED CALL: team-a's rows from one workload run of the drift
+# step: its tools/list, a row of kind list under REVISION naming exactly LISTED (its tools,
+# comma-separated, sorted), then its call to its list tool under REVISION, CALL being its
+# decision and its reason or outcome: `deny unknown_tool` while the tool is withdrawn, `allow ok`
+# while it is served.
+check_drift_rows() {
+  local rows=$1 revision=$2 listed=$3 call=$4 want
+  # shellcheck disable=SC2016 # jq's own variables
+  want=$(jq -cn --arg revision "$revision" --arg listed "$listed" --arg call "$call" \
+    --arg tool "$(team_entry team-a)__list_documents" '[
+      {kind: "list", revision: $revision, listed: ($listed | split(","))},
+      {kind: "call", revision: $revision, tool: $tool, call: $call}]')
+  check "$(jq -c '[.[] | select(.team == "team-a")
+      | if .kind == "list" then {kind, revision, listed: (.listed | sort)}
+        else {kind, revision, tool, call: "\(.decision) \(.reason // .outcome)"} end]' <<<"$rows" 2>/dev/null)" \
+    "$want" "audit: team-a's list and call are recorded under revision $revision, listing $listed, the call $call"
+}
+
+# check_reapproval EVENTS REVISION: the gateway's lines since the registry approving both list
+# tools again, under REVISION, was installed (policy_reloaded, policy_withdrawal_cleared and
+# tool_withdrawn). It served REVISION itself, with no withdrawal derived from it, and dropped
+# both list tools' withdrawals as approved again; it withdrew nothing.
+check_reapproval() {
+  local events=$1 revision=$2
+  check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_reloaded") | .revision' 2>/dev/null | head -n 1)" \
+    "$revision" "the gateway serves revision $revision, with no withdrawal"
+  check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\(.tool): \(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \
+    "docs-team-a__list_documents: approved again;docs-team-b__list_documents: approved again" \
+    "both list tools' withdrawals cleared as approved again"
+  check "$(printf '%s\n' "$events" | jq -c 'select(.event == "tool_withdrawn")' 2>/dev/null | awk 'END { print NR }')" 0 \
+    "the drift pass withdrew nothing since"
+}
+
+# drift_polls TEXT: the drift pass's successful reads of each entry's tool list so far, from the
+# metrics TEXT, as `A B`.
+drift_polls() {
+  echo "$(metric 'switchboard_drift_polls_total{server="docs-team-a",result="ok"}' "$1") $(metric 'switchboard_drift_polls_total{server="docs-team-b",result="ok"}' "$1")"
+}
+
+# wait_for_polls N: waits until the drift pass has read each entry's tool list N more times,
+# so N polls of each began after the wait did, at most N intervals plus a call deadline and 10 s.
+wait_for_polls() {
+  local polls=$1 limit=$(($1 * DRIFT_INTERVAL + CALL_DEADLINE + 10)) waited=0 from now a b
+  fetch "the gateway's metrics" gateway_metrics || return 0
+  from=$(drift_polls "$FETCHED")
+  case "$from" in
+    *[!0-9\ ]* | ' '* | *' ') fail "the drift pass's polls are counted (got '$from')"; return 0 ;;
+  esac
+  while :; do
+    sleep 2
+    waited=$((waited + 2))
+    fetch "the gateway's metrics" gateway_metrics || return 0
+    now=$(drift_polls "$FETCHED")
+    read -r a b <<<"$now"
+    if [ "$(number_or_none "$a")" != none ] && [ "$(number_or_none "$b")" != none ] &&
+      [ "$a" -ge $((${from% *} + polls)) ] && [ "$b" -ge $((${from#* } + polls)) ]; then
+      pass "the drift pass read each entry's tool list $polls more times (polls $from, then $now, within $waited s)"
+      return 0
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      fail "the drift pass read each entry's tool list $polls more times (polls $from, then $now, after $waited s)"
+      return 0
+    fi
+  done
+}
+
+# undeclared_step: decision 0011, section 1, and its Consequences: an undeclared argument is
+# refused before forwarding.
+undeclared_step() {
+  step "an undeclared argument: team-a's read with an argument its approval does not declare is refused before it is forwarded, and mock-docs receives nothing"
+  local before after
+  step_mark
+  if fetch "mock-docs' log" mock_docs_log; then before=$(accepted_calls "$FETCHED"); fi
+  workload "team-a, an undeclared argument" team-a undeclared
+  if fetch "mock-docs' log" mock_docs_log; then after=$(accepted_calls "$FETCHED"); fi
+  check_undeclared "$(step_rows "$MARK_EPOCH")" "${before:-}" "${after:-}"
+}
+
+# refused_at_load_step: decision 0011's Consequences: a registry admitting team-b to
+# docs-team-a's surface, whose entry reaches atlas, which team-b's limit does not hold, is
+# refused at load. The variant is made from the registry served, at run time.
+refused_at_load_step() {
+  step "refused at load: a registry admitting team-b to docs-team-a's surface, whose entry reaches atlas, is refused for rule 5 and revision $REVISION stays served"
+  local served=$DEMO_DIR/registry-served.toml variant=$DEMO_DIR/registry-variant.toml revision
+  revision=$VARIANT_REVISION-reach-$(date -u +%Y%m%dT%H%M%SZ)
+  served_registry >"$served"
+  if ! reach_variant "$revision" <"$served" >"$variant"; then
+    fail "the registry served admits team-a alone to docs-team-a's surface, so the variant can be made from it"
+    return 0
+  fi
+  step_mark
+  RESTORE_REGISTRY=$served
+  install_registry "$variant"
+  if wait_for_events "the gateway read the variant" "$(reload_wait)" 1 "$MARK_TIME" \
+    'select(.event == "policy_reloaded" or .event == "policy_reload_refused")'; then
+    check_refused_at_load "$EVENTS" "$revision"
+  fi
+  step_mark
+  install_registry "$served"
+  wait_for_events "the gateway reloaded the registry served before, revision $REVISION" "$(reload_wait)" 1 "$MARK_TIME" \
+    "select(.event == \"policy_reloaded\" and .revision == \"$REVISION\")" || true
+  RESTORE_REGISTRY=""
+}
+
+# isolation_steps: decision 0014, sections 1 and 2: a hanging server and an overload, each held
+# to team-a's own calls while team-b's go on.
+isolation_steps() {
+  local reads stream hang burst before after
+  case "$MODE" in
+    compose) reads=30 ;;
+    kind) reads=60 ;;
+  esac
+  step "team-b reads its own project once a second, $reads times, through the next two steps"
+  step_mark
+  stream=$MARK_EPOCH
+  start_workload "team-b, steady reads" team-b steady "$reads"
+  local waited=0
+  until [ "$(psql_reader -Atc "select count(*) from $AUDIT_TABLE where begun_at >= to_timestamp($stream)
+      and proved_team = 'team-b' and outcome = 'ok'")" -ge 1 ] || [ "$waited" -ge 120 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "    team-b's reads began after ${waited} s"
+
+  step "a hanging server: team-a reads slow-doc, which mock-docs answers after 10 s, and the gateway answers at the $CALL_DEADLINE s call deadline"
+  step_mark
+  hang=$MARK_EPOCH
+  WORKLOAD_OUTPUT=""
+  workload "team-a, a read past its deadline" team-a hang
+  check_hang "$(step_rows "$hang")" "$WORKLOAD_OUTPUT"
+
+  step "overload: team-a starts $((TEAM_CAP + 1)) reads of slow-doc at once, one over its cap of $TEAM_CAP calls in flight to its server"
+  step_mark
+  burst=$MARK_EPOCH
+  if fetch "the gateway's metrics" gateway_metrics; then
+    before=$(metric 'switchboard_calls_shed_total{scope="team"}' "$FETCHED")
+  fi
+  WORKLOAD_OUTPUT=""
+  workload "team-a, overload" team-a overload $((TEAM_CAP + 1))
+  if fetch "the gateway's metrics" gateway_metrics; then
+    after=$(metric 'switchboard_calls_shed_total{scope="team"}' "$FETCHED")
+  fi
+  local shed=unreadable
+  if [ "$(number_or_none "${before:-}")" != none ] && [ "$(number_or_none "${after:-}")" != none ]; then
+    shed=$((after - before))
+  fi
+  check_overload "$(step_rows "$burst")" "$shed" "$WORKLOAD_OUTPUT"
+
+  step "team-b's steady reads: every one allowed and answered ok"
+  finish_workload
+  check "$(psql_reader -Atc "select count(*) from $AUDIT_TABLE where begun_at >= to_timestamp($stream)
+      and proved_team = 'team-b' and not (kind = 'call' and decision = 'allow' and outcome = 'ok')")" 0 \
+    "audit: every team-b row since its reads began is an allowed read answered ok"
+}
+
+# drift_steps: decision 0013, sections 5 to 7 and the acceptance scenarios of section 11: a
+# changed definition withdrawn within the interval plus the deadline, rows under the literal
+# derived revision, the withdrawal standing after the definition is restored, and a new approval
+# of the same definition clearing it. Nothing here approves a changed definition.
+drift_steps() {
+  local list
+  list=$(team_entry team-a)__list_documents
+  step "drift: mock-docs serves another description of list_documents, which both entries list; the gateway withdraws both list tools within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline"
+  step_mark
+  local changed=$MARK_EPOCH changed_at=$MARK_TIME
+  DRIFTED=1
+  WITHDRAWAL_HELD=1
+  mock_admin PUT /admin/definitions/list_documents "{\"description\": \"$DRIFTED_DESCRIPTION\"}" | sed 's/^/    mock-docs: /'
+  if wait_for_events "the gateway withdrew both list tools" $((DRIFT_INTERVAL + CALL_DEADLINE + 30)) 2 "$changed_at" \
+    'select(.event == "tool_withdrawn")'; then
+    printf '%s\n' "$EVENTS" | sed 's/^/    /'
+    check_withdrawal "$EVENTS" "$changed"
+  fi
+  step_mark
+  workload "team-a after the withdrawal" team-a withdrawn list
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$DRIFTED_REVISION" "$(team_entry team-a)__read_document" "deny unknown_tool"
+
+  step "drift: mock-docs serves the approved description again; the list tools stay withdrawn until they are approved again (decision 0013, section 7)"
+  step_mark
+  local restored_at=$MARK_TIME
+  mock_admin DELETE /admin/definitions/list_documents | sed 's/^/    mock-docs: /'
+  DRIFTED=""
+  wait_for_polls 2
+  step_mark
+  workload "team-a after the description is restored" team-a withdrawn list
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$DRIFTED_REVISION" "$(team_entry team-a)__read_document" "deny unknown_tool"
+  if fetch "the gateway's log" gateway_log "$restored_at"; then
+    check "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared")' | awk 'END { print NR }')" 0 \
+      "nothing cleared the withdrawals since"
+  fi
+
+  local served=$DEMO_DIR/registry-served.toml variant=$DEMO_DIR/registry-variant.toml stamp revision
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  revision=$VARIANT_REVISION-reapproved-$stamp
+  step "drift: both list tools approved again, unchanged, with a new approved_at, under revision $revision; the withdrawals clear and the next polls leave them served"
+  served_registry >"$served"
+  if ! reapproval_variant "$revision" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$list" "$(team_entry team-b)__list_documents" <"$served" >"$variant"; then
+    fail "the registry served approves both list tools, so the variant can be made from it"
+    return 0
+  fi
+  step_mark
+  local approved_at=$MARK_TIME
+  RESTORE_REGISTRY=$served
+  install_registry "$variant"
+  if wait_for_events "the gateway served revision $revision" "$(reload_wait)" 1 "$approved_at" \
+    "select(.event == \"policy_reloaded\" and (.revision | startswith(\"$revision\")))"; then
+    # A new approval clears a standing withdrawal (decision 0013, section 6).
+    WITHDRAWAL_HELD=""
+  fi
+  wait_for_polls 2
+  if fetch "the gateway's log" gateway_log "$approved_at"; then
+    check_reapproval "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared" or .event == "tool_withdrawn")')" "$revision"
+  fi
+  step_mark
+  workload "team-a after the new approval" team-a served
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$revision" "$list,$(team_entry team-a)__read_document" "allow ok"
+
+  step "drift: the registry served before, revision $REVISION, back in place; both list tools served"
+  step_mark
+  install_registry "$served"
+  wait_for_events "the gateway served revision $REVISION" "$(reload_wait)" 1 "$MARK_TIME" \
+    "select(.event == \"policy_reloaded\" and .revision == \"$REVISION\")" || true
+  RESTORE_REGISTRY=""
+  step_mark
+  workload "team-a under revision $REVISION" team-a served
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$REVISION" "$list,$(team_entry team-a)__read_document" "allow ok"
+}
+
+# demonstrations: #11's demonstrations, in order, in whichever deployment is running.
+demonstrations() {
+  undeclared_step
+  refused_at_load_step
+  isolation_steps
+  drift_steps
+}
+
 # --- Compose --------------------------------------------------------------------------------
 
-compose_workload() { # LABEL MODE TEAM: runs the workload service once
-  local label=$1 mode=$2 team=$3 own other output status
+compose_workload_output() { # MODE TEAM [ARGS...]: runs the workload service once, and prints what it printed
+  local mode=$1 team=$2 own other
+  shift 2
   if [ "$team" = team-a ]; then own=atlas other=borealis; else own=borealis other=atlas; fi
   local issuer=http://dev-issuer:8090/token
-  if output=$(dc run --rm --no-deps -T \
+  dc run --rm --no-deps -T \
       -e "GATEWAY_URL=http://gateway:8080/mcp/$(team_entry "$team")" \
       -e "TOKEN_URL=$issuer?subject=workload:$team:mock-workload&audience=switchboard" \
       -e "OWN_PROJECT=$own" -e "OTHER_PROJECT=$other" \
       -e "BAD_TOKEN_URLS=$issuer?subject=workload:$team:stranger&audience=switchboard $issuer?subject=workload:$team:mock-workload&audience=not-switchboard" \
-      workload workload.sh "$mode" 2>&1); then
+      workload workload.sh "$mode" "$@" 2>&1
+}
+
+compose_workload() { # LABEL MODE TEAM [ARGS...]: runs the workload service once and tallies it
+  local label=$1 output status
+  shift
+  if output=$(compose_workload_output "$@"); then
     status=0
   else
     status=$?
@@ -641,6 +1348,7 @@ compose_run() {
   step "the gateway's boot lines"
   if fetch "the gateway's log" dc logs --no-log-prefix gateway; then
     check_boot "$FETCHED"
+    check_bounds "$FETCHED"
   fi
 
   step "team-a and team-b workloads"
@@ -681,28 +1389,33 @@ compose_run() {
   # Let the gateway load the restored registry before anything else runs against it.
   sleep 4
 
+  demonstrations
+
   step "the gateway's metrics (GET /metrics on its own listener, loopback in the container, unpublished)"
   if fetch "the gateway's metrics" dc exec -T gateway curl -sS --fail http://127.0.0.1:9090/metrics; then
     check_metrics outage "$FETCHED"
   fi
 
-  # Three lists: each team's full run, and the run after the withdrawal.
-  audit_rows 3
+  # Seven lists: each team's full run, the run after the withdrawal, and team-a's four in the
+  # drift steps.
+  audit_rows 7
   FINISHED=1
 }
 
 # --- kind -----------------------------------------------------------------------------------
 
-# start_job NAMESPACE CRONJOB MODE: starts a new Job, so a new pod, from the suspended CronJob's
-# template with MODE as the workload's argument. Sets JOB.
+# start_job NAMESPACE CRONJOB MODE [ARGS...]: starts a new Job, so a new pod, from the suspended
+# CronJob's template with MODE and ARGS as the workload's arguments. Sets JOB.
 start_job() {
   local ns=$1 cron=$2 mode=$3
+  shift 3
   JOB="$cron-$mode-$(date +%s)"
   k -n "$ns" get cronjob "$cron" -o json \
-    | jq --arg name "$JOB" --arg mode "$mode" '{
+    | jq --arg name "$JOB" '{
         apiVersion: "batch/v1", kind: "Job",
         metadata: {name: $name, namespace: .metadata.namespace, labels: .spec.jobTemplate.metadata.labels},
-        spec: (.spec.jobTemplate.spec | .template.spec.containers[0].args = [$mode])}' \
+        spec: (.spec.jobTemplate.spec | .template.spec.containers[0].args = $ARGS.positional)}' \
+      --args "$mode" "$@" \
     | k apply -f - >/dev/null
 }
 
@@ -725,11 +1438,12 @@ wait_job() {
   done
 }
 
-# kind_workload LABEL NAMESPACE CRONJOB MODE: runs the workload as a new Job and tallies its log.
-# A log that cannot be read fails as that, whatever part of it was printed.
+# kind_workload LABEL NAMESPACE CRONJOB MODE [ARGS...]: runs the workload as a new Job and
+# tallies its log. A log that cannot be read fails as that, whatever part of it was printed.
 kind_workload() {
   local label=$1 ns=$2 cron=$3 mode=$4
-  start_job "$ns" "$cron" "$mode"
+  shift 4
+  start_job "$ns" "$cron" "$mode" "$@"
   wait_job "$ns" "$JOB" 180
   if fetch "$label's log (job $ns/$JOB)" k -n "$ns" logs "job/$JOB"; then
     tally_workload "$label" "$JOB_STATUS" "$FETCHED"
@@ -1235,6 +1949,7 @@ kind_run() {
   if fetch "the gateway's log (pod $GATEWAY_POD)" k -n switchboard logs "pod/$GATEWAY_POD"; then
     check_boot "$FETCHED"
     check_keys_fetched "$FETCHED" "$KIND_ISSUER"
+    check_bounds "$FETCHED"
   fi
 
   step "the API server gives its issuer's keys, and nothing else, to a caller with no token (decision 0013, section 10)"
@@ -1308,6 +2023,8 @@ kind_run() {
   # audience), and the stranger once.
   check_at_least "$(count_lines '"event":"identity_failed"' "$gateway_logs")" 7 "the gateway logged every identity failure"
 
+  demonstrations
+
   step "the gateway's metrics (GET /metrics on its own port, which the teams cannot reach)"
   # The kind run has no database outage.
   if fetch "the gateway's metrics (pod $GATEWAY_POD)" k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \
@@ -1315,9 +2032,9 @@ kind_run() {
     check_metrics none "$FETCHED"
   fi
 
-  # Two lists: each team's full run. The probes before the policy make none, and the
-  # stranger's is refused for identity, which writes no row.
-  audit_rows 2
+  # Six lists: each team's full run, and team-a's four in the drift steps. The probes before
+  # the policy make none, and the stranger's is refused for identity, which writes no row.
+  audit_rows 6
   FINISHED=1
 }
 
