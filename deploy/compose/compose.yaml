@@ -121,9 +121,10 @@ services:
     # (dummy-credentials/mock-docs-callers). It is given each credential's sha256, never the
     # credential. It logs the sha256 prefix of every bearer it receives.
     #
-    # Its admin endpoint, which changes what it serves, is for demo.sh's drift step alone: it
-    # listens on this container's loopback, which no other container can reach, and demo.sh
-    # reaches it with `docker compose exec mock-docs curl`. With no admin credential it answers
+    # Its admin endpoint, which changes what it serves and the projects each caller may name, is
+    # for demo.sh's drift and reach steps alone: it listens on this container's loopback, which
+    # no other container can reach, and demo.sh reaches it with `docker compose exec mock-docs
+    # curl`. With no admin credential it answers
     # mock-docs' callers, and the binary serves it nowhere but on loopback.
     command: ["mock-docs-server"]
     environment:

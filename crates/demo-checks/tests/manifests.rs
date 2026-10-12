@@ -916,10 +916,10 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
     ));
 }
 
-/// mock-docs' admin endpoint changes what it serves, and is for demo.sh's drift step alone. In
-/// Compose and in kind it listens on its container's loopback, which the binary allows with no
-/// admin credential only because no caller can reach it there, and demo.sh reaches it from inside
-/// that container. No published port, containerPort, Service or network policy names its port,
+/// mock-docs' admin endpoint changes what it serves, and is for demo.sh's drift and reach
+/// steps. In Compose and in kind it listens on its container's loopback, which the binary
+/// allows with no admin credential only because no caller can reach it there, and demo.sh
+/// reaches it from inside that container. No published port, containerPort, Service or network policy names its port,
 /// so no workload, and not the gateway either, can reach it.
 #[test]
 fn mock_docs_admin_endpoint_is_reached_only_from_inside_its_container() {
