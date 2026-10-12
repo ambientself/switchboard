@@ -10,7 +10,7 @@ mod files;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
+use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
 use files::{
     AUDIENCE, Files, READ_TOOL, TEAM_A_SA, call, cluster_issuer, kubernetes_token, registry,
 };
@@ -55,15 +55,19 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
 fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
     let credential = files.path(&format!("{entry}-credential"));
     let credentials = FileCredentials::load([(entry.into(), credential)]).unwrap();
-    let upstream = Upstream::new(entry, url)
-        .tool(
-            format!("{entry}__read_document").parse().unwrap(),
-            "read_document",
-        )
-        .tool(
-            format!("{entry}__list_documents").parse().unwrap(),
-            "list_documents",
-        );
+    // The entry is in_cluster.
+    let upstream = Upstream {
+        destination: Destination::InCluster,
+        ..Upstream::new(entry, url)
+    }
+    .tool(
+        format!("{entry}__read_document").parse().unwrap(),
+        "read_document",
+    )
+    .tool(
+        format!("{entry}__list_documents").parse().unwrap(),
+        "list_documents",
+    );
     Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap())
 }
 

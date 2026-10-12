@@ -19,7 +19,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use connector_proxy::{FileCredentials, ProxyConnector, Upstream, outcome};
+use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream, outcome};
 use files::{
     AUDIENCE, Answered, Files, TEAM_A_SA, TEAM_B_SA, cluster_issuer, deployment_file,
     deployment_file_probing,
@@ -266,7 +266,12 @@ async fn wired(
         (SLOW, &slow.url, SLOW_TOOL),
         (OTHER, &other.url, OTHER_TOOL),
     ] {
-        let mut upstream = Upstream::new(server, url.clone()).tool(tool.parse().unwrap(), "read");
+        // Each entry is in_cluster.
+        let mut upstream = Upstream {
+            destination: Destination::InCluster,
+            ..Upstream::new(server, url.clone())
+        }
+        .tool(tool.parse().unwrap(), "read");
         upstream.deadline = deadline;
         let connector = ProxyConnector::new(upstream, credentials.clone()).unwrap();
         let bulkhead = Bulkhead::new(server.into(), Arc::new(connector), per_server, per_team);

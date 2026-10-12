@@ -66,13 +66,14 @@ pub struct Upstream {
 impl Upstream {
     /// A server at `url`, routed to by `connector`, with no tools yet and the default bounds:
     /// [`DEFAULT_DEADLINE`] and [`DEFAULT_MAX_RESPONSE_BYTES`]. Its destination is
-    /// [`Destination::InCluster`], with no CA file, and loopback is as
-    /// [`Loopback::of_this_build`] says; set each for a server elsewhere.
+    /// [`Destination::Public`], the stricter class, so a caller that never sets it is held to
+    /// `https` and public addresses; set [`Destination::InCluster`] for a Service in the
+    /// cluster. It has no CA file, and loopback is as [`Loopback::of_this_build`] says.
     pub fn new(connector: impl Into<ConnectorName>, url: impl Into<String>) -> Self {
         Self {
             connector: connector.into(),
             url: url.into(),
-            destination: Destination::InCluster,
+            destination: Destination::Public,
             ca_file: None,
             loopback: Loopback::of_this_build(),
             tools: BTreeMap::new(),

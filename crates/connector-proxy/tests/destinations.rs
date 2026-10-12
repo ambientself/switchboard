@@ -669,7 +669,7 @@ async fn a_refused_address_is_logged_naming_the_server() {
     let connector = ProxyConnector::new(
         Upstream {
             loopback: Loopback::Refused,
-            ..Upstream::new(name, server.url("http", "localhost"))
+            ..common::in_cluster(name, server.url("http", "localhost"))
                 .tool(gateway_core::ToolName::parse(READ_TOOL).unwrap(), "read")
         },
         credentials_for(name, GATEWAY_TOKEN),
@@ -728,7 +728,7 @@ async fn two_entries_at_one_address_have_separate_pools() {
     let url = server.url("http", "127.0.0.1");
     let entry = |name: &str| {
         ProxyConnector::new(
-            Upstream::new(name, url.clone())
+            common::in_cluster(name, url.clone())
                 .tool(gateway_core::ToolName::parse(READ_TOOL).unwrap(), "read"),
             credentials_for(name, GATEWAY_TOKEN),
         )

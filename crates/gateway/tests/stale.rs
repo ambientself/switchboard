@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::routing::get;
 
-use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
+use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
 use files::{AUDIENCE, Files, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, cluster_issuer};
 use gateway::boot::{self, Settings, Wiring};
 use gateway::{
@@ -86,15 +86,19 @@ impl Stale {
             let credentials =
                 FileCredentials::load([(entry.into(), files.path(&format!("{entry}-credential")))])
                     .unwrap();
-            let upstream = Upstream::new(entry, mock.url())
-                .tool(
-                    format!("{entry}__read_document").parse().unwrap(),
-                    "read_document",
-                )
-                .tool(
-                    format!("{entry}__list_documents").parse().unwrap(),
-                    "list_documents",
-                );
+            // The entry is in_cluster.
+            let upstream = Upstream {
+                destination: Destination::InCluster,
+                ..Upstream::new(entry, mock.url())
+            }
+            .tool(
+                format!("{entry}__read_document").parse().unwrap(),
+                "read_document",
+            )
+            .tool(
+                format!("{entry}__list_documents").parse().unwrap(),
+                "list_documents",
+            );
             let connector = Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap());
             wiring = wiring.proxied(entry, connector);
         }

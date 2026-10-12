@@ -30,7 +30,7 @@ fn target(url: &str) -> Upstream {
     Upstream {
         deadline: DEADLINE,
         max_response_bytes: 1000,
-        ..Upstream::new("docs", url)
+        ..common::in_cluster("docs", url)
     }
 }
 
@@ -383,7 +383,7 @@ async fn the_mock_server_refuses_all_three() {
         .unwrap();
     let (_file, credential) = foreign();
 
-    let report = probe(&Upstream::new("docs", server.url()), &credential)
+    let report = probe(&common::in_cluster("docs", server.url()), &credential)
         .await
         .unwrap();
 
