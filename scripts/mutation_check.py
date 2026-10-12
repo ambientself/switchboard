@@ -2711,6 +2711,8 @@ mutate("proxy-retry-enabled", "a request the client believes the server never sa
 mutate("proxy-loopback-allowed-in-release", "loopback is allowed whatever the connector is told, so a release build reaches it", PD,
        "        Refusal::Loopback if loopback != Loopback::Refused => None,\n",
        "        Refusal::Loopback => None,\n")
+mutate("proxy-default-in-cluster", "a server whose destination is never set may use plain http and private addresses", PC,
+       "            destination: Destination::Public,\n", "            destination: Destination::InCluster,\n")
 mutate("proxy-destination-refusal-unreported", "a call refused for its address is reported as a server that could not be reached", PC,
        "                ToolOutcome::error(ErrorKind::Other, outcome::DESTINATION_REFUSED)\n",
        "                ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE)\n")
@@ -4421,8 +4423,8 @@ mutate("gw-start-ca-file-optional-for-https", "an https server with no CA file p
 mutate("gw-start-ca-file-for-http-accepted", "a CA file for an http server passes the start's check", START,
        "            (false, true) => return Err(StartError::CaFileForHttp(server.name.clone())),\n",
        "            (false, true) => {}\n")
-mutate("gw-start-loopback-allowed-in-release", "a release start allows a server on loopback", START,
-       "    let loopback = if development {\n", "    let loopback = if true {\n")
+mutate("gw-start-destination-not-passed", "each server's connector is built with the default destination, not its entry's, so an in_cluster server is held to the public class", START,
+       "        upstream.destination = destination(server.destination);\n", "")
 mutate("gw-start-destinations-unchecked", "where each server is reached is not checked until its connector is built, after its credential is read", START,
        "    destinations(&registry, &deployment.ca_files, loopback)?;\n", "")
 
