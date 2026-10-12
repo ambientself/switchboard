@@ -2890,7 +2890,9 @@ mutate("registry-schema-boolean-root-loads", "a root input schema of `true` or `
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
 # pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
 # pg-retry-socket-failure-final, pg-finish-dropped-task-not-reported,
-# pg-finish-pause-past-deadline, pg-finish-pause-uncapped and pg-stats-histogram-off-by-one-bucket.
+# pg-finish-pause-past-deadline, pg-finish-pause-uncapped, pg-stats-histogram-off-by-one-bucket,
+# pg-stats-pool-timeout-as-budget, pg-stats-silent-database-not-pool-timeout and
+# pg-stats-connected-kept-across-attempts.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
