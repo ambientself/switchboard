@@ -176,7 +176,9 @@ pub(crate) fn describe(error: &tokio_postgres::Error) -> String {
 /// How many connections each pool may hold.
 ///
 /// Finish has a pool of its own, so a surge of begins cannot starve the writes that close
-/// rows. The defaults are provisional; decision 0009 leaves pool sizes to Q12.
+/// rows. The defaults are provisional; decision 0009 leaves pool sizes to Q12. The open-row
+/// query has a third pool, of [`OPEN_ROWS_POOL_SIZE`] connection, which is not set here. So a
+/// store opens at most `begin + finish + 1` connections: 21 with the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolSizes {
     /// Connections for begin.
@@ -520,6 +522,12 @@ pub(crate) const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// How long [`PgAuditStore::open_rows`] has, from asking for a connection to its answer.
 pub(crate) const OPEN_ROWS_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The connections [`PgAuditStore::open_rows`] has, in a pool of its own, so a query held up
+/// for its whole time limit never takes a connection a finish could use. The gateway's poll
+/// asks one query at a time, so a second connection would never be used, and the size is
+/// fixed rather than a [`PoolSizes`] setting.
+pub const OPEN_ROWS_POOL_SIZE: usize = 1;
+
 /// The open rows (decision 0009, "Open rows"): allowed rows of kind `call` with no completion
 /// past their deadline, by the database's clock. A denial and a list row are never open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -594,6 +602,8 @@ pub struct OpenRows {
 pub struct PgAuditStore {
     pub(crate) begin: Pool,
     pub(crate) finish: Pool,
+    /// The open-row query's own pool, of [`OPEN_ROWS_POOL_SIZE`].
+    pub(crate) open_rows_pool: Pool,
     budgets: Budgets,
     cancel: Canceller,
     counters: Arc<Counters>,
@@ -605,8 +615,9 @@ impl PgAuditStore {
     /// needed, with the default [`Budgets`]. Nothing connects here, so a database that is down
     /// is found by the first call, or by [`check_at_boot`](Self::check_at_boot).
     ///
-    /// Each session sets `synchronous_commit` to `on` and `search_path` to
-    /// `pg_catalog, pg_temp`, after any options `config` carries.
+    /// It has three pools: begin's and finish's, of `sizes`, and the open-row query's, of
+    /// [`OPEN_ROWS_POOL_SIZE`]. Each session in each of them sets `synchronous_commit` to `on`
+    /// and `search_path` to `pg_catalog, pg_temp`, after any options `config` carries.
     pub fn connect<T>(
         config: tokio_postgres::Config,
         tls: T,
@@ -636,6 +647,7 @@ impl PgAuditStore {
         };
         let begin = pool(sizes.begin)?;
         let finish = pool(sizes.finish)?;
+        let open_rows_pool = pool(OPEN_ROWS_POOL_SIZE)?;
         let cancel: Canceller = Arc::new(move |token: CancelToken| {
             let tls = tls.clone();
             Box::pin(async move {
@@ -647,6 +659,7 @@ impl PgAuditStore {
         Ok(Self {
             begin,
             finish,
+            open_rows_pool,
             budgets: Budgets::default(),
             cancel,
             counters: Arc::default(),
@@ -710,13 +723,14 @@ impl PgAuditStore {
     }
 
     /// Counts the open rows, and finds the earliest deadline among them, through the view
-    /// `switchboard_audit.open_call_rows`. Runs on the finish pool, within 2 s from asking for a
-    /// connection; past that, it asks the server to cancel the query and fails. Reads only:
-    /// nothing marks a row abandoned or writes its outcome.
+    /// `switchboard_audit.open_call_rows`. Runs on a pool of its own, of
+    /// [`OPEN_ROWS_POOL_SIZE`], so a query held up never delays a finish, within 2 s from
+    /// asking for a connection; past that, it asks the server to cancel the query and fails.
+    /// Reads only: nothing marks a row abandoned or writes its outcome.
     pub async fn open_rows(&self) -> Result<OpenRows, PgAuditError> {
         let budget = OPEN_ROWS_TIMEOUT;
         let deadline = Instant::now() + budget;
-        let client = timeout_at(deadline, self.finish.get())
+        let client = timeout_at(deadline, self.open_rows_pool.get())
             .await
             .map_err(|_| PgAuditError::OpenRowsTimedOut { budget })??;
         let query = client.query_one(

@@ -178,8 +178,8 @@ pub struct StoreStats {
     pub finish_latency: LatencyHistogram,
     /// The begin pool, which begins and list rows use.
     pub begin_pool: PoolStats,
-    /// The finish pool, which finishes, completions of failed begins' rows and the open-row
-    /// query use.
+    /// The finish pool, which finishes and completions of failed begins' rows use. The
+    /// open-row query has a pool of its own.
     pub finish_pool: PoolStats,
 }
 
