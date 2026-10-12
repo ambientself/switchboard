@@ -1023,18 +1023,22 @@ turn-grant checking off, run with identity disabled, run with audit disabled
 loopback destinations, for the tests' local servers
 ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). The release
 build refuses the first four at boot, before it makes any connection, and refuses a loopback
-destination when it connects. `#[cfg(test)]` cannot provide them, because the harness runs the
-gateway from integration tests and other crates. Since a feature can be turned on in any
-build, CI checks the release artifact itself: started with a `propose` snapshot and no receipt
-store, with grant checking off, with identity disabled and with audit disabled, it must refuse
-each, and it must refuse a loopback destination. The identity and audit refusals, and CI's
-steps for them, are built (#11): the binary refuses each opt-out, and runs the receipt-store
-gate, as soon as the registry loads, before it reads a credential, fetches a key or connects
-to the audit database. Until built-in connectors exist (milestone 4), a registry cannot reach
-the receipt-store gate: the snapshot loader's rule 2 (decision 0011) refuses every proxied
-tool not classified `read` first, so CI's `propose` step checks that refusal instead (#26
-below). The loopback refusal and its step arrive in milestone 3 (#11). With identity disabled
-a development build lists nothing and refuses every `tools/call`, with no row.
+destination too: an address that is a loopback literal at boot, before it reads a credential,
+and a name that resolves to loopback when it connects. `#[cfg(test)]` cannot provide them,
+because the harness runs the gateway from integration tests and other crates. Since a feature
+can be turned on in any build, CI checks the release artifact itself: started with a
+`propose` snapshot and no receipt store, with grant checking off, with identity disabled and
+with audit disabled, it must refuse each, and it must refuse a loopback destination. The
+identity and audit refusals, and CI's steps for them, are built (#11): the binary refuses
+each opt-out, and runs the receipt-store gate, as soon as the registry loads, before it reads
+a credential, fetches a key or connects to the audit database. Until built-in connectors exist
+(milestone 4), a registry cannot reach the receipt-store gate: the snapshot loader's rule 2
+(decision 0011) refuses every proxied tool not classified `read` first, so CI's `propose` step
+checks that refusal instead (#26 below). The loopback refusal and its step are built (#11):
+connector-proxy's own `test-support` feature, which the gateway's turns on, is the only way to
+reach loopback, and CI starts the release binary with a server at `127.0.0.1` and expects
+that refusal. With identity disabled a development build lists nothing and refuses every
+`tools/call`, with no row.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
@@ -1402,7 +1406,21 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   its credential permits, its reach and its reach test's date, but not the reach test's record,
   the probe record or the reach check (the connector entries entry below).
 - Drift detection and withdrawal: built (the drift pass entry below).
-- Destination limits, the server's identity verified and redirects refused: not built.
+- Destination limits, the server's identity verified and redirects refused: built. The
+  connector reaches an `https` server with its certificate verified against the server's
+  identity, the host in its address, trusting only the CA file `[servers.<name>] ca_file`
+  names: no roots are compiled in and none are read from the operating system. Plain `http` is
+  only for an `in_cluster` entry, and the gateway refuses to start with an `https` server that
+  has no CA file or an `http` server that has one. A DNS name is resolved once for each
+  connection by a resolver that drops every refused address, and the connector connects only
+  to the addresses it returned; an IP literal is checked when the connector is built, and at
+  boot. Loopback, unspecified, link-local (`169.254.169.254` among them), multicast and
+  broadcast addresses, and their IPv4-mapped and IPv4-compatible forms, are always refused,
+  and private and carrier-grade NAT ranges unless the entry is `in_cluster`. A refusal
+  is an error of the kind `other` with its own sentence, and a warning naming the server.
+  Loopback is allowed only in a development build (section 12), and CI checks the release
+  binary refuses it. Calls, tool lists and probes, `switchboard probe`'s included, go out on
+  the same checked client, which follows no redirect and reads no proxy setting.
 - Size limits, deadlines, bounded concurrency and per-team and per-server limits: built
   (#139). Each server's deadline and result size, and the caps on calls in flight in the
   instance, to each server and from each team to each server, are in the limits entry below.
@@ -1410,8 +1428,12 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   (`MAX_BODY_BYTES`).
 - Isolating a failing server: built (#139). A hanging server holds at most its own caps of
   slots until its calls' deadline (the limits entry below).
-- Upstream sessions isolated by server, credential identity and authorization context: not
-  built.
+- Upstream sessions isolated by server, credential identity and authorization context: built
+  as decision 0013, section 4 meets it. The connector keeps no upstream session and sends no
+  `initialize`. Each connector entry has its own client and connection pool, so two entries at
+  one address never share a connection, and the HTTP client's retry of cancelled requests is
+  turned off explicitly: a call the server read before the connection broke is an error, and
+  no call is ever sent again on a new connection. Each is tested.
 - Identity and audit opt-outs unavailable outside development builds: built (#132), in the
   opt-outs entry below.
 - The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
@@ -1478,7 +1500,7 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   for the dialect). Each server's destination class is recorded and bound, and the loader
   allows plain `http` only for `in_cluster`. Every proxied entry must record a probe whose
   result is `refused` (the probe entry below). Verified certificates, the address checks and
-  the refused addresses are not built.
+  the refused addresses are built in the connector (the destinations box above).
 - The drift pass, its derived revisions and standing withdrawals: built. Every replica reads
   each proxied server's `tools/list` with the entry's own credential, under its call deadline
   and answer cap, once during boot before the listener is bound and then every
@@ -1668,15 +1690,15 @@ off only in a development build, with CI's check of the release artifact; and th
   every registry reload refuse a snapshot serving a tool not classified `read`, since no
   receipt store can be configured yet; a tool approved but on no surface passes. The harness's
   crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
-  and CI builds it with the same command and checks it for three refusals: a proxied
-  `propose` tool, identity disabled and audit disabled (#11). Since the snapshot loader's rule
-  2 (decision 0011) refuses every proxied tool not classified `read` as the registry loads,
-  and every tool a registry approves is proxied, the gate cannot be reached from a release
-  registry until built-in connectors exist (milestone 4). CI's `propose` check therefore
-  expects rule 2's refusal, which shows the release binary applies the loader's rules before
-  it connects to anything; the opt-out checks still show it is not a development build. The
-  gate's own tests run it on snapshots with in-process connectors. The receipt store, audit
-  and identity condition arrives with receipts (#10).
+  and CI builds it with the same command and checks it for four refusals: a proxied
+  `propose` tool, identity disabled, audit disabled and a server on loopback (#11). Since the
+  snapshot loader's rule 2 (decision 0011) refuses every proxied tool not classified `read` as
+  the registry loads, and every tool a registry approves is proxied, the gate cannot be
+  reached from a release registry until built-in connectors exist (milestone 4). CI's
+  `propose` check therefore expects rule 2's refusal, which shows the release binary applies
+  the loader's rules before it connects to anything; the opt-out and loopback checks still
+  show it is not a development build. The gate's own tests run it on snapshots with in-process
+  connectors. The receipt store, audit and identity condition arrives with receipts (#10).
 - An allowed call whose connector is not registered completes its row as `error`: built
   (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
