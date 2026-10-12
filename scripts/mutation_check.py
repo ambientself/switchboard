@@ -3285,6 +3285,14 @@ mutate("pg-stats-histogram-off-by-one-bucket", "a latency at a bucket's bound is
        "nanos <= u128::from(*bound)", "nanos < u128::from(*bound)")
 mutate("pg-stats-pool-timeout-as-budget", "a begin that waited past its budget for a connection counts as its insert running out", PG_STORE,
        "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n", "")
+# #105: `pool_timeout` is any begin whose budget ran out before its last attempt had a
+# connection, whether waiting for a pool permit or opening a new connection.
+mutate("pg-stats-silent-database-not-pool-timeout", "a begin whose budget ran out opening a connection to a database that never answers counts as a database error", PG_STORE,
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n",
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::DatabaseError,\n")
+mutate("pg-stats-connected-kept-across-attempts", "a begin whose reconnect ran past its budget counts as its insert running out, because an earlier attempt had a connection", PG_STORE,
+       "        let failed = loop {\n            let mut sent = false;\n            let mut connected = false;\n",
+       "        let mut connected = false;\n        let failed = loop {\n            let mut sent = false;\n")
 mutate("pg-stats-late-answer-not-counted", "an answer released at the answer budget is not counted", PG_STORE,
        "                self.counters\n                    .answers_released\n                    .fetch_add(1, Ordering::SeqCst);\n", "")
 mutate("pg-stats-completed-differently-as-deadline", "a finish refused for a different completion counts as given up at the deadline", PG_STORE,
