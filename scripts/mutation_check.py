@@ -2892,7 +2892,9 @@ mutate("registry-schema-boolean-root-loads", "a root input schema of `true` or `
 # pg-check-durability-ignored, pg-check-delete-ignored, pg-check-truncate-ignored,
 # pg-session-search-path-kept, pg-retry-slow-attempt-final, pg-retry-closed-connection-final,
 # pg-retry-socket-failure-final, pg-finish-dropped-task-not-reported,
-# pg-finish-pause-past-deadline, pg-finish-pause-uncapped and pg-stats-histogram-off-by-one-bucket.
+# pg-finish-pause-past-deadline, pg-finish-pause-uncapped, pg-stats-histogram-off-by-one-bucket,
+# pg-stats-pool-timeout-as-budget, pg-stats-silent-database-not-pool-timeout and
+# pg-stats-connected-kept-across-attempts.
 PG = "crates/audit-postgres/"
 PG_SQL = PG + "sql/migrations/0001_call_rows.sql"
 # 0003 replaces set_times, so the mutations of its body edit 0003, not 0001.
@@ -3289,6 +3291,14 @@ mutate("pg-stats-histogram-off-by-one-bucket", "a latency at a bucket's bound is
        "nanos <= u128::from(*bound)", "nanos < u128::from(*bound)")
 mutate("pg-stats-pool-timeout-as-budget", "a begin that waited past its budget for a connection counts as its insert running out", PG_STORE,
        "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n", "")
+# #105: `pool_timeout` is any begin whose budget ran out before its last attempt had a
+# connection, whether waiting for a pool permit or opening a new connection.
+mutate("pg-stats-silent-database-not-pool-timeout", "a begin whose budget ran out opening a connection to a database that never answers counts as a database error", PG_STORE,
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,\n",
+       "        PgAuditError::BeginBudget { .. } if !connected => BeginCause::DatabaseError,\n")
+mutate("pg-stats-connected-kept-across-attempts", "a begin whose reconnect ran past its budget counts as its insert running out, because an earlier attempt had a connection", PG_STORE,
+       "        let failed = loop {\n            let mut sent = false;\n            let mut connected = false;\n",
+       "        let mut connected = false;\n        let failed = loop {\n            let mut sent = false;\n")
 mutate("pg-stats-late-answer-not-counted", "an answer released at the answer budget is not counted", PG_STORE,
        "                self.counters\n                    .answers_released\n                    .fetch_add(1, Ordering::SeqCst);\n", "")
 mutate("pg-stats-completed-differently-as-deadline", "a finish refused for a different completion counts as given up at the deadline", PG_STORE,

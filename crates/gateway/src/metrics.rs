@@ -458,9 +458,12 @@ fn audit_signals(text: &mut Text, signals: &AuditSignals) {
         "switchboard_audit_begin_failures_total",
         "counter",
         "Audit begins that failed, by cause. budget_exceeded: the begin budget ran out with a \
-         connection in hand. pool_timeout: no connection obtained within the begin budget \
-         (waiting for the pool or opening a connection). database_error: the database refused \
-         or failed the statement. value_refused: a value could not be put in its column.",
+         connection in hand. pool_timeout: no connection was obtained in time, whether waiting \
+         for a pool permit or opening a new connection; a database that never answers, a \
+         reconnect that runs past the budget and a pool too small for the load all count here, \
+         and this count does not tell them apart. database_error: connecting failed with an \
+         error, such as a refused connection, or the database refused or failed the statement. \
+         value_refused: a value could not be put in its column.",
     );
     for (cause, count) in [
         ("budget_exceeded", failures.budget_exceeded),
