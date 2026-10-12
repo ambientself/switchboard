@@ -167,6 +167,11 @@ BACKGROUND_OUTPUT=""
 # whether mock-docs serves the drifted description. on_exit undoes both if the run stops early.
 RESTORE_REGISTRY=""
 DRIFTED=""
+# Set from the drift step's change until the gateway serves the re-approval: the gateway may hold
+# withdrawals of both list tools in its memory, which only a new approval or a restart clears.
+# on_exit says so and how to clear them, and restarts nothing: the gateway is left as it was, to
+# be looked at.
+WITHDRAWAL_HELD=""
 
 k() { kubectl --kubeconfig "$KCFG" --context "kind-$CLUSTER" "$@"; }
 # team_entry TEAM: TEAM's entry of the mock server, its surface. team_project TEAM: the project
@@ -281,6 +286,13 @@ on_exit() {
   if [ -n "$RESTORE_REGISTRY" ]; then
     echo "putting back the registry the gateway served before the interrupted step" >&2
     install_registry "$RESTORE_REGISTRY" >&2 || echo "could not; the next run puts it back" >&2
+  fi
+  if [ -n "$WITHDRAWAL_HELD" ]; then
+    echo "the gateway may still hold the drift step's withdrawals of docs-team-a__list_documents and docs-team-b__list_documents in memory; until it restarts, a run against it fails" >&2
+    case "$MODE" in
+      compose) echo "to clear them, stop Compose and start afresh: $0 down compose" >&2 ;;
+      kind) echo "to clear them, restart the gateway: kubectl --kubeconfig $KCFG --context kind-$CLUSTER -n switchboard rollout restart deploy/gateway" >&2 ;;
+    esac
   fi
   result "$status"
 }
@@ -1168,6 +1180,7 @@ drift_steps() {
   step_mark
   local changed=$MARK_EPOCH changed_at=$MARK_TIME
   DRIFTED=1
+  WITHDRAWAL_HELD=1
   mock_admin PUT /admin/definitions/list_documents "{\"description\": \"$DRIFTED_DESCRIPTION\"}" | sed 's/^/    mock-docs: /'
   if wait_for_events "the gateway withdrew both list tools" $((DRIFT_INTERVAL + CALL_DEADLINE + 30)) 2 "$changed_at" \
     'select(.event == "tool_withdrawn")'; then
@@ -1205,8 +1218,11 @@ drift_steps() {
   local approved_at=$MARK_TIME
   RESTORE_REGISTRY=$served
   install_registry "$variant"
-  wait_for_events "the gateway served revision $revision" "$(reload_wait)" 1 "$approved_at" \
-    "select(.event == \"policy_reloaded\" and (.revision | startswith(\"$revision\")))" || true
+  if wait_for_events "the gateway served revision $revision" "$(reload_wait)" 1 "$approved_at" \
+    "select(.event == \"policy_reloaded\" and (.revision | startswith(\"$revision\")))"; then
+    # A new approval clears a standing withdrawal (decision 0013, section 6).
+    WITHDRAWAL_HELD=""
+  fi
   wait_for_polls 2
   if fetch "the gateway's log" gateway_log "$approved_at"; then
     check_reapproval "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared" or .event == "tool_withdrawn")')" "$revision"

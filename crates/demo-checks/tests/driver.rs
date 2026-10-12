@@ -4305,6 +4305,27 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
     }
 }
 
+/// A run stopped between the drift step's change and the re-approval leaves the gateway holding
+/// both list tools' withdrawals in memory, which a reused gateway would fail the next run on.
+/// The exit says so, and how to clear them in the deployment the run used.
+#[test]
+fn a_run_stopped_with_the_withdrawals_held_says_how_to_clear_them() {
+    let held = "the gateway may still hold the drift step's withdrawals";
+    for (mode, clear) in [
+        ("compose", "down compose"),
+        ("kind", "-n switchboard rollout restart deploy/gateway"),
+    ] {
+        let run = sourced(&format!(
+            "MODE={mode}\nWITHDRAWAL_HELD=1\ntrap on_exit EXIT\nexit 1"
+        ));
+        assert_eq!(run.status, Some(1), "{mode}: {}", run.transcript());
+        assert!(run.stderr.contains(held), "{mode}: {}", run.transcript());
+        assert!(run.stderr.contains(clear), "{mode}: {}", run.transcript());
+    }
+    let run = sourced("MODE=compose\ntrap on_exit EXIT\nexit 1");
+    assert!(!run.stderr.contains(held), "{}", run.transcript());
+}
+
 /// The list rows of the drift steps: under the revision the drift pass derives, each team is
 /// shown its tools less those withdrawn; under a re-approval's revision, both of its tools.
 #[test]
