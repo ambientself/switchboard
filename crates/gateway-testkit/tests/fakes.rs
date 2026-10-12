@@ -1000,22 +1000,25 @@ fn a_denial_or_a_list_row_is_never_completed() {
     assert!(failure.contains("records a listing"), "{failure}");
     assert_eq!(other.row_with_id(&listed), None);
 
-    // A record of kind list handed to begin. The fake keeps it as a call row, where the
-    // Postgres table's kind_shape would refuse it, and finish refuses it by its kind.
+    // A call record of kind list handed to begin. The fake refuses it and writes no row, as
+    // the Postgres table's kind_shape does, so finish finds no row to complete.
     let (call, _) = records(&fixture);
     let (kind_list, ran) = ran_after(&|start| {
         let record = AuditRecord {
             kind: RowKind::List,
             ..call.clone()
         };
-        block_on(other.begin(&start.row, &record)).unwrap();
+        let failure = block_on(other.begin(&start.row, &record))
+            .expect_err("a call record of kind list was begun")
+            .to_string();
+        assert!(failure.contains("kind_shape"), "{failure}");
     });
     let failure = block_on(audit::finish(&other, ran, 10))
         .failure()
-        .expect("a call row of kind list was completed")
+        .expect("a row begin refused was completed")
         .to_string();
-    assert!(failure.contains("records a listing"), "{failure}");
-    assert_eq!(other.row_with_id(&kind_list).unwrap().completion, None);
+    assert!(failure.contains("no such row"), "{failure}");
+    assert_eq!(other.row_with_id(&kind_list), None);
 
     // The allowed rows themselves are open, and complete.
     let (own, ran) = ran_after(&|_| {});

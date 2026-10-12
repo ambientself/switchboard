@@ -1250,8 +1250,8 @@ mutate("testkit-denial-completed", "the in-memory store completes a denial, whic
        "        if row.decision != DecisionKind::Allow {", "        if false {")
 mutate("testkit-list-row-completed", "the in-memory store finds no row, rather than a listing, when finish names a list row", A,
        "        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {", "        if false {")
-mutate("testkit-list-kind-completed", "the in-memory store completes a call row of kind list, which complete_once refuses", A,
-       "        if row.kind != RowKind::Call {", "        if false {")
+mutate("testkit-list-kind-begun", "the in-memory store begins a call record of kind list, which kind_shape refuses", A,
+       "    if record.kind != RowKind::Call {", "    if false {")
 mutate("testkit-deadline-past-postgres-end", "the in-memory store writes a deadline past what a Postgres time holds", A,
        "    if begun_micros + i128::from(span_micros) >= POSTGRES_END_MICROS {", "    if false {")
 mutate("testkit-deadline-end-accepted", "the in-memory store writes a deadline at the end of what a Postgres time holds", A,
