@@ -17,7 +17,7 @@ use gateway::keys::REFRESH_STARTED_EVENT;
 use gateway_core::IDENTITY_FAILURE;
 use gateway_identity::SigningAlgorithm;
 use gateway_testkit::LocalIssuer;
-use mock_docs_server::{AcceptedCredential, Config};
+use mock_docs_server::Config;
 use serde_json::{Value, json};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_switchboard");
@@ -433,7 +433,7 @@ impl Drop for Running {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential() {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+    let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
         .await
         .unwrap();
     let files = Files::new("binary-serves", &issuer().jwks_document(), &mock.url());
@@ -450,7 +450,7 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
     assert_eq!(field("issuers"), [json!(1)]);
     assert_eq!(field("subjects"), [json!(2)]);
     assert_eq!(field("audit"), [json!("disabled")]);
-    assert_eq!(field("revision"), [json!("demo-1")]);
+    assert_eq!(field("revision"), [json!(files::KIND_REVISION)]);
     assert_eq!(field("instance"), [json!(INSTANCE)]);
     // No `[metrics]`, no metrics listener.
     assert_eq!(field("metrics"), [json!("off")]);
@@ -514,7 +514,7 @@ fn get(address: SocketAddr, target: &str) -> (u16, String) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_metrics_configured_it_serves_them_on_their_own_listener_only() {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+    let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
         .await
         .unwrap();
     let files = Files::new("binary-metrics", &issuer().jwks_document(), &mock.url());

@@ -20,9 +20,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use connector_proxy::{FileCredentials, ProxyConnector, Upstream, outcome};
-use files::{
-    AUDIENCE, Answered, Files, TEAM_A_SA, TEAM_B_SA, call, cluster_issuer, deployment_file,
-};
+use files::{AUDIENCE, Answered, Files, TEAM_A_SA, TEAM_B_SA, cluster_issuer, deployment_file};
 use gateway::Gates;
 use gateway::boot::{self, Settings, Wiring};
 use gateway::path::RequestPath;
@@ -55,6 +53,21 @@ fn issuer() -> &'static LocalIssuer {
 
 fn token(subject: &str) -> String {
     files::kubernetes_token(issuer(), subject, &[AUDIENCE])
+}
+
+/// Calls `tool` on this file's surface, `docs`.
+async fn call(path: &RequestPath, token: &str, tool: &str, arguments: Value) -> Answered {
+    files::call_on(path, "docs", token, tool, arguments).await
+}
+
+/// The credential reference of `server`: the deployment file names one file for each, as it
+/// does for the demo's two entries.
+fn reference(server: &str) -> &'static str {
+    if server == SLOW {
+        "docs-team-a-credential"
+    } else {
+        "docs-team-b-credential"
+    }
 }
 
 /// A proxied server on loopback that counts each `tools/call` it receives, and then either
@@ -119,7 +132,8 @@ impl Scripted {
 
 /// A registry of the two servers, each with one read tool that takes one string argument and
 /// names no resources, served on the surface `docs` to team-a and team-b. Each server's
-/// identity is its address's host, and its tool's approval binds that entry.
+/// identity is its address's host, its credential is one of the two the deployment file names,
+/// and its tool's approval binds that entry.
 fn registry_text(slow_url: &str, other_url: &str) -> String {
     let schema = json!({
         "type": "object",
@@ -134,15 +148,16 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
         identity: gateway_registry::address_host(url).unwrap().to_owned(),
         address: url.to_owned(),
         credential: gateway_registry::Credential::Bearer {
-            reference: "docs-credential".into(),
+            reference: reference(name).into(),
         },
     };
     let server = |name: &str, url: &str| {
         let identity = entry(name, url).identity;
+        let reference = reference(name);
         format!(
             "[[servers]]\nname = \"{name}\"\nsystem = \"{name}\"\nowner = \"platform\"\n\
              identity = \"{identity}\"\naddress = \"{url}\"\n\
-             credential = {{ mode = \"bearer\", reference = \"docs-credential\" }}\n\n"
+             credential = {{ mode = \"bearer\", reference = \"{reference}\" }}\n\n"
         )
     };
     let tool = |name: &str, url: &str| {
@@ -204,9 +219,12 @@ async fn wired(
         read_at: Instant::now(),
     };
     let registry = Registry::from_toml_str(&registry_text(&slow.url, &other.url)).unwrap();
-    let credential = files.path("docs-credential");
     let credentials = Arc::new(
-        FileCredentials::load([(SLOW.into(), &credential), (OTHER.into(), &credential)]).unwrap(),
+        FileCredentials::load([
+            (SLOW.into(), files.path(reference(SLOW))),
+            (OTHER.into(), files.path(reference(OTHER))),
+        ])
+        .unwrap(),
     );
     let store = Arc::new(InMemoryAuditStore::new());
     let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());

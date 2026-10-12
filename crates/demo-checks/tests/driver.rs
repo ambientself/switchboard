@@ -506,36 +506,61 @@ fn a_run_that_stopped_early_fails_even_with_every_check_passing() {
     );
 }
 
-#[test]
-fn the_server_bearer_check_admits_only_the_gateways_credential() {
-    let sha = "35078c7e636169b1ad9e5a04af03cb483f59535baaf71232f48d8a6181a93bd4";
-    // Lines as mock-docs writes them: one per request, with `accepted` and the bearer's prefix.
-    let good = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#;
-    let refused = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"aaaaaaaaaaaa","accepted":false}"#;
-    let health_check = r#"{"event":"request","http_method":"GET","path":"/mcp","bearer_sha256":null,"accepted":false}"#;
-    let accepted_other = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"bbbbbbbbbbbb","accepted":true}"#;
-    let logs = |lines: &[&str]| lines.join("\n");
+/// The SHA-256s of the Compose entries' dummy credentials, docs-team-a's and docs-team-b's.
+const SHA_A: &str = "88a0f2ba13fc3cc8cc886b3b543f88c828ba61e0f4c1109c510837e569bb23d9";
+const SHA_B: &str = "d20bf481167cefe6c02813ea8c9886c2059292650bf5816a02843ab973eb19e3";
 
-    let run = sourced(&format!(
-        "check_server_bearers '{}' {sha} 2 accepted\nFINISHED=1\nresult 0",
-        logs(&[good, health_check, good, refused])
-    ));
+#[test]
+fn the_compose_entries_digests_are_their_credentials() {
+    for (entry, sha) in [("docs-team-a", SHA_A), ("docs-team-b", SHA_B)] {
+        assert_eq!(
+            common::read(&format!(
+                "deploy/compose/dummy-credentials/{entry}-credential.sha256"
+            ))
+            .trim(),
+            sha
+        );
+    }
+}
+
+/// A line of mock-docs in its static mode: one request with a bearer whose SHA-256 starts with
+/// `prefix`, accepted or not.
+fn static_line(prefix: &str, accepted: bool) -> String {
+    json!({"event": "request", "http_method": "POST", "path": "/mcp",
+           "bearer_sha256": prefix, "accepted": accepted})
+    .to_string()
+}
+
+#[test]
+fn the_server_bearer_check_admits_only_the_gateways_credentials() {
+    // Lines as mock-docs writes them: one per request, with `accepted` and the bearer's prefix.
+    let team_a = static_line("88a0f2ba13fc", true);
+    let team_b = static_line("d20bf481167c", true);
+    let refused = static_line("aaaaaaaaaaaa", false);
+    let health_check = r#"{"event":"request","http_method":"GET","path":"/mcp","bearer_sha256":null,"accepted":false}"#.to_owned();
+    let accepted_other = static_line("bbbbbbbbbbbb", true);
+    let check = |lines: &[&String], calls: usize, scope: &str| {
+        let logs: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();
+        sourced(&format!(
+            "check_server_bearers '{}' \"{SHA_A} {SHA_B}\" {calls} {scope}\nFINISHED=1\nresult 0",
+            logs.join("\n")
+        ))
+    };
+
+    let run = check(&[&team_a, &health_check, &team_b, &refused], 2, "accepted");
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    // Either entry's credential counts as the gateway's.
+    let run = check(&[&team_a, &team_a, &team_b, &team_b], 4, "all");
     assert_eq!(run.status, Some(0), "{}", run.transcript());
 
-    let run = sourced(&format!(
-        "check_server_bearers '{}' {sha} 2 all\nFINISHED=1\nresult 0",
-        logs(&[good, good, refused])
-    ));
+    let run = check(&[&team_a, &team_b, &refused], 2, "all");
     assert!(
         run.failed("mock-docs never received any bearer but the gateway's"),
         "{}",
         run.transcript()
     );
 
-    let run = sourced(&format!(
-        "check_server_bearers '{}' {sha} 2 accepted\nFINISHED=1\nresult 0",
-        logs(&[good, good, accepted_other])
-    ));
+    let run = check(&[&team_a, &team_b, &accepted_other], 2, "accepted");
     assert!(
         run.failed("mock-docs accepted no other bearer"),
         "{}",
@@ -544,13 +569,10 @@ fn the_server_bearer_check_admits_only_the_gateways_credential() {
 
     // One fewer than the calls the gateway allowed, or one more: a denied call reached the
     // server, or the log is short.
-    for lines in [&[good][..], &[good, good, good][..]] {
-        let run = sourced(&format!(
-            "check_server_bearers '{}' {sha} 2 accepted\nFINISHED=1\nresult 0",
-            logs(lines)
-        ));
+    for lines in [&[&team_a][..], &[&team_a, &team_b, &team_b][..]] {
+        let run = check(lines, 2, "accepted");
         assert!(
-            run.failed("mock-docs accepted the gateway's credential on exactly the 2 calls"),
+            run.failed("mock-docs accepted the gateway's credentials on exactly the 2 calls"),
             "{}",
             run.transcript()
         );
@@ -601,18 +623,30 @@ fn the_server_bearer_checks_expect_exactly_the_calls_each_run_allows() {
     let driver = common::read("deploy/demo/demo.sh");
     let probes = driver.matches(" mock-workload before-policy\n").count();
     assert_eq!(probes, 2);
+    // Each team's share of the calls, which check_server_entries expects under its own entry.
+    let (compose_each, kind_each) = (compose / 2, kind / 2);
     let compose_call = format!(
-        "  if fetch \"mock-docs' log\" mock_docs_log; then\n    check_server_bearers \"$FETCHED\" \\\n      \"$(cat \"$ROOT/deploy/compose/dummy-credentials/docs-credential.sha256\")\" {compose} all\n"
+        "  if fetch \"mock-docs' log\" mock_docs_log; then\n    check_server_bearers \"$FETCHED\" \"$(entry_sha team-a) $(entry_sha team-b)\" {compose} all\n    check_server_entries \"$FETCHED\" {compose_each} \"team-a=$(entry_sha team-a)\" \"team-b=$(entry_sha team-b)\"\n"
     );
     let kind_call = format!(
-        "  if fetch \"mock-docs' log\" mock_docs_log; then\n    check_server_callers \"$FETCHED\" \"$KIND_GATEWAY_SUBJECT\" {kind} {probes} \"$OPEN_ATTEMPTS\"\n"
+        "  if fetch \"mock-docs' log\" mock_docs_log; then\n    check_server_callers \"$FETCHED\" \"$KIND_ENTRY_SUBJECTS\" {kind} {probes} \"$OPEN_ATTEMPTS\"\n    check_server_entries \"$FETCHED\" {kind_each} \"team-a=${{KIND_ENTRY_SUBJECTS%% *}}\" \"team-b=${{KIND_ENTRY_SUBJECTS##* }}\"\n"
     );
     for call in [compose_call, kind_call] {
         assert_eq!(driver.matches(&call).count(), 1, "{call}");
     }
-    // Compose's is the only bearer check, and kind's the only caller check.
+    // Compose's is the only bearer check, kind's the only caller check, and each run has one
+    // entry check.
     assert_eq!(driver.matches("  check_server_bearers \"").count(), 1);
     assert_eq!(driver.matches("  check_server_callers \"").count(), 1);
+    assert_eq!(driver.matches("  check_server_entries \"").count(), 2);
+    // The Compose digests are the entries' credentials' files, team by team.
+    let run = sourced("echo \"$(entry_sha team-a) $(entry_sha team-b)\"");
+    assert_eq!(
+        run.stdout.trim(),
+        format!("{SHA_A} {SHA_B}"),
+        "{}",
+        run.transcript()
+    );
 }
 
 /// A line of mock-docs in its JWT mode: one request, accepted with `caller` or refused for
@@ -630,22 +664,23 @@ fn jwt_line(accepted: bool, caller: Option<&str>, refusal: Option<&str>) -> Stri
     .to_string()
 }
 
-/// Runs check_server_callers on `lines` for the gateway's subject, 8 calls, 2 refusals and 3
+/// Runs check_server_callers on `lines` for the entries' subjects, 8 calls, 2 refusals and 3
 /// open attempts of the route check's probe.
 fn check_callers(lines: &[String]) -> Run {
     sourced(&format!(
-        "check_server_callers '{}' \"$KIND_GATEWAY_SUBJECT\" 8 2 3\nFINISHED=1\nresult 0",
+        "check_server_callers '{}' \"$KIND_ENTRY_SUBJECTS\" 8 2 3\nFINISHED=1\nresult 0",
         lines.join("\n")
     ))
 }
 
+/// The kind entries' ServiceAccounts, as mock-docs logs the verified caller.
+const SUBJECT_A: &str = "system:serviceaccount:switchboard:docs-team-a";
+const SUBJECT_B: &str = "system:serviceaccount:switchboard:docs-team-b";
+
 #[test]
-fn the_server_caller_check_admits_only_the_gateways_identity() {
-    let gateway = jwt_line(
-        true,
-        Some("system:serviceaccount:switchboard:gateway"),
-        None,
-    );
+fn the_server_caller_check_admits_only_the_entries_identities() {
+    let team_a = jwt_line(true, Some(SUBJECT_A), None);
+    let team_b = jwt_line(true, Some(SUBJECT_B), None);
     let direct = jwt_line(false, None, Some("wrong_audience"));
     // The route check's probe before the policy sends no credential.
     let mut probe = jwt_line(false, None, Some("no_bearer"));
@@ -655,7 +690,12 @@ fn the_server_caller_check_admits_only_the_gateways_identity() {
     let run_of = |gateway_calls: usize, extra: &[String]| {
         let mut lines = vec![boot.to_owned(), direct.clone(), direct.clone()];
         lines.extend(std::iter::repeat_n(probe.clone(), 3));
-        lines.extend(std::iter::repeat_n(gateway.clone(), gateway_calls));
+        // Half under each entry's identity, team-a's first.
+        lines.extend(std::iter::repeat_n(
+            team_a.clone(),
+            gateway_calls.div_ceil(2),
+        ));
+        lines.extend(std::iter::repeat_n(team_b.clone(), gateway_calls / 2));
         lines.extend_from_slice(extra);
         check_callers(&lines)
     };
@@ -677,20 +717,21 @@ fn the_server_caller_check_admits_only_the_gateways_identity() {
         run.transcript()
     );
 
-    // A second caller from the trusted issuer, and a token accepted with no caller at all, as
-    // the static mode logs it.
+    // Another caller from the trusted issuer, the gateway's own ServiceAccount among them, and a
+    // token accepted with no caller at all, as the static mode logs it.
     let other = jwt_line(
         true,
         Some("system:serviceaccount:team-a:mock-workload"),
         None,
     );
-    let fake_gateway = jwt_line(
+    let gateway = jwt_line(
         true,
-        Some("system:serviceaccount:switchboard:gateway x"),
+        Some("system:serviceaccount:switchboard:gateway"),
         None,
     );
+    let fake_entry = jwt_line(true, Some(&format!("{SUBJECT_A} x")), None);
     let static_line = r#"{"event":"request","http_method":"POST","path":"/mcp","bearer_sha256":"35078c7e6361","accepted":true}"#;
-    for extra in [other, fake_gateway, static_line.to_owned()] {
+    for extra in [other, gateway, fake_entry, static_line.to_owned()] {
         let run = run_of(8, std::slice::from_ref(&extra));
         assert!(
             run.failed("mock-docs accepted no other caller, and no token without one"),
@@ -717,13 +758,120 @@ fn the_server_caller_check_admits_only_the_gateways_identity() {
         run.transcript()
     );
     let mut lines = vec![direct.clone(), jwt_line(false, None, Some("expired"))];
-    lines.extend(std::iter::repeat_n(gateway.clone(), 8));
+    lines.extend(std::iter::repeat_n(team_a.clone(), 8));
     let run = check_callers(&lines);
     assert!(
         run.failed("mock-docs refused the 2 direct calls' tokens as meant for another audience"),
         "{}",
         run.transcript()
     );
+}
+
+/// A tools/call line of mock-docs, accepted under `identity` and naming `project`: in the JWT
+/// mode when `identity` is a subject, as its verified caller, and in the static mode otherwise,
+/// as its bearer's prefix. `refused` marks a project mock-docs refused for that identity.
+fn call_line(identity: &str, project: &str, refused: bool) -> String {
+    let mut line = json!({"event": "request", "http_method": "POST", "path": "/mcp",
+        "accepted": true, "rpc_method": "tools/call", "rpc_id": 1,
+        "tool": "read_document", "project": project, "document": "plan"});
+    if identity.starts_with("system:") {
+        line["bearer_sha256"] = json!("0123456789ab");
+        line["caller"] = json!(identity);
+        line["refusal"] = Value::Null;
+    } else {
+        line["bearer_sha256"] = json!(identity);
+    }
+    if refused {
+        line["refused"] = json!("project");
+    }
+    line.to_string()
+}
+
+#[test]
+fn the_server_entry_check_holds_each_team_to_its_own_entrys_identity_and_project() {
+    // In Compose an entry's identity is its credential's SHA-256, logged as a prefix; in kind its
+    // ServiceAccount, logged as the verified caller.
+    for (who, a, b) in [
+        (
+            format!("\"team-a={SHA_A}\" \"team-b={SHA_B}\""),
+            &SHA_A[..12],
+            &SHA_B[..12],
+        ),
+        (
+            "\"team-a=${KIND_ENTRY_SUBJECTS%% *}\" \"team-b=${KIND_ENTRY_SUBJECTS##* }\""
+                .to_owned(),
+            SUBJECT_A,
+            SUBJECT_B,
+        ),
+    ] {
+        let run_of = |lines: &[String]| {
+            sourced(&format!(
+                "check_server_entries '{}' 2 {who}\nFINISHED=1\nresult 0",
+                lines.join("\n")
+            ))
+        };
+        let good = [
+            call_line(a, "atlas", false),
+            call_line(a, "atlas", false),
+            call_line(b, "borealis", false),
+            call_line(b, "borealis", false),
+        ];
+        // A request that is not a tools/call, or was not accepted, is not counted.
+        let mut lines = good.to_vec();
+        lines.push(
+            json!({"event": "request", "accepted": true, "rpc_method": "ping", "bearer_sha256": a, "caller": a})
+                .to_string(),
+        );
+        lines.push(
+            json!({"event": "request", "accepted": false, "rpc_method": "tools/call", "bearer_sha256": a, "project": "borealis"})
+                .to_string(),
+        );
+        let run = run_of(&lines);
+        assert_eq!(run.status, Some(0), "{who}: {}", run.transcript());
+        assert_eq!(run.lines("PASS ").len(), 4, "{}", run.transcript());
+
+        // Team B's call under team A's entry: one too many under A's, one too few under B's,
+        // and one under A's for B's project.
+        let mut swapped = good.to_vec();
+        swapped[3] = call_line(a, "borealis", false);
+        let run = run_of(&swapped);
+        assert!(
+            run.failed(
+                "mock-docs answered team-b's 2 allowed calls under team-b's own entry's identity"
+            ),
+            "{who}: {}",
+            run.transcript()
+        );
+        assert!(
+            run.failed("no call under team-a's entry's identity named another project"),
+            "{who}: {}",
+            run.transcript()
+        );
+
+        // A call under team A's entry that mock-docs refused for its project.
+        let mut refused = good.to_vec();
+        refused[1] = call_line(a, "atlas", true);
+        let run = run_of(&refused);
+        assert!(
+            run.failed("mock-docs answered team-a's 2 allowed calls under team-a's own entry's identity, each for atlas"),
+            "{who}: {}",
+            run.transcript()
+        );
+        assert!(
+            run.failed("no call under team-a's entry's identity named another project"),
+            "{who}: {}",
+            run.transcript()
+        );
+
+        // One call fewer under team B's entry: the log is short, or an allowed call went
+        // elsewhere.
+        let run = run_of(&good[..3]);
+        assert!(
+            run.failed("mock-docs answered team-b's 2 allowed calls"),
+            "{who}: {}",
+            run.transcript()
+        );
+    }
 }
 
 #[test]
@@ -1308,15 +1456,16 @@ fn row(
     resources: Value,
 ) -> Value {
     json!({
-        "kind": "call", "team": team, "tool": "docs__read_document", "decision": decision,
-        "reason": reason,
+        "kind": "call", "team": team, "tool": format!("docs-{team}__read_document"),
+        "decision": decision, "reason": reason,
         "sentence": if sentence.is_empty() { Value::Null } else { json!(sentence) },
-        "resources": resources, "revision": "demo-1", "listed": null, "omitted": null,
+        "resources": resources, "revision": "demo-3", "listed": null, "omitted": null,
     })
 }
 
 /// A list row as `row_resources_json` reads it: no tool, decision or resources.
-fn list_row(team: &str, revision: &str, listed: &[&str]) -> Value {
+fn list_row(team: &str, revision: &str, listed: &[impl AsRef<str>]) -> Value {
+    let listed: Vec<&str> = listed.iter().map(AsRef::as_ref).collect();
     json!({
         "kind": "list", "team": team, "tool": null, "decision": null, "reason": null,
         "sentence": null, "resources": null, "revision": revision, "listed": listed,
@@ -1324,7 +1473,13 @@ fn list_row(team: &str, revision: &str, listed: &[&str]) -> Value {
     })
 }
 
-const BOTH_TOOLS: [&str; 2] = ["docs__list_documents", "docs__read_document"];
+/// The tools `team`'s surface serves: its own entry's two.
+fn both_tools(team: &str) -> [String; 2] {
+    [
+        format!("docs-{team}__list_documents"),
+        format!("docs-{team}__read_document"),
+    ]
+}
 
 fn project(name: &str) -> Value {
     json!([{"system": "docs", "kind": "project", "identifier": name}])
@@ -1332,10 +1487,10 @@ fn project(name: &str) -> Value {
 
 /// The rows a run of the demo writes, each recording what its call named.
 fn demo_rows() -> Vec<Value> {
-    let none_named = "Tool `docs__read_document` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for.";
+    let none_named = "Tool `docs-team-a__read_document` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for.";
     let outside = |name: &str| {
         format!(
-            "Tool `docs__read_document` names docs project `{name}`, which is outside what workload `w` may reach. Name only resources within that limit."
+            "Tool `docs-team-a__read_document` names docs project `{name}`, which is outside what workload `w` may reach. Name only resources within that limit."
         )
     };
     vec![
@@ -1374,13 +1529,13 @@ fn demo_rows() -> Vec<Value> {
             "team-a",
             "deny",
             Some("unknown_tool"),
-            "Tool `docs__read_document` is not available on surface `docs`.",
+            "Tool `docs-team-a__read_document` is not available on surface `docs-team-a`.",
             json!("unknown"),
         ),
         // Each team's list, and team-a's after the withdrawal, under the next revision.
-        list_row("team-a", "demo-1", &BOTH_TOOLS),
-        list_row("team-b", "demo-1", &BOTH_TOOLS),
-        list_row("team-a", "demo-2", &["docs__list_documents"]),
+        list_row("team-a", "demo-3", &both_tools("team-a")),
+        list_row("team-b", "demo-3", &both_tools("team-b")),
+        list_row("team-a", "demo-4", &["docs-team-a__list_documents"]),
     ]
 }
 
@@ -1516,17 +1671,25 @@ fn each_list_row_is_one_of_the_workloads_lists() {
     };
     for (case, rows) in [
         // The withdrawn tool listed after the withdrawal, or missing before it.
-        ("withdrawn-listed", wrong(9, "listed", json!(BOTH_TOOLS))),
+        (
+            "withdrawn-listed",
+            wrong(9, "listed", json!(both_tools("team-a"))),
+        ),
         (
             "read-missing",
-            wrong(7, "listed", json!(["docs__list_documents"])),
+            wrong(7, "listed", json!(["docs-team-a__list_documents"])),
+        ),
+        // A team shown the other team's entry's tools.
+        (
+            "other-teams-tools",
+            wrong(7, "listed", json!(both_tools("team-b"))),
         ),
         ("nothing-listed", wrong(8, "listed", json!([]))),
         ("listed-null", wrong(8, "listed", Value::Null)),
         ("tools-omitted", wrong(7, "omitted", json!(1))),
         ("other-team", wrong(7, "team", json!("team-c"))),
         ("no-team", wrong(7, "team", Value::Null)),
-        ("unknown-revision", wrong(7, "revision", json!("demo-3"))),
+        ("unknown-revision", wrong(7, "revision", json!("demo-1"))),
     ] {
         let run = check_lists(case, &rows, 3);
         assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
@@ -1544,7 +1707,7 @@ fn each_list_row_is_one_of_the_workloads_lists() {
         &wrong(
             7,
             "listed",
-            json!(["docs__read_document", "docs__list_documents"]),
+            json!(["docs-team-a__read_document", "docs-team-a__list_documents"]),
         ),
         3,
     );
@@ -2382,7 +2545,7 @@ fn the_route_check_runs_as_its_operator_against_the_idle_pod() {
         "--routes",
         &format!("{}/deploy/route-check/routes/kind.tsv", root.display()),
         "--gateway-url",
-        "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs",
+        "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs-team-b",
         "--expect",
         "refused",
         "--probe-image",
@@ -2744,6 +2907,304 @@ fn each_run_reads_the_metrics_inside_the_gateways_container_after_its_workloads(
     assert!(kind.contains(reading), "{kind}");
     assert!(kind.find("team-a and team-b workloads").unwrap() < kind.find(reading).unwrap());
     assert_eq!(driver.matches("\n    check_metrics ").count(), 2);
+}
+
+// --- The token writer (deploy/demo/token-writer.sh) ------------------------------------------
+
+/// The token writer's own API token in the tests. A dummy.
+const API_TOKEN: &str = "dummy-api-token-for-the-token-writer-tests";
+
+/// The token the fake API server issues for `account`. A dummy.
+fn issued(account: &str) -> String {
+    format!("dummy-issued-token-for-{account}")
+}
+
+/// A scratch directory for the token writer: `bin/curl`, a fake API server that records its
+/// arguments and the headers it read from standard input, and answers as `FAKE_API` says
+/// (`ok`, `fail`, `no-token` or `ok-but-<account>-fails`); `api/token` and `api/ca.crt`; and an
+/// empty `tokens` directory.
+fn token_writer_dir(name: &str) -> PathBuf {
+    let dir = scratch(name);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(dir.join("api")).unwrap();
+    std::fs::create_dir_all(dir.join("tokens")).unwrap();
+    write(&dir.join("api"), "token", &format!("{API_TOKEN}\n"));
+    write(
+        &dir.join("api"),
+        "ca.crt",
+        "dummy CA, never read by the fake\n",
+    );
+    // The last argument is the URL; the TokenRequest is the argument after --data-binary.
+    let curl = write(
+        &bin,
+        "curl",
+        &format!(
+            r#"#!/bin/sh
+log='{log}'
+printf 'ARGS' >> "$log"; for arg in "$@"; do printf ' [%s]' "$arg" >> "$log"; done; echo >> "$log"
+printf 'STDIN %s\n' "$(cat)" >> "$log"
+for arg in "$@"; do url=$arg; done
+account=${{url%/token}}; account=${{account##*/}}
+case "$FAKE_API" in
+  fail) echo 'curl: (22) The requested URL returned error: 403' >&2; exit 22 ;;
+  no-token) echo '{{"kind":"TokenRequest","status":{{}}}}'; exit 0 ;;
+  ok-but-*-fails) if [ "$account-fails" = "${{FAKE_API#ok-but-}}" ]; then exit 7; fi ;;
+esac
+printf '{{"kind":"TokenRequest","status":{{"token":"dummy-issued-token-for-%s","expirationTimestamp":"2026-10-11T00:10:00Z"}}}}\n' "$account"
+"#,
+            log = dir.join("curl.log").display()
+        ),
+    );
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// Runs `token-writer.sh once` in `dir` with the fake API server answering `api`, and `env`
+/// over the kind manifest's settings.
+fn token_writer(dir: &Path, api: &str, env: &[(&str, &str)]) -> Run {
+    require(&["sh", "jq"]);
+    let path = format!(
+        "{}:{}",
+        dir.join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("sh");
+    command
+        .arg(repo().join("deploy/demo/token-writer.sh"))
+        .arg("once")
+        .env_clear()
+        .env("PATH", path)
+        .env("FAKE_API", api)
+        .env("TOKEN_SERVICE_ACCOUNTS", "docs-team-a docs-team-b")
+        .env("TOKEN_NAMESPACE", "switchboard")
+        .env("TOKEN_AUDIENCE", "mock-docs")
+        .env("TOKEN_EXPIRATION_SECONDS", "600")
+        .env("TOKEN_REFRESH_SECONDS", "300")
+        .env("TOKEN_RETRY_SECONDS", "5")
+        .env("TOKEN_DIR", dir.join("tokens"))
+        .env("API_SERVER", "https://kubernetes.default.svc")
+        .env("API_TOKEN_FILE", dir.join("api/token"))
+        .env("API_CA_FILE", dir.join("api/ca.crt"));
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    Run::from(command.output().unwrap())
+}
+
+/// What the fake API server recorded: each call's arguments and the headers it read.
+fn api_calls(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("curl.log")).unwrap_or_default()
+}
+
+fn token_file(dir: &Path, account: &str) -> Option<String> {
+    std::fs::read_to_string(dir.join("tokens").join(account)).ok()
+}
+
+#[test]
+fn the_token_writer_writes_each_entrys_token_for_the_servers_audience() {
+    let dir = token_writer_dir("token-writer-ok");
+    let run = token_writer(&dir, "ok", &[]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    for account in ["docs-team-a", "docs-team-b"] {
+        assert_eq!(
+            token_file(&dir, account),
+            Some(format!("{}\n", issued(account))),
+            "{}",
+            run.transcript()
+        );
+    }
+    // Nothing is left beside the tokens.
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("tokens"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["docs-team-a", "docs-team-b"]);
+
+    // Each request is a TokenRequest for the server's audience and the expiration, to the
+    // account's token subresource, over TLS checked against the cluster's CA.
+    let calls = api_calls(&dir);
+    let args: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("ARGS"))
+        .collect();
+    assert_eq!(args.len(), 2, "{calls}");
+    let body = r#"[{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","spec":{"audiences":["mock-docs"],"expirationSeconds":600}}]"#;
+    for (line, account) in args.iter().zip(["docs-team-a", "docs-team-b"]) {
+        assert!(
+            line.contains(&format!(" [--data-binary] {body} ")),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!(
+                " [https://kubernetes.default.svc/api/v1/namespaces/switchboard/serviceaccounts/{account}/token]"
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                " [--cacert] [{}] ",
+                dir.join("api/ca.crt").display()
+            )),
+            "{line}"
+        );
+        assert!(line.contains(" [--fail] "), "{line}");
+    }
+    // The API token goes on standard input as the header, never on a command line.
+    assert!(!args.iter().any(|line| line.contains(API_TOKEN)), "{calls}");
+    assert_eq!(
+        calls
+            .matches(&format!("STDIN Authorization: Bearer {API_TOKEN}\n"))
+            .count(),
+        2,
+        "{calls}"
+    );
+}
+
+#[test]
+fn the_token_writer_never_prints_a_token() {
+    for api in ["ok", "fail", "no-token"] {
+        let dir = token_writer_dir(&format!("token-writer-quiet-{api}"));
+        let run = token_writer(&dir, api, &[]);
+        let printed = format!("{}{}", run.stdout, run.stderr);
+        for secret in [
+            API_TOKEN.to_owned(),
+            issued("docs-team-a"),
+            issued("docs-team-b"),
+        ] {
+            assert!(!printed.contains(&secret), "{api}: {}", run.transcript());
+        }
+        // It says what it did for each account all the same.
+        assert_eq!(
+            printed.matches("token-writer: docs-team-").count(),
+            2,
+            "{api}: {}",
+            run.transcript()
+        );
+    }
+}
+
+#[test]
+fn a_token_the_writer_cannot_get_leaves_the_previous_one_in_place() {
+    for api in ["fail", "no-token"] {
+        let dir = token_writer_dir(&format!("token-writer-keeps-{api}"));
+        for account in ["docs-team-a", "docs-team-b"] {
+            write(&dir.join("tokens"), account, "previous-token\n");
+        }
+        let run = token_writer(&dir, api, &[]);
+        assert_eq!(run.status, Some(1), "{api}: {}", run.transcript());
+        for account in ["docs-team-a", "docs-team-b"] {
+            assert_eq!(
+                token_file(&dir, account).as_deref(),
+                Some("previous-token\n"),
+                "{api}: {}",
+                run.transcript()
+            );
+            assert!(
+                run.stdout.contains(&format!("token-writer: {account}: "))
+                    && run.stdout.contains("keeping the previous token"),
+                "{api}: {}",
+                run.transcript()
+            );
+        }
+        assert!(!dir.join("tokens/.docs-team-a.next").exists());
+    }
+
+    // One account failing does not stop the other's.
+    let dir = token_writer_dir("token-writer-one-fails");
+    write(&dir.join("tokens"), "docs-team-a", "previous-token\n");
+    let run = token_writer(&dir, "ok-but-docs-team-a-fails", &[]);
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    assert_eq!(
+        token_file(&dir, "docs-team-a").as_deref(),
+        Some("previous-token\n")
+    );
+    assert_eq!(
+        token_file(&dir, "docs-team-b"),
+        Some(format!("{}\n", issued("docs-team-b")))
+    );
+}
+
+#[test]
+fn the_token_writer_refuses_a_bad_configuration_before_asking() {
+    for (name, value) in [
+        ("TOKEN_SERVICE_ACCOUNTS", ""),
+        ("TOKEN_SERVICE_ACCOUNTS", "docs-team-a ../gateway"),
+        ("TOKEN_AUDIENCE", ""),
+        ("TOKEN_EXPIRATION_SECONDS", "ten minutes"),
+        ("TOKEN_EXPIRATION_SECONDS", "60"),
+        ("TOKEN_REFRESH_SECONDS", "600"),
+        ("TOKEN_RETRY_SECONDS", "0"),
+        ("TOKEN_DIR", "/no/such/directory"),
+        ("API_SERVER", "http://kubernetes.default.svc"),
+        ("API_CA_FILE", ""),
+    ] {
+        let dir = token_writer_dir("token-writer-bad");
+        let run = token_writer(&dir, "ok", &[(name, value)]);
+        assert_eq!(run.status, Some(2), "{name}={value}: {}", run.transcript());
+        assert!(
+            run.stderr.contains("token-writer: bad configuration: "),
+            "{name}={value}: {}",
+            run.transcript()
+        );
+        assert_eq!(api_calls(&dir), "", "{name}={value}");
+    }
+}
+
+/// The kind manifest runs the token writer with the settings the tests above use, and the image
+/// carries it.
+#[test]
+fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
+    let gateway = common::read("deploy/kind/base/gateway.yaml");
+    for line in [
+        "          command: [\"token-writer.sh\"]\n",
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b\"}\n",
+        "            - {name: TOKEN_NAMESPACE, value: switchboard}\n",
+        "            - {name: TOKEN_AUDIENCE, value: mock-docs}\n",
+        "            - {name: TOKEN_EXPIRATION_SECONDS, value: \"600\"}\n",
+        "            - {name: TOKEN_REFRESH_SECONDS, value: \"300\"}\n",
+        "            - {name: TOKEN_RETRY_SECONDS, value: \"5\"}\n",
+        "            - {name: TOKEN_DIR, value: /var/run/switchboard/tokens}\n",
+        "            - {name: API_SERVER, value: \"https://kubernetes.default.svc\"}\n",
+    ] {
+        assert_eq!(gateway.matches(line).count(), 1, "{line}");
+    }
+    let dockerfile = common::read("deploy/Dockerfile");
+    assert!(dockerfile.contains(
+        "\nCOPY deploy/demo/workload.sh deploy/demo/migrate.sh deploy/demo/token-writer.sh /usr/local/bin/\n"
+    ));
+}
+
+#[test]
+fn the_gateways_token_grant_must_name_only_the_entries() {
+    // A fake `k` answering can-i as RBAC would for gateway-tokens.yaml, or as it would with
+    // the grant widened to every ServiceAccount.
+    let fake = |widened: bool| {
+        format!(
+            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
+            if widened {
+                "echo yes"
+            } else {
+                "echo no; return 1"
+            }
+        )
+    };
+    let run = sourced(&format!(
+        "{}token_grants\nFINISHED=1\nresult 0",
+        fake(false)
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 6, "{}", run.transcript());
+    let run = sourced(&format!("{}token_grants\nFINISHED=1\nresult 0", fake(true)));
+    assert_eq!(run.lines("FAIL ").len(), 4, "{}", run.transcript());
+    assert!(
+        run.failed(
+            "the gateway may not: create serviceaccounts --subresource=token -n switchboard"
+        ),
+        "{}",
+        run.transcript()
+    );
 }
 
 /// A gateway log line as the gateway writes it: tracing's JSON, its fields under `fields`.

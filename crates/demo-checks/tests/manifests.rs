@@ -114,6 +114,7 @@ fn the_base_has_no_network_policy() {
         [
             "  - namespaces.yaml",
             "  - serviceaccounts.yaml",
+            "  - gateway-tokens.yaml",
             "  - postgres.yaml",
             "  - migrate-job.yaml",
             "  - mock-docs.yaml",
@@ -226,18 +227,89 @@ fn the_compose_gateways_metrics_are_on_its_loopback_and_unpublished() {
 
 #[test]
 fn each_dummy_credentials_hash_matches_it() {
-    // Only Compose has a dummy credential; in kind the gateway presents a projected token.
+    // Only Compose has dummy credentials, one for each entry of the mock server; in kind the
+    // gateway presents each entry's ServiceAccount token.
     let dir = "deploy/compose/dummy-credentials";
-    let credential = read(&format!("{dir}/docs-credential"));
-    assert!(
-        credential.starts_with("dummy-"),
-        "{dir}: the credential must be an obvious dummy"
-    );
+    let callers = read(&format!("{dir}/mock-docs-callers"));
+    let mut digests = Vec::new();
+    for (entry, project) in [("docs-team-a", "atlas"), ("docs-team-b", "borealis")] {
+        let credential = read(&format!("{dir}/{entry}-credential"));
+        assert!(
+            credential.starts_with("dummy-"),
+            "{dir}/{entry}-credential must be an obvious dummy"
+        );
+        let digest = sha256_hex(credential.as_bytes());
+        assert_eq!(
+            read(&format!("{dir}/{entry}-credential.sha256")).trim(),
+            digest,
+            "{dir}: demo.sh would look for another digest in mock-docs' log"
+        );
+        // mock-docs accepts the credential for its team's project alone.
+        digests.push(format!("{digest} {project}"));
+    }
     assert_eq!(
-        read(&format!("{dir}/docs-credential.sha256")).trim(),
-        sha256_hex(credential.as_bytes()),
-        "{dir}: mock-docs would refuse the gateway's credential"
+        callers.lines().collect::<Vec<_>>(),
+        digests,
+        "{dir}/mock-docs-callers: mock-docs would refuse an entry's credential, or let it name another team's project"
     );
+    assert_ne!(
+        read(&format!("{dir}/docs-team-a-credential")),
+        read(&format!("{dir}/docs-team-b-credential"))
+    );
+}
+
+#[test]
+fn compose_gives_each_entry_its_own_credential_and_mock_docs_their_digests() {
+    let compose = read("deploy/compose/compose.yaml");
+    let gateway = compose_service(&compose, "gateway");
+    assert!(
+        gateway.contains(
+            "    secrets:\n      - docs-team-a-credential\n      - docs-team-b-credential\n"
+        ),
+        "{gateway}"
+    );
+    let mock_docs = compose_service(&compose, "mock-docs");
+    assert!(
+        mock_docs.contains("      MOCK_DOCS_TOKEN_SHA256_FILE: /run/secrets/mock-docs-callers\n"),
+        "{mock_docs}"
+    );
+    assert!(
+        mock_docs.contains("    secrets:\n      - mock-docs-callers\n"),
+        "{mock_docs}"
+    );
+    for (secret, file) in [
+        ("docs-team-a-credential", "docs-team-a-credential"),
+        ("docs-team-b-credential", "docs-team-b-credential"),
+        ("mock-docs-callers", "mock-docs-callers"),
+    ] {
+        assert!(
+            compose.contains(&format!(
+                "  {secret}:\n    file: ./dummy-credentials/{file}\n"
+            )),
+            "{secret}"
+        );
+    }
+    // The deployment file maps each entry's reference to its secret.
+    let config = read("deploy/compose/config/gateway.toml");
+    assert_eq!(
+        credential_entries(&config),
+        [
+            "docs-team-a-credential = \"/run/secrets/docs-team-a-credential\"",
+            "docs-team-b-credential = \"/run/secrets/docs-team-b-credential\"",
+        ]
+    );
+}
+
+/// The non-comment lines of a deployment file's `[credentials]` table.
+fn credential_entries(config: &str) -> Vec<&str> {
+    config
+        .split_once("[credentials]\n")
+        .expect("a [credentials] section")
+        .1
+        .lines()
+        .take_while(|line| !line.starts_with('['))
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect()
 }
 
 /// The one Deployment in a kind manifest.
@@ -273,35 +345,324 @@ fn block_after(text: &str, header: &str) -> String {
         .join("\n")
 }
 
-/// Decision 0010: in kind the gateway calls mock-docs with a projected token of its own
-/// ServiceAccount, for mock-docs' audience and short-lived, and holds no static credential.
+/// The items of the YAML list that follows the line `header` in `text`, each from its `- ` line
+/// up to the next item. A comment between two items goes with the first.
+fn items(text: &str, header: &str) -> Vec<String> {
+    let block = block_after(text, header);
+    let indent = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("- "))
+        .map(|line| line.len() - line.trim_start().len())
+        .unwrap_or_else(|| panic!("no list after `{header}`"));
+    let mut items: Vec<String> = Vec::new();
+    for line in block.lines() {
+        if line.len() - line.trim_start().len() == indent && line.trim_start().starts_with("- ") {
+            items.push(String::new());
+        }
+        if let Some(item) = items.last_mut() {
+            item.push_str(line);
+            item.push('\n');
+        }
+    }
+    items
+}
+
+/// The name of a list item that starts `- name: NAME`, or `- {name: NAME, ...}`.
+fn item_name(item: &str) -> &str {
+    let first = item.lines().next().unwrap().trim_start();
+    let name = first
+        .strip_prefix("- name: ")
+        .or_else(|| first.strip_prefix("- {name: "))
+        .unwrap_or_else(|| panic!("an item without a name first: {first}"));
+    name.split([',', '}']).next().unwrap().trim()
+}
+
+/// The audience of each projected ServiceAccount token source in `volume`, None for a source
+/// that names none and so gets the API server's.
+fn token_audiences(volume: &str) -> Vec<Option<String>> {
+    let lines: Vec<&str> = volume.lines().collect();
+    let mut audiences = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if line.trim_start() != "- serviceAccountToken:" {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let audience = lines[at + 1..]
+            .iter()
+            .take_while(|next| next.len() - next.trim_start().len() > indent + 2)
+            .find_map(|next| next.trim_start().strip_prefix("audience: "))
+            .map(|audience| audience.trim_matches('"').to_owned());
+        audiences.push(audience);
+    }
+    audiences
+}
+
+/// The audiences the kind cluster's API server accepts: its issuer's, which a projected token
+/// gets when it names none.
+fn api_audience(audience: Option<&str>) -> bool {
+    audience.is_none_or(|audience| audience == KIND_ISSUER)
+}
+
+const KIND_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
+
+/// A pod template's containers of both kinds, by name, each with the names of the volumes it
+/// mounts.
+fn containers(pod: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    for header in ["      initContainers:", "      containers:"] {
+        if !pod.contains(&format!("{header}\n")) {
+            continue;
+        }
+        for container in items(pod, header) {
+            let mounts = if container.contains("volumeMounts:\n") {
+                let header = container
+                    .lines()
+                    .find(|line| line.trim_start() == "volumeMounts:")
+                    .unwrap()
+                    .to_owned();
+                items(&container, &header)
+                    .iter()
+                    .map(|mount| item_name(mount).to_owned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            found.push((item_name(&container).to_owned(), mounts));
+        }
+    }
+    found
+}
+
+/// The volumes of a pod template, by name, that hold a token the API server accepts.
+fn api_token_volumes(pod: &str) -> Vec<String> {
+    items(pod, "      volumes:")
+        .iter()
+        .filter(|volume| {
+            token_audiences(volume)
+                .iter()
+                .any(|audience| api_audience(audience.as_deref()))
+        })
+        .map(|volume| item_name(volume).to_owned())
+        .collect()
+}
+
+/// Decision 0013, section 10: in the gateway pod only the token writer mounts a token the API
+/// server accepts, a projected one with no audience or the API server's, and the gateway
+/// container mounts no ServiceAccount token at all. No container gets the default API token.
 #[test]
-fn the_kind_gateway_presents_its_own_projected_token_and_holds_no_secret() {
+fn only_the_token_writer_mounts_an_api_token_in_the_gateway_pod() {
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let volume = block_after(&gateway, "        - name: mock-docs-token");
+    let api_volumes = api_token_volumes(&gateway);
+    assert_eq!(api_volumes, ["api-token"], "{gateway}");
+    let containers = containers(&gateway);
+    let names: Vec<&str> = containers.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["wait-for-audit-schema", "token-writer", "gateway"]);
+    let with_api_token: Vec<&str> = containers
+        .iter()
+        .filter(|(_, mounts)| mounts.iter().any(|mount| api_volumes.contains(mount)))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(with_api_token, ["token-writer"], "{gateway}");
+
+    // The gateway container mounts no projected ServiceAccount token, of any audience.
+    let token_volumes: Vec<String> = items(&gateway, "      volumes:")
+        .iter()
+        .filter(|volume| !token_audiences(volume).is_empty())
+        .map(|volume| item_name(volume).to_owned())
+        .collect();
+    let (_, mounts) = containers
+        .iter()
+        .find(|(name, _)| name == "gateway")
+        .unwrap();
     assert!(
-        volume.starts_with(
-            "          projected:\n            sources:\n              - serviceAccountToken:\n"
-        ),
-        "{volume}"
+        !mounts.iter().any(|mount| token_volumes.contains(mount)),
+        "the gateway container mounts a ServiceAccount token: {mounts:?}"
     );
-    assert_eq!(
-        volume.matches("              - ").count(),
-        1,
-        "the volume projects one source:\n{volume}"
-    );
-    assert_eq!(
-        value_after(&volume, "                  audience: "),
-        "mock-docs"
-    );
-    assert_eq!(value_after(&volume, "                  path: "), "token");
-    let lifetime = number_after(&volume, "                  expirationSeconds: ", "");
+
+    // The token writer's API token is short-lived, and comes with the cluster's CA.
+    let api_token = items(&gateway, "      volumes:")
+        .into_iter()
+        .find(|volume| item_name(volume) == "api-token")
+        .unwrap();
     assert!(
-        (600..=3600).contains(&lifetime),
-        "the gateway's token lives {lifetime} s; the kubelet's minimum is 600 and the demo's longest 3600"
+        api_token.contains("                  expirationSeconds: 600\n"),
+        "{api_token}"
     );
+    assert!(
+        api_token.contains("                  name: kube-root-ca.crt\n"),
+        "{api_token}"
+    );
+
+    // No container is given the default API token.
+    assert!(
+        !gateway.contains("automountServiceAccountToken: true"),
+        "{gateway}"
+    );
+    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
+    let account = documents_with(&accounts, "  name: gateway\n");
+    assert_eq!(account.len(), 1);
+    assert!(account[0].contains("\nautomountServiceAccountToken: false"));
+}
+
+/// Decision 0013, section 10: no workload mounts a token the API server accepts, neither the
+/// default API token nor a projected one.
+#[test]
+fn no_workload_mounts_an_api_token() {
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
+    let cronjobs = documents_with(&workloads, "kind: CronJob");
+    assert_eq!(cronjobs.len(), 3);
+    for cronjob in cronjobs {
+        // The pod template, unindented to a Deployment's depth so the helpers read it.
+        let pod: String = cronjob
+            .lines()
+            .map(|line| line.strip_prefix("    ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(api_token_volumes(&pod), Vec::<String>::new(), "{cronjob}");
+        assert!(
+            !cronjob.contains("automountServiceAccountToken: true"),
+            "{cronjob}"
+        );
+        let namespace = value_after(cronjob, "  namespace: ");
+        let account = value_after(cronjob, "          serviceAccountName: ");
+        let account = documents_with(
+            &accounts,
+            &format!("  name: {account}\n  namespace: {namespace}\n"),
+        );
+        assert_eq!(account.len(), 1, "{namespace}");
+        assert!(
+            account[0].contains("\nautomountServiceAccountToken: false"),
+            "{namespace}: {}",
+            account[0]
+        );
+    }
+}
+
+/// What the token RBAC grants: ServiceAccount gateway may create tokens for the entries'
+/// ServiceAccounts, named, and nothing else; and no other Role or binding is in the base.
+#[test]
+fn the_token_grant_names_exactly_the_entries_service_accounts() {
+    let grant = read("deploy/kind/base/gateway-tokens.yaml");
+    let documents: Vec<String> = grant
+        .split("\n---\n")
+        .map(|doc| {
+            doc.lines()
+                .filter(|line| !line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect();
+    assert_eq!(
+        documents,
+        [
+            "apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-tokens
+  namespace: switchboard
+rules:
+  - apiGroups: [\"\"]
+    resources: [\"serviceaccounts/token\"]
+    verbs: [\"create\"]
+    resourceNames: [\"docs-team-a\", \"docs-team-b\"]",
+            "apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-tokens
+  namespace: switchboard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gateway-tokens
+subjects:
+  - kind: ServiceAccount
+    name: gateway
+    namespace: switchboard",
+        ],
+        "the token grant must be exactly this"
+    );
+    // The names are the token writer's accounts, each a ServiceAccount in the namespace.
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
     assert!(gateway.contains(
-        "            - {name: mock-docs-token, mountPath: /var/run/secrets/switchboard/mock-docs, readOnly: true}\n"
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b\"}\n"
+    ));
+    assert!(gateway.contains("            - {name: TOKEN_NAMESPACE, value: switchboard}\n"));
+    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
+    for account in ["docs-team-a", "docs-team-b"] {
+        let found = documents_with(
+            &accounts,
+            &format!("  name: {account}\n  namespace: switchboard\n"),
+        );
+        assert_eq!(found.len(), 1, "{account}");
+        assert!(found[0].contains("\nautomountServiceAccountToken: false"));
+    }
+    // No other file of the base grants a ServiceAccount anything or names ServiceAccounts in a
+    // rule. A binding for other subjects, such as unauthenticated callers, is not checked here.
+    let kustomization = read("deploy/kind/base/kustomization.yaml");
+    for file in kustomization
+        .lines()
+        .filter_map(|line| line.strip_prefix("  - "))
+        .filter(|file| file.ends_with(".yaml") && *file != "gateway-tokens.yaml")
+    {
+        let text = read(&format!("deploy/kind/base/{file}"));
+        for document in text.split("\n---\n") {
+            assert!(
+                !document
+                    .lines()
+                    .any(|line| line.contains("resources:") && line.contains("serviceaccounts")),
+                "{file} has a rule on ServiceAccounts: {document}"
+            );
+            let binding = document
+                .lines()
+                .any(|line| line == "kind: RoleBinding" || line == "kind: ClusterRoleBinding");
+            if let (true, Some((_, subjects))) = (binding, document.split_once("\nsubjects:")) {
+                assert!(
+                    !subjects.contains("kind: ServiceAccount")
+                        && !subjects.contains("system:serviceaccounts"),
+                    "{file} binds a role to a ServiceAccount: {document}"
+                );
+            }
+        }
+    }
+}
+
+/// Decision 0013, section 10: in kind the gateway presents each entry's ServiceAccount token,
+/// which the token writer writes, and holds no static credential.
+#[test]
+fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    let containers = items(&gateway, "      containers:");
+    let container = containers
+        .iter()
+        .find(|container| item_name(container) == "gateway")
+        .unwrap();
+    // The gateway reads the tokens; only the token writer writes them.
+    assert!(container.contains(
+        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
+    ));
+    let writer = items(&gateway, "      initContainers:")
+        .into_iter()
+        .find(|container| item_name(container) == "token-writer")
+        .unwrap();
+    assert!(
+        writer.contains("          restartPolicy: Always\n"),
+        "{writer}"
+    );
+    assert!(
+        writer.contains(
+            "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens}\n"
+        )
+    );
+    assert!(
+        writer.contains("            - {name: TOKEN_DIR, value: /var/run/switchboard/tokens}\n")
+    );
+    // The gateway starts only once both tokens are written: it reads every credential at boot.
+    assert!(writer.contains(
+        "                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b\n"
+    ), "{writer}");
+    assert!(gateway.contains(
+        "        - name: entry-tokens\n          emptyDir: {medium: Memory, sizeLimit: 1Mi}"
     ));
     // No Secret volume, nor a Secret projected into one; the database URL comes from a Secret
     // by secretKeyRef, which is not a credential for mock-docs.
@@ -311,29 +672,19 @@ fn the_kind_gateway_presents_its_own_projected_token_and_holds_no_secret() {
             "the gateway mounts a Secret:\n{gateway}"
         );
     }
-    assert!(!gateway.contains("automountServiceAccountToken: true"));
-    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
-    let account = documents_with(&accounts, "  name: gateway\n");
-    assert_eq!(account.len(), 1);
-    assert!(account[0].contains("\nautomountServiceAccountToken: false"));
 
-    // The deployment file names the token as the one credential, under the registry's
-    // reference.
+    // The deployment file names each entry's token as its credential, under the registry's
+    // references.
     let config = read("deploy/kind/base/config/gateway.toml");
-    let credentials = config
-        .split_once("[credentials]\n")
-        .expect("a [credentials] section")
-        .1;
-    let entries: Vec<&str> = credentials
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .collect();
     assert_eq!(
-        entries,
-        ["docs-credential = \"/var/run/secrets/switchboard/mock-docs/token\""]
+        credential_entries(&config),
+        [
+            "docs-team-a-credential = \"/var/run/switchboard/tokens/docs-team-a\"",
+            "docs-team-b-credential = \"/var/run/switchboard/tokens/docs-team-b\"",
+        ]
     );
 
-    // The dummy credential and the Secrets made from it are gone.
+    // The dummy credentials and the Secrets made from them are not in kind.
     assert!(
         !common::repo()
             .join("deploy/kind/base/dummy-credentials")
@@ -341,33 +692,36 @@ fn the_kind_gateway_presents_its_own_projected_token_and_holds_no_secret() {
     );
     let kustomization = read("deploy/kind/base/kustomization.yaml");
     assert!(
-        !kustomization.contains("docs-credential"),
-        "{kustomization}"
-    );
-    assert!(
-        !kustomization.contains("dummy-credentials"),
+        !kustomization
+            .lines()
+            .any(|line| !line.starts_with('#') && line.contains("credential")),
         "{kustomization}"
     );
 }
 
-/// mock-docs in kind accepts only the gateway's ServiceAccount, signed by the cluster's issuer,
-/// for its own audience, and holds no static credential.
+/// mock-docs in kind accepts only the entries' ServiceAccounts, signed by the cluster's issuer,
+/// for its own audience, each for its team's project alone, and holds no static credential.
 #[test]
-fn the_kind_mock_docs_accepts_only_the_gateways_identity() {
+fn the_kind_mock_docs_accepts_only_the_entries_identities() {
     use mock_docs_server::config;
 
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let subject = format!(
-        "system:serviceaccount:{}:{}",
-        value_after(&gateway, "  namespace: "),
-        value_after(&gateway, "      serviceAccountName: "),
-    );
-    assert_eq!(subject, "system:serviceaccount:switchboard:gateway");
-    let audience = value_after(&gateway, "                  audience: ").to_owned();
+    let namespace = value_after(&gateway, "  namespace: ");
+    let subjects: Vec<String> = ["docs-team-a", "docs-team-b"]
+        .iter()
+        .map(|account| format!("system:serviceaccount:{namespace}:{account}"))
+        .collect();
+    let audience = value_after(&gateway, "            - {name: TOKEN_AUDIENCE, value: ")
+        .trim_end_matches('}')
+        .to_owned();
     let issuer = value_after(&read("deploy/kind/base/config/gateway.toml"), "issuer = ").to_owned();
+    assert_eq!(issuer, KIND_ISSUER);
     let driver = read("deploy/demo/demo.sh");
     assert_eq!(value_after(&driver, "KIND_ISSUER="), issuer);
-    assert_eq!(value_after(&driver, "KIND_GATEWAY_SUBJECT="), subject);
+    assert_eq!(
+        value_after(&driver, "KIND_ENTRY_SUBJECTS="),
+        subjects.join(" ")
+    );
 
     let mock_docs = only_deployment("deploy/kind/base/mock-docs.yaml");
     let env: Vec<(String, String)> = block_after(&mock_docs, "          env:")
@@ -383,11 +737,14 @@ fn the_kind_mock_docs_accepts_only_the_gateways_identity() {
         })
         .collect();
     let jwks = "/etc/mock-docs/issuer/jwks.json";
+    // Each entry's ServiceAccount, for its team's project alone: the project the registry's
+    // limit gives the team whose surface serves that entry's tools.
+    let callers = format!("{}=atlas;{}=borealis", subjects[0], subjects[1]);
     let want: Vec<(String, String)> = [
         (config::LISTEN_VAR, "0.0.0.0:8080"),
         (config::JWT_ISSUER_VAR, issuer.as_str()),
         (config::JWT_AUDIENCE_VAR, audience.as_str()),
-        (config::JWT_SUBJECT_VAR, subject.as_str()),
+        (config::JWT_SUBJECTS_VAR, callers.as_str()),
         (config::JWKS_FILE_VAR, jwks),
     ]
     .into_iter()
@@ -395,8 +752,31 @@ fn the_kind_mock_docs_accepts_only_the_gateways_identity() {
     .collect();
     assert_eq!(env, want);
     assert_eq!(audience, "mock-docs");
-    for name in config::STATIC_VARS {
-        assert!(!mock_docs.contains(name), "mock-docs sets {name}");
+    let registry = read("deploy/kind/base/config/registry/registry.toml");
+    for (entry, team, project) in [
+        ("docs-team-a", "team-a", "atlas"),
+        ("docs-team-b", "team-b", "borealis"),
+    ] {
+        assert!(registry.contains(&format!(
+            "[[surfaces]]\nname = \"{entry}\"\ntools = [\"{entry}__list_documents\", \"{entry}__read_document\"]\nteams = [\"{team}\"]\n"
+        )));
+        assert!(registry.contains(&format!(
+            "{team} = [{{ system = \"docs\", kind = \"project\", identifier = \"{project}\" }}]\n"
+        )));
+        assert!(registry.contains(&format!(
+            "credential = {{ mode = \"bearer\", reference = \"{entry}-credential\" }}\n"
+        )));
+    }
+    // Neither the admin endpoint nor slow-doc's delay is set: no demo step uses them.
+    for name in config::STATIC_VARS.into_iter().chain([
+        config::JWT_SUBJECT_VAR,
+        config::ADMIN_LISTEN_VAR,
+        config::SLOW_MS_VAR,
+    ]) {
+        assert!(
+            !mock_docs.contains(&format!("{name},")),
+            "mock-docs sets {name}"
+        );
     }
     for secret in ["secret:", "secretName", "secretKeyRef"] {
         assert!(
@@ -467,23 +847,6 @@ fn volume(deployment: &str, name: &str) -> String {
         .chain(rest)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// The audience of each projected ServiceAccount token in `volume`; None for one that sets
-/// none, which the kubelet gives the API server's audience.
-fn token_audiences(volume: &str) -> Vec<Option<String>> {
-    volume
-        .split("- serviceAccountToken:")
-        .skip(1)
-        .map(|source| {
-            source
-                .lines()
-                .skip(1)
-                .take_while(|line| line.starts_with("                  "))
-                .find_map(|line| line.trim().strip_prefix("audience: "))
-                .map(|audience| audience.trim_matches('"').to_owned())
-        })
-        .collect()
 }
 
 /// #88, decision 0013 section 10: in kind the gateway fetches the cluster issuer's keys from the
@@ -634,6 +997,50 @@ fn workload_tokens_are_for_the_gateways_audience_and_short_lived() {
     assert!(gateway.contains("max_lifetime_seconds = 3600"));
 }
 
+/// Each team's workload calls its own surface, which serves only its own entry's tools, in kind
+/// and in Compose.
+#[test]
+fn each_teams_workload_calls_its_own_surface() {
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    for (team, account) in [
+        ("team-a", "mock-workload"),
+        ("team-b", "mock-workload"),
+        ("team-a", "stranger"),
+    ] {
+        let cronjob = documents_with(&workloads, &format!("  namespace: {team}\n"))
+            .into_iter()
+            .filter(|doc| doc.contains(&format!("          serviceAccountName: {account}\n")))
+            .collect::<Vec<_>>();
+        assert_eq!(cronjob.len(), 1, "{team} {account}");
+        assert!(
+            cronjob[0].contains(&format!(
+                "                - {{name: GATEWAY_URL, value: \"http://gateway.switchboard.svc.cluster.local:8080/mcp/docs-{team}\"}}\n"
+            )),
+            "{team}'s {account} does not call its own surface:\n{}",
+            cronjob[0]
+        );
+    }
+    // In Compose, demo.sh names the surface on every run of the workload service.
+    let driver = read("deploy/demo/demo.sh");
+    assert!(
+        driver.contains(
+            "      -e \"GATEWAY_URL=http://gateway:8080/mcp/$(team_entry \"$team\")\" \\\n"
+        )
+    );
+    let run = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            ". '{}' && team_entry team-a && team_entry team-b",
+            common::repo().join("deploy/demo/demo.sh").display()
+        ))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "docs-team-a\ndocs-team-b\n"
+    );
+}
+
 #[test]
 fn each_teams_workload_names_its_own_project() {
     // Every Job demo.sh starts, the before-policy one included, keeps the template's
@@ -774,20 +1181,24 @@ fn registry_body(path: &str) -> String {
         .join("\n")
 }
 
-/// The one `binding_sha256` every tool in `registry` records, which holds one server.
-fn binding(registry: &str) -> String {
-    let bindings: std::collections::BTreeSet<&str> = registry
+/// Each `binding_sha256` the tools in `registry` record, in the order of the tools: one for each
+/// of its servers, the same on each of that server's tools.
+fn bindings(registry: &str) -> Vec<String> {
+    let mut bindings: Vec<String> = Vec::new();
+    for binding in registry
         .lines()
         .filter_map(|line| line.strip_prefix("binding_sha256 = "))
-        .collect();
-    assert_eq!(bindings.len(), 1, "{bindings:?}");
-    let binding = bindings.into_iter().next().unwrap().to_owned();
+    {
+        if !bindings.iter().any(|seen| seen == binding) {
+            bindings.push(binding.to_owned());
+        }
+    }
     assert_eq!(
-        registry.matches(&binding).count(),
-        registry.matches("\n[[tools]]\n").count(),
-        "a tool without the binding"
+        bindings.len(),
+        registry.matches("\n[[servers]]\n").count(),
+        "{bindings:?}"
     );
-    binding
+    bindings
 }
 
 #[test]
@@ -797,18 +1208,22 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
     let kind_issuer = "issuer = \"https://kubernetes.default.svc.cluster.local\"";
     let kind_identity = "identity = \"mock-docs.mock-docs.svc.cluster.local\"";
     let kind_address = "address = \"http://mock-docs.mock-docs.svc.cluster.local:8080/mcp\"";
-    for line in [kind_issuer, kind_identity, kind_address] {
-        assert_eq!(kind.matches(line).count(), 1, "{line}");
+    assert_eq!(kind.matches(kind_issuer).count(), 1);
+    // The mock server is registered once per team, both entries at the one address.
+    for line in [kind_identity, kind_address] {
+        assert_eq!(kind.matches(line).count(), 2, "{line}");
     }
-    // The binding differs because the identity and address do; the loader checks each file's.
-    let as_compose = kind
+    // Each binding differs because the identity and address do; the loader checks each file's.
+    let mut as_compose = kind
         .replace(
             kind_issuer,
             "issuer = \"https://dev-issuer.switchboard.test\"",
         )
         .replace(kind_identity, "identity = \"mock-docs\"")
-        .replace(kind_address, "address = \"http://mock-docs:8080/mcp\"")
-        .replace(&binding(&kind), &binding(&compose));
+        .replace(kind_address, "address = \"http://mock-docs:8080/mcp\"");
+    for (kind_binding, compose_binding) in bindings(&kind).iter().zip(bindings(&compose)) {
+        as_compose = as_compose.replace(kind_binding, &compose_binding);
+    }
     assert_eq!(as_compose, compose);
     // The kind registry is the registry crate's own demo file.
     assert_eq!(
@@ -816,16 +1231,23 @@ fn the_compose_and_kind_registries_differ_only_in_issuer_identity_address_and_bi
         registry_body("crates/gateway-registry/demo/registry.toml")
     );
 
-    // The withdrawn copy is the Compose registry less the read tool, at a new revision.
+    // The withdrawn copy is the Compose registry less each team's read tool, at a new
+    // revision.
     let withdrawn = registry_body("deploy/compose/config/registry-withdrawn.toml");
-    assert!(withdrawn.contains("revision = \"demo-2\""));
-    assert!(!withdrawn.contains("name = \"docs__read_document\""));
-    assert!(withdrawn.contains("tools = [\"docs__list_documents\"]\n"));
+    assert!(compose.contains("revision = \"demo-3\""));
+    assert!(withdrawn.contains("revision = \"demo-4\""));
+    for entry in ["docs-team-a", "docs-team-b"] {
+        assert!(!withdrawn.contains(&format!("name = \"{entry}__read_document\"")));
+        assert!(withdrawn.contains(&format!("tools = [\"{entry}__list_documents\"]\n")));
+    }
     assert_eq!(
         compose.lines().count() - withdrawn.lines().count(),
-        23,
-        "the withdrawn copy differs by more than the read tool"
+        2 * 23,
+        "the withdrawn copy differs by more than the read tools"
     );
+    // demo.sh names the same revisions.
+    let driver = read("deploy/demo/demo.sh");
+    assert!(driver.contains("\nREVISION=demo-3\nWITHDRAWN_REVISION=demo-4\n"));
 }
 
 #[test]

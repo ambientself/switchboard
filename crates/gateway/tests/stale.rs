@@ -34,7 +34,7 @@ use gateway_identity::{SigningAlgorithm, SystemClock};
 use gateway_mcp::DENIAL_CODE;
 use gateway_registry::Registry;
 use gateway_testkit::{InMemoryAuditStore, LocalIssuer};
-use mock_docs_server::{AcceptedCredential, Config};
+use mock_docs_server::Config;
 use serde_json::{Value, json};
 use support::{Answer, Http, PATIENCE, exchange, legacy};
 use tokio::net::TcpListener;
@@ -62,10 +62,9 @@ struct Stale {
 
 impl Stale {
     async fn start(name: &str) -> Self {
-        let mock =
-            mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
-                .await
-                .unwrap();
+        let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
+            .await
+            .unwrap();
         let issuer = cluster_issuer();
         let files = Files::new(name, &issuer.jwks_document(), &mock.url());
         let deployment = files.load();
@@ -80,16 +79,25 @@ impl Stale {
             read_at: Instant::now(),
         };
         let registry = Registry::from_toml_str(std::str::from_utf8(&loaded).unwrap()).unwrap();
-        let credentials =
-            FileCredentials::load([("mock-docs".into(), files.path("docs-credential"))]).unwrap();
-        let upstream = Upstream::new("mock-docs", mock.url())
-            .tool(READ_TOOL.parse().unwrap(), "read_document")
-            .tool(LIST_TOOL.parse().unwrap(), "list_documents");
-        let connector = Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap());
         let store = Arc::new(InMemoryAuditStore::new());
-        let wiring = Wiring::new(Arc::new(SystemClock))
-            .audit_store(store.clone())
-            .proxied("mock-docs", connector);
+        let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
+        // One connector for each of the mock server's entries, with that entry's credential.
+        for entry in ["docs-team-a", "docs-team-b"] {
+            let credentials =
+                FileCredentials::load([(entry.into(), files.path(&format!("{entry}-credential")))])
+                    .unwrap();
+            let upstream = Upstream::new(entry, mock.url())
+                .tool(
+                    format!("{entry}__read_document").parse().unwrap(),
+                    "read_document",
+                )
+                .tool(
+                    format!("{entry}__list_documents").parse().unwrap(),
+                    "list_documents",
+                );
+            let connector = Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap());
+            wiring = wiring.proxied(entry, connector);
+        }
         let (gates, reloader) = boot::check_registry(settings, registry, wiring).unwrap();
         let freshness = gates.freshness().clone();
         tokio::spawn(reloader.watch(registry_file.clone(), POLL, loaded));
@@ -352,10 +360,9 @@ impl SlowBoot {
     /// Boots as `name`, the slow issuer doing `during` to the registry file, with the
     /// reloader to read it every `poll`.
     async fn start(name: &str, during: DuringFetch, poll: Duration) -> Self {
-        let mock =
-            mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
-                .await
-                .unwrap();
+        let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
+            .await
+            .unwrap();
         let cluster = cluster_issuer();
         let files = Files::new(name, &cluster.jwks_document(), &mock.url());
         let registry_file = files.path("registry/registry.toml");

@@ -3689,7 +3689,7 @@ mutate("demo-driver-workload-exit-ignored", "a workload's non-zero exit without 
 mutate("demo-driver-result-ignores-failures", "the RESULT passes with FAILs counted", DRIVER,
        """  if [ "$FAILS" -eq 0 ] && [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""", """  if [ "$total" -gt 0 ] && [ -n "$FINISHED" ]; then""")
 mutate("demo-driver-any-bearer-is-the-gateways", "mock-docs' accepted bearers are not compared with the gateway's", DRIVER,
-       """'$1 == "accepted" && !(length($2) >= 8 && index(sha, $2) == 1) { n++ }""", """'$1 == "accepted" && 0 { n++ }""")
+       """'$1 == "accepted" && !ours($2) { count++ }""", """'$1 == "accepted" && 0 { count++ }""")
 mutate("demo-driver-compose-bearers-whole-log", "the Compose bearer check counts earlier runs' requests too", DRIVER,
        """    compose) dc logs --no-log-prefix --since "$LOG_SINCE" mock-docs ;;""", """    compose) dc logs --no-log-prefix mock-docs ;;""")
 mutate("demo-driver-kind-bearers-whole-log", "the kind bearer check counts earlier runs' requests too", DRIVER,
@@ -3707,8 +3707,8 @@ mutate("demo-driver-job-log-status-ignored", "a Job's log that kubectl could not
        '  if fetch "$label\'s log (job $ns/$JOB)" k -n "$ns" logs "job/$JOB"; then\n    tally_workload "$label" "$JOB_STATUS" "$FETCHED"\n  fi\n',
        '  tally_workload "$label" "$JOB_STATUS" "$(k -n "$ns" logs "job/$JOB")"\n')
 mutate_all("demo-driver-mock-log-status-ignored", "a mock-docs log that could not be read is checked as an empty log",
-           (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_bearers "$FETCHED" \\\n      "$(cat""",
-            """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_bearers "$FETCHED" \\\n      "$(cat"""),
+           (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_bearers "$FETCHED" "$(entry_sha""",
+            """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_bearers "$FETCHED" "$(entry_sha"""),
            (DRIVER, """  if fetch "mock-docs' log" mock_docs_log; then\n    check_server_callers""",
             """  if FETCHED=$(mock_docs_log) || true; then\n    check_server_callers"""))
 mutate_all("demo-driver-boot-log-status-ignored", "a gateway log that could not be read is checked for boot lines",
@@ -3807,8 +3807,8 @@ mutate("demo-policy-any-switchboard-pod", "mock-docs admits any pod in the switc
        "              kubernetes.io/metadata.name: switchboard\n")
 mutate("demo-policy-in-base", "the base applies the network policy before the direct call is shown", "deploy/kind/base/kustomization.yaml",
        "  - workloads.yaml\n", "  - workloads.yaml\n  - ../policy\n")
-mutate("demo-credential-hash-mismatch", "mock-docs holds the hash of another credential", "deploy/compose/dummy-credentials/docs-credential.sha256",
-       "35078c7e636169b1", "35078c7e636169b2")
+mutate("demo-credential-hash-mismatch", "demo.sh looks for the hash of another credential than team-a's entry's",
+       "deploy/compose/dummy-credentials/docs-team-a-credential.sha256", "88a0f2ba13fc3cc8", "88a0f2ba13fc3cc9")
 # #47: the gateway's call before the policy, and the rest of decision 0010's control 1.
 mutate("demo-before-policy-no-gateway-read", "before the policy, the gateway's call to the server is not made", WORKLOAD,
        '  expect_allowed "$(call "$TOKEN" "$READ_TOOL" "{\\"project\\":\\"$OWN_PROJECT\\",\\"document\\":\\"$DOCUMENT\\"}")" "before policy: read own project through the gateway"\n', "")
@@ -3817,8 +3817,8 @@ mutate("demo-before-policy-own-project-optional", "before-policy runs without OW
 mutate("demo-kind-before-policy-no-own-project", "team-b's workload template names no project", "deploy/kind/base/workloads.yaml",
        "                - {name: OWN_PROJECT, value: borealis}\n", "")
 mutate("demo-kind-accepted-count-6", "the kind caller check still expects 6 calls, without the before-policy reads", DRIVER,
-       '    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n',
-       '    check_server_callers "$FETCHED" "$KIND_GATEWAY_SUBJECT" 6 2 "$OPEN_ATTEMPTS"\n')
+       '    check_server_callers "$FETCHED" "$KIND_ENTRY_SUBJECTS" 8 2 "$OPEN_ATTEMPTS"\n',
+       '    check_server_callers "$FETCHED" "$KIND_ENTRY_SUBJECTS" 6 2 "$OPEN_ATTEMPTS"\n')
 PERMISSIONS = "deploy/route-check/permissions.tsv"
 mutate("demo-operator-checks-no-attach", "attach is not checked", PERMISSIONS,
        "create\tpods\tattach\tnamespaced\nget\tpods\tattach\tnamespaced\n", "")
@@ -3882,11 +3882,11 @@ mutate_all("demo-kind-gateway-keys-token", "the gateway container mounts a proje
            ("deploy/kind/base/gateway.yaml",
             "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n",
             "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n"
-            "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n"),
+            "            - {name: keys-token, mountPath: /var/run/secrets/switchboard/keys, readOnly: true}\n"),
            ("deploy/kind/base/gateway.yaml",
             "          configMap: {name: kube-root-ca.crt}\n",
             "          configMap: {name: kube-root-ca.crt}\n"
-            "        - name: api-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
+            "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
             "                  audience: https://kubernetes.default.svc.cluster.local\n                  expirationSeconds: 600\n                  path: token\n"))
 mutate("demo-kind-gateway-keys-token-unset-audience", "the gateway's CA volume also projects a token with no audience, which is the API server's",
        "deploy/kind/base/gateway.yaml",
@@ -4078,6 +4078,44 @@ mutate("route-check-broken-rows-ignored", "route-check.sh starts the probe whate
        """  if [ -n "$broken" ]; then\n    local row why\n""", """  if false; then\n    local row why\n""")
 mutate("probe-not-in-image", "the image does not install the probe", "deploy/Dockerfile",
        "COPY --chmod=0755 deploy/route-check/probe.sh /usr/local/bin/route-probe.sh\n", "")
+# #11's kind slice: the mock server registered once per team, each entry with its own identity
+# (decisions 0010 and 0013, section 10). In kind a token-writer sidecar holds the only API token
+# in the gateway pod and writes each entry's ServiceAccount token to a file.
+TOKEN_WRITER = "deploy/demo/token-writer.sh"
+mutate("demo-token-writer-prints-token", "the token writer prints each token it writes", TOKEN_WRITER,
+       '  log "$account: wrote a token for audience',
+       '  log "$account: wrote $token for audience')
+mutate("demo-token-writer-truncates-on-failure", "the token writer empties the token file before it asks for a new one", TOKEN_WRITER,
+       r"""  answer=$(printf 'Authorization: Bearer %s\n' "$api" |""",
+       r""": >"$target"
+  answer=$(printf 'Authorization: Bearer %s\n' "$api" |""")
+mutate("demo-token-writer-wrong-audience", "the token writer asks for tokens for another audience than the server's", TOKEN_WRITER,
+       "    spec: {audiences: [$audience], expirationSeconds: $seconds}}')",
+       """    spec: {audiences: ["switchboard"], expirationSeconds: $seconds}}')""")
+mutate("demo-kind-gateway-mounts-api-token", "the gateway container mounts the token writer's API token", "deploy/kind/base/gateway.yaml",
+       "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n",
+       "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
+       "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n")
+mutate("demo-kind-token-rbac-unnamed", "the gateway may create a token for any ServiceAccount in its namespace", "deploy/kind/base/gateway-tokens.yaml",
+       '    resourceNames: ["docs-team-a", "docs-team-b"]\n', "")
+STRANGER = "  name: stranger\n  namespace: team-a\nautomountServiceAccountToken: false\n"
+mutate("demo-kind-other-file-binds-service-account", "another base file binds a ClusterRole to a team's ServiceAccount",
+       "deploy/kind/base/serviceaccounts.yaml", STRANGER,
+       STRANGER + "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: RoleBinding\nmetadata:\n  name: stranger-edit\n"
+       "  namespace: team-a\nroleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: edit\n"
+       "subjects:\n  - kind: ServiceAccount\n    name: stranger\n    namespace: team-a\n")
+mutate("demo-kind-other-file-token-rule", "another base file holds a Role that may create ServiceAccount tokens",
+       "deploy/kind/base/serviceaccounts.yaml", STRANGER,
+       STRANGER + "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: tokens\n"
+       "  namespace: team-a\nrules:\n  - apiGroups: [\"\"]\n    resources: [\"serviceaccounts/token\"]\n    verbs: [\"create\"]\n")
+mutate("demo-workload-shared-surface", "team-b's workload calls team-a's surface", "deploy/kind/base/workloads.yaml",
+       '8080/mcp/docs-team-b"}', '8080/mcp/docs-team-a"}')
+mutate("demo-compose-workload-default-surface", "every Compose workload run calls the service's default surface, team-a's", DRIVER,
+       '      -e "GATEWAY_URL=http://gateway:8080/mcp/$(team_entry "$team")" \\\n', "")
+mutate("demo-kind-mock-docs-entry-any-project", "mock-docs lets team-a's entry name team-b's project", "deploy/kind/base/mock-docs.yaml",
+       "docs-team-a=atlas;", "docs-team-a=atlas,borealis;")
+mutate("demo-driver-entry-check-any-identity", "the entry check counts a kind call under any entry's identity as each team's", DRIVER,
+       "      return logged == identity\n", "      return 1\n")
 
 
 # --- gateway: the first slice from files ---------------------------------------------------
@@ -4209,7 +4247,7 @@ mutate("dev-issuer-no-subject", "the development issuer starts with no subjects"
 mutate("demo-driver-bearer-count-floor", "a denied call that reached mock-docs passes the bearer check", DRIVER,
        '  check "$good" "$calls" "mock-docs accepted', '  check_at_least "$good" "$calls" "mock-docs accepted')
 mutate("demo-driver-kind-bearer-count-compose", "the kind run expects only Compose's four allowed calls", DRIVER,
-       '"$KIND_GATEWAY_SUBJECT" 8 2 "$OPEN_ATTEMPTS"\n', '"$KIND_GATEWAY_SUBJECT" 4 2 "$OPEN_ATTEMPTS"\n')
+       '"$KIND_ENTRY_SUBJECTS" 8 2 "$OPEN_ATTEMPTS"\n', '"$KIND_ENTRY_SUBJECTS" 4 2 "$OPEN_ATTEMPTS"\n')
 mutate("demo-dockerignore-worktrees-sent", "the image's build context takes in .claude and its worktrees", ".dockerignore",
        "\n.claude\n", "\n")
 mutate("demo-dockerignore-nested-targets-sent", "the image's build context takes in nested target directories", ".dockerignore",
@@ -4287,11 +4325,15 @@ mutate("demo-driver-list-count-unchecked", "the list check passes whatever numbe
 mutate("demo-driver-list-check-counts-nothing", "the list check passes whatever list rows were wrong", DRIVER,
        '  check "$(count_lines . "$wrong")" 0 "audit: each list row', '  check 0 0 "audit: each list row')
 mutate("demo-driver-list-withdrawn-shown", "the list check expects the withdrawn tool after the withdrawal too", DRIVER,
-       '"demo-2": [$list]}', '"demo-2": [$list, $read]}')
+       '($withdrawn): [entry + "__list_documents"]}', '($withdrawn): [entry + "__list_documents", entry + "__read_document"]}')
 mutate("demo-driver-list-omitted-unchecked", "the list check passes a list row that left tools out", DRIVER,
        "            and .omitted == 0) | not)\n", "            and true) | not)\n")
-mutate("demo-driver-list-any-team", "the list check passes a list row from any team", DRIVER,
-       '        | select(((.team == "team-a" or .team == "team-b")\n', "        | select(((true)\n")
+# A team without an entry has no tools to be shown, so a row from one fails on that too: the
+# mutation takes away both, judging the row as team-a's.
+mutate_all("demo-driver-list-any-team", "the list check passes a list row from any team",
+           (DRIVER, '        | select(((.team == "team-a" or .team == "team-b")\n', "        | select(((true)\n"),
+           (DRIVER, '        def entry: {"team-a": "docs-team-a", "team-b": "docs-team-b"}[.team // ""];\n',
+            '        def entry: {"team-a": "docs-team-a", "team-b": "docs-team-b"}[.team // ""] // "docs-team-a";\n'))
 mutate("demo-driver-row-check-no-rows-passes", "the row check passes with no rows", DRIVER,
        '  if [ "$total" -eq 0 ]; then\n', '  if false; then\n')
 mutate("demo-driver-operator-checks-team-a-only", "only team-a's workload is checked", DRIVER,
@@ -4318,24 +4360,24 @@ mutate("demo-kind-tcp-readiness-probe", "the kind probe only opens a connection,
        "            tcpSocket:\n              port: http\n")
 mutate("demo-compose-default-grace-period", "the Compose gateway gets Compose's default 10 s to stop", COMPOSE,
        "    stop_grace_period: 50s\n", "    stop_grace_period: 10s\n")
-# #47: in kind the gateway presents its own projected token, and mock-docs accepts only that
-# identity (decision 0010).
+# #47: in kind the gateway presents a projected token, and mock-docs accepts only the identities
+# the gateway presents (decision 0010). Since #11's kind slice those are the entries'
+# ServiceAccounts, whose tokens the token writer writes (decision 0013, section 10).
 KIND_GATEWAY = "deploy/kind/base/gateway.yaml"
 KIND_MOCK_DOCS = "deploy/kind/base/mock-docs.yaml"
-mutate("demo-kind-gateway-still-mounts-docs-credential", "the kind gateway mounts a static credential from a Secret", KIND_GATEWAY,
-       "          projected:\n            sources:\n              - serviceAccountToken:\n"
-       "                  audience: mock-docs\n                  expirationSeconds: 600\n                  path: token\n",
+mutate("demo-kind-gateway-still-mounts-docs-credential", "the kind gateway's credentials come from a Secret", KIND_GATEWAY,
+       "          emptyDir: {medium: Memory, sizeLimit: 1Mi}\n",
        "          secret: {secretName: docs-credential}\n")
-mutate("demo-kind-gateway-token-long-lived", "the gateway's token for mock-docs lives a day", KIND_GATEWAY,
+mutate("demo-kind-gateway-token-long-lived", "the token writer's API token lives a day", KIND_GATEWAY,
        "                  expirationSeconds: 600\n", "                  expirationSeconds: 86400\n")
 mutate("demo-kind-mock-docs-any-subject", "mock-docs accepts a workload's ServiceAccount", KIND_MOCK_DOCS,
-       '"system:serviceaccount:switchboard:gateway"', '"system:serviceaccount:team-a:mock-workload"')
+       "system:serviceaccount:switchboard:docs-team-b=borealis", "system:serviceaccount:team-b:mock-workload=borealis")
 # #88: the gateway fetches its own keys; only mock-docs still reads the copy.
 mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys into the gateway's namespace, not mock-docs'", DRIVER,
        "  k -n mock-docs create configmap cluster-issuer-keys ", "  k -n switchboard create configmap cluster-issuer-keys ")
 mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
-           (DRIVER, """'$1 == "accepted" && $2 == subject && NF == 2 { n++ }""", """'$1 == "accepted" { n++ }"""),
-           (DRIVER, """'$1 == "accepted" && !($2 == subject && NF == 2) { n++ }""", """'$1 == "accepted" && 0 { n++ }"""))
+           (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 2 { count++ }""", """'$1 == "accepted" { count++ }"""),
+           (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 2) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
 mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls and the probe do not explain passes", DRIVER,
        '  check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"\n', "")
 mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure count reads the gateway's whole log", DRIVER,

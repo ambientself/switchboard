@@ -14,14 +14,14 @@
 #                  team manifest)
 #   audit-down     one allowed read while the audit database is unavailable; the gateway must
 #                  refuse it with the audit-failure sentence
-#   withdrawn      after docs__read_document is withdrawn from the registry: tools/list drops it
+#   withdrawn      after the team's read tool is withdrawn from the registry: tools/list drops it
 #                  and a call to it is refused
 #   idle           makes no call: sleeps until SIGTERM, at most IDLE_SECONDS, then prints
 #                  `PASS idle`. It holds a running pod with the workload's labels and
 #                  ServiceAccount, for the route check to start its probe in
 #
 # Environment:
-#   GATEWAY_URL      the surface's endpoint, e.g. http://gateway:8080/mcp/docs
+#   GATEWAY_URL      the team's surface's endpoint, e.g. http://gateway:8080/mcp/docs-team-a
 #   TOKEN_FILE       a file holding this workload's token, or
 #   TOKEN_URL        a URL that answers with this workload's token (the Compose dev issuer)
 #   OWN_PROJECT      the project this workload's team may read
@@ -32,7 +32,9 @@
 #   DIRECT_TIMEOUT   seconds to wait on DIRECT_URL, default 3
 #   IDLE_SECONDS     how long idle waits for SIGTERM, 1 to 600, default 600
 #
-# The tool names and their arguments are the demo registry's (deploy/*/config/registry); the
+# The tool names and their arguments are the demo registry's (deploy/*/config/registry). Each
+# team's surface is named for its entry of the mock server, docs-team-a or docs-team-b, and serves
+# that entry's tools, named <entry>__list_documents and <entry>__read_document. The
 # `plan` document and the projects `atlas` and `borealis` are the mock server's
 # (crates/mock-docs-server). The sentences are the core's (crates/gateway-core/src/sentences.rs);
 # crates/demo-checks tests that they still match.
@@ -42,8 +44,8 @@ MODE=${1:-full}
 GW=${GATEWAY_URL:?GATEWAY_URL is required}
 SURFACE=${GW##*/}
 PROTOCOL=2025-06-18
-LIST_TOOL=docs__list_documents
-READ_TOOL=docs__read_document
+LIST_TOOL=${SURFACE}__list_documents
+READ_TOOL=${SURFACE}__read_document
 DOCUMENT=plan
 
 IDENTITY_FAILURE='The gateway could not verify who is calling, so the call was refused.'

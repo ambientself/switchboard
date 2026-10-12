@@ -78,14 +78,16 @@ services:
 
   mock-docs:
     <<: *demo-image
-    # Accepts only the gateway's credential: it is given the credential's sha256, never the
+    # Accepts only the gateway's two credentials, one for each entry of it in the registry, and
+    # limits each to its team's project: docs-team-a's to atlas, docs-team-b's to borealis
+    # (dummy-credentials/mock-docs-callers). It is given each credential's sha256, never the
     # credential. It logs the sha256 prefix of every bearer it receives.
     command: ["mock-docs-server"]
     environment:
       MOCK_DOCS_LISTEN: 0.0.0.0:8080
-      MOCK_DOCS_TOKEN_SHA256_FILE: /run/secrets/docs-credential-sha256
+      MOCK_DOCS_TOKEN_SHA256_FILE: /run/secrets/mock-docs-callers
     secrets:
-      - docs-credential-sha256
+      - mock-docs-callers
     healthcheck:
       test: ["CMD", "curl", "-so", "/dev/null", "http://127.0.0.1:8080/mcp"]
       interval: 2s
@@ -100,7 +102,7 @@ services:
       args:
         REQUIRE_ALL_BINS: "true"
     # The deployment file names everything else: the registry, the dev issuer's keys, the team
-    # manifest, the audit database's URL variable and the credential file.
+    # manifest, the audit database's URL variable and each entry's credential file.
     command: ["switchboard", "--config=/etc/switchboard/gateway.toml"]
     # Decision 0009, Shutdown: on `docker compose stop` or `down`, the gateway serves on for its
     # 8 s readiness removal, though nothing probes it here, and then needs the 2 s begin budget,
@@ -122,7 +124,8 @@ services:
       - ${SWITCHBOARD_REGISTRY_DIR:-./config/registry}:/etc/switchboard/registry:ro
       - issuer-keys:/shared/issuer:ro
     secrets:
-      - docs-credential
+      - docs-team-a-credential
+      - docs-team-b-credential
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -131,7 +134,7 @@ services:
       mock-docs:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-so", "/dev/null", "http://127.0.0.1:8080/mcp/docs"]
+      test: ["CMD", "curl", "-so", "/dev/null", "http://127.0.0.1:8080/mcp/docs-team-a"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -140,9 +143,9 @@ services:
     <<: *demo-image
     profiles: [demo]
     command: ["workload.sh", "full"]
-    # Team A by default; demo.sh sets these per run.
+    # Team A by default, on its own surface; demo.sh sets these per run.
     environment:
-      GATEWAY_URL: http://gateway:8080/mcp/docs
+      GATEWAY_URL: http://gateway:8080/mcp/docs-team-a
       TOKEN_URL: http://dev-issuer:8090/token?subject=workload:team-a:mock-workload&audience=switchboard
       OWN_PROJECT: atlas
       OTHER_PROJECT: borealis
@@ -156,10 +159,13 @@ services:
         condition: service_healthy
 
 secrets:
-  docs-credential:
-    file: ./dummy-credentials/docs-credential
-  docs-credential-sha256:
-    file: ./dummy-credentials/docs-credential.sha256
+  docs-team-a-credential:
+    file: ./dummy-credentials/docs-team-a-credential
+  docs-team-b-credential:
+    file: ./dummy-credentials/docs-team-b-credential
+  # Each credential's sha256 and its team's project, one line each.
+  mock-docs-callers:
+    file: ./dummy-credentials/mock-docs-callers
 
 volumes:
   pgdata:

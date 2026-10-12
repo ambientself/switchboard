@@ -1,6 +1,7 @@
 //! The gateway built from files, as the `switchboard` binary builds it, forwarding to the mock
 //! docs server on loopback: tools listed from the approved definitions, an allowed read
-//! forwarded with the gateway's own credential, a read outside the team's limit denied by the
+//! forwarded with the gateway's own credential for the team's entry, a team kept to its own
+//! surface, a read outside the team's limit denied by the
 //! gateway, undeclared arguments and arguments that do not match the approved schema an error
 //! with nothing sent, a registry reload, and every boot refusal of the wiring.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -11,8 +12,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use files::{
-    AUDIENCE, Files, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, TEAM_B_SA, call, cluster_issuer,
-    kubernetes_token, listed, registry, rpc,
+    AUDIENCE, Files, KIND_REVISION, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, TEAM_B_LIST_TOOL,
+    TEAM_B_READ_TOOL, TEAM_B_SA, TEAM_B_SURFACE, call, call_on, cluster_issuer, kubernetes_token,
+    listed, listed_on, registry, rpc,
 };
 use gateway::path::RequestPath;
 use gateway::start::{Prepared, StartError, prepare};
@@ -21,7 +23,7 @@ use gateway_core::IDENTITY_FAILURE;
 use gateway_identity::SystemClock;
 use gateway_registry::{Registry, RegistryError};
 use gateway_testkit::LocalIssuer;
-use mock_docs_server::{AcceptedCredential, Config};
+use mock_docs_server::Config;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -54,10 +56,9 @@ struct World {
 
 impl World {
     async fn new(name: &str) -> Self {
-        let mock =
-            mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
-                .await
-                .unwrap();
+        let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
+            .await
+            .unwrap();
         let files = Files::new(name, &issuer().jwks_document(), &mock.url());
         Self { mock, files }
     }
@@ -187,11 +188,17 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
         missing.body
     );
 
+    // Team B, on its own surface, through its own entry.
     let team_b = token(TEAM_B_SA);
-    let read = call(
+    assert_eq!(
+        listed_on(&path, TEAM_B_SURFACE, &team_b).await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
+    let read = call_on(
         &path,
+        TEAM_B_SURFACE,
         &team_b,
-        READ_TOOL,
+        TEAM_B_READ_TOOL,
         json!({"project": "borealis", "document": "plan"}),
     )
     .await;
@@ -201,17 +208,41 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
         read.body
     );
 
-    // Every request the server saw carried the gateway's credential, and no caller's token.
+    // Every request the server saw carried the gateway's credential for the caller's team's
+    // entry, and no caller's token: team A's three calls docs-team-a's, team B's docs-team-b's.
     let bearers = world.bearers();
-    assert_eq!(bearers.len(), 4, "{bearers:?}");
-    assert!(
-        bearers
-            .iter()
-            .all(|bearer| *bearer == logged(files::CREDENTIAL)),
-        "{bearers:?}"
-    );
+    let (a, b) = (logged(files::CREDENTIAL), logged(files::TEAM_B_CREDENTIAL));
+    assert_eq!(bearers, [a.clone(), a.clone(), a, b], "{bearers:?}");
     assert!(!bearers.contains(&logged(&team_a)));
     assert!(!bearers.contains(&logged(&team_b)));
+}
+
+#[tokio::test]
+async fn each_team_is_kept_to_its_own_surface() {
+    let world = World::new("own-surface").await;
+    let path = RequestPath::new(world.prepare().await.unwrap().gates);
+    for (caller, surface, tool) in [
+        (TEAM_A_SA, TEAM_B_SURFACE, TEAM_B_READ_TOOL),
+        (TEAM_B_SA, SURFACE, READ_TOOL),
+    ] {
+        let caller = token(caller);
+        assert!(listed_on(&path, surface, &caller).await.is_empty());
+        let refused = call_on(
+            &path,
+            surface,
+            &caller,
+            tool,
+            json!({"project": "atlas", "document": "plan"}),
+        )
+        .await;
+        assert_eq!(
+            refused.body["error"]["code"],
+            json!(-32001),
+            "{}",
+            refused.body
+        );
+    }
+    assert_eq!(world.calls(), 0, "{:?}", world.mock.log_lines());
 }
 
 #[tokio::test]
@@ -232,7 +263,7 @@ async fn a_read_outside_the_teams_limit_is_denied_by_the_gateway_and_never_sent(
     let sentence = other.body["error"]["message"].as_str().unwrap();
     assert!(
         sentence.starts_with(
-            "Tool `docs__read_document` names docs project `borealis`, which is outside what"
+            "Tool `docs-team-a__read_document` names docs project `borealis`, which is outside what"
         ),
         "{sentence}"
     );
@@ -363,7 +394,7 @@ async fn a_new_registry_file_is_served_once_it_passes_and_refused_otherwise() {
     let team_a = token(TEAM_A_SA);
     let original = registry(&world.mock.url());
 
-    // Withdraw the read tool: revision demo-2, the approval and the surface entry removed.
+    // Withdraw team A's read tool: revision demo-2, the approval and the surface entry removed.
     let withdrawn = withdraw_read_tool(&original);
     let revision = reloader
         .apply(&Registry::from_toml_str(&withdrawn).unwrap())
@@ -395,7 +426,7 @@ async fn a_new_registry_file_is_served_once_it_passes_and_refused_otherwise() {
     let unapproved = original.replace(&world.mock.url(), "http://127.0.0.1:9/mcp");
     let refused = Registry::from_toml_str(&unapproved).unwrap_err();
     assert!(
-        matches!(&refused, RegistryError::BindingChanged { server, .. } if server.as_str() == "mock-docs"),
+        matches!(&refused, RegistryError::BindingChanged { server, .. } if server.as_str() == "docs-team-a"),
         "{refused}"
     );
     // Approved again, a changed server still needs a restart.
@@ -453,9 +484,12 @@ async fn a_new_registry_file_that_changes_the_policy_but_not_its_revision_is_ref
     let team_a = token(TEAM_A_SA);
     let original = registry(&world.mock.url());
 
-    // The read tool withdrawn and a limit narrowed, both still as demo-1.
-    let withdrawn =
-        withdraw_read_tool(&original).replace("revision = \"demo-2\"", "revision = \"demo-1\"");
+    // The read tool withdrawn and a limit narrowed, both still under the kind registry's
+    // revision.
+    let withdrawn = withdraw_read_tool(&original).replace(
+        "revision = \"demo-2\"",
+        &format!("revision = \"{KIND_REVISION}\""),
+    );
     let narrowed = original.replace(
         "team-b = [{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
         "team-b = []",
@@ -466,18 +500,22 @@ async fn a_new_registry_file_that_changes_the_policy_but_not_its_revision_is_ref
             .apply(&Registry::from_toml_str(&changed).unwrap())
             .unwrap_err();
         assert!(
-            matches!(&refused, ReloadError::RevisionUnchanged(revision) if revision.as_str() == "demo-1"),
+            matches!(&refused, ReloadError::RevisionUnchanged(revision) if revision.as_str() == KIND_REVISION),
             "{refused}"
         );
-        assert!(refused.to_string().contains("`demo-1`"), "{refused}");
+        assert!(
+            refused.to_string().contains(&format!("`{KIND_REVISION}`")),
+            "{refused}"
+        );
     }
     // The policy served before stays.
     assert_eq!(listed(&path, &team_a).await, [LIST_TOOL, READ_TOOL]);
     let team_b = token(TEAM_B_SA);
-    let read = call(
+    let read = call_on(
         &path,
+        TEAM_B_SURFACE,
         &team_b,
-        READ_TOOL,
+        TEAM_B_READ_TOOL,
         json!({"project": "borealis", "document": "plan"}),
     )
     .await;
@@ -492,7 +530,7 @@ async fn a_new_registry_file_that_changes_the_policy_but_not_its_revision_is_ref
     let revision = reloader
         .apply(&Registry::from_toml_str(&commented).unwrap())
         .unwrap();
-    assert_eq!(revision.as_str(), "demo-1");
+    assert_eq!(revision.as_str(), KIND_REVISION);
 
     // And a changed policy under a new revision is served.
     let revision = reloader
@@ -549,18 +587,19 @@ async fn wait_for(path: &RequestPath, token: &str, tools: &[&str]) {
     );
 }
 
-/// The registry without the read tool, at revision demo-2.
+/// The registry without team A's read tool, at revision demo-2.
 fn withdraw_read_tool(registry: &str) -> String {
     let start = registry
-        .find("[[tools]]\nname = \"docs__read_document\"")
+        .find(&format!("[[tools]]\nname = \"{READ_TOOL}\""))
         .unwrap();
-    let end = start + registry[start..].find("# --- Surfaces").unwrap();
+    let end = start + 1 + registry[start + 1..].find("[[tools]]").unwrap();
     let mut withdrawn = format!("{}{}", &registry[..start], &registry[end..]);
-    withdrawn = withdrawn.replace("revision = \"demo-1\"", "revision = \"demo-2\"");
-    withdrawn.replace(
-        "tools = [\"docs__list_documents\", \"docs__read_document\"]",
-        "tools = [\"docs__list_documents\"]",
-    )
+    let revision = format!("revision = \"{KIND_REVISION}\"");
+    assert_eq!(withdrawn.matches(&revision).count(), 1);
+    withdrawn = withdrawn.replace(&revision, "revision = \"demo-2\"");
+    let tools = format!("tools = [\"{LIST_TOOL}\", \"{READ_TOOL}\"]");
+    assert_eq!(withdrawn.matches(&tools).count(), 1);
+    withdrawn.replace(&tools, &format!("tools = [\"{LIST_TOOL}\"]"))
 }
 
 #[tokio::test]
@@ -572,28 +611,33 @@ async fn the_wiring_refuses_to_start_on_what_it_cannot_serve() {
     world.files.write(
         "gateway.toml",
         &deployment.replace(
-            "docs-credential = \"docs-credential\"",
-            "other = \"docs-credential\"",
+            "docs-team-a-credential = \"docs-team-a-credential\"",
+            "other = \"docs-team-a-credential\"",
         ),
     );
     let said = refused(&world).await;
-    assert!(said.contains("uses credential `docs-credential`"), "{said}");
+    assert!(
+        said.contains("uses credential `docs-team-a-credential`"),
+        "{said}"
+    );
     // A credential file no server uses.
     world.files.write(
         "gateway.toml",
         &deployment.replace(
-            "docs-credential = \"docs-credential\"",
-            "docs-credential = \"docs-credential\"\nspare = \"docs-credential\"",
+            "docs-team-a-credential = \"docs-team-a-credential\"",
+            "docs-team-a-credential = \"docs-team-a-credential\"\nspare = \"docs-team-a-credential\"",
         ),
     );
     let said = refused(&world).await;
     assert!(said.contains("`spare`"), "{said}");
     world.files.write("gateway.toml", &deployment);
     // An empty credential file.
-    world.files.write("docs-credential", "\n");
+    world.files.write("docs-team-a-credential", "\n");
     let said = refused(&world).await;
     assert!(said.contains("is empty"), "{said}");
-    world.files.write("docs-credential", files::CREDENTIAL);
+    world
+        .files
+        .write("docs-team-a-credential", files::CREDENTIAL);
     // A server the proxy cannot reach over plain HTTP.
     world.files.write(
         "registry/registry.toml",
@@ -605,13 +649,13 @@ async fn the_wiring_refuses_to_start_on_what_it_cannot_serve() {
     world.files.write(
         "registry/registry.toml",
         &registry(&world.mock.url()).replace(
-            "reference = \"docs-credential\"",
+            "reference = \"docs-team-a-credential\"",
             "reference = \"other-credential\"",
         ),
     );
     let said = refused(&world).await;
     assert!(
-        said.contains("binding to server `mock-docs`") && said.contains("approve it again"),
+        said.contains("binding to server `docs-team-a`") && said.contains("approve it again"),
         "{said}"
     );
     // A registry that does not load.

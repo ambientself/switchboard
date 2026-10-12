@@ -3,10 +3,15 @@
 # the container's argument. A new Job is a new pod, which is what the network-policy check needs.
 #
 # Each pod projects a token for audience `switchboard`, valid for 600 s, signed by the cluster.
-# No token is made by hand. Jobs never retry (backoffLimit 0): a failure is reported, not hidden.
-# team-a's workload. BAD_TOKEN_FILES is the pod's default API token: real and cluster-signed, for
-# the wrong audience. DIRECT_URL is the server's own address: before the policy a call there
-# connects, and after it the call must time out.
+# No token is made by hand. No workload mounts an API token (decision 0013, section 10). Jobs
+# never retry (backoffLimit 0): a failure is reported, not hidden.
+#
+# Each team calls its own surface, /mcp/docs-team-a or /mcp/docs-team-b, which serves only its
+# own entry's tools.
+#
+# team-a's workload. BAD_TOKEN_FILES is a projected token for audience not-switchboard: real and
+# cluster-signed, for the wrong audience. DIRECT_URL is the server's own address: before the
+# policy a call there connects, and after it the call must time out.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -43,11 +48,11 @@ spec:
               command: ["workload.sh"]
               args: ["full"]
               env:
-                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs"}
+                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs-team-a"}
                 - {name: TOKEN_FILE, value: /var/run/secrets/switchboard/token}
                 - {name: OWN_PROJECT, value: atlas}
                 - {name: OTHER_PROJECT, value: borealis}
-                - {name: BAD_TOKEN_FILES, value: /var/run/secrets/kubernetes.io/serviceaccount/token}
+                - {name: BAD_TOKEN_FILES, value: /var/run/secrets/wrong-audience/token}
                 - {name: DIRECT_URL, value: "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"}
               securityContext:
                 allowPrivilegeEscalation: false
@@ -55,6 +60,7 @@ spec:
                 capabilities: {drop: ["ALL"]}
               volumeMounts:
                 - {name: switchboard-token, mountPath: /var/run/secrets/switchboard, readOnly: true}
+                - {name: wrong-audience-token, mountPath: /var/run/secrets/wrong-audience, readOnly: true}
                 - {name: tmp, mountPath: /tmp}
           volumes:
             - name: switchboard-token
@@ -64,11 +70,20 @@ spec:
                       audience: switchboard
                       expirationSeconds: 600
                       path: token
+            # A real token the cluster signs for this workload, for an audience that is neither
+            # the gateway's nor a server's nor the API server's. The gateway must refuse it.
+            - name: wrong-audience-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: not-switchboard
+                      expirationSeconds: 600
+                      path: token
             - {name: tmp, emptyDir: {}}
 ---
-# team-b's workload. BAD_TOKEN_FILES is the pod's default API token: real and cluster-signed, for
-# the wrong audience. DIRECT_URL is the server's own address: before the policy a call there
-# connects, and after it the call must time out.
+# team-b's workload. BAD_TOKEN_FILES is a projected token for audience not-switchboard: real and
+# cluster-signed, for the wrong audience. DIRECT_URL is the server's own address: before the
+# policy a call there connects, and after it the call must time out.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -105,11 +120,11 @@ spec:
               command: ["workload.sh"]
               args: ["full"]
               env:
-                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs"}
+                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs-team-b"}
                 - {name: TOKEN_FILE, value: /var/run/secrets/switchboard/token}
                 - {name: OWN_PROJECT, value: borealis}
                 - {name: OTHER_PROJECT, value: atlas}
-                - {name: BAD_TOKEN_FILES, value: /var/run/secrets/kubernetes.io/serviceaccount/token}
+                - {name: BAD_TOKEN_FILES, value: /var/run/secrets/wrong-audience/token}
                 - {name: DIRECT_URL, value: "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp"}
               securityContext:
                 allowPrivilegeEscalation: false
@@ -117,6 +132,7 @@ spec:
                 capabilities: {drop: ["ALL"]}
               volumeMounts:
                 - {name: switchboard-token, mountPath: /var/run/secrets/switchboard, readOnly: true}
+                - {name: wrong-audience-token, mountPath: /var/run/secrets/wrong-audience, readOnly: true}
                 - {name: tmp, mountPath: /tmp}
           volumes:
             - name: switchboard-token
@@ -124,6 +140,15 @@ spec:
                 sources:
                   - serviceAccountToken:
                       audience: switchboard
+                      expirationSeconds: 600
+                      path: token
+            # A real token the cluster signs for this workload, for an audience that is neither
+            # the gateway's nor a server's nor the API server's. The gateway must refuse it.
+            - name: wrong-audience-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: not-switchboard
                       expirationSeconds: 600
                       path: token
             - {name: tmp, emptyDir: {}}
@@ -165,7 +190,7 @@ spec:
               command: ["workload.sh"]
               args: ["refused"]
               env:
-                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs"}
+                - {name: GATEWAY_URL, value: "http://gateway.switchboard.svc.cluster.local:8080/mcp/docs-team-a"}
                 - {name: TOKEN_FILE, value: /var/run/secrets/switchboard/token}
               securityContext:
                 allowPrivilegeEscalation: false

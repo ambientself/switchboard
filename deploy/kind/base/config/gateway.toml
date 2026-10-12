@@ -1,7 +1,7 @@
 # The gateway's deployment file for the kind demo: `switchboard --config=<this file>`. The format
 # is in crates/gateway/src/deployment.rs. Relative paths are read from this file's directory.
 # Keep it in step with deploy/compose/config/gateway.toml; only the issuer, where its keys come
-# from, the team manifest, the hosts, the credential's path and the metrics address differ.
+# from, the team manifest, the hosts, the credentials' paths and the metrics address differ.
 
 deployment = "kind-demo"
 listen = "0.0.0.0:8080"
@@ -50,7 +50,9 @@ url_env = "SWITCHBOARD_DATABASE_URL"
 listen = "0.0.0.0:9090"
 
 [credentials]
-# The gateway's own projected ServiceAccount token, for audience mock-docs (gateway.yaml). The
-# kubelet rotates it in place; the proxy reads it again on every call and sends it upstream. The
-# workload never sees it. The reference keeps its name, so the registry is the same as Compose's.
-docs-credential = "/var/run/secrets/switchboard/mock-docs/token"
+# Each entry's token: ServiceAccount docs-team-a's and docs-team-b's, for audience mock-docs,
+# which the gateway pod's token writer writes and replaces every 300 s (gateway.yaml). The proxy
+# reads the file again on every call and sends it upstream. The workload never sees it. The
+# references are the registry's, the same as Compose's.
+docs-team-a-credential = "/var/run/switchboard/tokens/docs-team-a"
+docs-team-b-credential = "/var/run/switchboard/tokens/docs-team-b"

@@ -1,7 +1,7 @@
 //! A deployment written to files, as the `switchboard` binary reads it: the deployment file, the
-//! kind demo's registry (with the mock server moved to an address on loopback, and its tools'
-//! approvals bound to it again), the issuer's keys, the team manifest and the gateway's
-//! credential for the mock server.
+//! kind demo's registry (with the mock server's two entries moved to an address on loopback, and
+//! their tools' approvals bound to it again), the issuer's keys, the team manifest and the
+//! gateway's credential for each entry.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
@@ -17,13 +17,14 @@ use gateway::{Deployment, path::RequestPath};
 use gateway_identity::SigningAlgorithm;
 use gateway_testkit::LocalIssuer;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use mock_docs_server::AcceptedCredential;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 /// The kind demo's registry, as deployed.
 pub const KIND_REGISTRY: &str =
     include_str!("../../../../deploy/kind/base/config/registry/registry.toml");
-/// The mock server's address in the kind registry.
+/// The mock server's address in the kind registry, where both of its entries name it.
 pub const KIND_ADDRESS: &str = "http://mock-docs.mock-docs.svc.cluster.local:8080/mcp";
 /// The cluster's ServiceAccount issuer, which the kind registry's rule names.
 pub const CLUSTER_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
@@ -35,14 +36,31 @@ pub const TEAM_A_SA: &str = "system:serviceaccount:team-a:mock-workload";
 pub const TEAM_B_SA: &str = "system:serviceaccount:team-b:mock-workload";
 /// A ServiceAccount the team manifest does not list.
 pub const STRANGER_SA: &str = "system:serviceaccount:team-a:stranger";
-/// The gateway's credential for the mock server. A dummy.
+/// The gateway's credential for team A's entry of the mock server, docs-team-a. A dummy.
 pub const CREDENTIAL: &str = "dummy-gateway-credential-for-the-wiring-tests";
-/// The read tool, which names a project.
-pub const READ_TOOL: &str = "docs__read_document";
-/// The list tool.
-pub const LIST_TOOL: &str = "docs__list_documents";
-/// The surface.
-pub const SURFACE: &str = "docs";
+/// The gateway's credential for team B's entry, docs-team-b. A dummy.
+pub const TEAM_B_CREDENTIAL: &str = "dummy-team-b-credential-for-the-wiring-tests";
+/// Team A's entry's read tool, which names a project.
+pub const READ_TOOL: &str = "docs-team-a__read_document";
+/// Team A's entry's list tool.
+pub const LIST_TOOL: &str = "docs-team-a__list_documents";
+/// Team A's surface.
+pub const SURFACE: &str = "docs-team-a";
+/// Team B's entry's read tool.
+pub const TEAM_B_READ_TOOL: &str = "docs-team-b__read_document";
+/// Team B's entry's list tool.
+pub const TEAM_B_LIST_TOOL: &str = "docs-team-b__list_documents";
+/// Team B's surface.
+pub const TEAM_B_SURFACE: &str = "docs-team-b";
+
+/// What a mock server accepts to answer both entries: each entry's credential, for every
+/// project.
+pub fn mock_credentials() -> Vec<AcceptedCredential> {
+    vec![
+        AcceptedCredential::token(CREDENTIAL),
+        AcceptedCredential::token(TEAM_B_CREDENTIAL),
+    ]
+}
 
 /// An RS256 issuer named like the cluster's, with a fresh key.
 pub fn cluster_issuer() -> LocalIssuer {
@@ -93,7 +111,8 @@ impl Files {
             "teams.toml",
             &format!("[subjects]\n\"{TEAM_A_SA}\" = \"team-a\"\n\"{TEAM_B_SA}\" = \"team-b\"\n"),
         );
-        files.write("docs-credential", &format!("{CREDENTIAL}\n"));
+        files.write("docs-team-a-credential", &format!("{CREDENTIAL}\n"));
+        files.write("docs-team-b-credential", &format!("{TEAM_B_CREDENTIAL}\n"));
         files.write(
             "gateway.toml",
             &deployment_file("[audit]\nmode = \"disabled\"\n"),
@@ -130,56 +149,70 @@ impl Files {
     }
 }
 
-/// The kind registry with the mock server at `mock_url`.
+/// The kind registry with the mock server's entries at `mock_url`.
 pub fn registry(mock_url: &str) -> String {
-    assert_eq!(KIND_REGISTRY.matches(KIND_ADDRESS).count(), 1);
+    assert_eq!(KIND_REGISTRY.matches(KIND_ADDRESS).count(), 2);
     rebind(KIND_REGISTRY, mock_url)
 }
 
-/// `text`, a registry whose one server is the mock server, with that server moved to
-/// `address`, as its owner would register it and a person would approve it again: the address,
-/// the identity (the address's host) and every tool's `binding_sha256`, through
-/// [`gateway_registry::binding_sha256`].
+/// `text`, a registry whose servers are all entries of the mock server, at one address, with
+/// every entry moved to `address`, as its owner would register it and a person would approve it
+/// again: the address, the identity (the address's host) and each tool's `binding_sha256`,
+/// through [`gateway_registry::binding_sha256`].
 pub fn rebind(text: &str, address: &str) -> String {
     let loaded = gateway_registry::Registry::from_toml_str(text).unwrap();
-    let [before] = loaded.servers().values().collect::<Vec<_>>()[..] else {
-        panic!("the registry has more than one server");
-    };
-    let mut after = before.clone();
-    after.address = address.to_owned();
-    after.identity = gateway_registry::address_host(address).unwrap().to_owned();
+    let servers: Vec<_> = loaded.servers().values().collect();
+    let first = servers.first().expect("the registry has a server");
+    assert!(
+        servers
+            .iter()
+            .all(|server| server.address == first.address && server.identity == first.identity),
+        "the registry's servers are at more than one address"
+    );
+    let identity = gateway_registry::address_host(address).unwrap().to_owned();
     let replace = |text: &str, from: String, to: String, count: usize| {
         assert_eq!(text.matches(&from).count(), count, "{from}");
         text.replace(&from, &to)
     };
-    let text = replace(
+    let mut text = replace(
         text,
-        format!("address = \"{}\"\n", before.address),
-        format!("address = \"{}\"\n", after.address),
-        1,
+        format!("address = \"{}\"\n", first.address),
+        format!("address = \"{address}\"\n"),
+        servers.len(),
     );
-    let text = replace(
+    text = replace(
         &text,
-        format!("identity = \"{}\"\n", before.identity),
-        format!("identity = \"{}\"\n", after.identity),
-        1,
+        format!("identity = \"{}\"\n", first.identity),
+        format!("identity = \"{identity}\"\n"),
+        servers.len(),
     );
-    replace(
-        &text,
-        format!(
-            "binding_sha256 = \"{}\"\n",
-            gateway_registry::binding_sha256(before)
-        ),
-        format!(
-            "binding_sha256 = \"{}\"\n",
-            gateway_registry::binding_sha256(&after)
-        ),
-        loaded.approvals().len(),
-    )
+    for before in servers {
+        let mut after = before.clone();
+        after.address = address.to_owned();
+        after.identity.clone_from(&identity);
+        let tools = loaded
+            .routes()
+            .values()
+            .filter(|route| route.server == before.name)
+            .count();
+        text = replace(
+            &text,
+            format!(
+                "binding_sha256 = \"{}\"\n",
+                gateway_registry::binding_sha256(before)
+            ),
+            format!(
+                "binding_sha256 = \"{}\"\n",
+                gateway_registry::binding_sha256(&after)
+            ),
+            tools,
+        );
+    }
+    text
 }
 
 /// The revision the kind registry is at.
-pub const KIND_REVISION: &str = "demo-1";
+pub const KIND_REVISION: &str = "demo-3";
 
 /// The kind registry with the mock server at `mock_url`, under `revision` instead of
 /// [`KIND_REVISION`].
@@ -277,7 +310,8 @@ leeway_seconds = 30
 
 {audit}
 [credentials]
-docs-credential = "docs-credential"
+docs-team-a-credential = "docs-team-a-credential"
+docs-team-b-credential = "docs-team-b-credential"
 "#
     )
 }
@@ -302,9 +336,20 @@ pub struct Answered {
     pub body: Value,
 }
 
-/// Sends one JSON-RPC request, in the 2025-06-18 era, with `token` as the bearer if there is
-/// one.
+/// Sends one JSON-RPC request on team A's surface, in the 2025-06-18 era, with `token` as the
+/// bearer if there is one.
 pub async fn rpc(path: &RequestPath, token: Option<&str>, method: &str, params: Value) -> Answered {
+    rpc_on(path, SURFACE, token, method, params).await
+}
+
+/// Sends one JSON-RPC request on `surface`, as [`rpc`] does.
+pub async fn rpc_on(
+    path: &RequestPath,
+    surface: &str,
+    token: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Answered {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers.insert(
@@ -326,7 +371,7 @@ pub async fn rpc(path: &RequestPath, token: Option<&str>, method: &str, params: 
         .handle(
             &Method::POST,
             &headers,
-            SURFACE,
+            surface,
             body.to_string().as_bytes(),
         )
         .await;
@@ -336,10 +381,22 @@ pub async fn rpc(path: &RequestPath, token: Option<&str>, method: &str, params: 
     }
 }
 
-/// Calls `tool` with `arguments`.
+/// Calls `tool` with `arguments` on team A's surface.
 pub async fn call(path: &RequestPath, token: &str, tool: &str, arguments: Value) -> Answered {
-    rpc(
+    call_on(path, SURFACE, token, tool, arguments).await
+}
+
+/// Calls `tool` with `arguments` on `surface`.
+pub async fn call_on(
+    path: &RequestPath,
+    surface: &str,
+    token: &str,
+    tool: &str,
+    arguments: Value,
+) -> Answered {
+    rpc_on(
         path,
+        surface,
         Some(token),
         "tools/call",
         json!({"name": tool, "arguments": arguments}),
@@ -347,9 +404,14 @@ pub async fn call(path: &RequestPath, token: &str, tool: &str, arguments: Value)
     .await
 }
 
-/// The names `tools/list` answers with, sorted.
+/// The names `tools/list` answers with on team A's surface, sorted.
 pub async fn listed(path: &RequestPath, token: &str) -> Vec<String> {
-    let answered = rpc(path, Some(token), "tools/list", json!({})).await;
+    listed_on(path, SURFACE, token).await
+}
+
+/// The names `tools/list` answers with on `surface`, sorted.
+pub async fn listed_on(path: &RequestPath, surface: &str, token: &str) -> Vec<String> {
+    let answered = rpc_on(path, surface, Some(token), "tools/list", json!({})).await;
     let mut names: Vec<String> = answered.body["result"]["tools"]
         .as_array()
         .unwrap_or_else(|| panic!("{}", answered.body))
