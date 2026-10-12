@@ -11,8 +11,8 @@ use super::{
 use crate::{GATEWAY_ROLE, MIGRATIONS, MigrateError, OWNER_ROLE, ROLES, migrate};
 
 /// The begin columns of an allowed call by a workload, as `(column, value)` in SQL. The
-/// identifier is a fresh UUID, as the gateway supplies one. The allowance is the default
-/// budgets' 2 s and 30 s and a call deadline of 5 s.
+/// identifier is a fresh UUID, as the gateway supplies one. The allowance is a fixed 37 s,
+/// written as SQL; these tests do not derive it from the budgets.
 const ALLOWED: &[(&str, &str)] = &[
     ("id", "gen_random_uuid()"),
     ("instance", "'fixture-instance'"),

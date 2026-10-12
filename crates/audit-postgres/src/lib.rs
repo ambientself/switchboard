@@ -39,8 +39,9 @@
 //! database's clock, whatever an insert or a completion carries; a row is completed at most
 //! once, a denial or a list row is never completed, and a completion writes nothing else. A
 //! call's deadline is its time at begin plus the allowance the store gives it: the begin
-//! budget, the call's deadline and the finish deadline ([`Budgets`]). A call row cannot be
-//! stored without one, and a list row cannot be stored with one or with a call's columns.
+//! budget, the call's deadline, the finish deadline and the answer budget ([`Budgets`]). A
+//! call row cannot be stored without one, and a list row cannot be stored with one or with a
+//! call's columns.
 //!
 //! # Tests against a database
 //!

@@ -16,6 +16,7 @@ use gateway_testkit::{
 /// each with a part millisecond, which the store drops as Postgres's does.
 const BUDGETS: StoreBudgets = StoreBudgets {
     begin: Duration::from_micros(3_000_400),
+    answer: Duration::from_micros(2_500_300),
     finish_deadline: Duration::from_micros(45_000_700),
 };
 
@@ -77,6 +78,6 @@ contract!(
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
     an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,
-    the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline,
+    the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget,
     a_list_row_is_stored_complete_with_no_deadline,
 );

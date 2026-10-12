@@ -623,9 +623,9 @@ const PERMISSIONS: &[(&str, &str, &str, &str)] = &[
     ("get", "secrets", "-", "namespaced"),
     ("list", "secrets", "-", "namespaced"),
     ("watch", "secrets", "-", "namespaced"),
-    ("get", "configmaps", "-", "namespaced"),
-    ("list", "configmaps", "-", "namespaced"),
-    ("watch", "configmaps", "-", "namespaced"),
+    ("get", "configmaps", "-", "gateway"),
+    ("list", "configmaps", "-", "gateway"),
+    ("watch", "configmaps", "-", "gateway"),
     ("create", "pods", "-", "namespaced"),
     ("create", "deployments.apps", "-", "namespaced"),
     ("update", "deployments.apps", "-", "namespaced"),
@@ -749,16 +749,18 @@ fn the_permissions_list_holds_every_family_of_control_one() {
 }
 
 /// The reviews a clean run must ask: each row of the list, as the workload's ServiceAccount, in
-/// each namespace for a namespaced row, and across the cluster for every row.
+/// each namespace and across the cluster for a namespaced row, in the gateway's and the server's
+/// namespace only for a gateway row, and across the cluster only for a cluster row.
 fn expected_reviews() -> BTreeSet<String> {
     let mut want = BTreeSet::new();
     for (verb, resource, sub, scope) in PERMISSIONS {
         let (resource, group) = resource.split_once('.').unwrap_or((resource, ""));
         let sub = if *sub == "-" { "" } else { sub };
-        let namespaces: &[&str] = if *scope == "namespaced" {
-            &["team-a", "switchboard", "mock-docs", ""]
-        } else {
-            &[""]
+        let namespaces: &[&str] = match *scope {
+            "namespaced" => &["team-a", "switchboard", "mock-docs", ""],
+            "gateway" => &["switchboard", "mock-docs"],
+            "cluster" => &[""],
+            _ => panic!("scope {scope:?}"),
         };
         for namespace in namespaces {
             want.insert(format!("{verb}|{group}|{resource}|{sub}|{namespace}"));
@@ -792,7 +794,9 @@ fn a_clean_pod_passes() {
         "no projected token for a server's audience",
         "team-a/mock-workload may not impersonate users (cluster)",
         "team-a/mock-workload may not get secrets (team-a,switchboard,mock-docs,cluster)",
+        "team-a/mock-workload may not get configmaps (switchboard,mock-docs)",
         "team-a/mock-workload is bound to no RBAC rule for get pods/exec, whatever its resourceNames (RoleBindings in every namespace, and ClusterRoleBindings)",
+        "team-a/mock-workload is bound to no RBAC rule for get configmaps, whatever its resourceNames (RoleBindings in switchboard,mock-docs, and ClusterRoleBindings)",
         "team-a/mock-workload is bound to no RBAC rule for impersonate users, whatever its resourceNames (ClusterRoleBindings)",
         "the probe ended within 5 s (exit 0)",
         "the probe passed: every route refused (4 attempts, EXPECT=refused)",
@@ -1850,6 +1854,176 @@ fn a_grant_in_a_namespace_the_reviews_do_not_ask_fails() {
             checked.run.transcript()
         );
     }
+}
+
+/// The ConfigMap rows' grant (#104): `get`, `list` and `watch` on ConfigMaps for the workload,
+/// bound in `namespace` by a RoleBinding to a `role_kind` (a Role there, or a ClusterRole), or
+/// across the cluster by a ClusterRoleBinding when `namespace` is None.
+fn config_map_grant<'a>(namespace: Option<&'a str>, role_kind: &str) -> Vec<RbacItem<'a>> {
+    let rules = json!([{"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "list", "watch"]}]);
+    let sa = json!([{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]);
+    let (roles, role_namespace) = if role_kind == "Role" {
+        ("roles", namespace)
+    } else {
+        ("clusterroles", None)
+    };
+    let bindings = if namespace.is_some() {
+        "rolebindings"
+    } else {
+        "clusterrolebindings"
+    };
+    vec![
+        (
+            roles,
+            role_namespace,
+            role(role_namespace, "read-config", rules),
+        ),
+        (
+            bindings,
+            namespace,
+            binding(namespace, "read-config", role_kind, "read-config", sa),
+        ),
+    ]
+}
+
+#[test]
+fn a_config_map_grant_counts_only_in_the_gateways_and_the_servers_namespaces() {
+    // A ConfigMap names the file that holds a credential, not the credential (#104): reading the
+    // workload's own, or another team's, passes. No review is asked in team-a, so the fake's yes
+    // there is never given.
+    for (name, namespace, role_kind) in [
+        ("own-role", Some("team-a"), "Role"),
+        ("own-cluster-role", Some("team-a"), "ClusterRole"),
+        ("other-team", Some("team-b"), "Role"),
+    ] {
+        let mut cluster = Cluster::clean();
+        for (what, namespace, item) in config_map_grant(namespace, role_kind) {
+            add_rbac(&mut cluster, what, namespace, item);
+        }
+        cluster.sar_yes = json!([{"resource": "configmaps", "namespace": "team-a"}]);
+        let checked = check(&format!("configmap-{name}"), &cluster);
+        assert_eq!(
+            checked.run.status,
+            Some(0),
+            "{name}\n{}",
+            checked.run.transcript()
+        );
+        for verb in ["get", "list", "watch"] {
+            for text in [
+                format!("team-a/mock-workload may not {verb} configmaps (switchboard,mock-docs)"),
+                format!(
+                    "team-a/mock-workload is bound to no RBAC rule for {verb} configmaps, whatever its resourceNames (RoleBindings in switchboard,mock-docs, and ClusterRoleBindings)"
+                ),
+            ] {
+                assert!(
+                    checked.passed(&text),
+                    "{name}: {text}\n{}",
+                    checked.run.transcript()
+                );
+            }
+        }
+    }
+
+    // In the gateway's or the server's namespace, to a Role or a ClusterRole, or across the
+    // cluster, it fails, though every review answers no.
+    for (name, namespace, role_kind, why) in [
+        (
+            "gateway-role",
+            Some("switchboard"),
+            "Role",
+            "RoleBinding switchboard/read-config binds Role read-config to ServiceAccount team-a/mock-workload",
+        ),
+        (
+            "gateway-cluster-role",
+            Some("switchboard"),
+            "ClusterRole",
+            "RoleBinding switchboard/read-config binds ClusterRole read-config to ServiceAccount team-a/mock-workload",
+        ),
+        (
+            "server-role",
+            Some("mock-docs"),
+            "Role",
+            "RoleBinding mock-docs/read-config binds Role read-config to ServiceAccount team-a/mock-workload",
+        ),
+        (
+            "cluster",
+            None,
+            "ClusterRole",
+            "ClusterRoleBinding read-config binds ClusterRole read-config to ServiceAccount team-a/mock-workload",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        for (what, namespace, item) in config_map_grant(namespace, role_kind) {
+            add_rbac(&mut cluster, what, namespace, item);
+        }
+        let checked = check(&format!("configmap-{name}"), &cluster);
+        for verb in ["get", "list", "watch"] {
+            checked.assert_failed(&rbac_granted(&format!("{verb} configmaps"), why));
+        }
+        assert_eq!(
+            checked.run.lines("FAIL ").len(),
+            3,
+            "{name}\n{}",
+            checked.run.transcript()
+        );
+    }
+
+    // The reviews: a yes in the gateway's or the server's namespace fails, and a grant across
+    // the cluster answers yes in both.
+    for (name, yes, text) in [
+        (
+            "gateway",
+            json!({"verb": "list", "resource": "configmaps", "namespace": "switchboard"}),
+            "team-a/mock-workload may not list configmaps: it may, in switchboard",
+        ),
+        (
+            "server",
+            json!({"verb": "watch", "resource": "configmaps", "namespace": "mock-docs"}),
+            "team-a/mock-workload may not watch configmaps: it may, in mock-docs",
+        ),
+        (
+            "cluster",
+            json!({"verb": "get", "resource": "configmaps"}),
+            "team-a/mock-workload may not get configmaps: it may, in switchboard,mock-docs",
+        ),
+    ] {
+        let mut cluster = Cluster::clean();
+        cluster.sar_yes = json!([yes]);
+        check(&format!("configmap-sar-{name}"), &cluster).assert_failed(text);
+    }
+
+    // The Secret rows are as they were: asked in the workload's own namespace, where a grant
+    // fails them.
+    let mut cluster = Cluster::clean();
+    add_rbac(
+        &mut cluster,
+        "roles",
+        Some("team-a"),
+        role(
+            Some("team-a"),
+            "read-secrets",
+            json!([{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}]),
+        ),
+    );
+    add_rbac(
+        &mut cluster,
+        "rolebindings",
+        Some("team-a"),
+        binding(
+            Some("team-a"),
+            "read-secrets",
+            "Role",
+            "read-secrets",
+            json!([{"kind": "ServiceAccount", "name": "mock-workload"}]),
+        ),
+    );
+    cluster.sar_yes = json!([{"verb": "get", "resource": "secrets", "namespace": "team-a"}]);
+    let checked = check("configmap-secrets-unchanged", &cluster);
+    checked.assert_failed(&rbac_granted(
+        "get secrets",
+        "RoleBinding team-a/read-secrets binds Role read-secrets to ServiceAccount team-a/mock-workload",
+    ));
+    checked.assert_failed("team-a/mock-workload may not get secrets: it may, in team-a");
 }
 
 #[test]

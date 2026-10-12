@@ -70,9 +70,9 @@ pub trait ContractStore {
     /// identifier, which Postgres's primary key forbids, makes this panic.
     fn stored(&self, row: &AuditRowId) -> impl Future<Output = Option<StoredRow>>;
 
-    /// The begin budget and the finish deadline the store was given, to add to each call row's
-    /// deadline. A runner answers with the budgets it gave the store, not with what the store
-    /// holds, so a store that ignores the ones it was given is caught.
+    /// The begin budget, the finish deadline and the answer budget the store was given, to add
+    /// to each call row's deadline. A runner answers with the budgets it gave the store, not
+    /// with what the store holds, so a store that ignores the ones it was given is caught.
     fn budgets(&self) -> StoreBudgets;
 
     /// The time on the store's own clock: database time for Postgres, the store's clock for the
@@ -247,6 +247,14 @@ async fn stored(contract: &impl ContractStore, row: &AuditRowId) -> StoredRow {
 /// millisecond is dropped.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// What a store adds to a call row's call deadline for its allowance: the begin budget, the
+/// finish deadline and the answer budget, each in whole milliseconds (decision 0009, as
+/// amended on 2026-10-11). Worked out here, not with a store's own arithmetic, so a store that
+/// leaves one out is caught.
+fn budgets_ms(budgets: &StoreBudgets) -> u64 {
+    millis(budgets.begin) + millis(budgets.finish_deadline) + millis(budgets.answer)
 }
 
 // --- Item 1: begin ------------------------------------------------------------------------------
@@ -468,7 +476,7 @@ pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
         record
     };
     // The allowance is the budgets and the call deadline, in whole milliseconds.
-    let budgets_ms = millis(budgets.begin) + millis(budgets.finish_deadline);
+    let budgets_ms = budgets_ms(&budgets);
     let cannot_hold = [
         refused(&|record| record.tool_use_id = Some(ToolUseId::new("toolu_\u{0}x"))),
         refused(&|record| record.claimed_team = Some(Claimed::new(TeamId::new("team\u{0}x")))),
@@ -799,16 +807,18 @@ fn postgres_end() -> SystemTime {
 }
 
 /// Each row of kind `call`, allowed or denied, has a time at begin from the store's clock, and a
-/// deadline the store sets: its time at begin plus the begin budget, the call deadline and the
-/// finish deadline, each budget in whole milliseconds, added as Postgres adds them. A deadline
-/// at the end of what a Postgres time holds is refused, and leaves no row.
-pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_and_finish_deadline(
+/// deadline the store sets: its time at begin plus the begin budget, the call deadline, the
+/// finish deadline and the answer budget, each budget in whole milliseconds, added as Postgres
+/// adds them. A deadline at the end of what a Postgres time holds is refused, and leaves no
+/// row. The edge cases pick a call deadline for the allowance they need, so they reach the same
+/// allowances whatever the budgets.
+pub async fn the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget(
     contract: &impl ContractStore,
 ) {
     let store = contract.store();
     let fixture = fixture();
     let budgets = contract.budgets();
-    let budgets_ms = millis(budgets.begin) + millis(budgets.finish_deadline);
+    let budgets_ms = budgets_ms(&budgets);
     for (call, call_deadline_ms) in [
         (&ALLOWED, crate::FIXTURE_CALL_DEADLINE_MS),
         (&DENIED, crate::FIXTURE_CALL_DEADLINE_MS),

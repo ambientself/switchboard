@@ -1244,6 +1244,8 @@ mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round 
 mutate("testkit-allowance-rounds-up", "a budget is counted in part milliseconds, not whole ones as Postgres counts it", A,
        "    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)",
        "    u64::try_from(duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 > 0)).unwrap_or(u64::MAX)")
+mutate("testkit-allowance-omits-answer", "the in-memory store's deadline leaves out the answer budget, so a failed begin's row can be completed past it (#96)", A,
+       "        .saturating_add(millis(budgets.answer))\n", "")
 mutate("testkit-denial-completed", "the in-memory store completes a denial, which complete_once refuses", A,
        "        if row.decision != DecisionKind::Allow {", "        if false {")
 mutate("testkit-list-row-completed", "the in-memory store finds no row, rather than a listing, when finish names a list row", A,
@@ -3083,6 +3085,8 @@ mutate("pg-allowance-without-finish-deadline", "a row's deadline leaves out the 
        "        .saturating_add(millis(budgets.finish_deadline))\n", "\n")
 mutate("pg-allowance-wraps", "a long call deadline wraps round to a short allowance", PG_COLUMNS,
        "        .saturating_add(call_deadline_ms)\n", "        .wrapping_add(call_deadline_ms)\n")
+mutate("pg-allowance-omits-answer", "a row's deadline leaves out the answer budget, so a failed begin's row can be completed past it (#96)", PG_COLUMNS,
+       "        .saturating_add(millis(budgets.answer))\n", "")
 mutate("pg-grant-insert-deadline", "the gateway may write the deadline", PG_ROW_DEADLINE,
        "GRANT INSERT (instance, kind, allowance_ms)", "GRANT INSERT (instance, kind, allowance_ms, deadline)")
 # List rows (0004).
@@ -3459,29 +3463,28 @@ mutate("pg-check-reaching-views-only", "a rule on another table that writes the 
 mutate("pg-check-reaching-column-grants-ignored", "a column grant on a view that reaches the table passes the check", PG_CHECK,
        "OR (p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND {}))", "OR (false AND {}))")
 mutate("pg-check-definers-ignored", "a SECURITY DEFINER function that can reach the table passes the check", PG_CHECK,
-       "             WHERE p.prosecdef\n                 AND {}\n",
-       "             WHERE false AND p.prosecdef\n                 AND {}\n")
+       "         WHERE p.prosecdef AND {}\n", "         WHERE false AND p.prosecdef AND {}\n")
 mutate("pg-check-definer-column-owner-ignored", "a definer function whose owner holds only column privileges passes the check", PG_CHECK,
        "OR has_any_column_privilege({owner}, x.oid,", "OR false AND has_any_column_privilege({owner}, x.oid,")
 mutate("pg-check-definer-view-owner-ignored", "a definer function whose owner holds privileges only on a view over the table passes the check", PG_CHECK,
-       "SELECT FROM reaching x\n", "SELECT FROM (SELECT $1::oid AS oid) x\n")
+       "        FROM reaching x\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n",
+       "        FROM (SELECT $1::oid AS oid) x\n            JOIN pg_catalog.pg_class c ON c.oid = x.oid\n")
 mutate("pg-check-definer-schema-owner-ignored", "a definer function of the schema's owner passes the check", PG_CHECK,
-       "OR EXISTS (SELECT FROM pg_catalog.pg_namespace s", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_namespace s")
+       "OR EXISTS (SELECT FROM schema_owner s", "OR false AND EXISTS (SELECT FROM schema_owner s")
 mutate("pg-check-definer-chain-not-followed", "a definer function that reaches the table through another passes the check", PG_CHECK,
-       "                 JOIN pg_catalog.pg_proc p ON p.prosecdef\n",
-       "                 JOIN pg_catalog.pg_proc p ON false AND p.prosecdef\n")
+       "        roles.extend(runners);\n    }\n", "        roles.extend(runners);\n        break;\n    }\n")
 mutate("pg-check-definer-chain-execute-not-followed", "a definer function that runs another passes the check", PG_CHECK,
-       "\"(has_function_privilege({owner}, d.oid, 'EXECUTE')", "\"(false AND has_function_privilege({owner}, d.oid, 'EXECUTE')")
+       "WHERE has_function_privilege(r.oid, d.oid, 'EXECUTE'))\n", "WHERE false AND has_function_privilege(r.oid, d.oid, 'EXECUTE'))\n")
 mutate("pg-check-definer-chain-trigger-not-followed", "a definer function that writes to a table whose trigger runs another passes the check", PG_CHECK,
-       "OR EXISTS (SELECT FROM pg_catalog.pg_trigger t", "OR false AND EXISTS (SELECT FROM pg_catalog.pg_trigger t")
+       "OR EXISTS (SELECT FROM fired t", "OR false AND EXISTS (SELECT FROM fired t")
 # #43: ownership counts wherever a privilege does, a definer's owner that can silence the
 # triggers counts, every trigger and enabled event trigger that runs a definer is refused
 # whoever can fire it (this replaced the hunt for write paths), and so is EXECUTE on a
 # function in an untrusted language.
 mutate("pg-check-definer-ignores-table-owner", "a definer function whose owner owns the table, but holds no privilege on it, passes the check", PG_CHECK,
-       "OR pg_has_role({owner}, c.relowner, 'USAGE'))", "OR false AND pg_has_role({owner}, c.relowner, 'USAGE'))")
+       "OR pg_has_role({owner}, x.relowner, 'USAGE'))", "OR false AND pg_has_role({owner}, x.relowner, 'USAGE'))")
 mutate("pg-check-definer-ignores-trigger-function-owner", "a definer function whose owner owns a function the table's triggers run passes the check", PG_CHECK,
-       "AND pg_has_role({owner}, f.proowner, 'USAGE'))", "AND false AND pg_has_role({owner}, f.proowner, 'USAGE'))")
+       "WHERE pg_has_role({owner}, f.proowner, 'USAGE'))", "WHERE false AND pg_has_role({owner}, f.proowner, 'USAGE'))")
 mutate("pg-check-reaching-owner-ignored", "a view outside the schema that reaches the table, owned by the gateway's role, passes the check", PG_CHECK,
        "                     AND pg_has_role(current_user, v.relowner, 'MEMBER')", "                     AND false")
 mutate("pg-check-replication-role-set-ignored", "a definer function whose owner can set session_replication_role passes the check", PG_CHECK,
@@ -3525,11 +3528,11 @@ mutate("pg-check-untrusted-event-trigger-allowed", "an enabled event trigger tha
 mutate("pg-check-disabled-untrusted-event-trigger-refused", "a disabled event trigger that runs a function in an untrusted language is refused", PG_CHECK,
        "                 WHERE e.evtenabled <> 'D'\n", "                 WHERE true\n")
 mutate("pg-check-definer-server-roles-ignored", "a definer function whose owner is a member of pg_read_server_files passes the check", PG_CHECK,
-       "                      OR EXISTS (SELECT FROM pg_catalog.pg_roles s\n",
-       "                      OR false AND EXISTS (SELECT FROM pg_catalog.pg_roles s\n")
+       "OR EXISTS (SELECT FROM server_roles s WHERE s.oid = {owner})",
+       "OR false AND EXISTS (SELECT FROM server_roles s WHERE s.oid = {owner})")
 mutate("pg-check-definer-server-roles-direct-only", "a definer function whose owner inherits pg_execute_server_program through another role passes the check", PG_CHECK,
-       "WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})",
-       "WHERE (mo.oid = {owner} OR mo.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = {owner})) AND {})")
+       "WHERE pg_has_role({owner}, a.oid, 'MEMBER'))",
+       "WHERE (a.oid = {owner} OR a.oid IN (SELECT roleid FROM pg_catalog.pg_auth_members WHERE member = {owner})))")
 # #138: a definer's owner, or a cascading table's, is able when any role it is a member of is,
 # inherited or not, as a member can give a function it makes to that role; a definer's owner
 # that may run a server function or a function in an untrusted language is able; and a foreign
@@ -3537,11 +3540,11 @@ mutate("pg-check-definer-server-roles-direct-only", "a definer function whose ow
 # is able, whatever the table has, judged on a partitioned table by the partitioned table's
 # owner.
 mutate("pg-check-definer-server-roles-inherited-only", "a definer function whose owner is a member of pg_execute_server_program, or of the owner of call_rows, without inheriting it passes the check", PG_CHECK,
-       "WHERE pg_has_role({owner}, mo.oid, 'MEMBER') AND {})", "WHERE pg_has_role({owner}, mo.oid, 'USAGE') AND {})")
+       "WHERE pg_has_role({owner}, a.oid, 'MEMBER'))", "WHERE pg_has_role({owner}, a.oid, 'USAGE'))")
 mutate("pg-check-definer-owner-server-functions-ignored", "a definer function whose owner may run lo_export passes the check", PG_CHECK,
        "AND f.proname::text = ANY($4::text[]))", "AND f.proname::text = ANY($4::text[]) AND false)")
 mutate("pg-check-definer-owner-untrusted-ignored", "a definer function whose owner may run a function in an untrusted language passes the check", PG_CHECK,
-       "OR (l.lanispl AND NOT l.lanpltrusted))", "OR false)")
+       "            OR (l.lanispl AND NOT l.lanpltrusted)\n", "            OR false\n")
 mutate("pg-check-cascade-action-ignored", "a foreign key whose action cascades, on a table owned by a role that can write call_rows, passes the check", PG_CHECK,
        "    problems.extend(found.into_iter().map(|row| Problem::CascadeAction {",
        "    problems.extend(found.into_iter().filter(|_| false).map(|row| Problem::CascadeAction {")
@@ -3550,10 +3553,10 @@ mutate("pg-check-cascade-update-ignored", "a foreign key that acts only on updat
 mutate("pg-check-cascade-restrict-refused", "a foreign key that is ON DELETE RESTRICT is refused", PG_CHECK,
        "AND (k.confdeltype NOT IN ('a', 'r')", "AND (k.confdeltype NOT IN ('a')")
 mutate("pg-check-cascade-any-owner", "a foreign key whose action cascades is refused whoever owns its table", PG_CHECK,
-       "                     AND ({}\n                          OR {})",
-       "                     AND (true OR {}\n                          OR {})")
+       "                     AND {}\n                 ORDER BY 1, 3\",",
+       "                     AND (true OR {})\n                 ORDER BY 1, 3\",")
 mutate("pg-check-cascade-definer-runner-ignored", "a cascading foreign key on a table owned by a role that can run a refused definer function passes the check", PG_CHECK,
-       "\"EXISTS (SELECT FROM definers d", "\"false AND EXISTS (SELECT FROM definers d")
+       "        roles.extend(runners);\n", "        let _ = runners;\n")
 mutate("pg-check-cascade-triggers-only", "a cascading foreign key whose table has a rule, a check or a default but no trigger passes the check", PG_CHECK,
        "WHERE k.contype = 'f' AND k.conparentid = 0\n",
        "WHERE k.contype = 'f' AND k.conparentid = 0\n                     AND EXISTS (SELECT FROM pg_catalog.pg_trigger t WHERE t.tgrelid = tbl.oid AND NOT t.tgisinternal)\n")
@@ -3810,6 +3813,10 @@ mutate("demo-operator-checks-no-impersonate", "impersonating a user, a group or 
        "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n", "")
 mutate("demo-operator-checks-one-namespace", "the team's own namespace is not checked", DRIVER,
        '        for ns in mock-docs switchboard "$team" all; do\n', "        for ns in mock-docs switchboard all; do\n")
+# #104: a `gateway` row (reading ConfigMaps) is asked in mock-docs and the gateway's namespace
+# only, so a team may read its own.
+mutate("demo-operator-checks-gateway-scope-asks-team", "a gateway row is asked in the team's own namespace and across the cluster too", DRIVER,
+       "        for ns in mock-docs switchboard; do\n", '        for ns in mock-docs switchboard "$team" all; do\n')
 mutate("demo-operator-checks-unknown-resource-passes", "a can-i about a resource the API does not serve passes on its no", DRIVER,
        """    *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\\n'*}" ;;\n""", "")
 mutate("demo-operator-checks-review-any-answer", "a SubjectAccessReview passes whatever it answers", DRIVER,
@@ -3976,6 +3983,15 @@ mutate("route-check-rbac-other-namespaces-unread", "the Roles and RoleBindings a
        """    if ! list=$(k get "$what" -n "$NAMESPACE" -o json) || ! json_object "$list" ||\n""")
 mutate("route-check-rbac-role-any-namespace", "a RoleBinding binds a Role of that name in any namespace, not only its own", RBAC_MATCH,
        """then ($roles[$bns] // {})[$ref.name] // []""", """then ([$roles[]] | add // {})[$ref.name] // []""")
+# #104: a `gateway` row (reading ConfigMaps) is asked, and its RoleBindings counted, in the
+# gateway's and the servers' namespaces only; a ClusterRoleBinding still counts for it.
+mutate("route-check-gateway-scope-asks-workload-namespace", "a gateway row is reviewed in the workload's own namespace too", ROUTE_CHECK,
+       """                    elif $scope == "gateway" then $gateway\n""", """                    elif $scope == "gateway" then $namespaces\n""")
+mutate("route-check-gateway-scope-skips-cluster", "a ClusterRoleBinding does not count for a gateway row, so a cluster-wide grant passes", RBAC_MATCH,
+       """   | select(.namespace == "" or $row.scope == "namespaced"\n""",
+       """   | select((.namespace == "" and $row.scope != "gateway") or $row.scope == "namespaced"\n""")
+mutate("route-check-rbac-gateway-scope-counts-workload-namespace", "a gateway row counts the RoleBindings in the workload's own namespace too", RBAC_MATCH,
+       "any($gateway_namespaces[]; . == $ns)", "any($gateway_namespaces[], $namespace; . == $ns)")
 
 # The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
 # tests/route_check.rs.

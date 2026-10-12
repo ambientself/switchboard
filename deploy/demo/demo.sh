@@ -875,12 +875,14 @@ sar_no() {
 # through it can use, and an ephemeral container with both that add one.
 #
 # A row's scope means what it means to route-check.sh. A `namespaced` row is asked in mock-docs,
-# in the gateway's namespace, in the team's own and across the cluster; a `cluster` row is asked
-# across the cluster only. Across the cluster is a can-i with no namespace, as the checks asked
-# it before they read the list (binding ClusterRoles among them). can-i then asks in the
-# kubeconfig's namespace, `default`, and warns for a resource that has none. RBAC counts that
-# namespace's RoleBindings as well as ClusterRoleBindings, so a no there holds across the
-# cluster too, and covers more than --all-namespaces, which counts only ClusterRoleBindings.
+# in the gateway's namespace, in the team's own and across the cluster; a `gateway` row in
+# mock-docs and the gateway's namespace only, so a team may read its own ConfigMaps (#104); a
+# `cluster` row is asked across the cluster only. Across the cluster is a can-i with no
+# namespace, as the checks asked it before they read the list (binding ClusterRoles among
+# them). can-i then asks in the kubeconfig's namespace, `default`, and warns for a resource
+# that has none. RBAC counts that namespace's RoleBindings as well as ClusterRoleBindings, so a
+# no there holds across the cluster too, and covers more than --all-namespaces, which counts
+# only ClusterRoleBindings.
 # A list that cannot be read fails the step; nothing is asked from a list of its own.
 #
 # A can-i names no resource, so it cannot see a rule limited by resourceNames: a workload able
@@ -890,7 +892,7 @@ sar_no() {
 operator_checks() {
   local rows team verb resource subresource scope ns
   if ! rows=$(awk -F'\t' '/^#/ || NF == 0 { next }
-      NF != 4 || ($4 != "namespaced" && $4 != "cluster") { bad = 1; next }
+      NF != 4 || ($4 != "namespaced" && $4 != "gateway" && $4 != "cluster") { bad = 1; next }
       { print }
       END { exit bad }' "$PERMISSIONS") || [ -z "$rows" ]; then
     fail "operator checks: every row of $PERMISSIONS is read (a row is not verb, resource, subresource and scope, or there is none)"
@@ -900,6 +902,10 @@ operator_checks() {
     while IFS=$'\t' read -r verb resource subresource scope <&3; do
       if [ "$scope" = cluster ]; then
         operator_ask "$team" "$verb" "$resource" "$subresource" ""
+      elif [ "$scope" = gateway ]; then
+        for ns in mock-docs switchboard; do
+          operator_ask "$team" "$verb" "$resource" "$subresource" "$ns"
+        done
       else
         for ns in mock-docs switchboard "$team" all; do
           operator_ask "$team" "$verb" "$resource" "$subresource" "$ns"
@@ -942,7 +948,7 @@ operator_rbac() {
   if [ "$status" -eq 0 ]; then
     for team in team-a team-b; do
       if ! verdicts=$(jq -n -r --rawfile permissions "$PERMISSIONS" --arg namespace "$team" --arg name mock-workload \
-        -f "$RBAC_MATCH" <"$lists" 2>&1); then
+        --argjson gateway_namespaces '["switchboard", "mock-docs"]' -f "$RBAC_MATCH" <"$lists" 2>&1); then
         fail "$team's workload is bound to no RBAC rule for a row of $PERMISSIONS (${verdicts%%$'\n'*})"
         continue
       fi
@@ -1252,7 +1258,7 @@ kind_run() {
   step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a and docs-team-b, and for no other ServiceAccount"
   token_grants
 
-  step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets or configuration; and no RBAC rule bound to either grants any of these, whatever its resourceNames"
+  step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets, or ConfigMaps in mock-docs or the gateway's namespace; and no RBAC rule bound to either grants any of these, whatever its resourceNames"
   operator_checks
 
   step "mock-docs accepted only the entries' identities, no denied call reached it, and each team's calls came under its own entry's identity"

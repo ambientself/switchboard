@@ -3229,3 +3229,68 @@ async fn a_definer_function_whose_owner_can_run_a_server_or_untrusted_function_i
         .await
         .unwrap();
 }
+
+/// #144's reproduction. The check asks which roles are able once, and then asks of each
+/// definer function and each cascading table only whether its owner is a member of one of
+/// them. Before, it asked whether each role was able once for every function, before
+/// `pg_proc` was analyzed, so 100 harmless definer functions took the check past the gateway's
+/// 15 s budget for it. Here 200 harmless ones, owned by 60 roles that can reach nothing, in a
+/// database nothing has analyzed, must pass well inside that budget, and so must 200 more that
+/// can reach the table but that no other role may run.
+#[tokio::test]
+async fn many_harmless_definer_functions_pass_well_inside_the_boot_budget() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let mut owners = Vec::new();
+    for _ in 0..60 {
+        owners.push(db.new_role("NOLOGIN", &[]).await);
+    }
+    let mut sql = format!(
+        "CREATE SCHEMA reports AUTHORIZATION {OWNER_ROLE};
+         GRANT USAGE ON SCHEMA reports TO PUBLIC;"
+    );
+    for i in 0..200 {
+        let owner = &owners[i % owners.len()];
+        sql.push_str(&format!(
+            "CREATE FUNCTION reports.harmless_{i}() RETURNS int
+                 LANGUAGE sql SECURITY DEFINER AS 'SELECT {i}';
+             ALTER FUNCTION reports.harmless_{i}() OWNER TO {owner};"
+        ));
+    }
+    db.admin().await.batch_execute(&sql).await.unwrap();
+
+    let started = std::time::Instant::now();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the check took {took:?}"
+    );
+
+    // And with 200 more that can reach the table, owned by its owner, but that nobody else may
+    // run, so the check must follow each one to the roles that can.
+    let mut sql = format!("SET ROLE {OWNER_ROLE};");
+    for i in 0..200 {
+        sql.push_str(&format!(
+            "CREATE FUNCTION reports.able_{i}() RETURNS bigint
+                 LANGUAGE sql SECURITY DEFINER
+                 AS 'SELECT count(*) FROM switchboard_audit.call_rows';
+             REVOKE EXECUTE ON FUNCTION reports.able_{i}() FROM PUBLIC;"
+        ));
+    }
+    db.admin().await.batch_execute(&sql).await.unwrap();
+    let started = std::time::Instant::now();
+    db.store(PoolSizes::default())
+        .check_at_boot()
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the check took {took:?}"
+    );
+}
