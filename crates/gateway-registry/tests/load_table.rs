@@ -831,6 +831,36 @@ fn cases() -> Vec<Case> {
             Want::Parse("missing field `principal`"),
         ),
         case(
+            "a reach test with no date",
+            |t| remove(t, "servers.0.reach_test", "date"),
+            Want::Parse("missing field `date`"),
+        ),
+        case(
+            "a reach test with no record",
+            |t| remove(t, "servers.0.reach_test", "record"),
+            Want::Parse("missing field `record`"),
+        ),
+        case(
+            "a reach check with no tool",
+            |t| remove(t, "servers.0.reach_check", "tool"),
+            Want::Parse("missing field `tool`"),
+        ),
+        case(
+            "a reach check with no arguments",
+            |t| remove(t, "servers.0.reach_check", "arguments"),
+            Want::Parse("missing field `arguments`"),
+        ),
+        case(
+            "a probe with no result",
+            |t| remove(t, "servers.0.probe", "result"),
+            Want::Parse("missing field `result`"),
+        ),
+        case(
+            "a probe with no date",
+            |t| remove(t, "servers.0.probe", "date"),
+            Want::Parse("missing field `date`"),
+        ),
+        case(
             "a credential with an empty principal",
             |t| set(t, "servers.0.credential", "principal", value("\"\"")),
             empty("credential.principal", "server `docs-server`"),
