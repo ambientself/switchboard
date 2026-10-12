@@ -2740,10 +2740,52 @@ mutate_all(
 mutate_all(
     "proxy-dependency-added",
     "the connector links the test fakes",
-    (PROXY + "Cargo.toml", 'tokio = { version = "1", features = ["time"] }\n',
-     'tokio = { version = "1", features = ["time"] }\ngateway-testkit = { path = "../gateway-testkit" }\n'),
+    (PROXY + "Cargo.toml", 'tokio = { version = "1", features = ["macros", "time"] }\n',
+     'tokio = { version = "1", features = ["macros", "time"] }\ngateway-testkit = { path = "../gateway-testkit" }\n'),
     (PROXY + "Cargo.toml", '[dev-dependencies]\ngateway-testkit = { path = "../gateway-testkit" }\n', "[dev-dependencies]\n"),
 )
+
+
+# --- connector-proxy: probe -------------------------------------------------------------------
+# Decision 0010, "Self-built servers at registration": three calls for a tool that does not
+# exist, with no credential, a malformed one and a stranger's token. The first two are refused
+# only by 401 with a challenge, the third by 401 or 403; any JSON-RPC answer is open, whatever
+# its status; anything else is not shown, never refused; the stranger's token goes on the third
+# call alone. tests/probe.rs watches each.
+PP = PROXY + "src/probe.rs"
+mutate("probe-challenge-unchecked", "a 401 with no WWW-Authenticate challenge counts as refused", PP,
+       "        401 if which.needs_challenge() && !answer.challenged => {\n",
+       "        401 if which.needs_challenge() && false => {\n")
+mutate("probe-jsonrpc-body-not-open", "a JSON-RPC error carried by a 401 counts as refused: only a 200 answer is read for one", PP,
+       "    if carries_rpc_response(&answer.body) {\n",
+       "    if answer.status == 200 && carries_rpc_response(&answer.body) {\n")
+mutate("probe-stream-data-lines-unjoined", "each data line of a stream event is read as a message of its own, so a JSON-RPC error split over several lines counts as refused", PP,
+       "                Some(data) => {\n"
+       "                    data.push('\\n');\n"
+       "                    data.push_str(value);\n"
+       "                }\n",
+       "                Some(data) => events.push(std::mem::replace(data, value.to_owned())),\n")
+mutate("probe-stream-bare-cr-unsplit", "a stream whose lines end at a bare CR is read as one line, so the JSON-RPC answer it carries is missed", PP,
+       "    for line in body.split(\"\\r\\n\").flat_map(|line| line.split(['\\r', '\\n'])) {\n",
+       "    for line in body.split(\"\\r\\n\").flat_map(|line| line.split('\\n')) {\n")
+mutate("probe-third-call-skipped", "the stranger's token is never sent; its call counts as refused", PP,
+       "        call(\n"
+       "            client,\n"
+       "            endpoint,\n"
+       "            bounds,\n"
+       "            ProbeCall::ForeignToken,\n"
+       "            Some(stranger())\n"
+       "        ),\n",
+       "        async {\n"
+       "            let _ = stranger;\n"
+       "            CallVerdict::Refused\n"
+       "        },\n")
+mutate("probe-not-shown-counted-refused", "a probe whose calls were not shown, such as one that could not connect, is recorded as refused", PP,
+       "                .all(|(_, verdict)| *verdict == CallVerdict::Refused)\n",
+       "                .all(|(_, verdict)| *verdict != CallVerdict::Open)\n")
+mutate("probe-token-sent-on-every-call", "the stranger's token is sent on the first call too, so the call with no credential is never made", PP,
+       "        call(client, endpoint, bounds, ProbeCall::NoCredential, None),\n",
+       "        call(client, endpoint, bounds, ProbeCall::NoCredential, Some(stranger())),\n")
 
 
 # --- gateway-registry ----------------------------------------------------------------------
@@ -2768,6 +2810,13 @@ mutate("registry-credential-reference-empty", "a credential may have no referenc
        '        require(&server.credential.reference, "credential.reference", place)?;\n', "")
 mutate("registry-credential-principal-empty", "a credential may name no principal", RR,
        '        require(&server.credential.principal, "credential.principal", place)?;\n', "")
+# Decision 0013, section 9: every entry records a probe the server refused.
+mutate("registry-probe-record-optional", "an entry without a probe record loads", RR,
+       "                None => return Err(RegistryError::ProbeMissing(server.name)),\n",
+       "                None => {}\n")
+mutate("registry-probe-open-accepted", "an entry whose probe found it open loads", RR,
+       "                Some(probe) if probe.result != ProbeResult::Refused => {\n",
+       "                Some(probe) if probe.result == ProbeResult::NotShown => {\n")
 mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
        "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
 mutate("registry-address-unchecked", "any address is accepted", RR,
@@ -4205,7 +4254,7 @@ mutate("demo-kind-gateway-mounts-api-token", "the gateway container mounts the t
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
        "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n")
 mutate("demo-kind-token-rbac-unnamed", "the gateway may create a token for any ServiceAccount in its namespace", "deploy/kind/base/gateway-tokens.yaml",
-       '    resourceNames: ["docs-team-a", "docs-team-b"]\n', "")
+       '    resourceNames: ["docs-team-a", "docs-team-b", "registry-probe"]\n', "")
 STRANGER = "  name: stranger\n  namespace: team-a\nautomountServiceAccountToken: false\n"
 mutate("demo-kind-other-file-binds-service-account", "another base file binds a ClusterRole to a team's ServiceAccount",
        "deploy/kind/base/serviceaccounts.yaml", STRANGER,
@@ -4427,11 +4476,10 @@ mutate("gw-drift-interval-ceiling-unchecked", "a drift interval above 900 s load
        " || seconds > MAX_DRIFT_INTERVAL.as_secs() {", " {")
 mutate("gw-drift-entries-share-one-schedule", "the servers are polled together each interval, so a server that does not answer holds back every other server's next poll until its deadline", DRIFT,
        "        let mut entries = JoinSet::new();\n"
-       "        for (server, connector) in self.servers {\n"
+       "        for (server, connector) in &self.servers {\n"
        "            entries.spawn(poll_every(\n"
        "                Arc::clone(&self.withdrawals),\n"
-       "                server,\n"
-       "                connector,\n"
+       "                self.entry(server, connector),\n"
        "                self.interval,\n"
        "            ));\n"
        "        }\n"
@@ -4446,6 +4494,35 @@ mutate("gw-drift-entries-share-one-schedule", "the servers are polled together e
        "        }\n")
 mutate("gw-drift-stale-poll-judged", "a poll is judged against the approvals in force when it answers, so a list read before a new approval withdraws it", DRIFT,
        "            if started.get(tool) != Some(&approved.key) {\n                continue;\n            }\n", "")
+# Decision 0013, section 9: each poll probes its server. An open server is logged and counted,
+# and its tools stay listed (decision 0010). switchboard probe exits 0 only for a refused
+# server. tests/probe.rs watches each.
+mutate("gw-probe-open-withdraws", "a server the probe finds open has its tools withdrawn", DRIFT,
+       "                self.signals.count(server, |counts| counts.probes_open += 1);\n",
+       "                self.signals.count(server, |counts| counts.probes_open += 1);\n"
+       "                {\n"
+       "                    let mut state = self.state();\n"
+       "                    let open: Vec<(ToolName, Standing)> = state\n"
+       "                        .approved\n"
+       "                        .iter()\n"
+       "                        .filter(|(_, approved)| approved.server == *server)\n"
+       "                        .map(|(tool, approved)| {\n"
+       "                            let standing = Standing {\n"
+       "                                key: approved.key.clone(),\n"
+       "                                server: server.clone(),\n"
+       "                            };\n"
+       "                            (tool.clone(), standing)\n"
+       "                        })\n"
+       "                        .collect();\n"
+       "                    state.standing.extend(open);\n"
+       "                    self.serve(&state);\n"
+       "                }\n")
+mutate("gw-probe-never-runs", "the drift pass never probes a server, so an open one is never reported", DRIFT,
+       "            Some(credential) => Some(entry.connector.probe(credential).await),\n",
+       "            Some(_credential) => None,\n")
+mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for a server it finds open", GW + "bin/switchboard.rs",
+       "    if finding == ProbeFinding::Refused {\n",
+       "    if finding != ProbeFinding::NotShown {\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
@@ -4568,7 +4645,9 @@ mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted request
            (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 3 && $3 != "tools/list" { count++ }""", """'$1 == "accepted" { count++ }"""),
            (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
 mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls and the probe do not explain passes", DRIVER,
-       '  check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"\n', "")
+       '  check "$refused" "$((refusals + probes + 3 * drift_probes))" "mock-docs refused nothing else"\n', "")
+mutate("demo-kind-probe-third-reason-unchecked", "the probe's third call passes refused for any reason, not only as wrong_subject", DRIVER,
+       '''  check "$third" "$drift_probes" "mock-docs refused the gateway's $drift_probes probes' calls with registry-probe's token as wrong_subject"\n''', "")
 mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure count reads the gateway's whole log", DRIVER,
        '  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" "pod/$GATEWAY_POD")\n',
        '  gateway_logs=$(k -n switchboard logs "pod/$GATEWAY_POD")\n')

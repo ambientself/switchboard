@@ -126,6 +126,7 @@ services:
     secrets:
       - docs-team-a-credential
       - docs-team-b-credential
+      - registry-probe-credential
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -163,6 +164,9 @@ secrets:
     file: ./dummy-credentials/docs-team-a-credential
   docs-team-b-credential:
     file: ./dummy-credentials/docs-team-b-credential
+  # The probe's third call presents it: a stranger's dummy, which mock-docs does not accept.
+  registry-probe-credential:
+    file: ./dummy-credentials/registry-probe-credential
   # Each credential's sha256 and its team's project, one line each.
   mock-docs-callers:
     file: ./dummy-credentials/mock-docs-callers

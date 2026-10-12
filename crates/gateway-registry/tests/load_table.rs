@@ -887,8 +887,8 @@ fn cases() -> Vec<Case> {
         ),
         case(
             "an unknown probe result",
-            |t| set(t, "servers.0.probe", "result", value("\"open\"")),
-            Want::Parse("unknown variant `open`"),
+            |t| set(t, "servers.0.probe", "result", value("\"passed\"")),
+            Want::Parse("unknown variant `passed`"),
         ),
         case(
             "an unknown reach field",
@@ -961,9 +961,30 @@ fn cases() -> Vec<Case> {
             Want::Loads,
         ),
         case(
-            "no probe record, for now",
+            "no probe record",
             |t| remove(t, "servers.0", "probe"),
-            Want::Loads,
+            Want::Error(E::ProbeMissing("docs-server".into())),
+        ),
+        case(
+            "no probe record on an entry that reaches nothing",
+            |t| remove(t, "servers.1", "probe"),
+            Want::Error(E::ProbeMissing("wiki-server".into())),
+        ),
+        case(
+            "a probe that found the server open",
+            |t| set(t, "servers.0.probe", "result", value("\"open\"")),
+            Want::Error(E::ProbeNotRefused {
+                server: "docs-server".into(),
+                result: "open",
+            }),
+        ),
+        case(
+            "a probe that showed no refusal",
+            |t| set(t, "servers.1.probe", "result", value("\"not_shown\"")),
+            Want::Error(E::ProbeNotRefused {
+                server: "wiki-server".into(),
+                result: "not_shown",
+            }),
         ),
         case(
             "a reach with no reach check",
@@ -1577,7 +1598,14 @@ fn the_base_file_becomes_the_snapshot_definitions_and_adapters_it_states() {
     );
     let wiki = &registry.servers()[&"wiki-server".into()];
     assert_eq!(wiki.destination, Destination::InCluster);
-    assert_eq!((&wiki.probe, &wiki.reach_check), (&None, &None));
+    assert_eq!(
+        wiki.probe,
+        Some(Probe {
+            result: ProbeResult::Refused,
+            date: "2026-10-02".into()
+        })
+    );
+    assert_eq!(wiki.reach_check, None);
 
     let definitions = registry.definitions();
     assert_eq!(definitions.len(), 3);
@@ -1616,4 +1644,56 @@ fn a_file_that_cannot_be_read_is_refused() {
         gateway_registry::Registry::load(&missing),
         Err(RegistryError::Read { .. })
     ));
+}
+
+/// `switchboard probe` reads one entry, checked as the loader checks it but for the probe rule,
+/// so an entry can be probed before it has a record, and nothing else in the file is checked.
+#[test]
+fn one_server_entry_is_read_alone_and_needs_no_probe_record() {
+    let entry = |table: &Table, name: &str| {
+        gateway_registry::Registry::server_entry(&toml::to_string(table).unwrap(), &name.into())
+    };
+    let mut table = base();
+    remove(&mut table, "servers.0", "probe");
+    set(&mut table, "servers.1.probe", "result", value("\"open\""));
+    // A tool that would refuse the whole file.
+    set(
+        &mut table,
+        "tools.0",
+        "definition_sha256",
+        value("\"changed\""),
+    );
+    assert!(load(&table).is_err());
+
+    let docs = entry(&table, "docs-server").unwrap();
+    assert_eq!(docs.address, "https://docs.internal.example.test/mcp");
+    assert_eq!(docs.probe, None);
+    let wiki = entry(&table, "wiki-server").unwrap();
+    assert_eq!(
+        wiki.probe.map(|probe| probe.result),
+        Some(ProbeResult::Open)
+    );
+
+    assert_eq!(
+        entry(&table, "mail-server").unwrap_err(),
+        RegistryError::NoSuchServer("mail-server".into())
+    );
+    // The entry itself is checked.
+    set(&mut table, "servers.0", "identity", value("\"elsewhere\""));
+    assert!(matches!(
+        entry(&table, "docs-server"),
+        Err(RegistryError::IdentityNotHost { .. })
+    ));
+    set(&mut table, "servers.0", "colour", value("\"red\""));
+    assert!(matches!(
+        entry(&table, "docs-server"),
+        Err(RegistryError::Parse(message)) if message.contains("unknown field `colour`")
+    ));
+    let mut twice = base();
+    let servers = twice["servers"].as_array_mut().unwrap();
+    servers.push(servers[0].clone());
+    assert_eq!(
+        entry(&twice, "docs-server").unwrap_err(),
+        RegistryError::DuplicateServer("docs-server".into())
+    );
 }

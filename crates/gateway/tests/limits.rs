@@ -20,7 +20,10 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use connector_proxy::{FileCredentials, ProxyConnector, Upstream, outcome};
-use files::{AUDIENCE, Answered, Files, TEAM_A_SA, TEAM_B_SA, cluster_issuer, deployment_file};
+use files::{
+    AUDIENCE, Answered, Files, TEAM_A_SA, TEAM_B_SA, cluster_issuer, deployment_file,
+    deployment_file_probing,
+};
 use gateway::Gates;
 use gateway::boot::{self, Settings, Wiring};
 use gateway::path::RequestPath;
@@ -85,7 +88,21 @@ struct Script {
     answer_bytes: Option<usize>,
 }
 
-async fn answer(State(script): State<Script>, body: Bytes) -> Response {
+async fn answer(State(script): State<Script>, headers: http::HeaderMap, body: Bytes) -> Response {
+    // Like any server that checks its caller, it refuses a bearer it does not know before
+    // reading the call, so the drift pass's probe calls are refused and never counted.
+    let known =
+        [files::CREDENTIAL, files::TEAM_B_CREDENTIAL].map(|token| format!("Bearer {token}"));
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !known.iter().any(|known| Some(known.as_str()) == bearer) {
+        return (
+            http::StatusCode::UNAUTHORIZED,
+            [(http::header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
+    }
     let request: Value = serde_json::from_slice(&body).unwrap();
     if request["method"] != json!("tools/call") {
         return http::StatusCode::NOT_FOUND.into_response();
@@ -172,7 +189,8 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
             "[[servers]]\nname = \"{name}\"\nsystem = \"{name}\"\nowner = \"platform\"\n\
              identity = \"{identity}\"\naddress = \"{url}\"\n\
              credential = {{ mode = \"gateway_token\", reference = \"{reference}\", principal = \"{name}\" }}\n\
-             narrowing = \"none\"\npermits = \"read\"\nreach = []\ndestination = \"in_cluster\"\n\n"
+             narrowing = \"none\"\npermits = \"read\"\nreach = []\ndestination = \"in_cluster\"\n\
+             probe = {{ result = \"refused\", date = 2026-10-06 }}\n\n"
         )
     };
     let tool = |name: &str, url: &str| {
@@ -643,9 +661,10 @@ async fn the_deployment_files_bounds_and_caps_reach_the_gateway() {
     );
     files.write(
         "gateway.toml",
-        &deployment_file(
+        &deployment_file_probing(
             "[audit]\nmode = \"disabled\"\n\n[limits]\nper_team_per_server_in_flight = 1\n\n\
              [servers.slow]\ndeadline_seconds = 1\n\n[servers.other]\nmax_result_bytes = 100\n",
+            &[SLOW, OTHER],
         ),
     );
     let prepared = prepare(
@@ -701,9 +720,10 @@ async fn the_deployment_files_caps_on_calls_in_flight_reach_the_server_and_each_
     );
     files.write(
         "gateway.toml",
-        &deployment_file(
+        &deployment_file_probing(
             "[audit]\nmode = \"disabled\"\n\n[limits]\nmax_in_flight = 2\nper_server_in_flight = 1\n\n\
              [servers.slow]\ndeadline_seconds = 3\n\n[servers.other]\ndeadline_seconds = 3\n",
+            &[SLOW, OTHER],
         ),
     );
     let prepared = prepare(

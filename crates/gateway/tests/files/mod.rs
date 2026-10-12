@@ -1,7 +1,7 @@
 //! A deployment written to files, as the `switchboard` binary reads it: the deployment file, the
 //! kind demo's registry (with the mock server's two entries moved to an address on loopback, and
-//! their tools' approvals bound to it again), the issuer's keys, the team manifest and the
-//! gateway's credential for each entry.
+//! their tools' approvals bound to it again), the issuer's keys, the team manifest, the
+//! gateway's credential for each entry and the probe's credential.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
@@ -40,6 +40,9 @@ pub const STRANGER_SA: &str = "system:serviceaccount:team-a:stranger";
 pub const CREDENTIAL: &str = "dummy-gateway-credential-for-the-wiring-tests";
 /// The gateway's credential for team B's entry, docs-team-b. A dummy.
 pub const TEAM_B_CREDENTIAL: &str = "dummy-team-b-credential-for-the-wiring-tests";
+/// The probe's credential for both entries: a stranger's, which the mock server refuses. A
+/// dummy.
+pub const PROBE_CREDENTIAL: &str = "dummy-probe-credential-for-the-wiring-tests";
 /// Team A's entry's read tool, which names a project.
 pub const READ_TOOL: &str = "docs-team-a__read_document";
 /// Team A's entry's list tool.
@@ -113,6 +116,10 @@ impl Files {
         );
         files.write("docs-team-a-credential", &format!("{CREDENTIAL}\n"));
         files.write("docs-team-b-credential", &format!("{TEAM_B_CREDENTIAL}\n"));
+        files.write(
+            "registry-probe-credential",
+            &format!("{PROBE_CREDENTIAL}\n"),
+        );
         files.write(
             "gateway.toml",
             &deployment_file("[audit]\nmode = \"disabled\"\n"),
@@ -224,7 +231,7 @@ pub fn rebind(text: &str, address: &str) -> String {
 }
 
 /// The revision the kind registry is at.
-pub const KIND_REVISION: &str = "demo-5";
+pub const KIND_REVISION: &str = "demo-7";
 
 /// The kind registry with the mock server at `mock_url`, under `revision` instead of
 /// [`KIND_REVISION`].
@@ -295,6 +302,15 @@ pub fn keys_url_issuer(issuer: &str, keys_url: &str) -> String {
 
 /// A deployment file, relative paths and all, with `audit` as its audit table.
 pub fn deployment_file(audit: &str) -> String {
+    deployment_file_probing(audit, &["docs-team-a", "docs-team-b"])
+}
+
+/// [`deployment_file`], giving each of `servers` the probe's credential.
+pub fn deployment_file_probing(audit: &str, servers: &[&str]) -> String {
+    let probes: String = servers
+        .iter()
+        .map(|server| format!("{server} = \"registry-probe-credential\"\n"))
+        .collect();
     format!(
         r#"deployment = "files-test"
 listen = "127.0.0.1:0"
@@ -324,7 +340,9 @@ leeway_seconds = 30
 [credentials]
 docs-team-a-credential = "docs-team-a-credential"
 docs-team-b-credential = "docs-team-b-credential"
-"#
+
+[drift.probe_credentials]
+{probes}"#
     )
 }
 

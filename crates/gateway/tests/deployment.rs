@@ -559,7 +559,7 @@ fn the_demo_deployment_files_are_valid_deployment_files() {
         std::fs::read_to_string(repo.join("deploy/compose/config/registry-withdrawn.toml"))
             .unwrap();
     let withdrawn = Registry::from_toml_str(&withdrawn).unwrap();
-    assert_eq!(withdrawn.snapshot().revision().as_str(), "demo-6");
+    assert_eq!(withdrawn.snapshot().revision().as_str(), "demo-8");
     for tool in [files::READ_TOOL, files::TEAM_B_READ_TOOL] {
         assert!(withdrawn.snapshot().tool(&tool.parse().unwrap()).is_none());
     }

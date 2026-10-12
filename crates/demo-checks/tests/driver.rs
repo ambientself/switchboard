@@ -702,7 +702,7 @@ fn the_server_caller_check_admits_only_the_entries_identities() {
 
     let run = run_of(8, &[]);
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 5, "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 6, "{}", run.transcript());
 
     // A request with no bearer that the probe's open attempts do not explain.
     let run = run_of(8, std::slice::from_ref(&probe));
@@ -762,6 +762,84 @@ fn the_server_caller_check_admits_only_the_entries_identities() {
     let run = check_callers(&lines);
     assert!(
         run.failed("mock-docs refused the 2 direct calls' tokens as meant for another audience"),
+        "{}",
+        run.transcript()
+    );
+}
+
+/// The gateway's drift probe sends mock-docs three calls it must refuse on every poll: no
+/// bearer, a malformed one, and the probe's own. Neither server check counts them as a
+/// workload's, and each still fails a probe bearer mock-docs accepted or a refusal they do not
+/// explain.
+#[test]
+fn the_server_checks_leave_out_the_gateways_probe_calls() {
+    // Compose: the malformed bearer's and the probe dummy's digests, refused.
+    let team_a = static_line("88a0f2ba13fc", true);
+    let team_b = static_line("d20bf481167c", true);
+    let malformed = static_line("ce6f21ae951d", false);
+    let dummy = static_line("f4441730e377", false);
+    let bearers = |extra: &[&String]| {
+        let mut lines = vec![team_a.as_str(), team_b.as_str()];
+        lines.extend(extra.iter().map(|line| line.as_str()));
+        sourced(&format!(
+            "check_server_bearers '{}' \"{SHA_A} {SHA_B}\" 2 all\nFINISHED=1\nresult 0",
+            lines.join("\n")
+        ))
+    };
+    let run = bearers(&[&malformed, &dummy, &malformed, &dummy]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let run = bearers(&[&static_line("f4441730e377", true)]);
+    assert!(
+        run.failed("mock-docs accepted no other bearer"),
+        "{}",
+        run.transcript()
+    );
+
+    // kind: each probe is one refusal each of no_bearer, malformed and wrong_subject.
+    let mut lines = vec![
+        jwt_line(false, None, Some("wrong_audience")),
+        jwt_line(false, None, Some("wrong_audience")),
+    ];
+    lines.extend(std::iter::repeat_n(
+        jwt_line(false, None, Some("no_bearer")),
+        3,
+    ));
+    lines.extend(std::iter::repeat_n(
+        jwt_line(true, Some(SUBJECT_A), None),
+        4,
+    ));
+    lines.extend(std::iter::repeat_n(
+        jwt_line(true, Some(SUBJECT_B), None),
+        4,
+    ));
+    for _ in 0..2 {
+        for refusal in ["no_bearer", "malformed", "wrong_subject"] {
+            lines.push(jwt_line(false, None, Some(refusal)));
+        }
+    }
+    let run = check_callers(&lines);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+
+    // The third call refused for any other reason: its token was not one valid for mock-docs'
+    // audience, so the probe did not show that mock-docs refuses a subject outside the
+    // gateway's identities.
+    let mut expired = lines.clone();
+    let third = expired
+        .iter()
+        .rposition(|line| line.contains("\"wrong_subject\""))
+        .unwrap();
+    expired[third] = jwt_line(false, None, Some("expired"));
+    let run = check_callers(&expired);
+    assert!(
+        run.failed("mock-docs refused the gateway's 2 probes' calls with registry-probe's token as wrong_subject"),
+        "{}",
+        run.transcript()
+    );
+
+    lines.push(jwt_line(false, None, Some("wrong_subject")));
+    let run = check_callers(&lines);
+    assert!(
+        run.failed("mock-docs refused nothing else"),
         "{}",
         run.transcript()
     );
@@ -1533,7 +1611,7 @@ fn row(
         "kind": "call", "team": team, "tool": format!("docs-{team}__read_document"),
         "decision": decision, "reason": reason,
         "sentence": if sentence.is_empty() { Value::Null } else { json!(sentence) },
-        "resources": resources, "revision": "demo-5", "listed": null, "omitted": null,
+        "resources": resources, "revision": "demo-7", "listed": null, "omitted": null,
     })
 }
 
@@ -1607,9 +1685,9 @@ fn demo_rows() -> Vec<Value> {
             json!("unknown"),
         ),
         // Each team's list, and team-a's after the withdrawal, under the next revision.
-        list_row("team-a", "demo-5", &both_tools("team-a")),
-        list_row("team-b", "demo-5", &both_tools("team-b")),
-        list_row("team-a", "demo-6", &["docs-team-a__list_documents"]),
+        list_row("team-a", "demo-7", &both_tools("team-a")),
+        list_row("team-b", "demo-7", &both_tools("team-b")),
+        list_row("team-a", "demo-8", &["docs-team-a__list_documents"]),
     ]
 }
 
@@ -3233,7 +3311,7 @@ fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
     let gateway = common::read("deploy/kind/base/gateway.yaml");
     for line in [
         "          command: [\"token-writer.sh\"]\n",
-        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b\"}\n",
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe\"}\n",
         "            - {name: TOKEN_NAMESPACE, value: switchboard}\n",
         "            - {name: TOKEN_AUDIENCE, value: mock-docs}\n",
         "            - {name: TOKEN_EXPIRATION_SECONDS, value: \"600\"}\n",
@@ -3251,12 +3329,12 @@ fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
 }
 
 #[test]
-fn the_gateways_token_grant_must_name_only_the_entries() {
+fn the_gateways_token_grant_must_name_only_the_entries_and_the_probe() {
     // A fake `k` answering can-i as RBAC would for gateway-tokens.yaml, or as it would with
     // the grant widened to every ServiceAccount.
     let fake = |widened: bool| {
         format!(
-            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
+            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *|*serviceaccounts/registry-probe\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
             if widened {
                 "echo yes"
             } else {
@@ -3269,7 +3347,13 @@ fn the_gateways_token_grant_must_name_only_the_entries() {
         fake(false)
     ));
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 6, "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 7, "{}", run.transcript());
+    assert!(
+        run.transcript()
+            .contains("the gateway may create tokens for registry-probe"),
+        "{}",
+        run.transcript()
+    );
     let run = sourced(&format!("{}token_grants\nFINISHED=1\nresult 0", fake(true)));
     assert_eq!(run.lines("FAIL ").len(), 4, "{}", run.transcript());
     assert!(

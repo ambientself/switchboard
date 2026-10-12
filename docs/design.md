@@ -1417,8 +1417,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
   issuer's key age (#115), the policy's age and maximum age (#132), and the calls shed and
   each proxied server's calls, latency and late or oversized answers (#139), and each proxied
-  server's drift polls and withdrawals (the drift pass entry below). The probe and reach-check
-  signals wait for what they count. Decision 0014 writes the alert conditions
+  server's drift polls, withdrawals and probe results (the drift pass entry below). The
+  reach-check signals wait for what they count. Decision 0014 writes the alert conditions
   down, and there are no rules until a metrics sink exists.
 - The overload, hanging-server and drift demonstrations: not built. `tests/limits.rs` shows
   overload and a hanging server in a test (#139), not in a demo.
@@ -1450,18 +1450,21 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
   which admits its own team only. In kind each entry's identity is a ServiceAccount. A
   token-writer sidecar in the gateway pod gets each one's token by TokenRequest, for the
-  server's audience, and writes it to the file the deployment file names for that entry; a
-  Role limited by `resourceNames` to the two ServiceAccounts is its only grant. Only the
-  sidecar mounts a token the API server accepts, and no workload mounts one. In Compose each
-  entry has a static dummy credential. The mock server limits each identity to its team's
-  project. The registration and drift probe is not built; its ServiceAccount, and the
-  registry's, join the Role when they are.
+  server's audience, and writes it to the file the deployment file names for that entry; a Role
+  limited by `resourceNames` to those two ServiceAccounts and the probe's (below) is its only
+  grant. Only the sidecar mounts a token the API server accepts, and no workload mounts one. In
+  Compose each entry has a static dummy credential. The mock server limits each identity to its
+  team's project. The probe's ServiceAccount, `registry-probe`, is the Role's third name: the
+  token writer writes its token for the mock server's audience beside the entries', and the
+  drift pass's probe presents it (the probe entry below). In Compose the probe presents a static
+  dummy the mock server is not given. The registry's own workload identity joins the Role when
+  the reach check is built.
 - Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the
   address's host, the dialect and no `+` in the registry's revision are built (#131, and #122
   for the dialect). Each server's destination class is recorded and bound, and the loader
-  allows plain `http` only for `in_cluster`. The probe record parses and is optional until the
-  probe is built. Verified certificates, the address checks and the refused addresses are not
-  built.
+  allows plain `http` only for `in_cluster`. Every proxied entry must record a probe whose
+  result is `refused` (the probe entry below). Verified certificates, the address checks and
+  the refused addresses are not built.
 - The drift pass, its derived revisions and standing withdrawals: built. Every replica reads
   each proxied server's `tools/list` with the entry's own credential, under its call deadline
   and answer cap, once during boot before the listener is bound and then every
@@ -1481,12 +1484,30 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `approved_at`, is applied again to each reload that keeps its key, and is cleared by a new
   approval or by removing the tool; it lives in the replica's memory, so a restart against a
   restored server serves the tool again (decision 0013, section 7). `tests/drift.rs` has
-  decision 0013's drift scenarios. Not built: the probe calls and the reach check of the same
-  pass.
+  decision 0013's drift scenarios. Each poll also probes its server (the probe entry below).
+  Not built: the reach check of the same pass.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.
-- `switchboard probe` and the token writer: not built.
+- The registration and drift probe: built. `connector_proxy::probe` sends decision 0010's
+  three `tools/call` requests for `switchboard_probe_no_such_tool`, with no credential, with
+  `Bearer not-a-token` and with the probe credential, held to the server's call deadline and
+  answer cap, following no redirect and reading no proxy from the environment. A call is
+  refused on `401` with a `WWW-Authenticate` challenge, or for the third call `401` or `403`,
+  with no JSON-RPC response in the answer; a JSON-RPC result or error, whatever the status,
+  as one JSON message, a batch, or a stream event however many `data` lines it spans, shows
+  it was dispatched, and the server is open; anything else, a connection that failed
+  included, is not shown and never counted as refused. `switchboard probe --config=FILE
+  --server=NAME` reads the deployment file and that one entry, without the loader's probe
+  rule, and prints each call, the result and the record line, exiting 0 only when all three
+  were refused. The loader refuses an entry without a record or with any result but
+  `refused`, and the demo registries record a real run in each demo. Each drift poll probes
+  its server beside the tool list, with the credential `[drift.probe_credentials]` names for
+  it, which the gateway requires for every server at start. An open server is logged as
+  `server_open` at ERROR, naming the calls it dispatched, and counted in
+  `switchboard_probe_results_total{server,result}`; its tools stay listed. A probe that
+  showed nothing is logged at WARN. `tests/probe.rs` in `connector-proxy` and `gateway` has
+  them. The token writer is built (the per-team identities entry above).
 - Decision 0013 section 11's acceptance scenarios: not built.
 - The identity and audit opt-outs refused by the release binary, with CI checks: built (#132),
   in the opt-outs entry below.
@@ -1494,8 +1515,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The 512 KiB row bound and its test: not built.
 - The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
   each proxied server's calls, latency and late or oversized answers (#139), and the policy's
-  age (#132), and each server's drift polls and withdrawals, are exported. Probe results and
-  reach-check results are not built.
+  age (#132), and each server's drift polls, withdrawals and probe results, are exported.
+  Reach-check results are not built.
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -1728,8 +1749,8 @@ Otto promises. These findings inform Q9–Q13; they are not silent changes to th
   removed, where the check must fail (a Secret mounted, a permission granted, enforcement off,
   a route left open), are tested against a fake cluster, in
   `crates/demo-checks/tests/route_check.rs`. No run has been made against a cluster that does
-  not enforce policy. When milestone 3 builds the registry's probe, each of its guards gets an
-  entry in `scripts/mutation_check.py`.
+  not enforce policy. The registration and drift probe's guards each have an entry in
+  `scripts/mutation_check.py`.
 - A `propose` tool's run-time guards (section 8), refusals and forced values such as a draft,
   are guards like any other. Its connector has a test against the fake vendor that fails
   without each one, and a mutation that removes it. Such a guard cannot sit inside a proxied

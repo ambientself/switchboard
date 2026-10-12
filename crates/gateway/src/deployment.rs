@@ -59,8 +59,11 @@
 //! deadline_seconds = 5        # 5 if left out; 1 to 60
 //! max_result_bytes = 65536    # 64 KiB if left out; 1 to 1 MiB
 //!
-//! [drift]                     # optional
+//! [drift]
 //! interval_seconds = 300      # 300 if left out; 5 to 900
+//!
+//! [drift.probe_credentials]   # one for each server the registry names
+//! mock-docs = "/run/secrets/registry-probe-credential"
 //!
 //! [credentials]
 //! docs-credential = "/run/secrets/docs-credential"
@@ -119,7 +122,12 @@
 //! - **The drift pass** reads each proxied server's tool list every `drift.interval_seconds`,
 //!   and withdraws a tool whose served definition no longer matches its approval (see
 //!   [`crate::drift`]): [`DEFAULT_DRIFT_INTERVAL`](crate::drift::DEFAULT_DRIFT_INTERVAL) if it
-//!   is not given, and refused below 5 or above 900 (decision 0013, section 5).
+//!   is not given, and refused below 5 or above 900 (decision 0013, section 5). Each poll also
+//!   probes the server (decision 0013, section 9), presenting on its third call the credential
+//!   in the file `drift.probe_credentials` names for that server: a stranger's, such as a
+//!   token for a ServiceAccount of the probe's own, or in Compose a static dummy. The gateway
+//!   refuses to start unless each server the registry names has one, and refuses one for any
+//!   other (see [`crate::drift::probe_credentials`]). `switchboard probe` reads the same file.
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! limits, each server's bounds and the drift interval have defaults, so a gateway not told
@@ -195,7 +203,8 @@ pub struct DeploymentFile {
     /// Each proxied server's bounds, where they differ from the defaults.
     #[serde(default)]
     pub servers: BTreeMap<ConnectorName, ServerSection>,
-    /// How often the drift pass runs, where it differs from the default.
+    /// How often the drift pass runs, where it differs from the default, and each proxied
+    /// server's probe credential.
     #[serde(default)]
     pub drift: Option<DriftSection>,
     /// Each credential reference the registry's servers name, and the file holding it.
@@ -211,6 +220,24 @@ impl DeploymentFile {
             .filter_map(|server| server.deadline_seconds)
             .map(Duration::from_secs)
             .fold(DEFAULT_DEADLINE, Duration::max)
+    }
+
+    /// The bounds the file sets for `server`'s calls, each defaulted, and refused if zero or
+    /// past its ceiling.
+    pub fn server_bounds(&self, server: &ConnectorName) -> Result<ServerLimits, DeploymentError> {
+        server_limits(
+            server,
+            self.servers.get(server).copied().unwrap_or_default(),
+        )
+    }
+
+    /// The file `drift.probe_credentials` names for `server`'s probe credential, as written.
+    pub fn probe_credential(&self, server: &ConnectorName) -> Option<&Path> {
+        self.drift
+            .as_ref()?
+            .probe_credentials
+            .get(server)
+            .map(PathBuf::as_path)
     }
 }
 
@@ -563,6 +590,8 @@ pub struct Deployment {
     pub servers: BTreeMap<ConnectorName, ServerLimits>,
     /// How often the drift pass runs.
     pub drift_interval: Duration,
+    /// Each proxied server's probe credential file, from the deployment file's directory.
+    pub probe_credentials: BTreeMap<ConnectorName, PathBuf>,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -578,6 +607,7 @@ impl std::fmt::Debug for Deployment {
             .field("limits", &self.limits)
             .field("servers", &self.servers)
             .field("drift_interval", &self.drift_interval)
+            .field("probe_credentials", &self.probe_credentials)
             .finish_non_exhaustive()
     }
 }
@@ -685,6 +715,13 @@ impl Deployment {
         }
         let limits = limits(file.limits.unwrap_or_default())?;
         let drift_interval = DriftSection::interval(file.drift.as_ref())?;
+        let probe_credentials = file
+            .drift
+            .map(|drift| drift.probe_credentials)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(server, path)| (server, base.join(path)))
+            .collect();
         let servers = file
             .servers
             .into_iter()
@@ -730,6 +767,7 @@ impl Deployment {
             limits,
             servers,
             drift_interval,
+            probe_credentials,
             credentials: file
                 .credentials
                 .into_iter()

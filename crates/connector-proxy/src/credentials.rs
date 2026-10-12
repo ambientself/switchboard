@@ -178,6 +178,55 @@ impl FileCredentials {
     }
 }
 
+/// The credential the probe's third call presents (decision 0010, "Self-built servers at
+/// registration"): a token for the server's audience for a subject outside the gateway's
+/// identities or, where there is no issuer, a static dummy the server must refuse as it would
+/// a stranger's. Never one of the gateway's own credentials.
+///
+/// It is read from its file when loaded, with the checks [`FileCredentials::load`] makes, and
+/// again on every probe, so a token rotated in place is the one sent. Only the probe reads the
+/// token.
+pub struct ProbeCredential {
+    server: ConnectorName,
+    path: PathBuf,
+}
+
+impl fmt::Debug for ProbeCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProbeCredential")
+            .field("server", &self.server)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl ProbeCredential {
+    /// Reads and checks the probe credential for `server` in `path`, and keeps the path to
+    /// read it again on every probe.
+    pub fn load(
+        server: ConnectorName,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, CredentialFileError> {
+        let path = path.as_ref();
+        read_secret(&server, path)?;
+        Ok(Self {
+            server,
+            path: path.to_owned(),
+        })
+    }
+
+    /// The server it is for.
+    pub fn server(&self) -> &ConnectorName {
+        &self.server
+    }
+
+    /// The token, read from its file now. The refusal names the server and the file, never
+    /// what the file holds.
+    pub(crate) fn secret(&self) -> Result<Secret, String> {
+        read_secret(&self.server, &self.path).map_err(|failed| failed.to_string())
+    }
+}
+
 impl CredentialSource for FileCredentials {
     fn credential_for<'a>(
         &'a self,

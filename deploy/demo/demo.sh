@@ -76,9 +76,12 @@ KEYS_FETCHED_MESSAGE="fetched the issuer's keys from its keys URL"
 # the only callers mock-docs accepts there. In Compose it is the entry's dummy credential.
 KIND_ENTRY_SUBJECTS="system:serviceaccount:switchboard:docs-team-a system:serviceaccount:switchboard:docs-team-b"
 COMPOSE_CREDENTIALS=$ROOT/deploy/compose/dummy-credentials
+# The SHA-256 of `not-a-token`, the malformed bearer of the gateway's drift probe
+# (connector_proxy::MALFORMED_CREDENTIAL).
+PROBE_MALFORMED_SHA=ce6f21ae951df0ba38d6ce0e0175465bf5e9882edcf2ba677bca63b296f17ce7
 # The registries' revision, and the Compose withdrawal's (registry-withdrawn.toml).
-REVISION=demo-5
-WITHDRAWN_REVISION=demo-6
+REVISION=demo-7
+WITHDRAWN_REVISION=demo-8
 AUDIT_TABLE=switchboard_audit.call_rows
 # The open-row query's view (crates/audit-postgres, sql/migrations/0005_open_rows.sql).
 OPEN_ROWS_VIEW=switchboard_audit.open_call_rows
@@ -480,7 +483,9 @@ check_metrics() {
 # carrying any bearer. CALLS is exactly how many calls the gateway allowed so far: one more means
 # a call it denied reached the server, one fewer that an allowed call did not, or that the log is
 # short. Requests with no bearer (the health checks) are not counted, and neither are the
-# gateway's drift polls: its own tools/list requests, with its own credentials.
+# gateway's drift polls: its own tools/list requests, with its own credentials. Nor are its drift
+# probes' bearers (decision 0013, section 9), the malformed one and the probe's dummy, which are
+# no workload's; mock-docs must refuse them, so one it accepted still fails.
 # check_server_entries checks that each team's calls carried its own entry's credential.
 check_server_bearers() {
   local logs=$1 shas=$2 calls=$3 scope=$4 lines sha shown=""
@@ -498,7 +503,9 @@ check_server_bearers() {
     }'
   good=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && ours($2) && $3 != "tools/list" { count++ } END { print count + 0 }')
   bad=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'$1 == "accepted" && !ours($2) { count++ } END { print count + 0 }')
-  stray=$(printf '%s\n' "$lines" | awk -v shas="$shas" "$ours"'NF == 3 && !ours($2) { count++ } END { print count + 0 }')
+  local probe_shas
+  probe_shas="$PROBE_MALFORMED_SHA $(cat "$COMPOSE_CREDENTIALS/registry-probe-credential.sha256")"
+  stray=$(printf '%s\n' "$lines" | awk -v shas="$shas $probe_shas" "$ours"'NF == 3 && !ours($2) { count++ } END { print count + 0 }')
   check "$good" "$calls" "mock-docs accepted the gateway's credentials on exactly the $calls calls the gateway allowed"
   check "$bad" 0 "mock-docs accepted no other bearer"
   if [ "$scope" = all ]; then
@@ -518,14 +525,20 @@ check_server_bearers() {
 # own entry's. Exactly REFUSALS requests were refused as wrong_audience: a token the cluster
 # signed for another audience, the workloads' own on their direct calls before the policy.
 # Exactly PROBES were refused as no_bearer: the route check's probe before the policy, which
-# sends no credential, one request per attempt it found open. Any other refusal fails.
+# sends no credential, one request per attempt it found open. Each drift poll's probe of an entry
+# (decision 0013, section 9) adds three refusals, one each of no_bearer, malformed and
+# wrong_subject, so one malformed refusal counts one gateway probe. Only wrong_subject shows that
+# the third call carried registry-probe's token, valid for mock-docs' audience but for a subject
+# outside the gateway's identities (decision 0010), so there must be exactly as many of those as
+# of malformed. A refusal for any other reason, or one more of any of these, fails.
 check_server_callers() {
   local logs=$1 subjects=$2 calls=$3 refusals=$4 probes=$5 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
     | if .accepted == true then "accepted \(.caller // "none") \(.rpc_method // "none")" else "refused \(.refusal // "none")" end')
   echo "    requests seen by mock-docs, by answer and verified caller and method, or refusal:"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
-  local gateway other audience bearerless refused
+  local gateway other audience bearerless third refused drift_probes
+  drift_probes=$(printf '%s\n' "$lines" | awk '$0 == "refused malformed" { n++ } END { print n + 0 }')
   # shellcheck disable=SC2016 # awk's own variables
   local ours='BEGIN { n = split(subjects, list, " "); for (i = 1; i <= n; i++) entry[list[i]] = 1 }
     '
@@ -533,12 +546,14 @@ check_server_callers() {
   other=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ } END { print count + 0 }')
   audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
   bearerless=$(printf '%s\n' "$lines" | awk '$0 == "refused no_bearer" { n++ } END { print n + 0 }')
+  third=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_subject" { n++ } END { print n + 0 }')
   refused=$(printf '%s\n' "$lines" | awk '$1 == "refused" { n++ } END { print n + 0 }')
   check "$gateway" "$calls" "mock-docs accepted the entries' tokens ($subjects) on exactly the $calls calls the gateway allowed"
   check "$other" 0 "mock-docs accepted no other caller, and no token without one"
   check "$audience" "$refusals" "mock-docs refused the $refusals direct calls' tokens as meant for another audience"
-  check "$bearerless" "$probes" "mock-docs refused the route check's $probes open attempts before the policy, which carried no bearer"
-  check "$refused" "$((refusals + probes))" "mock-docs refused nothing else"
+  check "$bearerless" "$((probes + drift_probes))" "mock-docs refused the route check's $probes open attempts before the policy, which carried no bearer, and the gateway's $drift_probes probes' calls with none"
+  check "$third" "$drift_probes" "mock-docs refused the gateway's $drift_probes probes' calls with registry-probe's token as wrong_subject"
+  check "$refused" "$((refusals + probes + 3 * drift_probes))" "mock-docs refused nothing else"
 }
 
 # check_server_entries LOGS CALLS WHO...: each team's calls reached mock-docs under its own
@@ -993,12 +1008,12 @@ operator_ask() {
 }
 
 # token_grants: what ServiceAccount gateway may do with ServiceAccount tokens, the grant its
-# pod's token writer uses (deploy/kind/base/gateway-tokens.yaml): create them for docs-team-a and
-# docs-team-b, named, and for no other ServiceAccount, its own and a workload's among them, nor
-# without a name.
+# pod's token writer uses (deploy/kind/base/gateway-tokens.yaml): create them for docs-team-a,
+# docs-team-b and registry-probe, the drift probe's, named, and for no other ServiceAccount, its
+# own and a workload's among them, nor without a name.
 token_grants() {
   local gateway=system:serviceaccount:switchboard:gateway entry answer
-  for entry in docs-team-a docs-team-b; do
+  for entry in docs-team-a docs-team-b registry-probe; do
     answer=$(k auth can-i create "serviceaccounts/$entry" --subresource=token -n switchboard --as="$gateway" 2>&1) || true
     check "${answer##*$'\n'}" yes "the gateway may create tokens for $entry"
   done
@@ -1262,7 +1277,7 @@ kind_run() {
   step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
   route_checks_after_policy
 
-  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a and docs-team-b, and for no other ServiceAccount"
+  step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a, docs-team-b and registry-probe, and for no other ServiceAccount"
   token_grants
 
   step "operator checks: every row of deploy/route-check/permissions.tsv, for each team's workload, in mock-docs, the gateway's namespace, its own and across the cluster: neither may start pods or the controllers that start them, mint tokens, impersonate, exec, attach, port-forward, proxy, add an ephemeral container, bind or escalate a role or create, update or patch a binding, nor get, list or watch secrets, or ConfigMaps in mock-docs or the gateway's namespace; and no RBAC rule bound to either grants any of these, whatever its resourceNames"

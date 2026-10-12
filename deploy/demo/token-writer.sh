@@ -1,9 +1,10 @@
 #!/bin/sh
 # deploy/demo/token-writer.sh: the kind demo's token writer (decision 0013, section 10). It runs
 # as a sidecar in the gateway's pod (deploy/kind/base/gateway.yaml). For each ServiceAccount it
-# is given, one per entry of the mock server in the registry, it asks the API server for a token
-# by TokenRequest and writes it to a file the gateway reads as that entry's credential. The
-# gateway itself holds no token the API server accepts and has no API-server client.
+# is given, it asks the API server for a token by TokenRequest and writes it to a file the
+# gateway reads: one per entry of the mock server in the registry, read as that entry's
+# credential, and registry-probe, read as the drift probe's credential. The gateway itself holds
+# no token the API server accepts and has no API-server client.
 #
 # Usage: token-writer.sh [once]
 #   (none)  write every token, then again every TOKEN_REFRESH_SECONDS; after a failure, try again

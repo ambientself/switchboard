@@ -27,6 +27,8 @@ narrowing = "none"
 permits = "read"
 reach = [{ system = "docs", kind = "project", identifier = "atlas" }]
 destination = "in_cluster"
+# A dummy, like the reach test: nothing is there to probe. The loader needs a record.
+probe = { result = "refused", date = 2026-10-12 }
 
 [servers.reach_test]
 date = 2026-10-12

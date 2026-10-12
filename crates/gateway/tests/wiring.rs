@@ -72,12 +72,13 @@ impl World {
         .await
     }
 
-    /// The bearers the mock server has received, as logged prefixes, on every request but the
+    /// The bearers the mock server has accepted, as logged prefixes, on every request but the
     /// drift pass's tool lists.
     fn bearers(&self) -> Vec<String> {
         self.mock
             .log_lines()
             .iter()
+            .filter(|line| line["accepted"] == json!(true))
             .filter(|line| line["rpc_method"] != json!("tools/list"))
             .filter_map(|line| line["bearer_sha256"].as_str().map(str::to_owned))
             .collect()
@@ -91,6 +92,17 @@ impl World {
             .iter()
             .filter(|line| line["rpc_method"] == json!("tools/list"))
             .filter_map(|line| line["bearer_sha256"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The requests the mock server refused: the drift pass's probe calls, each logged with the
+    /// prefix of the bearer it carried, if any.
+    fn refused(&self) -> Vec<Option<String>> {
+        self.mock
+            .log_lines()
+            .iter()
+            .filter(|line| line["event"] == json!("request") && line["accepted"] == json!(false))
+            .map(|line| line["bearer_sha256"].as_str().map(str::to_owned))
             .collect()
     }
 
@@ -128,15 +140,27 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
     .await;
     assert_eq!(initialized.status, 200, "{}", initialized.body);
     // Before serving, the first drift pass read each entry's tool list once, with that entry's
-    // credential, and nothing else.
+    // credential, and probed each entry: three calls the server refused, with no credential, a
+    // malformed one and the probe's, never the gateway's. Nothing else.
     let mut lists = world.lists();
     lists.sort();
     let mut entries = vec![logged(files::CREDENTIAL), logged(files::TEAM_B_CREDENTIAL)];
     entries.sort();
     assert_eq!(lists, entries);
+    let mut refused = world.refused();
+    refused.sort();
+    let probe = |bearer: Option<&str>| bearer.map(logged);
+    let each = vec![
+        probe(None),
+        probe(Some(connector_proxy::MALFORMED_CREDENTIAL)),
+        probe(Some(files::PROBE_CREDENTIAL)),
+    ];
+    let mut probes = [each.clone(), each].concat();
+    probes.sort();
+    assert_eq!(refused, probes);
     assert_eq!(
         world.mock.log_lines().len(),
-        2,
+        2 + 6,
         "{:?}",
         world.mock.log_lines()
     );
@@ -144,7 +168,7 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
     assert_eq!(listed(&path, &team_a).await, [LIST_TOOL, READ_TOOL]);
     assert_eq!(
         world.mock.log_lines().len(),
-        2,
+        2 + 6,
         "{:?}",
         world.mock.log_lines()
     );
