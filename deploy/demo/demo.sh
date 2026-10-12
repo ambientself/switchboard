@@ -1094,8 +1094,9 @@ undeclared_step() {
   check_undeclared "$(step_rows "$MARK_EPOCH")" "${before:-}" "${after:-}"
 }
 
-# refused_at_load_step: decision 0011's Consequences: one entry reaching both projects, served
-# to both teams, is refused at load. The variant is made from the registry served, at run time.
+# refused_at_load_step: decision 0011's Consequences: a registry admitting team-b to
+# docs-team-a's surface, whose entry reaches atlas, which team-b's limit does not hold, is
+# refused at load. The variant is made from the registry served, at run time.
 refused_at_load_step() {
   step "refused at load: a registry admitting team-b to docs-team-a's surface, whose entry reaches atlas, is refused for rule 5 and revision $REVISION stays served"
   local served=$DEMO_DIR/registry-served.toml variant=$DEMO_DIR/registry-variant.toml revision

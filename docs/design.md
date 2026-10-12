@@ -1440,9 +1440,10 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   resource; `tests/loader_rules.json` has a refusing and a passing case for each, and the
   properties include the reach property of decision 0011's Consequences. The rules apply to
   tools whose connector has an entry; the JSON configuration's in-process connectors have
-  none. The demos' entries reach exactly the project mock-docs lets each identity read, and
-  one entry reaching both projects, served to both teams, is refused at load (rule 5); both
-  demos show that refusal at run time, and an undeclared argument refused before forwarding.
+  none. The demos' entries reach exactly the project mock-docs lets each identity read. Both
+  demos show at run time a registry refused at load for rule 5, one admitting team-b to
+  `docs-team-a`'s surface, whose entry reaches `atlas`, which team-b's limit does not hold, and
+  an undeclared argument refused before forwarding.
   `PolicySnapshot::without` derives a withdrawal's snapshot for the drift pass. The gateway
   reads a team service identity's or gateway token's credential from its file and refuses a
   per-user grant at start, until milestone 5. The reach check's tool need not be approved, so
