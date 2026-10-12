@@ -1068,12 +1068,13 @@ impl PgAuditStore {
     /// It asks whether a role is able once per role, where it used to ask that once for every
     /// pair of a definer function and a role, and its walk over definer functions reads small
     /// sets it read from the catalog once (#144). In a database nothing has analyzed, with 200
-    /// harmless definer functions owned by 60 roles, the check took 24 to 37 s before,
-    /// depending on the machine's load, and takes about 0.3 s now; with 200 more that can reach
-    /// `call_rows` but that no other role may run, about 0.4 s. Each round of the walk still
-    /// asks, of every role not yet found, whether it can run a definer the round found, so its
-    /// cost depends on the catalog and the plan, and a long chain of definers takes a round
-    /// per link. Has no time limit: wrap it in one if boot must not wait on the database.
+    /// harmless definer functions owned by 60 roles, the check took tens of seconds before (24
+    /// to 41 s measured, depending on the machine's load), and takes about 0.3 s now; with 200
+    /// more that can reach `call_rows` but that no other role may run, about 0.4 s. Each round
+    /// of the walk still asks, of every role not yet found, whether it can run a definer the
+    /// round found, so its cost depends on the catalog and the plan, and a long chain of
+    /// definers takes a round per link. Has no time limit: wrap it in one if boot must not wait
+    /// on the database.
     pub async fn check_at_boot(&self) -> Result<(), BootCheckError> {
         let client = self.begin.get().await?;
         check(&client).await
@@ -1952,7 +1953,7 @@ async fn definers(
 /// No table other than `call_rows` may hold a foreign key whose action on a delete or an
 /// update of the row it references writes that table (`CASCADE`, `SET NULL` or `SET DEFAULT`),
 /// when the table's owner is able ([`able`]: a member, inherited or not, of an able role, or
-/// of one that can run a definer function [`definers`] refuses).
+/// of one that can run a definer function whose owner is able, as [`able`] finds them).
 ///
 /// Postgres runs a foreign key's action as the owner of the table that holds the key, whether
 /// or not anything it sets off is `SECURITY DEFINER`, for any role that may delete or update a

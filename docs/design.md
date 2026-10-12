@@ -982,12 +982,12 @@ pair of a definer function and a role, since the planner, before `pg_proc` was a
 evaluated the test inside the walk over definer functions, and the cascade check walked them
 again. Now the walk over definer functions reads small sets read from the catalog once, and the
 definer and cascade checks share its result. In a database nothing has analyzed, with 200
-harmless definer functions owned by 60 roles, the check took 24 to 37 seconds before, depending
-on the machine's load, past the 15-second budget the gateway gives it, and takes about 0.3
-seconds now; with 200 more that can reach the audit table but that no other role may run, about
-0.4 seconds. Each round of the walk still asks, of every role not yet found, whether it can run
-a definer function the round found, so the cost still depends on the catalog and the plan, and
-a long chain of definer functions takes a round per link.
+harmless definer functions owned by 60 roles, the check took tens of seconds before (24 to 41
+seconds measured, depending on the machine's load), past the 15-second budget the gateway gives
+it, and takes about 0.3 seconds now; with 200 more that can reach the audit table but that no
+other role may run, about 0.4 seconds. Each round of the walk still asks, of every role not yet
+found, whether it can run a definer function the round found, so the cost still depends on the
+catalog and the plan, and a long chain of definer functions takes a round per link.
 
 What the Postgres check does not look for, each out of scope because it needs an
 administrator's act rather than a misconfiguration of what the role script and the migrations
