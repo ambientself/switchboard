@@ -604,15 +604,17 @@ check_server_bearers() {
 # Exactly PROBES were refused as no_bearer: the route check's probe before the policy, which
 # sends no credential, one request per attempt it found open. Each drift poll's probe of an entry
 # (decision 0013, section 9) adds three refusals, one each of no_bearer, malformed and
-# wrong_subject (registry-probe's token), so one malformed refusal counts one gateway probe. Any
-# other refusal fails.
+# wrong_subject, so one malformed refusal counts one gateway probe. Only wrong_subject shows that
+# the third call carried registry-probe's token, valid for mock-docs' audience but for a subject
+# outside the gateway's identities (decision 0010), so there must be exactly as many of those as
+# of malformed. A refusal for any other reason, or one more of any of these, fails.
 check_server_callers() {
   local logs=$1 subjects=$2 calls=$3 refusals=$4 probes=$5 lines
   lines=$(printf '%s\n' "$logs" | jq -rR 'fromjson? | select(has("accepted"))
     | if .accepted == true then "accepted \(.caller // "none") \(.rpc_method // "none")" else "refused \(.refusal // "none")" end')
   echo "    requests seen by mock-docs, by answer and verified caller and method, or refusal:"
   printf '%s\n' "$lines" | sort | uniq -c | sed 's/^/    /'
-  local gateway other audience bearerless refused drift_probes
+  local gateway other audience bearerless third refused drift_probes
   drift_probes=$(printf '%s\n' "$lines" | awk '$0 == "refused malformed" { n++ } END { print n + 0 }')
   # shellcheck disable=SC2016 # awk's own variables
   local ours='BEGIN { n = split(subjects, list, " "); for (i = 1; i <= n; i++) entry[list[i]] = 1 }
@@ -621,11 +623,13 @@ check_server_callers() {
   other=$(printf '%s\n' "$lines" | awk -v subjects="$subjects" "$ours"'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ } END { print count + 0 }')
   audience=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_audience" { n++ } END { print n + 0 }')
   bearerless=$(printf '%s\n' "$lines" | awk '$0 == "refused no_bearer" { n++ } END { print n + 0 }')
+  third=$(printf '%s\n' "$lines" | awk '$0 == "refused wrong_subject" { n++ } END { print n + 0 }')
   refused=$(printf '%s\n' "$lines" | awk '$1 == "refused" { n++ } END { print n + 0 }')
   check "$gateway" "$calls" "mock-docs accepted the entries' tokens ($subjects) on exactly the $calls calls the gateway allowed"
   check "$other" 0 "mock-docs accepted no other caller, and no token without one"
   check "$audience" "$refusals" "mock-docs refused the $refusals direct calls' tokens as meant for another audience"
   check "$bearerless" "$((probes + drift_probes))" "mock-docs refused the route check's $probes open attempts before the policy, which carried no bearer, and the gateway's $drift_probes probes' calls with none"
+  check "$third" "$drift_probes" "mock-docs refused the gateway's $drift_probes probes' calls with registry-probe's token as wrong_subject"
   check "$refused" "$((refusals + probes + 3 * drift_probes))" "mock-docs refused nothing else"
 }
 

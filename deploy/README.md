@@ -48,21 +48,20 @@ mock-docs limits each credential to its team's project, `docs-team-a`'s to `atla
 project at the server, whatever the gateway decided. Both demos read mock-docs' log to show
 that each team's calls came under its own entry's identity, for its own project.
 
-In kind each entry's identity is a ServiceAccount whose token comes by TokenRequest. The
-gateway pod runs a native sidecar, `token-writer` (`demo/token-writer.sh`), which asks the API
-server for each entry's token, and for that of `registry-probe`, the drift probe's
-ServiceAccount, for audience `mock-docs` and valid for 600 s, and writes it to
-`/var/run/switchboard/tokens/<name>`, again every 300 s, always to a new file renamed into
-place. A token it cannot get leaves the previous file and is tried again in 5 s. It never
-prints a token. The gateway reads each entry's file as that entry's credential on every call,
-and the probe's on every probe, so it has no API-server client.
-`kind/base/gateway-tokens.yaml` lets ServiceAccount `gateway` create tokens for `docs-team-a`,
-`docs-team-b` and `registry-probe`, by name, and for no other ServiceAccount. Both containers
-run as that ServiceAccount, but only the token writer mounts a token the API server accepts (a
-projected token with no audience); the gateway container mounts no API token and reads the
-tokens directory read-only. No workload mounts an API token either. The kind run asks the API
-server that the gateway may create tokens for the two entries and the probe, and for no other
-ServiceAccount, and `crates/demo-checks` holds the manifests to all of it.
+In kind each entry's identity is a ServiceAccount whose token comes by TokenRequest. The gateway
+pod runs a native sidecar, `token-writer` (`demo/token-writer.sh`), which asks the API server
+for each entry's token, and for that of `registry-probe`, the drift probe's ServiceAccount, for
+audience `mock-docs` and valid for 600 s, and writes it to `/var/run/switchboard/tokens/<name>`,
+again every 300 s, always to a new file renamed into place. A token it cannot get leaves the
+previous file and is tried again in 5 s. It never prints a token. The gateway reads each entry's
+file as that entry's credential on every call, and the probe's on every probe, so it has no
+API-server client. `kind/base/gateway-tokens.yaml` lets ServiceAccount `gateway` create tokens
+for `docs-team-a`, `docs-team-b` and `registry-probe`, by name, and for no other ServiceAccount.
+Both containers run as that ServiceAccount, but only the token writer mounts a token the API
+server accepts (a projected token with no audience); the gateway container mounts no API token
+and reads the tokens directory read-only. No workload mounts an API token either. The kind run
+asks the API server that the gateway may create tokens for the two entries and the probe, and
+for no other ServiceAccount, and `crates/demo-checks` holds the manifests to all of it.
 
 In kind the gateway fetches the cluster issuer's keys from the API server with no token
 (decision 0013, section 10). A projected token would not help: every one authenticates as the

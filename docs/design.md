@@ -1462,14 +1462,13 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
   which admits its own team only. In kind each entry's identity is a ServiceAccount. A
   token-writer sidecar in the gateway pod gets each one's token by TokenRequest, for the
-  server's audience, and writes it to the file the deployment file names for that entry; a
-  Role limited by `resourceNames` to those two ServiceAccounts and the probe's (below) is its
-  only grant. Only the sidecar mounts a token the API server accepts, and no workload mounts
-  one. In Compose each
-  entry has a static dummy credential. The mock server limits each identity to its team's
-  project. The probe's ServiceAccount, `registry-probe`, is the Role's third name: the token
-  writer writes its token for the mock server's audience beside the entries', and the drift
-  pass's probe presents it (the probe entry below). In Compose the probe presents a static
+  server's audience, and writes it to the file the deployment file names for that entry; a Role
+  limited by `resourceNames` to those two ServiceAccounts and the probe's (below) is its only
+  grant. Only the sidecar mounts a token the API server accepts, and no workload mounts one. In
+  Compose each entry has a static dummy credential. The mock server limits each identity to its
+  team's project. The probe's ServiceAccount, `registry-probe`, is the Role's third name: the
+  token writer writes its token for the mock server's audience beside the entries', and the
+  drift pass's probe presents it (the probe entry below). In Compose the probe presents a static
   dummy the mock server is not given. The registry's own workload identity joins the Role when
   the reach check is built.
 - Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the

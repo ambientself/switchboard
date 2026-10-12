@@ -702,7 +702,7 @@ fn the_server_caller_check_admits_only_the_entries_identities() {
 
     let run = run_of(8, &[]);
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 5, "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 6, "{}", run.transcript());
 
     // A request with no bearer that the probe's open attempts do not explain.
     let run = run_of(8, std::slice::from_ref(&probe));
@@ -819,6 +819,23 @@ fn the_server_checks_leave_out_the_gateways_probe_calls() {
     }
     let run = check_callers(&lines);
     assert_eq!(run.status, Some(0), "{}", run.transcript());
+
+    // The third call refused for any other reason: its token was not one valid for mock-docs'
+    // audience, so the probe did not show that mock-docs refuses a subject outside the
+    // gateway's identities.
+    let mut expired = lines.clone();
+    let third = expired
+        .iter()
+        .rposition(|line| line.contains("\"wrong_subject\""))
+        .unwrap();
+    expired[third] = jwt_line(false, None, Some("expired"));
+    let run = check_callers(&expired);
+    assert!(
+        run.failed("mock-docs refused the gateway's 2 probes' calls with registry-probe's token as wrong_subject"),
+        "{}",
+        run.transcript()
+    );
+
     lines.push(jwt_line(false, None, Some("wrong_subject")));
     let run = check_callers(&lines);
     assert!(

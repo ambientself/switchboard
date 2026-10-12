@@ -30,7 +30,9 @@
 //!   as refused.
 //!
 //! The server is reached over session-less streamable HTTP, revision 2025-06-18, at an
-//! `http://` URL. An answer must be JSON; an event stream is not read.
+//! `http://` URL. The answer to a forwarded call or a tool list must be JSON; an event stream
+//! is not read there. The probe does read an event stream's data, to look for a JSON-RPC
+//! answer that shows a call was dispatched.
 
 #![forbid(unsafe_code)]
 
