@@ -47,6 +47,9 @@
 //!   boot checks, or audit explicitly disabled; and the boot gates.
 //! - [`KeyRefresher`] fetches the keys of each issuer configured with a keys URL again on a
 //!   timer, from the issuer's own origin, and keeps the keys in use when a fetch fails.
+//! - [`DriftPass`] reads each proxied server's tool list, once during boot before the listener
+//!   is bound and then on a timer, and withdraws each approved tool whose served definition no
+//!   longer hashes to its approval, or that the server no longer lists ([`drift`]).
 //!
 //! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves, and
 //! `switchboard migrate` brings the audit schema up to date. Nothing in it comes from the
@@ -60,6 +63,7 @@ pub mod bulkhead;
 mod catalog;
 mod config;
 pub mod deployment;
+pub mod drift;
 pub mod keys;
 pub mod metrics;
 pub mod path;
@@ -85,6 +89,10 @@ pub use deployment::{
     AuditChoice, DEFAULT_MAX_AGE, DEFAULT_MAX_IN_FLIGHT, DEFAULT_PER_SERVER_IN_FLIGHT,
     DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT, Deployment, DeploymentError, KeysUrl, Limits,
     MAX_SERVER_DEADLINE, MAX_SERVER_RESULT_BYTES, MetricsSection, ServerLimits,
+};
+pub use drift::{
+    DEFAULT_DRIFT_INTERVAL, DriftCounts, DriftPass, DriftSection, DriftSignals, MAX_DRIFT_INTERVAL,
+    MIN_DRIFT_INTERVAL, Withdrawals, withdrawn_revision,
 };
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,

@@ -93,6 +93,13 @@ impl ToolCatalog {
     pub fn definition(&self, name: &ToolName) -> Option<&ToolDefinition> {
         self.definitions.get(name)
     }
+
+    /// This catalog without the definitions of `withdrawn`.
+    pub(crate) fn without(&self, withdrawn: &BTreeSet<ToolName>) -> Self {
+        let mut definitions = self.definitions.clone();
+        definitions.retain(|name, _| !withdrawn.contains(name));
+        Self { definitions }
+    }
 }
 
 fn is_object_schema(schema: &serde_json::Value) -> bool {
