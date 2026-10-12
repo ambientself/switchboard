@@ -835,21 +835,39 @@ mod tests {
     /// The boot test registry with its one server at an `https` address, its identity the
     /// address's host.
     fn https_registry() -> Registry {
+        let text = registry_text_at(
+            "docs.example.test",
+            "https://docs.example.test/mcp",
+            "in_cluster",
+        );
+        Registry::from_toml_str(&text).unwrap()
+    }
+
+    /// The boot test registry's text with its one server's identity, address and destination
+    /// replaced, and its tool's binding hash to match.
+    fn registry_text_at(identity: &str, address: &str, destination: &str) -> String {
         let mut server = crate::boot::tests::server();
         let before = gateway_registry::binding_sha256(&server);
-        server.identity = "docs.example.test".into();
-        server.address = "https://docs.example.test/mcp".into();
-        let text = crate::boot::tests::registry_text("read", true, "r1")
+        server.identity = identity.into();
+        server.address = address.into();
+        server.destination = match destination {
+            "public" => gateway_registry::Destination::Public,
+            _ => gateway_registry::Destination::InCluster,
+        };
+        crate::boot::tests::registry_text("read", true, "r1")
             .replace(
                 "identity = \"127.0.0.1\"",
-                "identity = \"docs.example.test\"",
+                &format!("identity = \"{identity}\""),
             )
             .replace(
                 "address = \"http://127.0.0.1:9/mcp\"",
-                "address = \"https://docs.example.test/mcp\"",
+                &format!("address = \"{address}\""),
             )
-            .replace(&before, &gateway_registry::binding_sha256(&server));
-        Registry::from_toml_str(&text).unwrap()
+            .replace(
+                "destination = \"in_cluster\"",
+                &format!("destination = \"{destination}\""),
+            )
+            .replace(&before, &gateway_registry::binding_sha256(&server))
     }
 
     /// Decision 0013, section 3: an `https` server needs the CA file its certificate is
@@ -931,6 +949,117 @@ mod tests {
             ),
             "{unnamed:?}"
         );
+    }
+
+    /// Decision 0013, section 3: a server whose entry is `public` is held to that class. Plain
+    /// `http` is refused as the registry loads, and a private address before anything is
+    /// connected to. The connector built for each server takes its entry's destination: a
+    /// `public` entry's connector refuses the private address too, and an `in_cluster` entry's
+    /// connector accepts it, which it would not if the destination were left at the default.
+    #[tokio::test]
+    async fn a_public_server_on_http_or_a_private_address_is_refused() {
+        let counted = Counted::start().await;
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-public-{}", std::process::id()));
+        let started = |text: String, ca_file: Option<PathBuf>| {
+            let mut deployment = deployment(&directory, &text, &counted, false, false);
+            if let Some(ca_file) = ca_file {
+                deployment.ca_files = BTreeMap::from([(ConnectorName::new("mock-docs"), ca_file)]);
+            }
+            prepare_with(
+                deployment,
+                InstanceName::new("start-test"),
+                Arc::new(gateway_identity::SystemClock),
+                true,
+            )
+        };
+        let ca_file = directory.join("ca.pem");
+
+        let http = started(
+            registry_text_at("127.0.0.1", "http://127.0.0.1:9/mcp", "public"),
+            None,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        let private = started(
+            registry_text_at("10.0.0.1", "https://10.0.0.1/mcp", "public"),
+            Some(ca_file.clone()),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &http,
+                StartError::Registry(RegistryError::DestinationScheme { server, .. })
+                    if server.as_str() == "mock-docs"
+            ),
+            "{http}"
+        );
+        assert!(
+            matches!(
+                &private,
+                StartError::DestinationRefused {
+                    refusal: Refusal::Private,
+                    ..
+                }
+            ),
+            "{private}"
+        );
+        assert_eq!(
+            private.to_string(),
+            "server `mock-docs`: the gateway does not connect to 10.0.0.1, a private address, \
+             which only a server whose destination is in_cluster may use"
+        );
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+
+        // The connectors, past the start's own check.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(&ca_file, ca.pem()).unwrap();
+        let credentials = Arc::new(
+            FileCredentials::load([(
+                ConnectorName::new("mock-docs"),
+                directory.join("docs-credential"),
+            )])
+            .unwrap(),
+        );
+        let ca_files = BTreeMap::from([(ConnectorName::new("mock-docs"), ca_file)]);
+        let built = |destination: &str| {
+            let text = registry_text_at("10.0.0.1", "https://10.0.0.1/mcp", destination);
+            proxied(
+                &Registry::from_toml_str(&text).unwrap(),
+                &credentials,
+                &Limits::default(),
+                &Reaching {
+                    bounds: &BTreeMap::new(),
+                    ca_files: &ca_files,
+                    loopback: Loopback::Refused,
+                },
+                Wiring::new(Arc::new(gateway_identity::SystemClock)),
+            )
+            .map(|_| ())
+        };
+        let public = built("public");
+        let in_cluster = built("in_cluster");
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(
+            matches!(
+                public,
+                Err(StartError::Upstream(UpstreamError::DestinationRefused {
+                    refusal: Refusal::Private,
+                    ..
+                }))
+            ),
+            "{public:?}"
+        );
+        assert!(in_cluster.is_ok(), "{in_cluster:?}");
     }
 
     /// A listener that counts the connections made to it and closes each at once: the audit
