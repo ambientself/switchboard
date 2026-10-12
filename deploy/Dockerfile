@@ -65,8 +65,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     ls -l /out/bin
 
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
-# curl and jq for the workload and health checks, psql for the migration runner and the audit
-# query, ca-certificates for any TLS upstream.
+# curl and jq for the workload, the kind demo's token writer and health checks, psql for the
+# migration runner and the audit query, ca-certificates for any TLS upstream.
 RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl jq postgresql-client; \
@@ -75,7 +75,7 @@ RUN set -eu; \
     # The Compose dev issuer writes its key set here; a new named volume takes this ownership.
     install -d -o 10001 -g 10001 /shared/issuer
 COPY --from=build /out/bin/ /usr/local/bin/
-COPY deploy/demo/workload.sh deploy/demo/migrate.sh /usr/local/bin/
+COPY deploy/demo/workload.sh deploy/demo/migrate.sh deploy/demo/token-writer.sh /usr/local/bin/
 COPY deploy/demo/roles.sql /usr/share/switchboard/roles.sql
 # The route check's probe (decision 0010), which route-check.sh starts in a workload's pod as an
 # ephemeral container from this image, and the routes it tries.

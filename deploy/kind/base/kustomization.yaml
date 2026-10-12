@@ -5,13 +5,15 @@
 # mock-docs, from the cluster's own issuer (kubectl get --raw /openid/v1/jwks). Neither the
 # gateway nor mock-docs will start without it.
 #
-# The gateway has no static credential for mock-docs: it presents a projected token of its own
-# ServiceAccount (gateway.yaml). Every password here is a dummy value for this demo.
+# The gateway has no static credential for mock-docs: for each team's entry it presents a token
+# of that entry's ServiceAccount, which the gateway pod's token writer asks the cluster for
+# (gateway.yaml, gateway-tokens.yaml). Every password here is a dummy value for this demo.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - namespaces.yaml
   - serviceaccounts.yaml
+  - gateway-tokens.yaml
   - postgres.yaml
   - migrate-job.yaml
   - mock-docs.yaml

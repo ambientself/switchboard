@@ -1,8 +1,12 @@
 # The mock docs server (#14a), in its JWT mode (decision 0010). It accepts only a token the
-# cluster signed for the gateway's ServiceAccount, for audience mock-docs, and in date. It checks
-# the signature against the cluster's keys, which demo.sh copies once into ConfigMap
+# cluster signed for one of the registry's two entries of it, ServiceAccounts docs-team-a and
+# docs-team-b, for audience mock-docs, and in date. Each may name only its team's project:
+# docs-team-a atlas, docs-team-b borealis (decision 0013, section 10). It checks the signature
+# against the cluster's keys, which demo.sh copies once into ConfigMap
 # mock-docs/cluster-issuer-keys, and holds no credential of its own. Each request's log line
 # names the verified caller, or why the token was refused.
+#
+# It has no admin endpoint and keeps slow-doc's default delay: no demo step uses either.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,7 +40,7 @@ spec:
             - {name: MOCK_DOCS_LISTEN, value: "0.0.0.0:8080"}
             - {name: MOCK_DOCS_JWT_ISSUER, value: "https://kubernetes.default.svc.cluster.local"}
             - {name: MOCK_DOCS_JWT_AUDIENCE, value: mock-docs}
-            - {name: MOCK_DOCS_JWT_SUBJECT, value: "system:serviceaccount:switchboard:gateway"}
+            - {name: MOCK_DOCS_JWT_SUBJECTS, value: "system:serviceaccount:switchboard:docs-team-a=atlas;system:serviceaccount:switchboard:docs-team-b=borealis"}
             - {name: MOCK_DOCS_JWKS_FILE, value: /etc/mock-docs/issuer/jwks.json}
           ports:
             - containerPort: 8080
