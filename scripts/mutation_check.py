@@ -2864,6 +2864,14 @@ mutate("schema-additional-properties-unenforced", "an `additionalProperties` sch
 mutate("schema-invalid-says-undeclared", "a call that fails a schema keyword is told it carried an undeclared argument",
        "crates/gateway/src/proxied.rs",
        "                            invalid_argument(tool.as_str())\n", "                            undeclared_argument(tool.as_str())\n")
+# #127: the names in a `type` list and in `required` are unique, as 2020-12 says, and the error
+# names the list's pointer.
+mutate("schema-type-repeat-loads", "a `type` list may name one type twice", RA,
+       '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value),')
+mutate("schema-required-repeat-loads", "a `required` list may name one property twice", RA,
+       "                    && unique(value, &here)?\n            }", "            }")
+mutate("schema-repeat-pointer-is-schema", "a repeated name is reported at the schema, not at its list", RA,
+       '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value) && unique(value, at)?,')
 
 
 # --- audit-postgres ------------------------------------------------------------------------

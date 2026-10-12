@@ -32,6 +32,7 @@ fn refused(schema: &str) -> RegistryError {
                     | RegistryError::SchemaMalformed { tool, .. }
                     | RegistryError::SchemaDialect { tool, .. }
                     | RegistryError::SchemaAdditionalPropertiesMalformed { tool, .. }
+                    | RegistryError::SchemaRepeatedName { tool, .. }
                     if tool.as_str() == "wiki__search"),
                 "{schema}: {error:?}"
             );
@@ -66,10 +67,11 @@ fn every_enforced_keyword_and_annotation_loads() {
         // Annotation values are not checked at load, though 2020-12 gives them a form: the
         // check reads nothing from them.
         &property(r#"{ format = 7, title = ["not", "text"] }"#),
-        // Nor is the uniqueness 2020-12 asks of `type` and `required`: a repeat checks the
-        // same thing twice.
-        &property(r#"{ type = ["string", "string"] }"#),
-        &property(r#"{ type = "object", required = ["a", "a"], properties = { a = {} } }"#),
+        // Names that differ, even by case or where one type contains the other, are unique.
+        &property(r#"{ type = ["number", "integer", "null"] }"#),
+        &property(
+            r#"{ type = "object", required = ["a", "A", "b"], properties = { a = {}, A = {}, b = {} } }"#,
+        ),
         // A property may be named like a keyword.
         r#"{ type = "object", properties = { pattern = { type = "string" }, "$ref" = true } }"#,
     ];
@@ -265,6 +267,89 @@ fn a_keyword_not_in_its_2020_12_form_is_refused() {
             RegistryError::SchemaMalformed { at: got, .. } => {
                 assert_eq!(got.as_str(), at, "{schema}");
             }
+            other => panic!("{schema}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_type_or_required_list_that_repeats_a_name_is_refused_at_load() {
+    // #127: 2020-12 says the names in each list must be unique.
+    let nested = [
+        (
+            r#"{ type = ["string", "string"] }"#,
+            "string",
+            "/properties/q/type",
+        ),
+        (
+            r#"{ type = ["null", "integer", "null"] }"#,
+            "null",
+            "/properties/q/type",
+        ),
+        (
+            r#"{ type = "object", required = ["a", "a"], properties = { a = {} } }"#,
+            "a",
+            "/properties/q/required",
+        ),
+        (
+            r#"{ type = "object", required = ["a", "b", "a"] }"#,
+            "a",
+            "/properties/q/required",
+        ),
+        (
+            r#"{ type = "array", items = { type = ["string", "string"] } }"#,
+            "string",
+            "/properties/q/items/type",
+        ),
+        (
+            r#"{ type = "object", additionalProperties = { type = "object", required = ["b", "b"] } }"#,
+            "b",
+            "/properties/q/additionalProperties/required",
+        ),
+    ];
+    let mut schemas: Vec<(String, &str, &str)> = nested
+        .iter()
+        .map(|(inner, name, at)| (property(inner), *name, *at))
+        .collect();
+    // At the root as well.
+    schemas.push((
+        r#"{ type = "object", required = ["q", "q"], properties = { q = {} } }"#.into(),
+        "q",
+        "/required",
+    ));
+    for (schema, name, at) in schemas {
+        match refused(&schema) {
+            RegistryError::SchemaRepeatedName {
+                name: got,
+                at: got_at,
+                ..
+            } => {
+                assert_eq!((got.as_str(), got_at.as_str()), (name, at), "{schema}");
+            }
+            other => panic!("{schema}: {other:?}"),
+        }
+    }
+    // The error names the tool, the name and where the list is.
+    let error = refused(&property(r#"{ type = ["string", "string"] }"#));
+    assert_eq!(
+        error.to_string(),
+        "tool `wiki__search`'s input schema names `string` twice in the list at \
+         `/properties/q/type`; JSON Schema 2020-12 requires its names to be unique"
+    );
+}
+
+#[test]
+fn a_list_not_of_names_is_malformed_before_it_is_checked_for_repeats() {
+    for (inner, at) in [
+        (
+            r#"{ type = ["string", "string", 1] }"#,
+            "/properties/q/type",
+        ),
+        (r#"{ required = ["a", "a", 1] }"#, "/properties/q/required"),
+    ] {
+        let schema = property(inner);
+        match refused(&schema) {
+            RegistryError::SchemaMalformed { at: got, .. } => assert_eq!(got.as_str(), at),
             other => panic!("{schema}: {other:?}"),
         }
     }
