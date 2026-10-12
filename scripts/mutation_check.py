@@ -4391,6 +4391,9 @@ mutate("gw-drift-poll-failure-withdraws", "a failed poll is read as an empty too
 mutate("gw-drift-withdrawal-not-reapplied", "a reload drops every standing withdrawal, so a withdrawn tool is served again unapproved", DRIFT,
        "            let keep = approved\n                .get(tool)\n                .is_some_and(|now| now.key == standing.key);\n",
        "            let keep = false && approved.contains_key(tool);\n")
+mutate("gw-drift-reload-compares-derived", "a reload is compared with the derived policy served, whose revision no registry can have, so a changed file under the base revision is served while a withdrawal stands", RELOAD,
+       "        let served = self.withdrawals.base();\n",
+       "        let served = self.live.current();\n")
 mutate("gw-drift-reapproval-not-cleared", "a withdrawal is keyed by the tool's name alone, so approving it again does not clear it", DRIFT,
        "                .is_some_and(|now| now.key == standing.key);\n",
        "                .is_some_and(|now| now.key.tool == standing.key.tool);\n")

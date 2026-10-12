@@ -24,7 +24,7 @@ use files::{
 };
 use gateway::boot::{self, Settings, Wiring};
 use gateway::path::RequestPath;
-use gateway::reload::Reloader;
+use gateway::reload::{ReloadError, Reloader};
 use gateway::{
     AuditSection, DriftPass, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, serve_with_telemetry,
     start,
@@ -563,6 +563,37 @@ async fn a_reload_keeps_a_withdrawal_and_a_new_approval_clears_it() {
     assert_eq!(replica.reload(&removed), "demo-9");
     assert!(replica.withdrawn().is_empty());
     assert_eq!(captured.events("policy_withdrawal_cleared").len(), 2);
+}
+
+/// While a withdrawal stands, a file that changes the policy but keeps the loaded revision is
+/// refused. It is compared with the loaded base, not the derived policy served, whose revision
+/// no registry can have: accepted, it would put a different policy under the same base in the
+/// rows.
+#[tokio::test]
+async fn a_changed_policy_under_the_base_revision_is_refused_while_a_withdrawal_stands() {
+    let mock = mock().await;
+    let files = Files::new("drift-same", &issuer().jwks_document(), &mock.url());
+    let replica = Replica::new(&files, &mock.url());
+    drift(&mock, Some(CHANGED));
+    replica.drift.pass().await;
+    assert_eq!(replica.revision(), without_reads(KIND_REVISION));
+
+    let original = files::registry(&mock.url());
+    let changed = reapproved(&original, READ_TOOL, CHANGED, KIND_REVISION);
+    let refused = replica
+        .reloader
+        .apply(&Registry::from_toml_str(&changed).unwrap())
+        .unwrap_err();
+
+    assert!(
+        matches!(&refused, ReloadError::RevisionUnchanged(revision) if revision.as_str() == KIND_REVISION),
+        "{refused}"
+    );
+    assert_eq!(replica.revision(), without_reads(KIND_REVISION));
+    assert_eq!(
+        replica.withdrawn(),
+        BTreeSet::from([READ_TOOL.to_owned(), TEAM_B_READ_TOOL.to_owned()])
+    );
 }
 
 /// A server that cannot be reached, or that answers with a list that goes on in another page,
