@@ -954,7 +954,7 @@ impl PgAuditStore {
     ) -> Result<(), PgAuditError> {
         let _timed = Timed::start(&self.counters.begin_latency);
         let begun = match BeginRow::from_record(row, record, &self.budgets) {
-            Ok(row) => self.insert(Insert::Call(row)).await,
+            Ok(row) => self.insert(Insert::Call(Box::new(row))).await,
             Err(error) => Err(InsertFailed {
                 error,
                 connected: false,
@@ -969,10 +969,10 @@ impl PgAuditStore {
 
 /// What [`PgAuditStore::insert`] writes.
 enum Insert {
-    /// The first half of a call row, for begin.
-    Call(BeginRow),
+    /// The first half of a call row, for begin. Each is boxed: the two differ much in size.
+    Call(Box<BeginRow>),
     /// A list row, complete.
-    List(ListRow),
+    List(Box<ListRow>),
 }
 
 /// Writes `row`, as begin or list. Sets `sent` just before the insert is executed: from then
@@ -1236,7 +1236,7 @@ impl AuditStore for PgAuditStore {
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
             let row = ListRow::from_record(row, record)?;
-            self.insert(Insert::List(row))
+            self.insert(Insert::List(Box::new(row)))
                 .await
                 .map_err(|failed| StoreError::from(failed.error))
         })
