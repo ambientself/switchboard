@@ -2252,7 +2252,7 @@ async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
     assert_eq!(rows(&db).await, 0);
 
     // Foreign keys that only refuse a write pass, as does a cascade from call_rows to another
-    // table.
+    // table, though that table has a trigger and its owner can write call_rows.
     admin
         .batch_execute(&format!(
             "SET ROLE {OWNER_ROLE};
@@ -2267,6 +2267,10 @@ async fn a_foreign_key_on_the_table_whose_action_writes_it_is_refused() {
                  call uuid REFERENCES switchboard_audit.call_rows
                      ON DELETE CASCADE ON UPDATE SET NULL
              );
+             CREATE FUNCTION reports.on_note_delete() RETURNS trigger
+                 LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$;
+             CREATE TRIGGER on_note_delete BEFORE DELETE ON reports.notes
+                 FOR EACH ROW EXECUTE FUNCTION reports.on_note_delete();
              RESET ROLE;"
         ))
         .await
