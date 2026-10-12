@@ -3809,6 +3809,10 @@ mutate("demo-operator-checks-no-impersonate", "impersonating a user, a group or 
        "impersonate\tusers\t-\tcluster\nimpersonate\tgroups\t-\tcluster\nimpersonate\tserviceaccounts\t-\tnamespaced\n", "")
 mutate("demo-operator-checks-one-namespace", "the team's own namespace is not checked", DRIVER,
        '        for ns in mock-docs switchboard "$team" all; do\n', "        for ns in mock-docs switchboard all; do\n")
+# #104: a `gateway` row (reading ConfigMaps) is asked in mock-docs and the gateway's namespace
+# only, so a team may read its own.
+mutate("demo-operator-checks-gateway-scope-asks-team", "a gateway row is asked in the team's own namespace and across the cluster too", DRIVER,
+       "        for ns in mock-docs switchboard; do\n", '        for ns in mock-docs switchboard "$team" all; do\n')
 mutate("demo-operator-checks-unknown-resource-passes", "a can-i about a resource the API does not serve passes on its no", DRIVER,
        """    *"doesn't have a resource type"*) answer="a resource the API does not serve: ${answer%%$'\\n'*}" ;;\n""", "")
 mutate("demo-operator-checks-review-any-answer", "a SubjectAccessReview passes whatever it answers", DRIVER,
@@ -3975,6 +3979,15 @@ mutate("route-check-rbac-other-namespaces-unread", "the Roles and RoleBindings a
        """    if ! list=$(k get "$what" -n "$NAMESPACE" -o json) || ! json_object "$list" ||\n""")
 mutate("route-check-rbac-role-any-namespace", "a RoleBinding binds a Role of that name in any namespace, not only its own", RBAC_MATCH,
        """then ($roles[$bns] // {})[$ref.name] // []""", """then ([$roles[]] | add // {})[$ref.name] // []""")
+# #104: a `gateway` row (reading ConfigMaps) is asked, and its RoleBindings counted, in the
+# gateway's and the servers' namespaces only; a ClusterRoleBinding still counts for it.
+mutate("route-check-gateway-scope-asks-workload-namespace", "a gateway row is reviewed in the workload's own namespace too", ROUTE_CHECK,
+       """                    elif $scope == "gateway" then $gateway\n""", """                    elif $scope == "gateway" then $namespaces\n""")
+mutate("route-check-gateway-scope-skips-cluster", "a ClusterRoleBinding does not count for a gateway row, so a cluster-wide grant passes", RBAC_MATCH,
+       """   | select(.namespace == "" or $row.scope == "namespaced"\n""",
+       """   | select((.namespace == "" and $row.scope != "gateway") or $row.scope == "namespaced"\n""")
+mutate("route-check-rbac-gateway-scope-counts-workload-namespace", "a gateway row counts the RoleBindings in the workload's own namespace too", RBAC_MATCH,
+       "any($gateway_namespaces[]; . == $ns)", "any($gateway_namespaces[], $namespace; . == $ns)")
 
 # The route check's probe (deploy/route-check/probe.sh), watched by tests/route_probe.rs and
 # tests/route_check.rs.
