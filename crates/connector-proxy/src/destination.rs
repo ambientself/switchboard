@@ -5,9 +5,9 @@
 //!
 //! - **An IP literal** in the server's URL is checked when the connector is built, since it
 //!   never changes ([`UpstreamError::DestinationRefused`](crate::UpstreamError)).
-//! - **A DNS name** is resolved once for each connection, by a [`CheckedResolver`]. It drops
-//!   every refused address from the answer and hands the rest to the TCP connector, which
-//!   connects only to those: nothing resolves the name again between the check and the
+//! - **A DNS name** is resolved once for each connection, by the connector's own resolver. It
+//!   drops every refused address from the answer and hands the rest to the TCP connector,
+//!   which connects only to those: nothing resolves the name again between the check and the
 //!   connection, so a second DNS answer cannot replace the one checked. An answer with no
 //!   address left is a refusal: nothing is connected to, a warning names the server, and the
 //!   call is an error with the [`DESTINATION_REFUSED`](crate::outcome::DESTINATION_REFUSED)

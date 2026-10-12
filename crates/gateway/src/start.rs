@@ -9,11 +9,11 @@
 //! [`prepare`] reads the registry file. Before anything else, it refuses the identity and audit
 //! opt-outs outside a development build, and runs the receipt-store gate (decision 0014,
 //! section 4), so that a refusal of either comes before any connection is made. Then it checks
-//! where each proxied server is reached (decision 0013, section 3; [`destinations`]): an
-//! `https` server needs the CA file `[servers.<name>] ca_file` names, an `http` server may have
-//! none, and an address that is an IP literal the connector would never connect to is
-//! refused, loopback among them outside a development build. Then it loads each proxied
-//! server's credential, builds a [`ProxyConnector`] per server with the deadline
+//! where each proxied server is reached (decision 0013, section 3): an `https` server needs the
+//! CA file `[servers.<name>] ca_file` names, an `http` server may have none, and an address
+//! that is an IP literal the connector would never connect to is refused, loopback among them
+//! outside a development build. Then it loads each proxied server's credential, builds a
+//! [`ProxyConnector`] per server with its destination and CA file and with the deadline
 //! and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each in a
 //! [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
 //! ([`probe_credentials`]), fetches the keys of each issuer
