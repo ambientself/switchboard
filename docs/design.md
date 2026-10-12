@@ -1300,8 +1300,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   one exactly when the kind is `call`. The in-memory store sets the same times from its own clock. The open-row query
   reads the deadline: the view `open_call_rows` (migration 0005) shows the allowed rows of
   kind `call` with no completion past their deadline, by the database's clock, and
-  `PgAuditStore::open_rows` counts them. The boot check requires the view as the migration
-  makes it. The in-memory store has no open-row query.
+  `PgAuditStore::open_rows` counts them, on a pool of one connection of its own, so a count
+  held up for its 2 s never takes a finish's connection (#140). The boot check requires the
+  view as the migration makes it. The in-memory store has no open-row query.
 - Columns for the instance, the kind and the deadline: built. The gateway names its instance
   from `SWITCHBOARD_INSTANCE`, or else `HOSTNAME`, and refuses to start with neither. Rows
   written before the migration read as calls by the instance `before-0003`, due when they were
@@ -1378,9 +1379,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped, but no outcome carries a vendor reference yet.
 - Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
-  finish pool of its own, finish waiting at most the answer budget and then retrying on its
-  own task until the deadline, an identical repeat finish accepted, column grants, and the
-  report of each finish given up.
+  finish pool of its own, the open-row query's single connection apart from it, finish
+  waiting at most the answer budget and then retrying on its own task until the deadline, an
+  identical repeat finish accepted, column grants, and the report of each finish given up.
 
 **#11, proxy hardening.** One bullet per box of the issue, each saying what is built and in
 which pull request. The three entries after this one describe the argument check (#122), the
