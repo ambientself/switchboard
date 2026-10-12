@@ -100,6 +100,13 @@ VARIANT_REVISION=demo-9
 TEAM_CAP=8
 CALL_DEADLINE=5
 DRIFT_INTERVAL=10
+# How long past CALL_DEADLINE the hanging-server step's client may wait for its answer, in ms.
+# The deadline holds the call to the server; the client also waits for what comes before and
+# after it: the token check, the policy, the audit row's begin and finish, each one Postgres
+# write, and the hops through Docker's or the cluster's network. 1.5 s covers those on a busy
+# laptop, and is far short of the 10 s after which mock-docs answers slow-doc, so a gateway that
+# waits for the server, or holds the call 2 s past its deadline, fails.
+HANG_ALLOWANCE_MS=1500
 # The drift step has mock-docs serve this description of list_documents in place of the one
 # approved. Both entries list it, so both entries' list tools are withdrawn, and the revision
 # served is then this one, the literal derived revision of decision 0013, section 6.
@@ -150,6 +157,8 @@ FETCHED=""
 MARK_EPOCH=""
 MARK_TIME=""
 EVENTS=""
+# What the last workload tallied printed.
+WORKLOAD_OUTPUT=""
 # The workload start_workload started, its label, and in Compose the file its output goes to.
 BACKGROUND=""
 BACKGROUND_LABEL=""
@@ -221,6 +230,7 @@ result_total() {
 # its lines.
 tally_workload() {
   local label=$1 status=$2 output=$3 passed failed result total
+  WORKLOAD_OUTPUT=$output
   printf '%s\n' "$output" | sed 's/^/    /'
   passed=$(count_lines '^PASS ' "$output")
   failed=$(count_lines '^FAIL ' "$output")
@@ -901,11 +911,14 @@ check_meanwhile() {
     "audit: team-b's reads were answered while $2"
 }
 
-# check_hang ROWS: team-a's read of slow-doc (workload.sh hang). Of the step's rows, team-a's is
-# exactly one: that read, allowed and completed as error of the kind oversized_or_late_read,
-# answered at the call deadline, within a second of it. Team-b's reads went on meanwhile.
+# check_hang ROWS OUTPUT: team-a's read of slow-doc (workload.sh hang). Of the step's rows,
+# team-a's is exactly one: that read, allowed and completed as error of the kind
+# oversized_or_late_read, its connector abandoned at the call deadline, within a second of it.
+# The row's latency ends before its audit completes, so it does not show when the caller was
+# answered: OUTPUT, what the workload printed, does. Its client got the answer no sooner than
+# the deadline and no later than HANG_ALLOWANCE_MS after it. Team-b's reads went on meanwhile.
 check_hang() {
-  local rows=$1 read deadline=$((CALL_DEADLINE * 1000))
+  local rows=$1 output=$2 read deadline=$((CALL_DEADLINE * 1000)) elapsed
   read=$(team_entry team-a)__read_document
   check "$(jq -c '[.[] | select(.team == "team-a") | {tool, decision, outcome, error_kind}]' <<<"$rows" 2>/dev/null)" \
     "[{\"tool\":\"$read\",\"decision\":\"allow\",\"outcome\":\"error\",\"error_kind\":\"oversized_or_late_read\"}]" \
@@ -913,6 +926,15 @@ check_hang() {
   # shellcheck disable=SC2016 # jq's own variables
   check "$(jq -r --argjson ms "$deadline" '[.[] | select(.team == "team-a" and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length' <<<"$rows" 2>/dev/null)" 1 \
     "audit: it was answered at the $CALL_DEADLINE s deadline, within a second ($(jq -r '[.[] | select(.team == "team-a") | .latency_ms] | map(tostring) | join(",")' <<<"$rows" 2>/dev/null) ms)"
+  elapsed=$(printf '%s\n' "$output" | sed -nE "s/^ *read of slow-doc: answered after ([0-9]+|unknown) ms by the client's clock\$/\\1/p" | tail -n 1)
+  local within="team-a's client was answered between the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
+  if [ "$(number_or_none "$elapsed")" = none ]; then
+    fail "$within (got '${elapsed:-no time}' from the workload)"
+  elif [ "$elapsed" -ge "$deadline" ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then
+    pass "$within ($elapsed ms)"
+  else
+    fail "$within (got $elapsed ms)"
+  fi
   check_meanwhile "$rows" "team-a's read was held until its deadline"
 }
 
@@ -1108,8 +1130,9 @@ isolation_steps() {
   step "a hanging server: team-a reads slow-doc, which mock-docs answers after 10 s, and the gateway answers at the $CALL_DEADLINE s call deadline"
   step_mark
   hang=$MARK_EPOCH
+  WORKLOAD_OUTPUT=""
   workload "team-a, a read past its deadline" team-a hang
-  check_hang "$(step_rows "$hang")"
+  check_hang "$(step_rows "$hang")" "$WORKLOAD_OUTPUT"
 
   step "overload: team-a starts $((TEAM_CAP + 1)) reads of slow-doc at once, one over its cap of $TEAM_CAP calls in flight to its server"
   step_mark

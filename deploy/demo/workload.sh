@@ -21,7 +21,8 @@
 #   undeclared     one read of OWN_PROJECT with an argument the tool's approval does not
 #                  declare; the gateway must answer with the undeclared-argument error
 #   hang           one read of SLOW_DOCUMENT, which the server answers only after the call's
-#                  deadline; the gateway must answer with the late-answer error
+#                  deadline; the gateway must answer with the late-answer error. Prints how
+#                  long the answer took by curl's own clock, which demo.sh checks
 #   overload N     N reads of SLOW_DOCUMENT at once, N one more than the team's cap on calls in
 #                  flight to its server: exactly one is refused with the team-capacity
 #                  sentence, and every other is answered with the late-answer error
@@ -79,9 +80,11 @@ team_capacity_sentence() {
 PASSES=0
 FAILS=0
 BODY=$(mktemp) || { echo "FAIL setup: cannot create a temporary file"; exit 1; }
+# The seconds the last request took, from curl starting it to the answer's last byte.
+ELAPSED=$BODY.elapsed
 # overload's answers, a directory of their own.
 ANSWERS=""
-trap 'rm -f "$BODY"; if [ -n "$ANSWERS" ]; then rm -rf "$ANSWERS"; fi' EXIT
+trap 'rm -f "$BODY" "$ELAPSED"; if [ -n "$ANSWERS" ]; then rm -rf "$ANSWERS"; fi' EXIT
 
 pass() { PASSES=$((PASSES + 1)); echo "PASS $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "FAIL $1"; }
@@ -115,8 +118,9 @@ load_token() {
   [ -n "$TOKEN" ] || setup_failed "the workload's token is empty"
 }
 
-# rpc TOKEN METHOD PARAMS: prints the HTTP status, or `curl exit N`; the body is in $BODY.
-# An empty TOKEN sends no Authorization header.
+# rpc TOKEN METHOD PARAMS: prints the HTTP status, or `curl exit N`; the body is in $BODY, and
+# the seconds the request took, by curl's clock, in $ELAPSED. An empty TOKEN sends no
+# Authorization header.
 rpc() {
   : >"$BODY"
   if [ -n "$1" ]; then
@@ -132,11 +136,12 @@ rpc() {
   else
     payload="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}"
   fi
-  status=$(curl -sS -m 10 -o "$BODY" -w '%{http_code}' "$GW" "$@" \
+  answer=$(curl -sS -m 10 -o "$BODY" -w '%{http_code} %{time_total}' "$GW" "$@" \
     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
     -H "MCP-Protocol-Version: $PROTOCOL" -d "$payload")
   code=$?
-  if [ "$code" -ne 0 ]; then echo "curl exit $code"; else echo "$status"; fi
+  echo "${answer#* }" >"$ELAPSED"
+  if [ "$code" -ne 0 ]; then echo "curl exit $code"; else echo "${answer%% *}"; fi
 }
 call() { rpc "$1" tools/call "{\"name\":\"$2\",\"arguments\":$3}"; }
 # body FILTER: applies a jq filter to the last body; prints `invalid JSON` if it is not JSON.
@@ -286,10 +291,14 @@ undeclared() {
 }
 
 # hang: the server answers slow-doc only after its delay, longer than the call's deadline, so
-# the gateway abandons the call at the deadline and answers with an error result.
+# the gateway abandons the call at the deadline and answers with an error result. How long the
+# answer took is printed, in whole milliseconds by curl's clock, or `unknown`; the workload does
+# not know the deadline, and demo.sh checks it.
 hang() {
   load_token
   status=$(call "$TOKEN" "$READ_TOOL" "{\"project\":\"$OWN_PROJECT\",\"document\":\"$SLOW_DOCUMENT\"}")
+  elapsed=$(awk '$1 ~ /^[0-9]+(\.[0-9]+)?$/ { printf "%d\n", $1 * 1000 + 0.5; next } { print "unknown" }' "$ELAPSED" 2>/dev/null)
+  note "read of $SLOW_DOCUMENT: answered after ${elapsed:-unknown} ms by the client's clock"
   check "$status" 200 "read of $SLOW_DOCUMENT: HTTP status"
   check "$(body '.result.isError')" true "read of $SLOW_DOCUMENT: isError"
   check "$(result_text)" "$LATE_ANSWER" "read of $SLOW_DOCUMENT: the late-answer sentence"

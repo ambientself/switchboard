@@ -3881,15 +3881,74 @@ fn hang_rows(latency: f64, kind: &str, team_b_from: f64) -> Value {
     json!(rows)
 }
 
+/// What workload.sh's hang mode prints when its client was answered after `elapsed`: a whole
+/// number of milliseconds, or `unknown`.
+fn hang_output(elapsed: &str) -> String {
+    format!(
+        "PASS read of slow-doc: HTTP status\n\
+         PASS read of slow-doc: isError\n\
+         PASS read of slow-doc: the late-answer sentence\n     \
+         read of slow-doc: answered after {elapsed} ms by the client's clock\n\
+         RESULT: PASS (3/3)\n"
+    )
+}
+
 #[test]
 fn the_hanging_server_step_needs_a_late_read_at_the_deadline_and_team_b_answered_meanwhile() {
-    let run_on = |name: &str, rows: Value| {
-        checked(name, "check_hang {rows}", &[("rows", &rows.to_string())])
+    let run_with = |name: &str, rows: Value, output: &str| {
+        checked(
+            name,
+            "check_hang {rows} {output}",
+            &[("rows", &rows.to_string()), ("output", output)],
+        )
     };
-    assert_all_passed(
-        "hang",
-        &run_on("hang", hang_rows(5.03, "oversized_or_late_read", 99.5)),
-        3,
+    let run_on = |name: &str, rows: Value| run_with(name, rows, &hang_output("5240"));
+    let run = run_on("hang", hang_rows(5.03, "oversized_or_late_read", 99.5));
+    assert_all_passed("hang", &run, 4);
+    assert!(
+        run.stdout.contains(
+            "PASS team-a's client was answered between the 5 s deadline and 1500 ms after it, by its own clock (5240 ms)"
+        ),
+        "{}",
+        run.transcript()
+    );
+    // The row's latency ends at the connector, before the audit completes: a row at the
+    // deadline does not show the caller was answered then. The client's own time must.
+    const CLIENT: &str =
+        "team-a's client was answered between the 5 s deadline and 1500 ms after it";
+    for (case, elapsed, failure) in [
+        (
+            "client waited 8 s",
+            "8000",
+            format!("{CLIENT}, by its own clock (got 8000 ms)"),
+        ),
+        (
+            "client answered early",
+            "4900",
+            format!("{CLIENT}, by its own clock (got 4900 ms)"),
+        ),
+        (
+            "client time unknown",
+            "unknown",
+            format!("{CLIENT}, by its own clock (got 'unknown' from the workload)"),
+        ),
+    ] {
+        let run = run_with(
+            case,
+            hang_rows(5.03, "oversized_or_late_read", 99.5),
+            &hang_output(elapsed),
+        );
+        assert_fails(case, &run, &failure);
+        assert_eq!(run.lines("FAIL ").len(), 1, "{case}: {}", run.transcript());
+    }
+    assert_fails(
+        "no client time",
+        &run_with(
+            "hang-silent",
+            hang_rows(5.03, "oversized_or_late_read", 99.5),
+            "RESULT: PASS (3/3)\n",
+        ),
+        &format!("{CLIENT}, by its own clock (got 'no time' from the workload)"),
     );
     const DEADLINE: &str = "audit: it was answered at the 5 s deadline, within a second";
     for (case, rows, failure) in [

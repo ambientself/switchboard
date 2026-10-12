@@ -694,7 +694,22 @@ fn an_undeclared_argument_must_be_refused_before_forwarding() {
 
 #[test]
 fn a_read_past_its_deadline_must_be_answered_as_late() {
-    assert_passed(&Workload::new("hang", serve(Fake::Gateway)).run("hang"));
+    let run = Workload::new("hang", serve(Fake::Gateway)).run("hang");
+    assert_passed(&run);
+    // It prints how long its client waited, in the line demo.sh's check_hang reads: the fake
+    // holds the read a second.
+    let elapsed: Vec<u64> = run
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("     read of slow-doc: answered after ")?
+                .strip_suffix(" ms by the client's clock")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert_eq!(elapsed.len(), 1, "{}", run.transcript());
+    assert!((1000..5000).contains(&elapsed[0]), "{}", run.transcript());
     let run = Workload::new("hang-answered", serve(Fake::SlowDocAnswers)).run("hang");
     assert_failed(&run, "read of slow-doc: isError");
     assert_failed(&run, "read of slow-doc: the late-answer sentence");
