@@ -269,6 +269,14 @@ pub(crate) async fn run(
     bounds: ProbeBounds,
     foreign: &ProbeCredential,
 ) -> ProbeReport {
+    // The stranger's token, read from its file now, for the third call alone.
+    let stranger = || {
+        foreign
+            .secret()
+            .map(|secret| secret.bearer().to_owned())
+            .map_err(NotShown::Credential)
+    };
+    let malformed = || Ok(MALFORMED_CREDENTIAL.to_owned());
     let (none, malformed, stranger) = tokio::join!(
         call(client, endpoint, bounds, ProbeCall::NoCredential, None),
         call(
@@ -276,19 +284,14 @@ pub(crate) async fn run(
             endpoint,
             bounds,
             ProbeCall::MalformedCredential,
-            Some(Ok(MALFORMED_CREDENTIAL.to_owned())),
+            Some(malformed())
         ),
         call(
             client,
             endpoint,
             bounds,
             ProbeCall::ForeignToken,
-            Some(
-                foreign
-                    .secret()
-                    .map(|secret| secret.bearer().to_owned())
-                    .map_err(NotShown::Credential),
-            ),
+            Some(stranger())
         ),
     );
     ProbeReport {

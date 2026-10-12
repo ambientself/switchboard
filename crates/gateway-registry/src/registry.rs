@@ -448,12 +448,12 @@ impl Registry {
     pub fn server_entry(text: &str, name: &ConnectorName) -> Result<Server, RegistryError> {
         let parse = |error: toml::de::Error| RegistryError::Parse(error.to_string());
         let file: toml::Table = toml::from_str(text).map_err(parse)?;
-        let Some(toml::Value::Array(servers)) = file.get("servers") else {
+        let Some(toml::Value::Array(entries)) = file.get("servers") else {
             return Err(RegistryError::Parse(
                 "`servers` is missing or not an array of tables".to_owned(),
             ));
         };
-        let mut named = servers.iter().filter(|server| {
+        let mut named = entries.iter().filter(|server| {
             server.get("name").and_then(toml::Value::as_str) == Some(name.as_str())
         });
         let Some(entry) = named.next() else {
@@ -463,7 +463,10 @@ impl Registry {
             return Err(RegistryError::DuplicateServer(name.clone()));
         }
         let entry: ServerFile = entry.clone().try_into().map_err(parse)?;
-        check_server(entry)
+        servers(vec![entry], ProbeRule::NotApplied)?
+            .into_values()
+            .next()
+            .ok_or_else(|| RegistryError::NoSuchServer(name.clone()))
     }
 
     /// The policy snapshot.
@@ -527,7 +530,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
     if file.revision.contains('+') {
         return Err(RegistryError::RevisionReserved(file.revision));
     }
-    let servers = servers(file.servers)?;
+    let servers = servers(file.servers, ProbeRule::Applied)?;
 
     let mut definitions = BTreeMap::new();
     let mut adapters = BTreeMap::new();
@@ -640,113 +643,120 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
     })
 }
 
-fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, RegistryError> {
+/// Whether [`servers`] applies the probe rule: the loader does, and
+/// [`Registry::server_entry`] does not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeRule {
+    Applied,
+    NotApplied,
+}
+
+fn servers(
+    files: Vec<ServerFile>,
+    probe_rule: ProbeRule,
+) -> Result<BTreeMap<ConnectorName, Server>, RegistryError> {
     let mut servers = BTreeMap::new();
     for server in files {
-        let checked = check_server(server)?;
-        // Registration is the approval pull request, which records a probe that the server
-        // refused (decision 0013, section 9).
-        match &checked.probe {
-            None => return Err(RegistryError::ProbeMissing(checked.name)),
-            Some(probe) if probe.result != ProbeResult::Refused => {
-                return Err(RegistryError::ProbeNotRefused {
-                    server: checked.name,
-                    result: probe.result.as_str(),
-                });
-            }
-            Some(_) => {}
+        let place = || format!("server `{}`", server.name);
+        require(server.name.as_str(), "name", place)?;
+        require(&server.system, "system", place)?;
+        require(&server.owner, "owner", place)?;
+        require(&server.identity, "identity", place)?;
+        require(&server.credential.reference, "credential.reference", place)?;
+        require(&server.credential.principal, "credential.principal", place)?;
+        let Some(host) = address_host(&server.address) else {
+            return Err(RegistryError::AddressNotHttp {
+                server: server.name,
+                address: server.address,
+            });
+        };
+        if server.identity != host {
+            return Err(RegistryError::IdentityNotHost {
+                host: host.to_owned(),
+                server: server.name,
+                identity: server.identity,
+            });
         }
-        let name = checked.name.clone();
-        if servers.insert(name.clone(), checked).is_some() {
-            return Err(RegistryError::DuplicateServer(name));
+        // Plain http only inside the cluster (decision 0013, section 3). Whether the address
+        // is one, and TLS for the rest, are checked when the gateway connects.
+        if server.address.starts_with("http://") && server.destination != Destination::InCluster {
+            return Err(RegistryError::DestinationScheme {
+                server: server.name,
+                address: server.address,
+            });
+        }
+        let reach = resource_set(server.reach, || {
+            format!("the reach of server `{}`", server.name)
+        })?;
+        let reach_test = match server.reach_test {
+            Some(test) => {
+                require(&test.record, "reach_test.record", place)?;
+                Some(ReachTest {
+                    date: date(test.date, "reach_test.date", place)?,
+                    record: test.record,
+                })
+            }
+            None => None,
+        };
+        if !reach.is_empty() && reach_test.is_none() {
+            return Err(RegistryError::ReachTestMissing(server.name));
+        }
+        // Every proxied entry with a reach is checked on a schedule, whatever its narrowing,
+        // except a per-user one (decision 0011, section 4).
+        if !reach.is_empty()
+            && server.credential.mode != CredentialMode::PerUserGrant
+            && server.reach_check.is_none()
+        {
+            return Err(RegistryError::ReachCheckMissing(server.name));
+        }
+        let probe = match server.probe {
+            Some(probe) => Some(Probe {
+                result: probe.result,
+                date: date(probe.date, "probe.date", place)?,
+            }),
+            None => None,
+        };
+        // Registration is the approval pull request, which records a probe the server refused
+        // (decision 0013, section 9).
+        if probe_rule == ProbeRule::Applied {
+            match &probe {
+                None => return Err(RegistryError::ProbeMissing(server.name)),
+                Some(probe) if probe.result != ProbeResult::Refused => {
+                    return Err(RegistryError::ProbeNotRefused {
+                        server: server.name,
+                        result: probe.result.as_str(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        let checked = Server {
+            name: server.name.clone(),
+            system: server.system,
+            owner: server.owner,
+            identity: server.identity,
+            address: server.address,
+            credential: Credential {
+                mode: server.credential.mode,
+                reference: server.credential.reference,
+                principal: server.credential.principal,
+            },
+            narrowing: server.narrowing,
+            permits: server.permits,
+            reach,
+            reach_test,
+            destination: server.destination,
+            probe,
+            reach_check: server.reach_check.map(|check| ReachCheck {
+                tool: check.tool,
+                arguments: check.arguments,
+            }),
+        };
+        if servers.insert(server.name.clone(), checked).is_some() {
+            return Err(RegistryError::DuplicateServer(server.name));
         }
     }
     Ok(servers)
-}
-
-/// One server entry, checked as the loader checks it, but for the probe rule.
-fn check_server(server: ServerFile) -> Result<Server, RegistryError> {
-    let place = || format!("server `{}`", server.name);
-    require(server.name.as_str(), "name", place)?;
-    require(&server.system, "system", place)?;
-    require(&server.owner, "owner", place)?;
-    require(&server.identity, "identity", place)?;
-    require(&server.credential.reference, "credential.reference", place)?;
-    require(&server.credential.principal, "credential.principal", place)?;
-    let Some(host) = address_host(&server.address) else {
-        return Err(RegistryError::AddressNotHttp {
-            server: server.name,
-            address: server.address,
-        });
-    };
-    if server.identity != host {
-        return Err(RegistryError::IdentityNotHost {
-            host: host.to_owned(),
-            server: server.name,
-            identity: server.identity,
-        });
-    }
-    // Plain http only inside the cluster (decision 0013, section 3). Whether the address
-    // is one, and TLS for the rest, are checked when the gateway connects.
-    if server.address.starts_with("http://") && server.destination != Destination::InCluster {
-        return Err(RegistryError::DestinationScheme {
-            server: server.name,
-            address: server.address,
-        });
-    }
-    let reach = resource_set(server.reach, || {
-        format!("the reach of server `{}`", server.name)
-    })?;
-    let reach_test = match server.reach_test {
-        Some(test) => {
-            require(&test.record, "reach_test.record", place)?;
-            Some(ReachTest {
-                date: date(test.date, "reach_test.date", place)?,
-                record: test.record,
-            })
-        }
-        None => None,
-    };
-    if !reach.is_empty() && reach_test.is_none() {
-        return Err(RegistryError::ReachTestMissing(server.name));
-    }
-    // Every proxied entry with a reach is checked on a schedule, whatever its narrowing,
-    // except a per-user one (decision 0011, section 4).
-    if !reach.is_empty()
-        && server.credential.mode != CredentialMode::PerUserGrant
-        && server.reach_check.is_none()
-    {
-        return Err(RegistryError::ReachCheckMissing(server.name));
-    }
-    let probe = match server.probe {
-        Some(probe) => Some(Probe {
-            result: probe.result,
-            date: date(probe.date, "probe.date", place)?,
-        }),
-        None => None,
-    };
-    Ok(Server {
-        name: server.name,
-        system: server.system,
-        owner: server.owner,
-        identity: server.identity,
-        address: server.address,
-        credential: Credential {
-            mode: server.credential.mode,
-            reference: server.credential.reference,
-            principal: server.credential.principal,
-        },
-        narrowing: server.narrowing,
-        permits: server.permits,
-        reach,
-        reach_test,
-        destination: server.destination,
-        probe,
-        reach_check: server.reach_check.map(|check| ReachCheck {
-            tool: check.tool,
-            arguments: check.arguments,
-        }),
-    })
 }
 
 /// A server's connector entry in the snapshot. Every registered server is proxied.
