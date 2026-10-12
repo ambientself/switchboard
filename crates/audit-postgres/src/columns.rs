@@ -14,7 +14,7 @@ use gateway_core::audit::{
     AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome,
     RecordedResources, RowKind,
 };
-use gateway_core::{Principal, PrincipalKind};
+use gateway_core::{CredentialIdentity, CredentialMode, Principal, PrincipalKind};
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
@@ -53,6 +53,11 @@ pub(crate) struct BeginRow {
     /// What the database adds to its own time at begin for the row's deadline, in
     /// milliseconds: see [`allowance_ms`].
     pub allowance_ms: i64,
+    /// The configured entry identity's credential mode, recorded at begin; with
+    /// `credential_principal`, or neither.
+    pub credential_mode: Option<&'static str>,
+    /// The vendor-side principal the entry states, never the secret.
+    pub credential_principal: Option<String>,
 }
 
 impl BeginRow {
@@ -64,10 +69,10 @@ impl BeginRow {
             resources, resources_omitted, decision, reason, sentence, policy_revision,
             proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
             proved_delegation_team, claimed_acting_person, claimed_team, instance, kind,
-            allowance_ms
+            allowance_ms, credential_mode, credential_principal
         ) VALUES (
             ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
+            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
         ) ON CONFLICT (id) DO NOTHING";
 
     /// The decision of the row already stored under an identifier, read with only the columns
@@ -94,6 +99,7 @@ impl BeginRow {
         let principal = record.proved_principal.get();
         let (proved_kind, proved_team, proved_groups) = principal_kind(principal)?;
         let (resources, resources_omitted) = resources(record)?;
+        let (credential_mode, credential_principal) = credential(record.credential.as_ref())?;
         Ok(Self {
             id: id.as_str().to_owned(),
             tool_use_id: optional(
@@ -139,11 +145,13 @@ impl BeginRow {
             kind: kind(record.kind),
             allowance_ms: i64::try_from(allowance_ms(budgets, record.call_deadline_ms))
                 .map_err(|_| PgAuditError::Column("an allowance past the column's range"))?,
+            credential_mode,
+            credential_principal,
         })
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 25] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 27] {
         [
             &self.id,
             &self.tool_use_id,
@@ -170,8 +178,30 @@ impl BeginRow {
             &self.instance,
             &self.kind,
             &self.allowance_ms,
+            &self.credential_mode,
+            &self.credential_principal,
         ]
     }
+}
+
+/// The credential columns: the configured entry identity's mode and principal, both or neither.
+type CredentialColumns = (Option<&'static str>, Option<String>);
+
+/// The credential columns for `credential`, the configured identity of the call's connector
+/// entry. A principal holding U+0000 is refused, as every text value is.
+fn credential(credential: Option<&CredentialIdentity>) -> Result<CredentialColumns, PgAuditError> {
+    let Some(credential) = credential else {
+        return Ok((None, None));
+    };
+    let mode = match credential.mode {
+        CredentialMode::TeamServiceIdentity => "team_service_identity",
+        CredentialMode::GatewayToken => "gateway_token",
+        CredentialMode::PerUserGrant => "per_user_grant",
+    };
+    Ok((
+        Some(mode),
+        Some(stored("credential_principal", &credential.principal)?),
+    ))
 }
 
 /// The columns `proved_kind`, `proved_team` and `proved_groups`.
@@ -345,8 +375,9 @@ fn kind(kind: RowKind) -> &'static str {
 }
 
 /// The resources columns: the named resources as a JSON array of `{system, kind, identifier}`,
-/// in the record's order, or the JSON string `"unknown"`; and how many were left out. A count
-/// past the column's range is refused rather than recorded as less than it was.
+/// in the record's order, a reach as the JSON object `{"reach": entry}`, or the JSON string
+/// `"unknown"`; and how many were left out. A count past the column's range is refused rather
+/// than recorded as less than it was.
 fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
     let resources = match &record.resources {
         RecordedResources::Named(named) => Value::Array(
@@ -361,6 +392,7 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
                 })
                 .collect::<Result<_, PgAuditError>>()?,
         ),
+        RecordedResources::Reach(entry) => json!({ "reach": stored("resources", entry.as_str())? }),
         RecordedResources::Unknown => Value::String("unknown".to_owned()),
     };
     let omitted = i64::try_from(record.resources_omitted).map_err(|_| {
@@ -536,6 +568,7 @@ mod tests {
             "proved_delegation_team": "team-d",
             "claimed_acting_person": "person@fixture.test",
             "claimed_team": "team-c",
+            "credential": {"mode": "gateway_token", "principal": "fixture-token"},
             "completion": null
         }))
     }
@@ -604,6 +637,8 @@ mod tests {
                 instance: "gateway-7f9c".into(),
                 kind: "call",
                 allowance_ms: 1_500 + 5_000 + 20_000 + 2_250,
+                credential_mode: Some("gateway_token"),
+                credential_principal: Some("fixture-token".into()),
             }
         );
     }
@@ -656,6 +691,13 @@ mod tests {
         let mut value = serde_json::to_value(allowed_workload()).unwrap();
         value["proved_principal"]["team"] = nul("team");
         assert_eq!(refused(value), "proved_team");
+        let mut value = user.clone();
+        value["credential"]["principal"] = nul("principal");
+        assert_eq!(refused(value), "credential_principal");
+        let mut value = user.clone();
+        value["resources"] = json!({"reach": nul("entry")});
+        value["resources_omitted"] = json!(0);
+        assert_eq!(refused(value), "resources");
 
         let refused = FinishRow::from_completion(&Completion {
             outcome: Outcome::Refused {
@@ -899,6 +941,44 @@ mod tests {
         let row = BeginRow::from_record(&id(), &allowed_workload(), &budgets()).unwrap();
         assert_eq!(row.resources, json!("unknown"));
         assert_eq!(row.resources_omitted, 0);
+    }
+
+    /// A reach is the object `{"reach": entry}`, never the list it stands for.
+    #[test]
+    fn a_reach_is_the_object_naming_its_entry() {
+        let mut record = allowed_workload();
+        record.resources = RecordedResources::Reach("docs-team-a".into());
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+        assert_eq!(row.resources, json!({"reach": "docs-team-a"}));
+        assert_eq!(row.resources_omitted, 0);
+    }
+
+    /// Each credential mode is written by the name the core gives it, with its principal; a row
+    /// with no credential identity writes neither column.
+    #[test]
+    fn the_credential_identity_is_its_mode_and_principal_or_neither() {
+        let mut record = allowed_workload();
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+        assert_eq!(
+            (row.credential_mode, row.credential_principal),
+            (None, None)
+        );
+        for mode in [
+            CredentialMode::TeamServiceIdentity,
+            CredentialMode::GatewayToken,
+            CredentialMode::PerUserGrant,
+        ] {
+            record.credential = Some(CredentialIdentity {
+                mode,
+                principal: "docs-team-a".into(),
+            });
+            let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+            assert_eq!(
+                row.credential_mode.map(str::to_owned),
+                Some(name_of(&mode).unwrap())
+            );
+            assert_eq!(row.credential_principal.as_deref(), Some("docs-team-a"));
+        }
     }
 
     #[test]

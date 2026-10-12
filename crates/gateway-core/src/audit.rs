@@ -59,7 +59,9 @@ use crate::names::{
     ConnectorName, DeploymentName, InstanceName, Person, PolicyRevision, ProfileName, SurfaceName,
     TeamId, ToolUseId,
 };
-use crate::policy::{ApprovedTool, Resource, Resources};
+use crate::policy::{
+    ApprovedTool, ConnectorEntry, CredentialMode, PolicySnapshot, Resource, Resources,
+};
 use crate::principal::Principal;
 use crate::proof::{Claimed, WasProved};
 use crate::sentences;
@@ -102,8 +104,50 @@ pub struct RecordedResource {
 pub enum RecordedResources {
     /// The resources the call named: see [`AuditRecord::resources`].
     Named(Vec<RecordedResource>),
+    /// The whole reach of this connector entry, which the tool, declared as the reach, named
+    /// on every call (decision 0011, section 1). Recorded by reference, not as a list: a reach
+    /// can hold more resources than a row keeps, and the row's policy revision says exactly
+    /// what it was.
+    Reach(ConnectorName),
     /// The tool could not say which resources the call names until it ran.
     Unknown,
+}
+
+/// The credential identity a row records: the configured identity of the tool's connector
+/// entry, recorded at begin (decisions 0011 and 0014). It is what the entry states, its
+/// credential's mode and the vendor-side principal that credential acts as, never the secret,
+/// and not what the credential layer reports while the call runs. An entry has one credential
+/// and no fallback, so this is the identity the call runs under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialIdentity {
+    /// The entry's credential mode.
+    pub mode: CredentialMode,
+    /// The vendor-side identity the entry's credential acts as, such as a service account's
+    /// name, as the entry states it.
+    pub principal: String,
+}
+
+impl CredentialIdentity {
+    /// The identity `entry` states. It has no secret to copy: an entry holds none.
+    pub fn of(entry: &ConnectorEntry) -> Self {
+        Self {
+            mode: entry.credential,
+            principal: entry.principal.clone(),
+        }
+    }
+}
+
+/// The credential identity for the row of `decision`, for [`RowStart::credential`]: that of the
+/// connector entry of the tool the decision names, from `snapshot`, which must be the snapshot
+/// the decision was made from. `None` when the decision names no tool, or the tool's connector
+/// has no entry, as the JSON configuration's in-process connectors have none.
+pub fn credential_identity(
+    snapshot: &PolicySnapshot,
+    decision: &Decision,
+) -> Option<CredentialIdentity> {
+    let tool = decision.tool()?;
+    snapshot.entry(&tool.connector).map(CredentialIdentity::of)
 }
 
 /// Allow or deny, as the audit record's decision column holds it.
@@ -201,6 +245,9 @@ pub struct AuditRecord {
     ///
     /// These are what the call named, not what the decision checked. A call denied before the
     /// resource check, or at one resource of several, still records the others it named.
+    ///
+    /// A tool declared as its connector entry's reach records the entry, as
+    /// [`RecordedResources::Reach`], with nothing left out, whatever the decision.
     pub resources: RecordedResources,
     /// How many distinct named resources were left out of `resources`. Zero when none were.
     /// Repeats are not counted.
@@ -222,6 +269,11 @@ pub struct AuditRecord {
     pub claimed_acting_person: Option<Claimed<Person>>,
     /// A team the caller stated, for example in a header.
     pub claimed_team: Option<Claimed<TeamId>>,
+    /// The configured identity of the connector entry of the tool the call names, recorded at
+    /// begin, as [`RowStart::credential`] gives it: see [`CredentialIdentity`]. Recorded for a
+    /// denial too, as the connector is. `None` when the call names no tool the surface serves,
+    /// or the tool's connector has no entry.
+    pub credential: Option<CredentialIdentity>,
     /// The outcome and latency. Empty when the row is begun, and always empty for a denial;
     /// filled by [`finish`]. An allowed row that stays empty is evidence that the gateway
     /// allowed a call and never learned what happened.
@@ -353,6 +405,10 @@ pub struct RowStart {
     /// How long the connector the call names may run, in milliseconds. Recorded so the store
     /// can give the row a deadline that covers the call; the core enforces nothing with it.
     pub call_deadline_ms: u64,
+    /// The credential identity of the connector entry of the tool the decision names, from the
+    /// snapshot the decision was made from: see [`credential_identity`]. [`begin`] records it
+    /// only on a row that names a tool, and [`listed`] not at all.
+    pub credential: Option<CredentialIdentity>,
 }
 
 /// The completion of one allowed row, for [`AuditStore::finish`]. Made only by [`finish`] and
@@ -535,6 +591,7 @@ pub async fn begin(
         row,
         instance,
         call_deadline_ms,
+        credential,
     } = start;
     let record = AuditRecord {
         kind: RowKind::Call,
@@ -571,6 +628,7 @@ pub async fn begin(
             .as_ref()
             .map(|delegation| delegation.acting_person()),
         claimed_team: metadata.claimed_team,
+        credential: tool.and(credential),
         completion: None,
     };
     store
@@ -656,8 +714,10 @@ pub async fn listed(
 /// The resources as a row records them, and how many distinct ones were left out. See
 /// [`AuditRecord::resources`]. `denied` is the resource a resource denial names.
 fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResources, usize) {
-    let Resources::Named(named) = resources else {
-        return (RecordedResources::Unknown, 0);
+    let named = match resources {
+        Resources::Named(named) => named,
+        Resources::Reach { entry, .. } => return (RecordedResources::Reach(entry.clone()), 0),
+        Resources::Unknown => return (RecordedResources::Unknown, 0),
     };
     let mut seen = BTreeSet::new();
     let distinct: Vec<&Resource> = named

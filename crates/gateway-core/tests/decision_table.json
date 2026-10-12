@@ -153,6 +153,39 @@
           ]
         }
       }
+    },
+    "reach": {
+      "revision": "reach-1",
+      "tools": [
+        { "name": "sumologic__search_logs", "classification": "read", "connector": "sumologic-inventory", "resources": "declared", "declared_from": "reach" },
+        { "name": "sumologic__search_archive", "classification": "read", "connector": "sumologic-archive", "resources": "declared", "declared_from": "reach" }
+      ],
+      "surfaces": [
+        { "name": "service", "tools": ["sumologic__search_logs", "sumologic__search_archive"], "teams": ["inventory"], "principals": "any_in_teams_and_groups" }
+      ],
+      "profiles": [
+        { "name": "service", "classifications": ["read"], "requires_delegation": false }
+      ],
+      "limits": {
+        "teams": {
+          "inventory": [
+            { "system": "sumologic", "kind": "search-filter", "identifier": "_sourceCategory=inventory/*" }
+          ]
+        }
+      },
+      "entries": [
+        {
+          "name": "sumologic-inventory", "kind": "proxied", "credential": "team_service_identity",
+          "principal": "inventory-log-search", "narrowing": "none", "permits": "read",
+          "reach": [{ "system": "sumologic", "kind": "search-filter", "identifier": "_sourceCategory=inventory/*" }],
+          "reach_tested_on": "2026-10-01"
+        },
+        {
+          "name": "sumologic-archive", "kind": "proxied", "credential": "gateway_token",
+          "principal": "archive-reader", "narrowing": "none", "permits": "read",
+          "reach": []
+        }
+      ]
     }
   },
   "cases": [
@@ -767,6 +800,29 @@
       "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
       "expect": { "decision": "deny", "reason": "surface_not_permitted",
         "sentence": "Surface `otto\\nsandbox` is not available to workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test`. Use a surface your team or groups are permitted to use." }
+    },
+    {
+      "name": "a tool declared as the reach is allowed when its entry's whole reach is within the limit, and its row records the entry",
+      "snapshot": "reach", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "service", "tool": "sumologic__search_logs",
+      "resources": { "reach": { "entry": "sumologic-inventory", "resources": [{ "system": "sumologic", "kind": "search-filter", "identifier": "_sourceCategory=inventory/*" }] } },
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a reach holding a resource outside the limit is denied at check 6, and its row records the entry, not the list",
+      "snapshot": "reach", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "service", "tool": "sumologic__search_logs",
+      "resources": { "reach": { "entry": "sumologic-inventory", "resources": [{ "system": "sumologic", "kind": "search-filter", "identifier": "_sourceCategory=inventory/*" }, { "system": "sumologic", "kind": "search-filter", "identifier": "_sourceCategory=payments/*" }] } },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `sumologic__search_logs` names sumologic search-filter `_sourceCategory=payments/*`, which is outside what workload `system:serviceaccount:inventory:api` of team `inventory` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "a tool declared as the reach of an entry that reaches nothing names nothing, and is denied",
+      "snapshot": "reach", "principal": "inventory-service", "delegation": null,
+      "profile": "service", "surface": "service", "tool": "sumologic__search_archive",
+      "resources": { "reach": { "entry": "sumologic-archive", "resources": [] } },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `sumologic__search_archive` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for." }
     }
   ],
   "lists": [

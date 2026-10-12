@@ -42,8 +42,9 @@ pub enum DeclaredFrom {
     /// The adapter reads them from structured arguments.
     Arguments,
     /// The adapter names its connector entry's whole recorded reach on every call, whatever
-    /// the arguments. Not built: the snapshot refuses it until the audit row can record a
-    /// reach by reference.
+    /// the arguments, as [`Resources::Reach`]. The gateway's one constant adapter does this
+    /// for every such tool, and the row records the entry, not the list. The tool's connector
+    /// must have an entry.
     Reach,
 }
 
@@ -150,6 +151,16 @@ pub enum Resources {
     /// The resources the tool's resource adapter found in the arguments. Empty when the call
     /// names none, and for `tools/list`.
     Named(Vec<Resource>),
+    /// The whole recorded reach of a connector entry, which a tool declared as the reach names
+    /// on every call, whatever its arguments (decision 0011, section 1). The decision checks
+    /// each of its resources as it checks named ones. The audit row records the entry, not the
+    /// list: the policy revision on the row says exactly what the reach was.
+    Reach {
+        /// The connector entry whose reach this is.
+        entry: ConnectorName,
+        /// The entry's reach, as the snapshot the decision is made from holds it.
+        resources: Vec<Resource>,
+    },
     /// The tool cannot say which resources the call names until it runs.
     Unknown,
 }
@@ -329,13 +340,18 @@ pub enum SnapshotError {
     /// A tool not `declared` says where its adapter finds resources.
     #[error("tool `{0}` says where its resources are declared from, but is not `declared`")]
     DeclaredFromWithoutDeclared(ToolName),
-    /// A tool is `declared` as its entry's reach, which is not built: the audit row cannot
-    /// record a reach by reference yet.
+    /// A tool is `declared` as its entry's reach, and its connector has no entry, so there is
+    /// no reach to name.
     #[error(
-        "tool `{0}` is declared as its connector entry's reach, which this gateway does not \
-         support yet"
+        "tool `{tool}` is declared as its connector entry's reach, and its connector \
+         `{connector}` has no connector entry"
     )]
-    DeclaredFromReach(ToolName),
+    ReachWithoutEntry {
+        /// The tool.
+        tool: ToolName,
+        /// The connector it names.
+        connector: ConnectorName,
+    },
     /// Rule 1 of decision 0011, section 3: a proxied tool declared `checks_own_scope`.
     #[error(
         "rule 1: tool `{tool}` is proxied through entry `{entry}` and declared \
@@ -477,8 +493,9 @@ impl PolicySnapshot {
     /// that serves a tool nobody approved. Then, when there are connector entries, refuses a
     /// tool with no entry, and a snapshot that breaks one of the nine rules of decision 0011,
     /// section 3, each named by its [`SnapshotError`] variant. The rules apply to tools whose
-    /// connector has an entry. Last, it refuses a tool `declared` as the reach, which is not
-    /// built.
+    /// connector has an entry. Last, it refuses a tool `declared` as the reach whose connector
+    /// has no entry, which a snapshot with no entries at all could otherwise hold: there would
+    /// be no reach for its calls to name.
     pub fn new(data: SnapshotData) -> Result<Self, SnapshotError> {
         let mut tools = BTreeMap::new();
         for tool in data.tools {
@@ -532,12 +549,14 @@ impl PolicySnapshot {
             entries,
         };
         check_rules(&snapshot)?;
-        if let Some(tool) = snapshot
-            .tools
-            .values()
-            .find(|tool| tool.declared_from == Some(DeclaredFrom::Reach))
-        {
-            return Err(SnapshotError::DeclaredFromReach(tool.name.clone()));
+        if let Some(tool) = snapshot.tools.values().find(|tool| {
+            tool.declared_from == Some(DeclaredFrom::Reach)
+                && !snapshot.entries.contains_key(&tool.connector)
+        }) {
+            return Err(SnapshotError::ReachWithoutEntry {
+                tool: tool.name.clone(),
+                connector: tool.connector.clone(),
+            });
         }
         Ok(snapshot)
     }

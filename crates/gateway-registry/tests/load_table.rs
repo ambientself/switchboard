@@ -1045,14 +1045,11 @@ fn cases() -> Vec<Case> {
             |t| set(t, "servers.0", "destination", value("\"in_cluster\"")),
             Want::Loads,
         ),
-        // Tools declared as the reach parse, and the snapshot refuses them until they are
-        // built.
+        // A tool declared as the reach loads, held to the loader's rules like any other.
         case(
             "a tool declared as its entry's reach",
             |t| set(t, "tools.0", "resources", value("\"as_reach\"")),
-            Want::Error(E::Snapshot(SnapshotError::DeclaredFromReach(tool(
-                "docs__read",
-            )))),
+            Want::Loads,
         ),
         // The snapshot loader's rules (decision 0011, section 3), through the registry. Rule 1
         // cannot be written here: `checks_own_scope` does not parse. Rule 3 is the registry's
@@ -1532,6 +1529,19 @@ fn each_rule_refuses_its_case() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A tool declared as its entry's reach is approved as `declared`, from the reach. Its adapter
+/// names nothing from the arguments: the gateway names the reach for it.
+#[test]
+fn a_tool_declared_as_the_reach_is_approved_as_declared_from_the_reach() {
+    let mut table = base();
+    set(&mut table, "tools.0", "resources", value("\"as_reach\""));
+    let registry = load(&table).unwrap();
+    let read = registry.snapshot().tool(&tool("docs__read")).unwrap();
+    assert_eq!(read.resources, ResourceDeclaration::Declared);
+    assert_eq!(read.declared_from, Some(DeclaredFrom::Reach));
+    assert_eq!(read.connector.as_str(), "docs-server");
 }
 
 #[test]

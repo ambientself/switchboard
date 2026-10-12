@@ -257,10 +257,21 @@
     },
 
     {
-      "name": "a tool declared as its entry's reach is refused, since it is not built",
+      "name": "a proxied tool declared as its entry's reach loads, held to rule 5",
+      "tool": { "declared_from": "reach" },
+      "expect": "loads"
+    },
+    {
+      "name": "a built-in tool declared as its entry's reach loads, held to rule 5",
       "tool": { "declared_from": "reach" },
       "entry": { "kind": "built_in" },
-      "expect": "DeclaredFromReach", "names": ["`docs-a__list`"]
+      "expect": "loads"
+    },
+    {
+      "name": "with no entries, a tool declared as the reach is refused: it has no reach to name",
+      "tool": { "declared_from": "reach" },
+      "entries": [],
+      "expect": "ReachWithoutEntry", "names": ["`docs-a__list`", "`docs-a`"]
     },
     {
       "name": "a tool that is not declared cannot say where it is declared from",

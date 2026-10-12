@@ -45,7 +45,7 @@ impl ContractStore for Postgres {
                         proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
                         proved_delegation_team, claimed_acting_person, claimed_team,
                         outcome, outcome_sentence, error_kind, latency_ms, listed_tools,
-                        listed_omitted,
+                        listed_omitted, credential_mode, credential_principal,
                         (extract(epoch FROM begun_at) * 1000000)::bigint AS begun_at_micros,
                         deadline IS NOT NULL AS deadline_set,
                         (extract(epoch FROM deadline - begun_at) * 1000000)::bigint
@@ -86,7 +86,14 @@ impl ContractStore for Postgres {
             RowKind::Call => {
                 let resources = match row.get::<_, Option<Value>>("resources") {
                     Some(Value::String(unknown)) => json!(unknown),
+                    // A reach, `{"reach": entry}`, is the record's own form of it.
+                    Some(reach @ Value::Object(_)) => reach,
                     named => json!({ "named": named }),
+                };
+                // Both columns or neither; a row with one would fail to read back.
+                let credential = match (text("credential_mode"), text("credential_principal")) {
+                    (None, None) => Value::Null,
+                    (mode, principal) => json!({ "mode": mode, "principal": principal }),
                 };
                 // The table holds the allowance, which is the store's budgets, each in whole
                 // milliseconds, and the call deadline. The budgets are worked out here, not
@@ -124,6 +131,7 @@ impl ContractStore for Postgres {
                         "proved_delegation_team": text("proved_delegation_team"),
                         "claimed_acting_person": text("claimed_acting_person"),
                         "claimed_team": text("claimed_team"),
+                        "credential": credential,
                         "completion": completion,
                     }))
                     .unwrap(),
@@ -209,6 +217,9 @@ contract!(
     begin_is_ok_only_once_stored_and_idempotent_by_identifier,
     the_stored_row_is_exactly_the_record,
     a_record_the_store_cannot_hold_is_refused_and_leaves_no_row,
+    a_reach_is_stored_as_the_entry_it_names,
+    a_credential_identity_is_stored_as_begin_was_given_it,
+    a_repeated_begin_compares_the_decision_and_not_the_reach_or_credential,
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
     an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,

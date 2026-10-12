@@ -252,7 +252,8 @@ async fn run(
     assert_eq!(deadlines, vec![due.clone(), due.clone(), due]);
 
     // Each row names the project its call named, as `system/kind/identifier`, so an allowed
-    // read shows which project it read and a denial which one it refused.
+    // read shows which project it read and a denial which one it refused. Each records the
+    // configured identity of docs-team-a's entry, which the call runs under, denial included.
     let rows = setup
         .query(
             "SELECT tool, decision, coalesce(reason, ''), concat_ws(':', outcome, error_kind),
@@ -264,13 +265,14 @@ async fn run(
                                                               r->>'identifier'), ','), '')
                            FROM jsonb_array_elements(resources) AS r)
                     ELSE coalesce(resources #>> '{}', 'NULL') END,
-                    resources_omitted::text
+                    resources_omitted::text,
+                    coalesce(credential_mode, 'NULL'), coalesce(credential_principal, 'NULL')
                FROM switchboard_audit.call_rows ORDER BY begun_at",
             &[],
         )
         .await
         .unwrap();
-    let rows: Vec<[String; 11]> = rows
+    let rows: Vec<[String; 13]> = rows
         .iter()
         .map(|row| std::array::from_fn(|column| row.get(column)))
         .collect();
@@ -320,6 +322,11 @@ async fn run(
         assert!(row[7].contains(outcome_sentence), "{row:?}");
         assert_eq!(row[8], files::KIND_REVISION);
         assert_eq!([&row[9], &row[10]], [resources, "0"], "{row:?}");
+        assert_eq!(
+            [&row[11], &row[12]],
+            ["team_service_identity", "docs-team-a"],
+            "{row:?}"
+        );
     }
 
     // A tools/list writes its row, of kind list, naming what it listed, and the answer names
