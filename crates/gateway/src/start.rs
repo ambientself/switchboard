@@ -832,6 +832,107 @@ mod tests {
         );
     }
 
+    /// The boot test registry with its one server at an `https` address, its identity the
+    /// address's host.
+    fn https_registry() -> Registry {
+        let mut server = crate::boot::tests::server();
+        let before = gateway_registry::binding_sha256(&server);
+        server.identity = "docs.example.test".into();
+        server.address = "https://docs.example.test/mcp".into();
+        let text = crate::boot::tests::registry_text("read", true, "r1")
+            .replace(
+                "identity = \"127.0.0.1\"",
+                "identity = \"docs.example.test\"",
+            )
+            .replace(
+                "address = \"http://127.0.0.1:9/mcp\"",
+                "address = \"https://docs.example.test/mcp\"",
+            )
+            .replace(&before, &gateway_registry::binding_sha256(&server));
+        Registry::from_toml_str(&text).unwrap()
+    }
+
+    /// Decision 0013, section 3: an `https` server needs the CA file its certificate is
+    /// verified against, and an `http` server, where nothing would be verified, takes none.
+    #[test]
+    fn an_https_server_needs_a_ca_file_and_an_http_server_takes_none() {
+        let https = https_registry();
+        let http = crate::boot::tests::registry("read", true);
+        let named = BTreeMap::from([(ConnectorName::new("mock-docs"), PathBuf::from("ca.pem"))]);
+        let none = BTreeMap::new();
+
+        let refused = destinations(&https, &none, Loopback::Refused).unwrap_err();
+        assert!(
+            matches!(&refused, StartError::NoCaFile(server) if server.as_str() == "mock-docs"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "server `mock-docs` has an https address, so `[servers.mock-docs]` must name the CA \
+             file its certificate is verified against in `ca_file`"
+        );
+        assert!(destinations(&https, &named, Loopback::Refused).is_ok());
+
+        let refused = destinations(&http, &named, Loopback::of_this_build()).unwrap_err();
+        assert!(
+            matches!(&refused, StartError::CaFileForHttp(server) if server.as_str() == "mock-docs"),
+            "{refused}"
+        );
+        assert!(destinations(&http, &none, Loopback::of_this_build()).is_ok());
+    }
+
+    /// The CA file the deployment names reaches the server's connector, which is built with it
+    /// and could not be built without it.
+    #[test]
+    fn an_https_servers_connector_is_built_with_the_ca_file_the_deployment_names() {
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-ca-file-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential = directory.join("docs-credential");
+        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
+        let ca_file = directory.join("ca.pem");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(&ca_file, ca.pem()).unwrap();
+        let credentials = Arc::new(
+            FileCredentials::load([(ConnectorName::new("mock-docs"), &credential)]).unwrap(),
+        );
+        let registry = https_registry();
+        let built = |ca_files: &BTreeMap<ConnectorName, PathBuf>| {
+            proxied(
+                &registry,
+                &credentials,
+                &Limits::default(),
+                &Reaching {
+                    bounds: &BTreeMap::new(),
+                    ca_files,
+                    loopback: Loopback::Refused,
+                },
+                Wiring::new(Arc::new(gateway_identity::SystemClock)),
+            )
+            .map(|_| ())
+        };
+
+        let named = built(&BTreeMap::from([(
+            ConnectorName::new("mock-docs"),
+            ca_file,
+        )]));
+        let unnamed = built(&BTreeMap::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(named.is_ok(), "{named:?}");
+        assert!(
+            matches!(
+                unnamed,
+                Err(StartError::Upstream(UpstreamError::NoCaFile(_)))
+            ),
+            "{unnamed:?}"
+        );
+    }
+
     /// A listener that counts the connections made to it and closes each at once: the audit
     /// database and the issuer's keys URL, which a refusal before connecting never reaches.
     struct Counted {
@@ -1115,6 +1216,43 @@ mod tests {
             assert!(expected, "{name}: {refused}");
         }
         assert_eq!(counted.connections(), 0, "something was connected to first");
+    }
+
+    /// Decision 0013, section 3: a release build refuses a server whose address is a loopback
+    /// literal before it reads a credential or connects to anything. A development build, as
+    /// these tests are, allows it for the tests' local servers.
+    #[tokio::test]
+    async fn a_release_build_refuses_a_server_on_loopback_before_anything_is_connected() {
+        let counted = Counted::start().await;
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-loopback-{}", std::process::id()));
+        let text = crate::boot::tests::registry_text("read", true, "r1");
+        let mut deployment = deployment(&directory, &text, &counted, false, false);
+        // A credential file that would refuse the start, were it read first.
+        deployment.credentials = BTreeMap::from([(
+            "docs-credential".to_owned(),
+            directory.join("no-such-credential"),
+        )]);
+        let refused = refused_as_release(deployment).await;
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(
+            matches!(
+                &refused,
+                StartError::DestinationRefused {
+                    refusal: Refusal::Loopback,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "server `mock-docs`: the gateway does not connect to 127.0.0.1, a loopback address"
+        );
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+        let registry = Registry::from_toml_str(&text).unwrap();
+        assert!(destinations(&registry, &BTreeMap::new(), Loopback::of_this_build()).is_ok());
     }
 
     #[test]

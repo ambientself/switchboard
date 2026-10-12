@@ -285,6 +285,7 @@ version = "0.1.0"
 dependencies = [
  "connector-proxy",
  "gateway-core",
+ "gateway-registry",
  "gateway-testkit",
  "http-body-util",
  "hyper",

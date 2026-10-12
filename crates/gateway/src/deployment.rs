@@ -981,3 +981,46 @@ fn read_text(path: &Path) -> Result<String, DeploymentError> {
         source,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A server's CA file is read from the deployment file's directory, beside its bounds; a
+    /// server with bounds and no CA file has none.
+    #[test]
+    fn a_servers_ca_file_is_found_from_the_deployment_files_directory() {
+        let file: DeploymentFile = toml::from_str(
+            r#"
+deployment = "ca-files"
+[http]
+allowed_hosts = ["localhost"]
+allowed_origins = []
+[registry]
+file = "registry.toml"
+poll_seconds = 2
+[identity]
+mode = "disabled"
+[audit]
+mode = "disabled"
+[servers.vendor-docs]
+ca_file = "vendor-docs-ca.pem"
+[servers.mock-docs]
+deadline_seconds = 3
+[credentials]
+"#,
+        )
+        .unwrap();
+        let vendor = ConnectorName::new("vendor-docs");
+        assert_eq!(file.ca_file(&vendor), Some(Path::new("vendor-docs-ca.pem")));
+        assert_eq!(file.ca_file(&ConnectorName::new("mock-docs")), None);
+
+        let loaded = Deployment::from_file(file, Path::new("/etc/switchboard"), |_| None).unwrap();
+        assert_eq!(
+            loaded.ca_files,
+            BTreeMap::from([(vendor, PathBuf::from("/etc/switchboard/vendor-docs-ca.pem"))])
+        );
+        assert_eq!(loaded.servers.len(), 2);
+    }
+}

@@ -209,3 +209,137 @@ pub(crate) fn parse_endpoint(url: &str) -> Option<Uri> {
         && !authority.as_str().contains('@');
     acceptable.then_some(endpoint)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use hyper::rt::{Read, ReadBufCursor, Write};
+    use hyper_util::client::legacy::connect::{Connected, Connection};
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::sync::mpsc;
+    use tower_service::Service;
+
+    use super::*;
+
+    /// A connection to a server inside the test: one end of an in-memory pipe.
+    struct Piped(TokioIo<DuplexStream>);
+
+    impl Connection for Piped {
+        fn connected(&self) -> Connected {
+            Connected::new()
+        }
+    }
+
+    impl Read for Piped {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl Write for Piped {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    /// A connector that makes each connection a new pipe, hands its server end to the test,
+    /// and counts them.
+    #[derive(Clone)]
+    struct Pipes {
+        servers: mpsc::UnboundedSender<DuplexStream>,
+        made: Arc<AtomicUsize>,
+    }
+
+    impl Service<Uri> for Pipes {
+        type Response = Piped;
+        type Error = io::Error;
+        type Future = std::future::Ready<Result<Piped, io::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            self.made.fetch_add(1, Ordering::SeqCst);
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let _ = self.servers.send(server);
+            std::future::ready(Ok(Piped(TokioIo::new(client))))
+        }
+    }
+
+    fn request() -> Request<Full<Bytes>> {
+        Request::post("http://docs.example.test/mcp")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap()
+    }
+
+    /// Reads one request, its two-byte body included, from `stream`.
+    async fn read_request(stream: &mut DuplexStream) {
+        let mut read = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !read.ends_with(b"\r\n\r\n{}") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0, "the client closed the connection");
+            read.extend_from_slice(&chunk[..count]);
+        }
+    }
+
+    /// A request taken from the pool onto a connection the server has closed, before the
+    /// client noticed, never reaches the server, and the client knows it. The legacy client
+    /// would send it again on a new connection by default; this one does not. The request
+    /// fails, and no second connection is made.
+    #[tokio::test]
+    async fn a_request_on_a_connection_the_server_closed_is_not_sent_again() {
+        let (servers, mut accepted) = mpsc::unbounded_channel();
+        let made = Arc::new(AtomicUsize::new(0));
+        let client = client(Pipes {
+            servers,
+            made: Arc::clone(&made),
+        });
+        let serve = async {
+            let mut stream = accepted.recv().await.unwrap();
+            read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            stream
+        };
+        let (first, server) = tokio::join!(client.request(request()), serve);
+        assert_eq!(first.unwrap().status(), 200);
+        // The connection goes back to the pool, idle.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The server closes it. The client's connection task has not run since, so the next
+        // request takes the connection from the pool; the task then finds the close before
+        // writing anything, and hands the request back unsent.
+        drop(server);
+        let second = tokio::time::timeout(Duration::from_secs(2), client.request(request())).await;
+
+        assert!(matches!(second, Ok(Err(_))), "{second:?}");
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+}

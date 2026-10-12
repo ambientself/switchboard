@@ -46,6 +46,8 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tracing-subscriber = "0.3"
 # The tests are a development build, so they reach their local servers on loopback.
 connector-proxy = { path = ".", features = ["test-support"] }
+# The registry's rule for http and https, which the connector's must agree with.
+gateway-registry = { path = "../gateway-registry" }
 # A CA and its leaf certificates, made when a test runs: no key is checked in.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # The loopback HTTPS servers the tests connect to.
