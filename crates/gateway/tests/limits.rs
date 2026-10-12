@@ -71,7 +71,9 @@ fn reference(server: &str) -> &'static str {
 }
 
 /// A proxied server on loopback that counts each `tools/call` it receives, and then either
-/// never answers or answers with a text of `answer_bytes` bytes.
+/// never answers or answers with a text of `answer_bytes` bytes. Anything else, such as the
+/// drift pass's `tools/list`, it answers at once with 404, which the pass takes as a failed
+/// poll that withdraws nothing.
 struct Scripted {
     url: String,
     received: Arc<AtomicUsize>,
@@ -84,11 +86,14 @@ struct Script {
 }
 
 async fn answer(State(script): State<Script>, body: Bytes) -> Response {
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    if request["method"] != json!("tools/call") {
+        return http::StatusCode::NOT_FOUND.into_response();
+    }
     script.received.fetch_add(1, Ordering::SeqCst);
     let Some(size) = script.answer_bytes else {
         return std::future::pending().await;
     };
-    let request: Value = serde_json::from_slice(&body).unwrap();
     let answer = json!({
         "jsonrpc": "2.0",
         "id": request["id"],

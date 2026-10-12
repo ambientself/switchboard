@@ -979,6 +979,80 @@ fn the_server_bearer_checks_count_only_this_runs_requests() {
     );
 }
 
+/// `line`, one of mock-docs' request lines, as a `tools/list`.
+fn as_list(line: &str) -> String {
+    let mut line: Value = serde_json::from_str(line).unwrap();
+    line["rpc_method"] = json!("tools/list");
+    line["rpc_id"] = json!(1);
+    line.to_string()
+}
+
+/// The gateway's drift pass reads each entry's tool list with the entry's own credential every
+/// interval (decision 0013, section 5). Those requests are not calls: the call counts leave out
+/// the gateway's own tools/list requests, and only those. A tools/list under any other bearer or
+/// caller still fails the check, and so does any other request under the gateway's.
+#[test]
+fn the_gateways_drift_polls_are_not_counted_as_calls() {
+    require(&["jq"]);
+    let team_a = static_line("88a0f2ba13fc", true);
+    let team_b = static_line("d20bf481167c", true);
+    let polls = [as_list(&team_a), as_list(&team_b), as_list(&team_a)];
+    let bearers = |lines: &[String]| {
+        sourced(&format!(
+            "check_server_bearers '{}' \"{SHA_A} {SHA_B}\" 2 all\nFINISHED=1\nresult 0",
+            lines.join("\n")
+        ))
+    };
+    let mut lines = vec![team_a.clone(), team_b.clone()];
+    lines.extend_from_slice(&polls);
+    let run = bearers(&lines);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    lines.push(as_list(&static_line("bbbbbbbbbbbb", true)));
+    let run = bearers(&lines);
+    assert!(
+        run.failed("mock-docs accepted no other bearer"),
+        "{}",
+        run.transcript()
+    );
+    let run = bearers(&polls);
+    assert!(
+        run.failed("mock-docs accepted the gateway's credentials on exactly the 2 calls"),
+        "{}",
+        run.transcript()
+    );
+
+    let entry_a = jwt_line(true, Some(SUBJECT_A), None);
+    let entry_b = jwt_line(true, Some(SUBJECT_B), None);
+    let direct = jwt_line(false, None, Some("wrong_audience"));
+    let probe = jwt_line(false, None, Some("no_bearer")).replace("\"35078c7e6361\"", "null");
+    let mut lines = vec![direct.clone(), direct, probe.clone(), probe.clone(), probe];
+    lines.extend(std::iter::repeat_n(entry_a.clone(), 4));
+    lines.extend(std::iter::repeat_n(entry_b.clone(), 4));
+    lines.extend([as_list(&entry_a), as_list(&entry_b)]);
+    let run = check_callers(&lines);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let stranger = jwt_line(
+        true,
+        Some("system:serviceaccount:team-a:mock-workload"),
+        None,
+    );
+    lines.push(as_list(&stranger));
+    let run = check_callers(&lines);
+    assert!(
+        run.failed("mock-docs accepted no other caller, and no token without one"),
+        "{}",
+        run.transcript()
+    );
+
+    // The outage step counts what mock-docs accepted other than tools/list.
+    let accepted = static_line("35078c7e6361", true);
+    let run = sourced(&format!(
+        "dc() {{ printf '%s\\n' '{}'; }}\nmock_docs_requests",
+        [accepted.clone(), as_list(&accepted), accepted].join("\n")
+    ));
+    assert_eq!(run.stdout.trim(), "2", "{}", run.transcript());
+}
+
 #[test]
 fn the_outage_step_counts_only_requests_mock_docs_accepted() {
     // The health checks run every 2 s and carry no bearer; were they counted, the count before

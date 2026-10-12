@@ -72,11 +72,24 @@ impl World {
         .await
     }
 
-    /// The bearers the mock server has received, as logged prefixes.
+    /// The bearers the mock server has received, as logged prefixes, on every request but the
+    /// drift pass's tool lists.
     fn bearers(&self) -> Vec<String> {
         self.mock
             .log_lines()
             .iter()
+            .filter(|line| line["rpc_method"] != json!("tools/list"))
+            .filter_map(|line| line["bearer_sha256"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The tool lists the mock server has answered: the drift pass's, each with its entry's
+    /// credential, as logged prefixes.
+    fn lists(&self) -> Vec<String> {
+        self.mock
+            .log_lines()
+            .iter()
+            .filter(|line| line["rpc_method"] == json!("tools/list"))
             .filter_map(|line| line["bearer_sha256"].as_str().map(str::to_owned))
             .collect()
     }
@@ -114,10 +127,24 @@ async fn an_allowed_read_is_forwarded_with_the_gateways_credential_only() {
     )
     .await;
     assert_eq!(initialized.status, 200, "{}", initialized.body);
+    // Before serving, the first drift pass read each entry's tool list once, with that entry's
+    // credential, and nothing else.
+    let mut lists = world.lists();
+    lists.sort();
+    let mut entries = vec![logged(files::CREDENTIAL), logged(files::TEAM_B_CREDENTIAL)];
+    entries.sort();
+    assert_eq!(lists, entries);
+    assert_eq!(
+        world.mock.log_lines().len(),
+        2,
+        "{:?}",
+        world.mock.log_lines()
+    );
     // Listed from the approved definitions, without asking the server.
     assert_eq!(listed(&path, &team_a).await, [LIST_TOOL, READ_TOOL]);
-    assert!(
-        world.mock.log_lines().is_empty(),
+    assert_eq!(
+        world.mock.log_lines().len(),
+        2,
         "{:?}",
         world.mock.log_lines()
     );

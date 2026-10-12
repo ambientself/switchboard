@@ -6,10 +6,11 @@
 //! reason is logged once per version of the file, at error level.
 //!
 //! A reload can change the policy: tools withdrawn, surfaces, profiles, limits, rules and
-//! definitions. It cannot change what the running connectors were built for, so a new file is
-//! refused, and the gateway must be restarted, if it changes a server, adds or removes one, or
-//! routes a tool to an upstream tool the gateway did not start with. Withdrawing a tool is
-//! always possible.
+//! definitions. The drift pass's standing withdrawals are applied to each new version whose
+//! approval of the tool is unchanged (see [`crate::drift`]). It cannot change what the running
+//! connectors were built for, so a new file is refused, and the gateway must be restarted, if
+//! it changes a server, adds or removes one, or routes a tool to an upstream tool the gateway
+//! did not start with. Withdrawing a tool is always possible.
 //!
 //! A new file that changes the policy must also change its `revision`. Audit rows explain a
 //! decision only by the revision they record, so two different policies served under one
@@ -38,6 +39,7 @@ use gateway_registry::{Registry, RegistryError};
 use thiserror::Error;
 
 use crate::boot::{Basis, BootError, check_registry_policy};
+use crate::drift::Withdrawals;
 use crate::policy::{LivePolicy, ServedPolicy};
 
 /// Why a new registry file was not served. The policy served before stays.
@@ -127,6 +129,7 @@ impl Freshness {
 /// Replaces the served policy with a new registry file's, if it passes.
 pub struct Reloader {
     live: Arc<LivePolicy>,
+    withdrawals: Arc<Withdrawals>,
     basis: Basis,
     freshness: Freshness,
 }
@@ -141,15 +144,25 @@ impl std::fmt::Debug for Reloader {
 
 impl Reloader {
     pub(crate) fn new(live: Arc<LivePolicy>, basis: Basis, freshness: Freshness) -> Self {
+        let withdrawals = Arc::new(Withdrawals::new(live.clone(), &basis.registry));
         Self {
             live,
+            withdrawals,
             basis,
             freshness,
         }
     }
 
-    /// Serves `registry`'s policy from the next request on, or refuses it and keeps the policy
-    /// served now. Returns the new revision.
+    /// The standing withdrawals, which the drift pass makes and every reload applies again
+    /// (see [`crate::drift`]).
+    pub fn withdrawals(&self) -> Arc<Withdrawals> {
+        Arc::clone(&self.withdrawals)
+    }
+
+    /// Serves `registry`'s policy from the next request on, less each standing withdrawal
+    /// whose tool it still approves under the same key, or refuses it and keeps the policy
+    /// served now. Returns the revision served: the new one, or the one derived from it by the
+    /// withdrawals.
     pub fn apply(&self, registry: &Registry) -> Result<PolicyRevision, ReloadError> {
         let started = &self.basis.registry;
         if registry.servers() != started.servers() {
@@ -162,13 +175,13 @@ impl Reloader {
         }
         let policy = ServedPolicy::from_registry(registry).map_err(BootError::from)?;
         check_registry_policy(registry, &policy, &self.basis)?;
-        let served = self.live.current();
+        // Compared with the loaded registry's policy, not the one served: a withdrawal's derived
+        // policy has a revision no registry can have.
+        let served = self.withdrawals.base();
         if policy.revision() == served.revision() && policy != *served {
             return Err(ReloadError::RevisionUnchanged(policy.revision().clone()));
         }
-        let revision = policy.revision().clone();
-        self.live.replace(policy);
-        Ok(revision)
+        Ok(self.withdrawals.load(registry, policy))
     }
 
     /// Reads `file` as soon as it starts and every `every` after that, records each read that

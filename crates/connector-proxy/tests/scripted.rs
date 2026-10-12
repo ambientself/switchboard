@@ -10,7 +10,9 @@ use common::{
     GATEWAY_TOKEN, Harness, READ_UPSTREAM, Scripted, Step, chunk, chunked_head, connector,
     json_response, last_chunk, response, result_of_size, text_result, upstream,
 };
-use connector_proxy::{DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Upstream, outcome};
+use connector_proxy::{
+    DEFAULT_MAX_RESPONSE_BYTES, ListError, ListedTool, PROTOCOL_VERSION, Upstream, outcome,
+};
 use gateway_core::ToolName;
 use gateway_core::audit::{Answer, ErrorKind, Outcome};
 use gateway_testkit::{DRAFT_TOOL, READ_TOOL};
@@ -568,4 +570,173 @@ async fn by_default_an_answer_of_64_kib_is_read_and_one_byte_more_is_not() {
             .await;
         assert_eq!(matches!(answer, Answer::Ok(_)), fits, "{size}: {answer:?}");
     }
+}
+
+/// A `tools/list` answer to `request` listing `tools`.
+fn tool_list(request: &Value, tools: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": tools}})
+}
+
+/// The read tool as a server lists it.
+fn listed_read() -> Value {
+    json!({"name": READ_UPSTREAM, "description": "Reads a document.",
+           "inputSchema": {"type": "object"}})
+}
+
+/// The drift pass's own request carries the gateway's credential for the connector and asks for
+/// the tool list alone, with no `initialize`, and the tools come back as served.
+#[tokio::test]
+async fn the_list_request_carries_the_gateway_credential_and_asks_only_for_the_list() {
+    let server = Scripted::start(|request| {
+        vec![Step::Write(json_response(&tool_list(
+            request,
+            json!([listed_read(), {"name": "unapproved", "title": "Other"}]),
+        )))]
+    })
+    .await;
+
+    let tools = bounded(&server).list_tools().await.unwrap();
+
+    assert_eq!(
+        tools,
+        [
+            ListedTool {
+                name: READ_UPSTREAM.into(),
+                title: None,
+                description: Some("Reads a document.".into()),
+                input_schema: Some(json!({"type": "object"})),
+            },
+            ListedTool {
+                name: "unapproved".into(),
+                title: Some("Other".into()),
+                description: None,
+                input_schema: None,
+            },
+        ]
+    );
+    let received = server.received();
+    assert_eq!(received.len(), 1);
+    let request = &received[0];
+    assert_eq!(request.request_line, "POST /mcp HTTP/1.1");
+    assert_eq!(
+        request.header("authorization"),
+        Some(format!("Bearer {GATEWAY_TOKEN}").as_str())
+    );
+    assert_eq!(
+        request.header("mcp-protocol-version"),
+        Some(PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        request.body,
+        json!({"jsonrpc": "2.0", "id": request.body["id"], "method": "tools/list", "params": {}})
+    );
+}
+
+/// The list is abandoned at the connector's deadline, the body included.
+#[tokio::test]
+async fn the_list_is_abandoned_at_the_deadline() {
+    let server = Scripted::start(|request| {
+        let body = tool_list(request, json!([listed_read()]))
+            .to_string()
+            .into_bytes();
+        let (first, second) = body.split_at(10);
+        vec![
+            Step::Write(chunked_head()),
+            Step::Write(chunk(first)),
+            Step::Sleep(DEADLINE * 3),
+            Step::Write([chunk(second), last_chunk()].concat()),
+        ]
+    })
+    .await;
+    let started = Instant::now();
+
+    let listed = bounded(&server).list_tools().await;
+
+    let took = started.elapsed();
+    assert_eq!(listed, Err(ListError::TimedOut));
+    assert!(took >= DEADLINE && took < DEADLINE * 3, "took {took:?}");
+}
+
+/// A list larger than the connector's cap is discarded, whether its length is declared or not;
+/// one of exactly the cap is read.
+#[tokio::test]
+async fn a_list_over_the_cap_is_discarded() {
+    fn padded(request: &Value, size: usize) -> Vec<u8> {
+        let empty = tool_list(request, json!([{"name": ""}])).to_string().len();
+        let body = tool_list(request, json!([{"name": "x".repeat(size - empty)}])).to_string();
+        assert_eq!(body.len(), size);
+        body.into_bytes()
+    }
+    for (size, chunked, fits) in [
+        (CAP, false, true),
+        (CAP + 1, false, false),
+        (CAP, true, true),
+        (CAP + 1, true, false),
+    ] {
+        let server = Scripted::start(move |request| {
+            let body = padded(request, size);
+            if chunked {
+                vec![Step::Write(
+                    [chunked_head(), chunk(&body), last_chunk()].concat(),
+                )]
+            } else {
+                vec![Step::Write(response("200 OK", "application/json", &body))]
+            }
+        })
+        .await;
+        let listed = bounded(&server).list_tools().await;
+        if fits {
+            assert_eq!(listed.unwrap().len(), 1, "{size}, chunked {chunked}");
+        } else {
+            assert_eq!(
+                listed,
+                Err(ListError::TooLarge),
+                "{size}, chunked {chunked}"
+            );
+        }
+    }
+}
+
+/// A redirect is a failed list, and is not followed.
+#[tokio::test]
+async fn a_list_redirect_is_not_followed() {
+    let elsewhere = Scripted::start(|request| {
+        vec![Step::Write(json_response(&tool_list(
+            request,
+            json!([listed_read()]),
+        )))]
+    })
+    .await;
+    let location = elsewhere.url().to_owned();
+    let server = Scripted::start(move |_| {
+        vec![Step::Write(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes(),
+        )]
+    })
+    .await;
+
+    let listed = bounded(&server).list_tools().await;
+
+    assert_eq!(listed, Err(ListError::Status(307)));
+    assert!(elsewhere.received().is_empty());
+}
+
+/// A list that names a next page is a failed list: the tools on later pages must not look
+/// removed, and later pages are not read.
+#[tokio::test]
+async fn a_list_with_a_next_page_is_a_failed_list() {
+    let server = Scripted::start(|request| {
+        let mut answer = tool_list(request, json!([listed_read()]));
+        answer["result"]["nextCursor"] = json!("page-2");
+        vec![Step::Write(json_response(&answer))]
+    })
+    .await;
+
+    let listed = bounded(&server).list_tools().await;
+
+    assert_eq!(listed, Err(ListError::Paginated));
+    assert_eq!(server.received().len(), 1);
 }

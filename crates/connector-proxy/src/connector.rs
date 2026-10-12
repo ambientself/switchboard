@@ -21,6 +21,7 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::credentials::{FileCredentials, Secret};
+use crate::list::{ListError, ListedTool, tool_list};
 use crate::outcome;
 
 /// How long a call may take, from sending the request to the last byte of the answer, unless
@@ -346,6 +347,82 @@ impl ProxyConnector {
         Ok(Received {
             content_type,
             body: received,
+        })
+    }
+}
+
+impl ProxyConnector {
+    /// The tools the server lists now, read with one `tools/list` request: the gateway's own,
+    /// for the drift pass (decision 0013, section 5), made for no caller.
+    ///
+    /// It goes where a call goes and is held to the same bounds: `POST`ed to the server's
+    /// endpoint with the gateway's credential for this connector, abandoned at the deadline,
+    /// and discarded past the answer cap. It follows no redirect and uses no proxy, and it sends
+    /// no `initialize`. Only one page is read: an answer that names a next page is
+    /// [`ListError::Paginated`]. Any failure is a [`ListError`], never a shorter list.
+    pub async fn list_tools(&self) -> Result<Vec<ListedTool>, ListError> {
+        let secret = self
+            .credentials
+            .own_secret(&self.connector)
+            .map_err(ListError::Credential)?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = self.list_request(id, &secret).ok_or(ListError::NotSent)?;
+        let listed = tokio::time::timeout(self.deadline, self.list_exchange(request))
+            .await
+            .map_err(|_elapsed| ListError::TimedOut)??;
+        tool_list(listed.content_type.as_deref(), &listed.body, id)
+    }
+
+    fn list_request(&self, id: u64, secret: &Secret) -> Option<Request<Full<Bytes>>> {
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", secret.bearer())).ok()?;
+        bearer.set_sensitive(true);
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}});
+        let mut request = Request::post(self.endpoint.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header("mcp-protocol-version", PROTOCOL_VERSION)
+            .body(Full::new(Bytes::from(body.to_string())))
+            .ok()?;
+        request.headers_mut().insert(AUTHORIZATION, bearer);
+        Some(request)
+    }
+
+    /// Sends the list request and reads a `200` answer's body, up to the cap.
+    async fn list_exchange(&self, request: Request<Full<Bytes>>) -> Result<Received, ListError> {
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|_| ListError::Unreachable)?;
+        match response.status() {
+            StatusCode::OK => {}
+            other => return Err(ListError::Status(other.as_u16())),
+        }
+        let cap = self.max_response_bytes;
+        if declared_length(response.headers()).is_some_and(|declared| declared > cap as u64) {
+            return Err(ListError::TooLarge);
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut body = response.into_body();
+        let mut listed = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                return Err(ListError::BrokenOff);
+            };
+            if let Ok(data) = frame.into_data() {
+                if listed.len() + data.len() > cap {
+                    return Err(ListError::TooLarge);
+                }
+                listed.extend_from_slice(&data);
+            }
+        }
+        Ok(Received {
+            content_type,
+            body: listed,
         })
     }
 }

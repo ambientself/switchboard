@@ -3,7 +3,7 @@
 //! are read. Held in a [`LivePolicy`], which the registry reloader can replace while the
 //! gateway runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -70,6 +70,22 @@ impl ServedPolicy {
             selection: Selection::Registry(registry.profile_rules().clone()),
             arguments: registry.adapters().clone(),
         })
+    }
+
+    /// This policy with `withdrawn` removed, under `revision`: from the snapshot's approved
+    /// tools and every surface ([`PolicySnapshot::without`]), from the definitions `tools/list`
+    /// answers with, and from the argument adapters, so a call decided before the withdrawal
+    /// is not sent. Everything else is unchanged, and the loader's rules are not run again: a
+    /// removal only narrows (decision 0013, section 6).
+    pub(crate) fn without(&self, withdrawn: &BTreeSet<ToolName>, revision: PolicyRevision) -> Self {
+        let mut arguments = self.arguments.clone();
+        arguments.retain(|tool, _| !withdrawn.contains(tool));
+        Self {
+            snapshot: Arc::new(self.snapshot.without(withdrawn, revision)),
+            catalog: self.catalog.without(withdrawn),
+            selection: self.selection.clone(),
+            arguments,
+        }
     }
 
     /// The snapshot decisions are made from.

@@ -1401,7 +1401,7 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   now also covers the destination class and the connector entry's principal, narrowing, what
   its credential permits, its reach and its reach test's date, but not the reach test's record,
   the probe record or the reach check (the connector entries entry below).
-- Drift detection and withdrawal: not built.
+- Drift detection and withdrawal: built (the drift pass entry below).
 - Destination limits, the server's identity verified and redirects refused: not built.
 - Size limits, deadlines, bounded concurrency and per-team and per-server limits: built
   (#139). Each server's deadline and result size, and the caps on calls in flight in the
@@ -1416,8 +1416,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   opt-outs entry below.
 - The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
   issuer's key age (#115), the policy's age and maximum age (#132), and the calls shed and
-  each proxied server's calls, latency and late or oversized answers (#139). The drift, probe
-  and reach-check signals wait for what they count. Decision 0014 writes the alert conditions
+  each proxied server's calls, latency and late or oversized answers (#139), and each proxied
+  server's drift polls and withdrawals (the drift pass entry below). The probe and reach-check
+  signals wait for what they count. Decision 0014 writes the alert conditions
   down, and there are no rules until a metrics sink exists.
 - The overload, hanging-server and drift demonstrations: not built. `tests/limits.rs` shows
   overload and a hanging server in a test (#139), not in a demo.
@@ -1461,7 +1462,27 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   allows plain `http` only for `in_cluster`. The probe record parses and is optional until the
   probe is built. Verified certificates, the address checks and the refused addresses are not
   built.
-- The drift pass, its derived revisions and standing withdrawals: not built.
+- The drift pass, its derived revisions and standing withdrawals: built. Every replica reads
+  each proxied server's `tools/list` with the entry's own credential, under its call deadline
+  and answer cap, once during boot before the listener is bound and then every
+  `[drift] interval_seconds` (300 s by default, 5 to 900; the demos set 10), each server on a
+  schedule of its own, so a server that answers late holds back no other server's polls. Each
+  server is polled one poll at a time, so section 13's bound of one interval plus one call
+  deadline holds when the interval is at least the entry's call deadline, as at the defaults
+  and in the demos. With a shorter interval, a list answered late but inside the deadline holds
+  back that server's next poll until it arrives, and the worst case is about two call deadlines
+  (#165). An approved tool whose served definition no longer hashes to its `definition_sha256`,
+  by the loader's own function, or that the server no longer lists, is withdrawn: the policy in
+  force less the tool, under the revision `{base}+withdrawn:{names}`, swapped in atomically,
+  with `tool_withdrawn` logged at ERROR and counted. A poll is judged only against the
+  approvals it began under, so a list read before a reload approved a tool again does not
+  withdraw it. A failed poll, including a list that names a next page, keeps the tools served
+  and is logged and counted. A withdrawal is keyed by the tool's name, both hashes and
+  `approved_at`, is applied again to each reload that keeps its key, and is cleared by a new
+  approval or by removing the tool; it lives in the replica's memory, so a restart against a
+  restored server serves the tool again (decision 0013, section 7). `tests/drift.rs` has
+  decision 0013's drift scenarios. Not built: the probe calls and the reach check of the same
+  pass.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.
@@ -1473,7 +1494,7 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The 512 KiB row bound and its test: not built.
 - The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
   each proxied server's calls, latency and late or oversized answers (#139), and the policy's
-  age (#132), are exported. Each server's drift polls and withdrawals, probe results and
+  age (#132), and each server's drift polls and withdrawals, are exported. Probe results and
   reach-check results are not built.
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a

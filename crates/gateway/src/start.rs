@@ -27,13 +27,21 @@
 //! how the gateway was started: identity enforced or disabled, with how many issuers and
 //! subjects; each issuer whose keys were fetched, with how many keys and how often they are
 //! fetched again; audit in Postgres, with the role and its check, or disabled; and the
-//! registry's revision.
+//! registry's revision, with the revision, tools and withdrawals actually served once the first
+//! drift pass has run.
 //!
 //! The Postgres store reports each audit row it stops trying to complete. The gateway logs each
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
 //! left open and not only by querying for it (decision 0009).
 //!
 //! It logs a boot line for the caps on calls in flight, and one for each server's bounds.
+//!
+//! Last, before it returns, it runs the drift pass's first pass ([`crate::drift`]): it reads
+//! every proxied server's tool list, each within its call deadline, and withdraws each approved
+//! tool the server no longer serves as approved. The binary binds its listener only after, so a
+//! tool withdrawn then is never served, and nothing is answered, `/readyz` included, until the
+//! pass ends. A poll that fails does not stop the start: the server's tools stay served.
+//! [`Prepared::drift`] polls each server again every interval, each on its own schedule.
 //!
 //! It logs a boot line for metrics too: the address `GET /metrics` will be served on, or that
 //! none is, since `[metrics]` is optional. [`Prepared::metrics`] carries the address to the
@@ -59,6 +67,7 @@ use crate::boot::{self, BootError, Gates, Settings, Wiring};
 use crate::bulkhead::{Bulkhead, ProxiedSignals};
 use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
+use crate::drift::DriftPass;
 use crate::keys::KeyRefresher;
 use crate::reload::Reloader;
 
@@ -180,6 +189,9 @@ pub struct Prepared {
     pub max_in_flight: usize,
     /// What each proxied server's bulkhead counts, for the metrics.
     pub proxied: ProxiedSignals,
+    /// The drift pass, its first pass already run. Run it beside the watch, and stop it when the
+    /// gateway shuts down.
+    pub drift: DriftPass,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -191,6 +203,7 @@ impl std::fmt::Debug for Prepared {
             .field("keys", &self.keys)
             .field("metrics", &self.metrics)
             .field("max_in_flight", &self.max_in_flight)
+            .field("drift", &self.drift)
             .finish_non_exhaustive()
     }
 }
@@ -267,7 +280,7 @@ async fn prepare_with(
     )?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
-    let (wiring, proxied_signals) = proxied(
+    let (wiring, proxied_signals, connectors) = proxied(
         &registry,
         &credentials,
         &deployment.limits,
@@ -378,15 +391,32 @@ async fn prepare_with(
         %instance,
         "audit rows record this instance as the one that began them"
     );
+    // The first drift pass, before the binary binds the listener (decision 0013, section 5).
+    let drift = DriftPass::new(
+        reloader.withdrawals(),
+        connectors,
+        deployment.drift_interval,
+    );
+    drift.pass().await;
+    tracing::info!(
+        event = "boot",
+        drift_interval_seconds = deployment.drift_interval.as_secs(),
+        "read each proxied server's tool list before serving, and again every interval"
+    );
+    // What is served: the registry file's policy, less what the first pass withdrew.
+    let withdrawn = drift.withdrawals().standing().len();
+    let served = gates.policy().revision().clone();
     tracing::info!(
         event = "boot",
         registry = %deployment.registry_file.display(),
-        %revision,
-        tools,
+        registry_revision = %revision,
+        revision = %served,
+        tools = tools.saturating_sub(withdrawn),
+        withdrawn,
         servers,
         poll_seconds = deployment.poll.as_secs(),
         max_age_seconds = deployment.max_age.as_secs(),
-        "serving the registry file's policy"
+        "serving the registry file's policy, less any tool the first drift pass withdrew"
     );
 
     Ok(Prepared {
@@ -402,20 +432,25 @@ async fn prepare_with(
         metrics: deployment.metrics,
         max_in_flight: limits.max_in_flight,
         proxied: proxied_signals,
+        drift,
     })
 }
+
+/// The connector of each proxied server, by name, for the drift pass.
+type Connectors = BTreeMap<ConnectorName, Arc<ProxyConnector>>;
 
 /// `wiring` with a [`ProxyConnector`] for each of the registry's servers, built with the bounds
 /// `servers` sets for it or the defaults, in a [`Bulkhead`] holding it to `limits`. Each is
 /// given the call deadline its connector was built with, which every row of its calls
-/// includes in its deadline. Refuses bounds for a server the registry does not name.
+/// includes in its deadline. Refuses bounds for a server the registry does not name. Each
+/// connector is returned too, for the drift pass, which reads the server's tool list with it.
 fn proxied(
     registry: &Registry,
     credentials: &Arc<FileCredentials>,
     limits: &Limits,
     servers: &BTreeMap<ConnectorName, ServerLimits>,
     mut wiring: Wiring,
-) -> Result<(Wiring, ProxiedSignals), StartError> {
+) -> Result<(Wiring, ProxiedSignals, Connectors), StartError> {
     if let Some(unknown) = servers
         .keys()
         .find(|name| !registry.servers().contains_key(*name))
@@ -423,6 +458,7 @@ fn proxied(
         return Err(StartError::UnknownServerLimits(unknown.clone()));
     }
     let mut signals = BTreeMap::new();
+    let mut connectors = BTreeMap::new();
     for server in registry.servers().values() {
         let bounds = servers.get(&server.name).copied().unwrap_or_default();
         let mut upstream = Upstream::new(server.name.clone(), server.address.clone());
@@ -434,10 +470,11 @@ fn proxied(
             }
         }
         let deadline = upstream.deadline;
-        let connector = ProxyConnector::new(upstream, credentials.clone())?;
+        let connector = Arc::new(ProxyConnector::new(upstream, credentials.clone())?);
+        connectors.insert(server.name.clone(), Arc::clone(&connector));
         let bulkhead = Bulkhead::new(
             server.name.clone(),
-            Arc::new(connector),
+            connector,
             limits.per_server_in_flight,
             limits.per_team_per_server_in_flight,
         );
@@ -446,7 +483,7 @@ fn proxied(
             .proxied(server.name.clone(), Arc::new(bulkhead))
             .call_deadline(server.name.clone(), deadline);
     }
-    Ok((wiring, ProxiedSignals::new(signals)))
+    Ok((wiring, ProxiedSignals::new(signals), connectors))
 }
 
 /// An issuer's key source, with how often to fetch again and how many keys its first fetch
@@ -643,7 +680,7 @@ mod tests {
             Wiring::new(Arc::new(gateway_identity::SystemClock)),
         );
         std::fs::remove_dir_all(&directory).unwrap();
-        wiring.map(|(wiring, _)| wiring)
+        wiring.map(|(wiring, _, _)| wiring)
     }
 
     /// Each proxied server's connector deadline reaches the wiring, which gives it to every row
@@ -791,6 +828,7 @@ mod tests {
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),
+            drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
             credentials: BTreeMap::from([("docs-credential".to_owned(), credential)]),
         }
     }

@@ -166,6 +166,16 @@ impl FileCredentials {
             .map_err(|failed| CredentialError::Refused(failed.to_string()))?;
         Ok((CredentialHandle::new(stored.label.clone()), secret))
     }
+
+    /// The secret for the gateway's own request to `connector`, made for no caller: the drift
+    /// pass's `tools/list`. Read from its file now, with the checks [`load`](Self::load) made.
+    /// The refusal names the connector and the file, never what the file holds.
+    pub(crate) fn own_secret(&self, connector: &ConnectorName) -> Result<Secret, String> {
+        let stored = self.entries.get(connector).ok_or_else(|| {
+            format!("no gateway credential is configured for connector `{connector}`")
+        })?;
+        read_secret(connector, &stored.path).map_err(|failed| failed.to_string())
+    }
 }
 
 impl CredentialSource for FileCredentials {
