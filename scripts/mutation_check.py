@@ -3611,7 +3611,10 @@ mutate("pg-check-open-rows-grant-option-own-role-only", "a grant option on the o
 mutate("pg-check-open-rows-options-ignored", "an open-row view with security_invoker passes the check", PG_CHECK,
        "    if !options.is_empty() {", "    if false {")
 mutate("pg-open-rows-begin-pool", "the open-row query runs on the begin pool", PG_STORE,
-       "timeout_at(deadline, self.finish.get())", "timeout_at(deadline, self.begin.get())")
+       "timeout_at(deadline, self.open_rows_pool.get())", "timeout_at(deadline, self.begin.get())")
+# #140: the open-row query has a pool of its own, so one held up never takes a finish's connection.
+mutate("pg-open-rows-uses-finish-pool", "the open-row query takes a connection from the finish pool again", PG_STORE,
+       "timeout_at(deadline, self.open_rows_pool.get())", "timeout_at(deadline, self.finish.get())")
 mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time limit", PG_STORE,
        "        match timeout_at(deadline, query).await {",
        "        match timeout_at(deadline + Duration::from_secs(3600), query).await {")
