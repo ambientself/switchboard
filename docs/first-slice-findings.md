@@ -256,8 +256,9 @@ From the run of 2026-10-07 (93/93):
 
 ## 6. What the kind run did not prove
 
-- **Key rotation or fetching.** The keys are copied once at deploy time. Tokens signed with a
-  new cluster key would be refused until the next deploy.
+- **Key rotation or fetching.** The keys were copied once at deploy time. Tokens signed with a
+  new cluster key would have been refused until the next deploy. Since #88 the kind gateway
+  fetches them (section 14); no run has rotated the cluster's key.
 - **A real client or a real workload.** The workload is a shell script using the 2025-06-18
   era. Claude Code as a client, and the 2026-07-28 era over HTTP in a cluster, were not run.
   Whether the policy model fits a real team's needs is still open (decision 0008).
@@ -526,3 +527,36 @@ The first slice in kind has the only path, to the mock server, while this eviden
 until 2026-10-17, or until a change that could open a route ([route-exceptions.md](route-exceptions.md),
 evidence log). No run was made against a cluster that does not enforce policy; the route
 check's own tests cover that case with a fake cluster.
+
+## 14. The kind gateway fetches the cluster's keys
+
+On 2026-10-11 the kind gateway stopped reading a copy of the cluster's keys (#88). It fetches
+them from `https://kubernetes.default.svc.cluster.local/openid/v1/jwks` at boot and every
+60 s, over TLS, trusting only the cluster CA from ConfigMap `kube-root-ca.crt`, and with no
+token: the kind base binds `system:service-account-issuer-discovery` to
+`system:unauthenticated` (decision 0013, section 10). mock-docs still reads the copy `demo.sh`
+makes, since it is a test double. Compose keeps its keys file.
+
+The first kind run found what only a real cluster could: the API server serves the keys only
+as `application/jwk-set+json` and answered `406` to the gateway's `Accept: application/json`,
+so the gateway refused to start. The fetch now accepts a JWK set first. The runs after that
+fix, on the existing cluster:
+
+| | result |
+| --- | --- |
+| `demo.sh compose` | PASS (97/97), exit 0 |
+| `demo.sh kind` | PASS (976/976), exit 0 |
+
+What the kind run showed:
+
+- **The fetch.** The gateway's boot line said it fetched 1 key for the cluster's issuer from
+  its keys URL, with `refresh_seconds` 60.
+- **No token, and nothing else.** The ClusterRole the binding names grants only `get` on the
+  issuer's discovery document and keys. From the gateway's container, which mounts no token
+  the API server accepts, curl with the cluster CA got the cluster's keys, and was refused
+  (`403`) the `registry` ConfigMap.
+- **The operator checks still pass.** They read every ClusterRoleBinding, this one among them,
+  and it counts for no team: a workload's token is authenticated, so `system:unauthenticated`
+  is not one of its groups, and the ClusterRole names only URLs.
+
+No run rotated the cluster's signing key.
