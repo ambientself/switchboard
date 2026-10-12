@@ -107,6 +107,11 @@ DRIFT_INTERVAL=10
 # laptop, and is far short of the 10 s after which mock-docs answers slow-doc, so a gateway that
 # waits for the server, or holds the call 2 s past its deadline, fails.
 HANG_ALLOWANCE_MS=1500
+# How long before CALL_DEADLINE the client may be answered, in ms, by its own clock. The
+# gateway's timer and curl's clock are read apart, each to the millisecond, and in kind a client
+# has been seen answered 1 ms before the deadline its row holds. 50 ms covers that, and still
+# fails an answer that came well before the deadline.
+CLIENT_EARLY_MS=50
 # The drift step has mock-docs serve this description of list_documents in place of the one
 # approved. Both entries list it, so both entries' list tools are withdrawn, and the revision
 # served is then this one, the literal derived revision of decision 0013, section 6.
@@ -932,7 +937,8 @@ check_meanwhile() {
 # oversized_or_late_read, its connector abandoned at the call deadline, within a second of it.
 # The row's latency ends before its audit completes, so it does not show when the caller was
 # answered: OUTPUT, what the workload printed, does. Its client got the answer no sooner than
-# the deadline and no later than HANG_ALLOWANCE_MS after it. Team-b's reads went on meanwhile.
+# CLIENT_EARLY_MS before the deadline and no later than HANG_ALLOWANCE_MS after it. Team-b's
+# reads went on meanwhile.
 check_hang() {
   local rows=$1 output=$2 read deadline=$((CALL_DEADLINE * 1000)) elapsed
   read=$(team_entry team-a)__read_document
@@ -943,10 +949,10 @@ check_hang() {
   check "$(jq -r --argjson ms "$deadline" '[.[] | select(.team == "team-a" and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length' <<<"$rows" 2>/dev/null)" 1 \
     "audit: it was answered at the $CALL_DEADLINE s deadline, within a second ($(jq -r '[.[] | select(.team == "team-a") | .latency_ms] | map(tostring) | join(",")' <<<"$rows" 2>/dev/null) ms)"
   elapsed=$(printf '%s\n' "$output" | sed -nE "s/^ *read of slow-doc: answered after ([0-9]+|unknown) ms by the client's clock\$/\\1/p" | tail -n 1)
-  local within="team-a's client was answered between the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
+  local within="team-a's client was answered between $CLIENT_EARLY_MS ms before the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
   if [ "$(number_or_none "$elapsed")" = none ]; then
     fail "$within (got '${elapsed:-no time}' from the workload)"
-  elif [ "$elapsed" -ge "$deadline" ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then
+  elif [ "$elapsed" -ge $((deadline - CLIENT_EARLY_MS)) ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then
     pass "$within ($elapsed ms)"
   else
     fail "$within (got $elapsed ms)"
@@ -960,9 +966,9 @@ check_hang() {
 # team-capacity sentence (decision 0014, section 2: refused, not error, which keeps no sentence).
 # Each of the TEAM_CAP was held until the deadline and no longer, as check_hang holds its one
 # read: its row's latency is within a second of the deadline, and OUTPUT, what the workload
-# printed, gives its client's answer between the deadline and HANG_ALLOWANCE_MS after it. SHED
-# is how many calls the gateway counted shed with scope team over the step: that one. Team-b's
-# reads went on meanwhile.
+# printed, gives its client's answer between CLIENT_EARLY_MS before the deadline and
+# HANG_ALLOWANCE_MS after it. SHED is how many calls the gateway counted shed with scope team
+# over the step: that one. Team-b's reads went on meanwhile.
 check_overload() {
   local rows=$1 shed=$2 output=$3 entry read calls=$((TEAM_CAP + 1)) deadline=$((CALL_DEADLINE * 1000))
   entry=$(team_entry team-a)
@@ -978,11 +984,11 @@ check_overload() {
       and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length' <<<"$rows" 2>/dev/null)" "$TEAM_CAP" \
     "audit: each was answered at the $CALL_DEADLINE s deadline, within a second ($(jq -r '[.[] | select(.team == "team-a" and .error_kind == "oversized_or_late_read") | .latency_ms] | map(tostring) | join(",")' <<<"$rows" 2>/dev/null) ms)"
   local times elapsed held=0 outside=0
-  local within="team-a's client was answered on each of the $TEAM_CAP held reads between the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
+  local within="team-a's client was answered on each of the $TEAM_CAP held reads between $CLIENT_EARLY_MS ms before the $CALL_DEADLINE s deadline and $HANG_ALLOWANCE_MS ms after it, by its own clock"
   times=$(printf '%s\n' "$output" | sed -nE "s/^ *read [0-9]+ of slow-doc, held: answered after ([0-9]+|unknown) ms by the client's clock\$/\\1/p")
   for elapsed in $times; do
     held=$((held + 1))
-    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt "$deadline" ] ||
+    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt $((deadline - CLIENT_EARLY_MS)) ] ||
       [ "$elapsed" -gt $((deadline + HANG_ALLOWANCE_MS)) ]; then
       outside=$((outside + 1))
     fi

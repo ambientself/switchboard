@@ -109,15 +109,16 @@ the workload's answers, the step's own audit rows, the gateway's log lines or me
    `oversized_or_late_read`, with a latency of 5 s and less than a second more. That latency
    ends at the connector, before the audit row completes, so the workload also prints how long
    its own client waited, by curl's clock, and the driver checks it was answered no sooner than
-   the deadline and no more than 1.5 s after it: room for the token check, the policy and the
-   row's two writes on a busy laptop, and far short of mock-docs' 10 s. Team-b's reads are
-   answered meanwhile, by the rows' times.
+   50 ms before the deadline and no more than 1.5 s after it. The 1.5 s is room for the token
+   check, the policy and the row's two writes on a busy laptop, and far short of mock-docs' 10 s.
+   The 50 ms is for the two clocks, read apart: in kind a client has been seen answered 1 ms
+   before the deadline its row holds. Team-b's reads are answered meanwhile, by the rows' times.
 4. **Overload** (decision 0014, section 2). Team-a starts 9 reads of `slow-doc` at once, one
    more than its cap of 8 calls in flight to its server. Eight are answered with the late-answer
    sentence and completed as `error` of the kind `oversized_or_late_read`, and each was held to
    the deadline and no longer, as in the hanging-server step: its row's latency is 5 s and less
-   than a second more, and its client, by curl's clock, was answered no sooner than the deadline
-   and no more than 1.5 s after it. One is refused with the team-capacity sentence and completed
+   than a second more, and its client, by curl's clock, was answered no sooner than 50 ms before
+   the deadline and no more than 1.5 s after it. One is refused with the team-capacity sentence and completed
    as `refused`, its row recording the sentence, and `switchboard_calls_shed_total{scope="team"}`
    rises by one. Team-b's reads are answered meanwhile, and every one of them, 30 in Compose and
    60 in kind, is allowed and answered `ok`.

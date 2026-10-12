@@ -3924,15 +3924,22 @@ fn the_hanging_server_step_needs_a_late_read_at_the_deadline_and_team_b_answered
     assert_all_passed("hang", &run, 4);
     assert!(
         run.stdout.contains(
-            "PASS team-a's client was answered between the 5 s deadline and 1500 ms after it, by its own clock (5240 ms)"
+            "PASS team-a's client was answered between 50 ms before the 5 s deadline and 1500 ms after it, by its own clock (5240 ms)"
         ),
         "{}",
         run.transcript()
     );
+    // The client's clock and the gateway's timer are read apart: a millisecond early passes.
+    let run = run_with(
+        "hang a millisecond early",
+        hang_rows(5.0, "oversized_or_late_read", 99.5),
+        &hang_output("4999"),
+    );
+    assert_all_passed("hang a millisecond early", &run, 4);
     // The row's latency ends at the connector, before the audit completes: a row at the
     // deadline does not show the caller was answered then. The client's own time must.
     const CLIENT: &str =
-        "team-a's client was answered between the 5 s deadline and 1500 ms after it";
+        "team-a's client was answered between 50 ms before the 5 s deadline and 1500 ms after it";
     for (case, elapsed, failure) in [
         (
             "client waited 8 s",
@@ -4064,15 +4071,25 @@ fn the_overload_step_needs_one_call_over_the_team_cap_refused_and_team_b_answere
     assert_all_passed("overload", &run, 7);
     assert!(
         run.stdout.contains(
-            "PASS team-a's client was answered on each of the 8 held reads between the 5 s deadline and 1500 ms after it, by its own clock (5210,5210,5210,5210,5210,5210,5210,5210 ms)"
+            "PASS team-a's client was answered on each of the 8 held reads between 50 ms before the 5 s deadline and 1500 ms after it, by its own clock (5210,5210,5210,5210,5210,5210,5210,5210 ms)"
         ),
         "{}",
         run.transcript()
     );
+    // The client's clock and the gateway's timer are read apart: a millisecond early passes.
+    let run = run_with(
+        "overload a millisecond early",
+        overload_rows_held(&[5.0; 8], 1, &team, 199.5),
+        "1",
+        &overload_output(&[
+            "4999", "5003", "5007", "6001", "4999", "5004", "5004", "5000",
+        ]),
+    );
+    assert_all_passed("overload a millisecond early", &run, 7);
     // Eight reads answered as late, but at 8 s: the deadline did not hold them. Their rows and
     // their client's clock each show it.
     const ROWS_LATE: &str = "audit: each was answered at the 5 s deadline, within a second";
-    const CLIENT: &str = "team-a's client was answered on each of the 8 held reads between the 5 s deadline and 1500 ms after it, by its own clock";
+    const CLIENT: &str = "team-a's client was answered on each of the 8 held reads between 50 ms before the 5 s deadline and 1500 ms after it, by its own clock";
     let run = run_with(
         "all at 8 s",
         overload_rows_held(&[8.0; 8], 1, &team, 199.5),

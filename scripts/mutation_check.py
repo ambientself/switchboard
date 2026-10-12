@@ -4273,8 +4273,8 @@ mutate("demo-hang-deadline-unchecked", "the hanging-server step passes a late re
        """'[.[] | select(.team == "team-a" and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length'""",
        """'[.[] | select(.team == "team-a")] | length'""")
 mutate("demo-hang-client-time-unchecked", "the hanging-server step passes a client answered any time after the deadline, as long as the row is at it", DRIVER,
-       """  elif [ "$elapsed" -ge "$deadline" ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then\n""",
-       """  elif [ "$elapsed" -ge "$deadline" ]; then\n""")
+       """  elif [ "$elapsed" -ge $((deadline - CLIENT_EARLY_MS)) ] && [ "$elapsed" -le $((deadline + HANG_ALLOWANCE_MS)) ]; then\n""",
+       """  elif [ "$elapsed" -ge $((deadline - CLIENT_EARLY_MS)) ]; then\n""")
 mutate("demo-drift-held-withdrawal-unsaid", "a run stopped with the drift step's withdrawals held says nothing of them", DRIVER,
        '  if [ -n "$WITHDRAWAL_HELD" ]; then\n', '  if false; then\n')
 mutate("demo-overload-other-team-unchecked", "the overload step does not check that team-b's reads went on meanwhile", DRIVER,
@@ -4282,7 +4282,7 @@ mutate("demo-overload-other-team-unchecked", "the overload step does not check t
 mutate_all("demo-overload-latency-unchecked", "the overload step passes reads answered as late at any time, by their rows and by their client's clock",
            (DRIVER, """ .error_kind == "oversized_or_late_read"\n      and .latency_ms >= $ms and .latency_ms < $ms + 1000)] | length'""",
             """ .error_kind == "oversized_or_late_read")] | length'"""),
-           (DRIVER, """    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt "$deadline" ] ||\n      [ "$elapsed" -gt $((deadline + HANG_ALLOWANCE_MS)) ]; then\n""",
+           (DRIVER, """    if [ "$(number_or_none "$elapsed")" = none ] || [ "$elapsed" -lt $((deadline - CLIENT_EARLY_MS)) ] ||\n      [ "$elapsed" -gt $((deadline + HANG_ALLOWANCE_MS)) ]; then\n""",
             """    if [ "$(number_or_none "$elapsed")" = none ]; then\n"""))
 mutate("demo-drift-withdrawal-unchecked", "the drift step passes a withdrawal however long after the change it came", DRIVER,
        """      [0-9]*:[0-9]*) check_at_most "$((at - changed))" $((DRIFT_INTERVAL + CALL_DEADLINE)) \\\n""",
