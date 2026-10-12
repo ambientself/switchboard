@@ -1744,9 +1744,10 @@ fn review(team: &str, resource: &str, subresource: &str, namespace: &str) -> Val
 
 /// What the operator checks must ask of `team`'s workload: every row of
 /// deploy/route-check/permissions.tsv, read here on its own. A `namespaced` row is asked in
-/// mock-docs, the gateway's namespace, the team's own and across the cluster; a `cluster` row
-/// across the cluster only. Impersonating a UID or an extra is a review; the rest are can-i
-/// arguments. Returns the can-i arguments and the reviews.
+/// mock-docs, the gateway's namespace, the team's own and across the cluster; a `gateway` row in
+/// mock-docs and the gateway's namespace only; a `cluster` row across the cluster only.
+/// Impersonating a UID or an extra is a review; the rest are can-i arguments. Returns the can-i
+/// arguments and the reviews.
 fn listed_asks(team: &str) -> (Vec<String>, Vec<Value>) {
     let mut asks = Vec::new();
     let mut reviews = Vec::new();
@@ -1760,6 +1761,7 @@ fn listed_asks(team: &str) -> (Vec<String>, Vec<Value>) {
         };
         let wheres: &[&str] = match scope {
             "namespaced" => &["mock-docs", "switchboard", team, "all"],
+            "gateway" => &["mock-docs", "switchboard"],
             "cluster" => &[""],
             _ => panic!("permissions.tsv: {line:?}"),
         };
@@ -1831,17 +1833,34 @@ fn the_operator_checks_ask_every_row_of_the_route_checks_list_for_both_teams() {
         }
         expected_reviews.extend(team_reviews);
     }
-    // Exactly these, and each once: 45 namespaced rows asked four ways and 10 cluster rows, 188
-    // asks and 2 reviews per team; then one RBAC check per row, 55 per team.
+    // Exactly these, and each once: 42 namespaced rows asked four ways, 3 gateway rows asked two
+    // ways and 10 cluster rows, 182 asks and 2 reviews per team; then one RBAC check per row, 55
+    // per team.
     let mut called = asks.clone();
     called.sort();
     expected.sort();
     assert_eq!(called, expected, "{}", run.transcript());
-    assert_eq!(called.len(), 2 * 188);
+    assert_eq!(called.len(), 2 * 182);
     assert_eq!(reviews, expected_reviews, "{}", run.transcript());
+    // A team may read its own ConfigMaps (#104), and not the gateway's or the server's.
+    for team in ["team-a", "team-b"] {
+        for verb in ["get", "list", "watch"] {
+            let user = format!("--as=system:serviceaccount:{team}:mock-workload");
+            for ns in ["mock-docs", "switchboard"] {
+                let ask = format!("k auth can-i {verb} configmaps -n {ns} {user}");
+                assert!(called.contains(&ask), "{ask}");
+            }
+            for ask in [
+                format!("k auth can-i {verb} configmaps -n {team} {user}"),
+                format!("k auth can-i {verb} configmaps {user}"),
+            ] {
+                assert!(!called.contains(&ask), "{ask}");
+            }
+        }
+    }
     assert_eq!(
         run.lines("PASS ").len(),
-        2 * (190 + 55),
+        2 * (184 + 55),
         "{}",
         run.transcript()
     );
@@ -1891,13 +1910,24 @@ fn the_operator_checks_read_the_rbac_rules_bound_to_each_team() {
                 run.transcript()
             );
         }
-        assert!(
-            run.stdout.contains(&format!(
-                "PASS {team}'s workload is bound to no RBAC rule for: get secrets, whatever its resourceNames (RoleBindings in every namespace, and ClusterRoleBindings)\n"
-            )),
-            "{}",
-            run.transcript()
-        );
+        for (row, read) in [
+            (
+                "get secrets",
+                "RoleBindings in every namespace, and ClusterRoleBindings",
+            ),
+            (
+                "get configmaps",
+                "RoleBindings in switchboard,mock-docs, and ClusterRoleBindings",
+            ),
+        ] {
+            assert!(
+                run.stdout.contains(&format!(
+                    "PASS {team}'s workload is bound to no RBAC rule for: {row}, whatever its resourceNames ({read})\n"
+                )),
+                "{}",
+                run.transcript()
+            );
+        }
     }
     // Each list is read once, with the demo's own access.
     reads.sort();
@@ -2020,6 +2050,82 @@ fn a_grant_outside_a_teams_three_namespaces_fails_the_operator_checks() {
         assert_eq!(run.status, Some(1), "{name}: {}", run.transcript());
         // team-a's alone; every can-i and review answered no.
         assert_eq!(run.lines("FAIL "), [want], "{name}: {}", run.transcript());
+    }
+}
+
+#[test]
+fn a_config_map_grant_fails_the_operator_checks_only_in_the_gateways_or_the_servers_namespace() {
+    // A ConfigMap names the file that holds a credential, not the credential (#104): team-a may
+    // read its own. The same grant in the gateway's or mock-docs' namespace, or across the
+    // cluster, fails it.
+    let clusterroles = r#"{"items": [{"metadata": {"name": "read-config"}, "rules": [
+        {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "list", "watch"]}
+    ]}]}"#;
+    let subjects =
+        r#"[{"kind": "ServiceAccount", "name": "mock-workload", "namespace": "team-a"}]"#;
+    let in_namespace = |ns: &str| {
+        format!(
+            r#"{{"items": [{{"metadata": {{"name": "read-config", "namespace": "{ns}"}},
+            "roleRef": {{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "read-config"}},
+            "subjects": {subjects}}}]}}"#
+        )
+    };
+    let (run, _, _, _) = with_rbac(
+        "rbac-configmap-own",
+        "no",
+        "false",
+        "operator_checks",
+        &[
+            ("clusterroles", Some(clusterroles)),
+            ("rolebindings", Some(&in_namespace("team-a"))),
+        ],
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert!(run.stdout.contains(
+        "PASS team-a's workload is bound to no RBAC rule for: list configmaps, whatever its resourceNames (RoleBindings in switchboard,mock-docs, and ClusterRoleBindings)\n"
+    ));
+
+    let cluster_wide = format!(
+        r#"{{"items": [{{"metadata": {{"name": "read-config"}},
+        "roleRef": {{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "read-config"}},
+        "subjects": {subjects}}}]}}"#
+    );
+    for (name, list, bindings, why) in [
+        (
+            "gateway",
+            "rolebindings",
+            in_namespace("switchboard"),
+            "RoleBinding switchboard/read-config binds ClusterRole read-config to ServiceAccount team-a/mock-workload",
+        ),
+        (
+            "server",
+            "rolebindings",
+            in_namespace("mock-docs"),
+            "RoleBinding mock-docs/read-config binds ClusterRole read-config to ServiceAccount team-a/mock-workload",
+        ),
+        (
+            "cluster",
+            "clusterrolebindings",
+            cluster_wide,
+            "ClusterRoleBinding read-config binds ClusterRole read-config to ServiceAccount team-a/mock-workload",
+        ),
+    ] {
+        let (run, _, _, _) = with_rbac(
+            &format!("rbac-configmap-{name}"),
+            "no",
+            "false",
+            "operator_checks",
+            &[
+                ("clusterroles", Some(clusterroles)),
+                (list, Some(&bindings)),
+            ],
+        );
+        assert_eq!(run.status, Some(1), "{name}: {}", run.transcript());
+        let want: Vec<String> = ["get", "list", "watch"]
+            .iter()
+            .map(|verb| format!("FAIL team-a's workload is bound to no RBAC rule for: {verb} configmaps, whatever its resourceNames ({why})"))
+            .collect();
+        assert_eq!(run.lines("FAIL "), want, "{name}: {}", run.transcript());
     }
 }
 

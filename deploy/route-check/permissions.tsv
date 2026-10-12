@@ -12,19 +12,26 @@
 #   verb  resource  subresource  scope
 #
 # The resource is written as `kubectl auth can-i` takes it: `name.group` outside the core group.
-# The subresource is `-` when there is none. The scope is `namespaced` (asked in the workload's,
-# the gateway's and each server's namespace, and across the cluster) or `cluster` (asked across
-# the cluster only, for resources that have no namespace).
+# The subresource is `-` when there is none. The scope is one of:
+#
+#   namespaced  asked in the workload's, the gateway's and each server's namespace, and across
+#               the cluster;
+#   gateway     asked in the gateway's and each server's namespace only, never in the
+#               workload's own and never across the cluster, for what yields something only
+#               where the gateway or a server keeps it. A ClusterRoleBinding still counts there,
+#               and so does a RoleBinding in one of those namespaces, to a Role or a ClusterRole;
+#   cluster     asked across the cluster only, for resources that have no namespace.
 #
 # Reading Secrets. list and watch return a Secret's data too.
 get	secrets	-	namespaced
 list	secrets	-	namespaced
 watch	secrets	-	namespaced
 # Reading the gateway's configuration, which names each server and the file that holds the
-# gateway's credential for it.
-get	configmaps	-	namespaced
-list	configmaps	-	namespaced
-watch	configmaps	-	namespaced
+# gateway's credential for it. It names the file, not the credential, so a workload may read the
+# ConfigMaps of its own namespace (#104): only the gateway's and the servers' are asked.
+get	configmaps	-	gateway
+list	configmaps	-	gateway
+watch	configmaps	-	gateway
 # Starting pods, directly or through a controller. A pod may mount any Secret in its namespace.
 create	pods	-	namespaced
 create	deployments.apps	-	namespaced
