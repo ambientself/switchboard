@@ -1,0 +1,20 @@
+# Decision 0013, section 10: the gateway fetches the cluster issuer's keys from the API server
+# with no token. A projected token would not do: every one authenticates as the pod's own
+# ServiceAccount, with whatever that account is granted. This binding lets a caller with no token
+# read the issuer's discovery document and public keys, which is all the ClusterRole
+# system:service-account-issuer-discovery grants (get on /.well-known/openid-configuration and
+# /openid/v1/jwks). Kubernetes binds that ClusterRole to every ServiceAccount already; this binds
+# it to unauthenticated callers too, and adds no Role or ClusterRole. Only the kind demo has it.
+# A cluster whose owner does not want it gives the gateway a keys file instead.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: switchboard-issuer-discovery-unauthenticated
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:service-account-issuer-discovery
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: system:unauthenticated

@@ -1,9 +1,12 @@
 # The kind demo, without network policy. demo.sh applies this first, shows that a direct call
 # to the mock docs server connects, and only then applies ../policy.
 #
-# Before applying this, demo.sh creates ConfigMap cluster-issuer-keys, in switchboard and in
-# mock-docs, from the cluster's own issuer (kubectl get --raw /openid/v1/jwks). Neither the
-# gateway nor mock-docs will start without it.
+# Before applying this, demo.sh creates ConfigMap cluster-issuer-keys in mock-docs from the
+# cluster's own issuer (kubectl get --raw /openid/v1/jwks). mock-docs will not start without it.
+# The gateway fetches the same keys from the API server itself, with no token, trusting the
+# cluster CA in ConfigMap kube-root-ca.crt (gateway.yaml). issuer-discovery.yaml lets it: it binds
+# system:service-account-issuer-discovery to system:unauthenticated, and nothing else (decision
+# 0013, section 10).
 #
 # The gateway has no static credential for mock-docs: it presents a projected token of its own
 # ServiceAccount (gateway.yaml). Every password here is a dummy value for this demo.
@@ -15,6 +18,7 @@ resources:
   - postgres.yaml
   - migrate-job.yaml
   - mock-docs.yaml
+  - issuer-discovery.yaml
   - gateway.yaml
   - workloads.yaml
 configMapGenerator:

@@ -59,6 +59,12 @@ IMG_RUN=$IMG
 POSTGRES_IMAGE=postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
 COMPOSE_FILE=$ROOT/deploy/compose/compose.yaml
 KIND_ISSUER=https://kubernetes.default.svc.cluster.local
+# Where the kind gateway fetches that issuer's keys, with no token, and the cluster CA it trusts
+# for it (deploy/kind/base: config/gateway.toml, gateway.yaml, issuer-discovery.yaml).
+KIND_KEYS_URL=$KIND_ISSUER/openid/v1/jwks
+KIND_CLUSTER_CA=/etc/switchboard/cluster-ca/ca.crt
+# What the gateway logs at boot for each issuer whose keys it fetched (crates/gateway, start.rs).
+KEYS_FETCHED_MESSAGE="fetched the issuer's keys from its keys URL"
 # The gateway's ServiceAccount: the one caller mock-docs accepts in kind (deploy/kind/base).
 KIND_GATEWAY_SUBJECT=system:serviceaccount:switchboard:gateway
 AUDIT_TABLE=switchboard_audit.call_rows
@@ -395,6 +401,19 @@ check_boot() {
   check_at_least "$(count_lines '"identity":"enforce"' "$1")" 1 "the gateway enforces identity"
   check_at_least "$(count_lines '"audit":"postgres"' "$1")" 1 "the gateway writes audit rows to Postgres"
   check "$(count_lines '"identity":"disabled"|"audit":"disabled"' "$1")" 0 "the gateway disabled neither identity nor audit"
+}
+
+# check_keys_fetched LOGS ISSUER: the gateway says at boot, exactly once, that it fetched
+# ISSUER's keys from its keys URL, and how many. A gateway that read a keys file logs no such
+# line, and one whose fetch failed did not start.
+check_keys_fetched() {
+  local counts
+  # shellcheck disable=SC2016 # jq's own variables
+  counts=$(printf '%s\n' "$1" | jq -rR --arg issuer "$2" --arg message "$KEYS_FETCHED_MESSAGE" \
+    'fromjson? | .fields? // empty
+      | select(.event == "boot" and .message == $message and .keys_issuer == $issuer) | .keys')
+  check "$(count_lines . "$counts")" 1 "the gateway fetched the keys of $2 from its keys URL at boot"
+  check_at_least "$(printf '%s\n' "$counts" | head -n 1)" 1 "the keys it fetched"
 }
 
 # metric SERIES TEXT: the value of the one sample of TEXT, Prometheus text, written exactly as
@@ -1066,19 +1085,19 @@ kind_run() {
   echo "this run's image: $IMG_RUN"
   load_images
 
-  step "the cluster's issuer and keys (copied once, not rotated or fetched)"
+  step "the cluster's issuer and keys (the gateway fetches its own; mock-docs gets a copy)"
   local issuer
   issuer=$(k get --raw /.well-known/openid-configuration | jq -r .issuer)
   check "$issuer" "$KIND_ISSUER" "the cluster's issuer is the one the gateway trusts"
   k get --raw /openid/v1/jwks >"$DEMO_DIR/cluster-jwks.json"
   check_at_least "$(jq '.keys | length' "$DEMO_DIR/cluster-jwks.json")" 1 "the cluster published its signing keys"
   k apply -f "$ROOT/deploy/kind/base/namespaces.yaml"
-  # The gateway verifies the workloads' tokens with these keys, and mock-docs the gateway's.
-  local ns
-  for ns in switchboard mock-docs; do
-    k -n "$ns" create configmap cluster-issuer-keys --from-file=jwks.json="$DEMO_DIR/cluster-jwks.json" \
-      --dry-run=client -o yaml | k apply -f -
-  done
+  # mock-docs, a test double, verifies the gateway's tokens with a copy of these keys, made once.
+  # The gateway fetches its own from the API server (deploy/kind/base/config/gateway.toml); a copy
+  # an earlier run left in its namespace is removed.
+  k -n mock-docs create configmap cluster-issuer-keys --from-file=jwks.json="$DEMO_DIR/cluster-jwks.json" \
+    --dry-run=client -o yaml | k apply -f -
+  k -n switchboard delete configmap cluster-issuer-keys --ignore-not-found
 
   step "deploy Postgres, the migration, mock-docs and the gateway, with no network policy"
   # A run on an existing cluster starts from no policy, or the first probe below would mean nothing.
@@ -1108,6 +1127,27 @@ kind_run() {
   echo "    pod $GATEWAY_POD"
   if fetch "the gateway's log (pod $GATEWAY_POD)" k -n switchboard logs "pod/$GATEWAY_POD"; then
     check_boot "$FETCHED"
+    check_keys_fetched "$FETCHED" "$KIND_ISSUER"
+  fi
+
+  step "the API server gives its issuer's keys, and nothing else, to a caller with no token (decision 0013, section 10)"
+  # Asked from the gateway's container, which mounts no token the API server accepts, with the
+  # cluster CA the gateway trusts. The base binds this ClusterRole, and only it, to
+  # system:unauthenticated (deploy/kind/base/issuer-discovery.yaml).
+  if fetch "the issuer-discovery ClusterRole" k get clusterrole system:service-account-issuer-discovery -o json; then
+    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \
+      '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \
+      "the issuer-discovery ClusterRole grants only get on the issuer's discovery document and keys"
+  fi
+  if fetch "the issuer's keys with no token (pod $GATEWAY_POD)" k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \
+    curl -sS --fail --cacert "$KIND_CLUSTER_CA" "$KIND_KEYS_URL"; then
+    check "$(jq -c '[.keys[].kid] | sort' <<<"$FETCHED")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \
+      "an unauthenticated read of $KIND_KEYS_URL gets the cluster's keys"
+  fi
+  if fetch "a ConfigMap with no token (pod $GATEWAY_POD)" k -n switchboard exec "pod/$GATEWAY_POD" -c gateway -- \
+    curl -sS -o /dev/null -w '%{http_code}' --cacert "$KIND_CLUSTER_CA" \
+    "$KIND_ISSUER/api/v1/namespaces/switchboard/configmaps/registry"; then
+    check "$FETCHED" 403 "an unauthenticated read of a ConfigMap is refused"
   fi
 
   step "before the policy: each team's direct call to mock-docs connects, the server refuses the workload's own token, and the gateway's call to mock-docs succeeds"

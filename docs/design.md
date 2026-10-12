@@ -302,7 +302,12 @@ address. The client is rustls with ring, passed to the client itself and never i
 process default; it offers HTTP/1.1 only, and the deadline covers the TLS handshake. An issuer
 whose keys need a bearer token takes `keys_token_file`, read again on every fetch because the
 kubelet rotates projected tokens, and sent to the keys URL only. Both are refused beside an
-`http` keys URL. The demo deployments still use keys files.
+`http` keys URL. The kind demo fetches the cluster issuer's keys from the API server this way,
+trusting `kube-root-ca.crt` and sending no token: the kind base binds
+`system:service-account-issuer-discovery` to `system:unauthenticated`, and nothing else
+([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 10). The
+Compose demo still uses a keys file, since its development issuer has an `https` name but is
+served over `http`.
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
