@@ -3368,3 +3368,856 @@ fn the_kind_run_checks_the_gateway_fetched_the_issuers_keys() {
         assert!(run.failed(failure), "{case}: {}", run.transcript());
     }
 }
+
+// --- #11's demonstrations ---------------------------------------------------------------------
+
+/// The value demo.sh gives `name` on its one line `NAME=value`, without quotes.
+fn driver_value(name: &str) -> String {
+    let driver = common::read("deploy/demo/demo.sh");
+    let lines: Vec<&str> = driver
+        .lines()
+        .filter_map(|line| line.strip_prefix(&format!("{name}=")))
+        .collect();
+    assert_eq!(lines.len(), 1, "want one line `{name}=` in demo.sh");
+    lines[0].trim_matches('"').to_owned()
+}
+
+/// Runs `call`, a call of one of demo.sh's functions, then finishes the run. Each `{key}` in
+/// `call` becomes the contents of a scratch file holding the matching text of `files`, quoted.
+fn checked(name: &str, call: &str, files: &[(&str, &str)]) -> Run {
+    require(&["jq", "awk"]);
+    let dir = scratch(name);
+    let mut call = call.to_owned();
+    for (key, contents) in files {
+        let path = write(&dir, key, contents);
+        call = call.replace(
+            &format!("{{{key}}}"),
+            &format!("\"$(cat '{}')\"", path.display()),
+        );
+    }
+    sourced(&format!("{call}\nFINISHED=1\nresult 0"))
+}
+
+/// The run passed every check it made, and made at least `checks`.
+fn assert_all_passed(case: &str, run: &Run, checks: usize) {
+    assert_eq!(run.status, Some(0), "{case}: {}", run.transcript());
+    assert!(
+        run.lines("FAIL ").is_empty(),
+        "{case}: {}",
+        run.transcript()
+    );
+    assert!(
+        run.lines("PASS ").len() >= checks,
+        "{case}: {}",
+        run.transcript()
+    );
+}
+
+/// The run failed, and a FAIL line holds `failure`.
+fn assert_fails(case: &str, run: &Run, failure: &str) {
+    assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+    assert!(
+        run.failed(failure),
+        "{case}: no FAIL line holds {failure:?}\n{}",
+        run.transcript()
+    );
+}
+
+/// A row as step_rows reads it: `team`'s call to its own entry's `tool`, allowed and completed
+/// with `outcome`, begun at `begun` and finished `seconds` later.
+fn step_row(team: &str, tool: &str, outcome: &str, begun: f64, seconds: f64) -> Value {
+    json!({
+        "kind": "call", "team": team, "tool": format!("docs-{team}__{tool}"),
+        "decision": "allow", "reason": null, "outcome": outcome,
+        "error_kind": if outcome == "error" { json!("other") } else { Value::Null },
+        "outcome_sentence": null, "latency_ms": (seconds * 1000.0).round(),
+        "revision": "demo-5", "listed": null,
+        "begun": begun, "finished": begun + seconds,
+    })
+}
+
+/// The gateway's JSON log line of one event with `fields`, at `timestamp`.
+fn log_line(timestamp: &str, fields: Value) -> String {
+    json!({"timestamp": timestamp, "level": "INFO", "fields": fields, "target": "gateway"})
+        .to_string()
+}
+
+/// The constants the demonstrations rely on are the code's and the deployment files': the team
+/// cap and the call deadline are the gateway's defaults, which the demos leave alone, the drift
+/// interval is what both deployment files set, and the derived revision is the drift pass's.
+#[test]
+fn the_demonstrations_rely_on_the_codes_caps_deadline_and_interval() {
+    assert_eq!(
+        driver_value("TEAM_CAP"),
+        gateway::DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT.to_string()
+    );
+    assert_eq!(
+        driver_value("CALL_DEADLINE"),
+        connector_proxy::DEFAULT_DEADLINE.as_secs().to_string()
+    );
+    for config in [
+        "deploy/compose/config/gateway.toml",
+        "deploy/kind/base/config/gateway.toml",
+    ] {
+        let text = common::read(config);
+        let table: toml::Table = text.parse().unwrap();
+        assert_eq!(
+            table["drift"]["interval_seconds"]
+                .as_integer()
+                .map(|n| n.to_string()),
+            Some(driver_value("DRIFT_INTERVAL")),
+            "{config}"
+        );
+        // Neither sets a cap or a server's deadline: the defaults hold.
+        assert!(!text.contains("in_flight"), "{config}");
+        assert!(!text.contains("deadline_seconds"), "{config}");
+    }
+    let revision = driver_value("REVISION");
+    let withdrawn = ["docs-team-a__list_documents", "docs-team-b__list_documents"]
+        .into_iter()
+        .map(|name| gateway_core::ToolName::parse(name).unwrap())
+        .collect();
+    assert_eq!(
+        driver_value("DRIFTED_REVISION").replace("$REVISION", &revision),
+        gateway::withdrawn_revision(&gateway_core::PolicyRevision::new(revision), &withdrawn)
+            .as_str()
+    );
+}
+
+/// The gateway's boot lines a run reads the caps, deadlines and interval from.
+fn boot_lines(cap: u64, deadline_b: Option<u64>, interval: u64) -> String {
+    let at = "2026-10-12T10:00:00.000000Z";
+    let mut lines = vec![
+        log_line(
+            at,
+            json!({"event": "boot", "max_in_flight": 256, "per_server_in_flight": 32,
+                   "per_team_per_server_in_flight": cap}),
+        ),
+        log_line(
+            at,
+            json!({"event": "boot", "server": "docs-team-a", "deadline_seconds": 5,
+                   "max_result_bytes": 65536}),
+        ),
+    ];
+    if let Some(deadline) = deadline_b {
+        lines.push(log_line(
+            at,
+            json!({"event": "boot", "server": "docs-team-b", "deadline_seconds": deadline,
+                   "max_result_bytes": 65536}),
+        ));
+    }
+    lines.push(log_line(
+        at,
+        json!({"event": "boot", "drift_interval_seconds": interval}),
+    ));
+    lines.join("\n")
+}
+
+#[test]
+fn the_runs_check_the_gateway_boots_with_the_caps_deadlines_and_interval_they_rely_on() {
+    let check = |name: &str, logs: &str| checked(name, "check_bounds {logs}", &[("logs", logs)]);
+    assert_all_passed("bounds", &check("bounds", &boot_lines(8, Some(5), 10)), 4);
+    for (case, logs, failure) in [
+        (
+            "other cap",
+            boot_lines(32, Some(5), 10),
+            "the gateway caps each team at 8 calls in flight to each server (decision 0014) (got '32'",
+        ),
+        (
+            "no deadline",
+            boot_lines(8, None, 10),
+            "entry docs-team-b's calls have a 5 s deadline (decision 0014) (got ''",
+        ),
+        (
+            "other deadline",
+            boot_lines(8, Some(60), 10),
+            "entry docs-team-b's calls have a 5 s deadline (decision 0014) (got '60'",
+        ),
+        (
+            "default interval",
+            boot_lines(8, Some(5), 300),
+            "the drift pass reads each entry's tool list every 10 s (got '300'",
+        ),
+    ] {
+        assert_fails(case, &check(case, &logs), failure);
+    }
+}
+
+#[test]
+fn a_kind_job_gets_the_workloads_mode_and_its_arguments() {
+    require(&["jq"]);
+    let cronjob = json!({
+        "metadata": {"namespace": "team-a"},
+        "spec": {"jobTemplate": {
+            "metadata": {"labels": {"app": "mock-workload"}},
+            "spec": {"template": {"spec": {"containers": [{"name": "workload", "args": ["full"]}]}}},
+        }},
+    });
+    let run = sourced(&format!(
+        "k() {{ case \"$*\" in '-n team-a get cronjob mock-workload -o json') echo '{cronjob}' ;; 'apply -f -') cat >&2 ;; esac; }}\n\
+         start_job team-a mock-workload overload 9"
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let applied: Value = serde_json::from_str(&run.stderr)
+        .unwrap_or_else(|error| panic!("{error}\n{}", run.transcript()));
+    assert_eq!(
+        applied["spec"]["template"]["spec"]["containers"][0]["args"],
+        json!(["overload", "9"]),
+        "{applied}"
+    );
+}
+
+/// Runs `call`, one of demo.sh's registry variants, on `registry`, the text of a registry
+/// file, and returns what it printed and how it ended.
+fn variant(name: &str, call: &str, registry: &str) -> Run {
+    require(&["awk"]);
+    let dir = scratch(name);
+    let input = write(&dir, "registry.toml", registry);
+    sourced(&format!("{call} <'{}'", input.display()))
+}
+
+/// The variants the refused-at-load and drift steps make from the registry served, at run time,
+/// load as the gateway loads them: the one admitting team-b to docs-team-a's surface is refused
+/// for rule 5, with a reason the step accepts, and the re-approval loads with only its revision
+/// and the two list tools' approval times changed.
+#[test]
+fn the_registry_variants_load_as_the_gateway_loads_them() {
+    for path in [
+        "deploy/compose/config/registry/registry.toml",
+        "deploy/kind/base/config/registry/registry.toml",
+    ] {
+        let served = common::read(path);
+        let original = gateway_registry::Registry::from_toml_str(&served).unwrap();
+
+        let reach = variant(
+            "reach",
+            "reach_variant demo-5-reach-20261012T100000Z",
+            &served,
+        );
+        assert_eq!(reach.status, Some(0), "{path}: {}", reach.transcript());
+        let error = gateway_registry::Registry::from_toml_str(&reach.stdout)
+            .expect_err("the loader admits team-b to docs-team-a's surface")
+            .to_string();
+        // The gateway logs this as the refusal's reason; the step must accept it.
+        let events = log_line(
+            "2026-10-12T10:00:02.000000Z",
+            json!({"event": "policy_reload_refused",
+                   "file": "/etc/switchboard/registry/registry.toml",
+                   "reason": error, "served": "demo-5"}),
+        );
+        let run = checked(
+            "refused-real",
+            "check_refused_at_load \"$(events {log} 'select(.event == \"policy_reloaded\" or .event == \"policy_reload_refused\")')\" demo-5-reach-20261012T100000Z",
+            &[("log", &events)],
+        );
+        assert_all_passed(path, &run, 4);
+        // Only the revision and the surface's teams changed.
+        let changed: Vec<(&str, &str)> = served
+            .lines()
+            .zip(reach.stdout.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                (
+                    "revision = \"demo-5\"",
+                    "revision = \"demo-5-reach-20261012T100000Z\""
+                ),
+                ("teams = [\"team-a\"]", "teams = [\"team-a\", \"team-b\"]"),
+            ],
+            "{path}"
+        );
+        assert_eq!(served.lines().count(), reach.stdout.lines().count());
+
+        let call = "reapproval_variant demo-5-reapproved-20261012T100000Z 2026-10-12T10:00:00Z \
+                    docs-team-a__list_documents docs-team-b__list_documents";
+        let again = variant("reapproval", call, &served);
+        assert_eq!(again.status, Some(0), "{path}: {}", again.transcript());
+        let approved = gateway_registry::Registry::from_toml_str(&again.stdout).unwrap();
+        assert_eq!(
+            approved.snapshot().revision().as_str(),
+            "demo-5-reapproved-20261012T100000Z"
+        );
+        assert_eq!(original.approvals().len(), approved.approvals().len());
+        for (tool, before) in original.approvals() {
+            let after = &approved.approvals()[tool];
+            if tool.as_str().ends_with("__list_documents") {
+                assert_eq!(after.approved_at, "2026-10-12T10:00:00Z", "{tool}");
+                assert_ne!(after.approved_at, before.approved_at, "{tool}");
+                assert_eq!(after.definition_sha256, before.definition_sha256, "{tool}");
+                assert_eq!(after.binding_sha256, before.binding_sha256, "{tool}");
+            } else {
+                assert_eq!(after, before, "{tool}");
+            }
+        }
+
+        // A registry the variant cannot be made from is refused, not passed on half made.
+        let widened = variant("reach-twice", "reach_variant demo-5-x", &reach.stdout);
+        assert_eq!(widened.status, Some(1), "{}", widened.transcript());
+        let unknown = variant(
+            "reapproval-unknown",
+            "reapproval_variant demo-5-y 2026-10-12T10:00:00Z docs-team-c__list_documents",
+            &served,
+        );
+        assert_eq!(unknown.status, Some(1), "{}", unknown.transcript());
+        let none = variant(
+            "reapproval-none",
+            "reapproval_variant demo-5-y 2026-10-12T10:00:00Z",
+            &served,
+        );
+        assert_eq!(none.status, Some(1), "{}", none.transcript());
+    }
+}
+
+#[test]
+fn the_refused_at_load_step_needs_a_rule_5_refusal_and_the_policy_served_unchanged() {
+    let refusal = |reason: &str, served: &str| {
+        log_line(
+            "2026-10-12T10:00:02.000000Z",
+            json!({"event": "policy_reload_refused", "reason": reason, "served": served}),
+        )
+    };
+    let rule_5 = "rule 5: surface `docs-team-a` serves tool `docs-team-a__list_documents`, whose entry reaches `docs / project / atlas`, to team `team-b`, whose limit does not hold it";
+    let run_on = |name: &str, lines: &[String]| {
+        checked(
+            name,
+            "check_refused_at_load \"$(events {log} 'select(.event == \"policy_reloaded\" or .event == \"policy_reload_refused\")')\" demo-5-reach-x",
+            &[("log", &lines.join("\n"))],
+        )
+    };
+    assert_all_passed(
+        "refused",
+        &run_on("refused", &[refusal(rule_5, "demo-5")]),
+        4,
+    );
+    let served_variant = log_line(
+        "2026-10-12T10:00:02.000000Z",
+        json!({"event": "policy_reloaded", "revision": "demo-5-reach-x"}),
+    );
+    for (case, lines, failure) in [
+        (
+            "served",
+            vec![served_variant.clone()],
+            "the gateway refused the registry that admits team-b to docs-team-a's surface (got 'policy_reloaded'",
+        ),
+        (
+            "served after a refusal",
+            vec![refusal(rule_5, "demo-5"), served_variant],
+            "the gateway never served revision demo-5-reach-x (got '1'",
+        ),
+        (
+            "another rule",
+            vec![refusal(
+                "rule 3: proxied entry `docs-team-a` reaches `docs / project / atlas` and has no recorded reach test",
+                "demo-5",
+            )],
+            "its reason is rule 5",
+        ),
+        (
+            "another team",
+            vec![refusal(&rule_5.replace("team-b", "team-c"), "demo-5")],
+            "its reason is rule 5",
+        ),
+        (
+            "another policy served",
+            vec![refusal(rule_5, "demo-6")],
+            "the policy served is still revision demo-5 (got 'demo-6'",
+        ),
+        ("nothing", vec![], "the gateway refused the registry"),
+    ] {
+        assert_fails(case, &run_on(case, &lines), failure);
+    }
+}
+
+#[test]
+fn the_undeclared_argument_step_needs_an_invalid_arguments_row_and_no_call() {
+    let row = |kind: &str| {
+        let mut row = step_row("team-a", "read_document", "error", 100.0, 0.01);
+        row["error_kind"] = json!(kind);
+        row
+    };
+    let run_on = |name: &str, rows: Value, before: &str, after: &str| {
+        checked(
+            name,
+            &format!("check_undeclared {{rows}} '{before}' '{after}'"),
+            &[("rows", &rows.to_string())],
+        )
+    };
+    assert_all_passed(
+        "undeclared",
+        &run_on("undeclared", json!([row("invalid_arguments")]), "6", "6"),
+        2,
+    );
+    const KIND: &str = "completed as error of the kind invalid_arguments";
+    for (case, rows, before, after, failure) in [
+        (
+            "forwarded",
+            json!([row("invalid_arguments")]),
+            "6",
+            "7",
+            "mock-docs received no call for the read with an undeclared argument (its calls before and after) (got '7', want '6')",
+        ),
+        (
+            "not counted",
+            json!([row("invalid_arguments")]),
+            "",
+            "",
+            "its calls could not be counted",
+        ),
+        ("other kind", json!([row("other")]), "6", "6", KIND),
+        (
+            "ran",
+            json!([step_row("team-a", "read_document", "ok", 100.0, 0.01)]),
+            "6",
+            "6",
+            KIND,
+        ),
+        (
+            "two rows",
+            json!([row("invalid_arguments"), row("invalid_arguments")]),
+            "6",
+            "6",
+            KIND,
+        ),
+        ("no rows", json!([]), "6", "6", KIND),
+    ] {
+        assert_fails(case, &run_on(case, rows, before, after), failure);
+    }
+}
+
+/// Team-b's steady reads, one a second from `from` until `to`, each answered in 10 ms.
+fn team_b_reads(from: f64, to: f64) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut at = from;
+    while at < to {
+        rows.push(step_row("team-b", "read_document", "ok", at, 0.01));
+        at += 1.0;
+    }
+    rows
+}
+
+/// The hanging-server step's rows: team-a's read, answered after `latency` seconds as an error
+/// of `kind`, and team-b's reads from `team_b_from`.
+fn hang_rows(latency: f64, kind: &str, team_b_from: f64) -> Value {
+    let mut late = step_row("team-a", "read_document", "error", 100.0, latency);
+    late["error_kind"] = json!(kind);
+    let mut rows = vec![late];
+    rows.extend(team_b_reads(team_b_from, 108.0));
+    json!(rows)
+}
+
+#[test]
+fn the_hanging_server_step_needs_a_late_read_at_the_deadline_and_team_b_answered_meanwhile() {
+    let run_on = |name: &str, rows: Value| {
+        checked(name, "check_hang {rows}", &[("rows", &rows.to_string())])
+    };
+    assert_all_passed(
+        "hang",
+        &run_on("hang", hang_rows(5.03, "oversized_or_late_read", 99.5)),
+        3,
+    );
+    const DEADLINE: &str = "audit: it was answered at the 5 s deadline, within a second";
+    for (case, rows, failure) in [
+        (
+            "answered early",
+            hang_rows(1.2, "oversized_or_late_read", 99.5),
+            DEADLINE,
+        ),
+        (
+            "held past the deadline",
+            hang_rows(9.9, "oversized_or_late_read", 99.5),
+            DEADLINE,
+        ),
+        (
+            "another kind",
+            hang_rows(5.03, "other", 99.5),
+            "completed as error of the kind oversized_or_late_read",
+        ),
+        (
+            "team-b held up",
+            hang_rows(5.03, "oversized_or_late_read", 105.5),
+            "audit: team-b's reads were answered while team-a's read was held until its deadline (got 0",
+        ),
+    ] {
+        assert_fails(case, &run_on(case, rows), failure);
+    }
+    // A second row of team-a's is a call the step did not make.
+    let mut rows = hang_rows(5.03, "oversized_or_late_read", 99.5);
+    rows.as_array_mut()
+        .unwrap()
+        .push(step_row("team-a", "read_document", "ok", 101.0, 0.01));
+    assert_fails(
+        "two",
+        &run_on("hang-two", rows),
+        "team-a's one row is its read",
+    );
+}
+
+/// The overload step's rows: `late` of team-a's reads held to the deadline, `refused` refused
+/// with `sentence`, and team-b's reads from `team_b_from`.
+fn overload_rows(late: usize, refused: usize, sentence: &str, team_b_from: f64) -> Value {
+    let mut rows = Vec::new();
+    for i in 0..late {
+        let begun = 200.0 + i as f64 / 100.0;
+        let mut row = step_row("team-a", "read_document", "error", begun, 5.02);
+        row["error_kind"] = json!("oversized_or_late_read");
+        rows.push(row);
+    }
+    for _ in 0..refused {
+        let mut row = step_row("team-a", "read_document", "refused", 200.05, 0.001);
+        row["outcome_sentence"] = json!(sentence);
+        rows.push(row);
+    }
+    rows.extend(team_b_reads(team_b_from, 208.0));
+    json!(rows)
+}
+
+#[test]
+fn the_overload_step_needs_one_call_over_the_team_cap_refused_and_team_b_answered_meanwhile() {
+    let team = gateway::bulkhead::team_at_capacity("docs-team-a", "docs-team-a__read_document");
+    let server = gateway::bulkhead::server_at_capacity("docs-team-a", "docs-team-a__read_document");
+    let run_on = |name: &str, rows: Value, shed: &str| {
+        checked(
+            name,
+            &format!("check_overload {{rows}} '{shed}'"),
+            &[("rows", &rows.to_string())],
+        )
+    };
+    assert_all_passed(
+        "overload",
+        &run_on("overload", overload_rows(8, 1, &team, 199.5), "1"),
+        5,
+    );
+    const REFUSED: &str = "completed as refused with the team-capacity sentence (got '0'";
+    for (case, rows, shed, failure) in [
+        (
+            "not shed",
+            overload_rows(8, 1, &team, 199.5),
+            "0",
+            "metrics: the gateway counted one call shed with scope team (got '0'",
+        ),
+        (
+            "shed unread",
+            overload_rows(8, 1, &team, 199.5),
+            "unreadable",
+            "metrics: the gateway counted one call shed with scope team",
+        ),
+        ("no cap", overload_rows(9, 0, &team, 199.5), "1", REFUSED),
+        (
+            "the server cap",
+            overload_rows(8, 1, &server, 199.5),
+            "1",
+            REFUSED,
+        ),
+        (
+            "two refused",
+            overload_rows(7, 2, &team, 199.5),
+            "1",
+            "were held until the deadline and completed as error",
+        ),
+        (
+            "a call more",
+            overload_rows(9, 1, &team, 199.5),
+            "1",
+            "audit: team-a's 9 reads each have a row",
+        ),
+        (
+            "team-b held up",
+            overload_rows(8, 1, &team, 205.5),
+            "1",
+            "audit: team-b's reads were answered while team-a's reads filled its cap (got 0",
+        ),
+    ] {
+        assert_fails(case, &run_on(case, rows, shed), failure);
+    }
+}
+
+/// A tool_withdrawn line for `tool`, `seconds` after 10:00:00, deriving `revision`.
+fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> String {
+    log_line(
+        &format!("2026-10-12T10:00:{seconds:02}.250000Z"),
+        json!({"event": "tool_withdrawn", "tool": tool, "server": tool.split("__").next(),
+               "cause": cause, "base": "demo-5", "revision": revision}),
+    )
+}
+
+#[test]
+fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revision() {
+    // 10:00:00 UTC on 2026-10-12, and a little more.
+    let changed = "1791799200.400000";
+    let drifted = "demo-5+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let run_on = |name: &str, lines: &[String]| {
+        checked(
+            name,
+            &format!(
+                "check_withdrawal \"$(events {{log}} 'select(.event == \"tool_withdrawn\")')\" {changed}"
+            ),
+            &[("log", &lines.join("\n"))],
+        )
+    };
+    let b = withdrawn_line(
+        "docs-team-b__list_documents",
+        7,
+        "definition changed",
+        "demo-5+withdrawn:docs-team-b__list_documents",
+    );
+    let a = |seconds: u32| {
+        withdrawn_line(
+            "docs-team-a__list_documents",
+            seconds,
+            "definition changed",
+            drifted,
+        )
+    };
+    assert_all_passed("withdrawn", &run_on("withdrawn", &[b.clone(), a(12)]), 5);
+    for (case, lines, failure) in [
+        (
+            "late",
+            vec![b.clone(), a(40)],
+            "it was withdrawn within the 10 s interval plus the 5 s deadline of the change (seconds) (got 40",
+        ),
+        (
+            "one",
+            vec![a(12)],
+            "the gateway withdrew docs-team-b__list_documents once",
+        ),
+        (
+            "twice",
+            vec![b.clone(), a(12), a(14)],
+            "the gateway withdrew docs-team-a__list_documents once",
+        ),
+        (
+            "unlisted",
+            vec![
+                b.clone(),
+                withdrawn_line(
+                    "docs-team-a__list_documents",
+                    12,
+                    "no longer listed",
+                    drifted,
+                ),
+            ],
+            "the gateway withdrew docs-team-a__list_documents once, for a changed definition",
+        ),
+        (
+            "not the literal revision",
+            vec![
+                b,
+                withdrawn_line(
+                    "docs-team-a__list_documents",
+                    12,
+                    "definition changed",
+                    "demo-5+withdrawn:2",
+                ),
+            ],
+            "the revision served after both withdrawals is the literal derived one (got 'demo-5+withdrawn:2'",
+        ),
+    ] {
+        assert_fails(case, &run_on(case, &lines), failure);
+    }
+}
+
+/// team-a's two rows from one workload run in the drift steps, under `revision`: its list,
+/// naming `listed`, and its call to its list tool, with `decision` and `result`, its reason for
+/// a denial and its outcome otherwise.
+fn drift_rows(revision: &str, listed: &[&str], decision: &str, result: &str) -> Value {
+    let mut list = list_row("team-a", revision, listed);
+    list["begun"] = json!(300.0);
+    let mut call = step_row("team-a", "list_documents", result, 300.1, 0.01);
+    call["revision"] = json!(revision);
+    call["decision"] = json!(decision);
+    if decision == "deny" {
+        call["reason"] = json!(result);
+        call["outcome"] = Value::Null;
+        call["error_kind"] = Value::Null;
+    }
+    json!([list, call])
+}
+
+#[test]
+fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
+    let drifted = "demo-5+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let read = "docs-team-a__read_document";
+    let both = "docs-team-a__list_documents,docs-team-a__read_document";
+    let run_on = |name: &str, rows: Value, revision: &str, listed: &str, call: &str| {
+        checked(
+            name,
+            &format!("check_drift_rows {{rows}} '{revision}' '{listed}' '{call}'"),
+            &[("rows", &rows.to_string())],
+        )
+    };
+    let withdrawn = drift_rows(drifted, &[read], "deny", "unknown_tool");
+    assert_all_passed(
+        "withdrawn",
+        &run_on(
+            "withdrawn",
+            withdrawn.clone(),
+            drifted,
+            read,
+            "deny unknown_tool",
+        ),
+        1,
+    );
+    let served = drift_rows(
+        "demo-5",
+        &["docs-team-a__read_document", "docs-team-a__list_documents"],
+        "allow",
+        "ok",
+    );
+    assert_all_passed(
+        "served",
+        &run_on("served", served, "demo-5", both, "allow ok"),
+        1,
+    );
+    const CHECK: &str = "audit: team-a's list and call are recorded under revision";
+    for (case, rows, revision, listed, call) in [
+        // Rows under the base revision while the tool is withdrawn.
+        (
+            "base revision",
+            drift_rows("demo-5", &[read], "deny", "unknown_tool"),
+            drifted,
+            read,
+            "deny unknown_tool",
+        ),
+        (
+            "still listed",
+            drift_rows(
+                drifted,
+                &["docs-team-a__list_documents", read],
+                "deny",
+                "unknown_tool",
+            ),
+            drifted,
+            read,
+            "deny unknown_tool",
+        ),
+        (
+            "still served",
+            drift_rows(drifted, &[read], "allow", "ok"),
+            drifted,
+            read,
+            "deny unknown_tool",
+        ),
+        ("still withdrawn", withdrawn, "demo-5", both, "allow ok"),
+        ("no rows", json!([]), "demo-5", both, "allow ok"),
+    ] {
+        assert_fails(case, &run_on(case, rows, revision, listed, call), CHECK);
+    }
+}
+
+#[test]
+fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleared() {
+    let revision = "demo-5-reapproved-20261012T100000Z";
+    let reloaded = |served: &str| {
+        log_line(
+            "2026-10-12T10:00:02.000000Z",
+            json!({"event": "policy_reloaded", "revision": served}),
+        )
+    };
+    let cleared = |tool: &str, reason: &str| {
+        log_line(
+            "2026-10-12T10:00:02.000000Z",
+            json!({"event": "policy_withdrawal_cleared", "tool": tool, "reason": reason,
+                   "revision": revision}),
+        )
+    };
+    let a = cleared("docs-team-a__list_documents", "approved again");
+    let b = cleared("docs-team-b__list_documents", "approved again");
+    let run_on = |name: &str, lines: &[String]| {
+        checked(
+            name,
+            &format!(
+                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision}"
+            ),
+            &[("log", &lines.join("\n"))],
+        )
+    };
+    assert_all_passed(
+        "reapproved",
+        &run_on("reapproved", &[reloaded(revision), a.clone(), b.clone()]),
+        3,
+    );
+    const CLEARED: &str = "both list tools' withdrawals cleared as approved again";
+    for (case, lines, failure) in [
+        (
+            "still withdrawn",
+            vec![reloaded(&format!(
+                "{revision}+withdrawn:docs-team-a__list_documents"
+            ))],
+            "the gateway serves revision demo-5-reapproved-20261012T100000Z, with no withdrawal",
+        ),
+        ("one cleared", vec![reloaded(revision), a.clone()], CLEARED),
+        (
+            "removed, not approved",
+            vec![
+                reloaded(revision),
+                a.clone(),
+                cleared("docs-team-b__list_documents", "no longer in the registry"),
+            ],
+            CLEARED,
+        ),
+        (
+            "withdrawn again",
+            vec![
+                reloaded(revision),
+                a,
+                b,
+                withdrawn_line("docs-team-a__list_documents", 12, "definition changed", "x"),
+            ],
+            "the drift pass withdrew nothing since (got '1'",
+        ),
+    ] {
+        assert_fails(case, &run_on(case, &lines), failure);
+    }
+}
+
+/// The list rows of the drift steps: under the revision the drift pass derives, each team is
+/// shown its tools less those withdrawn; under a re-approval's revision, both of its tools.
+#[test]
+fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
+    let drifted = "demo-5+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let reapproved = "demo-5-reapproved-20261012T100000Z";
+    let rows = |team_a: Value| {
+        json!([
+            list_row("team-a", drifted, &["docs-team-a__read_document"]),
+            list_row("team-a", reapproved, &both_tools("team-a")),
+            list_row("team-b", drifted, &["docs-team-b__read_document"]),
+            team_a,
+        ])
+        .to_string()
+    };
+    let good = list_row("team-a", "demo-5", &both_tools("team-a"));
+    let run = check_lists("lists-drift", &rows(good), 4);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    for (case, row) in [
+        (
+            "withdrawn listed",
+            list_row("team-a", drifted, &both_tools("team-a")),
+        ),
+        (
+            "another tool withdrawn",
+            list_row(
+                "team-a",
+                "demo-5+withdrawn:docs-team-a__read_document",
+                &both_tools("team-a"),
+            ),
+        ),
+        (
+            "re-approval missing a tool",
+            list_row("team-a", reapproved, &["docs-team-a__read_document"]),
+        ),
+        (
+            "not a reapproval revision",
+            list_row("team-a", "demo-5-reapproved-soon", &both_tools("team-a")),
+        ),
+        (
+            "not a derived revision",
+            list_row("team-a", "demo-5+other", &both_tools("team-a")),
+        ),
+    ] {
+        let run = check_lists(case, &rows(row), 4);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(LISTS_NAMED), "{case}: {}", run.transcript());
+    }
+}

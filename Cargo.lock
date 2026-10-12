@@ -447,6 +447,7 @@ dependencies = [
  "connector-proxy",
  "gateway",
  "gateway-core",
+ "gateway-registry",
  "mock-docs-server",
  "serde_json",
  "sha2 0.10.9",
