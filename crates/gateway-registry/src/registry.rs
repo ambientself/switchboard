@@ -210,6 +210,19 @@ pub enum RegistryError {
         /// Where, as a JSON Pointer into the schema.
         at: JsonPointer,
     },
+    /// A tool's input schema has a `type` list or a `required` list that names one name twice
+    /// (#127). JSON Schema 2020-12 says the names in each must be unique.
+    #[error(
+        "tool `{tool}`'s input schema names `{name}` twice in the list at `{at}`; JSON Schema 2020-12 requires its names to be unique"
+    )]
+    SchemaRepeatedName {
+        /// The tool.
+        tool: ToolName,
+        /// The name given twice.
+        name: String,
+        /// Where, as a JSON Pointer into the schema: the `type` or `required` list.
+        at: JsonPointer,
+    },
     /// A tool says its resources come from its arguments, and lists no source.
     #[error("tool `{0}` reads its resources from its arguments but lists none")]
     AdapterWithoutSources(ToolName),
@@ -577,6 +590,11 @@ fn check_tool(
                     at,
                 }
             }
+            SchemaProblem::Repeated { name: repeated, at } => RegistryError::SchemaRepeatedName {
+                tool: name.clone(),
+                name: repeated,
+                at,
+            },
         }
     })?;
 
