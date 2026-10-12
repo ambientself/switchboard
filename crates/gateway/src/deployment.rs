@@ -61,6 +61,9 @@
 //!
 //! [drift]
 //! interval_seconds = 300      # 300 if left out; 5 to 900
+//! reach_token_file = "/run/switchboard/registry-token"  # the reach check: all three, or none
+//! reach_url = "http://127.0.0.1:8080/mcp/registry-reach"
+//! reach_host = "gateway"
 //!
 //! [drift.probe_credentials]   # one for each server the registry names
 //! mock-docs = "/run/secrets/registry-probe-credential"
@@ -128,6 +131,9 @@
 //!   token for a ServiceAccount of the probe's own, or in Compose a static dummy. The gateway
 //!   refuses to start unless each server the registry names has one, and refuses one for any
 //!   other (see [`crate::drift::probe_credentials`]). `switchboard probe` reads the same file.
+//!   `drift.reach_token_file`, `drift.reach_url` and `drift.reach_host` set up the reach check
+//!   ([`crate::reach`]): given together or not at all, the URL plain `http` and the host one of
+//!   `http.allowed_hosts`.
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! limits, each server's bounds and the drift interval have defaults, so a gateway not told
@@ -150,6 +156,7 @@ use crate::config::{
 };
 use crate::drift::{DriftError, DriftSection};
 use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
+use crate::reach::ReachSettings;
 
 /// Where the gateway listens when the deployment file does not say: loopback only, never every
 /// interface.
@@ -592,6 +599,8 @@ pub struct Deployment {
     pub drift_interval: Duration,
     /// Each proxied server's probe credential file, from the deployment file's directory.
     pub probe_credentials: BTreeMap<ConnectorName, PathBuf>,
+    /// The reach check's settings, or `None` when no reach is checked.
+    pub reach: Option<ReachSettings>,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -608,6 +617,7 @@ impl std::fmt::Debug for Deployment {
             .field("servers", &self.servers)
             .field("drift_interval", &self.drift_interval)
             .field("probe_credentials", &self.probe_credentials)
+            .field("reach", &self.reach)
             .finish_non_exhaustive()
     }
 }
@@ -715,6 +725,7 @@ impl Deployment {
         }
         let limits = limits(file.limits.unwrap_or_default())?;
         let drift_interval = DriftSection::interval(file.drift.as_ref())?;
+        let reach = DriftSection::reach(file.drift.as_ref(), &file.http.allowed_hosts, base)?;
         let probe_credentials = file
             .drift
             .map(|drift| drift.probe_credentials)
@@ -768,6 +779,7 @@ impl Deployment {
             servers,
             drift_interval,
             probe_credentials,
+            reach,
             credentials: file
                 .credentials
                 .into_iter()

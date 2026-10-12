@@ -59,6 +59,30 @@
 //! [`TOOL_WITHDRAWN_EVENT`] at ERROR, naming the tool, its server, the cause and the base and
 //! derived revisions, and counted.
 //!
+//! **The reach check** (decision 0011, section 4; decision 0013, section 5, step 3). When the
+//! deployment file gives `[drift] reach_*` ([`ReachSettings`]), each server whose registry entry
+//! has a `reach_check` is checked on its schedule, beside each poll: [`ReachCaller`] sends the
+//! check's canary, a call outside the entry's reach, through this replica's own listener, under
+//! the registry's own workload identity, so it is decided and audited like any call. It goes
+//! through the listener, so it never runs in the boot pass, which comes before the listener is
+//! bound: [`DriftPass::run`] makes each entry's first check as soon as it starts, after the
+//! binary has bound the listener, and one more beside each poll after. What the answer means is
+//! [`reach::Verdict`](crate::reach::Verdict)'s:
+//!
+//! - **Held**, the server refused the canary: logged as [`REACH_HELD_EVENT`] at INFO and
+//!   counted in `switchboard_reach_checks_total{result="held"}`.
+//! - **Mismatch**, the server answered it: the reach is wider than recorded. Every tool of the
+//!   entry is withdrawn, as a changed definition is, with the cause `reach mismatch`, so only a
+//!   new approval brings them back. It is logged as [`REACH_MISMATCH_EVENT`] at ERROR, with a
+//!   [`TOOL_WITHDRAWN_EVENT`] for each tool, and counted as `mismatch`.
+//! - **Failed**, anything else, such as a denial, an audit failure or no answer in time:
+//!   logged as [`REACH_FAILED_EVENT`] at WARN and counted as `failed`. Nothing is withdrawn: a
+//!   failed check shows nothing about the reach. A check whose canary tool is not served now,
+//!   because it is withdrawn or not approved, fails without a call.
+//!
+//! A mismatch is judged against the approvals in force when the check began, as a poll is: a
+//! tool approved again while the check was outstanding is left for the next check.
+//!
 //! **A standing withdrawal** is keyed by the tool's exposed name, `definition_sha256`,
 //! `binding_sha256` and `approved_at` ([`WithdrawalKey`]). When the registry reloader serves a
 //! new version, every standing withdrawal whose key is unchanged is applied to it, and the
@@ -79,12 +103,14 @@ use connector_proxy::{
     ProbeReport, ProxyConnector,
 };
 use gateway_core::{ConnectorName, PolicyRevision, ToolName};
-use gateway_registry::{Registry, definition_sha256};
+use gateway_registry::{ReachCheck, Registry, definition_sha256};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::task::JoinSet;
 
+use crate::deployment::ServerLimits;
 use crate::policy::{LivePolicy, ServedPolicy};
+use crate::reach::{ReachCaller, ReachSettings, ReachSettingsError, Verdict};
 
 /// How often the drift pass runs when the deployment file does not say.
 pub const DEFAULT_DRIFT_INTERVAL: Duration = Duration::from_secs(300);
@@ -110,11 +136,26 @@ pub const SERVER_OPEN_EVENT: &str = "server_open";
 /// The `event` field of the warning logged for each probe that showed no refusal.
 pub const PROBE_NOT_SHOWN_EVENT: &str = "probe_not_shown";
 
+/// The `event` field of the line logged for each reach check the server held: it refused the
+/// canary.
+pub const REACH_HELD_EVENT: &str = "reach_held";
+
+/// The `event` field of the error logged for each reach check the server answered: its reach
+/// is wider than recorded, and the entry's tools are withdrawn.
+pub const REACH_MISMATCH_EVENT: &str = "reach_mismatch";
+
+/// The `event` field of the warning logged for each reach check that showed nothing.
+pub const REACH_FAILED_EVENT: &str = "reach_check_failed";
+
 /// The deployment file's `[drift]` table.
 ///
 /// ```toml
 /// [drift]
 /// interval_seconds = 300      # 300 if left out; 5 to 900
+/// # The reach check: all three, or none.
+/// reach_token_file = "/var/run/switchboard/tokens/registry"
+/// reach_url = "http://127.0.0.1:8080/mcp/registry-reach"
+/// reach_host = "gateway.switchboard.svc.cluster.local"
 ///
 /// [drift.probe_credentials]   # one for each proxied server in the registry
 /// mock-docs = "/var/run/switchboard/tokens/registry-probe"
@@ -124,6 +165,11 @@ pub const PROBE_NOT_SHOWN_EVENT: &str = "probe_not_shown";
 /// probe's third call presents: a stranger's (decision 0010). The gateway refuses to start
 /// unless every server in the registry has one, and refuses one for a server the registry does
 /// not name ([`probe_credentials`]).
+///
+/// `reach_token_file`, `reach_url` and `reach_host` set up the reach check
+/// ([`ReachSettings`]): the registry's workload token, this replica's own listener and the
+/// surface the registry is admitted to, and the `Host` to call it with, one of
+/// `http.allowed_hosts`. Without them no reach is checked, and boot logs so at WARN.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriftSection {
@@ -134,6 +180,15 @@ pub struct DriftSection {
     /// Each proxied server's probe credential file, by server name.
     #[serde(default)]
     pub probe_credentials: BTreeMap<ConnectorName, PathBuf>,
+    /// The file holding the registry's workload token, which the reach check presents.
+    #[serde(default)]
+    pub reach_token_file: Option<PathBuf>,
+    /// This replica's own listener and the registry's surface, which the reach check calls.
+    #[serde(default)]
+    pub reach_url: Option<String>,
+    /// The `Host` the reach check's call carries.
+    #[serde(default)]
+    pub reach_host: Option<String>,
 }
 
 /// Why the `[drift]` table was refused.
@@ -149,6 +204,9 @@ pub enum DriftError {
         /// The interval given, in seconds.
         seconds: u64,
     },
+    /// The reach check's fields were refused.
+    #[error(transparent)]
+    Reach(#[from] ReachSettingsError),
 }
 
 /// Why the probe credentials were refused.
@@ -210,6 +268,27 @@ impl DriftSection {
         }
         Ok(Duration::from_secs(seconds))
     }
+
+    /// The reach check's settings `section` gives, from the deployment file's directory
+    /// `base`, or `None` with no table or none of the fields. Refused unless all three are
+    /// given, the URL is plain `http` with a host and a path, and the host is one of
+    /// `allowed_hosts`.
+    pub fn reach(
+        section: Option<&Self>,
+        allowed_hosts: &BTreeSet<String>,
+        base: &std::path::Path,
+    ) -> Result<Option<ReachSettings>, DriftError> {
+        let Some(section) = section else {
+            return Ok(None);
+        };
+        Ok(ReachSettings::from_fields(
+            section.reach_token_file.as_deref(),
+            section.reach_url.as_deref(),
+            section.reach_host.as_deref(),
+            allowed_hosts,
+            base,
+        )?)
+    }
 }
 
 /// What a standing withdrawal is keyed by: while the registry approves the tool under the same
@@ -233,6 +312,8 @@ pub enum Cause {
     DefinitionChanged,
     /// The server no longer lists the tool.
     NoLongerListed,
+    /// The server answered the reach check's canary, a call outside its entry's reach.
+    ReachMismatch,
 }
 
 impl Cause {
@@ -241,6 +322,22 @@ impl Cause {
         match self {
             Self::DefinitionChanged => "definition changed",
             Self::NoLongerListed => "no longer listed",
+            Self::ReachMismatch => "reach mismatch",
+        }
+    }
+
+    /// What the log line says of it.
+    fn message(self) -> &'static str {
+        match self {
+            Self::DefinitionChanged | Self::NoLongerListed => {
+                "withdrew the tool from every surface: the server no longer serves its approved \
+                 definition; approve it again, or remove it from the registry"
+            }
+            Self::ReachMismatch => {
+                "withdrew the tool from every surface: its entry's server answered a call outside \
+                 the entry's recorded reach; narrow the credential and approve it again, or \
+                 remove it from the registry"
+            }
         }
     }
 }
@@ -269,6 +366,12 @@ pub struct DriftCounts {
     pub probes_open: u64,
     /// Probes that showed neither.
     pub probes_not_shown: u64,
+    /// Reach checks the server held: it refused the canary.
+    pub reach_held: u64,
+    /// Reach checks the server answered: its tools were withdrawn.
+    pub reach_mismatch: u64,
+    /// Reach checks that showed nothing.
+    pub reach_failed: u64,
 }
 
 /// The drift pass's counts, for the metrics. Cheap to clone; clones share the counts.
@@ -345,6 +448,17 @@ struct State {
     approved: BTreeMap<ToolName, Approved>,
     /// The tools withdrawn now.
     standing: BTreeMap<ToolName, Standing>,
+    /// Each server's reach check, as the loaded registry gives it.
+    reach_checks: BTreeMap<ConnectorName, ReachCheck>,
+}
+
+/// Each reach check `registry` gives, by server.
+fn reach_checks(registry: &Registry) -> BTreeMap<ConnectorName, ReachCheck> {
+    registry
+        .servers()
+        .iter()
+        .filter_map(|(name, server)| Some((name.clone(), server.reach_check.clone()?)))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -404,6 +518,7 @@ impl Withdrawals {
                 base: live.current(),
                 approved: approved(registry),
                 standing: BTreeMap::new(),
+                reach_checks: reach_checks(registry),
             }),
             live,
             signals,
@@ -446,6 +561,7 @@ impl Withdrawals {
         let mut state = self.state();
         state.base = Arc::new(policy);
         state.approved = approved(registry);
+        state.reach_checks = reach_checks(registry);
         let mut cleared = Vec::new();
         let approved = state.approved.clone();
         state.standing.retain(|tool, standing| {
@@ -519,7 +635,7 @@ impl Withdrawals {
                 return;
             }
         };
-        let mut state = self.state();
+        let state = self.state();
         let mut found = Vec::new();
         for (tool, approved) in &state.approved {
             if approved.server != *server || state.standing.contains_key(tool) {
@@ -545,6 +661,16 @@ impl Withdrawals {
             };
             found.push((approved.key.clone(), cause));
         }
+        self.withdraw(state, server, found);
+    }
+
+    /// Withdraws each tool of `found`, all `server`'s, under `state`, and logs and counts each.
+    fn withdraw(
+        &self,
+        mut state: std::sync::MutexGuard<'_, State>,
+        server: &ConnectorName,
+        found: Vec<(WithdrawalKey, Cause)>,
+    ) {
         if found.is_empty() {
             return;
         }
@@ -569,9 +695,81 @@ impl Withdrawals {
                 cause = cause.as_str(),
                 base = %base,
                 %revision,
-                "withdrew the tool from every surface: the server no longer serves its approved \
-                 definition; approve it again, or remove it from the registry"
+                "{}",
+                cause.message()
             );
+        }
+    }
+
+    /// `server`'s reach check, and whether its canary tool is served now: approved and not
+    /// withdrawn. `None` when the registry gives the server none.
+    fn reach_check(&self, server: &ConnectorName) -> Option<(ReachCheck, bool)> {
+        let state = self.state();
+        let check = state.reach_checks.get(server)?.clone();
+        let served =
+            state.approved.contains_key(&check.tool) && !state.standing.contains_key(&check.tool);
+        Some((check, served))
+    }
+
+    /// Judges what `server`'s reach check came to (see the [module documentation](self)). A
+    /// mismatch withdraws every tool approved on the server whose key is the one in `started`,
+    /// the keys when the check began; one approved again since is left for the next check.
+    /// Only a mismatch withdraws anything.
+    fn judge_reach(
+        &self,
+        server: &ConnectorName,
+        tool: &ToolName,
+        started: &BTreeMap<ToolName, WithdrawalKey>,
+        verdict: Verdict,
+    ) {
+        match verdict {
+            Verdict::Held { row } => {
+                self.signals.count(server, |counts| counts.reach_held += 1);
+                tracing::info!(
+                    event = REACH_HELD_EVENT,
+                    %server,
+                    %tool,
+                    row = row.as_deref().unwrap_or("none"),
+                    "the server refused the reach check's call outside its entry's reach"
+                );
+            }
+            Verdict::Failed(reason) => {
+                self.signals
+                    .count(server, |counts| counts.reach_failed += 1);
+                tracing::warn!(
+                    event = REACH_FAILED_EVENT,
+                    %server,
+                    %tool,
+                    %reason,
+                    "the reach check showed nothing about the entry's reach; nothing is withdrawn"
+                );
+            }
+            Verdict::Mismatch { row } => {
+                self.signals
+                    .count(server, |counts| counts.reach_mismatch += 1);
+                let state = self.state();
+                let found: Vec<(WithdrawalKey, Cause)> = state
+                    .approved
+                    .iter()
+                    .filter(|(name, approved)| {
+                        approved.server == *server
+                            && !state.standing.contains_key(*name)
+                            && started.get(*name) == Some(&approved.key)
+                    })
+                    .map(|(_, approved)| (approved.key.clone(), Cause::ReachMismatch))
+                    .collect();
+                tracing::error!(
+                    event = REACH_MISMATCH_EVENT,
+                    %server,
+                    %tool,
+                    row = row.as_deref().unwrap_or("none"),
+                    withdrawn = found.len(),
+                    "the server answered the reach check's call outside its entry's recorded \
+                     reach: its credential reaches more than was approved, so every tool of the \
+                     entry is withdrawn"
+                );
+                self.withdraw(state, server, found);
+            }
         }
     }
 }
@@ -647,6 +845,7 @@ pub struct DriftPass {
     servers: BTreeMap<ConnectorName, Arc<ProxyConnector>>,
     probes: ProbeCredentials,
     interval: Duration,
+    reach: Option<Reach>,
 }
 
 impl std::fmt::Debug for DriftPass {
@@ -654,6 +853,10 @@ impl std::fmt::Debug for DriftPass {
         f.debug_struct("DriftPass")
             .field("servers", &self.servers.keys().collect::<Vec<_>>())
             .field("interval", &self.interval)
+            .field(
+                "reach",
+                &self.reach.as_ref().map(|reach| reach.caller.settings()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -674,7 +877,38 @@ impl DriftPass {
             servers,
             probes,
             interval,
+            reach: None,
         }
+    }
+
+    /// The same pass, checking each server's reach too (decision 0011, section 4) with
+    /// `caller`, each check given its server's call deadline in `bounds`, or the default
+    /// deadline for a server it does not name, plus the caller's allowance. The checks run in
+    /// [`run`](Self::run) and [`reach_pass`](Self::reach_pass), never in [`pass`](Self::pass):
+    /// they call the listener, which boot's first pass comes before.
+    pub fn with_reach(
+        mut self,
+        caller: ReachCaller,
+        bounds: &BTreeMap<ConnectorName, ServerLimits>,
+    ) -> Self {
+        let deadlines = self
+            .servers
+            .keys()
+            .map(|server| {
+                let deadline = bounds.get(server).copied().unwrap_or_default().deadline;
+                (server.clone(), deadline)
+            })
+            .collect();
+        self.reach = Some(Reach {
+            caller: Arc::new(caller),
+            deadlines,
+        });
+        self
+    }
+
+    /// Whether it checks each server's reach.
+    pub fn checks_reach(&self) -> bool {
+        self.reach.is_some()
     }
 
     /// The withdrawals this pass makes.
@@ -692,12 +926,39 @@ impl DriftPass {
         self.withdrawals.signals()
     }
 
-    /// What one poll of `server` needs: its connector and its probe credential.
+    /// What one poll of `server` needs: its connector, its probe credential, and the reach
+    /// check's caller and its deadline.
     fn entry(&self, server: &ConnectorName, connector: &Arc<ProxyConnector>) -> Entry {
         Entry {
             server: server.clone(),
             connector: Arc::clone(connector),
             probe: self.probes.get(server).cloned(),
+            reach: self.reach.as_ref().map(|reach| {
+                let deadline = reach
+                    .deadlines
+                    .get(server)
+                    .copied()
+                    .unwrap_or_else(|| ServerLimits::default().deadline);
+                (Arc::clone(&reach.caller), deadline)
+            }),
+        }
+    }
+
+    /// Checks every server's reach once, all at once, and withdraws an entry whose server
+    /// answered its canary. Returns when every check has been judged. Without a caller
+    /// ([`with_reach`](Self::with_reach)) it does nothing.
+    pub async fn reach_pass(&self) {
+        let mut checks = JoinSet::new();
+        for (server, connector) in &self.servers {
+            checks.spawn(check_reach(
+                Arc::clone(&self.withdrawals),
+                self.entry(server, connector),
+            ));
+        }
+        while let Some(checked) = checks.join_next().await {
+            if let Err(error) = checked {
+                tracing::error!(%error, "a reach check's task failed");
+            }
         }
     }
 
@@ -720,7 +981,9 @@ impl DriftPass {
 
     /// Polls each server every interval, for ever, each on a schedule of its own, so a slow
     /// server delays no other server's polls. Each server's first poll is an interval from now:
-    /// boot ran one already, before the listener was bound.
+    /// boot ran one already, before the listener was bound. With a reach caller, each server's
+    /// reach is checked at once, since the binary starts this only once the listener is bound,
+    /// and again beside each poll.
     pub async fn run(self) {
         let mut entries = JoinSet::new();
         for (server, connector) in &self.servers {
@@ -734,12 +997,50 @@ impl DriftPass {
     }
 }
 
+/// The reach check's caller, and each server's call deadline.
+struct Reach {
+    caller: Arc<ReachCaller>,
+    deadlines: BTreeMap<ConnectorName, Duration>,
+}
+
 /// One proxied server, as a poll reaches it.
 #[derive(Clone)]
 struct Entry {
     server: ConnectorName,
     connector: Arc<ProxyConnector>,
     probe: Option<Arc<ProbeCredential>>,
+    /// The reach check's caller and the server's call deadline, when reach is checked.
+    reach: Option<(Arc<ReachCaller>, Duration)>,
+}
+
+/// Checks `entry`'s reach, if reach is checked and its registry entry has a reach check, and
+/// judges it against the approvals in force when it began. A canary tool that is not served now
+/// fails the check without a call: the gateway would refuse it.
+async fn check_reach(withdrawals: Arc<Withdrawals>, entry: Entry) {
+    let Some((caller, deadline)) = &entry.reach else {
+        return;
+    };
+    let Some((check, served)) = withdrawals.reach_check(&entry.server) else {
+        return;
+    };
+    let started = withdrawals.keys_on(&entry.server);
+    let verdict = if served {
+        caller.call(&check, *deadline).await
+    } else {
+        Verdict::Failed(format!(
+            "its tool `{}` is not served now, so no call was made",
+            check.tool
+        ))
+    };
+    withdrawals.judge_reach(&entry.server, &check.tool, &started, verdict);
+}
+
+/// One poll of `entry` and, beside it, one reach check.
+async fn poll_and_check(withdrawals: Arc<Withdrawals>, entry: Entry) {
+    tokio::join!(
+        poll(Arc::clone(&withdrawals), entry.clone()),
+        check_reach(withdrawals, entry)
+    );
 }
 
 /// Reads `entry`'s tool list and judges it against the approvals in force when it began, and
@@ -766,15 +1067,23 @@ async fn poll(withdrawals: Arc<Withdrawals>, entry: Entry) {
 /// beside it. So with an interval of at least the server's call deadline, a change is withdrawn
 /// within one interval plus that deadline, and with a shorter one, within about two call
 /// deadlines (#165). A poll whose task fails is logged, and the next runs as usual.
+///
+/// Its reach is checked at once, and again beside each poll. A reach that has widened is then
+/// withdrawn within one interval plus the call deadline and the reach check's allowance.
 async fn poll_every(withdrawals: Arc<Withdrawals>, entry: Entry, interval: Duration) {
+    // Each in its own task, so a panic ends that poll or check alone; dropped with the set
+    // when the pass is aborted.
+    let mut first = JoinSet::new();
+    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));
+    if let Some(Err(error)) = first.join_next().await {
+        tracing::error!(%error, server = %entry.server, "a reach check's task failed");
+    }
     let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        // Its own task, so a panic ends this poll alone; dropped with the set when the pass is
-        // aborted.
         let mut one = JoinSet::new();
-        one.spawn(poll(Arc::clone(&withdrawals), entry.clone()));
+        one.spawn(poll_and_check(Arc::clone(&withdrawals), entry.clone()));
         if let Some(Err(error)) = one.join_next().await {
             tracing::error!(%error, server = %entry.server, "a drift poll's task failed");
         }

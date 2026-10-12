@@ -70,6 +70,7 @@ use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
 use crate::drift::{DriftPass, ProbeCredentialError, probe_credentials};
 use crate::keys::KeyRefresher;
+use crate::reach::ReachCaller;
 use crate::reload::Reloader;
 
 /// The `event` field of the error logged for each audit row the Postgres store stops trying to
@@ -397,12 +398,30 @@ async fn prepare_with(
         "audit rows record this instance as the one that began them"
     );
     // The first drift pass, before the binary binds the listener (decision 0013, section 5).
-    let drift = DriftPass::new(
+    let mut drift = DriftPass::new(
         reloader.withdrawals(),
         connectors,
         probes,
         deployment.drift_interval,
     );
+    // The reach check calls the listener, so it runs only once the binary has bound it, in
+    // `DriftPass::run`.
+    match deployment.reach {
+        Some(reach) => {
+            tracing::info!(
+                event = "boot",
+                reach_url = %reach.url,
+                reach_host = %reach.host,
+                "each entry's reach is checked through this listener, as the registry's workload, once it is bound and then every interval"
+            );
+            drift = drift.with_reach(ReachCaller::new(reach), &deployment.servers);
+        }
+        None => tracing::warn!(
+            event = "boot",
+            reach = "off",
+            "no entry's reach is checked: the deployment file has no [drift] reach_token_file, reach_url and reach_host"
+        ),
+    }
     drift.pass().await;
     tracing::info!(
         event = "boot",
@@ -838,6 +857,7 @@ mod tests {
             servers: BTreeMap::new(),
             drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
             probe_credentials: BTreeMap::from([(ConnectorName::new("mock-docs"), probe)]),
+            reach: None,
             credentials: BTreeMap::from([("docs-credential".to_owned(), credential)]),
         }
     }
