@@ -357,7 +357,8 @@ impl Drop for Timed<'_> {
 }
 
 /// A begin or list that failed, with whether its last attempt had a connection: a budget that
-/// ran out without one ran out waiting for the pool.
+/// ran out without one ran out getting a connection from the pool, whether waiting for a
+/// permit or opening a new connection.
 struct InsertFailed {
     error: PgAuditError,
     connected: bool,
@@ -369,8 +370,11 @@ impl InsertFailed {
     }
 }
 
-/// Why a begin failed with `error`; `connected` tells a budget that ran out waiting for a
-/// connection from one that ran out with one in hand.
+/// Why a begin failed with `error`; `connected` tells a budget that ran out before the last
+/// attempt had a connection, whether waiting for a pool permit or opening a new connection,
+/// from one that ran out with one in hand. Those two ways of having no connection are not told
+/// apart, so a database that never answers counts as a pool timeout, as a pool too small for
+/// the load does (#155).
 fn begin_cause(error: &PgAuditError, connected: bool) -> BeginCause {
     match error {
         PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,
