@@ -5,3 +5,6 @@
 [subjects]
 "workload:team-a:mock-workload" = "team-a"
 "workload:team-b:mock-workload" = "team-b"
+# The registry's own workload identity, which the gateway's reach check calls as (decision
+# 0011, section 4). Its team's one surface is registry-reach, which admits this subject alone.
+"workload:registry:reach-check" = "registry"

@@ -527,24 +527,24 @@ async fn a_reload_keeps_a_withdrawal_and_a_new_approval_clears_it() {
     assert_eq!(replica.revision(), without_reads(KIND_REVISION));
 
     let original = files::registry(&mock.url());
-    let same = at_revision(&original, "demo-9");
-    assert_eq!(replica.reload(&same), without_reads("demo-9"));
-    assert_eq!(replica.revision(), without_reads("demo-9"));
+    let same = at_revision(&original, "demo-12");
+    assert_eq!(replica.reload(&same), without_reads("demo-12"));
+    assert_eq!(replica.revision(), without_reads("demo-12"));
     assert_eq!(replica.listed().await, [LIST_TOOL]);
     let (_, revision) = replica.read().await;
-    assert_eq!(revision, without_reads("demo-9"));
+    assert_eq!(revision, without_reads("demo-12"));
     assert!(captured.events("policy_withdrawal_cleared").is_empty());
 
     // Team A's read tool approved again as served now; team B's is not.
-    let again = reapproved(&same, READ_TOOL, CHANGED, "demo-10");
+    let again = reapproved(&same, READ_TOOL, CHANGED, "demo-13");
     assert_eq!(
         replica.reload(&again),
-        format!("demo-10+withdrawn:{TEAM_B_READ_TOOL}")
+        format!("demo-13+withdrawn:{TEAM_B_READ_TOOL}")
     );
     assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
     let (answer, revision) = replica.read().await;
     assert_eq!(answer["result"]["isError"], json!(false), "{answer}");
-    assert_eq!(revision, format!("demo-10+withdrawn:{TEAM_B_READ_TOOL}"));
+    assert_eq!(revision, format!("demo-13+withdrawn:{TEAM_B_READ_TOOL}"));
     let cleared = captured.events("policy_withdrawal_cleared");
     assert_eq!(cleared.len(), 1, "{cleared:?}");
     assert_eq!(cleared[0].0, "INFO");
@@ -570,9 +570,9 @@ async fn a_reload_keeps_a_withdrawal_and_a_new_approval_clears_it() {
             ),
             &format!("tools = [\"{}\"]", files::TEAM_B_LIST_TOOL),
         ),
-        "demo-9",
+        "demo-12",
     );
-    assert_eq!(replica.reload(&removed), "demo-9");
+    assert_eq!(replica.reload(&removed), "demo-12");
     assert!(replica.withdrawn().is_empty());
     assert_eq!(captured.events("policy_withdrawal_cleared").len(), 2);
 }
@@ -806,7 +806,7 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
     let held = Held::start().await;
     let files = Files::new("drift-stale", &issuer().jwks_document(), &held.url);
     let replica = Replica::new(&files, &held.url);
-    let again = reapproved(&files::registry(&held.url), READ_TOOL, CHANGED, "demo-10");
+    let again = reapproved(&files::registry(&held.url), READ_TOOL, CHANGED, "demo-13");
     let long = Duration::from_secs(600);
     let drift_pass = DriftPass::new(
         replica.drift.withdrawals().clone(),
@@ -827,7 +827,7 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
             held.arrived.load(Ordering::SeqCst) == 2
         })
         .await;
-        assert_eq!(replica.reload(&again), "demo-10");
+        assert_eq!(replica.reload(&again), "demo-13");
         held.release.add_permits(2);
     };
     tokio::join!(drift_pass.pass(), approving);
@@ -852,7 +852,7 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
     );
     assert!(replica.withdrawn().is_empty(), "{:?}", replica.withdrawn());
     assert!(captured.events("tool_withdrawn").is_empty());
-    assert_eq!(replica.revision(), "demo-10");
+    assert_eq!(replica.revision(), "demo-13");
     assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
 }
 

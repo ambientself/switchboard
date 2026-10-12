@@ -231,7 +231,7 @@ pub fn rebind(text: &str, address: &str) -> String {
 }
 
 /// The revision the kind registry is at.
-pub const KIND_REVISION: &str = "demo-7";
+pub const KIND_REVISION: &str = "demo-10";
 
 /// The kind registry with the mock server at `mock_url`, under `revision` instead of
 /// [`KIND_REVISION`].

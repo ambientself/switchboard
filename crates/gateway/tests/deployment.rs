@@ -537,14 +537,35 @@ fn the_demo_deployment_files_are_valid_deployment_files() {
         let file: DeploymentFile = toml::from_str(&read("gateway.toml"))
             .unwrap_or_else(|error| panic!("{place}/gateway.toml: {error}"));
         assert_eq!(file.registry.poll_seconds, 2, "{place}");
+        let drift = file.drift.clone().unwrap();
+        assert_eq!(drift.interval_seconds, Some(10), "{place}");
+        // The reach check calls this gateway's own listener, on its registry-reach surface,
+        // with a Host it serves.
         assert_eq!(
-            file.drift.and_then(|drift| drift.interval_seconds),
-            Some(10),
+            drift.reach_url.as_deref(),
+            Some("http://127.0.0.1:8080/mcp/registry-reach"),
             "{place}"
         );
+        assert!(
+            file.http
+                .allowed_hosts
+                .contains(drift.reach_host.as_deref().unwrap()),
+            "{place}"
+        );
+        assert!(drift.reach_token_file.is_some(), "{place}");
         let manifest: TeamManifest = toml::from_str(&read("teams.toml"))
             .unwrap_or_else(|error| panic!("{place}/teams.toml: {error}"));
-        assert_eq!(manifest.subjects.len(), 2, "{place}");
+        // Each team's workload, and the registry's own workload identity in team registry.
+        assert_eq!(manifest.subjects.len(), 3, "{place}");
+        assert_eq!(
+            manifest
+                .subjects
+                .values()
+                .filter(|team| team.as_str() == "registry")
+                .count(),
+            1,
+            "{place}"
+        );
         assert!(
             manifest
                 .subjects
@@ -559,7 +580,7 @@ fn the_demo_deployment_files_are_valid_deployment_files() {
         std::fs::read_to_string(repo.join("deploy/compose/config/registry-withdrawn.toml"))
             .unwrap();
     let withdrawn = Registry::from_toml_str(&withdrawn).unwrap();
-    assert_eq!(withdrawn.snapshot().revision().as_str(), "demo-8");
+    assert_eq!(withdrawn.snapshot().revision().as_str(), "demo-11");
     for tool in [files::READ_TOOL, files::TEAM_B_READ_TOOL] {
         assert!(withdrawn.snapshot().tool(&tool.parse().unwrap()).is_none());
     }
