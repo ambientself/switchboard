@@ -1,23 +1,44 @@
 //! The audit store contract suite on the in-memory store, in the per-change loop. The Postgres
 //! store runs the same functions in its own crate's tests.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gateway_core::AuditStore;
 use gateway_core::audit::AuditRowId;
+use gateway_identity::Clock;
 use gateway_testkit::contract::{ContractStore, StoredRow};
-use gateway_testkit::{InMemoryAuditStore, StoreBudgets, block_on, contract};
-
-/// Budgets other than the defaults, so a store that ignores the ones it was given is caught.
-const BUDGETS: StoreBudgets = StoreBudgets {
-    begin: Duration::from_secs(3),
-    finish_deadline: Duration::from_secs(45),
+use gateway_testkit::{
+    FIXTURE_NOW, FixedClock, InMemoryAuditStore, StoreBudgets, block_on, contract,
 };
 
-/// The in-memory store given [`BUDGETS`]. It answers the suite with [`BUDGETS`], not with the
-/// budgets the store holds, so a store that ignored them would fail the deadline cases.
+/// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
+/// each with a part millisecond, which the store drops as Postgres's does.
+const BUDGETS: StoreBudgets = StoreBudgets {
+    begin: Duration::from_micros(3_000_400),
+    finish_deadline: Duration::from_micros(45_000_700),
+};
+
+/// The in-memory store given [`BUDGETS`] and a clock a day past [`FIXTURE_NOW`], where the
+/// store's default clock reads. It answers the suite with [`BUDGETS`] and that clock, not with
+/// anything the store holds, so a store that ignored either would fail the deadline and time
+/// cases. The day is a whole multiple of 16 seconds, so the deadline-end case still lands
+/// exactly on the end of what a Postgres time holds.
 struct InMemory {
     store: InMemoryAuditStore,
+    clock: Arc<FixedClock>,
+}
+
+impl InMemory {
+    fn new() -> Self {
+        let clock = Arc::new(FixedClock::at(FIXTURE_NOW + 86_400));
+        Self {
+            store: InMemoryAuditStore::new()
+                .with_budgets(BUDGETS)
+                .with_clock(clock.clone()),
+            clock,
+        }
+    }
 }
 
 impl ContractStore for InMemory {
@@ -26,7 +47,7 @@ impl ContractStore for InMemory {
     }
 
     async fn stored(&self, row: &AuditRowId) -> Option<StoredRow> {
-        ContractStore::stored(&self.store, row).await
+        contract::stored_in_memory(&self.store, row)
     }
 
     fn budgets(&self) -> StoreBudgets {
@@ -34,7 +55,7 @@ impl ContractStore for InMemory {
     }
 
     async fn now(&self) -> SystemTime {
-        ContractStore::now(&self.store).await
+        self.clock.now()
     }
 }
 
@@ -43,9 +64,7 @@ macro_rules! contract {
         $(
             #[test]
             fn $name() {
-                block_on(contract::$name(&InMemory {
-                    store: InMemoryAuditStore::new().with_budgets(BUDGETS),
-                }));
+                block_on(contract::$name(&InMemory::new()));
             }
         )*
     };

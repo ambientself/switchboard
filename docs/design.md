@@ -302,7 +302,12 @@ address. The client is rustls with ring, passed to the client itself and never i
 process default; it offers HTTP/1.1 only, and the deadline covers the TLS handshake. An issuer
 whose keys need a bearer token takes `keys_token_file`, read again on every fetch because the
 kubelet rotates projected tokens, and sent to the keys URL only. Both are refused beside an
-`http` keys URL. The demo deployments still use keys files.
+`http` keys URL. The kind demo fetches the cluster issuer's keys from the API server this way,
+trusting `kube-root-ca.crt` and sending no token: the kind base binds
+`system:service-account-issuer-discovery` to `system:unauthenticated`, and nothing else
+([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 10). The
+Compose demo still uses a keys file, since its development issuer has an `https` name but is
+served over `http`.
 
 **Verification has three states:** `proved`, `disabled` (checking was explicitly turned off) and
 `failed`. An incident review must be able to tell "we were not checking" from "someone tried and
@@ -1424,14 +1429,14 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
-another dialect and an `additionalProperties` that is neither a boolean nor a schema. It
-refuses another dialect rather than converting it. An enforced keyword must have the JSON type
-2020-12 gives it; an annotation's value, and whether the names in a `type` list or in
-`required` are unique, are not checked. The
-argument check enforces every keyword the loader accepts other than annotations: `type`,
-`properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, and the bounds on
-lengths, item counts and numbers. Numbers compare by value, so `1.0` is an integer, and the
-schema `false` admits nothing. A call that fails is outcome `error` of kind
+another dialect and an `additionalProperties` that is neither a boolean nor a schema. It refuses
+another dialect rather than converting it. An enforced keyword must have the JSON type 2020-12
+gives it, and the names in a `type` list or in `required` must be unique (#127); an annotation's
+value is not checked. The root must be an object schema, so a root `true` or `false` is refused
+at load. The argument check enforces every keyword the loader accepts other than annotations:
+`type`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, and the
+bounds on lengths, item counts and numbers. Numbers compare by value, so `1.0` is an integer,
+and the schema `false` admits nothing. A call that fails is outcome `error` of kind
 `invalid_arguments`, and nothing is sent. The exact rules are in the `adapter` module of
 `gateway-registry`. `pattern`, `$ref` and the composition keywords are refused at load, not
 checked; a schema that needs them cannot be approved yet.

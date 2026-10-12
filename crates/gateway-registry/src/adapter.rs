@@ -32,10 +32,11 @@
 //!   too: `type` must be a type name or a list of them, `required` a list of strings,
 //!   `properties` an object of schemas, `enum` a list, a length or count bound a non-negative
 //!   integer, and a number bound a number. An `additionalProperties` that is neither a boolean
-//!   nor a schema has an error of its own.
-//! - **Not checked at load:** an annotation's value, which nothing reads, and whether the
-//!   names in a `type` list or in `required` are unique, as 2020-12 requires. A repeated name
-//!   checks the same thing twice.
+//!   nor a schema has an error of its own, and so does a `type` list or a `required` list that
+//!   names one name twice: 2020-12 says those names must be unique (#127).
+//! - **Not checked at load:** an annotation's value, which nothing reads.
+//! - **The root:** an input schema must be an object schema with `type` `object`, so the
+//!   schemas `true` and `false` are refused at the root, though they load anywhere below it.
 //!
 //! A call's arguments then pass only if they meet every enforced keyword, at every depth:
 //!
@@ -61,6 +62,7 @@
 //! item counts come before the items.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fmt;
 
 use gateway_core::{Resource, ResourceDeclaration, Resources, ToolName};
@@ -500,11 +502,13 @@ pub(crate) enum SchemaProblem {
     Dialect { dialect: String },
     /// An `additionalProperties` that is neither a boolean nor a schema.
     AdditionalProperties { at: JsonPointer },
+    /// A `type` or `required` list, at `at`, that names `name` more than once.
+    Repeated { name: String, at: JsonPointer },
 }
 
 /// Checks that `schema`, found at `at`, uses only the approved subset of 2020-12, each enforced
 /// keyword with a value of the JSON type 2020-12 gives it, and that so does every schema inside
-/// it. Annotation values, and whether the names in `type` and `required` are unique, are not
+/// it, and that no `type` or `required` list names a name twice. Annotation values are not
 /// checked.
 pub(crate) fn followable(schema: &Value, at: &JsonPointer) -> Result<(), SchemaProblem> {
     let object = match schema {
@@ -515,7 +519,7 @@ pub(crate) fn followable(schema: &Value, at: &JsonPointer) -> Result<(), SchemaP
     for (keyword, value) in object {
         let here = at.child(keyword);
         let formed = match keyword.as_str() {
-            "type" => names_types(value),
+            "type" => names_types(value) && unique(value, &here)?,
             "properties" => {
                 let Some(properties) = value.as_object() else {
                     return Err(SchemaProblem::Malformed { at: here });
@@ -525,9 +529,12 @@ pub(crate) fn followable(schema: &Value, at: &JsonPointer) -> Result<(), SchemaP
                 }
                 true
             }
-            "required" => value
-                .as_array()
-                .is_some_and(|names| names.iter().all(Value::is_string)),
+            "required" => {
+                value
+                    .as_array()
+                    .is_some_and(|names| names.iter().all(Value::is_string))
+                    && unique(value, &here)?
+            }
             "additionalProperties" => {
                 if !(value.is_boolean() || value.is_object()) {
                     return Err(SchemaProblem::AdditionalProperties { at: here });
@@ -570,6 +577,27 @@ pub(crate) fn followable(schema: &Value, at: &JsonPointer) -> Result<(), SchemaP
     Ok(())
 }
 
+/// Checks that a list of names, the value of `type` or `required` at `at`, names none twice, as
+/// 2020-12 requires. A single name is unique. Returns `true`, so that it reads as part of the
+/// keyword's form.
+fn unique(value: &Value, at: &JsonPointer) -> Result<bool, SchemaProblem> {
+    let mut seen = HashSet::new();
+    for name in value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !seen.insert(name) {
+            return Err(SchemaProblem::Repeated {
+                name: name.to_owned(),
+                at: at.clone(),
+            });
+        }
+    }
+    Ok(true)
+}
+
 /// Whether a `type` value is a type name or a list of them.
 fn names_types(value: &Value) -> bool {
     let named = |name: &Value| name.as_str().is_some_and(|name| TYPE_NAMES.contains(&name));
@@ -589,6 +617,35 @@ mod tests {
     fn a_pointer_escapes_its_tokens() {
         let at = JsonPointer::default().child("a/b").child("c~d");
         assert_eq!(at.as_str(), "/a~1b/c~0d");
+    }
+
+    #[test]
+    fn a_root_false_schema_refuses_any_arguments_object() {
+        // #94's third case, #127. The loader refuses a root `false` (it is not an object
+        // schema), so this builds the adapter directly: if that rule were ever relaxed, the
+        // check would still admit nothing, and say so at the root.
+        let tool = ToolName::parse("wiki__search").unwrap();
+        let adapter = ArgumentAdapter::new(tool.clone(), Vec::new(), json!(false));
+        for arguments in [
+            json!({}),
+            json!({ "q": "text" }),
+            json!({ "q": { "deep": [1, 2] } }),
+        ] {
+            assert_eq!(
+                adapter.check_arguments(&arguments),
+                Err(ArgumentError::Invalid {
+                    tool: tool.clone(),
+                    path: JsonPointer::default(),
+                    keyword: "false",
+                }),
+                "{arguments}"
+            );
+        }
+        // Arguments that are not an object are refused as that, before the schema is read.
+        assert_eq!(
+            adapter.check_arguments(&json!([])),
+            Err(ArgumentError::NotAnObject { tool })
+        );
     }
 
     #[test]

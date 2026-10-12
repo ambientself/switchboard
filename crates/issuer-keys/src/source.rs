@@ -35,6 +35,11 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
 /// token is far shorter; a larger file is the wrong file.
 pub const MAX_TOKEN_BYTES: u64 = 8 * 1024;
 
+/// The `Accept` header of each fetch. A Kubernetes API server serves `/openid/v1/jwks` only as
+/// `application/jwk-set+json`, and answers `406` to a request that accepts only
+/// `application/json` (#88, found in the kind run). Other issuers serve plain JSON.
+const ACCEPTED: &str = "application/jwk-set+json, application/json";
+
 /// The bounds on each fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FetchOptions {
@@ -414,7 +419,7 @@ impl KeySource {
         uri: Uri,
         authorization: Option<HeaderValue>,
     ) -> Result<Response<Incoming>, FetchError> {
-        let mut request = Request::get(uri).header(ACCEPT, "application/json");
+        let mut request = Request::get(uri).header(ACCEPT, ACCEPTED);
         if let Some(authorization) = authorization {
             request = request.header(AUTHORIZATION, authorization);
         }

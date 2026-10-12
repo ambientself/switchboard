@@ -370,8 +370,9 @@ fn binding(
 }
 
 /// The RBAC objects of a kind cluster with the demo applied, in part: the default discovery
-/// roles bound to every ServiceAccount or every authenticated user, cluster-admin bound to
-/// system:masters, the route-check operator's own access, a workload Role that reads pods and
+/// roles bound to every ServiceAccount or every authenticated user, the issuer-discovery role
+/// the demo binds to unauthenticated callers too, cluster-admin bound to system:masters, the
+/// route-check operator's own access, a workload Role that reads pods and
 /// their logs, and two of kubeadm's Roles in kube-system and kube-public, limited by
 /// resourceNames and bound to other subjects. None grants a row of permissions.tsv to the
 /// workload: `get` on `pods` is not `get` on `pods/exec`.
@@ -415,6 +416,8 @@ fn kind_rbac() -> Value {
                 {"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": "system:unauthenticated"}
             ])),
             binding(None, "system:service-account-issuer-discovery", "ClusterRole", "system:service-account-issuer-discovery", group("system:serviceaccounts")),
+            // The kind base's own (deploy/kind/base/issuer-discovery.yaml, #88).
+            binding(None, "switchboard-issuer-discovery-unauthenticated", "ClusterRole", "system:service-account-issuer-discovery", group("system:unauthenticated")),
             binding(None, "route-check-operator", "ClusterRole", "route-check-operator", operator.clone())
         ],
         "roles": {

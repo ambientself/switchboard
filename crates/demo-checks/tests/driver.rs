@@ -3100,3 +3100,91 @@ fn the_gateways_token_grant_must_name_only_the_entries() {
         run.transcript()
     );
 }
+
+/// A gateway log line as the gateway writes it: tracing's JSON, its fields under `fields`.
+fn boot_line(fields: &Value) -> String {
+    json!({"timestamp": "2026-10-11T00:00:00Z", "level": "INFO", "fields": fields, "target": "gateway::start"})
+        .to_string()
+}
+
+fn check_keys_fetched(lines: &[String]) -> Run {
+    require(&["jq"]);
+    let logs = lines.join("\n").replace('\'', "'\\''");
+    sourced(&format!(
+        "check_keys_fetched '{logs}' https://issuer.test\nFINISHED=1\nresult 0"
+    ))
+}
+
+/// #88: the kind run checks that the gateway fetched the cluster issuer's keys from its keys URL
+/// at boot, by the line the gateway logs for it, right after the other boot lines.
+#[test]
+fn the_kind_run_checks_the_gateway_fetched_the_issuers_keys() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let message = "fetched the issuer's keys from its keys URL";
+    assert!(
+        common::read("crates/gateway/src/start.rs").contains(&format!("\"{message}\"")),
+        "the gateway no longer logs `{message}`"
+    );
+    assert!(driver.contains(&format!("\nKEYS_FETCHED_MESSAGE=\"{message}\"\n")));
+    let kind = function_body(&driver, "kind_run");
+    assert!(
+        kind.contains(
+            "    check_boot \"$FETCHED\"\n    check_keys_fetched \"$FETCHED\" \"$KIND_ISSUER\"\n"
+        ),
+        "{kind}"
+    );
+
+    let fetched = |issuer: &str, keys: u64| {
+        boot_line(&json!({
+            "message": message, "event": "boot", "keys_issuer": issuer, "keys": keys,
+            "refresh_seconds": 60
+        }))
+    };
+    let other = boot_line(
+        &json!({"message": "identity is enforced", "event": "boot", "identity": "enforce"}),
+    );
+    let run = check_keys_fetched(&[other.clone(), fetched("https://issuer.test", 2)]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(run.lines("PASS ").len(), 2, "{}", run.transcript());
+
+    let not_boot = boot_line(&json!({
+        "message": message, "keys_issuer": "https://issuer.test", "keys": 1
+    }));
+    for (case, lines, failure) in [
+        // A gateway that read a keys file logs no such line.
+        (
+            "keys file",
+            vec![other.clone()],
+            "from its keys URL at boot (got '0'",
+        ),
+        // Another issuer's keys, or the line with no boot event.
+        (
+            "other issuer",
+            vec![fetched("https://other.test", 1)],
+            "from its keys URL at boot (got '0'",
+        ),
+        (
+            "not boot",
+            vec![not_boot],
+            "from its keys URL at boot (got '0'",
+        ),
+        // Two boots in one log, and a fetch that found no key.
+        (
+            "twice",
+            vec![
+                fetched("https://issuer.test", 1),
+                fetched("https://issuer.test", 1),
+            ],
+            "from its keys URL at boot (got '2'",
+        ),
+        (
+            "no keys",
+            vec![fetched("https://issuer.test", 0)],
+            "the keys it fetched (got 0",
+        ),
+    ] {
+        let run = check_keys_fetched(&lines);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        assert!(run.failed(failure), "{case}: {}", run.transcript());
+    }
+}

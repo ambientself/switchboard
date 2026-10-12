@@ -1,5 +1,7 @@
 # The gateway. It verifies projected ServiceAccount tokens against the cluster's own issuer
-# keys (ConfigMap cluster-issuer-keys, which demo.sh creates), writes audit rows to Postgres as
+# keys, which it fetches from the API server's /openid/v1/jwks with no token, trusting only the
+# cluster CA in ConfigMap kube-root-ca.crt (decision 0013, section 10; issuer-discovery.yaml
+# lets an unauthenticated caller read them). It writes audit rows to Postgres as
 # switchboard_gateway, and forwards allowed calls to mock-docs with the token of the entry the
 # tool belongs to: ServiceAccount docs-team-a's on team-a's calls and docs-team-b's on team-b's,
 # each for audience mock-docs (decisions 0010 and 0013, section 10). There is no static
@@ -133,7 +135,9 @@ spec:
             - {name: config, mountPath: /etc/switchboard/config, readOnly: true}
             # No subPath, so ConfigMap edits reach the running gateway.
             - {name: registry, mountPath: /etc/switchboard/registry, readOnly: true}
-            - {name: issuer-keys, mountPath: /etc/switchboard/issuer, readOnly: true}
+            # The cluster CA, which kube-root-ca.crt holds in every namespace: the only CA the
+            # gateway trusts for the API server's keys URL (keys_ca_file in gateway.toml).
+            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}
             # Each entry's token, which the token writer writes. Read-only here.
             - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}
       volumes:
@@ -141,8 +145,11 @@ spec:
           configMap: {name: gateway-config}
         - name: registry
           configMap: {name: registry}
-        - name: issuer-keys
-          configMap: {name: cluster-issuer-keys}
+        # The cluster CA alone, with no token beside it. Every projected token authenticates as
+        # the pod's ServiceAccount, so the gateway reads the keys with none (decision 0013,
+        # section 10).
+        - name: cluster-ca
+          configMap: {name: kube-root-ca.crt}
         # The token writer's own token for the API server: no audience, so the API server's,
         # and 600 s, the kubelet's minimum, so it is replaced about every 8 minutes. With it, the
         # cluster's CA. automountServiceAccountToken stays false, so no container gets the

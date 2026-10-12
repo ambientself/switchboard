@@ -1192,6 +1192,11 @@ mutate("testkit-begin-compares-more-than-decision", "a begin with a known identi
        "                    && AuditRecord { completion: None, ..stored.clone() } == *record => {}")
 mutate("testkit-deadline-wrong-clock", "the in-memory store reads the system clock, not its own, for a row's times", A,
        "        let begun_at = self.clock.now();", "        let begun_at = SystemTime::now();")
+mutate("testkit-list-wrong-clock", "the in-memory store reads the system clock, not its own, for a list row's time at begin", A,
+       "                    .push((row.clone(), record.clone(), self.clock.now()));",
+       "                    .push((row.clone(), record.clone(), SystemTime::now()));")
+mutate("testkit-clock-ignored", "the in-memory store keeps its default clock, not the one it was given", A,
+       "        self.clock = clock;\n        self\n", "        let _ = clock;\n        self\n")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
        "                let _ = state.complete(row, &error);", "                let _ = &error;")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
@@ -2864,6 +2869,17 @@ mutate("schema-additional-properties-unenforced", "an `additionalProperties` sch
 mutate("schema-invalid-says-undeclared", "a call that fails a schema keyword is told it carried an undeclared argument",
        "crates/gateway/src/proxied.rs",
        "                            invalid_argument(tool.as_str())\n", "                            undeclared_argument(tool.as_str())\n")
+# #127: the names in a `type` list and in `required` are unique, as 2020-12 says, and the error
+# names the list's pointer. A root `true` or `false` is refused, though either loads below it.
+mutate("schema-type-repeat-loads", "a `type` list may name one type twice", RA,
+       '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value),')
+mutate("schema-required-repeat-loads", "a `required` list may name one property twice", RA,
+       "                    && unique(value, &here)?\n            }", "            }")
+mutate("schema-repeat-pointer-is-schema", "a repeated name is reported at the schema, not at its list", RA,
+       '            "type" => names_types(value) && unique(value, &here)?,', '            "type" => names_types(value) && unique(value, at)?,')
+mutate("registry-schema-boolean-root-loads", "a root input schema of `true` or `false` loads", RR,
+       '    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {',
+       '    if tool.input_schema.is_object() && tool.input_schema.get("type") != Some(&Value::String("object".into())) {')
 
 
 # --- audit-postgres ------------------------------------------------------------------------
@@ -3830,6 +3846,33 @@ mutate("demo-kind-boot-reads-deployment", "the boot lines are read from whicheve
        ' k -n switchboard logs "pod/$GATEWAY_POD"; then\n', ' k -n switchboard logs deploy/gateway; then\n')
 mutate("demo-kind-gateway-pod-any-revision", "the gateway's pod is taken from any of its ReplicaSets", DRIVER,
        """      | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $revision)\n""", "")
+# #88, decision 0013 section 10: the kind gateway fetches the cluster's keys over TLS with no
+# token, under one binding of the issuer-discovery ClusterRole to unauthenticated callers.
+mutate("demo-kind-keys-file-still-used", "the kind gateway still reads its keys from a file the driver copies", "deploy/kind/base/config/gateway.toml",
+       'keys_url = "https://kubernetes.default.svc.cluster.local/openid/v1/jwks"\nkeys_ca_file = "/etc/switchboard/cluster-ca/ca.crt"\n',
+       'keys_file = "/etc/switchboard/issuer/jwks.json"\n')
+mutate("demo-kind-keys-fetch-unchecked", "the kind run never checks that the gateway fetched the issuer's keys", DRIVER,
+       '    check_keys_fetched "$FETCHED" "$KIND_ISSUER"\n', "")
+mutate("demo-kind-discovery-binding-widened", "the discovery binding gives unauthenticated callers a broader ClusterRole", "deploy/kind/base/issuer-discovery.yaml",
+       "  name: system:service-account-issuer-discovery\n", "  name: view\n")
+mutate("demo-kind-discovery-binding-extra-subject", "the discovery binding names a second subject", "deploy/kind/base/issuer-discovery.yaml",
+       "    name: system:unauthenticated\n",
+       "    name: system:unauthenticated\n  - apiGroup: rbac.authorization.k8s.io\n    kind: Group\n    name: system:authenticated\n")
+mutate_all("demo-kind-gateway-keys-token", "the gateway container mounts a projected token for the API server's audience",
+           ("deploy/kind/base/gateway.yaml",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n"
+            "            - {name: keys-token, mountPath: /var/run/secrets/switchboard/keys, readOnly: true}\n"),
+           ("deploy/kind/base/gateway.yaml",
+            "          configMap: {name: kube-root-ca.crt}\n",
+            "          configMap: {name: kube-root-ca.crt}\n"
+            "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
+            "                  audience: https://kubernetes.default.svc.cluster.local\n                  expirationSeconds: 600\n                  path: token\n"))
+mutate("demo-kind-gateway-keys-token-unset-audience", "the gateway's CA volume also projects a token with no audience, which is the API server's",
+       "deploy/kind/base/gateway.yaml",
+       "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}\n",
+       "        - name: cluster-ca\n          projected:\n            sources:\n              - configMap: {name: kube-root-ca.crt}\n"
+       "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
        '    check "curl exit $code, ${connects:-no} connections"', '    check "curl exit $code, 0 connections"')
 mutate("demo-workload-idle-no-trap", "the idle workload has no trap, so SIGTERM kills it and it never passes", WORKLOAD,
@@ -4296,8 +4339,9 @@ mutate("demo-kind-gateway-token-long-lived", "the token writer's API token lives
        "                  expirationSeconds: 600\n", "                  expirationSeconds: 86400\n")
 mutate("demo-kind-mock-docs-any-subject", "mock-docs accepts a workload's ServiceAccount", KIND_MOCK_DOCS,
        "system:serviceaccount:switchboard:docs-team-b=borealis", "system:serviceaccount:team-b:mock-workload=borealis")
-mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys only for the gateway", DRIVER,
-       "  for ns in switchboard mock-docs; do\n", "  for ns in switchboard; do\n")
+# #88: the gateway fetches its own keys; only mock-docs still reads the copy.
+mutate("demo-kind-issuer-keys-gateway-only", "demo.sh copies the cluster's keys into the gateway's namespace, not mock-docs'", DRIVER,
+       "  k -n mock-docs create configmap cluster-issuer-keys ", "  k -n switchboard create configmap cluster-issuer-keys ")
 mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted requests whatever their caller",
            (DRIVER, """'$1 == "accepted" && ($2 in entry) && NF == 2 { count++ }""", """'$1 == "accepted" { count++ }"""),
            (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 2) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
@@ -4350,6 +4394,10 @@ mutate("issuer-keys-zero-deadline-allowed", "a zero deadline is accepted", IK,
        "        if options.deadline.is_zero() {", "        if false {")
 mutate("issuer-keys-zero-cap-allowed", "a zero body cap is accepted", IK,
        "        if options.max_body_bytes == 0 {", "        if false {")
+# #88: a Kubernetes API server answers 406 to a fetch that does not accept a JWK set.
+mutate("issuer-keys-accepts-only-json", "a fetch accepts only application/json, which Kubernetes refuses", IK,
+       'const ACCEPTED: &str = "application/jwk-set+json, application/json";',
+       'const ACCEPTED: &str = "application/json";')
 # Only a redirect to another host or port is followed, so only the tests whose redirect changes
 # the host (plain and over TLS) or the port can catch it.
 mutate("issuer-keys-redirect-followed", "a redirect to another host or port is followed once", IK,

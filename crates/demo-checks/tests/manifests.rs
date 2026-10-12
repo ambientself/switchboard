@@ -118,6 +118,7 @@ fn the_base_has_no_network_policy() {
             "  - postgres.yaml",
             "  - migrate-job.yaml",
             "  - mock-docs.yaml",
+            "  - issuer-discovery.yaml",
             "  - gateway.yaml",
             "  - workloads.yaml",
         ]
@@ -784,7 +785,8 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
         );
     }
 
-    // The keys are the cluster's, which demo.sh copies into mock-docs' namespace too.
+    // The keys are the cluster's, which demo.sh copies into mock-docs' namespace, and only
+    // there: the gateway fetches its own (the next test).
     assert!(mock_docs.contains(
         "            - {name: issuer-keys, mountPath: /etc/mock-docs/issuer, readOnly: true}\n"
     ));
@@ -793,9 +795,185 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
             "        - name: issuer-keys\n          configMap: {name: cluster-issuer-keys}"
         )
     );
+    let copies: Vec<&str> = driver
+        .lines()
+        .filter(|line| line.contains("create configmap cluster-issuer-keys"))
+        .collect();
+    assert_eq!(
+        copies,
+        [
+            "  k -n mock-docs create configmap cluster-issuer-keys --from-file=jwks.json=\"$DEMO_DIR/cluster-jwks.json\" \\"
+        ]
+    );
     assert!(driver.contains(
-        "  for ns in switchboard mock-docs; do\n    k -n \"$ns\" create configmap cluster-issuer-keys --from-file=jwks.json="
+        "\n  k -n switchboard delete configmap cluster-issuer-keys --ignore-not-found\n"
     ));
+}
+
+/// The lines of the container `name` in a Deployment: from its `- name:` line to the next
+/// container, or the end of the pod's containers.
+fn container(deployment: &str, name: &str) -> String {
+    let header = format!("        - name: {name}");
+    let mut lines = deployment.lines().skip_while(|line| *line != header);
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("no container `{name}`:\n{deployment}"));
+    let rest = lines.take_while(|line| line.starts_with("          ") || line.trim().is_empty());
+    std::iter::once(first)
+        .chain(rest)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The name of each volume the container mounts, from its `- {name: ..., mountPath: ...}` lines.
+fn mounted(container: &str) -> Vec<String> {
+    block_after(container, "          volumeMounts:")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- {name: "))
+        .map(|rest| rest.split(',').next().unwrap().to_owned())
+        .collect()
+}
+
+/// The pod's volume `name`: its `- name:` line and those under it.
+fn volume(deployment: &str, name: &str) -> String {
+    let volumes = block_after(deployment, "      volumes:");
+    let header = format!("        - name: {name}");
+    let mut lines = volumes.lines().skip_while(|line| *line != header);
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("no volume `{name}`:\n{volumes}"));
+    let rest = lines.take_while(|line| line.starts_with("          "));
+    std::iter::once(first)
+        .chain(rest)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// #88, decision 0013 section 10: in kind the gateway fetches the cluster issuer's keys from the
+/// API server's own origin, over TLS with only the cluster CA trusted, and with no token. Its
+/// container mounts kube-root-ca.crt and no token the API server accepts, and its deployment
+/// file names no keys file and no token file.
+#[test]
+fn the_kind_gateway_fetches_the_clusters_keys_with_no_token() {
+    let config = read("deploy/kind/base/config/gateway.toml");
+    let issuer = value_after(&config, "issuer = ");
+    assert_eq!(issuer, "https://kubernetes.default.svc.cluster.local");
+    assert_eq!(
+        value_after(&config, "keys_url = "),
+        format!("{issuer}/openid/v1/jwks")
+    );
+    let ca_file = value_after(&config, "keys_ca_file = ");
+    for field in ["keys_file", "keys_token_file"] {
+        assert!(
+            !config
+                .lines()
+                .any(|line| line.trim_start().starts_with(field)),
+            "the kind gateway sets {field}:\n{config}"
+        );
+    }
+    let refresh = number_after(&config, "keys_refresh_seconds = ", "");
+    assert!((30..=300).contains(&refresh), "{refresh}");
+
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    let container = container(&gateway, "gateway");
+    let (ca_dir, ca_name) = ca_file.rsplit_once('/').unwrap();
+    assert_eq!(ca_name, "ca.crt");
+    assert!(
+        container.contains(&format!(
+            "            - {{name: cluster-ca, mountPath: {ca_dir}, readOnly: true}}\n"
+        )),
+        "{container}"
+    );
+    assert_eq!(
+        volume(&gateway, "cluster-ca"),
+        "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}"
+    );
+
+    // No volume the gateway container mounts projects a token the API server accepts: each
+    // projected token names an audience, and not the API server's, which in kind is the issuer.
+    let mounts = mounted(&container);
+    assert!(mounts.contains(&"cluster-ca".to_owned()), "{mounts:?}");
+    for name in &mounts {
+        for audience in token_audiences(&volume(&gateway, name)) {
+            let audience = audience
+                .unwrap_or_else(|| panic!("volume {name} projects a token for the API server"));
+            assert!(
+                audience != issuer && !audience.starts_with("https://kubernetes.default.svc"),
+                "volume {name} projects a token for the API server's audience {audience}"
+            );
+        }
+    }
+    assert!(
+        !container.contains("/var/run/secrets/kubernetes.io/serviceaccount"),
+        "{container}"
+    );
+    assert!(!gateway.contains("automountServiceAccountToken: true"));
+    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
+    let account = documents_with(&accounts, "  name: gateway\n");
+    assert_eq!(account.len(), 1);
+    assert!(account[0].contains("\nautomountServiceAccountToken: false"));
+
+    // The cluster-issuer-keys copy is mock-docs' alone.
+    assert!(!gateway.contains("cluster-issuer-keys"), "{gateway}");
+    assert!(!gateway.contains("/etc/switchboard/issuer"), "{gateway}");
+}
+
+/// Decision 0013 section 10: the only RBAC the kind base adds for the keys is one binding of the
+/// existing ClusterRole system:service-account-issuer-discovery to system:unauthenticated, and
+/// nothing else binds either.
+#[test]
+fn the_kind_issuer_discovery_binding_names_only_that_role_and_group() {
+    let text = read("deploy/kind/base/issuer-discovery.yaml");
+    let body: Vec<&str> = text.lines().filter(|line| !line.starts_with('#')).collect();
+    assert_eq!(
+        body,
+        [
+            "apiVersion: rbac.authorization.k8s.io/v1",
+            "kind: ClusterRoleBinding",
+            "metadata:",
+            "  name: switchboard-issuer-discovery-unauthenticated",
+            "roleRef:",
+            "  apiGroup: rbac.authorization.k8s.io",
+            "  kind: ClusterRole",
+            "  name: system:service-account-issuer-discovery",
+            "subjects:",
+            "  - apiGroup: rbac.authorization.k8s.io",
+            "    kind: Group",
+            "    name: system:unauthenticated",
+        ]
+    );
+    let kustomization = read("deploy/kind/base/kustomization.yaml");
+    assert!(
+        kustomization.contains("\n  - issuer-discovery.yaml\n"),
+        "{kustomization}"
+    );
+
+    // No other manifest under deploy/kind binds that ClusterRole or that group, or defines a
+    // role of that name.
+    let mut others = Vec::new();
+    let mut directories = vec![common::repo().join("deploy/kind")];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "yaml")
+                && !path.ends_with("base/issuer-discovery.yaml")
+            {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let uncommented: String = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .collect();
+                if uncommented.contains("system:service-account-issuer-discovery")
+                    || uncommented.contains("system:unauthenticated")
+                {
+                    others.push(path);
+                }
+            }
+        }
+    }
+    assert!(others.is_empty(), "{others:?}");
 }
 
 #[test]
