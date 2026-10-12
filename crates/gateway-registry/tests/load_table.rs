@@ -970,28 +970,15 @@ fn cases() -> Vec<Case> {
             },
             Want::Loads,
         ),
+        // Withdrawal removes a tool's approval (decision 0013, section 8). The reach check's
+        // tool, and an entry's last tool, can be withdrawn without touching the reach check.
         case(
-            "a reach check calling another server's tool",
+            "withdrawing the reach check's tool, the entry's last, loads",
             |t| {
-                set(
-                    t,
-                    "servers.0.reach_check",
-                    "tool",
-                    value("\"wiki__search\""),
-                )
+                at(t, "tools").as_array_mut().unwrap().remove(0);
+                set(t, "surfaces.0", "tools", value("[\"wiki__search\"]"));
             },
-            Want::Error(E::ReachCheckTool {
-                server: "docs-server".into(),
-                tool: tool("wiki__search"),
-            }),
-        ),
-        case(
-            "a reach check calling a tool nobody approved",
-            |t| set(t, "servers.0.reach_check", "tool", value("\"docs__write\"")),
-            Want::Error(E::ReachCheckTool {
-                server: "docs-server".into(),
-                tool: tool("docs__write"),
-            }),
+            Want::Loads,
         ),
         // The destination against the address's scheme (decision 0013, section 3).
         case(

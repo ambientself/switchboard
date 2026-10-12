@@ -122,11 +122,13 @@ pub struct Probe {
     pub date: String,
 }
 
-/// The reach check's call outside the reach: one of the entry's approved tools, and arguments
-/// naming a canary resource outside the reach.
+/// The reach check's call outside the reach: one of the entry's tools, and arguments naming a
+/// canary resource outside the reach.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReachCheck {
-    /// The tool, which must be approved on this server.
+    /// The tool, by its exposed name. The loader does not require it to be approved: removing
+    /// a tool's approval withdraws it (decision 0013, section 8), and that must stay possible
+    /// for this tool and for an entry's last tool without editing the reach check.
     pub tool: ToolName,
     /// Its arguments.
     pub arguments: serde_json::Map<String, Value>,
@@ -214,16 +216,6 @@ pub enum RegistryError {
         "server `{0}` has a reach and no `reach_check`, the call outside it the reach check makes"
     )]
     ReachCheckMissing(ConnectorName),
-    /// A server's reach check calls a tool that is not one of its approved tools.
-    #[error(
-        "server `{server}`'s reach check calls `{tool}`, which is not one of its approved tools"
-    )]
-    ReachCheckTool {
-        /// The server.
-        server: ConnectorName,
-        /// The tool its reach check names.
-        tool: ToolName,
-    },
     /// Two tools share an exposed name.
     #[error("tool `{0}` is approved more than once")]
     DuplicateTool(ToolName),
@@ -506,18 +498,6 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         adapters.insert(name.clone(), checked.adapter);
         routes.insert(name.clone(), checked.route);
         approvals.insert(name, checked.approval);
-    }
-    for server in servers.values() {
-        if let Some(check) = &server.reach_check
-            && routes
-                .get(&check.tool)
-                .is_none_or(|route| route.server != server.name)
-        {
-            return Err(RegistryError::ReachCheckTool {
-                server: server.name.clone(),
-                tool: check.tool.clone(),
-            });
-        }
     }
 
     let surfaces = file

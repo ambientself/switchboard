@@ -25,8 +25,9 @@ revision = "demo-3"
 # Each server is a connector entry (decision 0011, section 1). `credential` is its one
 # credential: its mode, the label of its secret, and the identity it acts as, the same in kind
 # and Compose. `narrowing` is what the credential is narrowed to per call ("call", "limit" or
-# "none"); `permits`, the highest classification a call with it could have; `reach`, every
-# resource it can reach, which is exactly the project mock-docs lets that identity read.
+# "none"; only "none" starts until the gateway can narrow a credential). `permits` is the
+# highest classification a call with it could have; `reach`, every resource it can reach,
+# which is exactly the project mock-docs lets that identity read.
 # `reach_test` records the test that showed a call outside the reach fails, and `reach_check`
 # the call outside it that the scheduled reach check makes. `destination` is "in_cluster",
 # which alone may use http. The loader refuses a snapshot that breaks one of decision 0011's

@@ -589,6 +589,65 @@ async fn wait_for(path: &RequestPath, token: &str, tools: &[&str]) {
     );
 }
 
+/// Decision 0013, section 8: removing an approval withdraws the tool on reload. That holds for
+/// the tool team A's reach check names, and for the entry's last tool, with the entry and its
+/// reach check left as they are.
+#[tokio::test]
+async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() {
+    let world = World::new("reload-last").await;
+    let prepared = world.prepare().await.unwrap();
+    let path = RequestPath::new(prepared.gates);
+    let reloader = prepared.watch.reloader;
+    let team_a = token(TEAM_A_SA);
+    let original = registry(&world.mock.url());
+    let check = format!("[servers.reach_check]\ntool = \"{LIST_TOOL}\"");
+    assert_eq!(
+        original.matches(&check).count(),
+        1,
+        "the reach check names the list tool"
+    );
+
+    // The list tool, which the reach check names: the approval and the surface entry removed.
+    let without_list = without_tool(&original, LIST_TOOL)
+        .replace(
+            &format!("revision = \"{KIND_REVISION}\""),
+            "revision = \"demo-2\"",
+        )
+        .replace(
+            &format!("tools = [\"{LIST_TOOL}\", \"{READ_TOOL}\"]"),
+            &format!("tools = [\"{READ_TOOL}\"]"),
+        );
+    let revision = reloader
+        .apply(&Registry::from_toml_str(&without_list).unwrap())
+        .unwrap();
+    assert_eq!(revision.as_str(), "demo-2");
+    assert_eq!(listed(&path, &team_a).await, [READ_TOOL]);
+
+    // Then the entry's last tool too, leaving the entry registered with nothing to serve.
+    let without_both = without_tool(&without_list, READ_TOOL)
+        .replace("revision = \"demo-2\"", "revision = \"demo-3-empty\"")
+        .replace(&format!("tools = [\"{READ_TOOL}\"]"), "tools = []");
+    let revision = reloader
+        .apply(&Registry::from_toml_str(&without_both).unwrap())
+        .unwrap();
+    assert_eq!(revision.as_str(), "demo-3-empty");
+    assert_eq!(listed(&path, &team_a).await, Vec::<String>::new());
+    assert_eq!(
+        listed_on(&path, TEAM_B_SURFACE, &token(TEAM_B_SA)).await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
+    assert_eq!(world.calls(), 0);
+}
+
+/// The registry without the approval of `tool`, which is followed by another approval.
+fn without_tool(registry: &str, tool: &str) -> String {
+    let start = registry
+        .find(&format!("[[tools]]\nname = \"{tool}\""))
+        .unwrap();
+    let end = start + 1 + registry[start + 1..].find("[[tools]]").unwrap();
+    format!("{}{}", &registry[..start], &registry[end..])
+}
+
 /// The registry without team A's read tool, at revision demo-2.
 fn withdraw_read_tool(registry: &str) -> String {
     let start = registry

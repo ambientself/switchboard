@@ -2810,8 +2810,11 @@ mutate("registry-reach-test-not-required", "a server may have a reach and no rea
        "        if !reach.is_empty() && reach_test.is_none() {", "        if false {")
 mutate("registry-reach-check-not-required", "a server may have a reach and no reach check", RR,
        "            && server.reach_check.is_none()\n", "            && false\n")
-mutate("registry-reach-check-any-tool", "a reach check may call a tool that is not its server's", RR,
-       "                .is_none_or(|route| route.server != server.name)", "                .is_none_or(|_| false)")
+mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file", RR,
+       "    let surfaces = file\n",
+       "    if servers.values().any(|server| server.reach_check.as_ref().is_some_and(|check| !routes.contains_key(&check.tool))) {\n"
+       "        return Err(RegistryError::ReachCheckMissing(servers.keys().next().unwrap().clone()));\n"
+       "    }\n    let surfaces = file\n")
 mutate("registry-destination-scheme-unchecked", "a public destination may use plain http", RR,
        '        if server.address.starts_with("http://") && server.destination != Destination::InCluster {',
        "        if false {")
@@ -4229,6 +4232,10 @@ mutate("gw-start-credential-unused", "a credential file no server uses is accept
 mutate("gw-start-per-user-grant-accepted", "a per-user grant is read from a file like a token", START,
        "            CredentialMode::PerUserGrant => {\n                return Err(StartError::PerUserGrant(server.name.clone()));\n            }\n",
        "            CredentialMode::PerUserGrant => &server.credential.reference,\n")
+mutate("gw-start-narrowing-accepted", "an entry narrowed per call or to the limit starts with one credential", START,
+       "        if server.narrowing != Narrowing::None {", "        if false {")
+mutate("gw-start-narrowing-call-accepted", "an entry narrowed per call starts with one credential", START,
+       "        if server.narrowing != Narrowing::None {", "        if server.narrowing == Narrowing::Limit {")
 mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
