@@ -1244,6 +1244,8 @@ mutate("testkit-allowance-wraps", "a call deadline near the largest wraps round 
 mutate("testkit-allowance-rounds-up", "a budget is counted in part milliseconds, not whole ones as Postgres counts it", A,
        "    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)",
        "    u64::try_from(duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 > 0)).unwrap_or(u64::MAX)")
+mutate("testkit-allowance-omits-answer", "the in-memory store's deadline leaves out the answer budget, so a failed begin's row can be completed past it (#96)", A,
+       "        .saturating_add(millis(budgets.answer))\n", "")
 mutate("testkit-denial-completed", "the in-memory store completes a denial, which complete_once refuses", A,
        "        if row.decision != DecisionKind::Allow {", "        if false {")
 mutate("testkit-list-row-completed", "the in-memory store finds no row, rather than a listing, when finish names a list row", A,
@@ -3083,6 +3085,8 @@ mutate("pg-allowance-without-finish-deadline", "a row's deadline leaves out the 
        "        .saturating_add(millis(budgets.finish_deadline))\n", "\n")
 mutate("pg-allowance-wraps", "a long call deadline wraps round to a short allowance", PG_COLUMNS,
        "        .saturating_add(call_deadline_ms)\n", "        .wrapping_add(call_deadline_ms)\n")
+mutate("pg-allowance-omits-answer", "a row's deadline leaves out the answer budget, so a failed begin's row can be completed past it (#96)", PG_COLUMNS,
+       "        .saturating_add(millis(budgets.answer))\n", "")
 mutate("pg-grant-insert-deadline", "the gateway may write the deadline", PG_ROW_DEADLINE,
        "GRANT INSERT (instance, kind, allowance_ms)", "GRANT INSERT (instance, kind, allowance_ms, deadline)")
 # List rows (0004).
