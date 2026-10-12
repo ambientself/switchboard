@@ -481,15 +481,27 @@ async fn it_serves_the_registry_from_files_and_forwards_with_its_own_credential(
 
     // One call reached the server, with the gateway's credential. Beside it, the first drift
     // pass read each entry's tool list once, before the listener was bound, with that entry's
-    // own credential; the next pass is five minutes away.
+    // own credential, and probed each entry with three calls the server refused; the next pass
+    // is five minutes away.
     let lines = mock.log_lines();
+    let (accepted, refused): (Vec<&Value>, Vec<&Value>) = lines
+        .iter()
+        .filter(|line| line["event"] == json!("request"))
+        .partition(|line| line["accepted"] == json!(true));
+    assert_eq!(refused.len(), 2 * 3, "{lines:?}");
     let bearers = |lists: bool| -> Vec<Value> {
-        lines
+        accepted
             .iter()
             .filter(|line| (line["rpc_method"] == json!("tools/list")) == lists)
             .filter_map(|line| line.get("bearer_sha256").cloned())
             .collect()
     };
+    for line in &refused {
+        assert!(
+            !bearers(true).contains(&line["bearer_sha256"]),
+            "a probe call carried the gateway's credential: {line}"
+        );
+    }
     assert_eq!(bearers(false).len(), 1, "{lines:?}");
     let listed = bearers(true);
     assert_eq!(listed.len(), 2, "{lines:?}");

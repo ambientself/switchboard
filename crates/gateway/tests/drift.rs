@@ -27,8 +27,8 @@ use gateway::boot::{self, Settings, Wiring};
 use gateway::path::RequestPath;
 use gateway::reload::{ReloadError, Reloader};
 use gateway::{
-    AuditSection, DriftPass, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, serve_with_telemetry,
-    start,
+    AuditSection, DriftPass, Metrics, ProbeCredentials, TELEMETRY_QUEUE, Telemetry, Timeouts,
+    probe_credentials, serve_with_telemetry, start,
 };
 use gateway_core::{ConnectorName, InstanceName, ToolName};
 use gateway_identity::SystemClock;
@@ -65,6 +65,7 @@ struct Replica {
     path: RequestPath,
     reloader: Reloader,
     drift: DriftPass,
+    probes: ProbeCredentials,
     store: Arc<InMemoryAuditStore>,
 }
 
@@ -103,6 +104,7 @@ impl Replica {
             read_at: Instant::now(),
         };
         let registry = Registry::load(&deployment.registry_file).unwrap();
+        let probes = probe_credentials(&registry, &deployment.probe_credentials).unwrap();
         let store = Arc::new(InMemoryAuditStore::new());
         let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
         let mut connectors = BTreeMap::new();
@@ -112,11 +114,12 @@ impl Replica {
             wiring = wiring.proxied(entry, connector);
         }
         let (gates, reloader) = boot::check_registry(settings, registry, wiring).unwrap();
-        let drift = DriftPass::new(reloader.withdrawals(), connectors, INTERVAL);
+        let drift = DriftPass::new(reloader.withdrawals(), connectors, probes.clone(), INTERVAL);
         Self {
             path: RequestPath::new(gates),
             reloader,
             drift,
+            probes,
             store,
         }
     }
@@ -366,6 +369,7 @@ async fn a_changed_description_is_withdrawn_within_one_interval() {
                 proxy("docs-team-b", &mock.url(), &files),
             ),
         ]),
+        replica.probes.clone(),
         INTERVAL,
     );
     let running = tokio::spawn(drift_pass.run());
@@ -709,6 +713,7 @@ async fn a_server_that_never_answers_does_not_hold_back_another_servers_withdraw
                 proxy_within("docs-team-b", &silent, &files, Duration::from_secs(60)),
             ),
         ]),
+        replica.probes.clone(),
         INTERVAL,
     );
     let running = tokio::spawn(drift_pass.run());
@@ -812,6 +817,8 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
                 (ConnectorName::new(entry), connector)
             })
             .collect(),
+        // No probe: the held server would hold its calls too. Each poll's list alone is judged.
+        ProbeCredentials::new(),
         INTERVAL,
     );
 

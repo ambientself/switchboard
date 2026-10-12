@@ -9,6 +9,18 @@
 //! with the approval's `definition_sha256`. A tool whose hash differs, or that the server no
 //! longer lists, is withdrawn. A tool the server lists that no approval names is ignored.
 //!
+//! **The probe.** Beside each tool list, the poll probes the server
+//! ([`ProxyConnector::probe`]): decision 0010's three `tools/call` requests for a tool that
+//! does not exist, with no credential, a malformed one, and the server's probe credential, a
+//! stranger's (`[drift.probe_credentials]`, [`probe_credentials`]). A server that dispatches
+//! one is open: it is logged as [`SERVER_OPEN_EVENT`] at ERROR, naming the server and the
+//! calls it dispatched, and counted in `switchboard_probe_results_total{result="open"}`. Its
+//! tools stay listed: withdrawing them would close the governed route and leave the open one
+//! (decision 0010). A probe that showed neither a refusal nor a dispatch, such as one that
+//! could not connect, is logged as [`PROBE_NOT_SHOWN_EVENT`] at WARN and counted as
+//! `not_shown`, never as refused. The probe runs while the list is read, so it adds nothing to
+//! how long a poll takes, and an open server found by the first pass does not stop boot.
+//!
 //! **A poll is judged against the approvals it began under.** Each poll notes the key
 //! ([`WithdrawalKey`]) of every tool approved on its server when it starts. When it ends, a
 //! tool whose key has changed since, because a reload approved it again or removed it while the
@@ -57,11 +69,15 @@
 //! checks for itself; nothing is passed between them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use connector_proxy::{ListError, ListedTool, ProxyConnector};
+use connector_proxy::{
+    CredentialFileError, ListError, ListedTool, ProbeCall, ProbeCredential, ProbeFinding,
+    ProbeReport, ProxyConnector,
+};
 use gateway_core::{ConnectorName, PolicyRevision, ToolName};
 use gateway_registry::{Registry, definition_sha256};
 use serde::Deserialize;
@@ -88,19 +104,36 @@ pub const POLL_FAILED_EVENT: &str = "drift_poll_failed";
 /// The `event` field of the line logged for each standing withdrawal a reload drops.
 pub const WITHDRAWAL_CLEARED_EVENT: &str = "policy_withdrawal_cleared";
 
-/// The deployment file's `[drift]` table. Optional, as is its one field.
+/// The `event` field of the error logged for each probe that found a server open.
+pub const SERVER_OPEN_EVENT: &str = "server_open";
+
+/// The `event` field of the warning logged for each probe that showed no refusal.
+pub const PROBE_NOT_SHOWN_EVENT: &str = "probe_not_shown";
+
+/// The deployment file's `[drift]` table.
 ///
 /// ```toml
 /// [drift]
 /// interval_seconds = 300      # 300 if left out; 5 to 900
+///
+/// [drift.probe_credentials]   # one for each proxied server in the registry
+/// mock-docs = "/var/run/switchboard/tokens/registry-probe"
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+///
+/// `probe_credentials` names, for each proxied server, the file holding the credential the
+/// probe's third call presents: a stranger's (decision 0010). The gateway refuses to start
+/// unless every server in the registry has one, and refuses one for a server the registry does
+/// not name ([`probe_credentials`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriftSection {
     /// How often, in seconds, each proxied server's tool list is read: 5 to 900, and
     /// [`DEFAULT_DRIFT_INTERVAL`] if left out.
     #[serde(default)]
     pub interval_seconds: Option<u64>,
+    /// Each proxied server's probe credential file, by server name.
+    #[serde(default)]
+    pub probe_credentials: BTreeMap<ConnectorName, PathBuf>,
 }
 
 /// Why the `[drift]` table was refused.
@@ -116,6 +149,53 @@ pub enum DriftError {
         /// The interval given, in seconds.
         seconds: u64,
     },
+}
+
+/// Why the probe credentials were refused.
+#[derive(Debug, Error)]
+pub enum ProbeCredentialError {
+    /// A proxied server has no probe credential.
+    #[error(
+        "server `{0}` has no probe credential; give it a file under `[drift.probe_credentials]`"
+    )]
+    Missing(ConnectorName),
+    /// A probe credential is given for a server the registry does not name.
+    #[error(
+        "`[drift.probe_credentials]` gives a file for server `{0}`, which the registry does not name"
+    )]
+    UnknownServer(ConnectorName),
+    /// A probe credential file could not be read, or does not hold one token.
+    #[error("the probe credential: {0}")]
+    File(#[from] CredentialFileError),
+}
+
+/// Each proxied server's probe credential, by server name.
+pub type ProbeCredentials = BTreeMap<ConnectorName, Arc<ProbeCredential>>;
+
+/// The probe credential of each of `registry`'s servers, from the file `files` names for it,
+/// each read and checked now. Refuses a server with no file and a file for a server the
+/// registry does not name.
+pub fn probe_credentials(
+    registry: &Registry,
+    files: &BTreeMap<ConnectorName, PathBuf>,
+) -> Result<ProbeCredentials, ProbeCredentialError> {
+    if let Some(unknown) = files
+        .keys()
+        .find(|server| !registry.servers().contains_key(*server))
+    {
+        return Err(ProbeCredentialError::UnknownServer(unknown.clone()));
+    }
+    registry
+        .servers()
+        .keys()
+        .map(|server| {
+            let path = files
+                .get(server)
+                .ok_or_else(|| ProbeCredentialError::Missing(server.clone()))?;
+            let credential = ProbeCredential::load(server.clone(), path)?;
+            Ok((server.clone(), Arc::new(credential)))
+        })
+        .collect()
 }
 
 impl DriftSection {
@@ -183,6 +263,12 @@ pub struct DriftCounts {
     pub polls_failed: u64,
     /// Tools withdrawn.
     pub withdrawals: u64,
+    /// Probes that found the server refused all three calls.
+    pub probes_refused: u64,
+    /// Probes that found the server open: it dispatched a call.
+    pub probes_open: u64,
+    /// Probes that showed neither.
+    pub probes_not_shown: u64,
 }
 
 /// The drift pass's counts, for the metrics. Cheap to clone; clones share the counts.
@@ -490,11 +576,76 @@ impl Withdrawals {
     }
 }
 
-/// The drift pass of one replica: each proxied server's connector, the withdrawals it makes,
-/// and how often it runs. See the [module documentation](self).
+impl Withdrawals {
+    /// Counts what `server`'s probe found, and logs it unless the server refused every call.
+    /// An open server is logged at ERROR and its tools stay listed: withdrawing them would
+    /// close the governed route and leave the open one (decision 0010). Nothing here touches
+    /// what is served.
+    fn report_probe(&self, server: &ConnectorName, report: &ProbeReport) {
+        let calls = || {
+            report
+                .calls()
+                .iter()
+                .map(|(call, verdict)| format!("{call}: {verdict}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        match report.finding() {
+            ProbeFinding::Refused => {
+                self.signals
+                    .count(server, |counts| counts.probes_refused += 1);
+            }
+            ProbeFinding::Open => {
+                self.signals.count(server, |counts| counts.probes_open += 1);
+                let dispatched: Vec<&str> = report
+                    .dispatched()
+                    .into_iter()
+                    .map(ProbeCall::as_str)
+                    .collect();
+                tracing::error!(
+                    event = SERVER_OPEN_EVENT,
+                    %server,
+                    dispatched = dispatched.join(","),
+                    calls = calls(),
+                    "the server dispatched a probe call for a tool that does not exist: it does \
+                     not check its caller, so it can be reached around the gateway; its tools \
+                     stay listed, and its owner and the register's owner must be told"
+                );
+            }
+            ProbeFinding::NotShown => {
+                self.signals
+                    .count(server, |counts| counts.probes_not_shown += 1);
+                tracing::warn!(
+                    event = PROBE_NOT_SHOWN_EVENT,
+                    %server,
+                    calls = calls(),
+                    "the probe could not show that the server refuses a caller it does not know"
+                );
+            }
+        }
+    }
+
+    /// Counts a probe of `server` that could not be made for want of a probe credential, as
+    /// not shown. The gateway refuses to start without one for every server, so only a pass
+    /// built without them comes here.
+    fn no_probe_credential(&self, server: &ConnectorName) {
+        self.signals
+            .count(server, |counts| counts.probes_not_shown += 1);
+        tracing::warn!(
+            event = PROBE_NOT_SHOWN_EVENT,
+            %server,
+            calls = "none: no probe credential is configured",
+            "the probe could not show that the server refuses a caller it does not know"
+        );
+    }
+}
+
+/// The drift pass of one replica: each proxied server's connector and probe credential, the
+/// withdrawals it makes, and how often it runs. See the [module documentation](self).
 pub struct DriftPass {
     withdrawals: Arc<Withdrawals>,
     servers: BTreeMap<ConnectorName, Arc<ProxyConnector>>,
+    probes: ProbeCredentials,
     interval: Duration,
 }
 
@@ -510,15 +661,18 @@ impl std::fmt::Debug for DriftPass {
 impl DriftPass {
     /// A pass over `servers`, each the connector of the proxied server of that name, every
     /// `interval`, withdrawing into `withdrawals`, which the registry reloader
-    /// ([`Reloader::withdrawals`](crate::reload::Reloader::withdrawals)) shares.
+    /// ([`Reloader::withdrawals`](crate::reload::Reloader::withdrawals)) shares. Each poll
+    /// probes its server with its credential in `probes` ([`probe_credentials`]).
     pub fn new(
         withdrawals: Arc<Withdrawals>,
         servers: BTreeMap<ConnectorName, Arc<ProxyConnector>>,
+        probes: ProbeCredentials,
         interval: Duration,
     ) -> Self {
         Self {
             withdrawals,
             servers,
+            probes,
             interval,
         }
     }
@@ -538,15 +692,23 @@ impl DriftPass {
         self.withdrawals.signals()
     }
 
-    /// Reads every server's tool list, all at once, and withdraws what changed. Returns when
-    /// every poll has answered or failed, each within its server's call deadline.
+    /// What one poll of `server` needs: its connector and its probe credential.
+    fn entry(&self, server: &ConnectorName, connector: &Arc<ProxyConnector>) -> Entry {
+        Entry {
+            server: server.clone(),
+            connector: Arc::clone(connector),
+            probe: self.probes.get(server).cloned(),
+        }
+    }
+
+    /// Reads every server's tool list and probes it, all at once, and withdraws what changed.
+    /// Returns when every poll has answered or failed, each within its server's call deadline.
     pub async fn pass(&self) {
         let mut polls = JoinSet::new();
         for (server, connector) in &self.servers {
             polls.spawn(poll(
                 Arc::clone(&self.withdrawals),
-                server.clone(),
-                Arc::clone(connector),
+                self.entry(server, connector),
             ));
         }
         while let Some(polled) = polls.join_next().await {
@@ -561,11 +723,10 @@ impl DriftPass {
     /// boot ran one already, before the listener was bound.
     pub async fn run(self) {
         let mut entries = JoinSet::new();
-        for (server, connector) in self.servers {
+        for (server, connector) in &self.servers {
             entries.spawn(poll_every(
                 Arc::clone(&self.withdrawals),
-                server,
-                connector,
+                self.entry(server, connector),
                 self.interval,
             ));
         }
@@ -573,29 +734,39 @@ impl DriftPass {
     }
 }
 
-/// Reads `server`'s tool list with `connector` and judges it against the approvals in force
-/// when it began.
-async fn poll(
-    withdrawals: Arc<Withdrawals>,
+/// One proxied server, as a poll reaches it.
+#[derive(Clone)]
+struct Entry {
     server: ConnectorName,
     connector: Arc<ProxyConnector>,
-) {
-    let started = withdrawals.keys_on(&server);
-    let listed = connector.list_tools().await;
-    withdrawals.judge(&server, &started, listed);
+    probe: Option<Arc<ProbeCredential>>,
 }
 
-/// Polls `server` every `interval`, the first an interval from now, for ever. A poll that runs
+/// Reads `entry`'s tool list and judges it against the approvals in force when it began, and
+/// probes the server beside it (decision 0013, section 5). The probe runs while the list is
+/// read, so a poll takes no longer than one call deadline.
+async fn poll(withdrawals: Arc<Withdrawals>, entry: Entry) {
+    let started = withdrawals.keys_on(&entry.server);
+    let probing = async {
+        match &entry.probe {
+            Some(credential) => Some(entry.connector.probe(credential).await),
+            None => None,
+        }
+    };
+    let (listed, probed) = tokio::join!(entry.connector.list_tools(), probing);
+    withdrawals.judge(&entry.server, &started, listed);
+    match probed {
+        Some(report) => withdrawals.report_probe(&entry.server, &report),
+        None => withdrawals.no_probe_credential(&entry.server),
+    }
+}
+
+/// Polls `entry` every `interval`, the first an interval from now, for ever. A poll that runs
 /// past the interval delays the next one, which starts when it ends; the next is never run
 /// beside it. So with an interval of at least the server's call deadline, a change is withdrawn
 /// within one interval plus that deadline, and with a shorter one, within about two call
 /// deadlines (#165). A poll whose task fails is logged, and the next runs as usual.
-async fn poll_every(
-    withdrawals: Arc<Withdrawals>,
-    server: ConnectorName,
-    connector: Arc<ProxyConnector>,
-    interval: Duration,
-) {
+async fn poll_every(withdrawals: Arc<Withdrawals>, entry: Entry, interval: Duration) {
     let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -603,13 +774,9 @@ async fn poll_every(
         // Its own task, so a panic ends this poll alone; dropped with the set when the pass is
         // aborted.
         let mut one = JoinSet::new();
-        one.spawn(poll(
-            Arc::clone(&withdrawals),
-            server.clone(),
-            Arc::clone(&connector),
-        ));
+        one.spawn(poll(Arc::clone(&withdrawals), entry.clone()));
         if let Some(Err(error)) = one.join_next().await {
-            tracing::error!(%error, %server, "a drift poll's task failed");
+            tracing::error!(%error, server = %entry.server, "a drift poll's task failed");
         }
     }
 }
@@ -631,6 +798,7 @@ mod tests {
         for seconds in [5, 10, 900] {
             let section = DriftSection {
                 interval_seconds: Some(seconds),
+                ..DriftSection::default()
             };
             assert_eq!(
                 DriftSection::interval(Some(&section)),
@@ -640,6 +808,7 @@ mod tests {
         for seconds in [0, 4, 901] {
             let section = DriftSection {
                 interval_seconds: Some(seconds),
+                ..DriftSection::default()
             };
             assert_eq!(
                 DriftSection::interval(Some(&section)),

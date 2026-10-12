@@ -1,8 +1,9 @@
 //! `switchboard`: the gateway as a process.
 //!
 //! ```text
-//! switchboard --config=FILE    serve the deployment FILE describes
-//! switchboard migrate          bring the audit schema up to date, then exit
+//! switchboard --config=FILE                      serve the deployment FILE describes
+//! switchboard probe --config=FILE --server=NAME  probe server NAME and print its record
+//! switchboard migrate                            bring the audit schema up to date, then exit
 //! ```
 //!
 //! **Serving.** Reads the deployment file (see [`gateway::deployment`]) and every file it
@@ -26,28 +27,37 @@
 //! `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it stops after
 //! the MCP listener, once those rows are done.
 //!
+//! **Probing.** Reads the deployment file and server NAME's entry in its registry file, and no
+//! other, sends decision 0010's three calls to the server, and prints each call's verdict, the
+//! result and the registry's record line, such as
+//! `probe = { result = "refused", date = 2026-10-12 }` (see [`gateway::probe`]). The entry
+//! need not have a record yet.
+//!
 //! **Migrating.** Connects with the URL in `SWITCHBOARD_MIGRATE_DATABASE_URL`, which must log
 //! in as `switchboard_owner`, applies every audit migration not yet applied, prints one JSON
 //! line saying which, and exits.
 //!
-//! Exit status: 0 after a clean shutdown or migration, 1 when the gateway refuses to start, the
-//! listener fails or the migration fails, 2 for a usage error.
+//! Exit status: 0 after a clean shutdown or migration, or a probe the server refused; 1 when
+//! the gateway refuses to start, the listener fails, the migration fails, or a probe could not
+//! be made or found the server anything but refused; 2 for a usage error.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use connector_proxy::ProbeFinding;
 use gateway::{
-    Deployment, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, serve_metrics, serve_with_telemetry,
-    start, telemetry,
+    Deployment, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, probe, serve_metrics,
+    serve_with_telemetry, start, telemetry,
 };
+use gateway_core::ConnectorName;
 use gateway_identity::SystemClock;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-const USAGE: &str = "usage: switchboard --config=FILE\n       switchboard migrate";
+const USAGE: &str = "usage: switchboard --config=FILE\n       switchboard probe --config=FILE --server=NAME\n       switchboard migrate";
 
 /// The environment variable `switchboard migrate` reads its database URL from.
 const MIGRATE_URL_VAR: &str = "SWITCHBOARD_MIGRATE_DATABASE_URL";
@@ -57,6 +67,7 @@ const MIGRATE_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 
 enum Command {
     Serve { config: PathBuf },
+    Probe { config: PathBuf, server: String },
     Migrate,
     Help,
 }
@@ -64,25 +75,44 @@ enum Command {
 fn command() -> Result<Command, String> {
     let mut arguments = std::env::args().skip(1);
     let mut config = None;
+    let mut server = None;
     let mut migrate = false;
+    let mut probe = false;
     while let Some(argument) = arguments.next() {
+        // A subcommand comes first.
+        let first = config.is_none() && server.is_none() && !migrate && !probe;
         match argument.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
-            "migrate" if config.is_none() && !migrate => migrate = true,
+            "migrate" if first => migrate = true,
+            "probe" if first => probe = true,
             "--config" => {
                 config = Some(arguments.next().ok_or("--config needs a file")?.into());
             }
-            _ => match argument.strip_prefix("--config=") {
-                Some(path) if !path.is_empty() => config = Some(path.into()),
-                _ => return Err(format!("unexpected argument `{argument}`")),
-            },
+            "--server" => {
+                server = Some(arguments.next().ok_or("--server needs a name")?);
+            }
+            _ => {
+                if let Some(path) = argument.strip_prefix("--config=").filter(|p| !p.is_empty()) {
+                    config = Some(path.into());
+                } else if let Some(name) =
+                    argument.strip_prefix("--server=").filter(|n| !n.is_empty())
+                {
+                    server = Some(name.to_owned());
+                } else {
+                    return Err(format!("unexpected argument `{argument}`"));
+                }
+            }
         }
     }
-    match (config, migrate) {
-        (Some(config), false) => Ok(Command::Serve { config }),
-        (None, true) => Ok(Command::Migrate),
-        (None, false) => Err("no deployment file was given".to_owned()),
-        (Some(_), true) => Err("`migrate` takes no deployment file".to_owned()),
+    match (config, server, migrate, probe) {
+        (Some(config), None, false, false) => Ok(Command::Serve { config }),
+        (Some(config), Some(server), false, true) => Ok(Command::Probe { config, server }),
+        (None, None, true, false) => Ok(Command::Migrate),
+        (_, Some(_), _, false) => Err("only `probe` takes a server".to_owned()),
+        (_, _, true, _) => Err("`migrate` takes no deployment file".to_owned()),
+        (None, _, _, true) => Err("`probe` needs a deployment file".to_owned()),
+        (Some(_), None, _, true) => Err("`probe` needs a server".to_owned()),
+        (None, None, false, false) => Err("no deployment file was given".to_owned()),
     }
 }
 
@@ -115,6 +145,7 @@ async fn main() -> ExitCode {
             telemetry::init();
             migrate().await
         }
+        Command::Probe { config, server } => probe(&config, server).await,
         Command::Serve { config } => {
             telemetry::init();
             serve(config).await
@@ -225,6 +256,36 @@ async fn finish_rows(store: &audit_postgres::PgAuditStore) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Probes `server` and prints what each call came to, the result and the record line. Exits 0
+/// only when the server refused all three calls.
+async fn probe(config: &std::path::Path, server: String) -> ExitCode {
+    let server = ConnectorName::new(server);
+    let probed = match probe::run(config, &server).await {
+        Ok(probed) => probed,
+        Err(error) => {
+            eprintln!("switchboard probe: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("server {} at {}", probed.server, probed.address);
+    for (call, verdict) in probed.report.calls() {
+        println!("{call}: {verdict}");
+    }
+    let finding = probed.report.finding();
+    println!("result: {finding}");
+    println!("{}", probed.record());
+    if finding == ProbeFinding::Refused {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "switchboard probe: server `{}` was not shown to refuse a caller it does not know \
+             ({finding}); the registry loads only a refused probe",
+            probed.server
+        );
+        ExitCode::from(1)
     }
 }
 
