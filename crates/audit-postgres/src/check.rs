@@ -573,10 +573,10 @@ pub enum Problem {
     /// update of the row it references, writes that table, and the table's owner can read or
     /// change `call_rows` or turn off its triggers, as [`Problem::Definer`] counts it. Postgres
     /// runs the action as that owner, for any role that may delete or update the referenced
-    /// row, and with it whatever the write sets off on the table, which here is something
-    /// that runs code: a trigger, a rule, or a check, default, generated column, index
-    /// expression or column domain that calls a function that is not built in, other than in
-    /// C. For a partitioned table, that is the partitioned table's owner, on every partition.
+    /// row, and with it whatever the write sets off on the table: its triggers, its rules, its
+    /// checks and its defaults. The catalog cannot say what each of those writes, so the key
+    /// is refused whatever the table has, a bare key too. For a partitioned table, the owner
+    /// judged is the partitioned table's, on every partition.
     CascadeAction {
         /// The table that holds the foreign key.
         table: String,
@@ -952,10 +952,9 @@ impl PgAuditStore {
     ///   the table's owner, as a rule does, and is refused.
     /// - A foreign key on another table whose action writes that table as its owner, firing its
     ///   plain triggers, rules, checks and defaults: closed. Such a foreign key is refused when
-    ///   that owner is able, as a definer function's owner is counted, and the table carries
-    ///   something that runs code, as the requirements below list; for a partitioned table,
-    ///   the partitioned table's owner, which the action runs as on every partition. A bare
-    ///   cascading key passes (#144).
+    ///   that owner is able, as a definer function's owner is counted, whatever the table has,
+    ///   a bare key too; for a partitioned table, the partitioned table's owner, which the
+    ///   action runs as on every partition.
     /// - Functions in untrusted languages: EXECUTE on one is refused, and so is a trigger on
     ///   any table, or an enabled event trigger, that runs one, and a definer function whose
     ///   owner may run one.
@@ -1031,22 +1030,18 @@ impl PgAuditStore {
     /// - No table other than `call_rows` holds a foreign key with a `CASCADE`, `SET NULL` or
     ///   `SET DEFAULT` action, on delete or on update, when the table's owner can read or
     ///   change `call_rows` or turn off its triggers, as a definer function's owner is counted
-    ///   above, or can run such a function, and the table carries something that runs code.
-    ///   Postgres runs the action as that owner, for any role that may delete or update a
-    ///   referenced row, and with it the table's triggers, rules, checks, defaults, generated
-    ///   columns, index expressions and its columns' domains. For a partitioned table it runs
-    ///   as the partitioned table's owner on every partition, whoever owns the partition. The
-    ///   catalog cannot say what each of those writes, so the foreign key is refused when the
-    ///   table, or any partition under it, has any trigger but those Postgres makes to carry
-    ///   out a foreign key, any rule, or a check, default, generated column, index expression
-    ///   or predicate, or column domain whose check names a function, directly or through an
-    ///   operator or another domain, that is not built in and not in C or `internal`. A bare
-    ///   cascading key, on a table with none of those,
-    ///   writes only the key's columns and runs nothing as the owner, so it passes. So do
-    ///   checks, defaults and indexes that call only what is built in, or an extension's C
-    ///   functions, which are out of scope below. A foreign key that references `call_rows`
-    ///   passes: its action runs only when an audit row is deleted or its key changes, which
-    ///   the gateway's role may not do. The migrations make no foreign key.
+    ///   above, or can run such a function, with EXECUTE or through a trigger on a table it can
+    ///   write; a member of such a role, inherited or not, counts too. Postgres runs the action
+    ///   as that owner, for any role that may delete or update a referenced row, and with it
+    ///   the table's triggers, rules, checks and defaults. For a partitioned table it runs as
+    ///   the partitioned table's owner on every partition, whoever owns the partition. The
+    ///   catalog cannot say what each of those writes, so the foreign key itself is refused,
+    ///   whatever the table has: a bare cascading key with no trigger, rule, check or default
+    ///   is refused too. A foreign key that references `call_rows` passes: its action runs only
+    ///   when an audit row is deleted or its key changes, which the gateway's role may not do.
+    ///   The migrations make no foreign key. In a database shared with other applications, a
+    ///   cascading key on a table owned by a superuser, or by any role that can reach
+    ///   `call_rows`, therefore stops the gateway from booting; narrowing this is #151.
     /// - Neither can run the catalog's functions that read or write the server's own files:
     ///   `lo_export`, `lo_import`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`,
     ///   `pg_stat_file`, and adminpack's `pg_file_*` where the server has them.
@@ -1949,107 +1944,24 @@ async fn definers(
     Ok(())
 }
 
-/// `running(classid, oid)`: what an expression can name that runs code as whoever evaluates
-/// it: a function in any language but C and `internal`, an operator that calls one, and a
-/// domain with a constraint that names any of those, or over such a domain. Postgres records,
-/// in `pg_depend`, each function, operator and type an expression names, except those built
-/// in, so what is built in never shows here. Functions in C are left out as
-/// [`PgAuditStore::check_at_boot`] says: only a superuser installs them, and the catalog cannot
-/// say what they do.
-///
-/// `carriers(oid)`: every relation a write to which runs such code, or a statement of its own,
-/// as the writer: one with a trigger, any but the internal ones that carry out foreign keys
-/// and deferred unique and exclusion checks (a trigger a partition copies from its parent is
-/// internal too before version 15, and counts); one with a rule; one with a check constraint,
-/// a column default or generated column, or an index expression or predicate, that names
-/// something running; and one with a column of a running domain, whose constraint runs when a
-/// value is written to it.
-const CARRIERS: &str = "domain_uses AS MATERIALIZED (
-        SELECT k.contypid AS domain, d.refclassid, d.refobjid
-        FROM pg_catalog.pg_constraint k
-            JOIN pg_catalog.pg_depend d
-                ON d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid = k.oid
-        WHERE k.contypid <> 0
-        UNION ALL
-        SELECT t.oid, 'pg_catalog.pg_type'::pg_catalog.regclass, t.typbasetype
-        FROM pg_catalog.pg_type t
-        WHERE t.typtype = 'd'
-    ),
-    running(classid, oid) AS (
-        SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, p.oid
-        FROM pg_catalog.pg_proc p
-            JOIN pg_catalog.pg_language l ON l.oid = p.prolang
-        WHERE l.lanname NOT IN ('c', 'internal')
-        UNION
-        SELECT 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oid
-        FROM pg_catalog.pg_operator o
-            JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode
-            JOIN pg_catalog.pg_language l ON l.oid = p.prolang
-                AND l.lanname NOT IN ('c', 'internal')
-        UNION
-        SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, u.domain
-        FROM running x
-            JOIN domain_uses u ON u.refclassid = x.classid AND u.refobjid = x.oid
-    ),
-    carriers AS MATERIALIZED (
-        SELECT t.tgrelid AS oid
-        FROM pg_catalog.pg_trigger t
-        WHERE NOT (t.tgisinternal
-                   AND EXISTS (SELECT FROM pg_catalog.pg_constraint k
-                               WHERE k.oid = t.tgconstraint
-                                   AND k.contype IN ('f', 'p', 'u', 'x')))
-        UNION
-        SELECT w.ev_class FROM pg_catalog.pg_rewrite w
-        UNION
-        SELECT k.conrelid
-        FROM pg_catalog.pg_constraint k
-            JOIN pg_catalog.pg_depend d
-                ON d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass AND d.objid = k.oid
-            JOIN running x ON x.classid = d.refclassid AND x.oid = d.refobjid
-        WHERE k.contype = 'c'
-        UNION
-        SELECT a.adrelid
-        FROM pg_catalog.pg_attrdef a
-            JOIN pg_catalog.pg_depend d
-                ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid
-            JOIN running x ON x.classid = d.refclassid AND x.oid = d.refobjid
-        UNION
-        SELECT i.indrelid
-        FROM pg_catalog.pg_index i
-            JOIN pg_catalog.pg_depend d
-                ON d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                    AND d.objid = i.indexrelid
-            JOIN running x ON x.classid = d.refclassid AND x.oid = d.refobjid
-        UNION
-        SELECT a.attrelid
-        FROM pg_catalog.pg_attribute a
-            JOIN running x ON x.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
-                AND x.oid = a.atttypid
-        WHERE a.attnum > 0 AND NOT a.attisdropped
-    )";
-
 /// No table other than `call_rows` may hold a foreign key whose action on a delete or an
 /// update of the row it references writes that table (`CASCADE`, `SET NULL` or `SET DEFAULT`),
-/// when the table's owner is able ([`able`]: a member of an able role, or of one that can run
-/// a definer function [`definers`] counts) and the table carries something its write runs as
-/// that owner ([`CARRIERS`]).
+/// when the table's owner is able ([`able`]: a member, inherited or not, of an able role, or
+/// of one that can run a definer function [`definers`] refuses).
 ///
 /// Postgres runs a foreign key's action as the owner of the table that holds the key, whether
 /// or not anything it sets off is `SECURITY DEFINER`, for any role that may delete or update a
 /// referenced row, the gateway's role among them. The write runs that table's triggers, goes
-/// through its rules, and evaluates its checks, its generated columns, its index expressions,
-/// its columns' domains and, for `SET DEFAULT`, its defaults, all as that owner. The catalog
-/// cannot say what each of those writes, so the foreign key is refused when its table has any
-/// of them that runs code: any trigger, any rule, or one of the rest that names a function
-/// that is not built in, other than in C. A bare cascading key writes only the key's columns,
-/// and runs nothing of its own as the owner, so it passes; so does one with only `NO ACTION`
-/// or `RESTRICT`, which writes nothing.
+/// through its rules, and evaluates its checks and, for `SET DEFAULT`, its defaults, all as
+/// that owner. The catalog cannot say what each of those writes, so the foreign key itself is
+/// refused, whatever its table has and whoever can write the referenced table. A foreign key
+/// with only `NO ACTION` or `RESTRICT` writes nothing, and passes. Narrowing the refusal to
+/// tables that run code as their owner is #151.
 ///
 /// A partitioned table's foreign key is copied to each partition, but its action writes the
-/// partitioned table, as that table's owner, and reaches each partition's triggers, rules,
-/// checks and defaults from there. So only a foreign key that is not a partition's copy is
-/// judged, by the owner of the table that holds it, and by what that table and every
-/// partition under it carries.
+/// partitioned table, as that table's owner, and reaches each partition's triggers from
+/// there. So only a foreign key that is not a partition's copy is judged, by the owner of the
+/// table that holds it.
 ///
 /// A foreign key on `call_rows` itself is [`referential_actions`]'. One that references
 /// `call_rows` acts only when an audit row is deleted, which the gateway's role may not do, or
@@ -2064,8 +1976,7 @@ async fn cascade_actions(
     let found = client
         .query(
             &format!(
-                "WITH RECURSIVE {CARRIERS}
-                 SELECT tn.nspname || '.' || tbl.relname, o.rolname::text, k.conname::text,
+                "SELECT tn.nspname || '.' || tbl.relname, o.rolname::text, k.conname::text,
                         rn.nspname || '.' || r.relname
                  FROM pg_catalog.pg_constraint k
                      JOIN pg_catalog.pg_class tbl ON tbl.oid = k.conrelid
@@ -2077,10 +1988,6 @@ async fn cascade_actions(
                      AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid
                      AND (k.confdeltype NOT IN ('a', 'r') OR k.confupdtype NOT IN ('a', 'r'))
                      AND {}
-                     AND (tbl.oid IN (SELECT c.oid FROM carriers c)
-                          OR EXISTS (SELECT FROM pg_catalog.pg_partition_tree(
-                                                     tbl.oid::pg_catalog.regclass) pt
-                                         JOIN carriers c ON c.oid = pt.relid))
                  ORDER BY 1, 3",
                 by_any_member("tbl.relowner", "$2"),
             ),
