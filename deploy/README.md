@@ -60,10 +60,10 @@ with no token gets the keys from the gateway's pod and is refused a ConfigMap.
 `crates/demo-checks` tests the scripts and manifests: the workload against a fake gateway that
 misbehaves one way at a time, the driver with fake docker, kind and kubectl, and the manifests'
 claims (only the gateway is published, the policy admits only the gateway, Compose's dummy
-credential's hash matches, and in kind the gateway mounts only a projected token for
-`mock-docs`, whose settings name only the gateway's ServiceAccount, fetches the issuer's keys
-with the cluster CA and no token, and the discovery binding names one ClusterRole and one
-group).
+credential's hash matches, and in kind: the gateway mounts only a projected token for
+`mock-docs`, whose settings name only the gateway's ServiceAccount; the gateway fetches the
+issuer's keys with the cluster CA and no token; and the discovery binding names one
+ClusterRole and one group).
 
 ## Network policy in kind
 
