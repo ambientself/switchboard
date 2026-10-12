@@ -17,10 +17,11 @@ use gateway_core::audit::{
 };
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
-    Classification, Connector, ConnectorName, Decision, Delegation, InstanceName, PolicySnapshot,
-    Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind,
-    RequestedTool, Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources,
-    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, decide, list_tools,
+    Classification, Connector, ConnectorEntry, ConnectorName, CredentialIdentity, CredentialMode,
+    Decision, Delegation, EntryKind, InstanceName, Narrowing, PolicySnapshot, Principal,
+    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind, RequestedTool,
+    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, SnapshotData,
+    Surface, TeamId, ToolCall, ToolOutcome, decide, list_tools,
 };
 use serde_json::json;
 
@@ -897,10 +898,125 @@ fn recorded_values_are_capped() {
     }
 }
 
+/// A call to a tool declared as the reach names its entry's whole reach, which the decision
+/// checks resource by resource. The row records the entry, not the list, so nothing is left
+/// out however large the reach, and a denial records it the same way.
+#[test]
+fn a_reach_is_recorded_by_its_entry_whatever_the_decision() {
+    let reach = |resources: Vec<Resource>| Resources::Reach {
+        entry: "fixture".into(),
+        resources,
+    };
+    let (refusal, recorded, omitted) = record_call(reach(permitted(PERMITTED)));
+    assert!(refusal.is_none(), "{refusal:?}");
+    assert_eq!(
+        (recorded, omitted),
+        (RecordedResources::Reach("fixture".into()), 0)
+    );
+
+    let mut wider = permitted(PERMITTED);
+    wider.push(repository("outside"));
+    let (refusal, recorded, omitted) = record_call(reach(wider));
+    let refusal = refusal.expect("a reach outside the limit was allowed");
+    assert!(refusal.sentence().contains("`org/outside`"), "{refusal:?}");
+    assert_eq!(
+        (recorded, omitted),
+        (RecordedResources::Reach("fixture".into()), 0)
+    );
+}
+
+/// The snapshot of [`snapshot`], with a connector entry for its connector.
+fn snapshot_with_entry() -> PolicySnapshot {
+    let mut data = SnapshotData {
+        revision: "audit-1".into(),
+        tools: vec![
+            tool("fixture__read", Classification::Read),
+            tool("fixture__propose", Classification::Propose),
+        ],
+        surfaces: vec![surface("fixture", &["fixture__read", "fixture__propose"])],
+        profiles: vec![Profile {
+            name: "readers".into(),
+            classifications: [Classification::Read].into(),
+            requires_delegation: true,
+        }],
+        limits: limits(),
+        entries: Vec::new(),
+    };
+    data.entries.push(ConnectorEntry {
+        name: "fixture".into(),
+        kind: EntryKind::BuiltIn,
+        credential: CredentialMode::TeamServiceIdentity,
+        principal: "payments-service".into(),
+        narrowing: Narrowing::None,
+        permits: Classification::Propose,
+        reach: BTreeSet::new(),
+        reach_tested_on: None,
+    });
+    PolicySnapshot::new(data).unwrap()
+}
+
+/// The credential identity is the entry's, taken from the snapshot the decision was made
+/// from, and a row records it only when it names the tool whose entry it is.
+#[test]
+fn the_credential_identity_is_the_entrys_and_only_on_a_row_naming_a_tool() {
+    let snapshot = snapshot_with_entry();
+    let entry = CredentialIdentity {
+        mode: CredentialMode::TeamServiceIdentity,
+        principal: "payments-service".into(),
+    };
+    let store = MemoryStore::default();
+    let begin_from = |decision: Decision, credential: Option<CredentialIdentity>| {
+        let start = RowStart {
+            credential,
+            ..common::start()
+        };
+        common::ready(audit::begin(&store, start, decision, json!({}), metadata())).unwrap()
+    };
+
+    // Allowed, and denied with the tool named: the entry's identity.
+    for tool in ["fixture__read", "fixture__propose"] {
+        let decision = decide(&snapshot, &call(tool));
+        let identity = audit::credential_identity(&snapshot, &decision);
+        assert_eq!(identity.as_ref(), Some(&entry), "{tool}");
+        let _ = begin_from(decision, identity);
+        assert_eq!(store.last().credential.as_ref(), Some(&entry), "{tool}");
+    }
+    assert!(store.rows()[0].decision == DecisionKind::Allow);
+    assert!(store.rows()[1].decision == DecisionKind::Deny);
+
+    // A call naming no tool the surface serves has no identity, and a row naming none records
+    // none even when one is supplied.
+    let decision = decide(&snapshot, &call("fixture__elsewhere"));
+    assert_eq!(audit::credential_identity(&snapshot, &decision), None);
+    let _ = begin_from(decision, Some(entry.clone()));
+    assert_eq!(store.last().connector, None);
+    assert_eq!(store.last().credential, None);
+
+    // A tool whose connector has no entry has none.
+    let decision = decide(&self::snapshot(), &call("fixture__read"));
+    assert_eq!(
+        audit::credential_identity(&self::snapshot(), &decision),
+        None
+    );
+}
+
 #[test]
 fn the_record_serializes_under_pinned_names_and_reads_back() {
     let pins = [
         (json!(RecordedResources::Unknown), json!("unknown")),
+        (
+            json!(RecordedResources::Reach("docs-team-a".into())),
+            json!({"reach": "docs-team-a"}),
+        ),
+        (
+            json!(CredentialIdentity {
+                mode: CredentialMode::TeamServiceIdentity,
+                principal: "docs-team-a".into(),
+            }),
+            json!({"mode": "team_service_identity", "principal": "docs-team-a"}),
+        ),
+        (json!(CredentialMode::GatewayToken), json!("gateway_token")),
+        (json!(CredentialMode::PerUserGrant), json!("per_user_grant")),
         (
             json!(as_recorded(&[repository("a")])),
             json!({"named": [{"system": "github", "kind": "repository", "identifier": "org/a"}]}),

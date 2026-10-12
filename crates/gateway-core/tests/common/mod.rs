@@ -66,6 +66,7 @@ pub fn start() -> RowStart {
         row: AuditRowId::new(format!("row-{}", NEXT.fetch_add(1, Ordering::Relaxed))),
         instance: INSTANCE.into(),
         call_deadline_ms: CALL_DEADLINE_MS,
+        credential: None,
     }
 }
 

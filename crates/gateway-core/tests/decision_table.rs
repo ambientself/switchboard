@@ -220,6 +220,8 @@ fn expected_row(
         // than a row records, so none are omitted; a case that did would be refused here.
         "resources": match &case.resources {
             Resources::Unknown => serde_json::json!("unknown"),
+            // A reach is recorded by its entry, never as the list.
+            Resources::Reach { entry, .. } => serde_json::json!({ "reach": entry }),
             Resources::Named(named) => {
                 let mut distinct: Vec<&Resource> = Vec::new();
                 for resource in named {
@@ -248,6 +250,14 @@ fn expected_row(
         "proved_delegation_team": delegation.map(|delegation| &delegation.team),
         "claimed_acting_person": delegation.map(|delegation| &delegation.acting_person),
         "claimed_team": metadata.claimed_team,
+        // The identity the served tool's entry states, if it has one.
+        "credential": served
+            .as_ref()
+            .and_then(|tool| snapshot.entry(&tool.connector))
+            .map(|entry| serde_json::json!({
+                "mode": entry.credential,
+                "principal": entry.principal,
+            })),
         "completion": null,
     });
     serde_json::from_value(row).expect("the expected row does not deserialize")
@@ -356,9 +366,15 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
             claimed_team: Some(Claimed::new(TeamId::from("claimed-team"))),
         };
         let store = MemoryStore::default();
+        // As the gateway does: the credential identity from the snapshot the decision was made
+        // from.
+        let start = audit::RowStart {
+            credential: audit::credential_identity(snapshot, &decision),
+            ..common::start()
+        };
         let begun = common::ready(audit::begin(
             &store,
-            common::start(),
+            start,
             decision,
             serde_json::json!({"case": index}),
             metadata.clone(),
