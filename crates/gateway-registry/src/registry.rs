@@ -4,23 +4,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use gateway_core::{
-    ApprovedTool, ConnectorName, DeclaredFrom, Issuer, PolicyRevision, PolicySnapshot, Principal,
-    PrincipalId, PrincipalRestriction, Profile, ProfileName, Resource, ResourceDeclaration,
-    ResourceLimits, SnapshotData, SnapshotError, Surface, ToolName,
+    ApprovedTool, Classification, ConnectorEntry, ConnectorName, CredentialMode, DeclaredFrom,
+    EntryKind, Issuer, Narrowing, PolicyRevision, PolicySnapshot, Principal, PrincipalId,
+    PrincipalRestriction, Profile, ProfileName, Resource, ResourceDeclaration, ResourceLimits,
+    SnapshotData, SnapshotError, Surface, ToolName,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use toml::value::Datetime;
 
 use crate::adapter::{self, ArgumentAdapter, JsonPointer, ResourceSource, SchemaProblem};
 use crate::definition::{Approval, Route, ToolDefinition, binding_sha256, definition_sha256};
 use crate::file::{
-    CredentialFile, PrincipalsFile, RegistryFile, ResourceFile, ResourcesFile, RulePrincipalFile,
-    ServerFile, ToolFile,
+    PrincipalsFile, RegistryFile, ResourceFile, ResourcesFile, RulePrincipalFile, ServerFile,
+    ToolFile,
 };
 use crate::selection::{NoProfile, ProfileRule, ProfileRules, RulePrincipal};
 
-/// A proxied MCP server, as its owner registered it.
+/// A proxied MCP server, as its owner registered it, and its connector entry (decision 0011,
+/// section 1): every server is one entry, with one credential.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Server {
     /// The server's name. Approved tools name it as their connector.
@@ -39,17 +42,94 @@ pub struct Server {
     pub address: String,
     /// The credential the gateway presents to it.
     pub credential: Credential,
+    /// What the credential is narrowed to on each call.
+    pub narrowing: Narrowing,
+    /// The highest classification any call made with the credential could have.
+    pub permits: Classification,
+    /// Every resource the credential and route can reach. Empty for an entry that reaches
+    /// nothing a limit applies to.
+    pub reach: BTreeSet<Resource>,
+    /// The recorded test showing that a call outside the reach fails. Required when the reach
+    /// is not empty.
+    pub reach_test: Option<ReachTest>,
+    /// Which class of destination the address is (decision 0013, section 3).
+    pub destination: Destination,
+    /// The registration probe's record (decision 0013, section 9). Optional for now. Not in
+    /// the binding: the drift pass repeats the probe.
+    pub probe: Option<Probe>,
+    /// The call outside the reach that the scheduled reach check makes (decision 0011,
+    /// section 4). Required when the reach is not empty and the credential is not per-user.
+    pub reach_check: Option<ReachCheck>,
 }
 
 /// How the gateway authenticates to a server. Never the caller's token (design.md section 13).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum Credential {
-    /// The gateway sends `Authorization: Bearer` with a secret it holds.
-    Bearer {
-        /// Which secret: a label the credential source resolves, never the secret itself.
-        reference: String,
-    },
+pub struct Credential {
+    /// The credential's mode. For a team service identity or a gateway token, the gateway
+    /// sends `Authorization: Bearer` with a secret it holds. A per-user grant is refused at
+    /// start until milestone 5 builds it.
+    pub mode: CredentialMode,
+    /// Which secret: a label the credential source resolves, never the secret itself.
+    pub reference: String,
+    /// The identity the credential acts as, such as a ServiceAccount's name: the same in every
+    /// deployment of one entry.
+    pub principal: String,
+}
+
+/// The class of a server's destination (decision 0013, section 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Destination {
+    /// A Service inside the cluster. Only such an entry may use plain `http`.
+    InCluster,
+    /// Anywhere else, over `https` only.
+    Public,
+}
+
+impl Destination {
+    /// The destination's name, as written in the registry and hashed in the binding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Destination::InCluster => "in_cluster",
+            Destination::Public => "public",
+        }
+    }
+}
+
+/// A recorded reach test (decision 0011, section 2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReachTest {
+    /// When it was run, `YYYY-MM-DD`.
+    pub date: String,
+    /// What was run and what it showed.
+    pub record: String,
+}
+
+/// What the registration probe found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeResult {
+    /// The server refused each of the probe's calls.
+    Refused,
+}
+
+/// A recorded registration probe (decision 0013, section 9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Probe {
+    /// What it found.
+    pub result: ProbeResult,
+    /// When it was run, `YYYY-MM-DD`.
+    pub date: String,
+}
+
+/// The reach check's call outside the reach: one of the entry's approved tools, and arguments
+/// naming a canary resource outside the reach.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReachCheck {
+    /// The tool, which must be approved on this server.
+    pub tool: ToolName,
+    /// Its arguments.
+    pub arguments: serde_json::Map<String, Value>,
 }
 
 /// Why a registry file was refused. Each names the first problem found.
@@ -103,6 +183,46 @@ pub enum RegistryError {
         identity: String,
         /// The host in its address.
         host: String,
+    },
+    /// A date is not a plain date such as `2026-10-12`.
+    #[error("`{field}` of {place} is not a date such as 2026-10-12")]
+    NotADate {
+        /// The field.
+        field: &'static str,
+        /// What it belongs to.
+        place: String,
+    },
+    /// A server's address is plain `http`, and its destination is not `in_cluster` (decision
+    /// 0013, section 3).
+    #[error(
+        "server `{server}` has the http address `{address}`; only an `in_cluster` destination may use http"
+    )]
+    DestinationScheme {
+        /// The server.
+        server: ConnectorName,
+        /// Its address.
+        address: String,
+    },
+    /// A server has a reach and no recorded reach test (decision 0011, section 2).
+    #[error(
+        "server `{0}` has a reach and no `reach_test`; record the test that shows a call outside it fails"
+    )]
+    ReachTestMissing(ConnectorName),
+    /// A server has a reach and no reach check, the call outside it that the scheduled check
+    /// makes (decision 0011, section 4).
+    #[error(
+        "server `{0}` has a reach and no `reach_check`, the call outside it the reach check makes"
+    )]
+    ReachCheckMissing(ConnectorName),
+    /// A server's reach check calls a tool that is not one of its approved tools.
+    #[error(
+        "server `{server}`'s reach check calls `{tool}`, which is not one of its approved tools"
+    )]
+    ReachCheckTool {
+        /// The server.
+        server: ConnectorName,
+        /// The tool its reach check names.
+        tool: ToolName,
     },
     /// Two tools share an exposed name.
     #[error("tool `{0}` is approved more than once")]
@@ -379,14 +499,25 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
             name: name.clone(),
             classification: checked.classification,
             connector: checked.route.server.clone(),
-            resources: checked.adapter.declaration(),
-            declared_from: (checked.adapter.declaration() == ResourceDeclaration::Declared)
-                .then_some(DeclaredFrom::Arguments),
+            resources: checked.resources,
+            declared_from: checked.declared_from,
         });
         definitions.insert(name.clone(), checked.definition);
         adapters.insert(name.clone(), checked.adapter);
         routes.insert(name.clone(), checked.route);
         approvals.insert(name, checked.approval);
+    }
+    for server in servers.values() {
+        if let Some(check) = &server.reach_check
+            && routes
+                .get(&check.tool)
+                .is_none_or(|route| route.server != server.name)
+        {
+            return Err(RegistryError::ReachCheckTool {
+                server: server.name.clone(),
+                tool: check.tool.clone(),
+            });
+        }
     }
 
     let surfaces = file
@@ -429,7 +560,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         surfaces,
         profiles,
         limits,
-        entries: Vec::new(),
+        entries: servers.values().map(entry).collect(),
     })?;
 
     let mut covered = BTreeSet::new();
@@ -474,12 +605,8 @@ fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, Re
         require(&server.system, "system", place)?;
         require(&server.owner, "owner", place)?;
         require(&server.identity, "identity", place)?;
-        let credential = match server.credential {
-            CredentialFile::Bearer { reference } => {
-                require(&reference, "credential.reference", place)?;
-                Credential::Bearer { reference }
-            }
-        };
+        require(&server.credential.reference, "credential.reference", place)?;
+        require(&server.credential.principal, "credential.principal", place)?;
         let Some(host) = address_host(&server.address) else {
             return Err(RegistryError::AddressNotHttp {
                 server: server.name,
@@ -493,19 +620,105 @@ fn servers(files: Vec<ServerFile>) -> Result<BTreeMap<ConnectorName, Server>, Re
                 identity: server.identity,
             });
         }
+        // Plain http only inside the cluster (decision 0013, section 3). Whether the address
+        // is one, and TLS for the rest, are checked when the gateway connects.
+        if server.address.starts_with("http://") && server.destination != Destination::InCluster {
+            return Err(RegistryError::DestinationScheme {
+                server: server.name,
+                address: server.address,
+            });
+        }
+        let reach = resource_set(server.reach, || {
+            format!("the reach of server `{}`", server.name)
+        })?;
+        let reach_test = match server.reach_test {
+            Some(test) => {
+                require(&test.record, "reach_test.record", place)?;
+                Some(ReachTest {
+                    date: date(test.date, "reach_test.date", place)?,
+                    record: test.record,
+                })
+            }
+            None => None,
+        };
+        if !reach.is_empty() && reach_test.is_none() {
+            return Err(RegistryError::ReachTestMissing(server.name));
+        }
+        // Every proxied entry with a reach is checked on a schedule, whatever its narrowing,
+        // except a per-user one (decision 0011, section 4).
+        if !reach.is_empty()
+            && server.credential.mode != CredentialMode::PerUserGrant
+            && server.reach_check.is_none()
+        {
+            return Err(RegistryError::ReachCheckMissing(server.name));
+        }
+        let probe = match server.probe {
+            Some(probe) => Some(Probe {
+                result: probe.result,
+                date: date(probe.date, "probe.date", place)?,
+            }),
+            None => None,
+        };
         let checked = Server {
             name: server.name.clone(),
             system: server.system,
             owner: server.owner,
             identity: server.identity,
             address: server.address,
-            credential,
+            credential: Credential {
+                mode: server.credential.mode,
+                reference: server.credential.reference,
+                principal: server.credential.principal,
+            },
+            narrowing: server.narrowing,
+            permits: server.permits,
+            reach,
+            reach_test,
+            destination: server.destination,
+            probe,
+            reach_check: server.reach_check.map(|check| ReachCheck {
+                tool: check.tool,
+                arguments: check.arguments,
+            }),
         };
         if servers.insert(server.name.clone(), checked).is_some() {
             return Err(RegistryError::DuplicateServer(server.name));
         }
     }
     Ok(servers)
+}
+
+/// A server's connector entry in the snapshot. Every registered server is proxied.
+fn entry(server: &Server) -> ConnectorEntry {
+    ConnectorEntry {
+        name: server.name.clone(),
+        kind: EntryKind::Proxied,
+        credential: server.credential.mode,
+        principal: server.credential.principal.clone(),
+        narrowing: server.narrowing,
+        permits: server.permits,
+        reach: server.reach.clone(),
+        reach_tested_on: server.reach_test.as_ref().map(|test| test.date.clone()),
+    }
+}
+
+/// `value` as `YYYY-MM-DD`, if it is a plain date: no time and no offset.
+fn date(
+    value: Datetime,
+    field: &'static str,
+    place: impl FnOnce() -> String,
+) -> Result<String, RegistryError> {
+    match value {
+        Datetime {
+            date: Some(date),
+            time: None,
+            offset: None,
+        } => Ok(date.to_string()),
+        _ => Err(RegistryError::NotADate {
+            field,
+            place: place(),
+        }),
+    }
 }
 
 /// The host in an `http` or `https` address, as written: what follows the scheme, up to the
@@ -532,6 +745,8 @@ struct CheckedTool {
     route: Route,
     approval: Approval,
     classification: gateway_core::Classification,
+    resources: ResourceDeclaration,
+    declared_from: Option<DeclaredFrom>,
 }
 
 fn check_tool(
@@ -624,8 +839,10 @@ fn check_tool(
         });
     }
 
-    let sources = match tool.resources {
-        ResourcesFile::NoResources => Vec::new(),
+    let (sources, declared_from) = match tool.resources {
+        ResourcesFile::NoResources => (Vec::new(), None),
+        // The snapshot refuses it: the adapter that names the reach is not built.
+        ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),
         ResourcesFile::FromArguments(sources) => {
             if sources.is_empty() {
                 return Err(RegistryError::AdapterWithoutSources(name));
@@ -653,12 +870,19 @@ fn check_tool(
                     kind: source.kind,
                 });
             }
-            checked
+            (checked, Some(DeclaredFrom::Arguments))
         }
+    };
+    let adapter = ArgumentAdapter::new(name.clone(), sources, tool.input_schema.clone());
+    let resources = match declared_from {
+        Some(DeclaredFrom::Reach) => ResourceDeclaration::Declared,
+        _ => adapter.declaration(),
     };
 
     Ok(CheckedTool {
-        adapter: ArgumentAdapter::new(name.clone(), sources, tool.input_schema.clone()),
+        resources,
+        declared_from,
+        adapter,
         definition: ToolDefinition {
             name,
             title: tool.title,
@@ -686,19 +910,79 @@ fn limit_sets<K: Ord + std::fmt::Display>(
 ) -> Result<BTreeMap<K, BTreeSet<Resource>>, RegistryError> {
     let mut sets = BTreeMap::new();
     for (key, resources) in limits {
-        let place = || format!("a limit of {owner} `{key}`");
-        let mut set = BTreeSet::new();
-        for resource in resources {
-            require(&resource.system, "system", place)?;
-            require(&resource.kind, "kind", place)?;
-            require(&resource.identifier, "identifier", place)?;
-            set.insert(Resource {
-                system: resource.system,
-                kind: resource.kind,
-                identifier: resource.identifier,
-            });
-        }
+        let set = resource_set(resources, || format!("a limit of {owner} `{key}`"))?;
         sets.insert(key, set);
     }
     Ok(sets)
+}
+
+/// A limit's or a reach's resources, each with a system, a kind and an identifier.
+fn resource_set(
+    resources: Vec<ResourceFile>,
+    place: impl Fn() -> String,
+) -> Result<BTreeSet<Resource>, RegistryError> {
+    let mut set = BTreeSet::new();
+    for resource in resources {
+        require(&resource.system, "system", &place)?;
+        require(&resource.kind, "kind", &place)?;
+        require(&resource.identifier, "identifier", &place)?;
+        set.insert(Resource {
+            system: resource.system,
+            kind: resource.kind,
+            identifier: resource.identifier,
+        });
+    }
+    Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// A tool not classified `read` never loads from a registry, since every server is proxied
+    /// (rule 2), so a definition's `read_only` is checked where it is made.
+    #[test]
+    fn a_definition_is_read_only_exactly_when_its_tool_is_read() {
+        let server = Server {
+            name: "docs".into(),
+            system: "docs".into(),
+            owner: "o".into(),
+            identity: "h".into(),
+            address: "http://h/mcp".into(),
+            credential: Credential {
+                mode: CredentialMode::GatewayToken,
+                reference: "c".into(),
+                principal: "p".into(),
+            },
+            narrowing: Narrowing::None,
+            permits: Classification::Read,
+            reach: BTreeSet::new(),
+            reach_test: None,
+            destination: Destination::InCluster,
+            probe: None,
+            reach_check: None,
+        };
+        let binding = binding_sha256(&server);
+        let definition = definition_sha256("t", None, "d", &serde_json::json!({"type": "object"}));
+        let servers = BTreeMap::from([(server.name.clone(), server)]);
+        for (classification, read_only) in [
+            ("read", true),
+            ("propose", false),
+            ("write", false),
+            ("destructive", false),
+        ] {
+            let tool: ToolFile = toml::from_str(&format!(
+                "name = \"docs__t\"\nserver = \"docs\"\nupstream_name = \"t\"\n\
+                 classification = \"{classification}\"\ndescription = \"d\"\n\
+                 approved_by = \"a\"\napproved_at = 2026-10-12T00:00:00Z\n\
+                 definition_sha256 = \"{definition}\"\nbinding_sha256 = \"{binding}\"\n\
+                 resources = \"no_resources\"\ninput_schema = {{ type = \"object\" }}\n"
+            ))
+            .unwrap();
+            let checked = check_tool(tool, &servers).unwrap();
+            assert_eq!(checked.definition.read_only, read_only, "{classification}");
+        }
+    }
 }

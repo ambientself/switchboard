@@ -1,6 +1,7 @@
 //! The loader's rules for input schemas, as a table: the subset of JSON Schema 2020-12 the
 //! argument check enforces or ignores loads, and anything else is refused at load, with the
-//! error that names it. Also, every registry file checked in to the repository still loads.
+//! error that names it. Also, every registry file checked in to the repository still loads,
+//! except CI's proxied `propose` tool, which rule 2 refuses.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -8,6 +9,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{base, load, rehash, set, value};
+use gateway_core::SnapshotError;
 use gateway_registry::{Registry, RegistryError};
 
 /// `wiki__search` approved with `schema` as its input schema.
@@ -393,11 +395,29 @@ fn every_registry_file_in_the_repository_still_loads() {
     registry_files(&root.join("crates"), &mut found);
     registry_files(&root.join("deploy"), &mut found);
     found.sort();
-    // The demo's, the kind and Compose registries, Compose's withdrawn one, and the receipt
-    // gate's: if one moves, this test should be told where.
+    // The demo's, the kind and Compose registries, Compose's withdrawn one, and CI's proxied
+    // `propose` tool: if one moves, this test should be told where.
     assert!(found.len() >= 5, "{found:?}");
+    let refused = Path::new("deploy/ci/proxied-propose/registry/registry.toml");
+    assert!(
+        found.iter().any(|path| path.ends_with(refused)),
+        "{found:?}"
+    );
     for path in found {
-        if let Err(error) = Registry::load(&path) {
+        let loaded = Registry::load(&path);
+        if path.ends_with(refused) {
+            // CI's release check: everything loads but the one rule it shows refusing.
+            assert!(
+                matches!(
+                    loaded,
+                    Err(RegistryError::Snapshot(
+                        SnapshotError::ProxiedNotRead { .. }
+                    ))
+                ),
+                "{}: {loaded:?}",
+                path.display()
+            );
+        } else if let Err(error) = loaded {
             panic!("{}: {error}", path.display());
         }
     }

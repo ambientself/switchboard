@@ -484,18 +484,20 @@ async fn a_new_registry_file_that_changes_the_policy_but_not_its_revision_is_ref
     let team_a = token(TEAM_A_SA);
     let original = registry(&world.mock.url());
 
-    // The read tool withdrawn and a limit narrowed, both still under the kind registry's
-    // revision.
+    // The read tool withdrawn and a limit changed, both still under the kind registry's
+    // revision. The limit is widened: narrowed below team B's entry's reach, rule 5 would
+    // refuse it first.
     let withdrawn = withdraw_read_tool(&original).replace(
         "revision = \"demo-2\"",
         &format!("revision = \"{KIND_REVISION}\""),
     );
-    let narrowed = original.replace(
+    let widened = original.replace(
         "team-b = [{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }]",
-        "team-b = []",
+        "team-b = [{ system = \"docs\", kind = \"project\", identifier = \"borealis\" }, \
+         { system = \"docs\", kind = \"project\", identifier = \"cygnus\" }]",
     );
-    assert_ne!(narrowed, original);
-    for changed in [withdrawn, narrowed] {
+    assert_ne!(widened, original);
+    for changed in [withdrawn, widened] {
         let refused = reloader
             .apply(&Registry::from_toml_str(&changed).unwrap())
             .unwrap_err();

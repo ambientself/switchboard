@@ -9,10 +9,11 @@
 use std::path::Path;
 
 use gateway_core::{
-    CallContext, CallerContext, Classification, ReasonKind, Resource, ResourceDeclaration,
-    ResourceProblem, Resources, ToolName, Verdict, decide, list_tools,
+    CallContext, CallerContext, Classification, CredentialMode, EntryKind, Narrowing, ReasonKind,
+    Resource, ResourceDeclaration, ResourceProblem, Resources, ToolName, Verdict, decide,
+    list_tools,
 };
-use gateway_registry::{Credential, Registry, binding_sha256};
+use gateway_registry::{Credential, Destination, Registry, binding_sha256};
 use gateway_testkit::{Caller, DEPLOYMENT, Fixture, WORKLOAD_ISSUER};
 use serde_json::{Map, Value, json};
 
@@ -31,8 +32,12 @@ fn project(identifier: &str) -> Resource {
     }
 }
 
-/// Each team's entry: its server name, which is also its system and its surface, and its team.
-const ENTRIES: [(&str, &str); 2] = [("docs-team-a", "team-a"), ("docs-team-b", "team-b")];
+/// Each team's entry: its server name, which is also its system and its surface, its team, its
+/// team's project and the other team's.
+const ENTRIES: [(&str, &str, &str, &str); 2] = [
+    ("docs-team-a", "team-a", "atlas", "borealis"),
+    ("docs-team-b", "team-b", "borealis", "atlas"),
+];
 
 #[test]
 fn the_demo_registry_loads_from_its_file() {
@@ -42,7 +47,7 @@ fn the_demo_registry_loads_from_its_file() {
     assert_eq!(snapshot.revision().as_str(), "demo-3");
     assert_eq!(registry.servers().len(), 2);
 
-    for (entry, team) in ENTRIES {
+    for (entry, team, own, other) in ENTRIES {
         // One surface per team, serving only its own entry's tools.
         let surface = snapshot.surface(&entry.into()).unwrap();
         let expected = [
@@ -72,11 +77,29 @@ fn the_demo_registry_loads_from_its_file() {
         assert_eq!(server.system, entry);
         assert_eq!(
             server.credential,
-            Credential::Bearer {
-                reference: format!("{entry}-credential")
+            Credential {
+                mode: CredentialMode::TeamServiceIdentity,
+                reference: format!("{entry}-credential"),
+                principal: entry.into(),
             }
         );
         assert_eq!(server.identity, "mock-docs.mock-docs.svc.cluster.local");
+        assert_eq!(server.destination, Destination::InCluster);
+
+        // Each entry reaches its team's project alone, unnarrowed, with a recorded test, and
+        // the reach check calls its list tool for the other team's project.
+        let entry_record = snapshot.entry(&entry.into()).unwrap();
+        assert_eq!(entry_record.kind, EntryKind::Proxied);
+        assert_eq!(entry_record.narrowing, Narrowing::None);
+        assert_eq!(entry_record.permits, Classification::Read);
+        assert_eq!(entry_record.reach, [project(own)].into_iter().collect());
+        assert_eq!(entry_record.reach_tested_on.as_deref(), Some("2026-10-12"));
+        let check = server.reach_check.as_ref().unwrap();
+        assert_eq!(check.tool, tool(&format!("{entry}__list_documents")));
+        assert_eq!(
+            Value::Object(check.arguments.clone()),
+            json!({"project": other})
+        );
         for name in &expected {
             assert_eq!(
                 registry.approvals()[name].binding_sha256,

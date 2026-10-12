@@ -265,8 +265,19 @@ mod tests {
         }
     }
 
+    /// The `policy_reload_refused` events logged into `captured`, as their fields.
+    fn refusals(captured: &Captured) -> Vec<Value> {
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        logged
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "policy_reload_refused")
+            .map(|event| event["fields"].clone())
+            .collect()
+    }
+
     #[test]
-    fn a_reload_the_receipt_gate_refuses_keeps_the_served_policy_and_says_so() {
+    fn a_reload_the_gates_or_the_loader_refuse_keeps_the_served_policy_and_says_so() {
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -286,29 +297,35 @@ mod tests {
             Freshness::new(None, Instant::now()),
         );
 
-        // The same tool reclassified `propose`, at r2: same server, same route.
-        let proposed = registry_text("propose", true, "r2");
-        reloader.reload(Path::new("registry.toml"), proposed.as_bytes());
-
-        assert_eq!(live.current().revision().as_str(), "r1");
-        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        let refused: Vec<Value> = logged
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|event| event["fields"]["event"] == "policy_reload_refused")
-            .collect();
-        assert_eq!(refused.len(), 1, "{logged}");
-        let fields = &refused[0]["fields"];
-        assert_eq!(fields["served"], "r1");
-        let reason = fields["reason"].as_str().unwrap();
-        assert!(
-            reason.contains("no receipt store is configured"),
-            "{reason}"
+        // The same file at r2 defining the reserved profile, which the boot gates refuse on
+        // every reload.
+        let reserved = registry_text("read", true, "r2").replace(
+            "profiles = []",
+            "profiles = [{ name = \"no-profile-selected\", classifications = [\"read\"], \
+             requires_delegation = false }]",
         );
+        reloader.reload(Path::new("registry.toml"), reserved.as_bytes());
+        assert_eq!(live.current().revision().as_str(), "r1");
+        let refused = refusals(&captured);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["served"], "r1");
+        let reason = refused[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("is reserved"), "{reason}");
 
-        // The read version at r2 is served: the refusal was the gate's, not the file's.
-        let read = registry_text("read", true, "r2");
+        // The same tool reclassified `propose`, at r3: the loader refuses it (rule 2), before
+        // the receipt-store gate could.
+        let proposed = registry_text("propose", true, "r3");
+        reloader.reload(Path::new("registry.toml"), proposed.as_bytes());
+        assert_eq!(live.current().revision().as_str(), "r1");
+        let refused = refusals(&captured);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        let reason = refused[1]["reason"].as_str().unwrap();
+        assert!(reason.contains("rule 2"), "{reason}");
+
+        // The read version at r4 is served: the refusals were the gates' and the loader's,
+        // not the file's.
+        let read = registry_text("read", true, "r4");
         reloader.reload(Path::new("registry.toml"), read.as_bytes());
-        assert_eq!(live.current().revision().as_str(), "r2");
+        assert_eq!(live.current().revision().as_str(), "r4");
     }
 }

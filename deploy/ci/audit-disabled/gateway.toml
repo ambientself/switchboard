@@ -18,8 +18,8 @@ poll_seconds = 2
 [identity]
 mode = "enforce"
 
-# A key set holding one public key only, the same as deploy/ci/receipt-gate's. Nobody holds its
-# private key.
+# A key set holding one public key only, the same as deploy/ci/proxied-propose's. Nobody holds
+# its private key.
 [[identity.issuers]]
 issuer = "https://ci-issuer.switchboard.test"
 kind = "workload"

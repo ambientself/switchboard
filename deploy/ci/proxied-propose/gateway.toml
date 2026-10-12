@@ -1,12 +1,11 @@
-# CI's check of the release artifact: `switchboard --config=deploy/ci/receipt-gate/gateway.toml`
-# must exit 1, refusing the registry's `propose` tool because no receipt store is configured
-# (decision 0009). Identity and audit are both on, as the release build requires (decision 0014):
-# identity is enforced against a checked-in public key, and audit names a database CI never
-# reaches. The receipt-store gate runs as soon as the registry loads, before any connection, so
-# the refusal comes first. The format is in crates/gateway/src/deployment.rs. Every value here is
-# a dummy.
+# CI's check of the release artifact: `switchboard --config=deploy/ci/proxied-propose/gateway.toml`
+# must exit 1, refusing the registry's proxied `propose` tool as the registry loads (decision
+# 0011, section 3, rule 2). Identity and audit are both on, as the release build requires
+# (decision 0014): identity is enforced against a checked-in public key, and audit names a
+# database CI never reaches. The registry is loaded before any connection, so the refusal comes
+# first. The format is in crates/gateway/src/deployment.rs. Every value here is a dummy.
 
-deployment = "ci-receipt-gate"
+deployment = "ci-proxied-propose"
 listen = "127.0.0.1:0"
 
 [http]

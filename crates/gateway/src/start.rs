@@ -49,9 +49,9 @@ use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSi
 use connector_proxy::{
     CredentialFileError, FileCredentials, ProxyConnector, Upstream, UpstreamError,
 };
-use gateway_core::{ConnectorName, InstanceName, Issuer};
+use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
 use gateway_identity::Clock;
-use gateway_registry::{Credential, Registry, RegistryError};
+use gateway_registry::{Registry, RegistryError};
 use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
 use thiserror::Error;
 
@@ -108,6 +108,11 @@ pub enum StartError {
          name a server the registry has"
     )]
     UnknownServerLimits(ConnectorName),
+    /// A server's credential is a per-user grant, which is not built until milestone 5.
+    #[error(
+        "server `{0}`'s credential is a per-user grant, which this gateway does not support yet"
+    )]
+    PerUserGrant(ConnectorName),
     /// A credential file is given that no server uses.
     #[error("credential `{0}` is given a file in `[credentials]` but no server uses it")]
     UnusedCredential(String),
@@ -504,7 +509,16 @@ fn credentials(
     let mut used = BTreeSet::new();
     let mut pairs = Vec::new();
     for server in registry.servers().values() {
-        let Credential::Bearer { reference } = &server.credential;
+        // A team service identity and a gateway token are each a secret the gateway holds,
+        // read from the file the deployment names. Per-user grants arrive in milestone 5.
+        let reference = match server.credential.mode {
+            CredentialMode::TeamServiceIdentity | CredentialMode::GatewayToken => {
+                &server.credential.reference
+            }
+            CredentialMode::PerUserGrant => {
+                return Err(StartError::PerUserGrant(server.name.clone()));
+            }
+        };
         let Some(path) = files.get(reference) else {
             return Err(StartError::NoCredentialFile {
                 server: server.name.clone(),
@@ -778,23 +792,76 @@ mod tests {
         .unwrap_err()
     }
 
-    /// Decision 0014, section 4: a release build refuses a registry serving a `propose` tool at
-    /// the receipt-store gate as soon as the registry loads, before it fetches a key or
-    /// connects to the audit database.
+    /// A release build refuses a registry serving a proxied `propose` tool as the registry
+    /// loads (decision 0011, rule 2), before it fetches a key or connects to the audit
+    /// database. The receipt-store gate, which `boot::before_connecting` also runs there, is
+    /// not reached: every registry tool is proxied.
     #[tokio::test]
-    async fn the_receipt_gate_refuses_before_anything_is_connected() {
+    async fn a_registry_the_loader_refuses_is_refused_before_anything_is_connected() {
         let counted = Counted::start().await;
         let directory =
-            std::env::temp_dir().join(format!("switchboard-start-receipt-{}", std::process::id()));
+            std::env::temp_dir().join(format!("switchboard-start-loader-{}", std::process::id()));
         let text = crate::boot::tests::registry_text("propose", true, "r1");
         let refused =
             refused_as_release(deployment(&directory, &text, &counted, false, false)).await;
         std::fs::remove_dir_all(&directory).unwrap();
         assert!(
-            matches!(refused, StartError::Boot(BootError::NoReceiptStore { .. })),
+            matches!(
+                refused,
+                StartError::Registry(RegistryError::Snapshot(
+                    gateway_core::SnapshotError::ProxiedNotRead { .. }
+                ))
+            ),
             "{refused}"
         );
         assert_eq!(counted.connections(), 0, "something was connected to first");
+    }
+
+    /// A per-user grant is refused at start, even with a file for its reference: it is not
+    /// built until milestone 5. A team service identity and a gateway token each read theirs.
+    #[test]
+    fn a_per_user_grant_is_refused_and_the_other_modes_read_their_file() {
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-per-user-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential = directory.join("docs-credential");
+        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
+        let files = BTreeMap::from([("docs-credential".to_owned(), credential)]);
+        let text = crate::boot::tests::registry_text("read", false, "r1");
+        let before = gateway_registry::binding_sha256(&crate::boot::tests::server());
+        let mut outcomes = Vec::new();
+        for mode in [
+            CredentialMode::PerUserGrant,
+            CredentialMode::TeamServiceIdentity,
+            CredentialMode::GatewayToken,
+        ] {
+            let mut server = crate::boot::tests::server();
+            server.credential.mode = mode;
+            let written = match mode {
+                CredentialMode::PerUserGrant => "per_user_grant",
+                CredentialMode::TeamServiceIdentity => "team_service_identity",
+                CredentialMode::GatewayToken => "gateway_token",
+            };
+            let text = text
+                .replace("mode = \"gateway_token\"", &format!("mode = \"{written}\""))
+                .replace(&before, &gateway_registry::binding_sha256(&server));
+            let registry = Registry::from_toml_str(&text).unwrap();
+            outcomes.push(credentials(&registry, &files).map(|_| ()));
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+        match &outcomes[0] {
+            Err(refused @ StartError::PerUserGrant(server)) => {
+                assert_eq!(server.as_str(), "mock-docs");
+                assert_eq!(
+                    refused.to_string(),
+                    "server `mock-docs`'s credential is a per-user grant, which this gateway \
+                     does not support yet"
+                );
+            }
+            other => panic!("expected the per-user refusal, got {other:?}"),
+        }
+        assert!(outcomes[1].is_ok(), "{:?}", outcomes[1]);
+        assert!(outcomes[2].is_ok(), "{:?}", outcomes[2]);
     }
 
     /// Decision 0014, section 4: a release build refuses each opt-out before it connects to

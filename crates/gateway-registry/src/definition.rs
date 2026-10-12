@@ -3,12 +3,12 @@
 
 use std::fmt::Write as _;
 
-use gateway_core::{ConnectorName, ToolName};
+use gateway_core::{ConnectorName, CredentialMode, Narrowing, ToolName};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::registry::{Credential, Server};
+use crate::registry::Server;
 
 /// The dialect of every approved input schema. Only JSON Schema 2020-12 loads (decision 0013),
 /// so [`binding_sha256`] covers it as a constant.
@@ -92,26 +92,72 @@ pub fn definition_sha256(
 /// sorted by byte at every depth and no whitespace. Its keys are:
 ///
 /// - `address`: the server's address, as written;
-/// - `credential_mode`: how the gateway authenticates to it, such as `"bearer"`;
+/// - `credential_mode`: how the gateway authenticates to it: `"team_service_identity"`,
+///   `"gateway_token"` or `"per_user_grant"`;
+/// - `credential_principal`: the identity the credential acts as;
 /// - `credential_reference`: the label of the credential the gateway presents;
+/// - `destination`: `"in_cluster"` or `"public"`;
 /// - `dialect`: the input schema's dialect, always [`SCHEMA_DIALECT`];
-/// - `identity`: the server's identity, which the loader requires to be the address's host.
+/// - `identity`: the server's identity, which the loader requires to be the address's host;
+/// - `narrowing`: `"call"`, `"limit"` or `"none"`;
+/// - `permits`: what the credential permits, a classification such as `"read"`;
+/// - `reach`: the reach, a list of objects with the keys `identifier`, `kind` and `system`,
+///   sorted by system, then kind, then identifier;
+/// - `reach_test_date`: the reach test's date, `YYYY-MM-DD`, or `null` when none is recorded.
 ///
-/// The server's name, system and owner are not in it. What a later server or connector entry
-/// adds to the binding is added here as further keys.
+/// The server's name, system and owner are not in it, and neither are the reach test's record,
+/// the probe record or the reach check: the drift pass repeats the probe and the reach check.
 pub fn binding_sha256(server: &Server) -> String {
-    let (mode, reference) = match &server.credential {
-        Credential::Bearer { reference } => ("bearer", reference),
+    let credential = &server.credential;
+    let mode = match credential.mode {
+        CredentialMode::TeamServiceIdentity => "team_service_identity",
+        CredentialMode::GatewayToken => "gateway_token",
+        CredentialMode::PerUserGrant => "per_user_grant",
     };
+    let narrowing = match server.narrowing {
+        Narrowing::Call => "call",
+        Narrowing::Limit => "limit",
+        Narrowing::None => "none",
+    };
+    let reach: Vec<Value> = server
+        .reach
+        .iter()
+        .map(|resource| {
+            json!({
+                "system": resource.system,
+                "kind": resource.kind,
+                "identifier": resource.identifier,
+            })
+        })
+        .collect();
+    let tested = server
+        .reach_test
+        .as_ref()
+        .map_or(Value::Null, |test| Value::String(test.date.clone()));
     let mut binding = serde_json::Map::new();
     binding.insert("dialect".into(), Value::String(SCHEMA_DIALECT.into()));
     binding.insert("identity".into(), Value::String(server.identity.clone()));
     binding.insert("address".into(), Value::String(server.address.clone()));
+    binding.insert(
+        "destination".into(),
+        Value::String(server.destination.as_str().into()),
+    );
     binding.insert("credential_mode".into(), Value::String(mode.into()));
     binding.insert(
         "credential_reference".into(),
-        Value::String(reference.clone()),
+        Value::String(credential.reference.clone()),
     );
+    binding.insert(
+        "credential_principal".into(),
+        Value::String(credential.principal.clone()),
+    );
+    binding.insert("narrowing".into(), Value::String(narrowing.into()));
+    binding.insert(
+        "permits".into(),
+        Value::String(server.permits.as_str().into()),
+    );
+    binding.insert("reach".into(), Value::Array(reach));
+    binding.insert("reach_test_date".into(), tested);
     sha256_hex(&Value::Object(binding))
 }
 
@@ -161,7 +207,8 @@ fn write_canonical(value: &Value, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::registry::{Credential, Destination, Probe, ProbeResult, ReachCheck, ReachTest};
+    use gateway_core::{Classification, Resource};
 
     #[test]
     fn the_hash_does_not_depend_on_key_order() {
@@ -204,24 +251,53 @@ mod tests {
             owner: "o".into(),
             identity: "h".into(),
             address: "http://h/".into(),
-            credential: Credential::Bearer {
+            credential: Credential {
+                mode: CredentialMode::TeamServiceIdentity,
                 reference: "c".into(),
+                principal: "p".into(),
             },
+            narrowing: Narrowing::None,
+            permits: Classification::Read,
+            reach: [resource("atlas")].into(),
+            reach_test: Some(ReachTest {
+                date: "2026-10-12".into(),
+                record: "r".into(),
+            }),
+            destination: Destination::InCluster,
+            probe: Some(Probe {
+                result: ProbeResult::Refused,
+                date: "2026-10-12".into(),
+            }),
+            reach_check: Some(ReachCheck {
+                tool: ToolName::parse("docs__list").unwrap(),
+                arguments: json!({"project": "borealis"}).as_object().unwrap().clone(),
+            }),
+        }
+    }
+
+    fn resource(identifier: &str) -> Resource {
+        Resource {
+            system: "docs".into(),
+            kind: "project".into(),
+            identifier: identifier.into(),
         }
     }
 
     #[test]
-    fn the_binding_text_is_compact_sorted_json_of_its_five_keys() {
-        // sha256 of {"address":"http://h/","credential_mode":"bearer","credential_reference":"c",
-        // "dialect":"2020-12","identity":"h"}, with no line break.
+    fn the_binding_text_is_compact_sorted_json_of_its_eleven_keys() {
+        // sha256 of {"address":"http://h/","credential_mode":"team_service_identity",
+        // "credential_principal":"p","credential_reference":"c","destination":"in_cluster",
+        // "dialect":"2020-12","identity":"h","narrowing":"none","permits":"read",
+        // "reach":[{"identifier":"atlas","kind":"project","system":"docs"}],
+        // "reach_test_date":"2026-10-12"}, with no line breaks.
         assert_eq!(
             binding_sha256(&server()),
-            "f87795d770b703500efd8adafcd2a0a9d3cc29262bf2c59b834aa5b844ac6db8"
+            "868407b173faebbb7c6b3c3e1d900686e51650c8a61afc2bd012b312ea48add0"
         );
     }
 
     #[test]
-    fn the_binding_covers_the_identity_address_and_credential_but_not_the_names() {
+    fn the_binding_covers_the_server_and_its_entry_but_not_the_names_or_records() {
         let base = binding_sha256(&server());
         let changed = |edit: fn(&mut Server)| {
             let mut server = server();
@@ -230,16 +306,50 @@ mod tests {
         };
         assert_ne!(base, changed(|s| s.identity = "i".into()));
         assert_ne!(base, changed(|s| s.address = "http://i/".into()));
+        assert_ne!(base, changed(|s| s.destination = Destination::Public));
+        assert_ne!(base, changed(|s| s.credential.reference = "d".into()));
+        assert_ne!(base, changed(|s| s.credential.principal = "q".into()));
+        for mode in [CredentialMode::GatewayToken, CredentialMode::PerUserGrant] {
+            let mut server = server();
+            server.credential.mode = mode;
+            assert_ne!(base, binding_sha256(&server), "{mode:?}");
+        }
+        for narrowing in [Narrowing::Call, Narrowing::Limit] {
+            let mut server = server();
+            server.narrowing = narrowing;
+            assert_ne!(base, binding_sha256(&server), "{narrowing:?}");
+        }
+        assert_ne!(base, changed(|s| s.permits = Classification::Propose));
+        assert_ne!(base, changed(|s| s.reach.clear()));
+        assert_ne!(base, changed(|s| s.reach = [resource("borealis")].into()));
         assert_ne!(
             base,
             changed(|s| {
-                s.credential = Credential::Bearer {
-                    reference: "d".into(),
-                }
+                s.reach.insert(resource("borealis"));
             })
         );
+        assert_ne!(
+            base,
+            changed(|s| s.reach_test.as_mut().unwrap().date = "2026-10-13".into())
+        );
+        assert_ne!(base, changed(|s| s.reach_test = None));
         assert_eq!(base, changed(|s| s.name = "t".into()));
         assert_eq!(base, changed(|s| s.system = "wiki".into()));
         assert_eq!(base, changed(|s| s.owner = "p".into()));
+        assert_eq!(
+            base,
+            changed(|s| s.reach_test.as_mut().unwrap().record = "other".into())
+        );
+        assert_eq!(base, changed(|s| s.probe = None));
+        assert_eq!(base, changed(|s| s.reach_check = None));
+    }
+
+    #[test]
+    fn the_reach_is_hashed_in_order_whatever_order_it_was_written_in() {
+        let mut one = server();
+        one.reach = [resource("borealis"), resource("atlas")].into();
+        let mut two = server();
+        two.reach = [resource("atlas"), resource("borealis")].into();
+        assert_eq!(binding_sha256(&one), binding_sha256(&two));
     }
 }

@@ -9,11 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gateway_core::{
-    Classification, ConnectorName, GroupId, Issuer, ProfileName, Subject, SurfaceName, TeamId,
-    ToolName,
+    Classification, ConnectorName, CredentialMode, GroupId, Issuer, Narrowing, ProfileName,
+    Subject, SurfaceName, TeamId, ToolName,
 };
 use serde::Deserialize;
 use toml::value::Datetime;
+
+use crate::registry::{Destination, ProbeResult};
 
 /// The whole file.
 #[derive(Debug, Deserialize)]
@@ -37,12 +39,45 @@ pub(crate) struct ServerFile {
     pub identity: String,
     pub address: String,
     pub credential: CredentialFile,
+    pub narrowing: Narrowing,
+    pub permits: Classification,
+    pub reach: Vec<ResourceFile>,
+    #[serde(default)]
+    pub reach_test: Option<ReachTestFile>,
+    pub destination: Destination,
+    #[serde(default)]
+    pub probe: Option<ProbeFile>,
+    #[serde(default)]
+    pub reach_check: Option<ReachCheckFile>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum CredentialFile {
-    Bearer { reference: String },
+#[serde(deny_unknown_fields)]
+pub(crate) struct CredentialFile {
+    pub mode: CredentialMode,
+    pub reference: String,
+    pub principal: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReachTestFile {
+    pub date: Datetime,
+    pub record: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProbeFile {
+    pub result: ProbeResult,
+    pub date: Datetime,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReachCheckFile {
+    pub tool: ToolName,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +103,9 @@ pub(crate) struct ToolFile {
 pub(crate) enum ResourcesFile {
     NoResources,
     FromArguments(Vec<SourceFile>),
+    /// Declared as the entry's whole reach (decision 0011, section 1). It parses, and the
+    /// snapshot refuses it until the audit row can record a reach by reference.
+    AsReach,
 }
 
 #[derive(Debug, Deserialize)]

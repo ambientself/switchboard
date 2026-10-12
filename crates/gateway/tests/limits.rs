@@ -147,9 +147,18 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
         owner: "platform".into(),
         identity: gateway_registry::address_host(url).unwrap().to_owned(),
         address: url.to_owned(),
-        credential: gateway_registry::Credential::Bearer {
+        credential: gateway_registry::Credential {
+            mode: gateway_core::CredentialMode::GatewayToken,
             reference: reference(name).into(),
+            principal: name.into(),
         },
+        narrowing: gateway_core::Narrowing::None,
+        permits: gateway_core::Classification::Read,
+        reach: Default::default(),
+        reach_test: None,
+        destination: gateway_registry::Destination::InCluster,
+        probe: None,
+        reach_check: None,
     };
     let server = |name: &str, url: &str| {
         let identity = entry(name, url).identity;
@@ -157,7 +166,8 @@ fn registry_text(slow_url: &str, other_url: &str) -> String {
         format!(
             "[[servers]]\nname = \"{name}\"\nsystem = \"{name}\"\nowner = \"platform\"\n\
              identity = \"{identity}\"\naddress = \"{url}\"\n\
-             credential = {{ mode = \"bearer\", reference = \"{reference}\" }}\n\n"
+             credential = {{ mode = \"gateway_token\", reference = \"{reference}\", principal = \"{name}\" }}\n\
+             narrowing = \"none\"\npermits = \"read\"\nreach = []\ndestination = \"in_cluster\"\n\n"
         )
     };
     let tool = |name: &str, url: &str| {

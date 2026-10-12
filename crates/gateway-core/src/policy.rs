@@ -476,8 +476,9 @@ impl PolicySnapshot {
     /// Refuses duplicate names rather than letting one silently shadow another, and a surface
     /// that serves a tool nobody approved. Then, when there are connector entries, refuses a
     /// tool with no entry, and a snapshot that breaks one of the nine rules of decision 0011,
-    /// section 3 (see [`check_rules`]). Last, it refuses a tool `declared` as the reach, which
-    /// is not built.
+    /// section 3, each named by its [`SnapshotError`] variant. The rules apply to tools whose
+    /// connector has an entry. Last, it refuses a tool `declared` as the reach, which is not
+    /// built.
     pub fn new(data: SnapshotData) -> Result<Self, SnapshotError> {
         let mut tools = BTreeMap::new();
         for tool in data.tools {

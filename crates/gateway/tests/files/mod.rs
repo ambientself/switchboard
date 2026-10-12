@@ -158,7 +158,9 @@ pub fn registry(mock_url: &str) -> String {
 /// `text`, a registry whose servers are all entries of the mock server, at one address, with
 /// every entry moved to `address`, as its owner would register it and a person would approve it
 /// again: the address, the identity (the address's host) and each tool's `binding_sha256`,
-/// through [`gateway_registry::binding_sha256`].
+/// through [`gateway_registry::binding_sha256`]. Each binding is recomputed from the entry as
+/// loaded, so it covers every field the binding does, the connector entry's included; the
+/// result must load.
 pub fn rebind(text: &str, address: &str) -> String {
     let loaded = gateway_registry::Registry::from_toml_str(text).unwrap();
     let servers: Vec<_> = loaded.servers().values().collect();
@@ -206,6 +208,16 @@ pub fn rebind(text: &str, address: &str) -> String {
                 gateway_registry::binding_sha256(&after)
             ),
             tools,
+        );
+    }
+    let moved = gateway_registry::Registry::from_toml_str(&text)
+        .unwrap_or_else(|error| panic!("the moved registry does not load: {error}"));
+    for (tool, approval) in moved.approvals() {
+        let server = &moved.servers()[&moved.routes()[tool].server];
+        assert_eq!(server.address, address);
+        assert_eq!(
+            approval.binding_sha256,
+            gateway_registry::binding_sha256(server)
         );
     }
     text

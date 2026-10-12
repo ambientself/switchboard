@@ -244,8 +244,11 @@ fn each_dummy_credentials_hash_matches_it() {
             digest,
             "{dir}: demo.sh would look for another digest in mock-docs' log"
         );
-        // mock-docs accepts the credential for its team's project alone.
+        // mock-docs accepts the credential for its team's project alone, which is the entry's
+        // whole recorded reach.
         digests.push(format!("{digest} {project}"));
+        let registry = read("deploy/compose/config/registry/registry.toml");
+        assert_eq!(entry_reach(&registry, entry), [project]);
     }
     assert_eq!(
         callers.lines().collect::<Vec<_>>(),
@@ -764,8 +767,10 @@ fn the_kind_mock_docs_accepts_only_the_entries_identities() {
             "{team} = [{{ system = \"docs\", kind = \"project\", identifier = \"{project}\" }}]\n"
         )));
         assert!(registry.contains(&format!(
-            "credential = {{ mode = \"bearer\", reference = \"{entry}-credential\" }}\n"
+            "credential = {{ mode = \"team_service_identity\", reference = \"{entry}-credential\", principal = \"{entry}\" }}\n"
         )));
+        // The entry's recorded reach is exactly what mock-docs lets its identity read.
+        assert_eq!(entry_reach(&registry, entry), [project]);
     }
     // Neither the admin endpoint nor slow-doc's delay is set: no demo step uses them.
     for name in config::STATIC_VARS.into_iter().chain([
@@ -1170,6 +1175,30 @@ fn the_kind_cluster_is_never_otto_dev() {
     let cluster = read("deploy/kind/cluster.yaml");
     assert!(cluster.contains("\nname: switchboard-demo\n"));
     assert!(!cluster.contains("otto-dev"));
+}
+
+/// The identifiers in the reach of the server `entry` in `registry`, each a `docs` project.
+/// The reach must be written on one `reach = [...]` line.
+fn entry_reach(registry: &str, entry: &str) -> Vec<String> {
+    let start = registry
+        .find(&format!("[[servers]]\nname = \"{entry}\"\n"))
+        .unwrap_or_else(|| panic!("no server `{entry}`"));
+    let line = registry[start..]
+        .lines()
+        .find_map(|line| line.strip_prefix("reach = "))
+        .expect("a reach line");
+    let prefix = "{ system = \"docs\", kind = \"project\", identifier = \"";
+    let identifiers: Vec<String> = line
+        .split(prefix)
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        line.matches("identifier").count(),
+        identifiers.len(),
+        "{line}"
+    );
+    identifiers
 }
 
 /// The registry without its leading comment lines.
