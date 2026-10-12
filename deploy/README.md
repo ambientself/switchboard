@@ -82,8 +82,78 @@ mock-docs no longer lists, is withdrawn from every surface in that replica until
 again or the replica restarts, with a `"event":"tool_withdrawn"` line at `ERROR`. A poll that
 fails keeps the entry's tools served and logs `"event":"drift_poll_failed"` at `WARN`. These
 tools/list requests reach mock-docs every 10 s under the entries' identities; they are not calls,
-and the runs' call counts leave them out. Neither run changes a definition: the demos show that
-the pass runs and withdraws nothing while mock-docs serves what was approved.
+and the runs' call counts leave them out. Both runs change a definition, and show the withdrawal
+and what clears it, in the drift steps below.
+
+## #11's demonstrations
+
+Both runs end with #11's demonstrations, after the checks of mock-docs' log and before the
+metrics and the audit rows (`demonstrations` in `demo/demo.sh`). Each step checks the
+workload's answers, the step's own audit rows and, where it says so, the gateway's log lines and
+metrics:
+
+1. **An undeclared argument** (decision 0011, section 1). Team-a reads its project with an
+   extra argument, `note`, which the tool's approved schema does not declare. The answer is an
+   error result with the undeclared-argument sentence, mock-docs accepts no call meanwhile, and
+   the step's one row is team-a's read, allowed and completed as `error` of the kind
+   `invalid_arguments`.
+2. **Refused at load** (decision 0011, Consequences). The driver makes a variant of the registry
+   the gateway serves, with a new revision and team-b admitted to `docs-team-a`'s surface, and
+   installs it. `docs-team-a` narrows nothing and reaches `atlas`, which team-b's limit does not
+   hold, so the gateway logs `policy_reload_refused` for rule 5, naming the surface, `atlas` and
+   team-b, with `demo-5` still served, and never serves the variant. The registry served before
+   then goes back.
+3. **A hanging server** (decision 0014, section 1). While team-b reads its own project once a
+   second, team-a reads `slow-doc`, which mock-docs answers after 10 s. The gateway answers at
+   the 5 s call deadline with the late-answer sentence, and the row is `error` of the kind
+   `oversized_or_late_read`, with a latency of 5 s and less than a second more. Team-b's reads
+   are answered meanwhile, by the rows' times.
+4. **Overload** (decision 0014, section 2). Team-a starts 9 reads of `slow-doc` at once, one
+   more than its cap of 8 calls in flight to its server. Eight are held to the deadline and
+   completed as `error`; one is refused with the team-capacity sentence and completed as
+   `refused`, its row recording the sentence; and `switchboard_calls_shed_total{scope="team"}`
+   rises by one. Team-b's reads are answered meanwhile, and every one of them, 30 in Compose and
+   60 in kind, is allowed and answered `ok`.
+5. **Drift** (decision 0013, sections 5 to 7). The driver has mock-docs serve another
+   description of `list_documents`. Both entries list it from the one server, so the gateway
+   withdraws both list tools, each within the 10 s interval plus the 5 s deadline of the change,
+   for a changed definition from `demo-5`, and serves the literal derived revision
+   `demo-5+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents`. Team-a's
+   tools/list drops its list tool, a call to it is refused as an unknown tool, and both rows
+   carry that revision. The driver then has mock-docs serve the approved description again,
+   waits for two more polls of each entry, and shows the tools still withdrawn: in milestone 3 a
+   withdrawal lasts until a new approval or a restart. It then installs a variant of the
+   registry approving both list tools again, unchanged (the same `definition_sha256`), with a
+   new `approved_at` and a new revision, `demo-5-reapproved-<UTC time>`. The gateway serves that
+   revision with no withdrawal, logs both withdrawals cleared as approved again, and withdraws
+   nothing over the next two polls, and team-a's tools are served again. Last, the registry
+   served before goes back, and team-a's tools are served under `demo-5`. No step approves a
+   changed definition, so nothing flaps.
+
+Before these, each run checks that the gateway's boot lines give what they rely on: a cap of 8
+calls in flight from each team to each server, a 5 s deadline on each entry's calls, and a 10 s
+drift interval. `crates/demo-checks` holds these to the code's defaults and the deployment
+files.
+
+Every registry variant is made at run time from the registry the gateway serves, the Compose
+copy under `.demo/` or kind's ConfigMap `registry`; the checked-in files are never edited. In
+kind the driver applies the variant to the ConfigMap and then annotates the gateway's pod, so
+the kubelet updates the mounted file at once rather than at its next sync. If a run stops in
+the middle of a step, the driver puts back the registry and mock-docs' description on its way
+out. A withdrawal the gateway made stays in its memory until the tool is approved again or the
+gateway restarts, which `demo.sh down compose`, or a rollout in kind, does.
+
+**What these need from mock-docs.** `slow-doc` keeps its default delay, 10 s. Its admin
+endpoint, which changes the description it serves, is enabled for the drift step alone, with
+`MOCK_DOCS_ADMIN_LISTEN=127.0.0.1:9091`: it listens on mock-docs' own loopback and nowhere else.
+No published port, containerPort, Service or network policy names it, so no workload, nor the
+gateway, can reach it, and the network policy still admits only the gateway, on 8080. The
+driver reaches it from inside mock-docs' container, with `docker compose exec` or `kubectl
+exec`. It has no admin credential of its own, which the binary allows only on loopback, so it
+answers mock-docs' callers: the driver sends `docs-team-a`'s credential, in Compose its dummy
+credential and in kind a ten-minute token of its ServiceAccount for audience `mock-docs`, which
+the demo's own kubeconfig asks the cluster for. Its requests are logged as `"event":"admin"`,
+and are not calls. `crates/demo-checks` holds the manifests to all of this.
 
 ## What is here
 
@@ -98,7 +168,7 @@ the pass runs and withdraws nothing while mock-docs serves what was approved.
 | `kind/policy/` | The network policies: mock-docs admits only the gateway, Postgres only the gateway and the migration, the gateway only the two teams. |
 | `kind/route-check/rbac.yaml` | The route check's operator: ServiceAccount `route-check/operator`, `get` and `list` on what it reads, among them Roles, ClusterRoles, RoleBindings and ClusterRoleBindings across the cluster, `create` on SubjectAccessReviews, and `patch` on `pods/ephemeralcontainers` in `team-a` and `team-b` only. Not part of the base; the kind run applies it. |
 | `route-check/` | The route check (decision 0010): `route-check.sh`, its operator step; `probe.sh`, its probe, which the image installs as `route-probe.sh`; `permissions.tsv`, the one list of control 1's permissions; `rbac-match.jq`, which finds the RBAC rules bound to a ServiceAccount that grant a row of that list; `token-patterns.txt`; and `routes/kind.tsv`, the routes the probe tries in kind. |
-| `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn`, and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
+| `demo/workload.sh` | The scripted workload (decision 0008). Modes `full`, `before-policy`, `refused`, `audit-down`, `withdrawn` (of the read tool, or with `list` the list tool), `served`, `undeclared`, `hang`, `overload N`, `steady N` (#11's demonstrations, above), and `idle`, which makes no call and holds a running pod for the route check until SIGTERM, at most 600 s. |
 | `demo/token-writer.sh` | The kind gateway pod's token writer (above). `token-writer.sh once` writes each token once. |
 | `demo/migrate.sh`, `demo/roles.sql` | Creates the roles and database as the superuser, runs `switchboard migrate` as `switchboard_owner`, and lets `switchboard_reader` read the audit schema. |
 | `demo/demo.sh` | The driver. |
@@ -110,7 +180,9 @@ credentials' hashes match, and in kind: only the token writer mounts an API toke
 grant names exactly the two entries' ServiceAccounts; mock-docs' settings name only those, each
 for its team's project; each workload calls its own team's surface; the gateway fetches the
 issuer's keys with the cluster CA and no token; and the discovery binding names one ClusterRole
-and one group). It runs `token-writer.sh` against a fake API server too.
+and one group). It runs `token-writer.sh` against a fake API server too, loads the registry
+variants the driver makes as the gateway loads them, and holds mock-docs' admin endpoint to its
+own loopback, with no port anywhere naming it.
 
 ## Network policy in kind
 
@@ -301,8 +373,8 @@ check that the deployment files load.
 | Registry | `gateway-registry`'s TOML (`compose/config/registry/registry.toml`, `kind/base/config/registry/registry.toml`; the kind one is the registry crate's demo file). Revision `demo-5`; `compose/config/registry-withdrawn.toml` is revision `demo-6` without either team's read tool. A new version that changes a server or a tool's route is refused until a restart. |
 | Migrations | `migrate.sh` creates the roles and database as the superuser (`demo/roles.sql`), then runs `switchboard migrate` as `switchboard_owner`, which applies `crates/audit-postgres`'s migrations and records them in `switchboard_audit.migrations`. |
 | Dev issuer | `switchboard-dev issuer --listen=0.0.0.0:8090 --issuer=https://dev-issuer.switchboard.test --keys-out=/shared/issuer/jwks.json --subject=...`. `GET /token?subject=<s>&audience=<a>` answers with the bare token for a listed subject, 403 otherwise. Workload subjects are `workload:<team>:mock-workload`. Not published: it signs for anyone who can reach it. A restart makes a new key, so restart the gateway after it. |
-| mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (each entry's credential's hash with its team's project, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECTS` (`docs-team-a`'s ServiceAccount for `atlas`, `docs-team-b`'s for `borealis`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once, for mock-docs only: the gateway fetches its own). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). No admin endpoint, and `slow-doc`'s default delay: no step uses either. Each run checks that it accepted exactly the gateway's allowed calls (4 in Compose, 8 in kind), each team's under its own entry's credential or ServiceAccount and for its own project. The kind run checks that it refused only the two direct calls before the policy, as `wrong_audience`, and the route check's open attempts before the policy, as `no_bearer`. |
-| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `kind`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms`, `policy_revision`, `listed_tools` and `listed_omitted`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row of kind `call` to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. A row of kind `list` records one workload's `tools/list`, with no tool or resources; the listing shows the tools it listed. The driver counts these apart, 3 in Compose and 2 in kind, and checks that each names the tools its caller was shown under its policy revision, with none left out. It reads the open rows through the view `switchboard_audit.open_call_rows` (migration 0005). |
+| mock-docs | `mock-docs-server`, configured by environment. In Compose: `MOCK_DOCS_LISTEN` and `MOCK_DOCS_TOKEN_SHA256_FILE` (each entry's credential's hash with its team's project, never the credential). In kind, its JWT mode: `MOCK_DOCS_JWT_ISSUER` (the cluster's issuer), `MOCK_DOCS_JWT_AUDIENCE` (`mock-docs`), `MOCK_DOCS_JWT_SUBJECTS` (`docs-team-a`'s ServiceAccount for `atlas`, `docs-team-b`'s for `borealis`) and `MOCK_DOCS_JWKS_FILE` (the cluster's keys, from ConfigMap `mock-docs/cluster-issuer-keys`, which `demo.sh` copies once, for mock-docs only: the gateway fetches its own). `POST /mcp`; tools `list_documents {project}` and `read_document {project, document}`; document `plan` in projects `atlas` and `borealis`; 401 for any other bearer, from the headers alone; one JSON log line per request with `bearer_sha256` (a hex prefix) and `accepted`, and in kind `caller` (the verified subject) and `refusal` (why a token was refused). `MOCK_DOCS_ADMIN_LISTEN` (`127.0.0.1:9091`, its admin endpoint on its own loopback, for the drift step alone), and `slow-doc`'s default delay of 10 s, which the hanging-server and overload steps read (#11's demonstrations, above). Each run checks that it accepted exactly the gateway's allowed calls (4 in Compose, 8 in kind), each team's under its own entry's credential or ServiceAccount and for its own project. The kind run checks that it refused only the two direct calls before the policy, as `wrong_audience`, and the route check's open attempts before the policy, as `no_bearer`. |
+| Audit schema | Table `switchboard_audit.call_rows` (`crates/audit-postgres/sql/migrations/`), with `begun_at`, `kind`, `proved_subject`, `proved_team`, `tool`, `resources`, `decision`, `reason`, `sentence`, `outcome`, `latency_ms`, `policy_revision`, `listed_tools` and `listed_omitted`, read by the driver as `switchboard_reader`. `resources` is a JSON array of the `{system, kind, identifier}` each call named (`[]` for none), or `"unknown"` when nobody could read what the call named, as for a tool the gateway does not know; the driver lists each as `docs/project/atlas`. It checks that each team's allowed read names its own project, that its denied read names the other's, that its call naming no project records `[]`, and that no allowed row names the other team's project. It matches every row of kind `call` to the demo call that made it and checks that the row records what that call named; in Compose, the call to the withdrawn tool records `"unknown"`. A row of kind `list` records one workload's `tools/list`, with no tool or resources; the listing shows the tools it listed. The driver counts these apart, 7 in Compose and 6 in kind (each team's full run, Compose's run after the withdrawal, and team-a's four in the drift steps), and checks that each names the tools its caller was shown under its policy revision, with none left out: under a revision the drift pass derived, its tools less those withdrawn. #11's demonstrations read `error_kind`, `outcome_sentence` and `finished_at` too. It reads the open rows through the view `switchboard_audit.open_call_rows` (migration 0005). |
 | Sentences | The core's, from `crates/gateway-core/src/sentences.rs`; `crates/demo-checks` fails if the workload's copies drift. |
 
 ## What a run shows that is not settled
