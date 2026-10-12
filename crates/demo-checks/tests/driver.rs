@@ -5092,9 +5092,20 @@ fn the_reach_checks_rows_name_their_canary_and_stay_out_of_each_steps_rows() {
         "docs-team-b__list_documents",
         project("atlas"),
     ));
+    // A check that found its canary tool served just before the drift poll beside it withdrew
+    // the tool: the gateway no longer knew it, so its resources are unknown.
+    let mut raced = registry_row("docs-team-b__list_documents", json!("unknown"));
+    raced["decision"] = json!("deny");
+    raced["reason"] = json!("unknown_tool");
+    rows.push(raced.clone());
     let run = check_rows("rows-reach", &Value::from(rows).to_string());
     assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let mut named_as_unknown = registry_row("docs-team-b__list_documents", json!("unknown"));
+    named_as_unknown["decision"] = json!("allow");
+    raced["resources"] = project("atlas");
     for (case, row) in [
+        ("allowed but unknown", named_as_unknown),
+        ("unknown tool naming its canary", raced),
         (
             "its own project",
             registry_row("docs-team-a__list_documents", project("atlas")),

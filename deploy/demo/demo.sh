@@ -401,7 +401,9 @@ row_resources_json() {
 #   - a call denied for naming no project: none, [];
 #   - a call denied for its project: the other team's project;
 #   - a call to a tool the gateway does not know: "unknown", since no adapter read the call;
-#   - a reach check's call, by team registry: its entry's canary, the other team's project.
+#   - a reach check's call, by team registry: its entry's canary, the other team's project; or
+#     "unknown" when the gateway no longer knew the tool, withdrawn by the drift poll that ran
+#     beside the check, after the check found it served (a failed check, which withdraws nothing).
 # A row of kind `list` records a tools/list, which names no resources: its resources are null.
 # check_list_rows counts those rows and checks what they name. A row that matches none of the
 # demo's calls or lists fails the check too.
@@ -416,7 +418,10 @@ check_row_resources() {
       def named:
         if .kind == "list" then null
         elif .kind != "call" then "no call of the demo makes this row"
-        elif .team == $reach then (if canary == null then "no call of the demo makes this row" else project(canary) end)
+        elif .team == $reach then
+          (if canary == null then "no call of the demo makes this row"
+           elif .decision == "deny" and .reason == "unknown_tool" then "unknown"
+           else project(canary) end)
         elif .decision == "allow" then project(own)
         elif .reason == "unknown_tool" then "unknown"
         elif .reason == "resource_outside_limit" and (.sentence // "" | contains("named none of them")) then []
