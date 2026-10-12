@@ -95,10 +95,16 @@ pub struct BeginFailures {
     /// The begin budget ran out with a connection in hand: the insert, or the preparing of it,
     /// was still waiting, as on a lock.
     pub budget_exceeded: u64,
-    /// The begin budget ran out while waiting for a connection from the begin pool.
+    /// No connection was obtained in time, whether waiting for a pool permit or opening a new
+    /// connection: the begin budget ran out before the begin's last attempt had a connection
+    /// from the begin pool. So three different things count here: a database that never
+    /// answers, such as one behind a blackholed address; a reconnect after a transient error,
+    /// such as a broken connection, that runs past the budget; and a pool too small for the
+    /// load. This count alone cannot tell them apart; a signal that can is #155.
     pub pool_timeout: u64,
-    /// The database could not be reached, refused or failed the statement, or already holds
-    /// the row under its identifier in another form.
+    /// Connecting failed with an error, such as a refused connection, or the database refused
+    /// or failed the statement, or already holds the row under its identifier in another form.
+    /// A database that never answers is counted in `pool_timeout` instead.
     pub database_error: u64,
     /// A value of the record could not be put in its column, such as text holding U+0000.
     pub value_refused: u64,
@@ -172,8 +178,8 @@ pub struct StoreStats {
     pub finish_latency: LatencyHistogram,
     /// The begin pool, which begins and list rows use.
     pub begin_pool: PoolStats,
-    /// The finish pool, which finishes, completions of failed begins' rows and the open-row
-    /// query use.
+    /// The finish pool, which finishes and completions of failed begins' rows use. The
+    /// open-row query has a pool of its own.
     pub finish_pool: PoolStats,
 }
 

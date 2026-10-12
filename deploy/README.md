@@ -220,20 +220,32 @@ the `gateway-from-teams` policy admits the teams on 8080 only. Both runs read it
 inside the gateway's container.
 
 The signals of design section 11, all from the gateway's own counters: begin failures by cause
-(`switchboard_audit_begin_failures_total{cause}`; `pool_timeout` is any begin that got no
-connection within its budget, waiting for the pool or opening a connection, until #105 tells
-them apart), the audit-failure answers they cause (`switchboard_audit_failure_answers_total`,
-for `tools/call` and `tools/list`), answers released before finish, finishes given up by cause,
-failed begins never committed, finishes in flight, open rows and the oldest open row's deadline
-(polled every 15 s through the open-row view; a failed poll is counted and keeps the last
-count), begin and finish latency histograms, each pool's connections in use, open and maximum,
-and telemetry events and drops. Each proxied server's drift polls by result, the tools the drift
+(`switchboard_audit_begin_failures_total{cause}`; see `pool_timeout` below), the audit-failure
+answers they cause (`switchboard_audit_failure_answers_total`, for `tools/call` and
+`tools/list`), answers released before finish, finishes given up by cause, failed begins never
+committed, finishes in flight, open rows and the oldest open row's deadline (polled every 15 s
+through the open-row view; a failed poll is counted and keeps the last count), begin and finish
+latency histograms, the begin and finish pools' connections in use, open and maximum, and
+telemetry events and drops. Each proxied server's drift polls by result, the tools the drift
 pass withdrew from it, and how many tools are withdrawn now
 (`switchboard_drift_polls_total{server,result}`, `switchboard_drift_withdrawals_total{server}`,
 `switchboard_tools_withdrawn`). Receipts in `unknown` arrive with receipts (#10 stage 2). The
-Compose run checks that its database outage counted a begin failure and an audit-failure
-answer; both runs check that telemetry dropped is exported and that at most one row is open.
-No alert thresholds or paging: those wait for the first production deployment (Still open 9).
+Compose run checks that its database outage counted a begin failure and an audit-failure answer;
+both runs check that telemetry dropped is exported and that at most one row is open. No alert
+thresholds or paging: those wait for the first production deployment (Still open 9).
+
+A begin failure's `pool_timeout` means no connection was obtained in time, whether waiting for
+a pool permit or opening a new connection. So three different things count there: a database
+that never answers, such as one behind a blackholed address; a reconnect after a transient
+error, such as a broken connection, that runs past the begin budget; and a begin pool too small
+for the load. The count does not say which, so a rise in it does not by itself mean the pool is
+too small. A database that refuses connections counts as `database_error` instead. A signal
+that tells an unreachable database from a small pool is #155.
+
+Each gateway instance opens at most 21 connections to the audit database: 16 for begins and list
+rows, 4 for finishes, and 1 for the open-row poll. The poll has its connection to itself, so a
+poll held up for its full 2 s never takes a connection a finish could use (#140). The pool
+metrics cover the begin and finish pools; the poll's connection is not among them.
 
 ## Stopping the gateway
 
