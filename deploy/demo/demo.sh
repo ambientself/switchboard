@@ -623,9 +623,11 @@ check_server_entries() {
 # --- #11's demonstrations, in both runs -------------------------------------------------------
 
 # check_bounds LOGS: the gateway's boot lines in LOGS give what the demonstrations rely on: a cap
-# of TEAM_CAP calls in flight from each team to each server, a CALL_DEADLINE s deadline on each
-# entry's calls, and a DRIFT_INTERVAL s drift interval. A gateway that started more than once
-# (a Compose container started again) is read at its last start.
+# of TEAM_CAP calls in flight from each team to each server, the default CALL_DEADLINE s
+# deadline on each entry's calls, and a DRIFT_INTERVAL s drift interval. The gateway logs a
+# server's bounds only when the deployment file sets them, so an entry with no such line has
+# the default. A gateway that started more than once (a Compose container started again) is
+# read at its last start.
 check_bounds() {
   local boot entry
   boot=$(printf '%s\n' "$1" | jq -cR 'fromjson? | .fields? // empty | select(.event == "boot")' 2>/dev/null) || boot=""
@@ -633,8 +635,8 @@ check_bounds() {
     "the gateway caps each team at $TEAM_CAP calls in flight to each server (decision 0014)"
   for entry in docs-team-a docs-team-b; do
     # shellcheck disable=SC2016 # jq's own variables
-    check "$(jq -rs --arg entry "$entry" '[.[] | select(.server == $entry) | .deadline_seconds // empty] | last // empty' <<<"$boot")" \
-      "$CALL_DEADLINE" "entry $entry's calls have a $CALL_DEADLINE s deadline (decision 0014)"
+    check "$(jq -rs --arg entry "$entry" '[.[] | select(.server == $entry) | .deadline_seconds // empty] | last // "the default"' <<<"$boot")" \
+      "the default" "entry $entry's calls have the default deadline, $CALL_DEADLINE s: the deployment file sets none (decision 0014)"
   done
   check "$(jq -rs '[.[] | .drift_interval_seconds // empty] | last // empty' <<<"$boot")" "$DRIFT_INTERVAL" \
     "the drift pass reads each entry's tool list every $DRIFT_INTERVAL s"

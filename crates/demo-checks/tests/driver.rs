@@ -3484,21 +3484,15 @@ fn the_demonstrations_rely_on_the_codes_caps_deadline_and_interval() {
     );
 }
 
-/// The gateway's boot lines a run reads the caps, deadlines and interval from.
+/// The gateway's boot lines a run reads the caps, deadlines and interval from. The gateway logs
+/// a server's bounds only when the deployment file sets them: `deadline_b` is docs-team-b's.
 fn boot_lines(cap: u64, deadline_b: Option<u64>, interval: u64) -> String {
     let at = "2026-10-12T10:00:00.000000Z";
-    let mut lines = vec![
-        log_line(
-            at,
-            json!({"event": "boot", "max_in_flight": 256, "per_server_in_flight": 32,
-                   "per_team_per_server_in_flight": cap}),
-        ),
-        log_line(
-            at,
-            json!({"event": "boot", "server": "docs-team-a", "deadline_seconds": 5,
-                   "max_result_bytes": 65536}),
-        ),
-    ];
+    let mut lines = vec![log_line(
+        at,
+        json!({"event": "boot", "max_in_flight": 256, "per_server_in_flight": 32,
+               "per_team_per_server_in_flight": cap}),
+    )];
     if let Some(deadline) = deadline_b {
         lines.push(log_line(
             at,
@@ -3516,30 +3510,33 @@ fn boot_lines(cap: u64, deadline_b: Option<u64>, interval: u64) -> String {
 #[test]
 fn the_runs_check_the_gateway_boots_with_the_caps_deadlines_and_interval_they_rely_on() {
     let check = |name: &str, logs: &str| checked(name, "check_bounds {logs}", &[("logs", logs)]);
-    assert_all_passed("bounds", &check("bounds", &boot_lines(8, Some(5), 10)), 4);
+    assert_all_passed("bounds", &check("bounds", &boot_lines(8, None, 10)), 4);
+    const DEADLINE: &str = "entry docs-team-b's calls have the default deadline, 5 s: the deployment file sets none (decision 0014)";
     for (case, logs, failure) in [
         (
             "other cap",
-            boot_lines(32, Some(5), 10),
-            "the gateway caps each team at 8 calls in flight to each server (decision 0014) (got '32'",
-        ),
-        (
-            "no deadline",
-            boot_lines(8, None, 10),
-            "entry docs-team-b's calls have a 5 s deadline (decision 0014) (got ''",
+            boot_lines(32, None, 10),
+            "the gateway caps each team at 8 calls in flight to each server (decision 0014) (got '32'"
+                .to_owned(),
         ),
         (
             "other deadline",
             boot_lines(8, Some(60), 10),
-            "entry docs-team-b's calls have a 5 s deadline (decision 0014) (got '60'",
+            format!("{DEADLINE} (got '60'"),
+        ),
+        // A deadline the deployment file sets is the file's to change, even at 5 s.
+        (
+            "deadline set",
+            boot_lines(8, Some(5), 10),
+            format!("{DEADLINE} (got '5'"),
         ),
         (
             "default interval",
-            boot_lines(8, Some(5), 300),
-            "the drift pass reads each entry's tool list every 10 s (got '300'",
+            boot_lines(8, None, 300),
+            "the drift pass reads each entry's tool list every 10 s (got '300'".to_owned(),
         ),
     ] {
-        assert_fails(case, &check(case, &logs), failure);
+        assert_fails(case, &check(case, &logs), &failure);
     }
 }
 
