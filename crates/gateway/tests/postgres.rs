@@ -22,7 +22,7 @@ use gateway::path::RequestPath;
 use gateway::start::prepare;
 use gateway::undeclared_argument;
 use gateway_identity::SystemClock;
-use mock_docs_server::{AcceptedCredential, Config};
+use mock_docs_server::Config;
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
@@ -133,7 +133,7 @@ async fn run(
     setup: &Client,
     captured: &Captured,
 ) -> Result<(), String> {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+    let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
         .await
         .unwrap();
     let issuer = cluster_issuer();
@@ -142,7 +142,7 @@ async fn run(
         "gateway.toml",
         &files::deployment_file(
             "[audit]\nmode = \"postgres\"\nurl_env = \"AUDIT_URL\"\n\n\
-             [servers.mock-docs]\ndeadline_seconds = 7\n",
+             [servers.docs-team-a]\ndeadline_seconds = 7\n",
         ),
     );
 
@@ -318,7 +318,7 @@ async fn run(
         assert_eq!(row[5], "team-a");
         assert!(row[6].contains(sentence), "{row:?}");
         assert!(row[7].contains(outcome_sentence), "{row:?}");
-        assert_eq!(row[8], "demo-1");
+        assert_eq!(row[8], files::KIND_REVISION);
         assert_eq!([&row[9], &row[10]], [resources, "0"], "{row:?}");
     }
 
@@ -354,7 +354,7 @@ async fn run(
         json!(names)
     );
     assert_eq!(list_row.get::<_, i64>(2), 0);
-    assert_eq!(list_row.get::<_, String>(3), "demo-1");
+    assert_eq!(list_row.get::<_, String>(3), files::KIND_REVISION);
     assert_eq!(list_row.get::<_, String>(4), "team-a");
     assert!(list_row.get::<_, bool>(5), "a list row has no call columns");
 

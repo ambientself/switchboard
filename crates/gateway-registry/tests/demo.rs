@@ -31,49 +31,58 @@ fn project(identifier: &str) -> Resource {
     }
 }
 
+/// Each team's entry: its server name, which is also its system and its surface, and its team.
+const ENTRIES: [(&str, &str); 2] = [("docs-team-a", "team-a"), ("docs-team-b", "team-b")];
+
 #[test]
 fn the_demo_registry_loads_from_its_file() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/registry.toml");
     let registry = Registry::load(&path).unwrap();
     let snapshot = registry.snapshot();
-    assert_eq!(snapshot.revision().as_str(), "demo-1");
+    assert_eq!(snapshot.revision().as_str(), "demo-3");
+    assert_eq!(registry.servers().len(), 2);
 
-    let surface = snapshot.surface(&"docs".into()).unwrap();
-    let expected = [tool("docs__list_documents"), tool("docs__read_document")];
-    assert_eq!(surface.tools, expected.iter().cloned().collect());
-    assert_eq!(
-        surface.teams,
-        ["team-a".into(), "team-b".into()].into_iter().collect()
-    );
-    for name in &expected {
-        let approved = snapshot.tool(name).unwrap();
-        assert_eq!(approved.classification, Classification::Read);
-        assert_eq!(approved.connector.as_str(), "mock-docs");
-        assert_eq!(approved.resources, ResourceDeclaration::Declared);
-        let definition = &registry.definitions()[name];
-        assert!(definition.read_only);
-        assert_eq!(definition.input_schema["type"], "object");
-        assert_eq!(registry.routes()[name].server.as_str(), "mock-docs");
-    }
-    assert_eq!(
-        registry.routes()[&tool("docs__read_document")].upstream_name,
-        "read_document"
-    );
-
-    let server = &registry.servers()[&"mock-docs".into()];
-    assert_eq!(
-        server.credential,
-        Credential::Bearer {
-            reference: "docs-credential".into()
+    for (entry, team) in ENTRIES {
+        // One surface per team, serving only its own entry's tools.
+        let surface = snapshot.surface(&entry.into()).unwrap();
+        let expected = [
+            tool(&format!("{entry}__list_documents")),
+            tool(&format!("{entry}__read_document")),
+        ];
+        assert_eq!(surface.tools, expected.iter().cloned().collect());
+        assert_eq!(surface.teams, [team.into()].into_iter().collect());
+        for name in &expected {
+            let approved = snapshot.tool(name).unwrap();
+            assert_eq!(approved.classification, Classification::Read);
+            assert_eq!(approved.connector.as_str(), entry);
+            assert_eq!(approved.resources, ResourceDeclaration::Declared);
+            let definition = &registry.definitions()[name];
+            assert!(definition.read_only);
+            assert_eq!(definition.input_schema["type"], "object");
+            assert_eq!(registry.routes()[name].server.as_str(), entry);
         }
-    );
-    // The identity is the mock server's Service name, and every approval binds that server.
-    assert_eq!(server.identity, "mock-docs.mock-docs.svc.cluster.local");
-    for name in &expected {
         assert_eq!(
-            registry.approvals()[name].binding_sha256,
-            binding_sha256(server)
+            registry.routes()[&tool(&format!("{entry}__read_document"))].upstream_name,
+            "read_document"
         );
+
+        // Each entry presents its own credential. The identity is the mock server's Service
+        // name, the same for both, and every approval binds its own entry.
+        let server = &registry.servers()[&entry.into()];
+        assert_eq!(server.system, entry);
+        assert_eq!(
+            server.credential,
+            Credential::Bearer {
+                reference: format!("{entry}-credential")
+            }
+        );
+        assert_eq!(server.identity, "mock-docs.mock-docs.svc.cluster.local");
+        for name in &expected {
+            assert_eq!(
+                registry.approvals()[name].binding_sha256,
+                binding_sha256(server)
+            );
+        }
     }
 
     let limits = snapshot.limits();
@@ -93,15 +102,25 @@ fn registry() -> Registry {
     Registry::from_toml_str(&DEMO.replace(KIND_ISSUER, WORKLOAD_ISSUER)).unwrap()
 }
 
-fn caller(registry: &Registry, fixture: &Fixture, who: Caller) -> CallerContext {
+/// `who` calling on `surface`.
+fn caller_on(registry: &Registry, fixture: &Fixture, who: Caller, surface: &str) -> CallerContext {
     let principal = fixture.principal(who).unwrap();
     CallerContext {
         profile: registry.select_profile(principal.get()).unwrap(),
         principal,
         delegation: None,
-        surface: "docs".into(),
+        surface: surface.into(),
         deployment: DEPLOYMENT.into(),
     }
+}
+
+/// `who`, team A or team B, calling on its own team's surface.
+fn caller(registry: &Registry, fixture: &Fixture, who: Caller) -> CallerContext {
+    let surface = match who {
+        Caller::TeamB => "docs-team-b",
+        _ => "docs-team-a",
+    };
+    caller_on(registry, fixture, who, surface)
 }
 
 fn arguments(value: Value) -> Map<String, Value> {
@@ -134,12 +153,16 @@ fn denial(verdict: &Verdict) -> Option<ReasonKind> {
 fn each_team_reads_its_own_project_and_is_denied_the_other() {
     let registry = registry();
     let fixture = Fixture::new().unwrap();
-    for (who, own, other) in [
-        (Caller::TeamA, "atlas", "borealis"),
-        (Caller::TeamB, "borealis", "atlas"),
+    for (who, entry, own, other) in [
+        (Caller::TeamA, "docs-team-a", "atlas", "borealis"),
+        (Caller::TeamB, "docs-team-b", "borealis", "atlas"),
     ] {
         let caller = caller(&registry, &fixture, who);
-        for name in ["docs__list_documents", "docs__read_document"] {
+        for name in [
+            format!("{entry}__list_documents"),
+            format!("{entry}__read_document"),
+        ] {
+            let name = name.as_str();
             let allowed = call(
                 &registry,
                 &caller,
@@ -182,7 +205,12 @@ fn a_call_that_names_no_project_is_denied_as_naming_none() {
         json!({"project": ["atlas"]}),
         json!({"project": ""}),
     ] {
-        let verdict = call(&registry, &caller, "docs__read_document", args.clone());
+        let verdict = call(
+            &registry,
+            &caller,
+            "docs-team-a__read_document",
+            args.clone(),
+        );
         assert!(
             matches!(
                 verdict,
@@ -199,16 +227,52 @@ fn a_call_that_names_no_project_is_denied_as_naming_none() {
 }
 
 #[test]
-fn tools_list_shows_both_tools_to_both_teams_with_their_definitions() {
+fn tools_list_shows_each_team_its_own_entrys_tools_with_their_definitions() {
     let registry = registry();
     let fixture = Fixture::new().unwrap();
-    for who in [Caller::TeamA, Caller::TeamB] {
+    for (who, entry) in [
+        (Caller::TeamA, "docs-team-a"),
+        (Caller::TeamB, "docs-team-b"),
+    ] {
         let caller = caller(&registry, &fixture, who);
         let listed: Vec<&str> = list_tools(registry.snapshot(), &caller)
             .into_iter()
             .map(|approved| registry.definitions()[&approved.name].name.as_str())
             .collect();
-        assert_eq!(listed, ["docs__list_documents", "docs__read_document"]);
+        assert_eq!(
+            listed,
+            [
+                format!("{entry}__list_documents"),
+                format!("{entry}__read_document")
+            ]
+        );
+    }
+}
+
+#[test]
+fn neither_team_may_use_the_other_teams_surface() {
+    let registry = registry();
+    let fixture = Fixture::new().unwrap();
+    for (who, other) in [
+        (Caller::TeamA, "docs-team-b"),
+        (Caller::TeamB, "docs-team-a"),
+    ] {
+        let caller = caller_on(&registry, &fixture, who, other);
+        assert!(
+            list_tools(registry.snapshot(), &caller).is_empty(),
+            "{who:?}"
+        );
+        let verdict = call(
+            &registry,
+            &caller,
+            &format!("{other}__read_document"),
+            json!({"project": "atlas", "document": "plan"}),
+        );
+        assert_eq!(
+            denial(&verdict),
+            Some(ReasonKind::SurfaceNotPermitted),
+            "{who:?}: {verdict:?}"
+        );
     }
 }
 
@@ -223,7 +287,7 @@ fn a_user_gets_no_profile_from_the_demo_rules() {
 #[test]
 fn an_undeclared_argument_fails_the_check_before_forwarding() {
     let registry = registry();
-    let adapter = &registry.adapters()[&tool("docs__read_document")];
+    let adapter = &registry.adapters()[&tool("docs-team-a__read_document")];
     assert!(
         adapter
             .check_arguments(&json!({"project": "atlas", "document": "plan"}))
@@ -235,7 +299,7 @@ fn an_undeclared_argument_fails_the_check_before_forwarding() {
     assert_eq!(
         refused.map_err(|error| error.to_string()),
         Err(
-            "the arguments to `docs__read_document` carry `/other_project`, which its approved schema does not declare"
+            "the arguments to `docs-team-a__read_document` carry `/other_project`, which its approved schema does not declare"
                 .to_owned()
         )
     );

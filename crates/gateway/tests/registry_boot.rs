@@ -7,7 +7,6 @@
 
 mod files;
 
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -29,7 +28,7 @@ use gateway_core::{
 use gateway_identity::SystemClock;
 use gateway_registry::Registry;
 use gateway_testkit::{Gate, InMemoryAuditStore, LocalIssuer};
-use mock_docs_server::{AcceptedCredential, Config};
+use mock_docs_server::Config;
 use serde_json::{Value, json};
 
 fn issuer() -> &'static LocalIssuer {
@@ -51,13 +50,43 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
     (settings, Registry::load(&deployment.registry_file).unwrap())
 }
 
-/// The mock server's connector, as the binary builds it.
-fn proxy(url: &str, credential: &Path) -> Arc<ProxyConnector> {
-    let credentials = FileCredentials::load([("mock-docs".into(), credential)]).unwrap();
-    let upstream = Upstream::new("mock-docs", url)
-        .tool(READ_TOOL.parse().unwrap(), "read_document")
-        .tool(files::LIST_TOOL.parse().unwrap(), "list_documents");
+/// The connector for `entry`, one of the mock server's entries, as the binary builds it: its
+/// credential is the file `files` writes for it.
+fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
+    let credential = files.path(&format!("{entry}-credential"));
+    let credentials = FileCredentials::load([(entry.into(), credential)]).unwrap();
+    let upstream = Upstream::new(entry, url)
+        .tool(
+            format!("{entry}__read_document").parse().unwrap(),
+            "read_document",
+        )
+        .tool(
+            format!("{entry}__list_documents").parse().unwrap(),
+            "list_documents",
+        );
     Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap())
+}
+
+/// `wiring` with a connector for each of the mock server's entries, at `url`.
+fn entries(wiring: Wiring, url: &str, files: &Files) -> Wiring {
+    wiring
+        .proxied("docs-team-a", proxy("docs-team-a", url, files))
+        .proxied("docs-team-b", proxy("docs-team-b", url, files))
+}
+
+/// Where `name`'s `[[tools]]` entry starts and ends in `registry`: up to the next tool, or the
+/// surfaces.
+fn tool_block(registry: &str, name: &str) -> (usize, usize) {
+    let start = registry
+        .find(&format!("[[tools]]\nname = \"{name}\""))
+        .unwrap();
+    let rest = &registry[start + 1..];
+    let end = start
+        + 1
+        + rest
+            .find("[[tools]]")
+            .unwrap_or_else(|| rest.find("# --- Surfaces").unwrap());
+    (start, end)
 }
 
 fn wiring() -> Wiring {
@@ -82,7 +111,18 @@ fn every_registry_server_needs_a_connector() {
     let (settings, registry) = parts(&files, true);
     let refused = boot::check_registry(settings, registry, wiring()).err();
     assert!(
-        matches!(&refused, Some(BootError::UnregisteredConnector { connector, .. }) if connector.as_str() == "mock-docs"),
+        matches!(&refused, Some(BootError::UnregisteredConnector { connector, .. }) if connector.as_str() == "docs-team-a"),
+        "{refused:?}"
+    );
+    // Each entry of the mock server is a server of its own, and needs its own connector.
+    let (settings, registry) = parts(&files, true);
+    let only_a = wiring().proxied(
+        "docs-team-a",
+        proxy("docs-team-a", "http://127.0.0.1:9/mcp", &files),
+    );
+    let refused = boot::check_registry(settings, registry, only_a).err();
+    assert!(
+        matches!(&refused, Some(BootError::UnregisteredConnector { connector, .. }) if connector.as_str() == "docs-team-b"),
         "{refused:?}"
     );
 }
@@ -95,11 +135,17 @@ fn a_connector_with_an_adapter_of_its_own_is_refused_beside_the_registry() {
         "http://127.0.0.1:9/mcp",
     );
     let (settings, registry) = parts(&files, true);
-    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
-    let wiring = wiring().connector("mock-docs", connector, Arc::new(NoResources));
+    let url = "http://127.0.0.1:9/mcp";
+    let wiring = wiring()
+        .connector(
+            "docs-team-a",
+            proxy("docs-team-a", url, &files),
+            Arc::new(NoResources),
+        )
+        .proxied("docs-team-b", proxy("docs-team-b", url, &files));
     let refused = boot::check_registry(settings, registry, wiring).err();
     assert!(
-        matches!(&refused, Some(BootError::AdapterBesideRegistry(name)) if name.as_str() == "mock-docs"),
+        matches!(&refused, Some(BootError::AdapterBesideRegistry(name)) if name.as_str() == "docs-team-a"),
         "{refused:?}"
     );
 }
@@ -108,13 +154,13 @@ fn a_connector_with_an_adapter_of_its_own_is_refused_beside_the_registry() {
 fn a_proxied_connector_registered_twice_is_refused() {
     let files = Files::new("twice", &issuer().jwks_document(), "http://127.0.0.1:9/mcp");
     let (settings, registry) = parts(&files, true);
-    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
-    let wiring = wiring()
-        .proxied("mock-docs", connector.clone())
-        .proxied("mock-docs", connector);
+    let wiring = entries(wiring(), "http://127.0.0.1:9/mcp", &files).proxied(
+        "docs-team-a",
+        proxy("docs-team-a", "http://127.0.0.1:9/mcp", &files),
+    );
     let refused = boot::check_registry(settings, registry, wiring).err();
     assert!(
-        matches!(&refused, Some(BootError::DuplicateConnector(name)) if name.as_str() == "mock-docs"),
+        matches!(&refused, Some(BootError::DuplicateConnector(name)) if name.as_str() == "docs-team-a"),
         "{refused:?}"
     );
 }
@@ -131,9 +177,12 @@ fn a_registry_that_defines_the_reserved_profile_is_refused() {
         &registry("http://127.0.0.1:9/mcp").replace("workload-read", NO_PROFILE),
     );
     let (settings, registry) = parts(&files, true);
-    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
-    let refused =
-        boot::check_registry(settings, registry, wiring().proxied("mock-docs", connector)).err();
+    let refused = boot::check_registry(
+        settings,
+        registry,
+        entries(wiring(), "http://127.0.0.1:9/mcp", &files),
+    )
+    .err();
     assert!(
         matches!(refused, Some(BootError::ReservedProfile)),
         "{refused:?}"
@@ -149,7 +198,7 @@ fn the_registry_path_refuses_the_opt_outs_in_a_release_build() {
         &issuer().jwks_document(),
         "http://127.0.0.1:9/mcp",
     );
-    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
+    let url = "http://127.0.0.1:9/mcp";
     let identity_off = |settings: &mut Settings| {
         settings.identity = gateway::IdentitySection {
             enforce: None,
@@ -158,12 +207,8 @@ fn the_registry_path_refuses_the_opt_outs_in_a_release_build() {
     };
 
     let (settings, registry) = parts(&files, true);
-    let refused = boot::as_release::check_registry(
-        settings,
-        registry,
-        wiring().proxied("mock-docs", connector.clone()),
-    )
-    .err();
+    let refused =
+        boot::as_release::check_registry(settings, registry, entries(wiring(), url, &files)).err();
     assert!(
         matches!(refused, Some(BootError::AuditOptOut)),
         "{refused:?}"
@@ -175,9 +220,7 @@ fn the_registry_path_refuses_the_opt_outs_in_a_release_build() {
     let refused = boot::as_release::check_registry(
         settings,
         registry,
-        wiring()
-            .audit_store(store)
-            .proxied("mock-docs", connector.clone()),
+        entries(wiring().audit_store(store), url, &files),
     )
     .err();
     assert!(
@@ -188,7 +231,7 @@ fn the_registry_path_refuses_the_opt_outs_in_a_release_build() {
     let (mut settings, registry) = parts(&files, true);
     identity_off(&mut settings);
     let (gates, _) =
-        boot::check_registry(settings, registry, wiring().proxied("mock-docs", connector)).unwrap();
+        boot::check_registry(settings, registry, entries(wiring(), url, &files)).unwrap();
     assert_eq!(gates.identity_state(), gateway::GateState::Disabled);
     assert_eq!(gates.audit_state(), gateway::GateState::Disabled);
 }
@@ -201,9 +244,12 @@ fn a_caller_no_registry_rule_covers_gets_no_profile() {
         "http://127.0.0.1:9/mcp",
     );
     let (settings, registry) = parts(&files, true);
-    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
-    let (gates, _) =
-        boot::check_registry(settings, registry, wiring().proxied("mock-docs", connector)).unwrap();
+    let (gates, _) = boot::check_registry(
+        settings,
+        registry,
+        entries(wiring(), "http://127.0.0.1:9/mcp", &files),
+    )
+    .unwrap();
     let workload = |issuer: &str| Principal {
         id: PrincipalId {
             issuer: issuer.into(),
@@ -287,7 +333,7 @@ impl AuditStore for HeldStore {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tool_withdrawn_while_a_call_waits_is_not_sent() {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+    let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
         .await
         .unwrap();
     let files = Files::new("race", &issuer().jwks_document(), &mock.url());
@@ -296,15 +342,12 @@ async fn a_tool_withdrawn_while_a_call_waits_is_not_sent() {
         inner: InMemoryAuditStore::new(),
         gate: Gate::closed(),
     });
-    let wiring = wiring().audit_store(store.clone()).proxied(
-        "mock-docs",
-        proxy(&mock.url(), &files.path("docs-credential")),
-    );
+    let wiring = entries(wiring().audit_store(store.clone()), &mock.url(), &files);
     let (gates, reloader) = boot::check_registry(settings, registry, wiring).unwrap();
     let path = RequestPath::new(gates);
     let token = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
 
-    // Decided under demo-1, then held at begin.
+    // Decided under the kind registry's revision, then held at begin.
     let calling = tokio::spawn({
         let path = path.clone();
         async move {
@@ -320,15 +363,15 @@ async fn a_tool_withdrawn_while_a_call_waits_is_not_sent() {
     store.held().await;
     // Withdrawn meanwhile.
     let original = files::registry(&mock.url());
-    let start = original
-        .find("[[tools]]\nname = \"docs__read_document\"")
-        .unwrap();
-    let end = start + original[start..].find("# --- Surfaces").unwrap();
+    let (start, end) = tool_block(&original, READ_TOOL);
     let withdrawn = format!("{}{}", &original[..start], &original[end..])
-        .replace("revision = \"demo-1\"", "revision = \"demo-2\"")
         .replace(
-            "tools = [\"docs__list_documents\", \"docs__read_document\"]",
-            "tools = [\"docs__list_documents\"]",
+            &format!("revision = \"{}\"", files::KIND_REVISION),
+            "revision = \"demo-2\"",
+        )
+        .replace(
+            &format!("tools = [\"{}\", \"{READ_TOOL}\"]", files::LIST_TOOL),
+            &format!("tools = [\"{}\"]", files::LIST_TOOL),
         );
     reloader
         .apply(&Registry::from_toml_str(&withdrawn).unwrap())
@@ -345,7 +388,7 @@ async fn a_tool_withdrawn_while_a_call_waits_is_not_sent() {
     assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
     let rows = store.inner.rows();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].policy_revision.as_str(), "demo-1");
+    assert_eq!(rows[0].policy_revision.as_str(), files::KIND_REVISION);
     let outcome = rows[0]
         .completion
         .as_ref()
@@ -358,13 +401,10 @@ async fn a_tool_withdrawn_while_a_call_waits_is_not_sent() {
     );
 }
 
-/// The kind registry under `revision`, with the read tool's schema and resources widened to
-/// take a second project, `other_project`, and the approved hash to match.
+/// The kind registry under `revision`, with team A's read tool's schema and resources widened
+/// to take a second project, `other_project`, and the approved hash to match.
 fn widened(original: &str, revision: &str) -> String {
-    let start = original
-        .find("[[tools]]\nname = \"docs__read_document\"")
-        .unwrap();
-    let end = start + original[start..].find("# --- Surfaces").unwrap();
+    let (start, end) = tool_block(original, READ_TOOL);
     let project = "{ from_argument = \"project\", system = \"docs\", kind = \"project\" }";
     let schema = json!({
         "type": "object",
@@ -397,14 +437,14 @@ fn widened(original: &str, revision: &str) -> String {
         + "[tools.input_schema.properties.other_project]\ntype = \"string\"\ndescription = \"Another project.\"\n\n";
     assert!(tool.contains("from_argument = \"other_project\""), "{tool}");
     format!("{}{tool}{}", &original[..start], &original[end..]).replace(
-        "revision = \"demo-1\"",
+        &format!("revision = \"{}\"", files::KIND_REVISION),
         &format!("revision = \"{revision}\""),
     )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_one() {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+    let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
         .await
         .unwrap();
     let files = Files::new("widened", &issuer().jwks_document(), &mock.url());
@@ -413,15 +453,12 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
         inner: InMemoryAuditStore::new(),
         gate: Gate::closed(),
     });
-    let wiring = wiring().audit_store(store.clone()).proxied(
-        "mock-docs",
-        proxy(&mock.url(), &files.path("docs-credential")),
-    );
+    let wiring = entries(wiring().audit_store(store.clone()), &mock.url(), &files);
     let (gates, reloader) = boot::check_registry(settings, registry, wiring).unwrap();
     let path = RequestPath::new(gates);
     let token = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
 
-    // Decided under demo-1, whose schema does not declare other_project and whose adapter
+    // Decided under the kind registry's revision, whose schema does not declare other_project and whose adapter
     // names only `atlas`; then held at begin.
     let calling = tokio::spawn({
         let path = path.clone();
@@ -461,7 +498,7 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
     assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
     let rows = store.inner.rows();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].policy_revision.as_str(), "demo-1");
+    assert_eq!(rows[0].policy_revision.as_str(), files::KIND_REVISION);
     let outcome = rows[0]
         .completion
         .as_ref()
@@ -500,16 +537,13 @@ async fn a_call_is_checked_against_the_policy_it_was_decided_under_not_a_later_o
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mistyped_argument_completes_its_row_as_invalid_arguments_and_is_not_sent() {
-    let mock = mock_docs_server::start(Config::new(AcceptedCredential::token(files::CREDENTIAL)))
+    let mock = mock_docs_server::start(Config::new(files::mock_credentials()))
         .await
         .unwrap();
     let files = Files::new("mistyped", &issuer().jwks_document(), &mock.url());
     let (settings, registry) = parts(&files, false);
     let store = Arc::new(InMemoryAuditStore::new());
-    let wiring = wiring().audit_store(store.clone()).proxied(
-        "mock-docs",
-        proxy(&mock.url(), &files.path("docs-credential")),
-    );
+    let wiring = entries(wiring().audit_store(store.clone()), &mock.url(), &files);
     let (gates, _) = boot::check_registry(settings, registry, wiring).unwrap();
     let path = RequestPath::new(gates);
     let token = kubernetes_token(issuer(), TEAM_A_SA, &[AUDIENCE]);
@@ -558,15 +592,18 @@ fn a_proxied_connector_is_not_handed_out_to_run_without_the_argument_check() {
         "http://127.0.0.1:9/mcp",
     );
     let (settings, registry) = parts(&files, true);
-    let connector = proxy("http://127.0.0.1:9/mcp", &files.path("docs-credential"));
-    let (gates, _) =
-        boot::check_registry(settings, registry, wiring().proxied("mock-docs", connector)).unwrap();
+    let (gates, _) = boot::check_registry(
+        settings,
+        registry,
+        entries(wiring(), "http://127.0.0.1:9/mcp", &files),
+    )
+    .unwrap();
     let tool = gates
         .snapshot()
         .tool(&READ_TOOL.parse().unwrap())
         .unwrap()
         .clone();
-    assert_eq!(tool.connector.as_str(), "mock-docs");
+    assert_eq!(tool.connector.as_str(), "docs-team-a");
     assert!(gates.connector(&tool.connector).is_none());
     assert!(gates.resource_adapter(&tool.connector).is_none());
 }

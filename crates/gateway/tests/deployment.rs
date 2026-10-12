@@ -55,10 +55,13 @@ fn a_deployment_loads_with_every_file_it_names_read() {
     assert_eq!(loaded.registry_file, files.path("registry/registry.toml"));
     assert_eq!(loaded.poll, Duration::from_secs(1));
     assert_eq!(loaded.audit, AuditChoice::Disabled);
-    assert_eq!(
-        loaded.credentials.get("docs-credential"),
-        Some(&files.path("docs-credential"))
-    );
+    for reference in ["docs-team-a-credential", "docs-team-b-credential"] {
+        assert_eq!(
+            loaded.credentials.get(reference),
+            Some(&files.path(reference))
+        );
+    }
+    assert_eq!(loaded.credentials.len(), 2);
     let issuers = loaded.identity.enforce.as_ref().unwrap();
     assert!(!loaded.identity.disabled);
     assert_eq!(issuers.len(), 1);
@@ -152,7 +155,8 @@ fn a_missing_field_is_refused() {
         ("leeway_seconds", "leeway_seconds = 30\n"),
         (
             "credentials",
-            "[credentials]\ndocs-credential = \"docs-credential\"\n",
+            "[credentials]\ndocs-team-a-credential = \"docs-team-a-credential\"\n\
+             docs-team-b-credential = \"docs-team-b-credential\"\n",
         ),
         ("allowed_hosts", "allowed_hosts = [\"127.0.0.1\"]\n"),
     ] {
@@ -508,11 +512,11 @@ fn the_demo_deployment_files_are_valid_deployment_files() {
         std::fs::read_to_string(repo.join("deploy/compose/config/registry-withdrawn.toml"))
             .unwrap();
     let withdrawn = Registry::from_toml_str(&withdrawn).unwrap();
-    assert_eq!(withdrawn.snapshot().revision().as_str(), "demo-2");
-    assert!(
-        withdrawn
-            .snapshot()
-            .tool(&files::READ_TOOL.parse().unwrap())
-            .is_none()
-    );
+    assert_eq!(withdrawn.snapshot().revision().as_str(), "demo-4");
+    for tool in [files::READ_TOOL, files::TEAM_B_READ_TOOL] {
+        assert!(withdrawn.snapshot().tool(&tool.parse().unwrap()).is_none());
+    }
+    for tool in [files::LIST_TOOL, files::TEAM_B_LIST_TOOL] {
+        assert!(withdrawn.snapshot().tool(&tool.parse().unwrap()).is_some());
+    }
 }

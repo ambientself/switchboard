@@ -1,23 +1,38 @@
-# The Compose demo registry after `docs__read_document` is withdrawn: revision demo-2, the tool's
-# approval removed and the surface no longer serving it. demo.sh copies this file over the
-# registry file in the mounted directory to show the withdrawal, and copies the original back
-# afterwards. It sits outside the registry directory, so the gateway never loads it directly.
+# The Compose demo registry after each team's read tool, docs-team-a__read_document and
+# docs-team-b__read_document, is withdrawn: revision demo-4, the tools' approvals removed and the
+# surfaces no longer serving them. demo.sh copies this file over the registry file in the
+# mounted directory to show the withdrawal, and copies the original back afterwards. It sits
+# outside the registry directory, so the gateway never loads it directly.
 
 # Recorded with every decision made from this file. Change it with every edit.
-revision = "demo-2"
+revision = "demo-4"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed
-# name of its tools: docs__list_documents, docs__read_document. `identity` is the DNS name the
-# connection proves, and must be the host in `address`.
+# name of its tools: docs-team-a__list_documents, docs-team-a__read_document. `identity` is the
+# DNS name the connection proves, and must be the host in `address`.
+#
+# The mock server is registered once per team (decisions 0010 and 0013, section 10). Both
+# entries have the same address and identity. Each presents its own credential, and the mock
+# server limits each credential to its team's project: docs-team-a's to atlas, docs-team-b's to
+# borealis. So a call through one team's entry cannot reach the other team's project, even if
+# the gateway's own resource check were wrong.
 
 [[servers]]
-name = "mock-docs"
-system = "docs"
+name = "docs-team-a"
+system = "docs-team-a"
 owner = "platform"
 identity = "mock-docs"
 address = "http://mock-docs:8080/mcp"
-credential = { mode = "bearer", reference = "docs-credential" }
+credential = { mode = "bearer", reference = "docs-team-a-credential" }
+
+[[servers]]
+name = "docs-team-b"
+system = "docs-team-b"
+owner = "platform"
+identity = "mock-docs"
+address = "http://mock-docs:8080/mcp"
+credential = { mode = "bearer", reference = "docs-team-b-credential" }
 
 # --- Tools ---------------------------------------------------------------------------------
 # Each tool is approved by a person, who assigns its classification and records two hashes.
@@ -34,15 +49,35 @@ credential = { mode = "bearer", reference = "docs-credential" }
 # default: a tool must say which.
 
 [[tools]]
-name = "docs__list_documents"
-server = "mock-docs"
+name = "docs-team-a__list_documents"
+server = "docs-team-a"
 upstream_name = "list_documents"
 classification = "read"
 description = "List the names of the documents in one project."
 approved_by = "demo-approver@example.test"
 approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a"
-binding_sha256 = "2e33078cbde0a3069f28d00b2f53091b8503c6799d219e0531dd8c082f3f6840"
+binding_sha256 = "cb2eb5271b9b1aac982ab3b41a9b73980a0a9fd4e0c8c02022ec07fcbed21f62"
+resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+
+[tools.input_schema]
+type = "object"
+required = ["project"]
+additionalProperties = false
+
+[tools.input_schema.properties.project]
+type = "string"
+
+[[tools]]
+name = "docs-team-b__list_documents"
+server = "docs-team-b"
+upstream_name = "list_documents"
+classification = "read"
+description = "List the names of the documents in one project."
+approved_by = "demo-approver@example.test"
+approved_at = 2026-10-11T00:00:00Z
+definition_sha256 = "0ed6da7bfe2db038137f2a650ca17903fcd52f542e4769d37327c21e4beec86a"
+binding_sha256 = "c739b431ef85125e32970635300debe8f67e8ec7d5ae7eadd20e38647bf2cde1"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
 
 [tools.input_schema]
@@ -54,12 +89,19 @@ additionalProperties = false
 type = "string"
 
 # --- Surfaces ------------------------------------------------------------------------------
-# Served at /mcp/{name}. Who may use it is an allowlist of teams and groups.
+# Served at /mcp/{name}. Who may use it is an allowlist of teams and groups. Each team has its
+# own surface, serving only its own entry's tools.
 
 [[surfaces]]
-name = "docs"
-tools = ["docs__list_documents"]
-teams = ["team-a", "team-b"]
+name = "docs-team-a"
+tools = ["docs-team-a__list_documents"]
+teams = ["team-a"]
+principals = "any_in_teams_and_groups"
+
+[[surfaces]]
+name = "docs-team-b"
+tools = ["docs-team-b__list_documents"]
+teams = ["team-b"]
 principals = "any_in_teams_and_groups"
 
 # --- Profiles and how they are selected ----------------------------------------------------
