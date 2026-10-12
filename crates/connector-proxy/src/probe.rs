@@ -13,8 +13,10 @@
 //!
 //! - **Refused**, when the server answered the first two with `401` and a `WWW-Authenticate`
 //!   challenge, or the third with `401` or `403`, and the answer carries no JSON-RPC response.
-//! - **Open**, when the answer, whatever its status, carries a JSON-RPC result or error: the
-//!   server dispatched the call to its tool handling, which shows it does not check its caller.
+//! - **Open**, when the answer, whatever its status, carries a JSON-RPC result or error, as one
+//!   JSON message, a batch, or the data of an event in a stream, however many `data` lines the
+//!   event spans: the server dispatched the call to its tool handling, which shows it does not
+//!   check its caller.
 //! - **Not shown**, for anything else: a connection that failed, the deadline, an answer too
 //!   large or broken off, a `401` with no challenge, any other status. A call whose refusal was
 //!   not shown is never counted as refused.
@@ -418,16 +420,44 @@ fn judge(which: ProbeCall, answer: &Answer) -> CallVerdict {
 }
 
 /// Whether `body` carries a JSON-RPC response with a result or an error: as one JSON message,
-/// a batch of them, or the `data` of an event in a stream.
+/// a batch of them, or the data of an event in a stream.
 fn carries_rpc_response(body: &[u8]) -> bool {
     if let Ok(message) = serde_json::from_slice::<Value>(body) {
         return is_rpc_response(&message);
     }
-    String::from_utf8_lossy(body)
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+    stream_events(&String::from_utf8_lossy(body))
+        .iter()
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
         .any(|message| is_rpc_response(&message))
+}
+
+/// The data of each event in `body`, read as a server-sent event stream: lines end at CRLF,
+/// LF or a bare CR; an event's `data` lines are joined with LF, and a blank line ends the
+/// event. A last event with no blank line after it is kept too, since the stream may have
+/// been cut off after it.
+fn stream_events(body: &str) -> Vec<String> {
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
+    let mut events = Vec::new();
+    let mut data: Option<String> = None;
+    for line in body.split("\r\n").flat_map(|line| line.split(['\r', '\n'])) {
+        if line.is_empty() {
+            events.extend(data.take());
+            continue;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match &mut data {
+                Some(data) => {
+                    data.push('\n');
+                    data.push_str(value);
+                }
+                None => data = Some(value.to_owned()),
+            }
+        }
+    }
+    events.extend(data);
+    events
 }
 
 /// A JSON-RPC response object, or a batch holding one: a `result` or an `error`, beside the
@@ -467,6 +497,24 @@ mod tests {
         ] {
             assert!(carries_rpc_response(body.as_bytes()), "{body}");
         }
+    }
+
+    #[test]
+    fn an_event_is_read_whole_however_its_data_lines_are_split_and_ended() {
+        for body in [
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\n\
+             data: \"error\":{\"code\":-32601,\"message\":\"unknown tool\"}}\n\n",
+            "data:{\"jsonrpc\":\"2.0\",\r\ndata:\"id\":1,\r\ndata:\"result\":{}}\r\n\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\rdata: \"id\":1,\rdata: \"result\":{}}\r\r",
+            ": ping\n\nid: 7\ndata: {\"id\": 1,\n: a comment\ndata: \"result\": {}}",
+        ] {
+            assert!(carries_rpc_response(body.as_bytes()), "{body:?}");
+        }
+        let two_events = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\n\ndata: \"result\":{}}\n\n";
+        assert!(
+            !carries_rpc_response(two_events.as_bytes()),
+            "a blank line ends an event, so its halves are not one message"
+        );
         for body in [
             r#"{"error": "unauthorized"}"#,
             r#"{"error": "invalid_token", "error_description": "expired"}"#,

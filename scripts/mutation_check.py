@@ -2759,6 +2759,15 @@ mutate("probe-challenge-unchecked", "a 401 with no WWW-Authenticate challenge co
 mutate("probe-jsonrpc-body-not-open", "a JSON-RPC error carried by a 401 counts as refused: only a 200 answer is read for one", PP,
        "    if carries_rpc_response(&answer.body) {\n",
        "    if answer.status == 200 && carries_rpc_response(&answer.body) {\n")
+mutate("probe-stream-data-lines-unjoined", "each data line of a stream event is read as a message of its own, so a JSON-RPC error split over several lines counts as refused", PP,
+       "                Some(data) => {\n"
+       "                    data.push('\\n');\n"
+       "                    data.push_str(value);\n"
+       "                }\n",
+       "                Some(data) => events.push(std::mem::replace(data, value.to_owned())),\n")
+mutate("probe-stream-bare-cr-unsplit", "a stream whose lines end at a bare CR is read as one line, so the JSON-RPC answer it carries is missed", PP,
+       "    for line in body.split(\"\\r\\n\").flat_map(|line| line.split(['\\r', '\\n'])) {\n",
+       "    for line in body.split(\"\\r\\n\").flat_map(|line| line.split('\\n')) {\n")
 mutate("probe-third-call-skipped", "the stranger's token is never sent; its call counts as refused", PP,
        "        call(\n"
        "            client,\n"

@@ -199,6 +199,33 @@ async fn a_401_carrying_a_json_rpc_error_is_open() {
 }
 
 #[tokio::test]
+async fn a_401_carrying_a_json_rpc_error_in_a_stream_event_split_over_data_lines_is_open() {
+    let (report, _) = probed(|request| {
+        let error = serde_json::to_string_pretty(&rpc_error(&request.body)).unwrap();
+        let mut event = String::from("event: message\r\n");
+        for line in error.lines() {
+            event.push_str(&format!("data: {line}\r\n"));
+        }
+        event.push_str("\r\n");
+        let mut bytes = format!(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"docs\"\r\n\
+             Content-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            event.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(event.as_bytes());
+        vec![Step::Write(bytes)]
+    })
+    .await;
+
+    assert_eq!(
+        verdicts(&report),
+        ProbeCall::ALL.map(|call| (call, CallVerdict::Open))
+    );
+    assert_eq!(report.finding(), ProbeFinding::Open);
+}
+
+#[tokio::test]
 async fn a_server_that_dispatches_only_the_foreign_token_is_open_on_that_call() {
     let (report, _) = probed(|request| match bearer(request) {
         Some(FOREIGN) => vec![Step::Write(json_response(&rpc_error(&request.body)))],
