@@ -20,9 +20,10 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::credentials::{FileCredentials, Secret};
+use crate::credentials::{FileCredentials, ProbeCredential, Secret};
 use crate::list::{ListError, ListedTool, tool_list};
 use crate::outcome;
+use crate::probe::{ProbeBounds, ProbeReport};
 
 /// How long a call may take, from sending the request to the last byte of the answer, unless
 /// configured otherwise.
@@ -176,11 +177,6 @@ impl ProxyConnector {
         if !credentials.connectors().any(|held| *held == connector) {
             return Err(UpstreamError::NoCredential(connector));
         }
-        // The legacy client follows no redirect and reads no proxy setting from the
-        // environment, so the credential goes to the configured endpoint or nowhere.
-        let client = Client::builder(TokioExecutor::new())
-            .pool_timer(TokioTimer::new())
-            .build_http();
         Ok(Self {
             connector,
             endpoint,
@@ -188,7 +184,7 @@ impl ProxyConnector {
             deadline,
             max_response_bytes,
             credentials,
-            client,
+            client: client(),
             next_id: AtomicU64::new(1),
         })
     }
@@ -427,6 +423,20 @@ impl ProxyConnector {
     }
 }
 
+impl ProxyConnector {
+    /// Probes the server with decision 0010's three calls, presenting `foreign` on the third:
+    /// the drift pass's probe (decision 0013, section 9). They go where a call goes and are held
+    /// to the connector's bounds; the gateway's own credential is never sent. See
+    /// [`probe`](crate::probe()) for the calls and their verdicts.
+    pub async fn probe(&self, foreign: &ProbeCredential) -> ProbeReport {
+        let bounds = ProbeBounds {
+            deadline: self.deadline,
+            max_response_bytes: self.max_response_bytes,
+        };
+        crate::probe::run(&self.client, &self.endpoint, bounds, foreign).await
+    }
+}
+
 impl Connector for ProxyConnector {
     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
         Box::pin(self.forward(call))
@@ -439,7 +449,16 @@ struct Received {
     body: Vec<u8>,
 }
 
-fn parse_endpoint(url: &str) -> Option<Uri> {
+/// The HTTP client every request to a proxied server goes out on. The legacy client follows no
+/// redirect and reads no proxy setting from the environment, so a credential goes to the
+/// configured endpoint or nowhere.
+pub(crate) fn client() -> Client<HttpConnector, Full<Bytes>> {
+    Client::builder(TokioExecutor::new())
+        .pool_timer(TokioTimer::new())
+        .build_http()
+}
+
+pub(crate) fn parse_endpoint(url: &str) -> Option<Uri> {
     let endpoint: Uri = url.parse().ok()?;
     let authority = endpoint.authority()?;
     let acceptable = endpoint.scheme_str() == Some("http")
