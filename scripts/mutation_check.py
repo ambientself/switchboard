@@ -4633,6 +4633,8 @@ mutate_all("demo-kind-caller-unchecked", "the kind check counts accepted request
            (DRIVER, """'$1 == "accepted" && !(($2 in entry) && NF == 3) { count++ }""", """'$1 == "accepted" && 0 { count++ }"""))
 mutate("demo-kind-other-refusals-unchecked", "a refusal the direct calls and the probe do not explain passes", DRIVER,
        '  check "$refused" "$((refusals + probes + 3 * drift_probes))" "mock-docs refused nothing else"\n', "")
+mutate("demo-kind-probe-third-reason-unchecked", "the probe's third call passes refused for any reason, not only as wrong_subject", DRIVER,
+       '''  check "$third" "$drift_probes" "mock-docs refused the gateway's $drift_probes probes' calls with registry-probe's token as wrong_subject"\n''', "")
 mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure count reads the gateway's whole log", DRIVER,
        '  gateway_logs=$(k -n switchboard logs --since-time "$LOG_SINCE" "pod/$GATEWAY_POD")\n',
        '  gateway_logs=$(k -n switchboard logs "pod/$GATEWAY_POD")\n')
