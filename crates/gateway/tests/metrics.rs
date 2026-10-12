@@ -192,7 +192,11 @@ async fn the_endpoint_answers_with_every_signal_and_nothing_else() {
         assert!(sample(&text, &series).unwrap() >= 1.0, "{series}\n{text}");
     }
     assert!(
-        text.contains("no connection obtained within the begin budget (waiting for the pool or opening a connection)"),
+        text.contains(
+            "pool_timeout: no connection was obtained in time, whether waiting for a pool permit \
+             or opening a new connection; a database that never answers, a reconnect that runs \
+             past the budget and a pool too small for the load all count here"
+        ),
         "{text}"
     );
     assert!(!text.contains("receipt"), "{text}");
