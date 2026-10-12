@@ -905,8 +905,8 @@ enabled event trigger that runs a definer function, or a function in an untruste
 refused, whoever can fire it; EXECUTE on a function in an untrusted language is refused; a
 foreign key on the audit table whose action writes it is refused, and so is a foreign key on
 another table whose action writes that table, when the table's owner could reach the audit
-table and the table carries something that runs code as that owner; and the three below are
-out of scope.
+table, whatever triggers, rules, checks or defaults the table has; and the three below are out
+of scope.
 
 Two more checks from Otto run at boot when audit is on: the gateway refuses to start if the
 audit table lacks a column it writes, and if its database role can do more than its own. The
@@ -957,30 +957,37 @@ or updated the row it references, and so does whatever its write sets off on tha
 triggers, rules, checks, and for `SET DEFAULT` the defaults. For a partitioned table the action
 writes the partitioned table, as its owner, and reaches each partition's triggers from there,
 whoever owns the partition. The catalog cannot say what any of those writes, so the check
-refuses a foreign key on a table other than the audit table when its action on delete or on
-update is `CASCADE`, `SET NULL` or `SET DEFAULT`, that table's owner counts as able as a
-definer function's owner does, or can run such a function, and the table, or any partition
-under it, carries something that runs code as that owner: any trigger but the internal ones
-Postgres makes to carry out a foreign key or a deferred unique or exclusion check; any rule; or
-a check constraint, column default, generated column, index expression or predicate, or a
-column's domain check, that names a function that is not built in, directly or through an
-operator or another domain, in any language but C and `internal`. Functions in C are out of
-scope, as below. A bare cascading key writes only its own columns and runs nothing as the
-owner, so it passes, and so do checks, defaults and indexes that call only what is built in or
-an extension's C functions, such as `uuid_generate_v4()`. In a database shared with other
-applications whose migrations run as a superuser, the check therefore refuses a superuser's
-cascading key only on a table that also carries one of those; the operator either gives that
-table to a role that cannot reach the audit table or moves the trigger, rule or function off it
-(#144). A partitioned table's key is judged by the partitioned table's owner, not by the owners
-of the partitions' copies. A foreign key that references the audit table passes: its action
-runs only when an audit row is deleted or its key changes, which the gateway's role cannot do.
-The migrations' trigger functions are in `plpgsql`, which is trusted, and are not
+refuses the foreign key itself, on a table other than the audit table, when its action on
+delete or on update is `CASCADE`, `SET NULL` or `SET DEFAULT` and that table's owner counts as
+able as a definer function's owner does, or can run such a function, whatever the table has: a
+bare cascading key with no trigger, rule, check or default of its own is refused too. A
+partitioned table's key is judged by the partitioned table's owner, not by the owners of the
+partitions' copies. A foreign key that references the audit table passes: its action runs only
+when an audit row is deleted or its key changes, which the gateway's role cannot do. The
+migrations' trigger functions are in `plpgsql`, which is trusted, and are not
 `SECURITY DEFINER`, and the migrations make no foreign key, so a database they built passes.
-The check asks which roles are able once, and then asks of each definer function and each
-cascading table only whether its owner is a member of one, so its time grows with the number
-of roles plus the number of functions, not their product: 400 definer functions in a database
-nothing has analyzed stay well inside the 15-second budget the gateway gives the boot check
-(#144).
+
+This has an operational cost. In a database shared with other applications, a cascading
+foreign key on a table owned by a superuser, or by any role that can reach the audit tables,
+stops the gateway from booting, though the table may run nothing as its owner. That is common
+where another application's migrations run as a superuser. The remedies are a database of its
+own for the audit store, owning such tables by a role that cannot reach the audit tables, or no
+cascading actions on them. Refusing only a table whose write runs code as its owner would need
+the check to follow every path by which PostgreSQL runs code during that write, which includes
+casts, operator classes, partition keys, domain defaults and built-in functions that run SQL;
+that narrowing is tracked in #151.
+
+The check asks whether a role is able once per role. Before #144 it asked that once for every
+pair of a definer function and a role, since the planner, before `pg_proc` was analyzed,
+evaluated the test inside the walk over definer functions, and the cascade check walked them
+again. Now the walk over definer functions reads small sets read from the catalog once, and the
+definer and cascade checks share its result. In a database nothing has analyzed, with 200
+harmless definer functions owned by 60 roles, the check took 24 to 37 seconds before, depending
+on the machine's load, past the 15-second budget the gateway gives it, and takes about 0.3
+seconds now; with 200 more that can reach the audit table but that no other role may run, about
+0.4 seconds. Each round of the walk still asks, of every role not yet found, whether it can run
+a definer function the round found, so the cost still depends on the catalog and the plan, and
+a long chain of definer functions takes a round per link.
 
 What the Postgres check does not look for, each out of scope because it needs an
 administrator's act rather than a misconfiguration of what the role script and the migrations
