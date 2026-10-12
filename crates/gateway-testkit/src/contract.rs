@@ -71,8 +71,8 @@ pub trait ContractStore {
     fn stored(&self, row: &AuditRowId) -> impl Future<Output = Option<StoredRow>>;
 
     /// The begin budget, the finish deadline and the answer budget the store was given, to add
-    /// to each call row's deadline. A runner answers with the budgets it gave the store, not with what the store
-    /// holds, so a store that ignores the ones it was given is caught.
+    /// to each call row's deadline. A runner answers with the budgets it gave the store, not
+    /// with what the store holds, so a store that ignores the ones it was given is caught.
     fn budgets(&self) -> StoreBudgets;
 
     /// The time on the store's own clock: database time for Postgres, the store's clock for the
