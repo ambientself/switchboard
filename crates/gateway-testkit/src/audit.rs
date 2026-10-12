@@ -196,8 +196,9 @@ fn refuse_non_uuid(id: &AuditRowId) -> Result<(), StoreError> {
 
 /// The allowance for `record`'s deadline, or why the Postgres store would refuse to write it
 /// as the row `id`: an identifier that is not a lowercase hyphenated UUID, a record already
-/// complete, a text value with U+0000, a count or an allowance past a `bigint`, or unknown
-/// resources with a count left out.
+/// complete, a text value with U+0000, a count or an allowance past a `bigint`, unknown
+/// resources with a count left out, or a call record of kind `list`, which the table's
+/// `kind_shape` refuses whatever row the identifier already names.
 fn refused_at_begin(
     id: &AuditRowId,
     record: &AuditRecord,
@@ -217,6 +218,13 @@ fn refused_at_begin(
     }
     let allowance = allowance_ms(budgets, record.call_deadline_ms);
     refuse_past_bigint("the row's allowance", allowance)?;
+    if record.kind != RowKind::Call {
+        return Err(format!(
+            "audit row {} is a call record of kind list, which violates the check constraint \"kind_shape\"",
+            id.as_str()
+        )
+        .into());
+    }
     Ok(allowance)
 }
 
@@ -304,26 +312,22 @@ impl State {
 
     /// Completes the row `id` with `completion`, unless it is complete already. Every
     /// completion comes through here, a late one and a lost begin's included. As Postgres's
-    /// `complete_once` does, it refuses a row of kind `list` and a denial, whatever the
-    /// completion: neither is ever completed.
+    /// `complete_once` does, it refuses a list row and a denial, whatever the completion:
+    /// neither is ever completed. Every call row is of kind `call`, since begin refuses any
+    /// other.
     fn complete(&mut self, id: &AuditRowId, completion: &Completion) -> Result<(), StoreError> {
-        let listing = || {
-            StoreError::from(format!(
+        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {
+            return Err(format!(
                 "audit row {} records a listing, which is never completed",
                 id.as_str()
-            ))
-        };
-        if self.list_rows.iter().any(|(stored, _, _)| stored == id) {
-            return Err(listing());
+            )
+            .into());
         }
         let (_, row, _) = self
             .rows
             .iter_mut()
             .find(|(stored, _, _)| stored == id)
             .ok_or_else(|| StoreError::from("no such row"))?;
-        if row.kind != RowKind::Call {
-            return Err(listing());
-        }
         if row.decision != DecisionKind::Allow {
             return Err(format!(
                 "audit row {} records a denial, which is never completed",
@@ -365,9 +369,10 @@ impl State {
 /// identifier that is not a UUID in the lowercase hyphenated form, a record handed to begin
 /// already complete, a record, list record or completion with U+0000 in a text value, a count
 /// of resources or tools left out or a latency past a Postgres `bigint`, and a call row whose
-/// allowance is past one. Of the table's own constraints it checks only one: unknown resources
-/// with a count left out. Of its triggers it follows both: `set_times`, which refuses a
-/// deadline past what a Postgres time holds, and `complete_once`.
+/// allowance is past one. Of the table's own constraints it checks two: unknown resources with
+/// a count left out, and `kind_shape`, which refuses a call record of kind `list` at begin.
+/// Of its triggers it follows both: `set_times`, which refuses a deadline past what a Postgres
+/// time holds, and `complete_once`.
 ///
 /// It fails the ways decision 0009 says the fake must, each until told otherwise or once:
 ///
@@ -465,14 +470,11 @@ impl InMemoryAuditStore {
         })
     }
 
-    /// The times for a row of `kind` begun now, with `allowance_ms` to its deadline. `None`
-    /// when the deadline is past what Postgres's `set_times` accepts.
-    fn times_for(&self, kind: RowKind, allowance_ms: u64) -> Option<Times> {
+    /// The times for a call row begun now, with `allowance_ms` to its deadline. `None` when
+    /// the deadline is past what Postgres's `set_times` accepts.
+    fn times_for(&self, allowance_ms: u64) -> Option<Times> {
         let begun_at = self.clock.now();
-        let deadline = match kind {
-            RowKind::Call => Some(postgres_deadline(begun_at, allowance_ms)?),
-            RowKind::List => None,
-        };
+        let deadline = Some(postgres_deadline(begun_at, allowance_ms)?);
         Some(Times { begun_at, deadline })
     }
 
@@ -680,7 +682,7 @@ impl AuditStore for InMemoryAuditStore {
             match state.rows.iter().find(|(id, _, _)| id == row) {
                 None => {
                     let times = self
-                        .times_for(record.kind, allowance_ms)
+                        .times_for(allowance_ms)
                         .ok_or_else(|| StoreError::from("the row's deadline is out of range"))?;
                     state.rows.push((row.clone(), record.clone(), times));
                 }
