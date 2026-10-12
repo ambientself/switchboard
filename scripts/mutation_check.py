@@ -4316,6 +4316,10 @@ mutate("issuer-keys-zero-deadline-allowed", "a zero deadline is accepted", IK,
        "        if options.deadline.is_zero() {", "        if false {")
 mutate("issuer-keys-zero-cap-allowed", "a zero body cap is accepted", IK,
        "        if options.max_body_bytes == 0 {", "        if false {")
+# #88: a Kubernetes API server answers 406 to a fetch that does not accept a JWK set.
+mutate("issuer-keys-accepts-only-json", "a fetch accepts only application/json, which Kubernetes refuses", IK,
+       'const ACCEPTED: &str = "application/jwk-set+json, application/json";',
+       'const ACCEPTED: &str = "application/json";')
 # Only a redirect to another host or port is followed, so only the tests whose redirect changes
 # the host (plain and over TLS) or the port can catch it.
 mutate("issuer-keys-redirect-followed", "a redirect to another host or port is followed once", IK,

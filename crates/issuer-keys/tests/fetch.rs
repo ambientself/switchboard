@@ -402,6 +402,35 @@ async fn a_fetch_is_one_get_to_the_keys_url_and_returns_the_set() {
     assert_eq!(server.authorizations(), vec![None]);
 }
 
+/// A Kubernetes API server serves its keys only as `application/jwk-set+json`, and answers
+/// `406` to a request that does not accept it (#88). Each fetch accepts it first, and plain
+/// JSON for other issuers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_accepts_a_jwk_set_as_kubernetes_serves_it() {
+    let server = Server::start(|_| Reply::ok(KEYS)).await;
+    source(&server, FetchOptions::default())
+        .fetch()
+        .await
+        .unwrap();
+    let accepts: Vec<Option<String>> = server
+        .heads()
+        .iter()
+        .map(|head| {
+            head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("accept")
+                    .then(|| value.trim().to_owned())
+            })
+        })
+        .collect();
+    assert_eq!(
+        accepts,
+        vec![Some(
+            "application/jwk-set+json, application/json".to_owned()
+        )]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn each_fetch_is_one_request() {
     let server = Server::start(|_| Reply::ok(KEYS)).await;
