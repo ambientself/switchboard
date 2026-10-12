@@ -51,6 +51,7 @@
 //!   - `switchboard_audit_pool_connections_in_use{pool}`, and beside it, as separate gauges,
 //!     `switchboard_audit_pool_connections_open{pool}` and
 //!     `switchboard_audit_pool_connections_max{pool}`, `pool` one of `begin` and `finish`.
+//!     The open-row poll's connection, in a pool of its own, has no series.
 //!
 //! - With an issuer whose keys are fetched from a keys URL, from [`KeyAges`]:
 //!   `switchboard_issuer_keys_age_seconds{issuer}`, the seconds since that issuer's keys were
@@ -65,8 +66,9 @@
 //! unknown when none can be.
 //!
 //! **Open rows.** A task polls [`PgAuditStore::open_rows`] every [`OPEN_ROWS_POLL`], the first
-//! time as soon as the listener serves. The query runs on the store's finish pool, holds one
-//! connection, and gives up after 2 s. A failed poll counts in
+//! time as soon as the listener serves. The query has a connection of its own, apart from the
+//! store's begin and finish pools, so a poll held up never delays a finish. It gives up 2 s
+//! after asking for that connection. A failed poll counts in
 //! `switchboard_audit_open_rows_poll_failures_total` and keeps the last value. Until a poll has
 //! succeeded, `switchboard_audit_open_rows` has no sample; the oldest deadline has one only
 //! while a row is open, as seconds since the Unix epoch. A scrape reads what the last poll

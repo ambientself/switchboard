@@ -173,7 +173,7 @@ pub(crate) fn describe(error: &tokio_postgres::Error) -> String {
     }
 }
 
-/// How many connections each pool may hold.
+/// How many connections the begin and finish pools may hold.
 ///
 /// Finish has a pool of its own, so a surge of begins cannot starve the writes that close
 /// rows. The defaults are provisional; decision 0009 leaves pool sizes to Q12. The open-row
@@ -704,9 +704,10 @@ impl PgAuditStore {
     /// What the store has counted since it was made, for the gateway's telemetry (decision
     /// 0009): begin failures by cause, answers released before their row was complete,
     /// finishes given up by cause, failed begins' rows never written, finishes in flight, the
-    /// latency of begin and of finish, and each pool's connections. The counts are atomics,
-    /// each read on its own; the pools' figures come from their status, which takes each
-    /// pool's lock for a moment. Nothing here waits on the database.
+    /// latency of begin and of finish, and the connections of the begin and finish pools. The
+    /// open-row query's pool is not among them. The counts are atomics, each read on its own;
+    /// the pools' figures come from their status, which takes each pool's lock for a moment.
+    /// Nothing here waits on the database.
     pub fn stats(&self) -> StoreStats {
         let finishes = self.finishes();
         StoreStats {
@@ -724,9 +725,10 @@ impl PgAuditStore {
 
     /// Counts the open rows, and finds the earliest deadline among them, through the view
     /// `switchboard_audit.open_call_rows`. Runs on a pool of its own, of
-    /// [`OPEN_ROWS_POOL_SIZE`], so a query held up never delays a finish, within 2 s from
-    /// asking for a connection; past that, it asks the server to cancel the query and fails.
-    /// Reads only: nothing marks a row abandoned or writes its outcome.
+    /// [`OPEN_ROWS_POOL_SIZE`], so a query held up never delays a finish. It has 2 s in all,
+    /// from asking for its connection to the answer; past that, it fails, and if the query has
+    /// started, asks the server to cancel it. Reads only: nothing marks a row abandoned or
+    /// writes its outcome.
     pub async fn open_rows(&self) -> Result<OpenRows, PgAuditError> {
         let budget = OPEN_ROWS_TIMEOUT;
         let deadline = Instant::now() + budget;

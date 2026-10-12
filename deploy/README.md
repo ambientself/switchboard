@@ -178,11 +178,11 @@ answers they cause (`switchboard_audit_failure_answers_total`, for `tools/call` 
 `tools/list`), answers released before finish, finishes given up by cause, failed begins never
 committed, finishes in flight, open rows and the oldest open row's deadline (polled every 15 s
 through the open-row view; a failed poll is counted and keeps the last count), begin and finish
-latency histograms, each pool's connections in use, open and maximum, and telemetry events and
-drops. Receipts in `unknown` arrive with receipts (#10 stage 2). The Compose run checks that its
-database outage counted a begin failure and an audit-failure answer; both runs check that
-telemetry dropped is exported and that at most one row is open. No alert thresholds or paging:
-those wait for the first production deployment (Still open 9).
+latency histograms, the begin and finish pools' connections in use, open and maximum, and
+telemetry events and drops. Receipts in `unknown` arrive with receipts (#10 stage 2). The
+Compose run checks that its database outage counted a begin failure and an audit-failure answer;
+both runs check that telemetry dropped is exported and that at most one row is open. No alert
+thresholds or paging: those wait for the first production deployment (Still open 9).
 
 A begin failure's `pool_timeout` means no connection was obtained in time, whether waiting for
 a pool permit or opening a new connection. So three different things count there: a database
