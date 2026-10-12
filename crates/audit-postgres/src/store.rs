@@ -1472,4 +1472,137 @@ mod unit {
             vec![(row.as_str().to_owned(), "error", lost.to_string())]
         );
     }
+
+    /// The begin budget of the stores below, which never write a row: long enough that an
+    /// attempt on a connection that breaks at once, and the pause after it, end well inside it.
+    const BEGIN_BUDGET: Duration = Duration::from_secs(1);
+
+    /// A server that takes each connection and never says anything, so opening a connection
+    /// to it never ends, as to a database behind a blackholed address. Told to, it first lets
+    /// one connection in, as [`server_that_lets_anyone_in`] does, and closes it when the client
+    /// first sends anything more, so that connection breaks. Counts the connections it took,
+    /// and holds the silent ones open.
+    async fn server_that_never_answers(break_one_first: bool) -> (u16, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let kept = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut silent = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let first = kept.fetch_add(1, Ordering::SeqCst) == 0;
+                if !(first && break_one_first) {
+                    silent.push(socket);
+                    continue;
+                }
+                let length = socket.read_u32().await.unwrap();
+                let mut startup = vec![0; usize::try_from(length).unwrap() - 4];
+                socket.read_exact(&mut startup).await.unwrap();
+                // AuthenticationOk, then ReadyForQuery.
+                socket
+                    .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                    .await
+                    .unwrap();
+                let _ = socket.read_u8().await;
+                drop(socket);
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A store whose pools connect to `port` on this machine, with [`BEGIN_BUDGET`].
+    fn store_at(port: u16) -> PgAuditStore {
+        let mut config = tokio_postgres::Config::new();
+        config.host("127.0.0.1").port(port).user("nobody");
+        PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())
+            .unwrap()
+            .with_budgets(Budgets {
+                begin: BEGIN_BUDGET,
+                ..Budgets::default()
+            })
+    }
+
+    /// Begins an allowed read through the core, as the gateway does, on a store that cannot
+    /// write it, and returns the begin failures the store counted. A begin that succeeds, or
+    /// does not end well past its budget, fails the test.
+    async fn failed_begin(store: &PgAuditStore) -> BeginFailures {
+        use gateway_core::audit::{self, RequestMetadata};
+        use gateway_core::{CallContext, RequestedTool, decide};
+        use gateway_testkit::{
+            Caller, Fixture, FixtureConnector, READ_TOOL, SURFACE_ALL, TEAM_A_DOCUMENT, row_start,
+        };
+        let fixture = Fixture::new().unwrap();
+        let arguments = serde_json::json!({ "document": TEAM_A_DOCUMENT });
+        let context = CallContext {
+            resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
+            caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
+            tool: RequestedTool::new(READ_TOOL),
+        };
+        let decision = decide(&fixture.policy, &context);
+        let begin = audit::begin(
+            store,
+            row_start(),
+            decision,
+            arguments,
+            RequestMetadata::default(),
+        );
+        let Ok(Err(_)) = tokio::time::timeout(BEGIN_BUDGET * 5, begin).await else {
+            panic!("the begin succeeded, or did not end");
+        };
+        store.stats().begin_failures
+    }
+
+    /// A begin against a database that never answers counts one pool timeout, the same as a
+    /// begin that waited for a pool permit: its budget ran out opening a new connection,
+    /// before it had one. Needs no server: the one here takes the connection and says nothing.
+    #[tokio::test]
+    async fn a_begin_against_a_database_that_never_answers_counts_one_pool_timeout() {
+        let (port, accepted) = server_that_never_answers(false).await;
+        let store = store_at(port);
+        assert_eq!(
+            failed_begin(&store).await,
+            BeginFailures {
+                pool_timeout: 1,
+                ..BeginFailures::default()
+            }
+        );
+        // The begin was opening a connection, not waiting for a permit: the server took one.
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A begin against a database that refuses each connection counts one database error, not
+    /// a pool timeout: each attempt failed at once, with an error. Needs no server: nothing
+    /// listens on the port.
+    #[tokio::test]
+    async fn a_begin_against_a_database_that_refuses_connections_counts_one_database_error() {
+        let store = store_at(closed_port());
+        assert_eq!(
+            failed_begin(&store).await,
+            BeginFailures {
+                database_error: 1,
+                ..BeginFailures::default()
+            }
+        );
+    }
+
+    /// A begin whose connection breaks, and whose next attempt then runs past the budget
+    /// opening a new one, counts one pool timeout: the connection that broke was taken out of
+    /// the pool, and what counts is whether the last attempt had a connection. Needs no
+    /// server: the one here lets the first connection in, breaks it at the begin's first
+    /// statement, and says nothing on the next.
+    #[tokio::test]
+    async fn a_begin_whose_reconnect_runs_past_its_budget_counts_one_pool_timeout() {
+        let (port, accepted) = server_that_never_answers(true).await;
+        let store = store_at(port);
+        assert_eq!(
+            failed_begin(&store).await,
+            BeginFailures {
+                pool_timeout: 1,
+                ..BeginFailures::default()
+            }
+        );
+        // The first connection broke, and the begin's second attempt opened another.
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
 }
