@@ -38,13 +38,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gateway_core::audit::RecordedResources;
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
     MAX_RECORDED_RESOURCES, Outcome, RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::{
-    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, Claimed, Connector, Decision,
-    RequestedTool, Resource, Resources, TeamId, ToolCall, ToolOutcome, ToolUseId, decide,
+    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, Claimed, Connector,
+    CredentialIdentity, CredentialMode, Decision, RequestedTool, Resource, Resources, TeamId,
+    ToolCall, ToolOutcome, ToolUseId, decide,
 };
 use serde_json::{Value, json};
 
@@ -193,15 +195,19 @@ fn arguments(call: &Call) -> Value {
 }
 
 fn decision(fixture: &Fixture, call: &Call) -> Decision {
+    decide(&fixture.policy, &decision_context(fixture, call))
+}
+
+/// The context `call` is decided with, its resources read by the fixture's adapter.
+fn decision_context(fixture: &Fixture, call: &Call) -> CallContext {
     let arguments = arguments(call);
-    let context = CallContext {
+    CallContext {
         resources: FixtureConnector::resources_of(call.tool, &arguments),
         caller: fixture
             .caller_context(call.caller, call.surface)
             .expect("the fixture knows the caller"),
         tool: RequestedTool::new(call.tool),
-    };
-    decide(&fixture.policy, &context)
+    }
 }
 
 /// Begins `call` through the core as the row `start` names.
@@ -370,6 +376,10 @@ fn records() -> Vec<AuditRecord> {
             "proved_delegation_team": format!("delegation-team-{decision}"),
             "claimed_acting_person": format!("acting-person-{decision}"),
             "claimed_team": format!("claimed-team-{decision}"),
+            "credential": {
+                "mode": "team_service_identity",
+                "principal": format!("credential-principal-{decision}")
+            },
             "completion": null
         })
     };
@@ -391,6 +401,7 @@ fn records() -> Vec<AuditRecord> {
         "kind": "user",
         "groups": ["group-1", "group-2"]
     });
+    denied["credential"]["mode"] = json!("gateway_token");
     let bare = json!({
         "kind": "call",
         "instance": "instance-bare",
@@ -416,6 +427,7 @@ fn records() -> Vec<AuditRecord> {
         "proved_delegation_team": null,
         "claimed_acting_person": null,
         "claimed_team": null,
+        "credential": null,
         "completion": null
     });
     let mut no_resources = common("none");
@@ -430,7 +442,20 @@ fn records() -> Vec<AuditRecord> {
         "kind": "workload",
         "team": "proved-team-none"
     });
-    [allowed, denied, bare, no_resources]
+    no_resources["credential"] = json!(null);
+    let mut reach = common("reach");
+    reach["decision"] = json!("allow");
+    reach["reason"] = json!(null);
+    reach["sentence"] = json!(null);
+    reach["classification"] = json!("read");
+    reach["resources"] = json!({"reach": "entry-reach"});
+    reach["resources_omitted"] = json!(0);
+    reach["proved_principal"] = json!({
+        "id": {"issuer": "issuer-reach", "subject": "subject-reach"},
+        "kind": "workload",
+        "team": "proved-team-reach"
+    });
+    [allowed, denied, bare, no_resources, reach]
         .into_iter()
         .map(call_record)
         .collect()
@@ -460,9 +485,10 @@ pub async fn the_stored_row_is_exactly_the_record(contract: &impl ContractStore)
 // --- Item 2: records the store cannot hold ------------------------------------------------------
 
 /// A record the store cannot hold exactly is refused at begin, and leaves no row: U+0000 in a
-/// text value, a record already complete, a count or an allowance past a Postgres `bigint`,
-/// unknown resources with a count left out, a deadline past what Postgres can work out, and an
-/// identifier that is not a lowercase hyphenated UUID. So is such a list record, and a
+/// text value, a credential identity's included, a record already complete, a count or an
+/// allowance past a Postgres `bigint`, unknown resources or a reach with a count left out, a
+/// reach naming no entry, a deadline past what Postgres can work out, and an identifier that
+/// is not a lowercase hyphenated UUID. So is such a list record, and a
 /// completion the store cannot hold leaves its row open.
 pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
     contract: &impl ContractStore,
@@ -489,8 +515,22 @@ pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
         }),
         refused(&|record| record.resources_omitted = usize::MAX),
         refused(&|record| {
-            record.resources = gateway_core::audit::RecordedResources::Unknown;
+            record.resources = RecordedResources::Unknown;
             record.resources_omitted = 3;
+        }),
+        refused(&|record| {
+            record.resources = RecordedResources::Reach("entry".into());
+            record.resources_omitted = 3;
+        }),
+        refused(&|record| {
+            record.resources = RecordedResources::Reach("".into());
+            record.resources_omitted = 0;
+        }),
+        refused(&|record| {
+            record.credential = Some(CredentialIdentity {
+                mode: CredentialMode::TeamServiceIdentity,
+                principal: "service\u{0}account".into(),
+            });
         }),
         // An allowance past a bigint.
         refused(&|record| record.call_deadline_ms = u64::MAX),
@@ -546,6 +586,169 @@ pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
         "the store accepted a latency past a bigint"
     );
     assert_eq!(stored(contract, &start.row).await, before);
+}
+
+// --- Item 2: the reach and the credential identity ---------------------------------------------
+
+/// A reach is stored as the connector entry it names, with nothing left out, as the core
+/// records it for a tool declared as the reach (decision 0011, section 1), whether the call
+/// was allowed or denied.
+pub async fn a_reach_is_stored_as_the_entry_it_names(contract: &impl ContractStore) {
+    let store = contract.store();
+    let fixture = fixture();
+    // Allowed, its reach more than a row names, every one within team A's limit; and denied.
+    for (call, copies, decision) in [
+        (&ALLOWED, MAX_RECORDED_RESOURCES + 3, DecisionKind::Allow),
+        (&DENIED, 1, DecisionKind::Deny),
+    ] {
+        let context = CallContext {
+            resources: Resources::Reach {
+                entry: "entry-reach".into(),
+                resources: vec![document(call.document); copies],
+            },
+            ..decision_context(&fixture, call)
+        };
+        let start = row_start();
+        let _ = audit::begin(
+            store,
+            start.clone(),
+            decide(&fixture.policy, &context),
+            arguments(call),
+            RequestMetadata::default(),
+        )
+        .await
+        .expect("the store refused a reach");
+        let StoredRecord::Call(record) = stored(contract, &start.row).await.record else {
+            panic!("a call was not stored as one");
+        };
+        assert_eq!(record.decision, decision);
+        assert_eq!(
+            (record.resources, record.resources_omitted),
+            (RecordedResources::Reach("entry-reach".into()), 0),
+            "{call:?}"
+        );
+    }
+}
+
+/// A credential identity is stored as begin was given it, its mode and principal together, in
+/// each mode, and a row given none stores none. Through the core, the identity the row start
+/// carries is stored with the call it names, allowed or denied.
+pub async fn a_credential_identity_is_stored_as_begin_was_given_it(contract: &impl ContractStore) {
+    let store = contract.store();
+    let base = records().swap_remove(0);
+    for credential in [
+        Some(CredentialIdentity {
+            mode: CredentialMode::TeamServiceIdentity,
+            principal: "docs-team-a".into(),
+        }),
+        Some(CredentialIdentity {
+            mode: CredentialMode::GatewayToken,
+            principal: "a token's \"holder\", \u{e9}".into(),
+        }),
+        Some(CredentialIdentity {
+            mode: CredentialMode::PerUserGrant,
+            principal: "per-user".into(),
+        }),
+        None,
+    ] {
+        let row = row_start().row;
+        let written = AuditRecord {
+            credential: credential.clone(),
+            ..base.clone()
+        };
+        store
+            .begin(&row, &written)
+            .await
+            .expect("the store refused a credential identity it can hold");
+        assert_eq!(
+            stored(contract, &row).await.record,
+            StoredRecord::Call(written),
+            "{credential:?}"
+        );
+    }
+
+    let fixture = fixture();
+    let identity = CredentialIdentity {
+        mode: CredentialMode::TeamServiceIdentity,
+        principal: "fixture-service".into(),
+    };
+    for call in [&ALLOWED, &DENIED] {
+        let start = RowStart {
+            credential: Some(identity.clone()),
+            ..row_start()
+        };
+        let _ = begin(store, &fixture, &start, call, RequestMetadata::default())
+            .await
+            .expect("the store refused a row");
+        let StoredRecord::Call(record) = stored(contract, &start.row).await.record else {
+            panic!("a call was not stored as one");
+        };
+        assert_eq!(record.credential.as_ref(), Some(&identity), "{call:?}");
+    }
+}
+
+/// A second begin under a stored row's identifier compares the decision and nothing more, as
+/// [`begin_is_ok_only_once_stored_and_idempotent_by_identifier`] says: one with the same
+/// decision and another reach, other resources, another credential identity or none is
+/// accepted and changes nothing. One with another decision is refused, and the row stands.
+pub async fn a_repeated_begin_compares_the_decision_and_not_the_reach_or_credential(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let first = records()
+        .into_iter()
+        .find(|record| matches!(record.resources, RecordedResources::Reach(_)))
+        .expect("a record names a reach");
+    assert!(first.credential.is_some(), "the record has no credential");
+    let row = row_start().row;
+    store
+        .begin(&row, &first)
+        .await
+        .expect("the store refused the first begin");
+    let stored_first = stored(contract, &row).await;
+
+    for repeat in [
+        AuditRecord {
+            resources: RecordedResources::Reach("another-entry".into()),
+            ..first.clone()
+        },
+        AuditRecord {
+            resources: RecordedResources::Named(Vec::new()),
+            ..first.clone()
+        },
+        AuditRecord {
+            credential: Some(CredentialIdentity {
+                mode: CredentialMode::GatewayToken,
+                principal: "another-principal".into(),
+            }),
+            ..first.clone()
+        },
+        AuditRecord {
+            credential: None,
+            ..first.clone()
+        },
+    ] {
+        store
+            .begin(&row, &repeat)
+            .await
+            .expect("a repeat with the same decision was refused");
+        assert_eq!(
+            stored(contract, &row).await,
+            stored_first,
+            "a repeat changed the stored row"
+        );
+    }
+    let denial = AuditRecord {
+        decision: DecisionKind::Deny,
+        reason: Some(gateway_core::ReasonKind::UnknownTool),
+        sentence: Some("Denied.".into()),
+        ..first.clone()
+    };
+    assert!(
+        store.begin(&row, &denial).await.is_err(),
+        "a repeat with another decision was accepted"
+    );
+    assert_eq!(stored(contract, &row).await, stored_first);
 }
 
 // --- Item 3: finish -----------------------------------------------------------------------------
