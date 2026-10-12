@@ -122,9 +122,10 @@
 //!   is not given, and refused below 5 or above 900 (decision 0013, section 5).
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
-//! limits, each server's bounds and the drift interval have defaults, so a gateway not told where to listen is
-//! reachable from its own machine only. Any other missing field is an error, and so is a field that does not belong to the chosen mode or kind,
-//! such as `subjects_file` on a user issuer.
+//! limits, each server's bounds and the drift interval have defaults, so a gateway not told
+//! where to listen is reachable from its own machine only. Any other missing field is an error,
+//! and so is a field that does not belong to the chosen mode or kind, such as `subjects_file`
+//! on a user issuer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

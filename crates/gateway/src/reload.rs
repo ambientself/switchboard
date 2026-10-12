@@ -7,10 +7,10 @@
 //!
 //! A reload can change the policy: tools withdrawn, surfaces, profiles, limits, rules and
 //! definitions. The drift pass's standing withdrawals are applied to each new version whose
-//! approval of the tool is unchanged (see [`crate::drift`]). It cannot change what the running connectors were built for, so a new file is
-//! refused, and the gateway must be restarted, if it changes a server, adds or removes one, or
-//! routes a tool to an upstream tool the gateway did not start with. Withdrawing a tool is
-//! always possible.
+//! approval of the tool is unchanged (see [`crate::drift`]). It cannot change what the running
+//! connectors were built for, so a new file is refused, and the gateway must be restarted, if
+//! it changes a server, adds or removes one, or routes a tool to an upstream tool the gateway
+//! did not start with. Withdrawing a tool is always possible.
 //!
 //! A new file that changes the policy must also change its `revision`. Audit rows explain a
 //! decision only by the revision they record, so two different policies served under one

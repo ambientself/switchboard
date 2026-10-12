@@ -15,15 +15,16 @@
 //! stale, readiness fails and tools are refused (see [`gateway::reload`]). The release build
 //! refuses the identity and audit opt-outs before it connects to anything (see
 //! [`gateway::start`]). Each keys URL is fetched again every `keys_refresh_seconds` (see
-//! [`gateway::keys`]). Each proxied server's tool list is read once before the listener is bound
-//! and again every `drift.interval_seconds`, and a tool that no longer matches its approval is
-//! withdrawn (see [`gateway::drift`]). All three stop when the gateway shuts down. Requests in flight, and calls in
-//! flight to each proxied server and from each team, are capped as `[limits]` says (see
-//! [`gateway::deployment`] and [`gateway::bulkhead`]). Logs go to standard output as JSON lines; a refusal to start goes to standard
-//! error as well, as plain text. Shutting down waits for the answers still running, and for the
-//! audit store to complete the rows it is still writing, up to its finish deadline. With
-//! `[metrics]`, `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it
-//! stops after the MCP listener, once those rows are done.
+//! [`gateway::keys`]). Each proxied server's tool list is read once before the listener is
+//! bound and again every `drift.interval_seconds`, and a tool that no longer matches its
+//! approval is withdrawn (see [`gateway::drift`]). All three stop when the gateway shuts down.
+//! Requests in flight, and calls in flight to each proxied server and from each team, are
+//! capped as `[limits]` says (see [`gateway::deployment`] and [`gateway::bulkhead`]). Logs go
+//! to standard output as JSON lines; a refusal to start goes to standard error as well, as
+//! plain text. Shutting down waits for the answers still running, and for the audit store to
+//! complete the rows it is still writing, up to its finish deadline. With `[metrics]`,
+//! `GET /metrics` is served on an address of its own (see [`gateway::metrics`]); it stops after
+//! the MCP listener, once those rows are done.
 //!
 //! **Migrating.** Connects with the URL in `SWITCHBOARD_MIGRATE_DATABASE_URL`, which must log
 //! in as `switchboard_owner`, applies every audit migration not yet applied, prints one JSON
