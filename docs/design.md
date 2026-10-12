@@ -730,6 +730,8 @@ written complete, has no finish, and is never open.
   mode and vendor-side principal, never the secret. An entry has one credential and no
   fallback, so it is the identity the call runs under until per-user grants arrive in
   milestone 5 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
+  It is part of the row's first half, not of its completion: a row whose tool has no entry
+  records none, and rows written before it was recorded read as not recorded.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
@@ -1316,11 +1318,24 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
   a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
-  Not built, for decisions 0011 and 0012: how the resources were found, with the reach by
-  reference, the credential identity, an unverified delegation's failure kind, and a grant's
-  digest, issuer, key ID, pod UID, egress setting and currency answer. With #12, a column for
-  the exception that allowed a call, since the row's shape constraint rightly allows no reason
-  on an allowed row.
+  How the resources were found, and the credential identity: built (#56). A tool declared as
+  its connector entry's reach is read by the gateway's one constant adapter, which names the
+  entry's whole reach from the policy version the call is decided from, whatever the
+  arguments; check 6 checks it as it checks named resources, and the decision function is
+  unchanged. The row records the reach by reference, as `{"reach": entry}` in `resources`,
+  with nothing left out, for an allowed call and a denial alike. The loader no longer refuses
+  `as_reach`; it refuses a tool declared as the reach whose connector has no entry. Each call
+  row records the configured identity of its tool's connector entry at begin, the entry's
+  credential mode and stated principal, never the secret, in `credential_mode` and
+  `credential_principal`, both or neither, and neither for a tool with no entry. Migration
+  0007 adds the reach to the resources check (`resources_known`, `reach_shape`) and the two
+  columns (`credential_mode_known`, `credential_shape`), which the gateway's role inserts and
+  does not read: a repeated begin still compares only the decision. Rows written before it
+  hold NULL in both, which means not recorded. Not built: the columns of decision 0012, an
+  unverified delegation's failure kind and a grant's digest, issuer, key ID, pod UID, egress
+  setting and currency answer, which go with #22; and, with #12, a column for the exception
+  that allowed a call, since the row's shape constraint rightly allows no reason on an allowed
+  row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
