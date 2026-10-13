@@ -4177,8 +4177,8 @@ mutate_all("demo-kind-gateway-keys-token-unset-audience", "the gateway container
             "          configMap: {name: kube-root-ca.crt}\n"
             "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
             "                  expirationSeconds: 600\n                  path: token\n"))
-# #153: the manifest guards read block-style mounts, and the kind run holds the three checks of
-# its anonymous key-fetch step.
+# #153: the manifest guards read block-style mounts and flow-style token sources, and the kind
+# run holds the three checks of its anonymous key-fetch step.
 mutate("demo-kind-mounts-flow-style-only", "the manifest guards read only flow-style volume mounts, and miss a block-style one",
        "crates/demo-checks/tests/manifests.rs",
        """    items
@@ -4206,6 +4206,10 @@ mutate("demo-kind-container-ends-at-comment", "the manifest guards end a contain
        "crates/demo-checks/tests/manifests.rs",
        """        line.starts_with("          ") || line.trim().is_empty() || line.trim().starts_with('#')\n""",
        """        line.starts_with("          ") || line.trim().is_empty()\n""")
+mutate("demo-kind-token-sources-block-style-only", "the manifest guards read only block-style token sources, and miss a flow-style one for the API server",
+       "crates/demo-checks/tests/manifests.rs",
+       """        if text.starts_with('#') || !text.contains("serviceAccountToken") {\n""",
+       """        if text != "- serviceAccountToken:" {\n""")
 mutate("demo-kind-anonymous-role-unchecked", "the kind run does not check the issuer-discovery ClusterRole's rules", DRIVER,
        """    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \\\n""",
        """    check '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \\\n""")

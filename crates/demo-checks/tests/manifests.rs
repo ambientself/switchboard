@@ -444,20 +444,55 @@ fn item_name(item: &str) -> &str {
 }
 
 /// The audience of each projected ServiceAccount token source in `volume`, None for a source
-/// that names none and so gets the API server's.
+/// that names none and so gets the API server's. It reads a source block style
+/// (`- serviceAccountToken:`, then its fields on the lines under it, past blank lines and
+/// comments) or flow style (`- serviceAccountToken: {...}` or `- {serviceAccountToken: {...}}`,
+/// its fields closed on that line). It fails closed: it panics on any other line that names
+/// `serviceAccountToken`, on a flow mapping that does not close on its line, and on a field it
+/// cannot read as `audience`, `expirationSeconds` or `path` with a value. So a token is never
+/// missed for how it is written.
 fn token_audiences(volume: &str) -> Vec<Option<String>> {
     let lines: Vec<&str> = volume.lines().collect();
     let mut audiences = Vec::new();
     for (at, line) in lines.iter().enumerate() {
-        if line.trim_start() != "- serviceAccountToken:" {
+        let text = line.trim_start();
+        if text.starts_with('#') || !text.contains("serviceAccountToken") {
             continue;
         }
-        let indent = line.len() - line.trim_start().len();
-        let audience = lines[at + 1..]
-            .iter()
-            .take_while(|next| next.len() - next.trim_start().len() > indent + 2)
-            .find_map(|next| next.trim_start().strip_prefix("audience: "))
-            .map(|audience| audience.trim_matches('"').to_owned());
+        let fields: Vec<&str> = if text == "- serviceAccountToken:" {
+            let indent = line.len() - text.len();
+            lines[at + 1..]
+                .iter()
+                .filter(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'))
+                .take_while(|next| next.len() - next.trim_start().len() > indent + 2)
+                .map(|next| next.trim())
+                .collect()
+        } else {
+            let rest = text
+                .strip_prefix("- serviceAccountToken: {")
+                .or_else(|| text.strip_prefix("- {serviceAccountToken: {"))
+                .unwrap_or_else(|| panic!("a token source it cannot read: {text}"));
+            let (fields, _) = rest.split_once('}').unwrap_or_else(|| {
+                panic!("a token source that does not close on its line: {text}")
+            });
+            fields
+                .split(',')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .collect()
+        };
+        let mut audience = None;
+        for field in fields {
+            let (key, value) = field
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("a token source field it cannot read: {field}"));
+            let value = value.split(" #").next().unwrap().trim();
+            match key {
+                "audience" => audience = Some(value.trim_matches(['"', '\'']).to_owned()),
+                "expirationSeconds" | "path" => {}
+                _ => panic!("a token source field it cannot read: {field}"),
+            }
+        }
         audiences.push(audience);
     }
     audiences
@@ -1163,6 +1198,121 @@ fn every_volume_mount_of_the_gateway_container_is_read_however_it_is_written() {
             Some("an item without a name first: -"),
             "{form}"
         );
+    }
+}
+
+/// #153, decision 0013 section 10: `token_audiences` reads a projected token source flow style
+/// as well as block style, so the guards see a token for the API server however its source is
+/// written, and panics on a source it cannot read rather than leave it out.
+#[test]
+fn every_token_source_of_a_volume_is_read_however_it_is_written() {
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    assert_eq!(token_audiences(&volume(&gateway, "api-token")), [None]);
+    assert_eq!(api_token_volumes(&gateway), ["api-token"]);
+
+    // The token writer's API token, mounted into the gateway container too.
+    let cluster_ca = "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n";
+    let api_mount = "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n";
+    let mounting = gateway.replacen(cluster_ca, &format!("{cluster_ca}{api_mount}"), 1);
+    assert_ne!(mounting, gateway);
+    let block = "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n";
+    assert!(mounting.contains(block));
+
+    // Each flow-style form of its source, with no audience or with the API server's: the
+    // pod-wide guard and the gateway container's guard both see it.
+    let unset = "volume api-token projects a token for the API server";
+    let issuer = format!("{unset}'s audience {KIND_ISSUER}");
+    for (source, audience, message) in [
+        (
+            "              - serviceAccountToken: {expirationSeconds: 600, path: token}\n"
+                .to_owned(),
+            None,
+            unset.to_owned(),
+        ),
+        (
+            "              - {serviceAccountToken: {expirationSeconds: 600, path: token}}\n"
+                .to_owned(),
+            None,
+            unset.to_owned(),
+        ),
+        (
+            "              - serviceAccountToken: {}\n".to_owned(),
+            None,
+            unset.to_owned(),
+        ),
+        (
+            format!(
+                "              - serviceAccountToken: {{path: token, audience: {KIND_ISSUER}}}\n"
+            ),
+            Some(KIND_ISSUER),
+            issuer.clone(),
+        ),
+        (
+            format!(
+                "              - {{serviceAccountToken: {{path: token, audience: \"{KIND_ISSUER}\"}}}}\n"
+            ),
+            Some(KIND_ISSUER),
+            issuer.clone(),
+        ),
+        (
+            format!(
+                "              - serviceAccountToken:\n                  # The API server's.\n                  audience: '{KIND_ISSUER}' # quoted\n                  path: token\n"
+            ),
+            Some(KIND_ISSUER),
+            issuer.clone(),
+        ),
+    ] {
+        let changed = mounting.replacen(block, &source, 1);
+        assert_ne!(changed, mounting, "{source}");
+        assert_eq!(
+            token_audiences(&volume(&changed, "api-token")),
+            [audience.map(str::to_owned)],
+            "{source}"
+        );
+        assert_eq!(api_token_volumes(&changed), ["api-token"], "{source}");
+        let container = container(&changed, "gateway");
+        let guarded =
+            std::panic::catch_unwind(|| no_api_token_mounted(&changed, &container, KIND_ISSUER));
+        let panicked = guarded.expect_err(&source);
+        assert_eq!(
+            panicked.downcast_ref::<String>(),
+            Some(&message),
+            "{source}"
+        );
+    }
+
+    // A blank line among a block-style source's fields does not end them.
+    let spaced = volume(&gateway, "api-token").replacen(
+        "- serviceAccountToken:\n",
+        &format!("- serviceAccountToken:\n\n                  audience: {KIND_ISSUER}\n"),
+        1,
+    );
+    assert_eq!(token_audiences(&spaced), [Some(KIND_ISSUER.to_owned())]);
+
+    // A flow-style source for another audience is read as that audience, and passes.
+    let other = "              - {serviceAccountToken: {audience: switchboard, path: token}}\n";
+    let changed = mounting.replacen(block, other, 1);
+    assert_eq!(
+        token_audiences(&volume(&changed, "api-token")),
+        [Some("switchboard".to_owned())]
+    );
+    assert_eq!(api_token_volumes(&changed), Vec::<String>::new());
+    no_api_token_mounted(&changed, &container(&changed, "gateway"), KIND_ISSUER);
+
+    // A source it cannot read panics, rather than being passed over.
+    for source in [
+        "              - serviceAccountToken: {path: token,\n                  audience: x}\n",
+        "              -\n                serviceAccountToken: {path: token}\n",
+        "              - \"serviceAccountToken\": {path: token}\n",
+        "              - serviceAccountToken: # no audience\n                  path: token\n",
+        "              - serviceAccountToken:\n                  {path: token}\n",
+        "              - serviceAccountToken:\n                  audience:\n                    x\n",
+    ] {
+        let changed = mounting.replacen(block, source, 1);
+        assert_ne!(changed, mounting, "{source}");
+        let api_token = volume(&changed, "api-token");
+        let read = std::panic::catch_unwind(|| token_audiences(&api_token));
+        assert!(read.is_err(), "{source}: {read:?}");
     }
 }
 
