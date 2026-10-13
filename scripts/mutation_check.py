@@ -536,8 +536,9 @@ mutate_all(
 
 # --- The snapshot loader's rules -----------------------------------------------------------
 #
-# Decision 0011, section 3: the nine rules PolicySnapshot::new checks for tools with a connector
-# entry, the refusal of a tool declared as the reach with no entry, and the withdrawal's derived snapshot
+# Decision 0011, section 3: the nine rules PolicySnapshot::new checks, 1 to 8 for tools with a
+# connector entry and 9 for every tool, a tool with no entry not being per-user (#163), the
+# refusal of a tool declared as the reach with no entry, and the withdrawal's derived snapshot
 # (section 4). tests/loader_rules.json has a refusing and a passing case for each rule, and
 # tests/properties.rs the reach property and that a withdrawal only narrows.
 
@@ -559,11 +560,14 @@ mutate("snapshot-rule-7-removed", "an entry narrowing per call may serve a tool 
        "        if entry.narrowing == Narrowing::Call && tool.declared_from != Some(DeclaredFrom::Arguments)",
        "        if false && tool.declared_from != Some(DeclaredFrom::Arguments)")
 mutate("snapshot-rule-8-removed", "a per-user entry's tool may be served to a team", SRC + "policy.rs",
-       "            if entry.credential == CredentialMode::PerUserGrant\n                && let Some(team)",
-       "            if false\n                && let Some(team)")
+       "                if entry.credential == CredentialMode::PerUserGrant\n                    && let Some(team)",
+       "                if false\n                    && let Some(team)")
 mutate("snapshot-rule-9-removed", "a propose tool on a shared entry may be served to a group", SRC + "policy.rs",
        "            if tool.classification == Classification::Propose\n",
        "            if false\n")
+mutate("snapshot-rule-9-skips-no-entry", "a propose tool with no connector entry may be served to a group", SRC + "policy.rs",
+       "                entry.is_some_and(|entry| entry.credential == CredentialMode::PerUserGrant);",
+       "                entry.is_none_or(|entry| entry.credential == CredentialMode::PerUserGrant);")
 mutate("snapshot-rule-3-any-text-a-date", "anything recorded as a reach test's date counts as a test", SRC + "policy.rs",
        "        let tested = entry.reach_tested_on.as_deref().is_some_and(is_date);",
        "        let tested = entry.reach_tested_on.is_some();")
@@ -1600,6 +1604,8 @@ mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate: not 
            (BOOT, RECEIPT_BEFORE_CONNECTING, "    let _ = snapshot;\n    Ok(())\n}\n"))
 mutate("gw-receipt-gate-config-path-skipped", "the JSON configuration's boot does not run the receipt-store gate", BOOT,
        RECEIPT_CONFIG_PATH, "")
+mutate("gw-boot-narrowing-config-path-skipped", "the JSON configuration's boot serves an entry narrowed per call or to the limit", BOOT,
+       "    narrowing_gate(&snapshot)?;\n", "")
 mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
            (BOOT, RECEIPT_REGISTRY_PATH, ""),
            (BOOT, REGISTRY_BOOT_POLICY,
@@ -2882,6 +2888,15 @@ mutate("registry-probe-open-accepted", "an entry whose probe found it open loads
        "                Some(probe) if probe.result == ProbeResult::NotShown => {\n")
 mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
        "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
+mutate("registry-system-duplicate-accepted", "two servers may have the same system", RR,
+       "        if let Some(first) = systems.insert(system.clone(), server.name.clone()) {",
+       "        if let Some(first) = systems.insert(system.clone(), server.name.clone()).filter(|_| false) {")
+mutate("registry-system-double-underscore-accepted", "a system may contain `__`", RR,
+       "        if server.system.contains(\"__\") || server.system.ends_with('_') {",
+       "        if server.system.ends_with('_') {")
+mutate("registry-system-trailing-underscore-accepted", "a system may end in `_`", RR,
+       "        if server.system.contains(\"__\") || server.system.ends_with('_') {",
+       "        if server.system.contains(\"__\") {")
 mutate("registry-address-unchecked", "any address is accepted", RR,
        "        let Some(host) = address_host(&server.address) else {",
        "        let Some(host) = address_host(&server.address).or(Some(server.identity.as_str())) else {")
@@ -2893,9 +2908,10 @@ mutate("registry-duplicate-upstream", "one upstream tool may be approved under t
        "        if !upstream.insert((", "        if false && !upstream.insert((")
 mutate("registry-unknown-server", "a tool on an unregistered server takes the first server", RR,
        "    let Some(server) = servers.get(&tool.server) else {", "    let Some(server) = servers.get(&tool.server).or(servers.values().next()) else {")
-mutate("registry-name-outside-system", "a tool may be named after any system", RR, "    if !under_system {", "    if false {")
-mutate("registry-name-nothing-after-system", "a tool may be named `{system}__` alone", RR,
-       "        .is_some_and(|rest| !rest.is_empty());", "        .is_some();")
+mutate("registry-name-outside-system", "a tool may be named after any system", RR,
+       "    if !under_system(&name, &server.system) {", "    if false {")
+mutate("registry-name-nothing-after-system", "a tool, or a reach check's tool, may be named `{system}__` alone", RR,
+       "        .is_some_and(|rest| !rest.is_empty())\n}", "        .is_some()\n}")
 mutate("registry-approved-at-offset", "an approval time may have no offset", RR, "    if at.offset.is_none() {", "    if false {")
 mutate("registry-hash-unchecked", "a definition changed after approval loads", RR,
        "    if computed != tool.definition_sha256 {", "    if false {")
@@ -2939,6 +2955,8 @@ mutate("registry-reach-test-not-required", "a server may have a reach and no rea
        "        if !reach.is_empty() && reach_test.is_none() {", "        if false {")
 mutate("registry-reach-check-not-required", "a server may have a reach and no reach check", RR,
        "            && server.reach_check.is_none()\n", "            && false\n")
+mutate("registry-reach-check-outside-system", "a reach check may name another server's tool or a malformed one", RR,
+       "            && !under_system(&check.tool, &server.system)\n", "            && false\n")
 mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file", RR,
        "    let surfaces = file\n",
        "    if servers.values().any(|server| server.reach_check.as_ref().is_some_and(|check| !routes.contains_key(&check.tool))) {\n"
@@ -4476,7 +4494,10 @@ mutate("demo-drift-withdrawal-unchecked", "the drift step passes a withdrawal ho
        """      [0-9]*:[0-9]*) check_at_most 0 $((DRIFT_INTERVAL + CALL_DEADLINE)) \\\n""")
 mutate("demo-drift-reapproval-unchecked", "the re-approval step passes without the withdrawals cleared", DRIVER,
        """  check "$(printf '%s\\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\\(.tool): \\(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \\\n""",
-       """  check "docs-team-a__list_documents: approved again;docs-team-b__list_documents: approved again" \\\n""")
+       """  check "$want" \\\n""")
+mutate("demo-drift-read-tools-unchecked", "the drift step passes with the read tools served, though their entries' reach check tool is withdrawn", DRIVER,
+       "  for tool in docs-team-a__list_documents docs-team-a__read_document docs-team-b__list_documents docs-team-b__read_document; do\n",
+       "  for tool in docs-team-a__list_documents docs-team-b__list_documents; do\n")
 mutate("demo-compose-mock-docs-admin-off-loopback", "Compose's mock-docs serves its admin endpoint to every container", COMPOSE,
        "      MOCK_DOCS_ADMIN_LISTEN: 127.0.0.1:9091\n", "      MOCK_DOCS_ADMIN_LISTEN: 0.0.0.0:9091\n")
 mutate("demo-kind-mock-docs-admin-service", "kind's mock-docs Service exposes the admin port", "deploy/kind/base/mock-docs.yaml",
@@ -4543,10 +4564,11 @@ mutate("gw-start-credential-unused", "a credential file no server uses is accept
 mutate("gw-start-per-user-grant-accepted", "a per-user grant is read from a file like a token", START,
        "            CredentialMode::PerUserGrant => {\n                return Err(StartError::PerUserGrant(server.name.clone()));\n            }\n",
        "            CredentialMode::PerUserGrant => &server.credential.reference,\n")
-mutate("gw-start-narrowing-accepted", "an entry narrowed per call or to the limit starts with one credential", START,
-       "        if server.narrowing != Narrowing::None {", "        if false {")
-mutate("gw-start-narrowing-call-accepted", "an entry narrowed per call starts with one credential", START,
-       "        if server.narrowing != Narrowing::None {", "        if server.narrowing == Narrowing::Limit {")
+# The narrowing gate is the boot gates' own (#163; gw-boot-narrowing-* below). The start runs
+# it before it reads a credential or connects to anything.
+mutate("gw-start-narrowing-after-credentials", "the start reads credentials and connects before it refuses a narrowed entry", BOOT,
+       "    narrowing_gate(snapshot)?;\n    receipt_gate(snapshot, development)\n}\n",
+       "    receipt_gate(snapshot, development)\n}\n")
 mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
@@ -4594,6 +4616,14 @@ mutate("gw-boot-proxied-connector-handed-out", "a proxied server's connector is 
        "            .filter(|registered| matches!(registered.reads, Reads::Adapter(_)))\n", "")
 mutate("gw-boot-registry-server-unconnected", "a registry server with no connector starts", BOOT,
        "        if !basis.connectors.contains(&route.server) {", "        if false {")
+# The narrowing gate (#163): nothing narrows a credential yet, so an entry narrowed per call or
+# to the limit is refused by the gates every registry's policy meets, at boot and on reload,
+# whoever wires the connectors. The JSON configuration's boot runs it too
+# (gw-boot-narrowing-config-path-skipped, beside the receipt-store gate's).
+mutate("gw-boot-narrowing-accepted", "boot::check_registry and a reload serve an entry narrowed per call or to the limit", BOOT,
+       "    narrowing_gate(policy.snapshot())?;\n", "")
+mutate("gw-boot-narrowing-call-accepted", "an entry narrowed per call passes the narrowing gate", BOOT,
+       "        .find(|entry| entry.narrowing != Narrowing::None)", "        .find(|entry| entry.narrowing == Narrowing::Limit)")
 mutate("gw-boot-registry-rule-issuer-unchecked", "a registry rule may name an untrusted issuer", BOOT,
        "            if !configured.contains(&rule.issuer) {", "            if false {")
 mutate("gw-boot-registry-reserved-profile", "a registry may define the reserved profile", BOOT,
@@ -4688,14 +4718,14 @@ mutate("gw-drift-poll-failure-withdraws", "a failed poll is read as an empty too
        "        let tools = match listed {\n",
        "        let listed = Ok::<_, ListError>(listed.unwrap_or_default());\n        let tools = match listed {\n")
 mutate("gw-drift-withdrawal-not-reapplied", "a reload drops every standing withdrawal, so a withdrawn tool is served again unapproved", DRIFT,
-       "            let keep = approved\n                .get(tool)\n                .is_some_and(|now| now.key == standing.key);\n",
-       "            let keep = false && approved.contains_key(tool);\n")
+       "                    && approved\n                        .get(*tool)\n                        .is_some_and(|now| now.key == standing.key)\n",
+       "                    && false\n                    && approved.contains_key(*tool)\n")
 mutate("gw-drift-reload-compares-derived", "a reload is compared with the derived policy served, whose revision no registry can have, so a changed file under the base revision is served while a withdrawal stands", RELOAD,
        "        let served = self.withdrawals.base();\n",
        "        let served = self.live.current();\n")
 mutate("gw-drift-reapproval-not-cleared", "a withdrawal is keyed by the tool's name alone, so approving it again does not clear it", DRIFT,
-       "                .is_some_and(|now| now.key == standing.key);\n",
-       "                .is_some_and(|now| now.key.tool == standing.key.tool);\n")
+       "                        .is_some_and(|now| now.key == standing.key)\n",
+       "                        .is_some_and(|now| now.key.tool == standing.key.tool)\n")
 mutate("gw-drift-revision-is-base", "a withdrawal's policy keeps the base revision, so its rows cannot tell it from the base", DRIFT,
        "            let revision = withdrawn_revision(state.base.revision(), &withdrawn);\n",
        "            let revision = state.base.revision().clone();\n")
@@ -4710,6 +4740,16 @@ mutate_all("gw-drift-first-pass-after-bind", "the first drift pass runs on the t
             "tokio::time::interval_at(tokio::time::Instant::now(), interval);"))
 mutate("gw-drift-interval-ceiling-unchecked", "a drift interval above 900 s loads", DRIFT,
        " || seconds > MAX_DRIFT_INTERVAL.as_secs() {", " {")
+# Decision 0013, section 5, noted on 2026-10-12 (#165): the gateway refuses to start with a drift
+# interval shorter than any proxied server's call deadline, its own or the default, so each poll
+# ends by the next tick. start.rs's own tests and tests/drift.rs watch it.
+mutate("gw-drift-interval-below-deadline-accepted", "a drift interval shorter than a server's call deadline starts, so a late poll holds back the next and a change outlasts its bound", START,
+       "        if deadline > interval {\n", "        if false && deadline > interval {\n")
+mutate("gw-drift-interval-default-deadline-uncounted", "a server the deployment file gives no bounds is not held to the default deadline, so an interval below the default starts", START,
+       "        let deadline = bounds.get(server).copied().unwrap_or_default().deadline;\n",
+       "        let Some(deadline) = bounds.get(server).map(|bounds| bounds.deadline) else {\n"
+       "            continue;\n"
+       "        };\n")
 mutate("gw-drift-entries-share-one-schedule", "the servers are polled together each interval, so a server that does not answer holds back every other server's next poll until its deadline", DRIFT,
        "        let mut entries = JoinSet::new();\n"
        "        for (server, connector) in &self.servers {\n"
@@ -4746,6 +4786,7 @@ mutate("gw-probe-open-withdraws", "a server the probe finds open has its tools w
        "                            let standing = Standing {\n"
        "                                key: approved.key.clone(),\n"
        "                                server: server.clone(),\n"
+       "                                canary: None,\n"
        "                            };\n"
        "                            (tool.clone(), standing)\n"
        "                        })\n"
@@ -4761,10 +4802,11 @@ mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for
        "    if finding != ProbeFinding::NotShown {\n")
 # Decision 0011, section 4: beside each poll, the reach check sends each entry's canary through
 # the gateway's own listener as the registry's workload. Only a successful canary withdraws the
-# entry's tools; a refusal holds and a failed check withdraws nothing. The first check runs
-# beside the schedule, so it delays no poll, and a check is judged only against the approvals
-# it began under. It reads past the largest answer a server may be allowed, so a widened canary
-# answered near that cap is a mismatch. tests/reach.rs watches each.
+# entry's tools; a refusal holds and a failed check withdraws nothing. Every check runs beside
+# the schedule, so it delays no poll, a tick makes none while the last is out, and a check is
+# judged only against the approvals it began under. It reads 8 times past the largest answer a
+# server may be allowed, plus the envelope, so a widened canary answered near that cap is a
+# mismatch, whatever numbers the gateway writes out again (#175). tests/reach.rs watches each.
 mutate("gw-reach-success-kept", "a canary the server answered withdraws nothing, so a widened reach stays served", DRIFT,
        "                self.withdraw(state, server, found);\n",
        "                let _ = (state, found);\n")
@@ -4780,13 +4822,35 @@ mutate("gw-reach-never-runs", "no reach check is ever made, so a widened reach i
        "    let Some((caller, deadline)) = &entry.reach else {\n",
        "    let Some((caller, deadline)) = entry.reach.as_ref().filter(|_| false) else {\n")
 mutate("gw-reach-first-check-delays-first-poll", "the first poll waits for the first reach check, so a check that hangs puts a changed definition past its withdrawal bound", DRIFT,
-       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
-       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
-       "    while first.join_next().await.is_some() {}\n    loop {\n")
+       "    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
+       "    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
+       "    while checking.join_next().await.is_some() {}\n    loop {\n")
+mutate("gw-reach-check-delays-next-poll", "each poll waits for the reach check made at its tick, so a check that hangs holds back the entry's next poll past the drift bound", DRIFT,
+       "            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n        }\n",
+       "            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n        }\n"
+       "        while checking.join_next().await.is_some() {}\n")
+mutate("gw-reach-checks-overlap", "a tick makes a reach check while the entry's last is still out, so checks of one entry pile up", DRIFT,
+       "        if checking.is_empty() {\n", "        if true {\n")
 mutate("gw-reach-answer-cap-no-headroom", "the reach check reads no more than a server's largest answer, so the gateway's answer to a widened canary near that cap is a failed check, not a mismatch", GW + "reach.rs",
-       "MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "MAX_SERVER_RESULT_BYTES;\n")
+       "    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "    MAX_SERVER_RESULT_BYTES;\n")
+mutate("gw-reach-answer-cap-no-expansion", "the reach check reads only the envelope past a server's largest answer, so the gateway's answer to a widened canary of compact numbers near that cap, written out again longer, is a failed check, not a mismatch", GW + "reach.rs",
+       "    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n",
+       "    MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n")
 mutate("gw-reach-stale-judgment-kept", "a mismatch is judged against the approvals in force when the answer comes, so a check begun before a new approval withdraws it", DRIFT,
        "                            && started.get(*name) == Some(&approved.key)\n", "")
+# Decision 0011, section 4, noted on 2026-10-12 (#172): a withdrawal of an entry's reach check
+# tool withdraws the entry's other tools, which stand while it does and clear with it. Each poll
+# still judges them, and one whose own definition changes is withdrawn for that cause, so the
+# reach check tool's new approval does not serve it. tests/drift.rs watches each.
+mutate("gw-drift-canary-withdrawal-leaves-entry", "a withdrawn reach check tool leaves its entry's other tools served, though the entry can no longer be checked", DRIFT,
+       "        for (tool, standing) in dependents(&state) {\n",
+       "        for (tool, standing) in dependents(&state).into_iter().take(0) {\n")
+mutate("gw-drift-canary-clear-leaves-dependents", "a new approval of the reach check tool leaves the tools withdrawn with it withdrawn", DRIFT,
+       "                standing.canary.is_none()\n                    && approved\n",
+       "                standing.canary.is_some()\n                    || approved\n")
+mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's reach check tool is never judged, so its changed definition is served once the reach check tool alone is approved again", DRIFT,
+       "            .is_some_and(|standing| standing.canary.is_none())\n",
+       "            .is_some()\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------

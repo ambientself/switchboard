@@ -7,14 +7,19 @@
 //! row records the instance that began it.
 //!
 //! [`prepare`] reads the registry file. Before anything else, it refuses the identity and audit
-//! opt-outs outside a development build, and runs the receipt-store gate (decision 0014,
-//! section 4), so that a refusal of either comes before any connection is made. Then it checks
+//! opt-outs outside a development build, refuses a server whose credential is to be narrowed,
+//! which nothing narrows yet, and runs the receipt-store gate (decision 0014, section 4), so
+//! that each refusal comes before any credential is read or connection made. Then it checks
 //! where each proxied server is reached (decision 0013, section 3): an `https` server needs the
 //! CA file `[servers.<name>] ca_file` names, an `http` server may have none, and an address
 //! that is an IP literal the connector would never connect to is refused, loopback among them
 //! outside a development build. It refuses a registry whose entries have a reach check when the
 //! deployment file gives no `[drift] reach_*` settings, naming those entries, since their reach
-//! would never be checked (decision 0011, section 4). Then it loads each proxied server's
+//! would never be checked (decision 0011, section 4). It refuses a `[drift] interval_seconds`
+//! shorter than any proxied server's call deadline, the one `[servers.<name>]` sets or the
+//! default, naming the server, its deadline and the interval: a poll that answered late would
+//! hold back the next, and a changed definition could be served for longer than one interval
+//! plus the deadline (decision 0013, section 5). Then it loads each proxied server's
 //! credential, builds a [`ProxyConnector`] per server with its destination and CA file and with
 //! the deadline and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each
 //! in a [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
@@ -65,7 +70,7 @@ use connector_proxy::{
     CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
     UpstreamError,
 };
-use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer, Narrowing};
+use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
 use gateway_identity::Clock;
 use gateway_registry::{Destination, Registry, RegistryError};
 use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
@@ -131,15 +136,6 @@ pub enum StartError {
         "server `{0}`'s credential is a per-user grant, which this gateway does not support yet"
     )]
     PerUserGrant(ConnectorName),
-    /// A server's credential is to be narrowed per call or to the caller's limit. The gateway
-    /// sends one credential for every call to a server until the custodian client (#12)
-    /// narrows them, so such an entry would skip rule 5 with a credential that is not narrowed.
-    #[error(
-        "server `{0}` says its credential is narrowed per call or to the caller's limit, which \
-         this gateway cannot do yet: it sends the same credential on every call, so only \
-         narrowing \"none\" is supported"
-    )]
-    NarrowingNotBuilt(ConnectorName),
     /// A credential file is given that no server uses.
     #[error("credential `{0}` is given a file in `[credentials]` but no server uses it")]
     UnusedCredential(String),
@@ -158,6 +154,24 @@ pub enum StartError {
         named(.0)
     )]
     NoReachSettings(Vec<ConnectorName>),
+    /// The drift interval is shorter than a proxied server's call deadline, so a poll that
+    /// answers late would hold back the next and a changed definition could stay served for
+    /// longer than one interval plus the deadline (decision 0013, section 5).
+    #[error(
+        "`drift.interval_seconds` is {interval} s, shorter than server `{server}`'s call deadline \
+         of {deadline} s; set the interval to at least every proxied server's call deadline, so \
+         a changed definition is withdrawn within one interval plus the deadline",
+        interval = .interval.as_secs(),
+        deadline = .deadline.as_secs()
+    )]
+    IntervalBelowDeadline {
+        /// The server.
+        server: ConnectorName,
+        /// Its call deadline: the one `[servers.<name>]` sets, or the default.
+        deadline: Duration,
+        /// The drift interval.
+        interval: Duration,
+    },
     /// An `https` server has no CA file in the deployment file (decision 0013, section 3).
     #[error(
         "server `{0}` has an https address, so `[servers.{0}]` must name the CA file its \
@@ -329,6 +343,11 @@ async fn prepare_with(
     };
     destinations(&registry, &deployment.ca_files, loopback)?;
     reach_settings(&registry, deployment.reach.as_ref())?;
+    drift_interval(
+        registry.servers().keys(),
+        &deployment.servers,
+        deployment.drift_interval,
+    )?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
@@ -538,6 +557,31 @@ fn reach_settings(registry: &Registry, reach: Option<&ReachSettings>) -> Result<
     Ok(())
 }
 
+/// Refuses a drift `interval` shorter than the call deadline of any of `servers`, the
+/// registry's proxied servers: the one `bounds` sets for it, or the default (decision 0013,
+/// section 5, as noted on 2026-10-12). Each server is polled one poll at a time, and a poll
+/// takes up to the deadline, so only then does each poll end by the next tick, and a changed
+/// definition is withdrawn within one interval plus the deadline. The deadlines are the
+/// deployment file's, which is read only at start, and a reload that changes the registry's
+/// servers is refused, so this holds until the gateway stops.
+fn drift_interval<'a>(
+    servers: impl IntoIterator<Item = &'a ConnectorName>,
+    bounds: &BTreeMap<ConnectorName, ServerLimits>,
+    interval: Duration,
+) -> Result<(), StartError> {
+    for server in servers {
+        let deadline = bounds.get(server).copied().unwrap_or_default().deadline;
+        if deadline > interval {
+            return Err(StartError::IntervalBelowDeadline {
+                server: server.clone(),
+                deadline,
+                interval,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The connector's class of a registry entry's destination.
 pub(crate) fn destination(destination: Destination) -> connector_proxy::Destination {
     match destination {
@@ -720,12 +764,6 @@ fn credentials(
                 return Err(StartError::PerUserGrant(server.name.clone()));
             }
         };
-        // Decision 0011 lets an entry narrowed per call or to the limit skip the whole-reach
-        // check (rule 5) only because its credential really is narrowed. Nothing narrows one
-        // yet: the same credential goes on every call to a server.
-        if server.narrowing != Narrowing::None {
-            return Err(StartError::NarrowingNotBuilt(server.name.clone()));
-        }
         let Some(path) = files.get(reference) else {
             return Err(StartError::NoCredentialFile {
                 server: server.name.clone(),
@@ -866,6 +904,54 @@ mod tests {
             wired("set", &set).unwrap().call_deadlines(),
             &BTreeMap::from([(ConnectorName::new("mock-docs"), Duration::from_secs(17))])
         );
+    }
+
+    /// A drift interval shorter than a proxied server's call deadline is refused, naming the
+    /// server, its deadline and the interval; one equal to every deadline is accepted. A server
+    /// the deployment file gives no bounds has the default deadline, and it counts too: the
+    /// file cannot set an interval below it, but a deployment built another way can.
+    #[test]
+    fn a_drift_interval_shorter_than_a_call_deadline_is_refused() {
+        let servers = [ConnectorName::new("docs-a"), ConnectorName::new("docs-b")];
+        let bounds = BTreeMap::from([(
+            ConnectorName::new("docs-b"),
+            ServerLimits {
+                deadline: Duration::from_secs(12),
+                ..ServerLimits::default()
+            },
+        )]);
+        let refused = drift_interval(&servers, &bounds, Duration::from_secs(11)).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                StartError::IntervalBelowDeadline { server, deadline, interval }
+                    if server.as_str() == "docs-b"
+                        && *deadline == Duration::from_secs(12)
+                        && *interval == Duration::from_secs(11)
+            ),
+            "{refused:?}"
+        );
+        let said = refused.to_string();
+        for part in [
+            "`drift.interval_seconds` is 11 s",
+            "server `docs-b`'s call deadline of 12 s",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert!(drift_interval(&servers, &bounds, Duration::from_secs(12)).is_ok());
+
+        let default = connector_proxy::DEFAULT_DEADLINE;
+        let below = default - Duration::from_secs(1);
+        let refused = drift_interval(&servers, &BTreeMap::new(), below).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                StartError::IntervalBelowDeadline { server, deadline, .. }
+                    if server.as_str() == "docs-a" && *deadline == default
+            ),
+            "{refused:?}"
+        );
+        assert!(drift_interval(&servers, &BTreeMap::new(), default).is_ok());
     }
 
     /// Bounds for a server the registry does not name refuse the start, naming it.
@@ -1312,63 +1398,35 @@ mod tests {
     }
 
     /// An entry whose credential is to be narrowed per call or to the caller's limit is
-    /// refused at start: the gateway sends the same credential on every call, so the entry
-    /// would skip rule 5's whole-reach check with a credential that is not narrowed. Narrowing
-    /// "none" starts.
-    #[test]
-    fn a_narrowed_credential_is_refused_and_none_starts() {
-        let directory = std::env::temp_dir().join(format!(
-            "switchboard-start-narrowing-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let credential = directory.join("docs-credential");
-        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
-        let files = BTreeMap::from([("docs-credential".to_owned(), credential)]);
-        // No tool is approved, so rule 7 (a tool on an entry narrowed per call declares its
-        // resources from its arguments) has nothing to refuse and each narrowing loads.
-        let text = crate::boot::tests::registry_text("read", false, "r1");
-        let tools = text.find("[[tools]]").unwrap();
-        let surfaces = text.find("[[surfaces]]").unwrap();
-        let text = format!("tools = []\n{}{}", &text[..tools], &text[surfaces..]);
-        let before = gateway_registry::binding_sha256(&crate::boot::tests::server());
-        let mut outcomes = Vec::new();
-        for (narrowing, written) in [
-            (Narrowing::Call, "call"),
-            (Narrowing::Limit, "limit"),
-            (Narrowing::None, "none"),
-        ] {
-            let mut server = crate::boot::tests::server();
-            server.narrowing = narrowing;
-            let text = text
-                .replace(
-                    "narrowing = \"none\"",
-                    &format!("narrowing = \"{written}\""),
-                )
-                .replace(&before, &gateway_registry::binding_sha256(&server));
-            let registry = Registry::from_toml_str(&text).unwrap();
-            assert_eq!(
-                registry.servers().values().next().unwrap().narrowing,
-                narrowing
-            );
-            outcomes.push(credentials(&registry, &files).map(|_| ()));
-        }
-        std::fs::remove_dir_all(&directory).unwrap();
-        for outcome in &outcomes[..2] {
-            match outcome {
-                Err(refused @ StartError::NarrowingNotBuilt(server)) => {
+    /// refused at start, before its credential is read or anything is connected: the gateway
+    /// sends the same credential on every call, so the entry would skip rule 5's whole-reach
+    /// check with a credential that is not narrowed. The refusal is the boot gates' own, which
+    /// `boot::before_connecting` runs. Narrowing "none" passes it, and the start goes on to
+    /// the next check, where its loopback address is refused.
+    #[tokio::test]
+    async fn a_narrowed_credential_is_refused_before_it_is_read_and_none_goes_on() {
+        let counted = Counted::start().await;
+        for written in ["call", "limit", "none"] {
+            let directory = std::env::temp_dir().join(format!(
+                "switchboard-start-narrowing-{written}-{}",
+                std::process::id()
+            ));
+            let text = crate::boot::tests::narrowed_registry_text(written, "r1");
+            let deployment = deployment(&directory, &text, &counted, false, false);
+            let refused = refused_as_release(deployment).await;
+            std::fs::remove_dir_all(&directory).unwrap();
+            match (written, &refused) {
+                ("none", StartError::DestinationRefused { server, .. }) => {
                     assert_eq!(server.as_str(), "mock-docs");
-                    assert_eq!(
-                        refused.to_string(),
-                        "server `mock-docs` says its credential is narrowed per call or to the \
-                         caller's limit, which this gateway cannot do yet: it sends the same \
-                         credential on every call, so only narrowing \"none\" is supported"
-                    );
                 }
-                other => panic!("expected the narrowing refusal, got {other:?}"),
+                ("none", other) => panic!("expected the loopback refusal, got {other}"),
+                (_, StartError::Boot(refused)) => {
+                    crate::boot::tests::assert_narrowing_refused(refused);
+                }
+                (_, other) => panic!("{written}: expected the narrowing refusal, got {other}"),
             }
         }
-        assert!(outcomes[2].is_ok(), "{:?}", outcomes[2]);
+        assert_eq!(counted.connections(), 0, "something was connected to first");
     }
 
     /// Decision 0014, section 4: a release build refuses each opt-out before it connects to

@@ -261,7 +261,9 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::boot::tests::{registry, registry_text, release_basis};
+    use crate::boot::tests::{
+        assert_narrowing_refused, narrowed_registry_text, registry, registry_text, release_basis,
+    };
 
     /// A log writer the test reads back.
     #[derive(Clone, Default)]
@@ -340,5 +342,35 @@ mod tests {
         let read = registry_text("read", true, "r4");
         reloader.reload(Path::new("registry.toml"), read.as_bytes());
         assert_eq!(live.current().revision().as_str(), "r4");
+    }
+
+    /// A reload cannot change a server, so a narrowed entry reaches one only if the gateway
+    /// started with it, by a path that did not run the boot gates. The reload still runs the
+    /// narrowing gate, refuses the file and keeps the policy served. Narrowing "none" reloads.
+    #[test]
+    fn a_reload_refuses_an_entry_whose_credential_is_to_be_narrowed() {
+        for written in ["call", "limit", "none"] {
+            let started = Registry::from_toml_str(&narrowed_registry_text(written, "r1")).unwrap();
+            let live = Arc::new(LivePolicy::new(
+                ServedPolicy::from_registry(&started).unwrap(),
+            ));
+            let reloader = Reloader::new(
+                live.clone(),
+                release_basis(started),
+                Freshness::new(None, Instant::now()),
+            );
+            let next = Registry::from_toml_str(&narrowed_registry_text(written, "r2")).unwrap();
+            let applied = reloader.apply(&next);
+            if written == "none" {
+                assert_eq!(applied.unwrap().as_str(), "r2");
+                assert_eq!(live.current().revision().as_str(), "r2");
+            } else {
+                match applied {
+                    Err(ReloadError::Boot(refused)) => assert_narrowing_refused(&refused),
+                    other => panic!("{written}: expected the narrowing refusal, got {other:?}"),
+                }
+                assert_eq!(live.current().revision().as_str(), "r1");
+            }
+        }
     }
 }

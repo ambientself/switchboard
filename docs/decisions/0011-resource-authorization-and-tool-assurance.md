@@ -254,6 +254,17 @@ approval" then holds only on a replica that has not restarted since the withdraw
 withdrawal is logged at ERROR and alerted on, so that a person makes it standing by a new
 approval or a registry edit. Persisted withdrawals come in milestone 6.
 
+*Note added 2026-10-12:* when an entry's reach check tool is withdrawn, its other tools are
+withdrawn too, because the entry can no longer be checked: the check calls that tool, and fails
+without a call while it is not served. A withdrawal for any cause, a changed definition, a tool
+no longer listed or a reach mismatch, that takes the tool an entry's reach check calls takes
+every other tool of the entry with it, in the same snapshot, each logged at ERROR with the
+cause `reach check tool withdrawn`. Nothing is served under the entry's credential until the
+reach check tool is served again. Those withdrawals stand while its withdrawal does, whatever
+the other tools' own approvals, and a new approval of the reach check tool, or of the whole
+entry, clears them. A tool withdrawn for a cause of its own still needs a new approval of its
+own. Another entry's tools are not touched. The owner accepted this on 2026-10-12 (#172).
+
 ### 5. Where each part of the decision is made
 
 | Part | Made by | When | Can it allow? | On the audit record |

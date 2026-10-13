@@ -119,10 +119,15 @@ HANG_ALLOWANCE_MS=1500
 # fails an answer that came well before the deadline.
 CLIENT_EARLY_MS=50
 # The drift step has mock-docs serve this description of list_documents in place of the one
-# approved. Both entries list it, so both entries' list tools are withdrawn, and the revision
-# served is then this one, the literal derived revision of decision 0013, section 6.
+# approved. Both entries list it, so both entries' list tools are withdrawn. The list tool is
+# each entry's reach check tool, so each entry's read tool is withdrawn with it (decision 0011,
+# section 4), and the revision served is then this one, the literal derived revision of decision
+# 0013, section 6.
 DRIFTED_DESCRIPTION="List the names of the documents in one project, and whatever else it holds."
-DRIFTED_REVISION="$REVISION+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents"
+DRIFTED_REVISION="$REVISION+withdrawn:docs-team-a__list_documents,docs-team-a__read_document,docs-team-b__list_documents,docs-team-b__read_document"
+# Why the gateway drops the withdrawal of a tool withdrawn with its entry's reach check tool, once
+# that tool is approved again (crates/gateway, drift.rs).
+CHECK_TOOL_CLEARED="its entry's reach check tool is no longer withdrawn"
 # The reach check (decision 0011, section 4; deploy/*/config/gateway.toml): beside each poll, the
 # gateway calls its own listener's registry-reach surface as the registry's own workload, in team
 # REACH_TEAM, naming each entry's canary, the other team's project, which mock-docs must refuse.
@@ -1102,15 +1107,21 @@ check_refused_at_load() {
 
 # check_withdrawal EVENTS CHANGED: the tool_withdrawn lines since mock-docs began serving the
 # drifted description at CHANGED (epoch seconds). Each list tool, docs-team-a's and
-# docs-team-b's, was withdrawn once, for a changed definition, from base REVISION, within the
-# drift interval plus the call deadline of CHANGED (decision 0013, section 5); and the revision
-# served after the last withdrawal is DRIFTED_REVISION, the literal derived one (section 6).
+# docs-team-b's, was withdrawn once, for a changed definition, from base REVISION, and each
+# entry's read tool once with it, since the list tool is the entry's reach check tool (decision
+# 0011, section 4), each within the drift interval plus the call deadline of CHANGED (decision
+# 0013, section 5); and the revision served after the last withdrawal is DRIFTED_REVISION, the
+# literal derived one (section 6).
 check_withdrawal() {
-  local events=$1 changed=${2%.*} tool at
-  for tool in docs-team-a__list_documents docs-team-b__list_documents; do
+  local events=$1 changed=${2%.*} tool cause why at
+  for tool in docs-team-a__list_documents docs-team-a__read_document docs-team-b__list_documents docs-team-b__read_document; do
+    case $tool in
+      *__list_documents) cause="definition changed" why="for a changed definition" ;;
+      *) cause="reach check tool withdrawn with ${tool%__*}__list_documents" why="with its entry's reach check tool, ${tool%__*}__list_documents" ;;
+    esac
     # shellcheck disable=SC2016 # jq's own variables
-    check "$(printf '%s\n' "$events" | jq -r --arg tool "$tool" 'select(.tool == $tool) | "\(.cause) from \(.base)"' 2>/dev/null | sort | uniq -c | awk '{ $1 = $1 " x"; print }')" \
-      "1 x definition changed from $REVISION" "the gateway withdrew $tool once, for a changed definition, from revision $REVISION"
+    check "$(printf '%s\n' "$events" | jq -r --arg tool "$tool" 'select(.tool == $tool) | "\(.cause)\(if .reach_check_tool then " with \(.reach_check_tool)" else "" end) from \(.base)"' 2>/dev/null | sort | uniq -c | awk '{ $1 = $1 " x"; print }')" \
+      "1 x $cause from $REVISION" "the gateway withdrew $tool once, $why, from revision $REVISION"
     # shellcheck disable=SC2016 # jq's own variables
     at=$(printf '%s\n' "$events" | jq -r --arg tool "$tool" 'select(.tool == $tool) | .timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601' 2>/dev/null | head -n 1)
     case "$at:$changed" in
@@ -1120,7 +1131,7 @@ check_withdrawal() {
     esac
   done
   check "$(printf '%s\n' "$events" | tail -n 1 | jq -r '.revision' 2>/dev/null)" "$DRIFTED_REVISION" \
-    "the revision served after both withdrawals is the literal derived one"
+    "the revision served after all four withdrawals is the literal derived one"
 }
 
 # check_drift_rows ROWS REVISION LISTED CALL: team-a's rows from one workload run of the drift
@@ -1144,23 +1155,28 @@ check_drift_rows() {
 # check_reapproval EVENTS REVISION [WHAT TOOL...]: the gateway's lines since the registry
 # approving TOOLs again, under REVISION, was installed (policy_reloaded, policy_withdrawal_cleared
 # and tool_withdrawn). It served REVISION itself, with no withdrawal derived from it, and dropped
-# the TOOLs' withdrawals, and no other, as approved again; it withdrew nothing. WHAT names the
-# TOOLs in the check. With no TOOL, they are both list tools, as the drift step approves them.
+# the TOOLs' withdrawals, and no other, as approved again; it withdrew nothing. A TOOL written
+# `TOOL: REASON` was dropped for REASON instead. WHAT says which withdrawals the check wants
+# dropped, and why. With no TOOL, they are both list tools', as the drift step approves them,
+# approved again, and both read tools', withdrawn with them as their entries' reach check tools,
+# since those are no longer withdrawn.
 check_reapproval() {
-  local events=$1 revision=$2 what="both list tools'" want tool
+  local events=$1 revision=$2 want tool
+  local what="both list tools' withdrawals cleared as approved again, and both read tools' as their entry's reach check tool no longer withdrawn"
   shift 2
   if [ $# -gt 0 ]; then
     what=$1
     shift
   else
-    set -- docs-team-a__list_documents docs-team-b__list_documents
+    set -- docs-team-a__list_documents docs-team-b__list_documents \
+      "docs-team-a__read_document: $CHECK_TOOL_CLEARED" "docs-team-b__read_document: $CHECK_TOOL_CLEARED"
   fi
-  want=$(for tool in "$@"; do echo "$tool: approved again"; done | sort | paste -sd ';' -)
+  want=$(for tool in "$@"; do case $tool in *': '*) echo "$tool" ;; *) echo "$tool: approved again" ;; esac; done | sort | paste -sd ';' -)
   check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_reloaded") | .revision' 2>/dev/null | head -n 1)" \
     "$revision" "the gateway serves revision $revision, with no withdrawal"
   check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\(.tool): \(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \
     "$want" \
-    "$what withdrawals cleared as approved again"
+    "$what"
   check "$(printf '%s\n' "$events" | jq -c 'select(.event == "tool_withdrawn")' 2>/dev/null | awk 'END { print NR }')" 0 \
     "the drift pass withdrew nothing since"
 }
@@ -1288,36 +1304,37 @@ isolation_steps() {
 }
 
 # drift_steps: decision 0013, sections 5 to 7 and the acceptance scenarios of section 11: a
-# changed definition withdrawn within the interval plus the deadline, rows under the literal
-# derived revision, the withdrawal standing after the definition is restored, and a new approval
-# of the same definition clearing it. Nothing here approves a changed definition.
+# changed definition withdrawn within the interval plus the deadline, with the read tools of the
+# entries whose reach check tool it is (decision 0011, section 4), rows under the literal derived
+# revision, the withdrawals standing after the definition is restored, and a new approval of the
+# same definition clearing them. Nothing here approves a changed definition.
 drift_steps() {
   local list
   list=$(team_entry team-a)__list_documents
-  step "drift: mock-docs serves another description of list_documents, which both entries list; the gateway withdraws both list tools within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline"
+  step "drift: mock-docs serves another description of list_documents, which both entries list as their reach check tool; the gateway withdraws both list tools, and both read tools with them, within the $DRIFT_INTERVAL s interval plus the $CALL_DEADLINE s deadline"
   step_mark
   local changed=$MARK_EPOCH changed_at=$MARK_TIME
   DRIFTED=1
-  WITHDRAWAL_HELD="the drift step's withdrawals of docs-team-a__list_documents and docs-team-b__list_documents"
+  WITHDRAWAL_HELD="the drift step's withdrawals of docs-team-a__list_documents and docs-team-b__list_documents, and of both read tools with them"
   mock_admin PUT /admin/definitions/list_documents "{\"description\": \"$DRIFTED_DESCRIPTION\"}" | sed 's/^/    mock-docs: /'
-  if wait_for_events "the gateway withdrew both list tools" $((DRIFT_INTERVAL + CALL_DEADLINE + 30)) 2 "$changed_at" \
+  if wait_for_events "the gateway withdrew both list tools and both read tools" $((DRIFT_INTERVAL + CALL_DEADLINE + 30)) 4 "$changed_at" \
     'select(.event == "tool_withdrawn")'; then
     printf '%s\n' "$EVENTS" | sed 's/^/    /'
     check_withdrawal "$EVENTS" "$changed"
   fi
   step_mark
-  workload "team-a after the withdrawal" team-a withdrawn list
-  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$DRIFTED_REVISION" "$(team_entry team-a)__read_document" "deny unknown_tool"
+  workload "team-a after the withdrawal" team-a withdrawn all
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$DRIFTED_REVISION" "" "deny unknown_tool"
 
-  step "drift: mock-docs serves the approved description again; the list tools stay withdrawn until they are approved again (decision 0013, section 7)"
+  step "drift: mock-docs serves the approved description again; the tools stay withdrawn until the list tools are approved again (decision 0013, section 7)"
   step_mark
   local restored_at=$MARK_TIME
   mock_admin DELETE /admin/definitions/list_documents | sed 's/^/    mock-docs: /'
   DRIFTED=""
   wait_for_polls 2
   step_mark
-  workload "team-a after the description is restored" team-a withdrawn list
-  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$DRIFTED_REVISION" "$(team_entry team-a)__read_document" "deny unknown_tool"
+  workload "team-a after the description is restored" team-a withdrawn all
+  check_drift_rows "$(step_rows "$MARK_EPOCH")" "$DRIFTED_REVISION" "" "deny unknown_tool"
   if fetch "the gateway's log" gateway_log "$restored_at"; then
     check "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared")' | awk 'END { print NR }')" 0 \
       "nothing cleared the withdrawals since"
@@ -1326,7 +1343,7 @@ drift_steps() {
   local served=$DEMO_DIR/registry-served.toml variant=$DEMO_DIR/registry-variant.toml stamp revision
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   revision=$VARIANT_REVISION-reapproved-$stamp
-  step "drift: both list tools approved again, unchanged, with a new approved_at, under revision $revision; the withdrawals clear and the next polls leave them served"
+  step "drift: both list tools approved again, unchanged, with a new approved_at, under revision $revision; the withdrawals clear, the read tools' with them, and the next polls leave them served"
   served_registry >"$served"
   if ! reapproval_variant "$revision" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$list" "$(team_entry team-b)__list_documents" <"$served" >"$variant"; then
     fail "the registry served approves both list tools, so the variant can be made from it"
@@ -1525,7 +1542,7 @@ reach_steps() {
     'select(.event == "reach_held" and .server == "docs-team-a")' || true
   if fetch "the gateway's log" gateway_log "$approved_at"; then
     check_reapproval "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared" or .event == "tool_withdrawn")')" \
-      "$revision" "both of docs-team-a's tools'" "$list" "$read"
+      "$revision" "both of docs-team-a's tools' withdrawals cleared as approved again" "$list" "$read"
   fi
   step_mark
   workload "team-a after the new approval" team-a served

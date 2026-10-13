@@ -3903,10 +3903,15 @@ fn the_demonstrations_rely_on_the_codes_caps_deadline_and_interval() {
         assert!(!text.contains("deadline_seconds"), "{config}");
     }
     let revision = driver_value("REVISION");
-    let withdrawn = ["docs-team-a__list_documents", "docs-team-b__list_documents"]
-        .into_iter()
-        .map(|name| gateway_core::ToolName::parse(name).unwrap())
-        .collect();
+    let withdrawn = [
+        "docs-team-a__list_documents",
+        "docs-team-a__read_document",
+        "docs-team-b__list_documents",
+        "docs-team-b__read_document",
+    ]
+    .into_iter()
+    .map(|name| gateway_core::ToolName::parse(name).unwrap())
+    .collect();
     assert_eq!(
         driver_value("DRIFTED_REVISION").replace("$REVISION", &revision),
         gateway::withdrawn_revision(&gateway_core::PolicyRevision::new(revision), &withdrawn)
@@ -4543,6 +4548,10 @@ fn the_overload_step_needs_one_call_over_the_team_cap_refused_and_team_b_answere
     }
 }
 
+/// The drift step's derived revision: both list tools withdrawn, and both read tools with them.
+const DRIFTED: &str = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-a__read_document,\
+                       docs-team-b__list_documents,docs-team-b__read_document";
+
 /// A tool_withdrawn line for `tool`, `seconds` after 10:00:00, deriving `revision`.
 fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> String {
     log_line(
@@ -4552,11 +4561,23 @@ fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> Stri
     )
 }
 
+/// The tool_withdrawn line of `entry`'s read tool, withdrawn with its list tool, its reach check
+/// tool, `seconds` after 10:00:00, deriving `revision`.
+fn read_withdrawn_line(entry: &str, seconds: u32, revision: &str) -> String {
+    log_line(
+        &format!("2026-10-12T10:00:{seconds:02}.250000Z"),
+        json!({"event": "tool_withdrawn", "tool": format!("{entry}__read_document"),
+               "server": entry, "cause": "reach check tool withdrawn",
+               "reach_check_tool": format!("{entry}__list_documents"),
+               "base": "demo-10", "revision": revision}),
+    )
+}
+
 #[test]
-fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revision() {
+fn the_drift_step_needs_every_tool_withdrawn_in_time_under_the_literal_revision() {
     // 10:00:00 UTC on 2026-10-12, and a little more.
     let changed = "1791799200.400000";
-    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = DRIFTED;
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
@@ -4566,12 +4587,16 @@ fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revi
             &[("log", &lines.join("\n"))],
         )
     };
-    let b = withdrawn_line(
-        "docs-team-b__list_documents",
-        7,
-        "definition changed",
-        "demo-10+withdrawn:docs-team-b__list_documents",
-    );
+    let team_b = "demo-10+withdrawn:docs-team-b__list_documents,docs-team-b__read_document";
+    let b = vec![
+        withdrawn_line(
+            "docs-team-b__list_documents",
+            7,
+            "definition changed",
+            team_b,
+        ),
+        read_withdrawn_line("docs-team-b", 7, team_b),
+    ];
     let a = |seconds: u32| {
         withdrawn_line(
             "docs-team-a__list_documents",
@@ -4580,48 +4605,67 @@ fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revi
             drifted,
         )
     };
-    assert_all_passed("withdrawn", &run_on("withdrawn", &[b.clone(), a(12)]), 5);
+    let a_read = |seconds: u32| read_withdrawn_line("docs-team-a", seconds, drifted);
+    let with = |more: &[String]| [b.clone(), more.to_vec()].concat();
+    assert_all_passed(
+        "withdrawn",
+        &run_on("withdrawn", &with(&[a(12), a_read(12)])),
+        9,
+    );
     for (case, lines, failure) in [
         (
             "late",
-            vec![b.clone(), a(40)],
+            with(&[a(40), a_read(40)]),
             "it was withdrawn within the 10 s interval plus the 5 s deadline of the change (seconds) (got 40",
         ),
         (
             "one",
-            vec![a(12)],
+            vec![a(12), a_read(12)],
             "the gateway withdrew docs-team-b__list_documents once",
         ),
         (
             "twice",
-            vec![b.clone(), a(12), a(14)],
+            with(&[a(12), a_read(12), a(14)]),
             "the gateway withdrew docs-team-a__list_documents once",
         ),
         (
+            "read tool kept",
+            with(&[a(12)]),
+            "the gateway withdrew docs-team-a__read_document once, with its entry's reach check tool, docs-team-a__list_documents",
+        ),
+        (
+            "read tool for another cause",
+            with(&[
+                a(12),
+                withdrawn_line(
+                    "docs-team-a__read_document",
+                    12,
+                    "definition changed",
+                    drifted,
+                ),
+            ]),
+            "the gateway withdrew docs-team-a__read_document once, with its entry's reach check tool",
+        ),
+        (
             "unlisted",
-            vec![
-                b.clone(),
+            with(&[
                 withdrawn_line(
                     "docs-team-a__list_documents",
                     12,
                     "no longer listed",
                     drifted,
                 ),
-            ],
+                a_read(12),
+            ]),
             "the gateway withdrew docs-team-a__list_documents once, for a changed definition",
         ),
         (
             "not the literal revision",
-            vec![
-                b,
-                withdrawn_line(
-                    "docs-team-a__list_documents",
-                    12,
-                    "definition changed",
-                    "demo-10+withdrawn:2",
-                ),
-            ],
-            "the revision served after both withdrawals is the literal derived one (got 'demo-10+withdrawn:2'",
+            with(&[
+                a(12),
+                read_withdrawn_line("docs-team-a", 12, "demo-10+withdrawn:4"),
+            ]),
+            "the revision served after all four withdrawals is the literal derived one (got 'demo-10+withdrawn:4'",
         ),
     ] {
         assert_fails(case, &run_on(case, &lines), failure);
@@ -4647,7 +4691,7 @@ fn drift_rows(revision: &str, listed: &[&str], decision: &str, result: &str) -> 
 
 #[test]
 fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
-    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = DRIFTED;
     let read = "docs-team-a__read_document";
     let both = "docs-team-a__list_documents,docs-team-a__read_document";
     let run_on = |name: &str, rows: Value, revision: &str, listed: &str, call: &str| {
@@ -4657,14 +4701,14 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
             &[("rows", &rows.to_string())],
         )
     };
-    let withdrawn = drift_rows(drifted, &[read], "deny", "unknown_tool");
+    let withdrawn = drift_rows(drifted, &[], "deny", "unknown_tool");
     assert_all_passed(
         "withdrawn",
         &run_on(
             "withdrawn",
             withdrawn.clone(),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         1,
@@ -4682,31 +4726,26 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
     );
     const CHECK: &str = "audit: team-a's list and call are recorded under revision";
     for (case, rows, revision, listed, call) in [
-        // Rows under the base revision while the tool is withdrawn.
+        // Rows under the base revision while the tools are withdrawn.
         (
             "base revision",
-            drift_rows("demo-10", &[read], "deny", "unknown_tool"),
+            drift_rows("demo-10", &[], "deny", "unknown_tool"),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         (
             "still listed",
-            drift_rows(
-                drifted,
-                &["docs-team-a__list_documents", read],
-                "deny",
-                "unknown_tool",
-            ),
+            drift_rows(drifted, &[read], "deny", "unknown_tool"),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         (
             "still served",
-            drift_rows(drifted, &[read], "allow", "ok"),
+            drift_rows(drifted, &[], "allow", "ok"),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         ("still withdrawn", withdrawn, "demo-10", both, "allow ok"),
@@ -4717,7 +4756,7 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
 }
 
 #[test]
-fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleared() {
+fn the_reapproval_step_needs_the_new_revision_served_and_every_withdrawal_cleared() {
     let revision = "demo-12-reapproved-20261012T100000Z";
     let reloaded = |served: &str| {
         log_line(
@@ -4734,6 +4773,11 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
     };
     let a = cleared("docs-team-a__list_documents", "approved again");
     let b = cleared("docs-team-b__list_documents", "approved again");
+    let with_canary = "its entry's reach check tool is no longer withdrawn";
+    let reads = [
+        cleared("docs-team-a__read_document", with_canary),
+        cleared("docs-team-b__read_document", with_canary),
+    ];
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
@@ -4743,12 +4787,17 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
             &[("log", &lines.join("\n"))],
         )
     };
+    let all = |more: &[String]| [more.to_vec(), reads.to_vec()].concat();
     assert_all_passed(
         "reapproved",
-        &run_on("reapproved", &[reloaded(revision), a.clone(), b.clone()]),
+        &run_on(
+            "reapproved",
+            &all(&[reloaded(revision), a.clone(), b.clone()]),
+        ),
         3,
     );
-    const CLEARED: &str = "both list tools' withdrawals cleared as approved again";
+    const CLEARED: &str = "both list tools' withdrawals cleared as approved again, and both read \
+                           tools' as their entry's reach check tool no longer withdrawn";
     for (case, lines, failure) in [
         (
             "still withdrawn",
@@ -4757,24 +4806,33 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
             ))],
             "the gateway serves revision demo-12-reapproved-20261012T100000Z, with no withdrawal",
         ),
-        ("one cleared", vec![reloaded(revision), a.clone()], CLEARED),
+        (
+            "one cleared",
+            all(&[reloaded(revision), a.clone()]),
+            CLEARED,
+        ),
         (
             "removed, not approved",
-            vec![
+            all(&[
                 reloaded(revision),
                 a.clone(),
                 cleared("docs-team-b__list_documents", "no longer in the registry"),
-            ],
+            ]),
+            CLEARED,
+        ),
+        (
+            "read tools kept",
+            vec![reloaded(revision), a.clone(), b.clone()],
             CLEARED,
         ),
         (
             "withdrawn again",
-            vec![
+            all(&[
                 reloaded(revision),
                 a,
                 b,
                 withdrawn_line("docs-team-a__list_documents", 12, "definition changed", "x"),
-            ],
+            ]),
             "the drift pass withdrew nothing since (got '1'",
         ),
     ] {
@@ -4826,13 +4884,13 @@ fn a_run_stopped_with_the_withdrawals_held_says_how_to_clear_them() {
 /// shown its tools less those withdrawn; under a re-approval's revision, both of its tools.
 #[test]
 fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
-    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = DRIFTED;
     let reapproved = "demo-12-reapproved-20261012T100000Z";
     let rows = |team_a: Value| {
         json!([
-            list_row("team-a", drifted, &["docs-team-a__read_document"]),
+            list_row("team-a", drifted, &[] as &[&str]),
             list_row("team-a", reapproved, &both_tools("team-a")),
-            list_row("team-b", drifted, &["docs-team-b__read_document"]),
+            list_row("team-b", drifted, &[] as &[&str]),
             team_a,
         ])
         .to_string()
@@ -5289,7 +5347,7 @@ fn the_reach_reapproval_needs_both_of_docs_team_as_withdrawals_cleared() {
         checked(
             name,
             &format!(
-                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools'\" docs-team-a__list_documents docs-team-a__read_document"
+                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools' withdrawals cleared as approved again\" docs-team-a__list_documents docs-team-a__read_document"
             ),
             &[("log", &lines.join("\n"))],
         )

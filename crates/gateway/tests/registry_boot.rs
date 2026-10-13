@@ -22,8 +22,8 @@ use gateway::{
 };
 use gateway_core::audit::{AuditRowId, ErrorKind, ListRecord, Outcome, RowCompletion, StoreError};
 use gateway_core::{
-    ApprovedTool, AuditRecord, AuditStore, BoxFuture, Principal, PrincipalId, PrincipalKind,
-    Resources,
+    ApprovedTool, AuditRecord, AuditStore, BoxFuture, Narrowing, Principal, PrincipalId,
+    PrincipalKind, Resources,
 };
 use gateway_identity::SystemClock;
 use gateway_registry::Registry;
@@ -191,6 +191,56 @@ fn a_registry_that_defines_the_reserved_profile_is_refused() {
         matches!(refused, Some(BootError::ReservedProfile)),
         "{refused:?}"
     );
+}
+
+/// `text` with every server's narrowing `written`, and each tool's binding approved again for
+/// it, so the file loads and only the boot gates can refuse it.
+fn narrowed(text: &str, written: &str, narrowing: Narrowing) -> String {
+    let loaded = Registry::from_toml_str(text).unwrap();
+    let line = "narrowing = \"none\"\n";
+    assert_eq!(text.matches(line).count(), loaded.servers().len());
+    let mut text = text.replace(line, &format!("narrowing = \"{written}\"\n"));
+    for before in loaded.servers().values() {
+        let mut after = before.clone();
+        after.narrowing = narrowing;
+        text = text.replace(
+            &gateway_registry::binding_sha256(before),
+            &gateway_registry::binding_sha256(&after),
+        );
+    }
+    text
+}
+
+/// `boot::check_registry`, which a caller wiring its own connectors reaches without the
+/// binary's start, refuses an entry whose credential is to be narrowed: nothing narrows one
+/// yet, so it would skip rule 5's whole-reach check with a credential that is not narrowed.
+#[test]
+fn the_registry_path_refuses_a_narrowed_entry_whoever_wires_the_connectors() {
+    let url = "http://127.0.0.1:9/mcp";
+    for (written, narrowing) in [("call", Narrowing::Call), ("limit", Narrowing::Limit)] {
+        let files = Files::new(
+            &format!("narrowed-{written}"),
+            &issuer().jwks_document(),
+            url,
+        );
+        files.write(
+            "registry/registry.toml",
+            &narrowed(&registry(url), written, narrowing),
+        );
+        let (settings, registry) = parts(&files, true);
+        assert!(
+            registry
+                .servers()
+                .values()
+                .all(|server| server.narrowing == narrowing)
+        );
+        let refused =
+            boot::check_registry(settings, registry, entries(wiring(), url, &files)).err();
+        assert!(
+            matches!(&refused, Some(BootError::NarrowingNotBuilt(server)) if server.as_str() == "docs-team-a"),
+            "{written}: {refused:?}"
+        );
+    }
 }
 
 /// The registry's path refuses the identity and audit opt-outs in a release build too

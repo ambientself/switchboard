@@ -183,6 +183,26 @@ while a replica's polls of an entry fail, a changed tool stays served on that re
 long as the failures last, and `tools/call` may keep working meanwhile. The alert on failed
 polls is what covers it.
 
+*Note added 2026-10-12:* the interval must be at least each proxied entry's call deadline. The
+gateway refuses to start with a `[drift] interval_seconds` shorter than any proxied entry's call
+deadline, the one its `[servers.<name>]` sets or the default, naming the entry, its deadline and
+the interval. Each entry is polled one poll at a time, and a poll takes at most the call
+deadline, so each poll ends before the next is due, and the bound holds as written: a changed
+definition is withdrawn within one interval plus the entry's call deadline, on each replica
+whose polls succeed. The deadlines are set only in the deployment file, which is read at start,
+and a reload that changes the registry's entries is refused, so the check at start covers every
+reload. The reach check of step 3 runs beside the polls, so no poll waits for it, and a check is
+not started while the entry's last is still out: a tick that finds it out makes no check, and
+the next check waits for a later tick. A check may take the call deadline plus 5 s, for the
+gateway's own work on the call, timed from after its tick. So a widened reach is withdrawn
+within one interval plus the call deadline and those 5 s when the interval is longer than the
+deadline plus 5 s, as at the defaults. When it is no longer, as in the demos (a 10 s interval
+and a 5 s deadline), a check can still be out at the next tick, which skips, and the reach is
+withdrawn within two intervals plus the deadline and the 5 s (30 s in the demos), except at a
+5 s interval with a 5 s deadline, where two ticks can skip and it is within three intervals plus
+them (25 s). In every case it is within one interval plus twice the sum of the deadline and the
+5 s. The owner accepted this on 2026-10-12 (#165).
+
 ### 6. Withdrawal in a replica
 
 A withdrawal makes a snapshot of its own, as decision 0011 requires: the snapshot in force
