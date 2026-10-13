@@ -11,7 +11,9 @@
 //! 3. **HTTP** names at least one allowed host.
 //! 4. **Policy** becomes a snapshot through the core's own checks, and passes the
 //!    receipt-store gate (decision 0009): until receipts exist, a tool not classified `read`
-//!    is served only by a development build, one with the `test-support` feature.
+//!    is served only by a development build, one with the `test-support` feature. It then
+//!    passes the narrowing gate (decision 0011): until something narrows a credential, an
+//!    entry narrowed per call or to the caller's limit is refused in every build.
 //! 5. **Tool definitions**: every approved tool has exactly one, and every one is for an
 //!    approved tool.
 //! 6. **Connectors**: none is registered twice, and every tool on a surface has its connector
@@ -26,15 +28,15 @@
 //! and rules. Its connectors are registered with [`Wiring::proxied`]: each call to one runs
 //! behind the registry's argument check, and its resources are read with the adapter the
 //! registry approved for its tool, both from the policy version the call's request took.
-//! Every approved tool's server must have a connector. The receipt-store gate runs there too,
-//! at boot and on every reload.
+//! Every approved tool's server must have a connector. The receipt-store gate and the narrowing
+//! gate run there too, at boot and on every reload.
 //!
 //! A disabled gate starts, in a development build, with a warning logged here; the HTTP layer
 //! repeats it while the gateway runs. The release build refuses both opt-outs.
-//! [`start::prepare`](crate::start::prepare) runs the opt-out refusals and the receipt-store
-//! gate as soon as the registry loads, before it connects to anything; [`check_registry`] runs
-//! them again, as [`check`] does for the JSON configuration's path, and every reload runs the
-//! receipt-store gate.
+//! [`start::prepare`](crate::start::prepare) runs the opt-out refusals, the narrowing gate and
+//! the receipt-store gate as soon as the registry loads, before it connects to anything;
+//! [`check_registry`] runs them again, as [`check`] does for the JSON configuration's path, and
+//! every reload runs the receipt-store gate and the narrowing gate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -44,7 +46,7 @@ use std::time::{Duration, Instant};
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
     AuditStore, Classification, Connector, ConnectorName, DeploymentName, InstanceName, Issuer,
-    PolicySnapshot, ProfileName, SnapshotError, ToolName,
+    Narrowing, PolicySnapshot, ProfileName, SnapshotError, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_registry::{Registry, RulePrincipal};
@@ -189,6 +191,15 @@ pub enum BootError {
         /// Its classification.
         classification: Classification,
     },
+    /// A server's credential is to be narrowed per call or to the caller's limit. The gateway
+    /// sends one credential for every call to a server until the custodian client (#12)
+    /// narrows them, so such an entry would skip rule 5 with a credential that is not narrowed.
+    #[error(
+        "server `{0}` says its credential is narrowed per call or to the caller's limit, which \
+         this gateway cannot do yet: it sends the same credential on every call, so only \
+         narrowing \"none\" is supported"
+    )]
+    NarrowingNotBuilt(ConnectorName),
 }
 
 /// The parts of a deployment's configuration that are not its policy, for [`check_registry`].
@@ -528,6 +539,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         .collect();
     let snapshot = PolicySnapshot::new(config.policy)?;
     receipt_gate(&snapshot, development)?;
+    narrowing_gate(&snapshot)?;
 
     let catalog = ToolCatalog::new(config.catalog)?;
     catalog.check(&approved)?;
@@ -687,15 +699,17 @@ pub(crate) fn check_registry_with(
 }
 
 /// The gates a registry's policy must pass, at boot and on every reload: the
-/// [receipt-store gate](receipt_gate); every approved tool's server has a connector; with
-/// identity enforced, every rule names a configured issuer of its kind; the snapshot does not
-/// define [`NO_PROFILE`]; and every profile a rule names exists.
+/// [receipt-store gate](receipt_gate); the [narrowing gate](narrowing_gate); every approved
+/// tool's server has a connector; with identity enforced, every rule names a configured issuer
+/// of its kind; the snapshot does not define [`NO_PROFILE`]; and every profile a rule names
+/// exists.
 pub(crate) fn check_registry_policy(
     registry: &Registry,
     policy: &ServedPolicy,
     basis: &Basis,
 ) -> Result<(), BootError> {
     receipt_gate(policy.snapshot(), basis.receipt_exempt)?;
+    narrowing_gate(policy.snapshot())?;
     for (tool, route) in registry.routes() {
         if !basis.connectors.contains(&route.server) {
             return Err(BootError::UnregisteredConnector {
@@ -767,6 +781,22 @@ fn receipt_store_configured() -> bool {
     false
 }
 
+/// The narrowing gate. Decision 0011 lets an entry narrowed per call or to the caller's limit
+/// skip the whole-reach check (rule 5) only because its credential really is narrowed. Nothing
+/// narrows one until the custodian client (#12) exists: the same credential goes on every call
+/// to a server. So an entry whose narrowing is not `none` is refused at boot, by [`check`] and
+/// by [`check_registry`], on every reload, and by [`before_connecting`] before a credential is
+/// read, whoever wires the connectors. No build is exempt.
+pub(crate) fn narrowing_gate(snapshot: &PolicySnapshot) -> Result<(), BootError> {
+    match snapshot
+        .entries()
+        .find(|entry| entry.narrowing != Narrowing::None)
+    {
+        Some(entry) => Err(BootError::NarrowingNotBuilt(entry.name.clone())),
+        None => Ok(()),
+    }
+}
+
 /// Logs a warning for each gate that is turned off.
 fn warn_disabled(deployment: &DeploymentName, identity: GateState, audit: GateState) {
     if identity == GateState::Disabled {
@@ -788,7 +818,8 @@ fn warn_disabled(deployment: &DeploymentName, identity: GateState, audit: GateSt
 /// [`start::prepare`](crate::start::prepare) runs as soon as the registry loads, before it
 /// reads a credential, fetches a key or connects to the audit store: the identity and audit
 /// opt-outs outside a development build (decision 0014, section 4), then the
-/// [receipt-store gate](receipt_gate). The boot gates run each again.
+/// [narrowing gate](narrowing_gate) and the [receipt-store gate](receipt_gate). The boot gates
+/// run each again.
 pub(crate) fn before_connecting(
     identity: &IdentitySection,
     audit: &AuditSection,
@@ -801,6 +832,7 @@ pub(crate) fn before_connecting(
     if audit.disabled {
         opt_out(BootError::AuditOptOut, development)?;
     }
+    narrowing_gate(snapshot)?;
     receipt_gate(snapshot, development)
 }
 
@@ -1011,6 +1043,33 @@ principals = "any_in_teams_and_groups"
         Registry::from_toml_str(&registry_text(classification, on_surface, "r1")).unwrap()
     }
 
+    /// [`registry_text`] with no tool approved and its server's narrowing `written`, at
+    /// `revision`. With no tool, rule 7 (a tool on an entry narrowed per call is declared from
+    /// its arguments) has nothing to refuse, so each narrowing loads.
+    pub(crate) fn narrowed_registry_text(written: &str, revision: &str) -> String {
+        let text = registry_text("read", false, revision);
+        let tools = text.find("[[tools]]").unwrap();
+        let surfaces = text.find("[[surfaces]]").unwrap();
+        let line = "narrowing = \"none\"\n";
+        assert_eq!(text.matches(line).count(), 1);
+        format!("tools = []\n{}{}", &text[..tools], &text[surfaces..])
+            .replace(line, &format!("narrowing = \"{written}\"\n"))
+    }
+
+    /// The refusal of a narrowed credential, naming the test registry's server.
+    pub(crate) fn assert_narrowing_refused(refused: &BootError) {
+        match refused {
+            BootError::NarrowingNotBuilt(server) => assert_eq!(server.as_str(), "mock-docs"),
+            other => panic!("expected the narrowing refusal, got {other:?}"),
+        }
+        assert_eq!(
+            refused.to_string(),
+            "server `mock-docs` says its credential is narrowed per call or to the caller's \
+             limit, which this gateway cannot do yet: it sends the same credential on every \
+             call, so only narrowing \"none\" is supported"
+        );
+    }
+
     /// A snapshot with one tool of `classification` on an in-process connector, with no
     /// connector entry, on the `docs` surface when `on_surface`.
     fn in_process(classification: Classification, on_surface: bool) -> PolicySnapshot {
@@ -1149,8 +1208,10 @@ principals = "any_in_teams_and_groups"
         }
     }
 
-    #[test]
-    fn the_json_configuration_path_runs_the_receipt_gate() {
+    /// A JSON configuration with identity and audit on, serving `tool` on the `docs` surface
+    /// with the connector `entries` given, and the wiring it boots with: an audit store and no
+    /// connector registered.
+    fn json_config(tool: serde_json::Value, entries: serde_json::Value) -> (Config, Wiring) {
         // The release build refuses the identity and audit opt-outs, so both gates are on.
         let issuer = gateway_testkit::LocalIssuer::new(
             "https://issuer.example.test",
@@ -1159,7 +1220,7 @@ principals = "any_in_teams_and_groups"
         .unwrap();
         let config = Config::from_json(
             &json!({
-                "deployment": "receipt-gate",
+                "deployment": "boot-gates",
                 "identity": {"enforce": [{
                     "issuer": issuer.issuer(),
                     "audiences": ["switchboard"],
@@ -1173,19 +1234,15 @@ principals = "any_in_teams_and_groups"
                 "http": {"allowed_hosts": ["localhost"]},
                 "policy": {
                     "revision": "r1",
-                    "tools": [{
-                        "name": "docs__list_documents",
-                        "classification": "propose",
-                        "connector": "mock-docs",
-                        "resources": "no_resources"
-                    }],
+                    "tools": [tool],
                     "surfaces": [{
                         "name": "docs",
                         "tools": ["docs__list_documents"],
                         "teams": ["team-a"],
                         "principals": "any_in_teams_and_groups"
                     }],
-                    "profiles": []
+                    "profiles": [],
+                    "entries": entries
                 },
                 "catalog": [{
                     "name": "docs__list_documents",
@@ -1199,11 +1256,65 @@ principals = "any_in_teams_and_groups"
         .unwrap();
         let wiring = Wiring::new(Arc::new(SystemClock))
             .audit_store(Arc::new(gateway_testkit::InMemoryAuditStore::new()));
+        (config, wiring)
+    }
+
+    #[test]
+    fn the_json_configuration_path_runs_the_receipt_gate() {
+        let (config, wiring) = json_config(
+            json!({
+                "name": "docs__list_documents",
+                "classification": "propose",
+                "connector": "mock-docs",
+                "resources": "no_resources"
+            }),
+            json!([]),
+        );
         let refused = check_with(config, wiring, false);
         assert!(
             matches!(refused, Err(BootError::NoReceiptStore { .. })),
             "{refused:?}"
         );
+    }
+
+    /// The JSON configuration's boot runs the narrowing gate, through [`check`] and as the
+    /// release build runs it: an entry narrowed per call or to the caller's limit is refused,
+    /// with the registry's refusal. Narrowing "none" passes it, and the boot goes on to find no
+    /// connector registered.
+    #[test]
+    fn the_json_configuration_path_runs_the_narrowing_gate() {
+        for written in ["call", "limit", "none"] {
+            // Rule 7: an entry narrowed per call serves only tools declared from arguments.
+            let tool = json!({
+                "name": "docs__list_documents",
+                "classification": "read",
+                "connector": "mock-docs",
+                "resources": "declared",
+                "declared_from": "arguments"
+            });
+            let entries = json!([{
+                "name": "mock-docs",
+                "kind": "built_in",
+                "credential": "gateway_token",
+                "principal": "docs-reader",
+                "narrowing": written,
+                "permits": "read",
+                "reach": []
+            }]);
+            let (config, wiring) = json_config(tool.clone(), entries.clone());
+            let checked = check(config, wiring);
+            let (config, wiring) = json_config(tool, entries);
+            let released = check_with(config, wiring, false);
+            for result in [checked, released] {
+                match (written, result) {
+                    ("none", Err(BootError::UnregisteredConnector { connector, .. })) => {
+                        assert_eq!(connector.as_str(), "mock-docs");
+                    }
+                    ("call" | "limit", Err(refused)) => assert_narrowing_refused(&refused),
+                    (_, other) => panic!("{written}: {other:?}"),
+                }
+            }
+        }
     }
 
     /// The gates a registry's policy meets at boot and on every reload run the receipt-store
@@ -1224,6 +1335,46 @@ principals = "any_in_teams_and_groups"
                 refused,
                 "{classification}: {checked:?}"
             );
+        }
+    }
+
+    /// The gates a registry's policy meets at boot and on every reload refuse an entry whose
+    /// credential is to be narrowed per call or to the caller's limit, in every build, and the
+    /// refusal that runs before connecting does too. Narrowing "none" passes both.
+    #[test]
+    fn a_narrowed_entry_is_refused_by_the_shared_gates_and_before_connecting() {
+        // Neither gate opted out, so only the snapshot's refusals apply before connecting.
+        let identity = IdentitySection {
+            enforce: None,
+            disabled: false,
+        };
+        let audit = AuditSection { disabled: false };
+        for (written, narrowing) in [
+            ("call", Narrowing::Call),
+            ("limit", Narrowing::Limit),
+            ("none", Narrowing::None),
+        ] {
+            let registry = Registry::from_toml_str(&narrowed_registry_text(written, "r1")).unwrap();
+            assert_eq!(
+                registry.servers().values().next().unwrap().narrowing,
+                narrowing
+            );
+            let policy = ServedPolicy::from_registry(&registry).unwrap();
+            for exempt in [false, true] {
+                let basis = Basis {
+                    receipt_exempt: exempt,
+                    ..release_basis(registry.clone())
+                };
+                let checked = check_registry_policy(&registry, &policy, &basis);
+                let before = before_connecting(&identity, &audit, registry.snapshot(), exempt);
+                if narrowing == Narrowing::None {
+                    assert!(checked.is_ok(), "{checked:?}");
+                    assert!(before.is_ok(), "{before:?}");
+                } else {
+                    assert_narrowing_refused(&checked.unwrap_err());
+                    assert_narrowing_refused(&before.unwrap_err());
+                }
+            }
         }
     }
 }

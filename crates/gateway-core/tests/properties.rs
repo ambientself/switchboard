@@ -61,6 +61,7 @@ impl World {
     fn snapshot(&self) -> PolicySnapshot {
         let mut data = self.data.clone();
         data.profiles = vec![self.profile.clone()];
+        serve_proposals_as_rules_8_and_9_allow(&mut data, &self.principal);
         PolicySnapshot::new(data).expect("a generated snapshot is invalid")
     }
 
@@ -97,6 +98,53 @@ impl World {
             .surfaces
             .iter_mut()
             .find(|surface| surface.name == name)
+    }
+}
+
+/// Decision 0011's rules 8 and 9 let no surface serve a `propose` tool to both a team and a
+/// group: a group is served one only through a per-user entry, and no surface may serve a
+/// per-user entry's tool to a team. Check 1 admits a workload by its team and a user by its
+/// groups, and nothing else a decision or a listing reads looks at a surface's teams or groups.
+/// So, without changing what the world's caller is decided or listed, a workload's world drops
+/// the groups of each surface that serves a `propose` tool; and a user's world, when a surface
+/// serves a `propose` tool to a group, gives the tools' connector a per-user entry and drops
+/// every surface's teams.
+fn serve_proposals_as_rules_8_and_9_allow(data: &mut SnapshotData, principal: &Principal) {
+    let tools = &data.tools;
+    let proposes = |surface: &Surface| {
+        tools.iter().any(|tool| {
+            tool.classification == Classification::Propose && surface.tools.contains(&tool.name)
+        })
+    };
+    match &principal.kind {
+        PrincipalKind::Workload { .. } => {
+            for surface in &mut data.surfaces {
+                if proposes(surface) {
+                    surface.groups.clear();
+                }
+            }
+        }
+        PrincipalKind::User { .. } => {
+            if data
+                .surfaces
+                .iter()
+                .any(|surface| !surface.groups.is_empty() && proposes(surface))
+            {
+                for surface in &mut data.surfaces {
+                    surface.teams.clear();
+                }
+                data.entries = vec![ConnectorEntry {
+                    name: "sys".into(),
+                    kind: EntryKind::BuiltIn,
+                    credential: CredentialMode::PerUserGrant,
+                    principal: "sys-user".into(),
+                    narrowing: Narrowing::None,
+                    permits: Classification::Propose,
+                    reach: BTreeSet::new(),
+                    reach_tested_on: None,
+                }];
+            }
+        }
     }
 }
 

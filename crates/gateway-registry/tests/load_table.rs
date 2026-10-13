@@ -1031,6 +1031,54 @@ fn cases() -> Vec<Case> {
             },
             Want::Loads,
         ),
+        // The reach check calls one of the entry's own tools: its name is under the server's
+        // system, though the tool need not be approved.
+        case(
+            "a reach check naming another server's tool",
+            |t| {
+                set(
+                    t,
+                    "servers.0.reach_check",
+                    "tool",
+                    value("\"wiki__search\""),
+                )
+            },
+            Want::Error(E::ReachCheckOutsideSystem {
+                server: "docs-server".into(),
+                tool: tool("wiki__search"),
+                system: "docs".into(),
+            }),
+        ),
+        case(
+            "a reach check naming a tool with no separator after the system",
+            |t| set(t, "servers.0.reach_check", "tool", value("\"docsread\"")),
+            Want::Error(E::ReachCheckOutsideSystem {
+                server: "docs-server".into(),
+                tool: tool("docsread"),
+                system: "docs".into(),
+            }),
+        ),
+        case(
+            "a reach check naming the system and nothing after it",
+            |t| set(t, "servers.0.reach_check", "tool", value("\"docs__\"")),
+            Want::Error(E::ReachCheckOutsideSystem {
+                server: "docs-server".into(),
+                tool: tool("docs__"),
+                system: "docs".into(),
+            }),
+        ),
+        case(
+            "a reach check naming an unapproved tool of the server's own system",
+            |t| {
+                set(
+                    t,
+                    "servers.0.reach_check",
+                    "tool",
+                    value("\"docs__canary\""),
+                )
+            },
+            Want::Loads,
+        ),
         // The destination against the address's scheme (decision 0013, section 3).
         case(
             "an http address with a public destination",
@@ -1705,5 +1753,24 @@ fn one_server_entry_is_read_alone_and_needs_no_probe_record() {
     assert_eq!(
         entry(&twice, "docs-server").unwrap_err(),
         RegistryError::DuplicateServer("docs-server".into())
+    );
+}
+
+/// The refusal of a reach check outside the server's system names the server, the tool and
+/// the system its tools are named after.
+#[test]
+fn a_reach_check_outside_the_system_is_refused_naming_the_server_and_the_tool() {
+    let mut table = base();
+    set(
+        &mut table,
+        "servers.0.reach_check",
+        "tool",
+        value("\"wiki__search\""),
+    );
+    let message = load(&table).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        "server `docs-server`'s reach check calls `wiki__search`, which is not one of its own \
+         tools: name it `docs__<tool>`, after the server's system"
     );
 }

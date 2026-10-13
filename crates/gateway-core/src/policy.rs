@@ -456,17 +456,17 @@ pub enum SnapshotError {
         /// A team the surface admits.
         team: TeamId,
     },
-    /// Rule 9: a `propose` tool on a surface that admits a group, and its entry is not
-    /// per-user.
+    /// Rule 9: a `propose` tool on a surface that admits a group, and its connector has no
+    /// per-user entry: its entry is shared, or it has none.
     #[error(
         "rule 9: surface `{surface}` serves `propose` tool `{tool}` to group `{group}`, and its \
-         entry `{entry}` is not per-user"
+         connector `{connector}` has no per-user entry"
     )]
     ProposeToGroup {
         /// The tool.
         tool: ToolName,
-        /// Its entry.
-        entry: ConnectorName,
+        /// Its connector.
+        connector: ConnectorName,
         /// The surface.
         surface: SurfaceName,
         /// A group the surface admits.
@@ -491,11 +491,12 @@ impl PolicySnapshot {
     ///
     /// Refuses duplicate names rather than letting one silently shadow another, and a surface
     /// that serves a tool nobody approved. Then, when there are connector entries, refuses a
-    /// tool with no entry, and a snapshot that breaks one of the nine rules of decision 0011,
-    /// section 3, each named by its [`SnapshotError`] variant. The rules apply to tools whose
-    /// connector has an entry. Last, it refuses a tool `declared` as the reach whose connector
-    /// has no entry, which a snapshot with no entries at all could otherwise hold: there would
-    /// be no reach for its calls to name.
+    /// tool with no entry. Then it refuses a snapshot that breaks one of the nine rules of
+    /// decision 0011, section 3, each named by its [`SnapshotError`] variant. Rules 1 to 8
+    /// apply to tools whose connector has an entry, and rule 9 to every tool: one with no entry
+    /// is not per-user. Last, it refuses a tool `declared` as the reach whose connector has no
+    /// entry, which a snapshot with no entries at all could otherwise hold: there would be no
+    /// reach for its calls to name.
     pub fn new(data: SnapshotData) -> Result<Self, SnapshotError> {
         let mut tools = BTreeMap::new();
         for tool in data.tools {
@@ -628,9 +629,11 @@ impl PolicySnapshot {
 /// The nine rules of decision 0011, section 3, which say where approvals contradict each other
 /// or the limits. Each refusal names the tool, entry, surface, team or group, and resource.
 ///
-/// They apply to tools whose connector has an entry. A snapshot from the JSON configuration
-/// or the tests has none, and its in-process connectors are neither proxied nor per-user; a
-/// snapshot with entries gives every tool one (see [`PolicySnapshot::new`]).
+/// Rules 1 to 8 apply to tools whose connector has an entry. A snapshot from the JSON
+/// configuration or the tests has none, and its in-process connectors are neither proxied nor
+/// per-user; a snapshot with entries gives every tool one (see [`PolicySnapshot::new`]). Rule 9
+/// allows a `propose` tool on a surface that admits a group only when its entry is per-user,
+/// so it applies to every tool: a tool with no entry is not per-user, and is refused there.
 ///
 /// No rule reads which surfaces a tool is on except 5, 8 and 9, which are about who is served.
 /// A tool approved but on no surface is still checked against its entry.
@@ -705,37 +708,39 @@ fn check_rules(snapshot: &PolicySnapshot) -> Result<(), SnapshotError> {
             .iter()
             .filter_map(|name| snapshot.tools.get(name))
         {
-            let Some(entry) = snapshot.entries.get(&tool.connector) else {
-                continue;
-            };
-            // Rule 5: a team or group admitted to the surface whose limit does not hold the
-            // whole reach, where the tool is declared as the reach, or is proxied and its entry
-            // narrows `none`.
-            let whole_reach = tool.declared_from == Some(DeclaredFrom::Reach)
-                || (entry.kind == EntryKind::Proxied && entry.narrowing == Narrowing::None);
-            if whole_reach {
-                reach_within_limits(snapshot, surface, tool, entry)?;
-            }
-            // Rule 8: a per-user entry's tool on a surface that admits any team.
-            if entry.credential == CredentialMode::PerUserGrant
-                && let Some(team) = surface.teams.first()
-            {
-                return Err(SnapshotError::PerUserToTeam {
-                    tool: tool.name.clone(),
-                    entry: entry.name.clone(),
-                    surface: surface.name.clone(),
-                    team: team.clone(),
-                });
+            let entry = snapshot.entries.get(&tool.connector);
+            if let Some(entry) = entry {
+                // Rule 5: a team or group admitted to the surface whose limit does not hold the
+                // whole reach, where the tool is declared as the reach, or is proxied and its
+                // entry narrows `none`.
+                let whole_reach = tool.declared_from == Some(DeclaredFrom::Reach)
+                    || (entry.kind == EntryKind::Proxied && entry.narrowing == Narrowing::None);
+                if whole_reach {
+                    reach_within_limits(snapshot, surface, tool, entry)?;
+                }
+                // Rule 8: a per-user entry's tool on a surface that admits any team.
+                if entry.credential == CredentialMode::PerUserGrant
+                    && let Some(team) = surface.teams.first()
+                {
+                    return Err(SnapshotError::PerUserToTeam {
+                        tool: tool.name.clone(),
+                        entry: entry.name.clone(),
+                        surface: surface.name.clone(),
+                        team: team.clone(),
+                    });
+                }
             }
             // Rule 9: a `propose` tool on a surface that admits any group, unless its entry is
-            // per-user.
+            // per-user. A tool with no entry is not per-user.
+            let per_user =
+                entry.is_some_and(|entry| entry.credential == CredentialMode::PerUserGrant);
             if tool.classification == Classification::Propose
-                && entry.credential != CredentialMode::PerUserGrant
+                && !per_user
                 && let Some(group) = surface.groups.first()
             {
                 return Err(SnapshotError::ProposeToGroup {
                     tool: tool.name.clone(),
-                    entry: entry.name.clone(),
+                    connector: tool.connector.clone(),
                     surface: surface.name.clone(),
                     group: group.clone(),
                 });

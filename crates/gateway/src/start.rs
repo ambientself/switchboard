@@ -7,8 +7,9 @@
 //! row records the instance that began it.
 //!
 //! [`prepare`] reads the registry file. Before anything else, it refuses the identity and audit
-//! opt-outs outside a development build, and runs the receipt-store gate (decision 0014,
-//! section 4), so that a refusal of either comes before any connection is made. Then it checks
+//! opt-outs outside a development build, refuses a server whose credential is to be narrowed,
+//! which nothing narrows yet, and runs the receipt-store gate (decision 0014, section 4), so
+//! that each refusal comes before any credential is read or connection made. Then it checks
 //! where each proxied server is reached (decision 0013, section 3): an `https` server needs the
 //! CA file `[servers.<name>] ca_file` names, an `http` server may have none, and an address
 //! that is an IP literal the connector would never connect to is refused, loopback among them
@@ -65,7 +66,7 @@ use connector_proxy::{
     CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
     UpstreamError,
 };
-use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer, Narrowing};
+use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer};
 use gateway_identity::Clock;
 use gateway_registry::{Destination, Registry, RegistryError};
 use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
@@ -131,15 +132,6 @@ pub enum StartError {
         "server `{0}`'s credential is a per-user grant, which this gateway does not support yet"
     )]
     PerUserGrant(ConnectorName),
-    /// A server's credential is to be narrowed per call or to the caller's limit. The gateway
-    /// sends one credential for every call to a server until the custodian client (#12)
-    /// narrows them, so such an entry would skip rule 5 with a credential that is not narrowed.
-    #[error(
-        "server `{0}` says its credential is narrowed per call or to the caller's limit, which \
-         this gateway cannot do yet: it sends the same credential on every call, so only \
-         narrowing \"none\" is supported"
-    )]
-    NarrowingNotBuilt(ConnectorName),
     /// A credential file is given that no server uses.
     #[error("credential `{0}` is given a file in `[credentials]` but no server uses it")]
     UnusedCredential(String),
@@ -722,12 +714,6 @@ fn credentials(
                 return Err(StartError::PerUserGrant(server.name.clone()));
             }
         };
-        // Decision 0011 lets an entry narrowed per call or to the limit skip the whole-reach
-        // check (rule 5) only because its credential really is narrowed. Nothing narrows one
-        // yet: the same credential goes on every call to a server.
-        if server.narrowing != Narrowing::None {
-            return Err(StartError::NarrowingNotBuilt(server.name.clone()));
-        }
         let Some(path) = files.get(reference) else {
             return Err(StartError::NoCredentialFile {
                 server: server.name.clone(),
@@ -1316,63 +1302,35 @@ mod tests {
     }
 
     /// An entry whose credential is to be narrowed per call or to the caller's limit is
-    /// refused at start: the gateway sends the same credential on every call, so the entry
-    /// would skip rule 5's whole-reach check with a credential that is not narrowed. Narrowing
-    /// "none" starts.
-    #[test]
-    fn a_narrowed_credential_is_refused_and_none_starts() {
-        let directory = std::env::temp_dir().join(format!(
-            "switchboard-start-narrowing-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let credential = directory.join("docs-credential");
-        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
-        let files = BTreeMap::from([("docs-credential".to_owned(), credential)]);
-        // No tool is approved, so rule 7 (a tool on an entry narrowed per call declares its
-        // resources from its arguments) has nothing to refuse and each narrowing loads.
-        let text = crate::boot::tests::registry_text("read", false, "r1");
-        let tools = text.find("[[tools]]").unwrap();
-        let surfaces = text.find("[[surfaces]]").unwrap();
-        let text = format!("tools = []\n{}{}", &text[..tools], &text[surfaces..]);
-        let before = gateway_registry::binding_sha256(&crate::boot::tests::server());
-        let mut outcomes = Vec::new();
-        for (narrowing, written) in [
-            (Narrowing::Call, "call"),
-            (Narrowing::Limit, "limit"),
-            (Narrowing::None, "none"),
-        ] {
-            let mut server = crate::boot::tests::server();
-            server.narrowing = narrowing;
-            let text = text
-                .replace(
-                    "narrowing = \"none\"",
-                    &format!("narrowing = \"{written}\""),
-                )
-                .replace(&before, &gateway_registry::binding_sha256(&server));
-            let registry = Registry::from_toml_str(&text).unwrap();
-            assert_eq!(
-                registry.servers().values().next().unwrap().narrowing,
-                narrowing
-            );
-            outcomes.push(credentials(&registry, &files).map(|_| ()));
-        }
-        std::fs::remove_dir_all(&directory).unwrap();
-        for outcome in &outcomes[..2] {
-            match outcome {
-                Err(refused @ StartError::NarrowingNotBuilt(server)) => {
+    /// refused at start, before its credential is read or anything is connected: the gateway
+    /// sends the same credential on every call, so the entry would skip rule 5's whole-reach
+    /// check with a credential that is not narrowed. The refusal is the boot gates' own, which
+    /// `boot::before_connecting` runs. Narrowing "none" passes it, and the start goes on to
+    /// the next check, where its loopback address is refused.
+    #[tokio::test]
+    async fn a_narrowed_credential_is_refused_before_it_is_read_and_none_goes_on() {
+        let counted = Counted::start().await;
+        for written in ["call", "limit", "none"] {
+            let directory = std::env::temp_dir().join(format!(
+                "switchboard-start-narrowing-{written}-{}",
+                std::process::id()
+            ));
+            let text = crate::boot::tests::narrowed_registry_text(written, "r1");
+            let deployment = deployment(&directory, &text, &counted, false, false);
+            let refused = refused_as_release(deployment).await;
+            std::fs::remove_dir_all(&directory).unwrap();
+            match (written, &refused) {
+                ("none", StartError::DestinationRefused { server, .. }) => {
                     assert_eq!(server.as_str(), "mock-docs");
-                    assert_eq!(
-                        refused.to_string(),
-                        "server `mock-docs` says its credential is narrowed per call or to the \
-                         caller's limit, which this gateway cannot do yet: it sends the same \
-                         credential on every call, so only narrowing \"none\" is supported"
-                    );
                 }
-                other => panic!("expected the narrowing refusal, got {other:?}"),
+                ("none", other) => panic!("expected the loopback refusal, got {other}"),
+                (_, StartError::Boot(refused)) => {
+                    crate::boot::tests::assert_narrowing_refused(refused);
+                }
+                (_, other) => panic!("{written}: expected the narrowing refusal, got {other}"),
             }
         }
-        assert!(outcomes[2].is_ok(), "{:?}", outcomes[2]);
+        assert_eq!(counted.connections(), 0, "something was connected to first");
     }
 
     /// Decision 0014, section 4: a release build refuses each opt-out before it connects to

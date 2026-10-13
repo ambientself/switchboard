@@ -1478,12 +1478,16 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   built. Each registry server is a proxied connector entry, stating its credential's mode,
   reference and principal, its narrowing, what its credential permits, its reach, a dated
   reach test (required when the reach is not empty) and a reach check (required for every
-  entry with a reach that is not per-user, whatever its narrowing). `PolicySnapshot::new`
-  refuses a snapshot that breaks a rule, naming the tool, entry, surface, team or group and
-  resource; `tests/loader_rules.json` has a refusing and a passing case for each, and the
-  properties include the reach property of decision 0011's Consequences. The rules apply to
-  tools whose connector has an entry; the JSON configuration's in-process connectors have
-  none. The demos' entries reach exactly the project mock-docs lets each identity read. Both
+  entry with a reach that is not per-user, whatever its narrowing). A reach check's tool must
+  be named `<system>__<tool>` for the entry's own system, so it cannot name another server's
+  tool or a malformed one. `PolicySnapshot::new` refuses a snapshot that breaks a rule, naming
+  the tool, entry, surface, team or group and resource; `tests/loader_rules.json` has a
+  refusing and a passing case for each, and the properties include the reach property of
+  decision 0011's Consequences. Rules 1 to 8 apply to tools whose connector has an entry; the
+  JSON configuration's in-process connectors have none. Rule 9 applies to every tool: a tool
+  with no entry is not per-user, so a `propose` tool with no entry on a surface admitting a
+  group is refused, until built-in connectors have entries of their own (milestone 4). The
+  demos' entries reach exactly the project mock-docs lets each identity read. Both
   demos show at run time a registry refused at load for rule 5, one admitting team-b to
   `docs-team-a`'s surface, whose entry reaches `atlas`, which team-b's limit does not hold, and
   an undeclared argument refused before forwarding.
@@ -1494,8 +1498,11 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   serves it, such as `registry-reach`, must drop it too. The scheduled reach check is built
   (the drift pass entry below). Not built: a check against a vendor's report of what a
   credential reaches, and narrowing a credential per call or to the caller's limit. The
-  gateway sends the same credential on every call to a server, so it
-  refuses an entry whose narrowing is not `none` at start, until the custodian client (#12).
+  gateway sends the same credential on every call to a server, so it refuses an entry whose
+  narrowing is not `none`, until the custodian client (#12). The refusal is one of the gates
+  every registry's policy meets, at boot and on every reload, whoever wires the connectors.
+  The JSON configuration's boot runs it too, and the start also runs it before it reads a
+  credential.
 - The kind slice extended to show them: built (#156, #169, #176). Both demos register the mock
   server once per team and show each team's calls reaching it under its own entry's identity,
   for its own project (the next entry), and both show the undeclared argument, the registry
