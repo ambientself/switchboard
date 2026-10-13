@@ -3932,9 +3932,15 @@ mutate("demo-workload-direct-any-failure", "any failed direct call passes, not o
 mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
        """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
 # #168: closed_port() holds its port for as long as its guard lives.
-mutate("demo-checks-closed-port-released", "closed_port() lets its port go once it has read it, so another test may take it",
-       "crates/demo-checks/tests/common/mod.rs",
-       "        _held: held,\n", "        _held: Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n")
+# The socket that bound the port is never connected and is dropped once the port is read, as
+# before #168. (Dropping it after it connected would leave it in TIME_WAIT, still holding the
+# port.)
+mutate_all("demo-checks-closed-port-released", "closed_port() lets its port go once it has read it, so another test may take it",
+           ("crates/demo-checks/tests/common/mod.rs",
+            "    held.connect(&peer.local_addr().unwrap().into()).unwrap();\n    let (accepted, _) = peer.accept().unwrap();\n",
+            "    let accepted = TcpStream::connect(peer.local_addr().unwrap()).unwrap();\n"),
+           ("crates/demo-checks/tests/common/mod.rs",
+            "        _held: held,\n", "        _held: Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n"))
 CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
 mutate("demo-driver-otto-dev-allowed", "the driver runs whatever cluster it is given", DRIVER,
        CLUSTER_CHECK, "if false; then")
