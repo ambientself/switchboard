@@ -255,6 +255,27 @@
       "surface": { "teams": [], "groups": ["engineering"] },
       "expect": "loads"
     },
+    {
+      "name": "rule 9: with no entries, a propose tool on a surface that admits a group is refused: a tool with no entry is not per-user",
+      "tool": { "classification": "propose", "resources": "checks_own_scope", "declared_from": null },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "entries": [],
+      "expect": "ProposeToGroup", "names": ["`docs-a__list`", "`docs-a`", "`engineering`", "rule 9"]
+    },
+    {
+      "name": "rule 9: with no entries, a propose tool on a surface that admits a team and a group is refused",
+      "tool": { "classification": "propose", "resources": "checks_own_scope", "declared_from": null },
+      "surface": { "groups": ["engineering"] },
+      "entries": [],
+      "expect": "ProposeToGroup", "names": ["`docs-a__list`", "`engineering`"]
+    },
+    {
+      "name": "rule 9: with no entries, a read tool on a surface that admits a group loads",
+      "tool": { "resources": "checks_own_scope", "declared_from": null },
+      "surface": { "teams": [], "groups": ["engineering"] },
+      "entries": [],
+      "expect": "loads"
+    },
 
     {
       "name": "a proxied tool declared as its entry's reach loads, held to rule 5",
@@ -306,9 +327,8 @@
       "expect": "does not parse"
     },
     {
-      "name": "with no entries, as the JSON configuration has, the rules do not apply",
+      "name": "with no entries, as the JSON configuration has, rules 1 to 8 do not apply",
       "tool": { "classification": "propose", "resources": "checks_own_scope", "declared_from": null },
-      "surface": { "teams": [], "groups": ["engineering"] },
       "entries": [],
       "expect": "loads"
     }

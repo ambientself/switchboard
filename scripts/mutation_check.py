@@ -536,8 +536,9 @@ mutate_all(
 
 # --- The snapshot loader's rules -----------------------------------------------------------
 #
-# Decision 0011, section 3: the nine rules PolicySnapshot::new checks for tools with a connector
-# entry, the refusal of a tool declared as the reach with no entry, and the withdrawal's derived snapshot
+# Decision 0011, section 3: the nine rules PolicySnapshot::new checks, 1 to 8 for tools with a
+# connector entry and 9 for every tool, a tool with no entry not being per-user (#163), the
+# refusal of a tool declared as the reach with no entry, and the withdrawal's derived snapshot
 # (section 4). tests/loader_rules.json has a refusing and a passing case for each rule, and
 # tests/properties.rs the reach property and that a withdrawal only narrows.
 
@@ -559,11 +560,14 @@ mutate("snapshot-rule-7-removed", "an entry narrowing per call may serve a tool 
        "        if entry.narrowing == Narrowing::Call && tool.declared_from != Some(DeclaredFrom::Arguments)",
        "        if false && tool.declared_from != Some(DeclaredFrom::Arguments)")
 mutate("snapshot-rule-8-removed", "a per-user entry's tool may be served to a team", SRC + "policy.rs",
-       "            if entry.credential == CredentialMode::PerUserGrant\n                && let Some(team)",
-       "            if false\n                && let Some(team)")
+       "                if entry.credential == CredentialMode::PerUserGrant\n                    && let Some(team)",
+       "                if false\n                    && let Some(team)")
 mutate("snapshot-rule-9-removed", "a propose tool on a shared entry may be served to a group", SRC + "policy.rs",
        "            if tool.classification == Classification::Propose\n",
        "            if false\n")
+mutate("snapshot-rule-9-skips-no-entry", "a propose tool with no connector entry may be served to a group", SRC + "policy.rs",
+       "                entry.is_some_and(|entry| entry.credential == CredentialMode::PerUserGrant);",
+       "                entry.is_none_or(|entry| entry.credential == CredentialMode::PerUserGrant);")
 mutate("snapshot-rule-3-any-text-a-date", "anything recorded as a reach test's date counts as a test", SRC + "policy.rs",
        "        let tested = entry.reach_tested_on.as_deref().is_some_and(is_date);",
        "        let tested = entry.reach_tested_on.is_some();")
@@ -1600,6 +1604,8 @@ mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate: not 
            (BOOT, RECEIPT_BEFORE_CONNECTING, "    let _ = snapshot;\n    Ok(())\n}\n"))
 mutate("gw-receipt-gate-config-path-skipped", "the JSON configuration's boot does not run the receipt-store gate", BOOT,
        RECEIPT_CONFIG_PATH, "")
+mutate("gw-boot-narrowing-config-path-skipped", "the JSON configuration's boot serves an entry narrowed per call or to the limit", BOOT,
+       "    narrowing_gate(&snapshot)?;\n", "")
 mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
            (BOOT, RECEIPT_REGISTRY_PATH, ""),
            (BOOT, REGISTRY_BOOT_POLICY,
@@ -2893,9 +2899,10 @@ mutate("registry-duplicate-upstream", "one upstream tool may be approved under t
        "        if !upstream.insert((", "        if false && !upstream.insert((")
 mutate("registry-unknown-server", "a tool on an unregistered server takes the first server", RR,
        "    let Some(server) = servers.get(&tool.server) else {", "    let Some(server) = servers.get(&tool.server).or(servers.values().next()) else {")
-mutate("registry-name-outside-system", "a tool may be named after any system", RR, "    if !under_system {", "    if false {")
-mutate("registry-name-nothing-after-system", "a tool may be named `{system}__` alone", RR,
-       "        .is_some_and(|rest| !rest.is_empty());", "        .is_some();")
+mutate("registry-name-outside-system", "a tool may be named after any system", RR,
+       "    if !under_system(&name, &server.system) {", "    if false {")
+mutate("registry-name-nothing-after-system", "a tool, or a reach check's tool, may be named `{system}__` alone", RR,
+       "        .is_some_and(|rest| !rest.is_empty())\n}", "        .is_some()\n}")
 mutate("registry-approved-at-offset", "an approval time may have no offset", RR, "    if at.offset.is_none() {", "    if false {")
 mutate("registry-hash-unchecked", "a definition changed after approval loads", RR,
        "    if computed != tool.definition_sha256 {", "    if false {")
@@ -2939,6 +2946,8 @@ mutate("registry-reach-test-not-required", "a server may have a reach and no rea
        "        if !reach.is_empty() && reach_test.is_none() {", "        if false {")
 mutate("registry-reach-check-not-required", "a server may have a reach and no reach check", RR,
        "            && server.reach_check.is_none()\n", "            && false\n")
+mutate("registry-reach-check-outside-system", "a reach check may name another server's tool or a malformed one", RR,
+       "            && !under_system(&check.tool, &server.system)\n", "            && false\n")
 mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file", RR,
        "    let surfaces = file\n",
        "    if servers.values().any(|server| server.reach_check.as_ref().is_some_and(|check| !routes.contains_key(&check.tool))) {\n"
@@ -4471,10 +4480,11 @@ mutate("gw-start-credential-unused", "a credential file no server uses is accept
 mutate("gw-start-per-user-grant-accepted", "a per-user grant is read from a file like a token", START,
        "            CredentialMode::PerUserGrant => {\n                return Err(StartError::PerUserGrant(server.name.clone()));\n            }\n",
        "            CredentialMode::PerUserGrant => &server.credential.reference,\n")
-mutate("gw-start-narrowing-accepted", "an entry narrowed per call or to the limit starts with one credential", START,
-       "        if server.narrowing != Narrowing::None {", "        if false {")
-mutate("gw-start-narrowing-call-accepted", "an entry narrowed per call starts with one credential", START,
-       "        if server.narrowing != Narrowing::None {", "        if server.narrowing == Narrowing::Limit {")
+# The narrowing gate is the boot gates' own (#163; gw-boot-narrowing-* below). The start runs
+# it before it reads a credential or connects to anything.
+mutate("gw-start-narrowing-after-credentials", "the start reads credentials and connects before it refuses a narrowed entry", BOOT,
+       "    narrowing_gate(snapshot)?;\n    receipt_gate(snapshot, development)\n}\n",
+       "    receipt_gate(snapshot, development)\n}\n")
 mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
@@ -4522,6 +4532,14 @@ mutate("gw-boot-proxied-connector-handed-out", "a proxied server's connector is 
        "            .filter(|registered| matches!(registered.reads, Reads::Adapter(_)))\n", "")
 mutate("gw-boot-registry-server-unconnected", "a registry server with no connector starts", BOOT,
        "        if !basis.connectors.contains(&route.server) {", "        if false {")
+# The narrowing gate (#163): nothing narrows a credential yet, so an entry narrowed per call or
+# to the limit is refused by the gates every registry's policy meets, at boot and on reload,
+# whoever wires the connectors. The JSON configuration's boot runs it too
+# (gw-boot-narrowing-config-path-skipped, beside the receipt-store gate's).
+mutate("gw-boot-narrowing-accepted", "boot::check_registry and a reload serve an entry narrowed per call or to the limit", BOOT,
+       "    narrowing_gate(policy.snapshot())?;\n", "")
+mutate("gw-boot-narrowing-call-accepted", "an entry narrowed per call passes the narrowing gate", BOOT,
+       "        .find(|entry| entry.narrowing != Narrowing::None)", "        .find(|entry| entry.narrowing == Narrowing::Limit)")
 mutate("gw-boot-registry-rule-issuer-unchecked", "a registry rule may name an untrusted issuer", BOOT,
        "            if !configured.contains(&rule.issuer) {", "            if false {")
 mutate("gw-boot-registry-reserved-profile", "a registry may define the reserved profile", BOOT,
