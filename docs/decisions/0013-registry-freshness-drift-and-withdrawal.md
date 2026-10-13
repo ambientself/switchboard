@@ -192,11 +192,16 @@ definition is withdrawn within one interval plus the entry's call deadline, on e
 whose polls succeed. The deadlines are set only in the deployment file, which is read at start,
 and a reload that changes the registry's entries is refused, so the check at start covers every
 reload. The reach check of step 3 runs beside the polls, so no poll waits for it, and a check is
-not started while the entry's last is still out. A check may take the call deadline plus 5 s,
-for the gateway's own work on the call. So a widened reach is withdrawn within one interval plus
-the call deadline and those 5 s when the interval is at least the deadline plus 5 s, as at the
-defaults and in the demos, and within one interval plus twice the deadline and the 5 s when it
-is shorter. The owner accepted this on 2026-10-12 (#165).
+not started while the entry's last is still out: a tick that finds it out makes no check, and
+the next check waits for a later tick. A check may take the call deadline plus 5 s, for the
+gateway's own work on the call, timed from after its tick. So a widened reach is withdrawn
+within one interval plus the call deadline and those 5 s when the interval is longer than the
+deadline plus 5 s, as at the defaults. When it is no longer, as in the demos (a 10 s interval
+and a 5 s deadline), a check can still be out at the next tick, which skips, and the reach is
+withdrawn within two intervals plus the deadline and the 5 s (30 s in the demos). At a 5 s
+interval with a 5 s deadline two ticks can skip, and it is within three intervals plus them
+(25 s). In every case it is within one interval plus twice the deadline and the 5 s. The owner
+accepted this on 2026-10-12 (#165).
 
 ### 6. Withdrawal in a replica
 

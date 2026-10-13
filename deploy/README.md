@@ -121,11 +121,15 @@ which comes before the listener is bound, and it never attempts a write: every p
   is withdrawn too, with the cause `reach check tool withdrawn`, since the entry can no longer
   be checked, until the list tool is served again.
 
-Each is counted in `switchboard_reach_checks_total{server,result}`. With the 10 s interval a
-widened reach is withdrawn within 10 s plus the 5 s call deadline and the 5 s allowance; at the
-300 s default, within about 310 s. The canaries reach mock-docs every 10 s under the entries'
-identities, and it refuses each for its project; the runs' call counts leave them out, and hold
-each to the other team's project.
+Each is counted in `switchboard_reach_checks_total{server,result}`. A tick that finds the
+entry's last check still out makes no check. The 10 s interval is no longer than the 5 s call
+deadline plus the 5 s allowance, so a check that runs to its limit makes the next tick skip, and
+a widened reach is withdrawn within two intervals plus the deadline and the allowance, 30 s.
+mock-docs answers each check at once, so every tick checks, and step 7 finds the widening within
+one interval plus the deadline and the allowance, 20 s. At the 300 s default, with the 5 s
+default deadline, it is withdrawn within about 310 s. The canaries reach mock-docs every 10 s
+under the entries' identities, and it refuses each for its project; the runs' call counts leave
+them out, and hold each to the other team's project.
 
 ## #11's demonstrations
 

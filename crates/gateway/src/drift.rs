@@ -80,10 +80,15 @@
 //! binary has bound the listener, and one more at each tick of the entry's schedule after,
 //! unless the last is still out. Each check runs beside the schedule, so no poll waits for one,
 //! and the bound above holds with reach checked too. A check takes up to the call deadline plus
-//! [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE): with an interval at least that long, as
-//! at the defaults and in the demos, a widened reach is withdrawn within one interval plus the
-//! deadline and the allowance, and with a shorter one, within one interval plus twice the
-//! deadline and the allowance. What the answer means is
+//! [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE), and a tick that finds it still out makes
+//! no check, so the next is at a later tick. With an interval longer than the deadline plus the
+//! allowance, as at the defaults, a widened reach is withdrawn within one interval plus the
+//! deadline and the allowance. With one no longer than that, as in the demos (10 s, with a 5 s
+//! deadline), a check can still be out at the next tick, which skips, and it is withdrawn within
+//! two intervals plus the deadline and the allowance (30 s in the demos). At a 5 s
+//! interval with a 5 s deadline, two ticks can skip, and it is withdrawn within three intervals
+//! plus them (25 s). In every case it is withdrawn within one interval plus twice the deadline
+//! and the allowance. What the answer means is
 //! [`reach::Verdict`](crate::reach::Verdict)'s:
 //!
 //! - **Held**, the server refused the canary: logged as [`REACH_HELD_EVENT`] at INFO and
@@ -1194,12 +1199,22 @@ async fn poll(withdrawals: Arc<Withdrawals>, entry: Entry) {
 ///
 /// Its reach is checked at once, and again at each tick, each check in a task beside the
 /// schedule, so no poll ever waits for one. A tick that comes while the last check is still out
-/// makes no check of its own, so two checks of one entry never run together. A check takes up
-/// to the call deadline plus [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE). With an
-/// interval at least that long, as at the defaults and in the demos, every tick makes a check,
-/// and a reach that has widened is withdrawn within one interval plus the call deadline and the
-/// allowance. With a shorter one, a tick may find the last check still out, so it is withdrawn
-/// within one interval plus twice the deadline and the allowance.
+/// makes no check of its own, so two checks of one entry never run together, and the next check
+/// waits for a later tick. A check takes up to the call deadline plus
+/// [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE), timed from after its tick. Take a reach
+/// that widens just after a check's canary was judged:
+///
+/// - With an interval longer than the deadline plus the allowance, as at the defaults, every
+///   tick makes a check, and the reach is withdrawn within one interval plus the call deadline
+///   and the allowance.
+/// - With one no longer than that, as in the demos (10 s, with a 5 s deadline), a check can
+///   still be out at the next tick, which then skips; one that runs to its limit always is. The
+///   next check starts a second interval on, and the reach is withdrawn within two intervals
+///   plus the deadline and the allowance (30 s in the demos).
+/// - At a 5 s interval with a 5 s deadline, the second tick skips too, and it is withdrawn
+///   within three intervals plus the deadline and the allowance (25 s).
+///
+/// In every case that is within one interval plus twice the deadline and the allowance.
 async fn poll_every(withdrawals: Arc<Withdrawals>, entry: Entry, interval: Duration) {
     let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
