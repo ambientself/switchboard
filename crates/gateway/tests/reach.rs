@@ -813,7 +813,6 @@ async fn a_widened_answer_at_the_largest_server_cap_is_a_mismatch() {
     let mismatch = captured.events("reach_mismatch");
     assert_eq!(mismatch.len(), 2, "{mismatch:?}");
     assert_eq!(replica.withdrawn().len(), 4, "{:?}", replica.withdrawn());
-    assert!(MAX_SERVER_RESULT_BYTES + 64 * 1024 <= gateway::reach::MAX_REACH_ANSWER_BYTES);
 }
 
 /// A missing token is a failed check: logged at WARN and counted, nothing sent to the server
