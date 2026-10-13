@@ -1,5 +1,5 @@
-# The Compose demo: Postgres, the migration, the dev issuer, the mock docs server and the
-# gateway. `deploy/demo/demo.sh compose` drives it; the `workload` service runs only under the
+# The Compose demo: Postgres, the migration, the dev issuer, the reach check's token writer,
+# the mock docs server and the gateway. `deploy/demo/demo.sh compose` drives it; the `workload` service runs only under the
 # `demo` profile. Compose proves the mechanics and makes no claim about network routes
 # (draft 0010): every service here shares one network.
 #
@@ -58,6 +58,8 @@ services:
     # volume, and answers GET /token?subject=...&audience=... on the Compose network for the
     # subjects below; it is not published. The two strangers are signed so the demo can show
     # the gateway refusing a real token whose subject is not in the team manifest.
+    # workload:registry:reach-check is the registry's own workload identity, which the gateway's
+    # reach check calls the gateway as (decision 0011, section 4).
     command:
       - switchboard-dev
       - issuer
@@ -68,10 +70,50 @@ services:
       - --subject=workload:team-b:mock-workload
       - --subject=workload:team-a:stranger
       - --subject=workload:team-b:stranger
+      - --subject=workload:registry:reach-check
     volumes:
       - issuer-keys:/shared/issuer
     healthcheck:
       test: ["CMD-SHELL", "test -s /shared/issuer/jwks.json && curl -fso /dev/null http://127.0.0.1:8090/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  reach-token:
+    <<: *demo-image
+    # The reach check's token writer: it asks the dev issuer for the registry's workload token,
+    # for audience switchboard, and writes it to the shared volume the gateway reads it from,
+    # every 60 s, each time to a new file renamed into place. Tokens last 600 s. It never prints
+    # the token. The gateway reads the file on every reach check, so it holds no copy of its own.
+    # It sleeps in the background so SIGTERM ends the wait at once: as PID 1 the shell gets no
+    # default action for it. `$$` is Compose's escape for a shell's `$`.
+    command:
+      - sh
+      - -c
+      - |
+        umask 077
+        trap 'exit 0' TERM INT
+        while :; do
+          if curl -fsS -m 10 -o /shared/reach/.registry.next \
+              'http://dev-issuer:8090/token?subject=workload:registry:reach-check&audience=switchboard' &&
+            test -s /shared/reach/.registry.next; then
+            mv -f /shared/reach/.registry.next /shared/reach/registry
+            echo "reach-token: wrote the registry's token for audience switchboard"
+            sleep 60 &
+          else
+            rm -f /shared/reach/.registry.next
+            echo "reach-token: could not get the registry's token; trying again in 2 s"
+            sleep 2 &
+          fi
+          wait $$!
+        done
+    volumes:
+      - reach-token:/shared/reach
+    depends_on:
+      dev-issuer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-s", "/shared/reach/registry"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -83,9 +125,10 @@ services:
     # (dummy-credentials/mock-docs-callers). It is given each credential's sha256, never the
     # credential. It logs the sha256 prefix of every bearer it receives.
     #
-    # Its admin endpoint, which changes what it serves, is for demo.sh's drift step alone: it
-    # listens on this container's loopback, which no other container can reach, and demo.sh
-    # reaches it with `docker compose exec mock-docs curl`. With no admin credential it answers
+    # Its admin endpoint, which changes what it serves and the projects each caller may name, is
+    # for demo.sh's drift and reach steps alone: it listens on this container's loopback, which
+    # no other container can reach, and demo.sh reaches it with `docker compose exec mock-docs
+    # curl`. With no admin credential it answers
     # mock-docs' callers, and the binary serves it nowhere but on loopback.
     command: ["mock-docs-server"]
     environment:
@@ -129,6 +172,8 @@ services:
       # demo.sh mounts a copy under .demo/, so withdrawing a tool never edits the repository.
       - ${SWITCHBOARD_REGISTRY_DIR:-./config/registry}:/etc/switchboard/registry:ro
       - issuer-keys:/shared/issuer:ro
+      # The registry's workload token, which the reach-token service writes.
+      - reach-token:/shared/reach:ro
     secrets:
       - docs-team-a-credential
       - docs-team-b-credential
@@ -137,6 +182,8 @@ services:
       migrate:
         condition: service_completed_successfully
       dev-issuer:
+        condition: service_healthy
+      reach-token:
         condition: service_healthy
       mock-docs:
         condition: service_healthy
@@ -180,3 +227,4 @@ secrets:
 volumes:
   pgdata:
   issuer-keys:
+  reach-token:

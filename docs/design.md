@@ -1141,7 +1141,8 @@ reload while the tool's hashes and `approved_at` are unchanged; a new approval c
 first pass's tool lists and probes run at boot, before the replica binds the one listener that
 serves `/readyz` and every surface, so it serves nothing until they finish. Its reach checks
 are calls through that listener, so they run as soon as it is bound; until they finish, at
-most one call deadline, a reach that has widened is served, as between any two passes. A poll
+most one call deadline plus 5 s, a reach that has widened is served, as between any two
+passes. They run beside the first scheduled polls and delay none of them. A poll
 that fails, by being unreachable, late or unparsable, is not drift: the tools stay served and
 the failure is counted and alerted on.
 Each replica checks for itself, so a change that lasts one interval plus one call deadline,
@@ -1454,9 +1455,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
   issuer's key age (#115), the policy's age and maximum age (#132), and the calls shed and
   each proxied server's calls, latency and late or oversized answers (#139), and each proxied
-  server's drift polls, withdrawals and probe results (the drift pass entry below). The
-  reach-check signals wait for what they count. Decision 0014 writes the alert conditions
-  down, and there are no rules until a metrics sink exists.
+  server's drift polls, withdrawals, probe results and reach checks (the drift pass entry
+  below). Decision 0014 writes the alert conditions down, and there are no rules until a
+  metrics sink exists.
 - The overload, hanging-server and drift demonstrations: built in both demos, Compose and kind
   (deploy/README.md, "#11's demonstrations"). A hanging server: team-a's read of mock-docs'
   `slow-doc` is answered at the 5 s deadline, its row `error` of the kind
@@ -1489,8 +1490,10 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `PolicySnapshot::without` derives a withdrawal's snapshot for the drift pass. The gateway
   reads a team service identity's or gateway token's credential from its file and refuses a
   per-user grant at start, until milestone 5. The reach check's tool need not be approved, so
-  removing it, or an entry's last tool, still withdraws it on reload (section 8). Not built:
-  the scheduled reach check, and narrowing a credential per call or to the caller's limit. The
+  removing it, or an entry's last tool, still withdraws it on reload (section 8); a surface that
+  serves it, such as `registry-reach`, must drop it too. The scheduled reach check is built
+  (the drift pass entry below). Not built: a check against a vendor's report of what a
+  credential reaches, and narrowing a credential per call or to the caller's limit. The
   gateway sends the same credential on every call to a server, so it refuses an entry whose
   narrowing is not `none`, until the custodian client (#12). The refusal is one of the gates
   every registry's policy meets, at boot and on every reload, whoever wires the connectors.
@@ -1499,9 +1502,13 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The kind slice extended to show them: partly built. Both demos register the mock server
   once per team and show each team's calls reaching it under its own entry's identity, for its
   own project (the next entry), and both show the undeclared argument, the registry refused at
-  load, the hanging server, overload and drift (the demonstrations entry above). The probe is
-  shown only by mock-docs refusing each probe's three calls in the kind run; no step shows it
-  finding an open server. The reach check is not shown.
+  load, the hanging server, overload and drift (the demonstrations entry above). Both check,
+  after boot, that each entry's probe was refused and its reach check held, with rows by the
+  registry's principal, and both widen docs-team-a's caller in mock-docs to both projects: the
+  next reach check finds the mismatch, both of docs-team-a's tools are withdrawn within the
+  interval plus the deadline and the reach check's allowance, and a new approval, once the
+  caller is narrowed again, serves them again. No step shows the probe finding an open
+  server.
 - The gateway's per-team identities: built in the demos (#11's kind slice), as decision 0013,
   section 10, has them. The registry lists the mock server twice, `docs-team-a` and
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
@@ -1514,8 +1521,11 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   team's project. The probe's ServiceAccount, `registry-probe`, is the Role's third name: the
   token writer writes its token for the mock server's audience beside the entries', and the
   drift pass's probe presents it (the probe entry below). In Compose the probe presents a static
-  dummy the mock server is not given. The registry's own workload identity joins the Role when
-  the reach check is built.
+  dummy the mock server is not given. The registry's own workload identity, ServiceAccount
+  `registry`, is the Role's fourth name: the token writer writes its token for the gateway's own
+  audience, `switchboard`, and the reach check presents it (the drift pass entry below). The team
+  manifest maps it to team `registry`. In Compose a `reach-token` service writes the dev
+  issuer's token for `workload:registry:reach-check` to a volume the gateway reads.
 - Decision 0013's loader rules: both hashes recomputed and compared, identity equal to the
   address's host, the dialect and no `+` in the registry's revision are built (#131, and #122
   for the dialect). Each server's destination class is recorded and bound, and the loader
@@ -1529,10 +1539,12 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   schedule of its own, so a server that answers late holds back no other server's polls. Each
   server is polled one poll at a time, so section 13's bound of one interval plus one call
   deadline holds when the interval is at least the entry's call deadline, as at the defaults
-  and in the demos. With a shorter interval, a list answered late but inside the deadline holds
-  back that server's next poll until it arrives, and the worst case is about two call deadlines
-  (#165). An approved tool whose served definition no longer hashes to its `definition_sha256`,
-  by the loader's own function, or that the server no longer lists, is withdrawn: the policy in
+  and in the demos. With the reach check (below), the next poll also waits for the check beside
+  the last, so the bound holds when the interval is at least the deadline plus 5 s, as there
+  too. With a shorter interval, a list answered late but inside the deadline holds back that
+  server's next poll until it arrives, and the worst case is about two call deadlines (#165).
+  An approved tool whose served definition no longer hashes to its `definition_sha256`, by the
+  loader's own function, or that the server no longer lists, is withdrawn: the policy in
   force less the tool, under the revision `{base}+withdrawn:{names}`, swapped in atomically,
   with `tool_withdrawn` logged at ERROR and counted. A poll is judged only against the
   approvals it began under, so a list read before a reload approved a tool again does not
@@ -1542,7 +1554,31 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   approval or by removing the tool; it lives in the replica's memory, so a restart against a
   restored server serves the tool again (decision 0013, section 7). `tests/drift.rs` has
   decision 0013's drift scenarios. Each poll also probes its server (the probe entry below).
-  Not built: the reach check of the same pass.
+  The reach check of the same pass is built (decision 0011, section 4; decision 0013, section
+  5, step 3). With `[drift] reach_token_file`, `reach_url` and `reach_host`, given together,
+  each entry with a `reach_check` is checked beside each poll, and once as soon as the drift
+  pass starts, after the listener is bound; never in the boot pass, which comes before it. The
+  gateway refuses to start without the three fields while any entry has a `reach_check`,
+  naming the entries, so no entry is left unchecked for want of them. That first check runs
+  beside the entry's schedule and delays no poll; a poll that comes while it is out makes no
+  check of its own. The check sends the entry's canary as
+  `tools/call` to the replica's own listener, on the `registry-reach` surface, with the
+  registry's own workload token: a principal the surface admits alone, by issuer and subject,
+  in team `registry`, whose limit holds each entry's reach and canary, so the call is decided,
+  audited and sent with the entry's credential like any other. An error result whose text is
+  the proxy's upstream-refused sentence holds, logged as `reach_held`. A successful result is
+  a mismatch: every tool of the entry is withdrawn with the cause `reach mismatch`, judged
+  against the approvals the check began under, logged as `reach_mismatch` and
+  `tool_withdrawn` at ERROR, and a new approval clears it. Anything else, a denial, an audit
+  failure, a token that cannot be read, an answer larger than the check reads or none within
+  the call deadline plus 5 s, is a failed check, logged as `reach_check_failed` at WARN, and
+  withdraws nothing; so is a check whose canary tool is not served now, which makes no call.
+  The check reads up to the largest `max_result_bytes` a server may have, 1 MiB, plus 64 KiB
+  for the gateway's envelope and `_meta`, so a widened canary answered near its server's cap
+  is a mismatch. Each is counted in `switchboard_reach_checks_total{server,result}`.
+  `tests/reach.rs` has the held, mismatch, failed and denied cases on the mock server, a
+  mismatch at the largest cap, a check outstanding across a new approval, which withdraws
+  nothing, and the start refused without the fields.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.
@@ -1572,8 +1608,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The 512 KiB row bound and its test: not built.
 - The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
   each proxied server's calls, latency and late or oversized answers (#139), and the policy's
-  age (#132), and each server's drift polls, withdrawals and probe results, are exported.
-  Reach-check results are not built.
+  age (#132), and each server's drift polls, withdrawals, probe results and reach-check
+  results, are exported.
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming

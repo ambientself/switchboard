@@ -72,8 +72,9 @@ RUN set -eu; \
     apt-get install -y --no-install-recommends ca-certificates curl jq postgresql-client; \
     rm -rf /var/lib/apt/lists/*; \
     useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin switchboard; \
-    # The Compose dev issuer writes its key set here; a new named volume takes this ownership.
-    install -d -o 10001 -g 10001 /shared/issuer
+    # The Compose dev issuer writes its key set here, and the reach-token service the registry's
+    # token; a new named volume takes this ownership.
+    install -d -o 10001 -g 10001 /shared/issuer /shared/reach
 COPY --from=build /out/bin/ /usr/local/bin/
 COPY deploy/demo/workload.sh deploy/demo/migrate.sh deploy/demo/token-writer.sh /usr/local/bin/
 COPY deploy/demo/roles.sql /usr/share/switchboard/roles.sql

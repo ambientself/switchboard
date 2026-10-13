@@ -730,6 +730,7 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
     let store = db.store(PoolSizes::default());
     assert_eq!(show(&store.begin.get().await.unwrap()).await, "on");
     assert_eq!(show(&store.finish.get().await.unwrap()).await, "on");
+    assert_eq!(show(&store.open_rows_pool.get().await.unwrap()).await, "on");
 
     // Options the caller set are kept beside the store's, and come before them, so where both
     // set one setting the store's value is the one that holds: the last wins.
@@ -738,11 +739,13 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
         "-c statement_timeout=4321 -c synchronous_commit=off -c search_path=public,pg_catalog",
     );
     let store = PgAuditStore::connect(config, NoTls, PoolSizes::default()).unwrap();
-    for client in [
-        store.begin.get().await.unwrap(),
-        store.finish.get().await.unwrap(),
+    // Each of the three pools, the open-row query's too, as the gateway's role.
+    for (pool, client) in [
+        ("begin", store.begin.get().await.unwrap()),
+        ("finish", store.finish.get().await.unwrap()),
+        ("open_rows", store.open_rows_pool.get().await.unwrap()),
     ] {
-        assert_eq!(show(&client).await, "on");
+        assert_eq!(show(&client).await, "on", "{pool}");
         for (setting, expected) in [
             ("statement_timeout", "4321ms"),
             ("search_path", "pg_catalog,pg_temp"),
@@ -752,8 +755,14 @@ async fn every_session_commits_synchronously_whatever_the_role_default() {
                 .await
                 .unwrap()
                 .get(0);
-            assert_eq!(found, expected, "{setting}");
+            assert_eq!(found, expected, "{pool}: {setting}");
         }
+        let role: String = client
+            .query_one("SELECT current_user::text", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(role, GATEWAY_ROLE, "{pool}");
     }
     store.check_at_boot().await.unwrap();
 }

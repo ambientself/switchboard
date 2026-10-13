@@ -1,9 +1,10 @@
 # 0014: Rollout safeguards and audit operations
 
-Date: 2026-10-10. Status: accepted on 2026-10-11, when the owner accepted every recommendation
-this record made, including the two that were the owner's own (see The owner's answers).
-Settles Q12 (#5), except the parts under Still open: the per-user rate limit, which the owner
-left open until milestone 5, and the parts that wait on other people. Written against
+Date: 2026-10-10, amended 2026-10-12 (the amendment is at the end). Status: accepted on
+2026-10-11, when the owner accepted every recommendation this record made, including the two
+that were the owner's own (see The owner's answers). Settles Q12 (#5), except the parts under
+Still open: the per-user rate limit, which the owner left open until milestone 5, and the
+parts that wait on other people. Written against
 [decision 0009](0009-audit-completion-receipts-and-recovery.md) as amended on 2026-10-10,
 [decision 0011](0011-resource-authorization-and-tool-assurance.md), and the code on main at
 the end of milestone 2, including the metrics export of #47. Decision 0013, proposed beside
@@ -110,7 +111,8 @@ limit is answered (Still open).
 - **Pools:** 16 begin and 4 finish connections in each instance, as built. A begin that cannot
   get a connection within its 2 s budget refuses the call with the audit-failure sentence.
 - **The database's `max_connections`** must be at least the number of gateway replicas times
-  20, plus the connections the migrate job and readers use.
+  21, plus the connections the migrate job and readers use (see the amendment of 2026-10-12 at
+  the end).
 - **The pool sizes become configurable** in the deployment file before the first deployment
   against a real database. The defaults stay 16 and 4.
 
@@ -309,3 +311,22 @@ open; each says what holds until it is answered.
   role exists, no one reads it but its operators.
 - **Whether Otto's `gateway_audit` table gains columns.** Otto's owners, through the one list
   of Otto requests (Q18, #21). Until then those columns stay in this gateway's own record.
+
+## Amended 2026-10-12: the open-row poll's connection
+
+Until this amendment, section 3 said the database's `max_connections` must be at least the
+number of gateway replicas times 20. It is now the number of gateway replicas times 21, plus
+the connections the migrate job and readers use.
+
+- **Each instance opens at most 21 audit connections:** 16 begin, 4 finish and 1 open-row
+  connection. The pool sizes of section 3 are unchanged.
+- **Why (#162, #161):** the open-row poll now has a pool of its own, of one connection, so a
+  poll held up for its full 2 s never takes a connection a finish could use. Before, it took
+  one of the finish pool's. That connection is one more per instance, and a `max_connections`
+  counted at 20 per replica would refuse it when every pool is full.
+- **What does not change:** the begin and finish pools, their budgets, and that the pool sizes
+  become configurable before the first deployment against a real database. When they do, the
+  bound is begin plus finish plus 1 per replica.
+
+The owner accepted this on 2026-10-12, taking the recommendation in #161 ("take your
+recommendations on 161, 165 and 172").

@@ -231,7 +231,7 @@ pub fn rebind(text: &str, address: &str) -> String {
 }
 
 /// The revision the kind registry is at.
-pub const KIND_REVISION: &str = "demo-7";
+pub const KIND_REVISION: &str = "demo-10";
 
 /// The kind registry with the mock server at `mock_url`, under `revision` instead of
 /// [`KIND_REVISION`].
@@ -300,12 +300,24 @@ pub fn keys_url_issuer(issuer: &str, keys_url: &str) -> String {
     )
 }
 
+/// The registry's token file that [`deployment_file`]'s reach check reads, relative to the
+/// deployment file. [`Files::new`] does not write it.
+pub const REACH_TOKEN_FILE: &str = "registry-token";
+
+/// Where [`deployment_file`]'s reach check calls: the discard port, where nothing listens.
+pub const REACH_URL: &str = "http://127.0.0.1:9/mcp/registry-reach";
+
 /// A deployment file, relative paths and all, with `audit` as its audit table.
 pub fn deployment_file(audit: &str) -> String {
     deployment_file_probing(audit, &["docs-team-a", "docs-team-b"])
 }
 
 /// [`deployment_file`], giving each of `servers` the probe's credential.
+///
+/// It gives the reach check's settings too, since the kind registry's entries have a reach
+/// check and the gateway refuses to start without them. The token file is not written and
+/// nothing listens at the URL, so each reach check that runs fails without reaching a server;
+/// `tests/reach.rs` gives a replica a working reach check of its own.
 pub fn deployment_file_probing(audit: &str, servers: &[&str]) -> String {
     let probes: String = servers
         .iter()
@@ -341,9 +353,24 @@ leeway_seconds = 30
 docs-team-a-credential = "docs-team-a-credential"
 docs-team-b-credential = "docs-team-b-credential"
 
+[drift]
+reach_token_file = "{REACH_TOKEN_FILE}"
+reach_url = "{REACH_URL}"
+reach_host = "127.0.0.1"
+
 [drift.probe_credentials]
 {probes}"#
     )
+}
+
+/// `text`, a deployment file from [`deployment_file`], without its `[drift]` reach settings.
+pub fn without_reach_settings(text: &str) -> String {
+    let settings = format!(
+        "[drift]\nreach_token_file = \"{REACH_TOKEN_FILE}\"\nreach_url = \"{REACH_URL}\"\n\
+         reach_host = \"127.0.0.1\"\n\n"
+    );
+    assert_eq!(text.matches(&settings).count(), 1, "{text}");
+    text.replace(&settings, "")
 }
 
 /// A JWK set document holding every key of `issuers`.

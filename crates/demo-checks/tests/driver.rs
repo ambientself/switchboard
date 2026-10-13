@@ -1611,7 +1611,7 @@ fn row(
         "kind": "call", "team": team, "tool": format!("docs-{team}__read_document"),
         "decision": decision, "reason": reason,
         "sentence": if sentence.is_empty() { Value::Null } else { json!(sentence) },
-        "resources": resources, "revision": "demo-7", "listed": null, "omitted": null,
+        "resources": resources, "revision": "demo-10", "listed": null, "omitted": null,
     })
 }
 
@@ -1685,9 +1685,9 @@ fn demo_rows() -> Vec<Value> {
             json!("unknown"),
         ),
         // Each team's list, and team-a's after the withdrawal, under the next revision.
-        list_row("team-a", "demo-7", &both_tools("team-a")),
-        list_row("team-b", "demo-7", &both_tools("team-b")),
-        list_row("team-a", "demo-8", &["docs-team-a__list_documents"]),
+        list_row("team-a", "demo-10", &both_tools("team-a")),
+        list_row("team-b", "demo-10", &both_tools("team-b")),
+        list_row("team-a", "demo-11", &["docs-team-a__list_documents"]),
     ]
 }
 
@@ -3311,7 +3311,7 @@ fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
     let gateway = common::read("deploy/kind/base/gateway.yaml");
     for line in [
         "          command: [\"token-writer.sh\"]\n",
-        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe\"}\n",
+        "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe registry:switchboard\"}\n",
         "            - {name: TOKEN_NAMESPACE, value: switchboard}\n",
         "            - {name: TOKEN_AUDIENCE, value: mock-docs}\n",
         "            - {name: TOKEN_EXPIRATION_SECONDS, value: \"600\"}\n",
@@ -3329,12 +3329,12 @@ fn the_kind_gateway_pod_runs_the_token_writer_the_tests_run() {
 }
 
 #[test]
-fn the_gateways_token_grant_must_name_only_the_entries_and_the_probe() {
+fn the_gateways_token_grant_must_name_only_the_entries_the_probe_and_the_registry() {
     // A fake `k` answering can-i as RBAC would for gateway-tokens.yaml, or as it would with
     // the grant widened to every ServiceAccount.
     let fake = |widened: bool| {
         format!(
-            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *|*serviceaccounts/registry-probe\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
+            "k() {{ case \"$*\" in\n  *serviceaccounts/docs-team-a\\ *|*serviceaccounts/docs-team-b\\ *|*serviceaccounts/registry-probe\\ *|*serviceaccounts/registry\\ *) echo yes ;;\n  *) {} ;;\n esac; }}\n",
             if widened {
                 "echo yes"
             } else {
@@ -3347,13 +3347,16 @@ fn the_gateways_token_grant_must_name_only_the_entries_and_the_probe() {
         fake(false)
     ));
     assert_eq!(run.status, Some(0), "{}", run.transcript());
-    assert_eq!(run.lines("PASS ").len(), 7, "{}", run.transcript());
-    assert!(
-        run.transcript()
-            .contains("the gateway may create tokens for registry-probe"),
-        "{}",
-        run.transcript()
-    );
+    assert_eq!(run.lines("PASS ").len(), 8, "{}", run.transcript());
+    for account in ["registry-probe", "registry"] {
+        assert!(
+            run.transcript().contains(&format!(
+                "PASS the gateway may create tokens for {account}\n"
+            )),
+            "{}",
+            run.transcript()
+        );
+    }
     let run = sourced(&format!("{}token_grants\nFINISHED=1\nresult 0", fake(true)));
     assert_eq!(run.lines("FAIL ").len(), 4, "{}", run.transcript());
     assert!(
@@ -3515,7 +3518,7 @@ fn step_row(team: &str, tool: &str, outcome: &str, begun: f64, seconds: f64) -> 
         "decision": "allow", "reason": null, "outcome": outcome,
         "error_kind": if outcome == "error" { json!("other") } else { Value::Null },
         "outcome_sentence": null, "latency_ms": (seconds * 1000.0).round(),
-        "revision": "demo-7", "listed": null,
+        "revision": "demo-10", "listed": null,
         "begun": begun, "finished": begun + seconds,
     })
 }
@@ -3682,7 +3685,7 @@ fn the_registry_variants_load_as_the_gateway_loads_them() {
 
         let reach = variant(
             "reach",
-            "reach_variant demo-9-reach-20261012T100000Z",
+            "reach_variant demo-12-reach-20261012T100000Z",
             &served,
         );
         assert_eq!(reach.status, Some(0), "{path}: {}", reach.transcript());
@@ -3694,11 +3697,11 @@ fn the_registry_variants_load_as_the_gateway_loads_them() {
             "2026-10-12T10:00:02.000000Z",
             json!({"event": "policy_reload_refused",
                    "file": "/etc/switchboard/registry/registry.toml",
-                   "reason": error, "served": "demo-7"}),
+                   "reason": error, "served": "demo-10"}),
         );
         let run = checked(
             "refused-real",
-            "check_refused_at_load \"$(events {log} 'select(.event == \"policy_reloaded\" or .event == \"policy_reload_refused\")')\" demo-9-reach-20261012T100000Z",
+            "check_refused_at_load \"$(events {log} 'select(.event == \"policy_reloaded\" or .event == \"policy_reload_refused\")')\" demo-12-reach-20261012T100000Z",
             &[("log", &events)],
         );
         assert_all_passed(path, &run, 4);
@@ -3712,8 +3715,8 @@ fn the_registry_variants_load_as_the_gateway_loads_them() {
             changed,
             [
                 (
-                    "revision = \"demo-7\"",
-                    "revision = \"demo-9-reach-20261012T100000Z\""
+                    "revision = \"demo-10\"",
+                    "revision = \"demo-12-reach-20261012T100000Z\""
                 ),
                 ("teams = [\"team-a\"]", "teams = [\"team-a\", \"team-b\"]"),
             ],
@@ -3721,14 +3724,14 @@ fn the_registry_variants_load_as_the_gateway_loads_them() {
         );
         assert_eq!(served.lines().count(), reach.stdout.lines().count());
 
-        let call = "reapproval_variant demo-9-reapproved-20261012T100000Z 2026-10-12T10:00:00Z \
+        let call = "reapproval_variant demo-12-reapproved-20261012T100000Z 2026-10-12T10:00:00Z \
                     docs-team-a__list_documents docs-team-b__list_documents";
         let again = variant("reapproval", call, &served);
         assert_eq!(again.status, Some(0), "{path}: {}", again.transcript());
         let approved = gateway_registry::Registry::from_toml_str(&again.stdout).unwrap();
         assert_eq!(
             approved.snapshot().revision().as_str(),
-            "demo-9-reapproved-20261012T100000Z"
+            "demo-12-reapproved-20261012T100000Z"
         );
         assert_eq!(original.approvals().len(), approved.approvals().len());
         for (tool, before) in original.approvals() {
@@ -3744,17 +3747,17 @@ fn the_registry_variants_load_as_the_gateway_loads_them() {
         }
 
         // A registry the variant cannot be made from is refused, not passed on half made.
-        let widened = variant("reach-twice", "reach_variant demo-9-x", &reach.stdout);
+        let widened = variant("reach-twice", "reach_variant demo-12-x", &reach.stdout);
         assert_eq!(widened.status, Some(1), "{}", widened.transcript());
         let unknown = variant(
             "reapproval-unknown",
-            "reapproval_variant demo-9-y 2026-10-12T10:00:00Z docs-team-c__list_documents",
+            "reapproval_variant demo-12-y 2026-10-12T10:00:00Z docs-team-c__list_documents",
             &served,
         );
         assert_eq!(unknown.status, Some(1), "{}", unknown.transcript());
         let none = variant(
             "reapproval-none",
-            "reapproval_variant demo-9-y 2026-10-12T10:00:00Z",
+            "reapproval_variant demo-12-y 2026-10-12T10:00:00Z",
             &served,
         );
         assert_eq!(none.status, Some(1), "{}", none.transcript());
@@ -3773,18 +3776,18 @@ fn the_refused_at_load_step_needs_a_rule_5_refusal_and_the_policy_served_unchang
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
-            "check_refused_at_load \"$(events {log} 'select(.event == \"policy_reloaded\" or .event == \"policy_reload_refused\")')\" demo-9-reach-x",
+            "check_refused_at_load \"$(events {log} 'select(.event == \"policy_reloaded\" or .event == \"policy_reload_refused\")')\" demo-12-reach-x",
             &[("log", &lines.join("\n"))],
         )
     };
     assert_all_passed(
         "refused",
-        &run_on("refused", &[refusal(rule_5, "demo-7")]),
+        &run_on("refused", &[refusal(rule_5, "demo-10")]),
         4,
     );
     let served_variant = log_line(
         "2026-10-12T10:00:02.000000Z",
-        json!({"event": "policy_reloaded", "revision": "demo-9-reach-x"}),
+        json!({"event": "policy_reloaded", "revision": "demo-12-reach-x"}),
     );
     for (case, lines, failure) in [
         (
@@ -3794,26 +3797,26 @@ fn the_refused_at_load_step_needs_a_rule_5_refusal_and_the_policy_served_unchang
         ),
         (
             "served after a refusal",
-            vec![refusal(rule_5, "demo-7"), served_variant],
-            "the gateway never served revision demo-9-reach-x (got '1'",
+            vec![refusal(rule_5, "demo-10"), served_variant],
+            "the gateway never served revision demo-12-reach-x (got '1'",
         ),
         (
             "another rule",
             vec![refusal(
                 "rule 3: proxied entry `docs-team-a` reaches `docs / project / atlas` and has no recorded reach test",
-                "demo-7",
+                "demo-10",
             )],
             "its reason is rule 5",
         ),
         (
             "another team",
-            vec![refusal(&rule_5.replace("team-b", "team-c"), "demo-7")],
+            vec![refusal(&rule_5.replace("team-b", "team-c"), "demo-10")],
             "its reason is rule 5",
         ),
         (
             "another policy served",
-            vec![refusal(rule_5, "demo-8")],
-            "the policy served is still revision demo-7 (got 'demo-8'",
+            vec![refusal(rule_5, "demo-11")],
+            "the policy served is still revision demo-10 (got 'demo-11'",
         ),
         ("nothing", vec![], "the gateway refused the registry"),
     ] {
@@ -4202,7 +4205,7 @@ fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> Stri
     log_line(
         &format!("2026-10-12T10:00:{seconds:02}.250000Z"),
         json!({"event": "tool_withdrawn", "tool": tool, "server": tool.split("__").next(),
-               "cause": cause, "base": "demo-7", "revision": revision}),
+               "cause": cause, "base": "demo-10", "revision": revision}),
     )
 }
 
@@ -4210,7 +4213,7 @@ fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> Stri
 fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revision() {
     // 10:00:00 UTC on 2026-10-12, and a little more.
     let changed = "1791799200.400000";
-    let drifted = "demo-7+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
@@ -4224,7 +4227,7 @@ fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revi
         "docs-team-b__list_documents",
         7,
         "definition changed",
-        "demo-7+withdrawn:docs-team-b__list_documents",
+        "demo-10+withdrawn:docs-team-b__list_documents",
     );
     let a = |seconds: u32| {
         withdrawn_line(
@@ -4272,10 +4275,10 @@ fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revi
                     "docs-team-a__list_documents",
                     12,
                     "definition changed",
-                    "demo-7+withdrawn:2",
+                    "demo-10+withdrawn:2",
                 ),
             ],
-            "the revision served after both withdrawals is the literal derived one (got 'demo-7+withdrawn:2'",
+            "the revision served after both withdrawals is the literal derived one (got 'demo-10+withdrawn:2'",
         ),
     ] {
         assert_fails(case, &run_on(case, &lines), failure);
@@ -4301,7 +4304,7 @@ fn drift_rows(revision: &str, listed: &[&str], decision: &str, result: &str) -> 
 
 #[test]
 fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
-    let drifted = "demo-7+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
     let read = "docs-team-a__read_document";
     let both = "docs-team-a__list_documents,docs-team-a__read_document";
     let run_on = |name: &str, rows: Value, revision: &str, listed: &str, call: &str| {
@@ -4324,14 +4327,14 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
         1,
     );
     let served = drift_rows(
-        "demo-7",
+        "demo-10",
         &["docs-team-a__read_document", "docs-team-a__list_documents"],
         "allow",
         "ok",
     );
     assert_all_passed(
         "served",
-        &run_on("served", served, "demo-7", both, "allow ok"),
+        &run_on("served", served, "demo-10", both, "allow ok"),
         1,
     );
     const CHECK: &str = "audit: team-a's list and call are recorded under revision";
@@ -4339,7 +4342,7 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
         // Rows under the base revision while the tool is withdrawn.
         (
             "base revision",
-            drift_rows("demo-7", &[read], "deny", "unknown_tool"),
+            drift_rows("demo-10", &[read], "deny", "unknown_tool"),
             drifted,
             read,
             "deny unknown_tool",
@@ -4363,8 +4366,8 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
             read,
             "deny unknown_tool",
         ),
-        ("still withdrawn", withdrawn, "demo-7", both, "allow ok"),
-        ("no rows", json!([]), "demo-7", both, "allow ok"),
+        ("still withdrawn", withdrawn, "demo-10", both, "allow ok"),
+        ("no rows", json!([]), "demo-10", both, "allow ok"),
     ] {
         assert_fails(case, &run_on(case, rows, revision, listed, call), CHECK);
     }
@@ -4372,7 +4375,7 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
 
 #[test]
 fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleared() {
-    let revision = "demo-9-reapproved-20261012T100000Z";
+    let revision = "demo-12-reapproved-20261012T100000Z";
     let reloaded = |served: &str| {
         log_line(
             "2026-10-12T10:00:02.000000Z",
@@ -4409,7 +4412,7 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
             vec![reloaded(&format!(
                 "{revision}+withdrawn:docs-team-a__list_documents"
             ))],
-            "the gateway serves revision demo-9-reapproved-20261012T100000Z, with no withdrawal",
+            "the gateway serves revision demo-12-reapproved-20261012T100000Z, with no withdrawal",
         ),
         ("one cleared", vec![reloaded(revision), a.clone()], CLEARED),
         (
@@ -4441,28 +4444,47 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
 /// The exit says so, and how to clear them in the deployment the run used.
 #[test]
 fn a_run_stopped_with_the_withdrawals_held_says_how_to_clear_them() {
-    let held = "the gateway may still hold the drift step's withdrawals";
-    for (mode, clear) in [
-        ("compose", "down compose"),
-        ("kind", "-n switchboard rollout restart deploy/gateway"),
-    ] {
-        let run = sourced(&format!(
-            "MODE={mode}\nWITHDRAWAL_HELD=1\ntrap on_exit EXIT\nexit 1"
-        ));
-        assert_eq!(run.status, Some(1), "{mode}: {}", run.transcript());
-        assert!(run.stderr.contains(held), "{mode}: {}", run.transcript());
-        assert!(run.stderr.contains(clear), "{mode}: {}", run.transcript());
+    let driver = common::read("deploy/demo/demo.sh");
+    for step in ["drift", "reach"] {
+        // What each step sets while the gateway may hold its withdrawals.
+        let set = driver
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "  WITHDRAWAL_HELD=\"the {step} step's withdrawals of "
+                ))
+            })
+            .unwrap_or_else(|| panic!("the {step} step sets WITHDRAWAL_HELD"))
+            .trim();
+        let held = format!(
+            "the gateway may still hold the {step} step's withdrawals of docs-team-a__list_documents and "
+        );
+        for (mode, clear) in [
+            ("compose", "down compose"),
+            ("kind", "-n switchboard rollout restart deploy/gateway"),
+        ] {
+            let run = sourced(&format!(
+                "MODE={mode}\nlist=docs-team-a__list_documents read=docs-team-a__read_document\n{set}\ntrap on_exit EXIT\nexit 1"
+            ));
+            assert_eq!(run.status, Some(1), "{mode}: {}", run.transcript());
+            assert!(run.stderr.contains(&held), "{mode}: {}", run.transcript());
+            assert!(run.stderr.contains(clear), "{mode}: {}", run.transcript());
+        }
     }
     let run = sourced("MODE=compose\ntrap on_exit EXIT\nexit 1");
-    assert!(!run.stderr.contains(held), "{}", run.transcript());
+    assert!(
+        !run.stderr.contains("the gateway may still hold"),
+        "{}",
+        run.transcript()
+    );
 }
 
 /// The list rows of the drift steps: under the revision the drift pass derives, each team is
 /// shown its tools less those withdrawn; under a re-approval's revision, both of its tools.
 #[test]
 fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
-    let drifted = "demo-7+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
-    let reapproved = "demo-9-reapproved-20261012T100000Z";
+    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let reapproved = "demo-12-reapproved-20261012T100000Z";
     let rows = |team_a: Value| {
         json!([
             list_row("team-a", drifted, &["docs-team-a__read_document"]),
@@ -4472,7 +4494,7 @@ fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
         ])
         .to_string()
     };
-    let good = list_row("team-a", "demo-7", &both_tools("team-a"));
+    let good = list_row("team-a", "demo-10", &both_tools("team-a"));
     let run = check_lists("lists-drift", &rows(good), 4);
     assert_eq!(run.status, Some(0), "{}", run.transcript());
     for (case, row) in [
@@ -4484,7 +4506,7 @@ fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
             "another tool withdrawn",
             list_row(
                 "team-a",
-                "demo-7+withdrawn:docs-team-a__read_document",
+                "demo-10+withdrawn:docs-team-a__read_document",
                 &both_tools("team-a"),
             ),
         ),
@@ -4494,15 +4516,769 @@ fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
         ),
         (
             "not a reapproval revision",
-            list_row("team-a", "demo-9-reapproved-soon", &both_tools("team-a")),
+            list_row("team-a", "demo-12-reapproved-soon", &both_tools("team-a")),
         ),
         (
             "not a derived revision",
-            list_row("team-a", "demo-7+other", &both_tools("team-a")),
+            list_row("team-a", "demo-10+other", &both_tools("team-a")),
         ),
     ] {
         let run = check_lists(case, &rows(row), 4);
         assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
         assert!(run.failed(LISTS_NAMED), "{case}: {}", run.transcript());
+    }
+}
+
+// --- the reach check (decision 0011, section 4) ------------------------------------------------
+
+/// The reach steps' constants are the code's and the deployment files': the reach check's
+/// allowance, the registry's team and identities, its surface, and the literal revision a reach
+/// mismatch on docs-team-a derives.
+#[test]
+fn the_reach_steps_rely_on_the_codes_allowance_and_the_files_identities() {
+    assert_eq!(
+        driver_value("REACH_ALLOWANCE"),
+        gateway::reach::REACH_ALLOWANCE.as_secs().to_string()
+    );
+    let revision = driver_value("REVISION");
+    let withdrawn = ["docs-team-a__list_documents", "docs-team-a__read_document"]
+        .into_iter()
+        .map(|name| gateway_core::ToolName::parse(name).unwrap())
+        .collect();
+    assert_eq!(
+        driver_value("REACH_WITHDRAWN_REVISION").replace("$REVISION", &revision),
+        gateway::withdrawn_revision(&gateway_core::PolicyRevision::new(revision), &withdrawn)
+            .as_str()
+    );
+    let team = driver_value("REACH_TEAM");
+    for (dir, subject) in [
+        (
+            "deploy/compose/config",
+            driver_value("COMPOSE_REACH_SUBJECT"),
+        ),
+        (
+            "deploy/kind/base/config",
+            driver_value("KIND_REACH_SUBJECT"),
+        ),
+    ] {
+        let manifest: toml::Table = common::read(&format!("{dir}/teams.toml")).parse().unwrap();
+        assert_eq!(
+            manifest["subjects"][subject.as_str()].as_str(),
+            Some(team.as_str()),
+            "{dir}"
+        );
+        let config: toml::Table = common::read(&format!("{dir}/gateway.toml"))
+            .parse()
+            .unwrap();
+        assert!(
+            config["drift"]["reach_url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("/mcp/{}", driver_value("REACH_SURFACE"))),
+            "{dir}"
+        );
+    }
+}
+
+/// A reach_held line for `server`, `seconds` after 10:00:00.
+fn held_line(server: &str, seconds: u32) -> String {
+    log_line(
+        &format!("2026-10-12T10:00:{seconds:02}.250000Z"),
+        json!({"event": "reach_held", "server": server, "tool": format!("{server}__list_documents"),
+               "row": "0192"}),
+    )
+}
+
+/// The gateway's metrics with each entry's probe results and reach checks as given, docs-team-a's
+/// then docs-team-b's: probes refused and open, reach checks held and mismatched.
+fn reach_metrics(a: [u32; 4], b: [u32; 4]) -> String {
+    let mut text = String::from("# TYPE switchboard_probe_results_total counter\n");
+    for (server, [refused, open, held, mismatch]) in [("docs-team-a", a), ("docs-team-b", b)] {
+        text.push_str(&format!(
+            "switchboard_probe_results_total{{server=\"{server}\",result=\"refused\"}} {refused}\n\
+             switchboard_probe_results_total{{server=\"{server}\",result=\"open\"}} {open}\n\
+             switchboard_probe_results_total{{server=\"{server}\",result=\"not_shown\"}} 0\n\
+             switchboard_reach_checks_total{{server=\"{server}\",result=\"held\"}} {held}\n\
+             switchboard_reach_checks_total{{server=\"{server}\",result=\"mismatch\"}} {mismatch}\n\
+             switchboard_reach_checks_total{{server=\"{server}\",result=\"failed\"}} 0\n"
+        ));
+    }
+    text
+}
+
+/// A row as reach_rows reads it: `subject`'s call on `surface` to `entry`'s list tool naming
+/// `project`, allowed, completed with `outcome` (`error` is mock-docs' 403, vendor_refusal).
+fn reach_row(subject: &str, surface: &str, entry: &str, project: &str, outcome: &str) -> Value {
+    json!({
+        "subject": subject, "team": "registry", "surface": surface,
+        "tool": format!("{entry}__list_documents"), "decision": "allow", "outcome": outcome,
+        "error_kind": if outcome == "error" { json!("vendor_refusal") } else { Value::Null },
+        "resources": [{"system": "docs", "kind": "project", "identifier": project}],
+        "revision": "demo-10",
+    })
+}
+
+const REACH_SA: &str = "system:serviceaccount:switchboard:registry";
+
+#[test]
+fn the_reach_held_step_needs_each_entrys_probe_refused_and_reach_check_held_with_its_rows() {
+    // The log lines.
+    let run_on = |name: &str, lines: &[String]| {
+        checked(
+            name,
+            "check_reach_held \"$(events {log} 'select(.event == \"reach_held\" or .event == \"reach_mismatch\")')\"",
+            &[("log", &lines.join("\n"))],
+        )
+    };
+    assert_all_passed(
+        "held",
+        &run_on(
+            "held",
+            &[held_line("docs-team-a", 1), held_line("docs-team-b", 2)],
+        ),
+        2,
+    );
+    assert_fails(
+        "one held",
+        &run_on(
+            "one-held",
+            &[held_line("docs-team-a", 1), held_line("docs-team-a", 11)],
+        ),
+        "the reach check of docs-team-b held: mock-docs refused its canary",
+    );
+    let mismatch = log_line(
+        "2026-10-12T10:00:05.000000Z",
+        json!({"event": "reach_mismatch", "server": "docs-team-a", "withdrawn": 2}),
+    );
+    assert_fails(
+        "a mismatch",
+        &run_on(
+            "held-mismatch",
+            &[
+                held_line("docs-team-a", 1),
+                held_line("docs-team-b", 2),
+                mismatch,
+            ],
+        ),
+        "no reach check found a reach wider than recorded (got '1'",
+    );
+
+    // The metrics: each entry's probe refused and none open, each reach check held and none a
+    // mismatch.
+    let metrics = |name: &str, text: String| {
+        checked(name, "check_probe_and_reach {text}", &[("text", &text)])
+    };
+    assert_all_passed(
+        "metrics",
+        &metrics("reach-metrics", reach_metrics([3, 0, 2, 0], [3, 0, 2, 0])),
+        6,
+    );
+    // A mismatch an earlier run's reach step left in the counts does not fail a later run
+    // against the same gateway: the log since the step began is what shows none.
+    assert_all_passed(
+        "an earlier mismatch",
+        &metrics(
+            "reach-metrics-earlier",
+            reach_metrics([3, 0, 2, 1], [3, 0, 2, 0]),
+        ),
+        6,
+    );
+    for (case, text, failure) in [
+        (
+            "probe never refused",
+            reach_metrics([0, 0, 2, 0], [3, 0, 2, 0]),
+            "metrics: mock-docs refused the gateway's probe of docs-team-a (got 0",
+        ),
+        (
+            "probe open",
+            reach_metrics([3, 0, 2, 0], [3, 1, 2, 0]),
+            "metrics: no probe of docs-team-b found mock-docs open (got '1'",
+        ),
+        (
+            "reach never held",
+            reach_metrics([3, 0, 0, 0], [3, 0, 2, 0]),
+            "metrics: the reach check of docs-team-a held (got 0",
+        ),
+        (
+            "no reach metrics",
+            reach_metrics([3, 0, 2, 0], [3, 0, 2, 0])
+                .lines()
+                .filter(|line| !line.starts_with("switchboard_reach_checks_total"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "metrics: the reach check of docs-team-a held (got ''",
+        ),
+    ] {
+        assert_fails(case, &metrics(case, text), failure);
+    }
+
+    // The rows: by the registry's own principal, on its own surface, each entry's canary refused.
+    let rows = |name: &str, rows: Vec<Value>| {
+        checked(
+            name,
+            &format!("check_reach_rows {{rows}} {REACH_SA}"),
+            &[("rows", &Value::from(rows).to_string())],
+        )
+    };
+    let a = reach_row(
+        REACH_SA,
+        "registry-reach",
+        "docs-team-a",
+        "borealis",
+        "error",
+    );
+    let b = reach_row(REACH_SA, "registry-reach", "docs-team-b", "atlas", "error");
+    assert_all_passed(
+        "rows",
+        &rows("reach-rows", vec![a.clone(), b.clone(), a.clone()]),
+        3,
+    );
+    const EVERY: &str = "audit: every reach check row since is a held check's";
+    for (case, extra, failure) in [
+        (
+            "another subject",
+            reach_row(
+                "system:serviceaccount:team-a:mock-workload",
+                "registry-reach",
+                "docs-team-a",
+                "borealis",
+                "error",
+            ),
+            EVERY,
+        ),
+        (
+            "another surface",
+            reach_row(REACH_SA, "docs-team-a", "docs-team-a", "borealis", "error"),
+            EVERY,
+        ),
+        (
+            "answered",
+            reach_row(REACH_SA, "registry-reach", "docs-team-a", "borealis", "ok"),
+            EVERY,
+        ),
+    ] {
+        assert_fails(
+            case,
+            &rows(case, vec![a.clone(), b.clone(), extra]),
+            failure,
+        );
+    }
+    for (case, list, failure) in [
+        (
+            "no rows",
+            vec![],
+            "audit: docs-team-a's reach check is a row by system:serviceaccount:switchboard:registry on registry-reach",
+        ),
+        (
+            "one entry",
+            vec![a.clone()],
+            "audit: docs-team-b's reach check is a row by",
+        ),
+        (
+            "its own project",
+            vec![
+                reach_row(REACH_SA, "registry-reach", "docs-team-a", "atlas", "error"),
+                b.clone(),
+            ],
+            "audit: docs-team-a's reach check is a row by",
+        ),
+    ] {
+        assert_fails(case, &rows(case, list), failure);
+    }
+}
+
+/// A tool_withdrawn line for `tool`, withdrawn for a reach mismatch, `seconds` after 10:00:00,
+/// deriving `revision`.
+fn reach_withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> String {
+    log_line(
+        &format!("2026-10-12T10:00:{seconds:02}.250000Z"),
+        json!({"event": "tool_withdrawn", "tool": tool, "server": tool.split("__").next(),
+               "cause": cause, "base": "demo-10", "revision": revision}),
+    )
+}
+
+fn mismatch_line(server: &str, seconds: u32, withdrawn: u32) -> String {
+    log_line(
+        &format!("2026-10-12T10:00:{seconds:02}.200000Z"),
+        json!({"event": "reach_mismatch", "server": server,
+               "tool": format!("{server}__list_documents"), "row": "0193", "withdrawn": withdrawn}),
+    )
+}
+
+#[test]
+fn the_reach_mismatch_step_needs_docs_team_as_tools_withdrawn_in_time_under_the_literal_revision() {
+    // 10:00:00 UTC on 2026-10-12, and a little more.
+    let widened = "1791799200.400000";
+    let derived = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-a__read_document";
+    let run_on = |name: &str, lines: &[String]| {
+        checked(
+            name,
+            &format!(
+                "check_reach_mismatch \"$(events {{log}} 'select(.event == \"reach_mismatch\" or .event == \"tool_withdrawn\")')\" {widened}"
+            ),
+            &[("log", &lines.join("\n"))],
+        )
+    };
+    let list = |seconds: u32, cause: &str| {
+        reach_withdrawn_line(
+            "docs-team-a__list_documents",
+            seconds,
+            cause,
+            "demo-10+withdrawn:docs-team-a__list_documents",
+        )
+    };
+    let read = |seconds: u32| {
+        reach_withdrawn_line(
+            "docs-team-a__read_document",
+            seconds,
+            "reach mismatch",
+            derived,
+        )
+    };
+    let good = vec![
+        mismatch_line("docs-team-a", 12, 2),
+        list(12, "reach mismatch"),
+        read(12),
+    ];
+    assert_all_passed("withdrawn", &run_on("reach-withdrawn", &good), 6);
+    for (case, lines, failure) in [
+        (
+            "late",
+            vec![
+                mismatch_line("docs-team-a", 40, 2),
+                list(40, "reach mismatch"),
+                read(40),
+            ],
+            "it was found within the 10 s interval plus the 5 s deadline and the 5 s allowance of the change (seconds) (got 40",
+        ),
+        (
+            "no mismatch",
+            vec![list(12, "reach mismatch"), read(12)],
+            "the reach check of docs-team-a found its reach wider than recorded, once",
+        ),
+        (
+            "one tool",
+            vec![
+                mismatch_line("docs-team-a", 12, 1),
+                list(12, "reach mismatch"),
+            ],
+            "the gateway withdrew docs-team-a__read_document once, for a reach mismatch",
+        ),
+        (
+            "another cause",
+            vec![
+                mismatch_line("docs-team-a", 12, 2),
+                list(12, "definition changed"),
+                read(12),
+            ],
+            "the gateway withdrew docs-team-a__list_documents once, for a reach mismatch",
+        ),
+        (
+            "docs-team-b too",
+            vec![
+                mismatch_line("docs-team-a", 12, 2),
+                list(12, "reach mismatch"),
+                read(12),
+                reach_withdrawn_line("docs-team-b__list_documents", 13, "reach mismatch", "x"),
+            ],
+            "the gateway withdrew none of docs-team-b's tools",
+        ),
+        (
+            "not the literal revision",
+            vec![
+                mismatch_line("docs-team-a", 12, 2),
+                list(12, "reach mismatch"),
+                reach_withdrawn_line(
+                    "docs-team-a__read_document",
+                    12,
+                    "reach mismatch",
+                    "demo-10+withdrawn:2",
+                ),
+            ],
+            "the revision served after both withdrawals is the literal derived one (got 'demo-10+withdrawn:2'",
+        ),
+    ] {
+        assert_fails(case, &run_on(case, &lines), failure);
+    }
+
+    // The mismatch's own row: docs-team-a's canary answered.
+    let rows = |name: &str, rows: Vec<Value>| {
+        checked(
+            name,
+            &format!("check_mismatch_row {{rows}} {REACH_SA}"),
+            &[("rows", &Value::from(rows).to_string())],
+        )
+    };
+    let answered = reach_row(REACH_SA, "registry-reach", "docs-team-a", "borealis", "ok");
+    let refused = reach_row(
+        REACH_SA,
+        "registry-reach",
+        "docs-team-a",
+        "borealis",
+        "error",
+    );
+    assert_all_passed(
+        "answered",
+        &rows("mismatch-row", vec![refused.clone(), answered]),
+        1,
+    );
+    assert_fails(
+        "refused only",
+        &rows("mismatch-row-refused", vec![refused]),
+        "audit: the mismatch is a row by system:serviceaccount:switchboard:registry, docs-team-a's canary borealis allowed and answered ok",
+    );
+}
+
+/// The re-approval check takes the tools it expects cleared: the reach step's are both of
+/// docs-team-a's.
+#[test]
+fn the_reach_reapproval_needs_both_of_docs_team_as_withdrawals_cleared() {
+    let revision = "demo-12-reapproved-20261012T100000Z";
+    let line = |fields: Value| log_line("2026-10-12T10:00:02.000000Z", fields);
+    let reloaded = line(json!({"event": "policy_reloaded", "revision": revision}));
+    let cleared = |tool: &str| {
+        line(
+            json!({"event": "policy_withdrawal_cleared", "tool": tool, "reason": "approved again",
+                    "revision": revision}),
+        )
+    };
+    let run_on = |name: &str, lines: &[String]| {
+        checked(
+            name,
+            &format!(
+                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools'\" docs-team-a__list_documents docs-team-a__read_document"
+            ),
+            &[("log", &lines.join("\n"))],
+        )
+    };
+    let a_list = cleared("docs-team-a__list_documents");
+    let a_read = cleared("docs-team-a__read_document");
+    assert_all_passed(
+        "reapproved",
+        &run_on(
+            "reach-reapproved",
+            &[reloaded.clone(), a_list.clone(), a_read.clone()],
+        ),
+        3,
+    );
+    const CLEARED: &str = "both of docs-team-a's tools' withdrawals cleared as approved again";
+    for (case, lines) in [
+        ("one cleared", vec![reloaded.clone(), a_list.clone()]),
+        (
+            "the drift steps tools",
+            vec![
+                reloaded.clone(),
+                a_list.clone(),
+                cleared("docs-team-b__list_documents"),
+            ],
+        ),
+    ] {
+        assert_fails(case, &run_on(case, &lines), CLEARED);
+    }
+}
+
+/// The reach check's canaries reach mock-docs with an entry's own credential, naming the other
+/// team's project, which mock-docs refuses: they are not calls a workload made. Each server check
+/// leaves them out of the calls it counts, and the entry check holds each to the other team's
+/// project, refused. A canary mock-docs answered, or one naming the entry's own project, still
+/// fails.
+#[test]
+fn the_server_checks_hold_the_reach_checks_canaries_to_the_other_project_refused() {
+    require(&["jq"]);
+    // Compose: the bearer check counts only the calls the gateway allowed for the workloads.
+    let team_a = static_line("88a0f2ba13fc", true);
+    let team_b = static_line("d20bf481167c", true);
+    let canary = call_line("88a0f2ba13fc", "borealis", true);
+    let run = sourced(&format!(
+        "check_server_bearers '{}' \"{SHA_A} {SHA_B}\" 2 all\nFINISHED=1\nresult 0",
+        [
+            team_a.clone(),
+            team_b.clone(),
+            canary.clone(),
+            canary.clone()
+        ]
+        .join("\n")
+    ));
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let answered = call_line("88a0f2ba13fc", "borealis", false);
+    let run = sourced(&format!(
+        "check_server_bearers '{}' \"{SHA_A} {SHA_B}\" 2 all\nFINISHED=1\nresult 0",
+        [team_a.clone(), team_b.clone(), answered].join("\n")
+    ));
+    assert!(
+        run.failed("mock-docs accepted the gateway's credentials on exactly the 2 calls"),
+        "{}",
+        run.transcript()
+    );
+
+    // kind: the caller check, likewise.
+    let mut lines = vec![
+        jwt_line(false, None, Some("wrong_audience")),
+        jwt_line(false, None, Some("wrong_audience")),
+    ];
+    lines.extend(std::iter::repeat_n(
+        jwt_line(false, None, Some("no_bearer")).replace("\"35078c7e6361\"", "null"),
+        3,
+    ));
+    lines.extend(std::iter::repeat_n(
+        jwt_line(true, Some(SUBJECT_A), None),
+        4,
+    ));
+    lines.extend(std::iter::repeat_n(
+        jwt_line(true, Some(SUBJECT_B), None),
+        4,
+    ));
+    lines.push(call_line(SUBJECT_A, "borealis", true));
+    lines.push(call_line(SUBJECT_B, "atlas", true));
+    let run = check_callers(&lines);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+
+    // The entry check: each canary names the other team's project, and mock-docs refused it.
+    for (who, a, b) in [
+        (
+            format!("\"team-a={SHA_A}\" \"team-b={SHA_B}\""),
+            &SHA_A[..12],
+            &SHA_B[..12],
+        ),
+        (
+            "\"team-a=${KIND_ENTRY_SUBJECTS%% *}\" \"team-b=${KIND_ENTRY_SUBJECTS##* }\""
+                .to_owned(),
+            SUBJECT_A,
+            SUBJECT_B,
+        ),
+    ] {
+        let run_of = |lines: &[String]| {
+            sourced(&format!(
+                "check_server_entries '{}' 1 {who}\nFINISHED=1\nresult 0",
+                lines.join("\n")
+            ))
+        };
+        let good = [
+            call_line(a, "atlas", false),
+            call_line(a, "borealis", true),
+            call_line(a, "borealis", true),
+            call_line(b, "borealis", false),
+            call_line(b, "atlas", true),
+        ];
+        let run = run_of(&good);
+        assert_eq!(run.status, Some(0), "{who}: {}", run.transcript());
+        assert!(
+            run.stdout.contains(
+                "the reach check's canaries under team-a's entry's identity so far, each for borealis and refused: 2"
+            ),
+            "{who}: {}",
+            run.transcript()
+        );
+        let mut answered = good.to_vec();
+        answered[1] = call_line(a, "borealis", false);
+        let run = run_of(&answered);
+        assert!(
+            run.failed("no call under team-a's entry's identity named another project, but the reach check's canaries"),
+            "{who}: {}",
+            run.transcript()
+        );
+    }
+
+    // The undeclared step's and the outage step's counts leave the canaries out too.
+    let run = sourced(&format!(
+        "accepted_calls '{}'",
+        [call_line(&SHA_A[..12], "atlas", false), canary.clone()].join("\n")
+    ));
+    assert_eq!(run.stdout.trim(), "1", "{}", run.transcript());
+    let run = sourced(&format!(
+        "dc() {{ printf '%s\\n' '{}'; }}\nmock_docs_requests",
+        [team_a, canary].join("\n")
+    ));
+    assert_eq!(run.stdout.trim(), "1", "{}", run.transcript());
+}
+
+/// The reach check's rows are the registry's: the audit check judges each by its entry's canary,
+/// and a step's own rows leave them out, since they come on the gateway's schedule whatever the
+/// step does.
+#[test]
+fn the_reach_checks_rows_name_their_canary_and_stay_out_of_each_steps_rows() {
+    let registry_row = |tool: &str, resources: Value| {
+        json!({
+            "kind": "call", "team": "registry", "tool": tool, "decision": "allow",
+            "reason": null, "sentence": null, "resources": resources, "revision": "demo-10",
+            "listed": null, "omitted": null,
+        })
+    };
+    let mut rows = demo_rows();
+    rows.push(registry_row(
+        "docs-team-a__list_documents",
+        project("borealis"),
+    ));
+    rows.push(registry_row(
+        "docs-team-b__list_documents",
+        project("atlas"),
+    ));
+    // A check that found its canary tool served just before the drift poll beside it withdrew
+    // the tool: the gateway no longer knew it, so its resources are unknown.
+    let mut raced = registry_row("docs-team-b__list_documents", json!("unknown"));
+    raced["decision"] = json!("deny");
+    raced["reason"] = json!("unknown_tool");
+    rows.push(raced.clone());
+    let run = check_rows("rows-reach", &Value::from(rows).to_string());
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    let mut named_as_unknown = registry_row("docs-team-b__list_documents", json!("unknown"));
+    named_as_unknown["decision"] = json!("allow");
+    raced["resources"] = project("atlas");
+    for (case, row) in [
+        ("allowed but unknown", named_as_unknown),
+        ("unknown tool naming its canary", raced),
+        (
+            "its own project",
+            registry_row("docs-team-a__list_documents", project("atlas")),
+        ),
+        (
+            "not a canary tool",
+            registry_row("docs-team-a__read_document", project("borealis")),
+        ),
+    ] {
+        let mut rows = demo_rows();
+        rows.push(row);
+        let run = check_rows(case, &Value::from(rows).to_string());
+        assert!(run.failed(ROWS_CHECK), "{case}: {}", run.transcript());
+    }
+
+    let query = |function: &str| {
+        let run = sourced(&format!(
+            "psql_reader() {{ printf '%s\\n' \"$@\"; }}\n{function} 1791799200"
+        ));
+        assert_eq!(run.status, Some(0), "{}", run.transcript());
+        run.stdout
+    };
+    assert!(
+        query("step_rows").contains("and proved_team is distinct from 'registry'"),
+        "{}",
+        query("step_rows")
+    );
+    assert!(
+        query("reach_rows").contains("and proved_team = 'registry'"),
+        "{}",
+        query("reach_rows")
+    );
+}
+
+/// The reach steps run in both deployments: the held check first, before anything else changes
+/// what the gateway serves, and the widening last, after the drift steps. The widening step
+/// changes mock-docs' caller, checks the mismatch and its row and the tools gone, narrows the
+/// caller, approves the tools again and puts the registry back, in that order.
+#[test]
+fn the_demonstrations_run_the_reach_steps() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let demonstrations = function_body(&driver, "demonstrations");
+    let steps: Vec<&str> = demonstrations.lines().map(str::trim).collect();
+    assert_eq!(steps.first(), Some(&"reach_held_step"), "{demonstrations}");
+    assert_eq!(steps.last(), Some(&"reach_steps"), "{demonstrations}");
+    let held = function_body(&driver, "reach_held_step");
+    for call in [
+        "check_reach_held \"$(events",
+        "check_probe_and_reach \"$FETCHED\"",
+        "check_reach_rows \"$(reach_rows \"$since\")\" \"$(reach_subject)\"",
+    ] {
+        assert!(held.contains(call), "{call}\n{held}");
+    }
+    let reach = function_body(&driver, "reach_steps");
+    let mut at = 0;
+    for call in [
+        "WIDENED=1",
+        "mock_admin PUT \"/admin/callers/$caller\" '{\"projects\": [\"atlas\", \"borealis\"]}'",
+        "check_reach_mismatch \"$EVENTS\" \"$widened\"",
+        "check_mismatch_row \"$(reach_rows \"$widened\")\" \"$(reach_subject)\"",
+        "workload \"team-a after the reach mismatch\" team-a withdrawn all",
+        "check_drift_rows \"$(step_rows \"$MARK_EPOCH\")\" \"$REACH_WITHDRAWN_REVISION\" \"\" \"deny unknown_tool\"",
+        "mock_admin PUT \"/admin/callers/$caller\" '{\"projects\": [\"atlas\"]}'",
+        "WIDENED=\"\"",
+        "reapproval_variant \"$revision\"",
+        "check_reapproval \"$(events",
+        "workload \"team-a after the new approval\" team-a served",
+        "install_registry \"$served\"",
+        "workload \"team-a under revision $REVISION\" team-a served",
+    ] {
+        let found = reach[at..]
+            .find(call)
+            .unwrap_or_else(|| panic!("reach_steps does not call, in order: {call}\n{reach}"));
+        at += found + call.len();
+    }
+    // The caller each mode's mock-docs knows docs-team-a's entry by.
+    for (mode, caller) in [
+        ("compose", &SHA_A[..12]),
+        ("kind", "system:serviceaccount:switchboard:docs-team-a"),
+    ] {
+        let run = sourced(&format!("MODE={mode}\nentry_caller team-a"));
+        assert_eq!(run.stdout.trim(), caller, "{mode}: {}", run.transcript());
+    }
+}
+
+/// A run stopped while mock-docs lets docs-team-a's credential read both projects limits it to
+/// atlas again on the way out.
+#[test]
+fn a_run_stopped_with_the_caller_widened_narrows_it_again() {
+    let run = sourced(
+        "mock_admin() { echo \"mock_admin $*\" >&2; }\nMODE=compose\nWIDENED=1\ntrap on_exit EXIT\nexit 1",
+    );
+    assert_eq!(run.status, Some(1), "{}", run.transcript());
+    assert!(
+        run.stderr.contains(&format!(
+            "mock_admin PUT /admin/callers/{} {{\"projects\": [\"atlas\"]}}",
+            &SHA_A[..12]
+        )),
+        "{}",
+        run.transcript()
+    );
+    let run = sourced(
+        "mock_admin() { echo \"mock_admin $*\" >&2; }\nMODE=compose\ntrap on_exit EXIT\nexit 1",
+    );
+    assert!(!run.stderr.contains("mock_admin"), "{}", run.transcript());
+}
+
+/// The token writer writes the registry's token for the gateway's own audience, named after the
+/// colon, beside the entries' tokens for mock-docs'; and refuses an empty or odd audience.
+#[test]
+fn the_token_writer_writes_an_accounts_token_for_the_audience_it_names() {
+    let dir = token_writer_dir("token-writer-audience");
+    let run = token_writer(
+        &dir,
+        "ok",
+        &[("TOKEN_SERVICE_ACCOUNTS", "docs-team-a registry:switchboard")],
+    );
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    for account in ["docs-team-a", "registry"] {
+        assert_eq!(
+            token_file(&dir, account),
+            Some(format!("{}\n", issued(account))),
+            "{}",
+            run.transcript()
+        );
+    }
+    let calls = api_calls(&dir);
+    let body = |audience: &str| {
+        format!(
+            r#" [--data-binary] [{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","spec":{{"audiences":["{audience}"],"expirationSeconds":600}}}}] "#
+        )
+    };
+    for (account, audience) in [("docs-team-a", "mock-docs"), ("registry", "switchboard")] {
+        let line = calls
+            .lines()
+            .find(|line| {
+                line.starts_with("ARGS")
+                    && line.ends_with(&format!("/serviceaccounts/{account}/token]"))
+            })
+            .unwrap_or_else(|| panic!("{account}: {calls}"));
+        assert!(line.contains(&body(audience)), "{account}: {line}");
+    }
+    assert!(
+        run.stdout
+            .contains("token-writer: registry: wrote a token for audience switchboard"),
+        "{}",
+        run.transcript()
+    );
+    for value in ["registry:", "registry:a*b", "../registry:switchboard"] {
+        let dir = token_writer_dir("token-writer-audience-bad");
+        let run = token_writer(&dir, "ok", &[("TOKEN_SERVICE_ACCOUNTS", value)]);
+        assert_eq!(run.status, Some(2), "{value}: {}", run.transcript());
+        assert!(api_calls(&dir).is_empty(), "{value}");
     }
 }

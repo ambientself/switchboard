@@ -658,7 +658,8 @@ async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() 
         "the reach check names the list tool"
     );
 
-    // The list tool, which the reach check names: the approval and the surface entry removed.
+    // The list tool, which the reach check names: the approval and the surface entries removed,
+    // its team's surface's and the reach check's surface's.
     let without_list = without_tool(&original, LIST_TOOL)
         .replace(
             &format!("revision = \"{KIND_REVISION}\""),
@@ -667,6 +668,10 @@ async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() 
         .replace(
             &format!("tools = [\"{LIST_TOOL}\", \"{READ_TOOL}\"]"),
             &format!("tools = [\"{READ_TOOL}\"]"),
+        )
+        .replace(
+            &format!("tools = [\"{LIST_TOOL}\", \"{TEAM_B_LIST_TOOL}\"]"),
+            &format!("tools = [\"{TEAM_B_LIST_TOOL}\"]"),
         );
     let revision = reloader
         .apply(&Registry::from_toml_str(&without_list).unwrap())

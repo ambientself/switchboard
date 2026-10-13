@@ -3,8 +3,9 @@
 # as a sidecar in the gateway's pod (deploy/kind/base/gateway.yaml). For each ServiceAccount it
 # is given, it asks the API server for a token by TokenRequest and writes it to a file the
 # gateway reads: one per entry of the mock server in the registry, read as that entry's
-# credential, and registry-probe, read as the drift probe's credential. The gateway itself holds
-# no token the API server accepts and has no API-server client.
+# credential; registry-probe, read as the drift probe's credential; and registry, the registry's
+# own workload identity, which the gateway's reach check presents to the gateway itself. The
+# gateway itself holds no token the API server accepts and has no API-server client.
 #
 # Usage: token-writer.sh [once]
 #   (none)  write every token, then again every TOKEN_REFRESH_SECONDS; after a failure, try again
@@ -12,9 +13,12 @@
 #   once    write every token once; exit 1 if any could not be written.
 #
 # Environment, every variable required:
-#   TOKEN_SERVICE_ACCOUNTS    space-separated ServiceAccount names, e.g. "docs-team-a docs-team-b"
+#   TOKEN_SERVICE_ACCOUNTS    space-separated ServiceAccount names, e.g. "docs-team-a docs-team-b".
+#                             NAME:AUDIENCE asks for NAME's token for AUDIENCE instead, e.g.
+#                             registry:switchboard
 #   TOKEN_NAMESPACE           their namespace
-#   TOKEN_AUDIENCE            the audience each token is for, the server's: mock-docs
+#   TOKEN_AUDIENCE            the audience each token is for unless its name gives one, the
+#                             server's: mock-docs
 #   TOKEN_EXPIRATION_SECONDS  how long each token is valid, 600 to 86400
 #   TOKEN_REFRESH_SECONDS     how often each is written again, less than the expiration
 #   TOKEN_RETRY_SECONDS       how soon after a failure
@@ -59,23 +63,31 @@ number TOKEN_REFRESH_SECONDS "$TOKEN_REFRESH_SECONDS" 1 $((TOKEN_EXPIRATION_SECO
 number TOKEN_RETRY_SECONDS "$TOKEN_RETRY_SECONDS" 1 "$TOKEN_REFRESH_SECONDS"
 case $API_SERVER in https://*) ;; *) bad_config "API_SERVER must be an https URL, not '$API_SERVER'" ;; esac
 [ -d "$TOKEN_DIR" ] || bad_config "TOKEN_DIR $TOKEN_DIR is not a directory"
-for account in $TOKEN_SERVICE_ACCOUNTS; do
+for entry in $TOKEN_SERVICE_ACCOUNTS; do
+  account=${entry%%:*}
   case $account in
     *[!a-z0-9.-]* | -* | '') bad_config "'$account' is not a ServiceAccount name" ;;
+  esac
+  case $entry in
+    *:) bad_config "'$entry' names no audience after the colon" ;;
+    *:*[!a-zA-Z0-9.:/_-]*) bad_config "'$entry' names an audience with characters an audience here may not have" ;;
   esac
 done
 case $MODE in run | once) ;; *) bad_config "usage: $0 [once]" ;; esac
 
-# The TokenRequest every token is asked with: the server's audience and the expiration only.
-BODY=$(jq -cn --arg audience "$TOKEN_AUDIENCE" --argjson seconds "$TOKEN_EXPIRATION_SECONDS" \
-  '{apiVersion: "authentication.k8s.io/v1", kind: "TokenRequest",
-    spec: {audiences: [$audience], expirationSeconds: $seconds}}') ||
-  bad_config "cannot build the TokenRequest"
+# body AUDIENCE: the TokenRequest a token is asked with: its audience and the expiration only.
+body() {
+  jq -cn --arg audience "$1" --argjson seconds "$TOKEN_EXPIRATION_SECONDS" \
+    '{apiVersion: "authentication.k8s.io/v1", kind: "TokenRequest",
+      spec: {audiences: [$audience], expirationSeconds: $seconds}}'
+}
+body "$TOKEN_AUDIENCE" >/dev/null || bad_config "cannot build the TokenRequest"
 
-# write ACCOUNT: asks for ACCOUNT's token and renames it into TOKEN_DIR/ACCOUNT. Returns non-zero,
-# with the file left as it was, if it cannot.
+# write ACCOUNT AUDIENCE: asks for ACCOUNT's token for AUDIENCE and renames it into
+# TOKEN_DIR/ACCOUNT. Returns non-zero, with the file left as it was, if it cannot.
 write() {
   account=$1
+  audience=$2
   target=$TOKEN_DIR/$account
   next=$TOKEN_DIR/.$account.next
   api=$(cat "$API_TOKEN_FILE" 2>/dev/null) || api=""
@@ -83,12 +95,16 @@ write() {
     log "$account: cannot read the API token in $API_TOKEN_FILE; keeping the previous token"
     return 1
   fi
+  if ! request=$(body "$audience"); then
+    log "$account: cannot build the TokenRequest; keeping the previous token"
+    return 1
+  fi
   # The header comes from standard input, so the API token is on no command line. The answer is
   # kept in a variable and only the token is taken from it; neither is printed.
   answer=$(printf 'Authorization: Bearer %s\n' "$api" |
     curl -q -sS --fail -m 10 --cacert "$API_CA_FILE" -H @- \
       -H 'Content-Type: application/json' -H 'Accept: application/json' \
-      -X POST --data-binary "$BODY" \
+      -X POST --data-binary "$request" \
       "$API_SERVER/api/v1/namespaces/$TOKEN_NAMESPACE/serviceaccounts/$account/token")
   code=$?
   if [ "$code" -ne 0 ]; then
@@ -105,14 +121,17 @@ write() {
     log "$account: cannot write $target; keeping the previous token"
     return 1
   fi
-  log "$account: wrote a token for audience $TOKEN_AUDIENCE, valid for ${TOKEN_EXPIRATION_SECONDS}s"
+  log "$account: wrote a token for audience $audience, valid for ${TOKEN_EXPIRATION_SECONDS}s"
 }
 
 # write_all: every account's token; non-zero if any could not be written.
 write_all() {
   failed=0
-  for account in $TOKEN_SERVICE_ACCOUNTS; do
-    write "$account" || failed=1
+  for entry in $TOKEN_SERVICE_ACCOUNTS; do
+    case $entry in
+      *:*) write "${entry%%:*}" "${entry#*:}" || failed=1 ;;
+      *) write "$entry" "$TOKEN_AUDIENCE" || failed=1 ;;
+    esac
   done
   return "$failed"
 }

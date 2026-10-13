@@ -54,6 +54,14 @@ listen = "0.0.0.0:9090"
 # definition no longer matches its approval. 10 s so a demo sees it; decision 0013 sets 300 s,
 # the default, for real deployments. 5 to 900.
 interval_seconds = 10
+# The reach check (decision 0011, section 4): with each poll, the gateway sends each entry's
+# reach_check, a call naming a project outside the entry's reach, to its own listener's
+# registry-reach surface, as the registry's workload, ServiceAccount registry. The token writer
+# writes that account's token for audience switchboard beside the entries' tokens; the gateway
+# reads it on every check. mock-docs must refuse the call.
+reach_token_file = "/var/run/switchboard/tokens/registry"
+reach_url = "http://127.0.0.1:8080/mcp/registry-reach"
+reach_host = "gateway.switchboard.svc.cluster.local"
 
 [drift.probe_credentials]
 # What each poll's probe presents on its third call (decision 0013, section 9): ServiceAccount

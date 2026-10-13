@@ -51,6 +51,9 @@
 //!   is bound and then on a timer, and withdraws each approved tool whose served definition no
 //!   longer hashes to its approval, or that the server no longer lists ([`drift`]). Each poll
 //!   also probes the server; an open server is logged and counted, and its tools stay listed.
+//!   Once the listener is bound it also checks each entry's reach, by a call outside it through
+//!   the gateway's own listener as the registry's workload ([`reach`]); an entry whose server
+//!   answers has every tool withdrawn.
 //! - [`probe`] is `switchboard probe`: decision 0010's three calls to one registry entry, and
 //!   the probe record they make.
 //!
@@ -74,6 +77,7 @@ pub mod path;
 mod policy;
 pub mod probe;
 mod proxied;
+pub mod reach;
 pub mod reload;
 mod resources;
 mod selector;
@@ -98,7 +102,8 @@ pub use deployment::{
 pub use drift::{
     DEFAULT_DRIFT_INTERVAL, DriftCounts, DriftPass, DriftSection, DriftSignals, MAX_DRIFT_INTERVAL,
     MIN_DRIFT_INTERVAL, PROBE_NOT_SHOWN_EVENT, ProbeCredentialError, ProbeCredentials,
-    SERVER_OPEN_EVENT, Withdrawals, probe_credentials, withdrawn_revision,
+    REACH_FAILED_EVENT, REACH_HELD_EVENT, REACH_MISMATCH_EVENT, SERVER_OPEN_EVENT, Withdrawals,
+    probe_credentials, withdrawn_revision,
 };
 pub use keys::{
     DEFAULT_KEYS_REFRESH, KeyRefresher, MIN_KEYS_REFRESH, REFRESH_FAILED_EVENT, REFRESHED_EVENT,
@@ -112,6 +117,7 @@ pub use path::{
 };
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{invalid_argument, undeclared_argument, withdrawn_while_deciding};
+pub use reach::{ReachCaller, ReachSettings, ReachSettingsError};
 pub use reload::{Freshness, ReloadError, Reloader};
 pub use resources::ResourceAdapter;
 pub use selector::{

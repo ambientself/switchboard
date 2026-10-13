@@ -14,9 +14,10 @@
 #                  team manifest)
 #   audit-down     one allowed read while the audit database is unavailable; the gateway must
 #                  refuse it with the audit-failure sentence
-#   withdrawn [read|list]
+#   withdrawn [read|list|all]
 #                  after the team's read tool, or with `list` its list tool, is withdrawn:
-#                  tools/list drops it and a call to it is refused
+#                  tools/list drops it and a call to it is refused. With `all`, both are
+#                  withdrawn: tools/list lists nothing and a call to the list tool is refused
 #   served         both of the team's tools are listed, and a call to its list tool is allowed
 #   undeclared     one read of OWN_PROJECT with an argument the tool's approval does not
 #                  declare; the gateway must answer with the undeclared-argument error
@@ -251,12 +252,13 @@ audit_down() {
 }
 
 # withdrawn WHICH: the team's read tool (`read`) or list tool (`list`) is withdrawn, and the other
-# is still served.
+# is still served; or both are (`all`), and none is.
 withdrawn() {
   case $1 in
     read) gone=$READ_TOOL kept=$LIST_TOOL args="{\"project\":\"$OWN_PROJECT\",\"document\":\"$DOCUMENT\"}" ;;
     list) gone=$LIST_TOOL kept=$READ_TOOL args="{\"project\":\"$OWN_PROJECT\"}" ;;
-    *) setup_failed "withdrawn takes read or list, not '$1'" ;;
+    all) gone=$LIST_TOOL kept="" args="{\"project\":\"$OWN_PROJECT\"}" ;;
+    *) setup_failed "withdrawn takes read, list or all, not '$1'" ;;
   esac
   load_token
   status=$(rpc "$TOKEN" tools/list '{}')

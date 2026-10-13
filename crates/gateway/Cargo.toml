@@ -28,9 +28,10 @@ http = "1"
 http-body-util = "0.1"
 # The connection loop. axum's own sets no deadline for a request's head, so a client that sends
 # half of one holds its connection, and shutting down, for as long as it likes. Both are
-# already in the build through axum.
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
+# already in the build through axum. The client side is the reach check's, which calls this
+# gateway's own listener as the registry's workload; connector-proxy builds it already.
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "server", "server-graceful", "service", "tokio"] }
 # Fetches the keys of an issuer configured with a keys URL, from the issuer's own origin, under
 # a deadline and a body cap.
 issuer-keys = { path = "../issuer-keys" }
