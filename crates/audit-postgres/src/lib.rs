@@ -12,8 +12,8 @@
 //!   insert was executed, and so may have been written, is completed as `error` the same way.
 //! - [`PgAuditStore::stats`] reads what the store counts for telemetry, in [`StoreStats`]: why
 //!   begins failed, answers released before their row was complete, why finishes gave up, the
-//!   latency of begin and finish, and the connections of the begin and finish pools. The
-//!   open-row query's pool is not among them, so the gateway exports no figures for it.
+//!   latency of begin and finish, and the connections of the begin and finish pools and of the
+//!   open-row query's.
 //! - [`PgAuditStore::open_rows`] counts the open rows, through the view `open_call_rows`:
 //!   allowed calls with no completion past their deadline, by the database's clock. It has a
 //!   pool of its own, of one connection, so a slow count never takes a finish's connection.

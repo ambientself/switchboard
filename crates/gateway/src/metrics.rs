@@ -60,8 +60,8 @@
 //!     histograms with the store's fixed buckets;
 //!   - `switchboard_audit_pool_connections_in_use{pool}`, and beside it, as separate gauges,
 //!     `switchboard_audit_pool_connections_open{pool}` and
-//!     `switchboard_audit_pool_connections_max{pool}`, `pool` one of `begin` and `finish`.
-//!     The open-row poll's connection, in a pool of its own, has no series.
+//!     `switchboard_audit_pool_connections_max{pool}`, `pool` one of `begin`, `finish` and
+//!     `open_rows`, the open-row poll's pool of its own.
 //!
 //! - With an issuer whose keys are fetched from a keys URL, from [`KeyAges`]:
 //!   `switchboard_issuer_keys_age_seconds{issuer}`, the seconds since that issuer's keys were
@@ -665,6 +665,7 @@ fn audit_signals(text: &mut Text, signals: &AuditSignals) {
         text.family(name, "gauge", help);
         text.sample(name, &[("pool", "begin")], of(&stats.begin_pool));
         text.sample(name, &[("pool", "finish")], of(&stats.finish_pool));
+        text.sample(name, &[("pool", "open_rows")], of(&stats.open_rows_pool));
     }
 }
 
@@ -873,6 +874,11 @@ mod tests {
                 size: 12,
                 max_size: 13,
             },
+            open_rows_pool: PoolStats {
+                in_use: 17,
+                size: 18,
+                max_size: 19,
+            },
             ..StoreStats::default()
         };
         let deadline = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
@@ -900,6 +906,9 @@ mod tests {
             "switchboard_audit_pool_connections_in_use{pool=\"finish\"} 11",
             "switchboard_audit_pool_connections_open{pool=\"finish\"} 12",
             "switchboard_audit_pool_connections_max{pool=\"finish\"} 13",
+            "switchboard_audit_pool_connections_in_use{pool=\"open_rows\"} 17",
+            "switchboard_audit_pool_connections_open{pool=\"open_rows\"} 18",
+            "switchboard_audit_pool_connections_max{pool=\"open_rows\"} 19",
             "switchboard_audit_failure_answers_total 14",
             "switchboard_audit_open_rows 15",
             "switchboard_audit_oldest_open_row_deadline_seconds 1800000000",

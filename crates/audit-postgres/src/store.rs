@@ -704,10 +704,9 @@ impl PgAuditStore {
     /// What the store has counted since it was made, for the gateway's telemetry (decision
     /// 0009): begin failures by cause, answers released before their row was complete,
     /// finishes given up by cause, failed begins' rows never written, finishes in flight, the
-    /// latency of begin and of finish, and the connections of the begin and finish pools. The
-    /// open-row query's pool is not among them. The counts are atomics, each read on its own;
-    /// the pools' figures come from their status, which takes each pool's lock for a moment.
-    /// Nothing here waits on the database.
+    /// latency of begin and of finish, and the connections of the begin, finish and open-row
+    /// pools. The counts are atomics, each read on its own; the pools' figures come from their
+    /// status, which takes each pool's lock for a moment. Nothing here waits on the database.
     pub fn stats(&self) -> StoreStats {
         let finishes = self.finishes();
         StoreStats {
@@ -720,6 +719,7 @@ impl PgAuditStore {
             finish_latency: self.counters.finish_latency.snapshot(),
             begin_pool: pool_stats(&self.begin),
             finish_pool: pool_stats(&self.finish),
+            open_rows_pool: pool_stats(&self.open_rows_pool),
         }
     }
 
