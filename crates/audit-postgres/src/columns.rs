@@ -11,6 +11,10 @@
 //! at begin, and [`MAX_ROW_BYTES`] for a list row. At finish, a refusal's sentence holding
 //! U+0000 or longer than [`MAX_OUTCOME_SENTENCE_BYTES`] is refused, never cut: finish fails and
 //! gives up, and the row keeps no completion.
+//!
+//! The testkit's in-memory store refuses the same rows and completions with copies of these
+//! constants and of [`BeginRow::sizes`] and [`ListRow::sizes`] (`gateway_testkit::row_bound`).
+//! A test here checks that the copies agree.
 
 use std::time::Duration;
 
@@ -1495,6 +1499,69 @@ mod tests {
                 );
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// The testkit's in-memory store holds this store's row bound with copies of its constants
+    /// and of its count, since the testkit cannot depend on this crate. They must agree: each
+    /// constant, and each column's bytes, for call rows of each principal kind, each kind of
+    /// resources and each credential mode, the largest a call can begin among them, and for list
+    /// rows.
+    #[test]
+    fn the_testkits_row_bound_is_this_stores() {
+        use gateway_testkit::row_bound;
+
+        assert_eq!(row_bound::MAX_ROW_BYTES, MAX_ROW_BYTES);
+        assert_eq!(row_bound::MAX_BEGUN_ROW_BYTES, MAX_BEGUN_ROW_BYTES);
+        assert_eq!(row_bound::COMPLETION_RESERVE, COMPLETION_RESERVE);
+        assert_eq!(
+            row_bound::MAX_OUTCOME_SENTENCE_BYTES,
+            MAX_OUTCOME_SENTENCE_BYTES
+        );
+
+        let mut reach = allowed_workload();
+        reach.resources = RecordedResources::Reach("fixture-entry".into());
+        reach.credential = Some(CredentialIdentity {
+            mode: CredentialMode::PerUserGrant,
+            principal: "per-user".into(),
+        });
+        let mut escaped = denied_user_with_delegation();
+        escaped.resources = serde_json::from_value(json!({"named": [
+            {"system": "s\"q", "kind": "k\\b", "identifier": "é\n\u{1}"}
+        ]}))
+        .unwrap();
+        escaped.credential = Some(CredentialIdentity {
+            mode: CredentialMode::TeamServiceIdentity,
+            principal: "service".into(),
+        });
+        for record in [
+            denied_user_with_delegation(),
+            allowed_workload(),
+            reach,
+            escaped,
+            largest_record(MAX_BEGUN_ROW_BYTES),
+            largest_allowed_record(MAX_BEGUN_ROW_BYTES),
+        ] {
+            let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+            assert_eq!(
+                row_bound::call_row_sizes(&id(), &record),
+                row.sizes(),
+                "{record:?}"
+            );
+        }
+
+        let mut workload = list_record();
+        workload.proved_principal = allowed_workload().proved_principal;
+        workload.tools = vec!["back\\slash \"quoted\" é".to_owned()];
+        let mut none = list_record();
+        none.tools = Vec::new();
+        for record in [list_record(), workload, none] {
+            let row = ListRow::from_record(&id(), &record).unwrap();
+            assert_eq!(
+                row_bound::list_row_sizes(&id(), &record),
+                row.sizes(),
+                "{record:?}"
+            );
         }
     }
 

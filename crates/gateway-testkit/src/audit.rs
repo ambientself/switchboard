@@ -15,6 +15,10 @@ use serde_json::Value;
 use crate::clock::FixedClock;
 use crate::contract::StoredRecord;
 use crate::gate::Gate;
+use crate::row_bound::{
+    MAX_BEGUN_ROW_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes, refuse_long_sentence,
+    refuse_over,
+};
 
 /// The instance [`row_start`] names.
 pub const FIXTURE_INSTANCE: &str = "fixture-instance";
@@ -197,10 +201,13 @@ fn refuse_non_uuid(id: &AuditRowId) -> Result<(), StoreError> {
 
 /// The allowance for `record`'s deadline, or why the Postgres store would refuse to write it
 /// as the row `id`: an identifier that is not a lowercase hyphenated UUID, a record already
-/// complete, a text value with U+0000, a count or an allowance past a `bigint`, unknown
-/// resources or a reach with a count left out, a reach naming no entry, or a call record of
-/// kind `list`, which the table's `kind_shape` refuses whatever row the identifier already
-/// names.
+/// complete, a text value with U+0000, a count or an allowance past a `bigint`, a row over
+/// [`MAX_BEGUN_ROW_BYTES`], unknown resources or a reach with a count left out, a reach naming
+/// no entry, or a call record of kind `list`, which the table's `kind_shape` refuses whatever
+/// row the identifier already names. It checks the allowance before the row bound, and the
+/// row bound before the table's own constraints, as that store does. Its other checks do not
+/// follow that store's order, so a record that breaks more than one rule may be refused for a
+/// different one of them.
 fn refused_at_begin(
     id: &AuditRowId,
     record: &AuditRecord,
@@ -215,6 +222,9 @@ fn refused_at_begin(
         "the count of resources left out",
         as_u64(record.resources_omitted),
     )?;
+    let allowance = allowance_ms(budgets, record.call_deadline_ms);
+    refuse_past_bigint("the row's allowance", allowance)?;
+    refuse_over(&call_row_sizes(id, record), MAX_BEGUN_ROW_BYTES)?;
     if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {
         return Err("unknown resources cannot have a count left out".into());
     }
@@ -226,8 +236,6 @@ fn refused_at_begin(
             return Err("a reach must name its connector entry".into());
         }
     }
-    let allowance = allowance_ms(budgets, record.call_deadline_ms);
-    refuse_past_bigint("the row's allowance", allowance)?;
     if record.kind != RowKind::Call {
         return Err(format!(
             "audit row {} is a call record of kind list, which violates the check constraint \"kind_shape\"",
@@ -238,16 +246,23 @@ fn refused_at_begin(
     Ok(allowance)
 }
 
-/// Why the Postgres store would refuse to write `record` as the row `id`, if it would.
+/// Why the Postgres store would refuse to write `record` as the row `id`, if it would: a list
+/// row is written complete, so one over [`MAX_ROW_BYTES`] is refused.
 fn refused_at_list(id: &AuditRowId, record: &ListRecord) -> Result<(), StoreError> {
     refuse_non_uuid(id)?;
     refuse_nul(serde_json::to_value(record))?;
-    refuse_past_bigint("the count of tools left out", as_u64(record.tools_omitted))
+    refuse_past_bigint("the count of tools left out", as_u64(record.tools_omitted))?;
+    refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES)
 }
 
-/// Why the Postgres store would refuse to write `completion`, if it would.
+/// Why the Postgres store would refuse to write `completion`, if it would: a refusal's sentence
+/// is refused, never cut, when it holds U+0000 or is longer than
+/// [`MAX_OUTCOME_SENTENCE_BYTES`](crate::row_bound::MAX_OUTCOME_SENTENCE_BYTES).
 fn refused_at_finish(completion: &Completion) -> Result<(), StoreError> {
     refuse_nul(serde_json::to_value(completion))?;
+    if let Outcome::Refused { sentence } = &completion.outcome {
+        refuse_long_sentence(sentence)?;
+    }
     refuse_past_bigint("the latency", completion.latency_ms)
 }
 
@@ -379,7 +394,10 @@ impl State {
 /// identifier that is not a UUID in the lowercase hyphenated form, a record handed to begin
 /// already complete, a record, list record or completion with U+0000 in a text value, a count
 /// of resources or tools left out or a latency past a Postgres `bigint`, and a call row whose
-/// allowance is past one. Of the table's own constraints it checks three: unknown resources or
+/// allowance is past one. It holds that store's row bound, as [`row_bound`](crate::row_bound)
+/// counts it: begin refuses a call row over 522,203 bytes and list a list row over 512 KiB,
+/// naming the row's largest column, and finish refuses a refusal's sentence over 2,048 bytes,
+/// leaving the row open. Of the table's own constraints it checks three: unknown resources or
 /// a reach with a count left out, a reach naming no entry, and `kind_shape`, which refuses a
 /// call record of kind `list` at begin. It keeps a row's credential identity as begin was
 /// given it, its mode and principal together, as the table's `credential_shape` requires.
