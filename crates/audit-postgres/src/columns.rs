@@ -6,8 +6,11 @@
 //! cannot hold U+0000, and callers choose some values, such as their tool-use identifier. A
 //! record with U+0000 in any text value is refused with [`PgAuditError::Nul`], naming the
 //! column, rather than written with another character in its place: begin fails, so the core
-//! refuses the call. A latency or a count past its column's range is refused the same way, and
-//! so is a row larger than [`MAX_ROW_BYTES`], naming its largest column.
+//! refuses the call. A latency or a count past its column's range is refused the same way. So
+//! is a row over its bound, naming its largest column: [`MAX_BEGUN_ROW_BYTES`] for a call row
+//! at begin, and [`MAX_ROW_BYTES`] for a list row. At finish, a refusal's sentence holding
+//! U+0000 or longer than [`MAX_OUTCOME_SENTENCE_BYTES`] is refused, never cut: finish fails and
+//! gives up, and the row keeps no completion.
 
 use std::time::Duration;
 
@@ -27,15 +30,16 @@ use crate::store::{Budgets, PgAuditError};
 /// 8 bytes.
 ///
 /// Finish cannot see the row begin wrote, so begin leaves room for the completion: it refuses a
-/// row over [`MAX_BEGUN_ROW_BYTES`], this bound less [`COMPLETION_RESERVE`], and finish caps the
-/// one completion value that has no fixed size, the refusal sentence, at
-/// [`MAX_OUTCOME_SENTENCE_BYTES`]. A list row is written complete and never completed, so list
-/// refuses one over this bound itself. Either refusal names the row's largest column, and the
-/// call or the list is refused.
+/// row over [`MAX_BEGUN_ROW_BYTES`], this bound less [`COMPLETION_RESERVE`], and finish refuses
+/// the one completion value that has no fixed size, the refusal sentence, when it is longer
+/// than [`MAX_OUTCOME_SENTENCE_BYTES`]. A list row is written complete and never completed, so list
+/// refuses one over this bound itself. Either refusal at begin or list names the row's largest
+/// column, and the call or the list is refused.
 ///
 /// The values a caller chooses, and the ones it can make long, are capped before they reach a
 /// row, so in the largest row a call can begin they take at most 316,129 bytes, leaving 206,074
-/// of the 522,203 a begun row may hold for the rest, and the completion's 2,085 after that:
+/// of the 522,203 a begun row may hold for the rest, and a reserve of 2,085 bytes for the
+/// completion after that:
 ///
 /// - `resources`: 298,049 for named resources. At most 64 resources (`MAX_RECORDED_RESOURCES`),
 ///   each a system and a kind of at most 128 escaped characters and an identifier of at most
@@ -66,12 +70,13 @@ use crate::store::{Budgets, PgAuditError};
 /// gateway yet.
 ///
 /// So the largest row a call can make, begun at 522,203 bytes and finished with the longest
-/// completion, is at most 524,288 bytes. A denial is never completed, and an allowed call has no
-/// `reason` or `sentence`, so a finished row is in fact smaller.
+/// completion finish writes, is at most 524,288 bytes. A denial is never completed, and an
+/// allowed call has no `reason` or `sentence`, so a finished row is in fact smaller.
 pub const MAX_ROW_BYTES: usize = 512 * 1024;
 
-/// The most bytes finish writes in `outcome_sentence`: a longer refusal sentence is cut at a
-/// character boundary and marked with a 3-byte `…`, so it takes at most this.
+/// The most bytes finish writes in `outcome_sentence`. A longer refusal sentence is refused
+/// with [`PgAuditError::TooLong`], naming the column and this cap, as one holding U+0000 is
+/// refused, never cut: finish sends nothing and gives up, and the row keeps no completion.
 ///
 /// A refusal's sentence is one the gateway makes, from these sources:
 ///
@@ -87,8 +92,10 @@ pub const MAX_ROW_BYTES: usize = 512 * 1024;
 /// The server's refusal of a call (`outcome::UPSTREAM_REFUSED`, its `403`) is an error of the
 /// kind `vendor_refusal`, not a refusal, and the row records the kind, not a sentence. So does
 /// every other error. 2 KiB holds every sentence the gateway makes with a server and a tool name
-/// of 900 bytes each (the gateway's `tests/limits.rs` checks this); a longer configured name is
-/// cut with the sentence, not refused.
+/// of 900 bytes each (the gateway's `tests/limits.rs` checks this). A configured name long
+/// enough to make a sentence longer than this, or a longer sentence from a connector outside
+/// this repository, makes that finish refused: the caller is answered with the audit-failure
+/// sentence instead, and the row is left open.
 pub const MAX_OUTCOME_SENTENCE_BYTES: usize = 2 * 1024;
 
 /// The longest name an outcome has: `refused`.
@@ -98,9 +105,9 @@ const LONGEST_OUTCOME: usize = "refused".len();
 const LONGEST_ERROR_KIND: usize = "oversized_or_late_read".len();
 
 /// The most bytes a completion adds to a row, as [`MAX_ROW_BYTES`] counts them: the longest
-/// outcome (7), the longest error kind (22), the latency (8) and the capped sentence
-/// ([`MAX_OUTCOME_SENTENCE_BYTES`]), 2,085 in all. No completion has both an error kind and a
-/// sentence, so this counts 22 bytes more than one can add.
+/// outcome (7), the longest error kind (22), the latency (8) and the longest sentence finish
+/// writes ([`MAX_OUTCOME_SENTENCE_BYTES`]), 2,085 in all. No completion has both an error kind
+/// and a sentence, so this counts 22 bytes more than one can add.
 pub const COMPLETION_RESERVE: usize =
     LONGEST_OUTCOME + LONGEST_ERROR_KIND + INTEGER_BYTES + MAX_OUTCOME_SENTENCE_BYTES;
 
@@ -518,8 +525,9 @@ impl ListRow {
         Ok(row)
     }
 
-    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.
-    pub fn sizes(&self) -> [(&'static str, usize); 16] {
+    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them: each parameter, and the
+    /// kind `list`, which [`INSERT`](Self::INSERT) writes itself.
+    pub fn sizes(&self) -> [(&'static str, usize); 17] {
         [
             ("id", text_bytes(&self.id)),
             ("deployment", text_bytes(&self.deployment)),
@@ -541,6 +549,7 @@ impl ListRow {
             ),
             ("claimed_team", optional_bytes(self.claimed_team.as_deref())),
             ("instance", text_bytes(&self.instance)),
+            ("kind", text_bytes(kind(RowKind::List))),
             ("listed_tools", json_bytes(&self.listed_tools)),
             ("listed_omitted", INTEGER_BYTES),
         ]
@@ -645,16 +654,17 @@ fn optional(column: &'static str, text: Option<&str>) -> Result<Option<String>, 
     text.map(|text| stored(column, text)).transpose()
 }
 
-/// `text` in at most `cap` bytes: as it is when it fits, and otherwise cut at the last
-/// character boundary that leaves room for a `…`, which marks the cut, as the core marks the
-/// values it cuts. `cap` must leave room for the `…`.
-fn cut(mut text: String, cap: usize) -> String {
+/// `text`, for `column`, which holds at most `cap` bytes: refused when it is longer, naming the
+/// column and the cap, rather than cut.
+fn within_cap(column: &'static str, text: String, cap: usize) -> Result<String, PgAuditError> {
     if text.len() > cap {
-        let end = text.floor_char_boundary(cap - '…'.len_utf8());
-        text.truncate(end);
-        text.push('…');
+        return Err(PgAuditError::TooLong {
+            column,
+            bytes: text.len(),
+            cap,
+        });
     }
-    text
+    Ok(text)
 }
 
 fn decision(kind: DecisionKind) -> &'static str {
@@ -694,17 +704,18 @@ impl FinishRow {
     pub const SELECT: &'static str = "SELECT outcome, outcome_sentence, error_kind, latency_ms
         FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
 
-    /// The columns for `completion`. Refuses a sentence holding U+0000, and a latency past the
-    /// column's range, rather than write another value than the completion's. Cuts a sentence
-    /// longer than [`MAX_OUTCOME_SENTENCE_BYTES`], so the completion is never more than
+    /// The columns for `completion`. Refuses a sentence holding U+0000, a sentence longer than
+    /// [`MAX_OUTCOME_SENTENCE_BYTES`], and a latency past the column's range, rather than write
+    /// another value than the completion's. So a completion written is never more than
     /// [`COMPLETION_RESERVE`], the room begin left for it.
     pub fn from_completion(completion: &Completion) -> Result<Self, PgAuditError> {
         let (outcome_sentence, error_kind) = match &completion.outcome {
             Outcome::Refused { sentence } => (
-                Some(cut(
+                Some(within_cap(
+                    "outcome_sentence",
                     stored("outcome_sentence", sentence)?,
                     MAX_OUTCOME_SENTENCE_BYTES,
-                )),
+                )?),
                 None,
             ),
             Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),
@@ -1332,9 +1343,9 @@ mod tests {
         );
     }
 
-    /// The largest row an allowed call can begin, finished with the longest completion, is
-    /// within [`MAX_ROW_BYTES`]: the completion is at most [`COMPLETION_RESERVE`], whatever
-    /// its outcome and however long its sentence.
+    /// The largest row an allowed call can begin, finished with the longest completion finish
+    /// writes, is within [`MAX_ROW_BYTES`]: every completion finish writes is at most
+    /// [`COMPLETION_RESERVE`], whatever its outcome, and a longer sentence is refused.
     #[test]
     fn the_largest_begun_row_and_the_longest_completion_are_within_the_bound() {
         let begun = largest_allowed_record(MAX_BEGUN_ROW_BYTES);
@@ -1344,7 +1355,7 @@ mod tests {
         let mut completions = vec![
             Outcome::Ok,
             Outcome::Refused {
-                sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES * 4),
+                sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES),
             },
         ];
         completions.extend(
@@ -1378,41 +1389,57 @@ mod tests {
         assert!(held + longest <= MAX_ROW_BYTES);
     }
 
-    /// A refusal's sentence longer than [`MAX_OUTCOME_SENTENCE_BYTES`] is cut at a character
-    /// boundary and marked with `…`, so it takes at most that; one that fits is kept as it is.
+    /// A refusal's sentence of [`MAX_OUTCOME_SENTENCE_BYTES`] is written whole, and one a byte
+    /// longer is refused, naming the column and the cap, never cut: the row is exactly its
+    /// record or it is not written. The cap counts bytes, not characters.
     #[test]
-    fn an_over_long_sentence_is_cut_at_finish() {
-        let sentence = |sentence: String| {
+    fn an_over_long_sentence_is_refused_at_finish() {
+        let finish = |sentence: String| {
             FinishRow::from_completion(&Completion {
                 outcome: Outcome::Refused { sentence },
                 latency_ms: 1,
             })
-            .unwrap()
-            .outcome_sentence
-            .unwrap()
         };
         let fits = "f".repeat(MAX_OUTCOME_SENTENCE_BYTES);
-        assert_eq!(sentence(fits.clone()), fits);
-        let cut = sentence("o".repeat(MAX_OUTCOME_SENTENCE_BYTES + 1));
-        assert_eq!(cut.len(), MAX_OUTCOME_SENTENCE_BYTES);
         assert_eq!(
-            cut,
-            format!("{}…", "o".repeat(MAX_OUTCOME_SENTENCE_BYTES - 3))
+            finish(fits.clone()).unwrap().outcome_sentence,
+            Some(fits.clone())
         );
-        // Two-byte characters: the cut falls between them, never inside one.
-        let cut = sentence("é".repeat(MAX_OUTCOME_SENTENCE_BYTES));
-        assert!(cut.len() <= MAX_OUTCOME_SENTENCE_BYTES, "{}", cut.len());
+        let two_byte = "é".repeat(MAX_OUTCOME_SENTENCE_BYTES / 2);
         assert_eq!(
-            cut,
-            format!("{}…", "é".repeat((MAX_OUTCOME_SENTENCE_BYTES - 3) / 2))
+            finish(two_byte.clone()).unwrap().outcome_sentence,
+            Some(two_byte.clone())
         );
-        // A U+0000 past the cap still refuses the sentence: it is checked before the cut.
-        let nul = format!("{}\u{0}", "n".repeat(MAX_OUTCOME_SENTENCE_BYTES));
+        for (over, bytes) in [
+            (format!("{fits}o"), MAX_OUTCOME_SENTENCE_BYTES + 1),
+            (format!("{two_byte}é"), MAX_OUTCOME_SENTENCE_BYTES + 2),
+        ] {
+            match finish(over) {
+                Err(PgAuditError::TooLong {
+                    column,
+                    bytes: refused,
+                    cap,
+                }) => assert_eq!(
+                    (column, refused, cap),
+                    ("outcome_sentence", bytes, MAX_OUTCOME_SENTENCE_BYTES)
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            PgAuditError::TooLong {
+                column: "outcome_sentence",
+                bytes: 2_049,
+                cap: MAX_OUTCOME_SENTENCE_BYTES,
+            }
+            .to_string(),
+            "the audit column outcome_sentence would hold 2049 bytes, more than the 2048 it may \
+             hold, so it is not written"
+        );
+        // A U+0000 in an over-long sentence is refused as a U+0000.
+        let nul = format!("{fits}\u{0}");
         assert!(matches!(
-            FinishRow::from_completion(&Completion {
-                outcome: Outcome::Refused { sentence: nul },
-                latency_ms: 1,
-            }),
+            finish(nul),
             Err(PgAuditError::Nul {
                 column: "outcome_sentence"
             })
@@ -1492,9 +1519,12 @@ mod tests {
         let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
         assert_eq!(sizes["sentence"], 5);
 
+        // A list row counts its parameters and the kind its statement writes itself.
         let row = ListRow::from_record(&id(), &list_record()).unwrap();
         let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
-        assert_eq!(sizes.len(), row.parameters().len());
+        assert_eq!(sizes.len(), row.parameters().len() + 1);
+        assert!(ListRow::INSERT.contains(" 'list',"));
+        assert_eq!(sizes["kind"], "list".len());
         assert_eq!(
             sizes["listed_tools"],
             r#"["fixture__read","fixture__write"]"#.len()

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
 use super::{GATEWAY_ROLE, TestDatabase};
-use crate::columns::{BeginRow, FinishRow, allowance_ms};
+use crate::columns::{BeginRow, FinishRow, ListRow, allowance_ms};
 use crate::{
     Budgets, FinishCounts, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES,
     PgAuditError, PgAuditStore, PoolSizes,
@@ -411,6 +411,84 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
     assert_eq!(given_up.lock().unwrap().clone(), vec![error.to_string()]);
 }
 
+/// A refusal's sentence of 2,048 bytes is written whole at finish. One of 2,049 is refused the
+/// way a sentence holding U+0000 is, rather than cut: finish fails at once, naming the column
+/// and the cap, gives up, and is counted under `other` and reported, and the row keeps no
+/// completion, so it stays open. Nothing else is written to it.
+#[tokio::test]
+async fn an_over_long_sentence_is_refused_at_finish_as_a_nul_is() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let given_up = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&given_up);
+    let store = db
+        .store(PoolSizes::default())
+        .on_given_up(move |report| kept.lock().unwrap().push(report.error.to_string()));
+    let admin = db.admin().await;
+
+    let whole = "w".repeat(MAX_OUTCOME_SENTENCE_BYTES);
+    let row = begun_row(&store, &fixture).await;
+    let refused = completion(
+        Outcome::Refused {
+            sentence: whole.clone(),
+        },
+        3,
+    );
+    store.finish_within_budget(&row, &refused).await.unwrap();
+    assert_eq!(read_back(&admin, &row).await.completion, Some(refused));
+
+    let mut errors = Vec::new();
+    for sentence in [format!("{whole}o"), "No.\u{0}".to_owned()] {
+        let row = begun_row(&store, &fixture).await;
+        let before = written_bytes(&admin, &row).await;
+        let error = store
+            .finish_within_budget(&row, &completion(Outcome::Refused { sentence }, 3))
+            .await
+            .unwrap_err();
+        assert_eq!(read_back(&admin, &row).await.completion, None);
+        assert_eq!(finished_at(&admin, &row).await, None);
+        assert_eq!(written_bytes(&admin, &row).await, before);
+        errors.push(error);
+    }
+    assert!(
+        matches!(
+            errors[0],
+            PgAuditError::TooLong {
+                column: "outcome_sentence",
+                bytes: 2_049,
+                cap: MAX_OUTCOME_SENTENCE_BYTES,
+            }
+        ),
+        "{}",
+        errors[0]
+    );
+    assert!(
+        matches!(
+            errors[1],
+            PgAuditError::Nul {
+                column: "outcome_sentence"
+            }
+        ),
+        "{}",
+        errors[1]
+    );
+    assert_eq!(
+        store.finishes(),
+        FinishCounts {
+            in_flight: 0,
+            given_up: 2,
+            never_written: 0,
+        }
+    );
+    assert_eq!(store.stats().finishes_given_up.other, 2);
+    assert_eq!(
+        given_up.lock().unwrap().clone(),
+        errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+}
+
 /// Decision 0014, section 7: the largest row a call can begin, at begin's bound, is written and
 /// reads back exactly; a byte more is refused, naming its largest column, and no row is
 /// written.
@@ -433,6 +511,8 @@ async fn the_largest_row_is_written_and_a_row_over_the_bound_is_refused() {
             ..largest.clone()
         }
     );
+    // The row as written holds what begin counted, every column included.
+    assert_eq!(written_bytes(&admin, &row).await, MAX_BEGUN_ROW_BYTES);
     let credential = admin
         .query_one(
             "SELECT credential_mode, credential_principal FROM switchboard_audit.call_rows
@@ -469,8 +549,8 @@ async fn the_largest_row_is_written_and_a_row_over_the_bound_is_refused() {
 }
 
 /// Decision 0014, section 7 bounds the whole row: the largest row an allowed call can begin,
-/// finished with the longest completion, a refusal whose sentence is longer than the cap, is
-/// written and reads back with the sentence cut, and is at most 512 KiB.
+/// finished with the longest completion finish writes, a refusal whose sentence is at the cap,
+/// is written and reads back whole, and the row as the table holds it is at most 512 KiB.
 #[tokio::test]
 async fn the_largest_row_finished_with_the_longest_completion_is_within_the_bound() {
     let Some(db) = TestDatabase::create().await else {
@@ -484,23 +564,17 @@ async fn the_largest_row_finished_with_the_longest_completion_is_within_the_boun
     store.begin(&row, &largest).await.unwrap();
     let refused = completion(
         Outcome::Refused {
-            sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES * 2),
+            sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES),
         },
         u64::from(u32::MAX),
     );
     store.finish_within_budget(&row, &refused).await.unwrap();
 
-    let cut = format!("{}…", "s".repeat(MAX_OUTCOME_SENTENCE_BYTES - 3));
     let read = read_back(&admin, &row).await;
     assert!(
         read == AuditRecord {
             credential: None,
-            completion: Some(completion(
-                Outcome::Refused {
-                    sentence: cut.clone()
-                },
-                u64::from(u32::MAX)
-            )),
+            completion: Some(refused.clone()),
             ..largest.clone()
         }
     );
@@ -530,6 +604,104 @@ async fn the_largest_row_finished_with_the_longest_completion_is_within_the_boun
         .unwrap()
         .get(0);
     assert_eq!(usize::try_from(stored).unwrap(), MAX_OUTCOME_SENTENCE_BYTES);
+    // The row as written, every column the table holds, is what the store counted.
+    let written = written_bytes(&admin, &row).await;
+    assert_eq!(written, begun + finished);
+    assert!(written <= MAX_ROW_BYTES, "{written}");
+}
+
+/// A list row at its bound, [`MAX_ROW_BYTES`] as the store counts it, holds exactly that many
+/// bytes as the table holds it, the kind its statement writes itself included.
+#[tokio::test]
+async fn a_list_row_at_the_bound_holds_what_the_store_counted() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+
+    let mut list: ListRecord = serde_json::from_value(json!({
+        "instance": "gateway-7f9c",
+        "deployment": "",
+        "surface": "fixture-read",
+        "profile": "user-ro",
+        "policy_revision": "fixture-1",
+        "proved_principal": {
+            "id": {"issuer": "https://user-issuer.fixture.test", "subject": "user-1"},
+            "kind": "user",
+            "groups": ["group-g"]
+        },
+        "proved_delegation_team": "team-d",
+        "claimed_acting_person": "person@fixture.test",
+        "claimed_team": "team-c",
+        "tools": ["fixture__read", "back\\slash"],
+        "tools_omitted": 2
+    }))
+    .unwrap();
+    let row = row_start().row;
+    let counted = |list: &ListRecord| -> usize {
+        ListRow::from_record(&row, list)
+            .unwrap()
+            .sizes()
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum()
+    };
+    list.deployment = "d".repeat(MAX_ROW_BYTES - counted(&list)).as_str().into();
+    assert_eq!(counted(&list), MAX_ROW_BYTES);
+    store.list(&row, &list).await.unwrap();
+    assert_eq!(read_back_list(&admin, &row).await, list);
+    assert_eq!(written_bytes(&admin, &row).await, MAX_ROW_BYTES);
+}
+
+/// The columns the database sets itself, which the store never sends: when a row was begun and
+/// finished, and its deadline, worked out from its allowance.
+const SET_BY_THE_DATABASE: [&str; 3] = ["begun_at", "finished_at", "deadline"];
+
+/// The bytes of the row `row` as the table holds it, counted from the table, not from the
+/// store's own count, as decision 0014, section 7 counts them: each text value as its UTF-8, a
+/// text array as its elements', a JSON value as its JSON text, an integer as 8 bytes, and the
+/// identifier as the text the store sends. Every column the table has is counted, but for
+/// [`SET_BY_THE_DATABASE`]; a column of any other type fails the test until it is counted here.
+async fn written_bytes(admin: &Client, row: &AuditRowId) -> usize {
+    let columns = admin
+        .query(
+            "SELECT column_name::text, data_type::text FROM information_schema.columns
+              WHERE table_schema = 'switchboard_audit' AND table_name = 'call_rows'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let written: Value = admin
+        .query_one(
+            "SELECT to_jsonb(written) FROM switchboard_audit.call_rows AS written
+              WHERE id = ($1::text)::uuid",
+            &[&row.as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let mut bytes = 0;
+    for column in columns {
+        let (name, data_type): (String, String) = (column.get(0), column.get(1));
+        let value = &written[name.as_str()];
+        if SET_BY_THE_DATABASE.contains(&name.as_str()) {
+            assert_eq!(data_type, "timestamp with time zone", "{name}");
+            continue;
+        }
+        bytes += match (data_type.as_str(), value) {
+            (_, Value::Null) => 0,
+            ("text" | "uuid", Value::String(text)) => text.len(),
+            ("ARRAY", Value::Array(texts)) => texts
+                .iter()
+                .map(|text| text.as_str().expect("a text array").len())
+                .sum(),
+            ("jsonb", json) => json.to_string().len(),
+            ("bigint" | "integer", Value::Number(_)) => 8,
+            (other, value) => panic!("column {name}, of type {other}, holds {value}"),
+        };
+    }
+    bytes
 }
 
 /// The decided call `call` in the fixture's policy.

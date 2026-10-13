@@ -3295,16 +3295,17 @@ mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is p
        '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
        "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
 mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
-       '                Some(cut(\n                    stored("outcome_sentence", sentence)?,\n',
-       "                Some(cut(\n                    sentence.clone(),\n")
+       '                    stored("outcome_sentence", sentence)?,\n                    MAX_OUTCOME_SENTENCE_BYTES,\n',
+       "                    sentence.clone(),\n                    MAX_OUTCOME_SENTENCE_BYTES,\n")
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
 # Decision 0014, section 7: a row is at most 512 KiB, counted as the bytes of the values the store
 # sends, the completion included, and one over it is refused naming its largest column. Begin
-# leaves room for the completion, and finish caps the refusal sentence, the completion's one
-# value of no fixed size. columns.rs's own tests watch the bounds, the count, the column named
-# and the cap; tests/store.rs writes the largest row to Postgres and finishes it.
+# leaves room for the completion, and finish refuses a refusal sentence over its cap, the
+# completion's one value of no fixed size, rather than cut it. columns.rs's own tests watch the
+# bounds, the count, the column named and the cap; tests/store.rs writes the largest rows to
+# Postgres, finishes the call row, and counts every column of each row as the table holds it.
 mutate("pg-columns-row-bound-unchecked", "a row over its bound is sent to the database", PG_COLUMNS,
        "    if bytes > bound {\n", "    if false && bytes > bound {\n")
 mutate("pg-columns-row-bound-refuses-at-bound", "a row of exactly its bound is refused", PG_COLUMNS,
@@ -3313,19 +3314,24 @@ mutate("pg-columns-row-bound-no-completion-reserve", "begin leaves no room for t
        "        within_bound(&row.sizes(), MAX_BEGUN_ROW_BYTES)?;\n",
        "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n")
 mutate("pg-columns-outcome-sentence-uncapped", "a refusal's sentence of any length is written at finish", PG_COLUMNS,
-       "    if text.len() > cap {\n", "    if false && text.len() > cap {\n")
+       "    if text.len() > cap {\n        return Err(PgAuditError::TooLong {\n",
+       "    if false && text.len() > cap {\n        return Err(PgAuditError::TooLong {\n")
+mutate("pg-columns-outcome-sentence-cut", "a refusal's sentence over the cap is cut to it rather than refused", PG_COLUMNS,
+       "    if text.len() > cap {\n        return Err(PgAuditError::TooLong {\n            column,\n"
+       "            bytes: text.len(),\n            cap,\n        });\n    }\n    Ok(text)\n",
+       "    let mut text = text;\n    let _ = column;\n"
+       "    text.truncate(text.floor_char_boundary(cap));\n    Ok(text)\n")
 mutate("pg-columns-row-bound-names-first-column", "a row over the bound names its first column, not its largest", PG_COLUMNS,
        "            .max_by_key(|(_, bytes)| *bytes)\n", "            .find(|(_, bytes)| *bytes > 0)\n")
 mutate("pg-columns-row-bound-groups-uncounted", "a user's groups are left out of the row's size", PG_COLUMNS,
        "    texts.map_or(0, |texts| texts.iter().map(|text| text.len()).sum())\n",
        "    texts.map_or(0, |texts| texts.iter().map(|_| 0).sum())\n")
 mutate("pg-columns-list-row-unbounded", "a list row over 512 KiB is sent to the database", PG_COLUMNS,
-       "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n        Ok(row)\n    }\n\n"
-       "    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.\n"
-       "    pub fn sizes(&self) -> [(&'static str, usize); 16] {\n",
-       "        Ok(row)\n    }\n\n"
-       "    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.\n"
-       "    pub fn sizes(&self) -> [(&'static str, usize); 16] {\n")
+       "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n        Ok(row)\n",
+       "        Ok(row)\n")
+mutate("pg-columns-list-kind-uncounted", "a list row's kind, which its statement writes itself, is left out of its size", PG_COLUMNS,
+       '            ("kind", text_bytes(kind(RowKind::List))),\n',
+       '            ("kind", 0),\n')
 mutate("pg-sql-resources-nullable", "a call row may record no resources at all", PG_LIST_ROWS,
        "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
        "                AND resources_omitted IS NOT NULL\n")
