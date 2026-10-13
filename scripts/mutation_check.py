@@ -4404,7 +4404,10 @@ mutate("demo-drift-withdrawal-unchecked", "the drift step passes a withdrawal ho
        """      [0-9]*:[0-9]*) check_at_most 0 $((DRIFT_INTERVAL + CALL_DEADLINE)) \\\n""")
 mutate("demo-drift-reapproval-unchecked", "the re-approval step passes without the withdrawals cleared", DRIVER,
        """  check "$(printf '%s\\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\\(.tool): \\(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \\\n""",
-       """  check "docs-team-a__list_documents: approved again;docs-team-b__list_documents: approved again" \\\n""")
+       """  check "$want" \\\n""")
+mutate("demo-drift-read-tools-unchecked", "the drift step passes with the read tools served, though their entries' reach check tool is withdrawn", DRIVER,
+       "  for tool in docs-team-a__list_documents docs-team-a__read_document docs-team-b__list_documents docs-team-b__read_document; do\n",
+       "  for tool in docs-team-a__list_documents docs-team-b__list_documents; do\n")
 mutate("demo-compose-mock-docs-admin-off-loopback", "Compose's mock-docs serves its admin endpoint to every container", COMPOSE,
        "      MOCK_DOCS_ADMIN_LISTEN: 127.0.0.1:9091\n", "      MOCK_DOCS_ADMIN_LISTEN: 0.0.0.0:9091\n")
 mutate("demo-kind-mock-docs-admin-service", "kind's mock-docs Service exposes the admin port", "deploy/kind/base/mock-docs.yaml",
@@ -4616,14 +4619,14 @@ mutate("gw-drift-poll-failure-withdraws", "a failed poll is read as an empty too
        "        let tools = match listed {\n",
        "        let listed = Ok::<_, ListError>(listed.unwrap_or_default());\n        let tools = match listed {\n")
 mutate("gw-drift-withdrawal-not-reapplied", "a reload drops every standing withdrawal, so a withdrawn tool is served again unapproved", DRIFT,
-       "            let keep = approved\n                .get(tool)\n                .is_some_and(|now| now.key == standing.key);\n",
-       "            let keep = false && approved.contains_key(tool);\n")
+       "                    && approved\n                        .get(*tool)\n                        .is_some_and(|now| now.key == standing.key)\n",
+       "                    && false\n                    && approved.contains_key(*tool)\n")
 mutate("gw-drift-reload-compares-derived", "a reload is compared with the derived policy served, whose revision no registry can have, so a changed file under the base revision is served while a withdrawal stands", RELOAD,
        "        let served = self.withdrawals.base();\n",
        "        let served = self.live.current();\n")
 mutate("gw-drift-reapproval-not-cleared", "a withdrawal is keyed by the tool's name alone, so approving it again does not clear it", DRIFT,
-       "                .is_some_and(|now| now.key == standing.key);\n",
-       "                .is_some_and(|now| now.key.tool == standing.key.tool);\n")
+       "                        .is_some_and(|now| now.key == standing.key)\n",
+       "                        .is_some_and(|now| now.key.tool == standing.key.tool)\n")
 mutate("gw-drift-revision-is-base", "a withdrawal's policy keeps the base revision, so its rows cannot tell it from the base", DRIFT,
        "            let revision = withdrawn_revision(state.base.revision(), &withdrawn);\n",
        "            let revision = state.base.revision().clone();\n")
@@ -4638,6 +4641,16 @@ mutate_all("gw-drift-first-pass-after-bind", "the first drift pass runs on the t
             "tokio::time::interval_at(tokio::time::Instant::now(), interval);"))
 mutate("gw-drift-interval-ceiling-unchecked", "a drift interval above 900 s loads", DRIFT,
        " || seconds > MAX_DRIFT_INTERVAL.as_secs() {", " {")
+# Decision 0013, section 5, noted on 2026-10-12 (#165): the gateway refuses to start with a drift
+# interval shorter than any proxied server's call deadline, its own or the default, so each poll
+# ends by the next tick. start.rs's own tests and tests/drift.rs watch it.
+mutate("gw-drift-interval-below-deadline-accepted", "a drift interval shorter than a server's call deadline starts, so a late poll holds back the next and a change outlasts its bound", START,
+       "        if deadline > interval {\n", "        if false && deadline > interval {\n")
+mutate("gw-drift-interval-default-deadline-uncounted", "a server the deployment file gives no bounds is not held to the default deadline, so an interval below the default starts", START,
+       "        let deadline = bounds.get(server).copied().unwrap_or_default().deadline;\n",
+       "        let Some(deadline) = bounds.get(server).map(|bounds| bounds.deadline) else {\n"
+       "            continue;\n"
+       "        };\n")
 mutate("gw-drift-entries-share-one-schedule", "the servers are polled together each interval, so a server that does not answer holds back every other server's next poll until its deadline", DRIFT,
        "        let mut entries = JoinSet::new();\n"
        "        for (server, connector) in &self.servers {\n"
@@ -4674,6 +4687,7 @@ mutate("gw-probe-open-withdraws", "a server the probe finds open has its tools w
        "                            let standing = Standing {\n"
        "                                key: approved.key.clone(),\n"
        "                                server: server.clone(),\n"
+       "                                canary: None,\n"
        "                            };\n"
        "                            (tool.clone(), standing)\n"
        "                        })\n"
@@ -4689,10 +4703,11 @@ mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for
        "    if finding != ProbeFinding::NotShown {\n")
 # Decision 0011, section 4: beside each poll, the reach check sends each entry's canary through
 # the gateway's own listener as the registry's workload. Only a successful canary withdraws the
-# entry's tools; a refusal holds and a failed check withdraws nothing. The first check runs
-# beside the schedule, so it delays no poll, and a check is judged only against the approvals
-# it began under. It reads past the largest answer a server may be allowed, so a widened canary
-# answered near that cap is a mismatch. tests/reach.rs watches each.
+# entry's tools; a refusal holds and a failed check withdraws nothing. Every check runs beside
+# the schedule, so it delays no poll, a tick makes none while the last is out, and a check is
+# judged only against the approvals it began under. It reads 8 times past the largest answer a
+# server may be allowed, plus the envelope, so a widened canary answered near that cap is a
+# mismatch, whatever numbers the gateway writes out again (#175). tests/reach.rs watches each.
 mutate("gw-reach-success-kept", "a canary the server answered withdraws nothing, so a widened reach stays served", DRIFT,
        "                self.withdraw(state, server, found);\n",
        "                let _ = (state, found);\n")
@@ -4708,13 +4723,31 @@ mutate("gw-reach-never-runs", "no reach check is ever made, so a widened reach i
        "    let Some((caller, deadline)) = &entry.reach else {\n",
        "    let Some((caller, deadline)) = entry.reach.as_ref().filter(|_| false) else {\n")
 mutate("gw-reach-first-check-delays-first-poll", "the first poll waits for the first reach check, so a check that hangs puts a changed definition past its withdrawal bound", DRIFT,
-       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
-       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
-       "    while first.join_next().await.is_some() {}\n    loop {\n")
+       "    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
+       "    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
+       "    while checking.join_next().await.is_some() {}\n    loop {\n")
+mutate("gw-reach-check-delays-next-poll", "each poll waits for the reach check made at its tick, so a check that hangs holds back the entry's next poll past the drift bound", DRIFT,
+       "            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n        }\n",
+       "            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n        }\n"
+       "        while checking.join_next().await.is_some() {}\n")
+mutate("gw-reach-checks-overlap", "a tick makes a reach check while the entry's last is still out, so checks of one entry pile up", DRIFT,
+       "        if checking.is_empty() {\n", "        if true {\n")
 mutate("gw-reach-answer-cap-no-headroom", "the reach check reads no more than a server's largest answer, so the gateway's answer to a widened canary near that cap is a failed check, not a mismatch", GW + "reach.rs",
-       "MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "MAX_SERVER_RESULT_BYTES;\n")
+       "    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "    MAX_SERVER_RESULT_BYTES;\n")
+mutate("gw-reach-answer-cap-no-expansion", "the reach check reads only the envelope past a server's largest answer, so the gateway's answer to a widened canary of compact numbers near that cap, written out again longer, is a failed check, not a mismatch", GW + "reach.rs",
+       "    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n",
+       "    MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n")
 mutate("gw-reach-stale-judgment-kept", "a mismatch is judged against the approvals in force when the answer comes, so a check begun before a new approval withdraws it", DRIFT,
        "                            && started.get(*name) == Some(&approved.key)\n", "")
+# Decision 0011, section 4, noted on 2026-10-12 (#172): a withdrawal of an entry's reach check
+# tool withdraws the entry's other tools, which stand while it does and clear with it.
+# tests/drift.rs watches each.
+mutate("gw-drift-canary-withdrawal-leaves-entry", "a withdrawn reach check tool leaves its entry's other tools served, though the entry can no longer be checked", DRIFT,
+       "        for (tool, standing) in dependents(&state) {\n",
+       "        for (tool, standing) in dependents(&state).into_iter().take(0) {\n")
+mutate("gw-drift-canary-clear-leaves-dependents", "a new approval of the reach check tool leaves the tools withdrawn with it withdrawn", DRIFT,
+       "                standing.canary.is_none()\n                    && approved\n",
+       "                standing.canary.is_some()\n                    || approved\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
