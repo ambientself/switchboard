@@ -3278,6 +3278,36 @@ fn a_token_the_writer_cannot_get_leaves_the_previous_one_in_place() {
     );
 }
 
+/// #153: each token is written whole to a new file and renamed over the old one, never written
+/// into the file the gateway may be reading. A hard link to the old file still holds the
+/// previous token after a write that succeeded; a write in place would change it too.
+#[test]
+fn the_token_writer_replaces_each_file_rather_than_writing_into_it() {
+    let dir = token_writer_dir("token-writer-renames");
+    let mut before = Vec::new();
+    for account in ["docs-team-a", "docs-team-b"] {
+        let old = write(&dir.join("tokens"), account, "previous-token\n");
+        let link = dir.join(format!("{account}.old"));
+        std::fs::hard_link(&old, &link).unwrap();
+        before.push((account, link));
+    }
+    let run = token_writer(&dir, "ok", &[]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    for (account, link) in before {
+        assert_eq!(
+            token_file(&dir, account),
+            Some(format!("{}\n", issued(account))),
+            "{}",
+            run.transcript()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            "previous-token\n",
+            "{account}'s token was written into the file in place"
+        );
+    }
+}
+
 #[test]
 fn the_token_writer_refuses_a_bad_configuration_before_asking() {
     for (name, value) in [
@@ -3366,6 +3396,319 @@ fn the_gateways_token_grant_must_name_only_the_entries_the_probe_and_the_registr
         "{}",
         run.transcript()
     );
+}
+
+/// #153: the kind run asks the API server for the gateway's token grant, in a step of its own.
+#[test]
+fn the_kind_run_checks_the_gateways_token_grant() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "the gateway's token grant (gateway-tokens.yaml)",
+    );
+    assert!(step.contains("\n  token_grants\n"), "{step}");
+    assert_eq!(driver.matches("\n  token_grants\n").count(), 1);
+}
+
+/// The kind run's step that asks the API server, with no token, for the issuer's keys and for
+/// a ConfigMap, run with a fake `k` that answers the issuer-discovery ClusterRole with `role`,
+/// the keys URL with `keys` and the ConfigMap with the HTTP status `configmap`. The cluster's
+/// keys, as the run fetched them before, have the key IDs `a` and `b`.
+fn anonymous_keys_step(name: &str, role: &Value, keys: &Value, configmap: &str) -> Run {
+    require(&["jq"]);
+    let dir = scratch(name);
+    write(
+        &dir,
+        "cluster-jwks.json",
+        &json!({"keys": [{"kid": "b"}, {"kid": "a"}]}).to_string(),
+    );
+    write(&dir, "role.json", &role.to_string());
+    write(&dir, "keys.json", &keys.to_string());
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "the API server gives its issuer's keys, and nothing else, to a caller with no token",
+    );
+    let dir = dir.display();
+    sourced(&format!(
+        "DEMO_DIR='{dir}'\nGATEWAY_POD=gateway-1\n\
+         k() {{ case \"$*\" in\n\
+           'get clusterrole system:service-account-issuer-discovery -o json') cat '{dir}/role.json' ;;\n\
+           '-n switchboard exec pod/gateway-1 -c gateway -- curl -sS --fail --cacert /etc/switchboard/cluster-ca/ca.crt https://kubernetes.default.svc.cluster.local/openid/v1/jwks') cat '{dir}/keys.json' ;;\n\
+           '-n switchboard exec pod/gateway-1 -c gateway -- curl -sS -o /dev/null -w %{{http_code}} --cacert /etc/switchboard/cluster-ca/ca.crt https://kubernetes.default.svc.cluster.local/api/v1/namespaces/switchboard/configmaps/registry') printf %s '{configmap}' ;;\n\
+           *) echo \"unexpected: k $*\" >&2; return 1 ;;\n\
+         esac; }}\n{step}\nFINISHED=1\nresult 0"
+    ))
+}
+
+/// The issuer-discovery ClusterRole as the API server serves it.
+fn discovery_role(rules: Value) -> Value {
+    json!({"kind": "ClusterRole", "metadata": {"name": "system:service-account-issuer-discovery"}, "rules": rules})
+}
+
+fn discovery_rule() -> Value {
+    json!({"verbs": ["get"], "nonResourceURLs": [
+        "/.well-known/openid-configuration", "/.well-known/openid-configuration/",
+        "/openid/v1/jwks", "/openid/v1/jwks/"
+    ]})
+}
+
+/// #153: the kind run's step "the API server gives its issuer's keys, and nothing else, to a
+/// caller with no token" holds its three checks: the discovery ClusterRole's exact rules, the
+/// keys an unauthenticated read gets against the cluster's key IDs, and a ConfigMap read with
+/// no token answered 403. Each fails when what it checks is not so.
+#[test]
+fn the_kind_run_checks_an_anonymous_caller_gets_the_keys_and_nothing_else() {
+    let keys = json!({"keys": [{"kid": "a"}, {"kid": "b"}]});
+    let role = discovery_role(json!([discovery_rule()]));
+    let names = [
+        "the issuer-discovery ClusterRole grants only get on the issuer's discovery document and keys",
+        "an unauthenticated read of https://kubernetes.default.svc.cluster.local/openid/v1/jwks gets the cluster's keys",
+        "an unauthenticated read of a ConfigMap is refused",
+    ];
+    let run = anonymous_keys_step("anonymous-keys", &role, &keys, "403");
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.lines("PASS "),
+        names.map(|name| format!("PASS {name}")),
+        "{}",
+        run.transcript()
+    );
+
+    let mut wider = discovery_rule();
+    wider["verbs"] = json!(["get", "list"]);
+    let mut more_urls = discovery_rule();
+    more_urls["nonResourceURLs"][0] = json!("/*");
+    let configmaps = json!({"verbs": ["get"], "apiGroups": [""], "resources": ["configmaps"]});
+    for (case, role, keys, configmap, failed) in [
+        (
+            "verbs",
+            discovery_role(json!([wider])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "urls",
+            discovery_role(json!([more_urls])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "extra rule",
+            discovery_role(json!([discovery_rule(), configmaps])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "other keys",
+            role.clone(),
+            json!({"keys": [{"kid": "a"}, {"kid": "c"}]}),
+            "403",
+            1,
+        ),
+        (
+            "one key",
+            role.clone(),
+            json!({"keys": [{"kid": "a"}]}),
+            "403",
+            1,
+        ),
+        ("configmap read", role.clone(), keys.clone(), "200", 2),
+        (
+            "configmap unauthorized",
+            role.clone(),
+            keys.clone(),
+            "401",
+            2,
+        ),
+    ] {
+        let run = anonymous_keys_step(&format!("anonymous-keys-{case}"), &role, &keys, configmap);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        let fails = run.lines("FAIL ");
+        assert_eq!(fails.len(), 1, "{case}: {}", run.transcript());
+        assert!(
+            fails[0].starts_with(&format!("FAIL {} (got ", names[failed])),
+            "{case}: {}",
+            run.transcript()
+        );
+        assert_eq!(run.lines("PASS ").len(), 2, "{case}: {}", run.transcript());
+    }
+
+    // The step runs once the gateway's pod is known, from that pod's gateway container.
+    let driver = common::read("deploy/demo/demo.sh");
+    let kind = function_body(&driver, "kind_run");
+    let boot = kind.find("\n  step \"the gateway's boot lines").unwrap();
+    let anonymous = kind
+        .find("\n  step \"the API server gives its issuer's keys, and nothing else")
+        .unwrap();
+    assert!(boot < anonymous);
+}
+
+/// The kind run's metrics-port step, `metrics_port_probes`, run with a fake `k`: the gateway
+/// pod's address is 10.244.0.9, the idle pods are pod-team-a and pod-team-b, and curl in a team
+/// pod answers 9090 with `metrics` and 8080 with `mcp`, each `OUT STATUS`: what curl printed and
+/// its exit status (`- 1` for a kubectl that could not run it). Returns the run and every `k`
+/// call, with the other calls the step makes.
+fn metrics_port_step(name: &str, metrics: &str, mcp: &str) -> (Run, String) {
+    require(&["jq"]);
+    let dir = scratch(name);
+    let calls = dir.join("calls");
+    let answer = |reply: &str| {
+        let (out, status) = reply.split_once(' ').unwrap();
+        let out = if out == "-" { "" } else { out };
+        format!("printf %s '{}'; return {status}", out.replace('_', " "))
+    };
+    let run = sourced(&format!(
+        "GATEWAY_POD=gateway-1\n\
+         start_idle() {{ JOB=idle-$1; echo \"start_idle $1\" >>'{calls}'; }}\n\
+         stop_idle() {{ echo \"stop_idle $*\" >>'{calls}'; }}\n\
+         sleep() {{ echo \"sleep $*\" >>'{calls}'; }}\n\
+         k() {{ echo \"k $*\" >>'{calls}'; case \"$*\" in\n\
+           '-n switchboard get pod/gateway-1 -o jsonpath={{.status.podIP}}') echo 10.244.0.9 ;;\n\
+           '-n team-a get pods -l job-name=idle-team-a -o jsonpath={{.items[0].metadata.name}}') echo pod-team-a ;;\n\
+           '-n team-b get pods -l job-name=idle-team-b -o jsonpath={{.items[0].metadata.name}}') echo pod-team-b ;;\n\
+           *' exec pod/pod-team-'?' -c workload -- curl -q -sS -o /dev/null --connect-timeout 3 -m 5 -w %{{http_code}} %{{num_connects}} http://10.244.0.9:9090/metrics') {} ;;\n\
+           *' exec pod/pod-team-'?' -c workload -- curl -q -sS -o /dev/null --connect-timeout 3 -m 5 -w %{{http_code}} %{{num_connects}} http://10.244.0.9:8080/readyz') {} ;;\n\
+           *) echo \"unexpected: k $*\" >&2; return 1 ;;\n\
+         esac; }}\nmetrics_port_probes\nFINISHED=1\nresult 0",
+        answer(metrics),
+        answer(mcp),
+        calls = calls.display(),
+    ));
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    (run, calls)
+}
+
+/// #140: after the policy, the kind run tries the gateway pod's metrics port, 9090, from a new
+/// pod of each team and requires it refused, and its MCP port, 8080, at the same address,
+/// answered. A metrics port that answers, an MCP port that does not, or a try that could not
+/// run fails, for each team.
+#[test]
+fn the_kind_run_tries_the_metrics_port_from_each_teams_pod() {
+    for (metrics, exit) in [("000_0 28", 28), ("000_0 7", 7)] {
+        let (run, calls) = metrics_port_step(&format!("metrics-port-{exit}"), metrics, "200_1 0");
+        assert_eq!(run.status, Some(0), "{}", run.transcript());
+        let mut want = Vec::new();
+        for team in ["team-a", "team-b"] {
+            want.push(format!(
+                "PASS {team}'s pod is refused on the gateway's metrics port, 9090 (curl exit {exit})"
+            ));
+            want.push(format!(
+                "PASS {team}'s pod is answered on the gateway's MCP port, 8080, at the same address"
+            ));
+        }
+        assert_eq!(run.lines("PASS "), want, "{}", run.transcript());
+        // A new idle pod of each team, 10 s, then both ports from each, then the pods go.
+        let order: Vec<&str> = calls
+            .lines()
+            .filter(|line| !line.contains(" get "))
+            .map(|line| {
+                line.split(" -- curl ")
+                    .next()
+                    .unwrap()
+                    .trim_end_matches(" -c workload")
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "start_idle team-a",
+                "start_idle team-b",
+                "sleep 10",
+                "k -n team-a exec pod/pod-team-a",
+                "k -n team-a exec pod/pod-team-a",
+                "k -n team-b exec pod/pod-team-b",
+                "k -n team-b exec pod/pod-team-b",
+                "stop_idle team-a idle-team-a",
+                "stop_idle team-b idle-team-b",
+            ],
+            "{calls}"
+        );
+        let execs: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.contains(" exec "))
+            .collect();
+        assert!(
+            execs[0].ends_with(" http://10.244.0.9:9090/metrics"),
+            "{calls}"
+        );
+        assert!(
+            execs[1].ends_with(" http://10.244.0.9:8080/readyz"),
+            "{calls}"
+        );
+    }
+
+    for (case, metrics, mcp, failed) in [
+        // The policy admitted the metrics port, or something answered it.
+        (
+            "metrics answered",
+            "200_1 0",
+            "200_1 0",
+            "metrics port, 9090 (got '200 1 0'",
+        ),
+        (
+            "metrics refused late",
+            "000_1 7",
+            "200_1 0",
+            "metrics port, 9090 (got '000 1 7'",
+        ),
+        (
+            "metrics not run",
+            "- 1",
+            "200_1 0",
+            "metrics port, 9090 (got '1'",
+        ),
+        // The MCP port dropped too: the pod reaches nothing, which shows nothing of the policy.
+        (
+            "mcp dropped",
+            "000_0 28",
+            "000_0 28",
+            "MCP port, 8080, at the same address (got '000 0 28'",
+        ),
+        (
+            "mcp not ready",
+            "000_0 28",
+            "503_1 0",
+            "MCP port, 8080, at the same address (got '503 1 0'",
+        ),
+    ] {
+        let (run, _) = metrics_port_step(
+            &format!("metrics-port-{}", case.replace(' ', "-")),
+            metrics,
+            mcp,
+        );
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        let fails = run.lines("FAIL ");
+        assert_eq!(fails.len(), 2, "{case}: {}", run.transcript());
+        for (fail, team) in fails.iter().zip(["team-a", "team-b"]) {
+            assert!(
+                fail.starts_with(&format!("FAIL {team}'s pod is ")) && fail.contains(failed),
+                "{case}: {}",
+                run.transcript()
+            );
+        }
+    }
+
+    // The kind run takes the step after the policy and the route checks that follow it.
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "after the policy: from a new idle pod of each team, 10 s after it started, the gateway pod's metrics port (9090) is refused",
+    );
+    assert!(step.contains("\n  metrics_port_probes\n"), "{step}");
+    let kind = function_body(&driver, "kind_run");
+    let policy = kind
+        .find("\n  k apply -k \"$ROOT/deploy/kind/policy\"\n")
+        .unwrap();
+    let probes = kind.find("\n  metrics_port_probes\n").unwrap();
+    assert!(policy < probes);
+    assert_eq!(driver.matches("\n  metrics_port_probes\n").count(), 1);
 }
 
 /// A gateway log line as the gateway writes it: tracing's JSON, its fields under `fields`.

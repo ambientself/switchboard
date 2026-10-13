@@ -9,7 +9,8 @@
 #                     rows
 #   demo.sh kind      the same in the kind cluster switchboard-demo, with projected
 #                     ServiceAccount tokens, network policy, the operator's permission checks,
-#                     and the route check (deploy/route-check) before and after the policy, and
+#                     and the route check (deploy/route-check) before and after the policy, a
+#                     try of the gateway's metrics port from each team's pod after it, and
 #                     with no database outage or withdrawn registry file
 #   demo.sh down compose   stop Compose and delete its volumes; the cluster is left alone
 #   demo.sh down kind      delete the kind cluster switchboard-demo; Compose is left alone
@@ -2075,6 +2076,61 @@ route_checks_after_policy() {
   done
 }
 
+# team_curl NAMESPACE POD URL: one GET of URL from the workload container of POD, bounded: 3 s
+# to connect and 5 s in all. Prints curl's HTTP status, its count of connections made and its
+# exit status, as `000 0 28`; if kubectl could not run curl, only kubectl's exit status.
+team_curl() {
+  local out status=0
+  out=$(k -n "$1" exec "pod/$2" -c workload -- \
+    curl -q -sS -o /dev/null --connect-timeout 3 -m 5 -w '%{http_code} %{num_connects}' "$3") || status=$?
+  echo "${out:+$out }$status"
+}
+
+# metrics_port_probes: after the policy, a new idle pod of each team tries the gateway pod's
+# metrics port, 9090, which the network policy admits nobody to (deploy/kind/policy), and its
+# MCP port, 8080, at the same address. The Service does not carry 9090, so both go to the pod's
+# own address. The metrics port must be refused: no connection made and no HTTP status, curl
+# timing out on the connection the policy drops (exit 28) or refused (exit 7). The MCP port
+# must answer /readyz with 200 from the same pod, so the refusal is the policy's on that port,
+# not a gateway the pod cannot reach at all. The pods get 10 s first, since a new pod is
+# briefly outside its policy.
+metrics_port_probes() {
+  local address team jobs=() i=0 pod got
+  if ! fetch "the gateway pod's address (pod $GATEWAY_POD)" \
+    k -n switchboard get "pod/$GATEWAY_POD" -o jsonpath='{.status.podIP}'; then
+    return 0
+  fi
+  address=$FETCHED
+  if [ -z "$address" ]; then
+    fail "the gateway pod $GATEWAY_POD has an address"
+    return 0
+  fi
+  for team in team-a team-b; do
+    start_idle "$team"
+    jobs+=("$JOB")
+  done
+  sleep 10
+  for team in team-a team-b; do
+    if fetch "the idle pod of job $team/${jobs[$i]}" \
+      k -n "$team" get pods -l "job-name=${jobs[$i]}" -o jsonpath='{.items[0].metadata.name}'; then
+      pod=$FETCHED
+      got=$(team_curl "$team" "$pod" "http://$address:9090/metrics")
+      case "$got" in
+        '000 0 7' | '000 0 28') pass "$team's pod is refused on the gateway's metrics port, 9090 (curl exit ${got##* })" ;;
+        *) fail "$team's pod is refused on the gateway's metrics port, 9090 (got '$got', want '000 0 28' or '000 0 7')" ;;
+      esac
+      got=$(team_curl "$team" "$pod" "http://$address:8080/readyz")
+      check "$got" "200 1 0" "$team's pod is answered on the gateway's MCP port, 8080, at the same address"
+    fi
+    i=$((i + 1))
+  done
+  i=0
+  for team in team-a team-b; do
+    stop_idle "$team" "${jobs[$i]}"
+    i=$((i + 1))
+  done
+}
+
 # check_route_report TEAM REPORT: the route check's report names the network plugin it read
 # enforcement from, kindnet, and the kind release whose kindnetd that is.
 check_route_report() {
@@ -2275,6 +2331,9 @@ kind_run() {
 
   step "after the policy: the route check, as the route-check operator, from a new idle pod of each team, 10 s after it started; every route to mock-docs is refused, by name and by address"
   route_checks_after_policy
+
+  step "after the policy: from a new idle pod of each team, 10 s after it started, the gateway pod's metrics port (9090) is refused and its MCP port (8080) answers"
+  metrics_port_probes
 
   step "the gateway's token grant (gateway-tokens.yaml): it may create tokens for docs-team-a, docs-team-b, registry-probe and registry, and for no other ServiceAccount"
   token_grants

@@ -2762,6 +2762,7 @@ fn rows_the_probe_would_fail_for_their_host_fail_before_it_starts() {
 fn the_step_reads_the_probes_own_lines() {
     let gateway = Recorder::start(401);
     let hole = dropped();
+    let hole = &hole.url;
     let port = hole.rsplit(':').next().unwrap().trim_end_matches("/mcp");
     let routes = format!(
         "# the probe's own run\n\

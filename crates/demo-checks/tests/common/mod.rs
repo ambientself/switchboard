@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -245,19 +245,50 @@ pub fn port_of(url: &str) -> &str {
 }
 
 /// A URL that the fake `curl` drops: a port nothing listens on, so a request the fake does not
-/// drop is refused (exit 7) by the real curl, and the test sees it.
-pub fn dropped() -> String {
+/// drop is refused (exit 7) by the real curl, and the test sees it. Held as `closed_port()`
+/// holds its port.
+pub fn dropped() -> ClosedPort {
     closed_port()
 }
 
-/// A port nothing listens on: curl's connection is refused (exit 7).
-pub fn closed_port() -> String {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
+/// A loopback port that refuses connections, held for as long as this lives, and its URL
+/// `http://127.0.0.1:PORT/mcp`. Keep it for the whole test: once it is dropped, nothing holds
+/// the port for this test, and another test in the same binary may listen on it. (The closed
+/// connection may leave the port in TIME_WAIT for a while, but nothing relies on that.)
+#[must_use = "the port is held only while this lives"]
+pub struct ClosedPort {
+    pub url: String,
+    _held: socket2::Socket,
+    _peer: TcpStream,
+}
+
+/// A port nothing listens on: curl's connection is refused (exit 7). A port that was only read
+/// and released could be taken meanwhile by another test's server, which would then answer
+/// this test's requests (#168). So a socket holds it: bound to it without SO_REUSEADDR, and
+/// connected to a peer of its own. A connection to a port with no listener is refused, on
+/// Linux and macOS alike; a socket bound and never listening would do on Linux, but macOS
+/// drops a connection to one, and curl times out (exit 28). While it lives, Linux lets no other
+/// socket bind the port. macOS still lets one that sets SO_REUSEADDR bind it by number, but it
+/// hands out the ports for port 0, which the tests' servers bind, in order, and skips this one.
+pub fn closed_port() -> ClosedPort {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+    let any: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    held.bind(&any.into()).unwrap();
+    held.connect(&peer.local_addr().unwrap().into()).unwrap();
+    let (accepted, _) = peer.accept().unwrap();
+    let port = held
         .local_addr()
         .unwrap()
+        .as_socket()
+        .expect("an IPv4 address")
         .port();
-    format!("http://127.0.0.1:{port}/mcp")
+    ClosedPort {
+        url: format!("http://127.0.0.1:{port}/mcp"),
+        _held: held,
+        _peer: accepted,
+    }
 }
 
 /// What a script printed and how it ended.
