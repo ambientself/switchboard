@@ -114,11 +114,15 @@
 //! reach check tool's does, whatever its own approval, and is dropped with it, or when the tool
 //! is removed. So a new approval of the reach check tool, or of the whole entry, clears the
 //! entry's tools; one of another tool alone does not. A tool withdrawn for a cause of its own
-//! keeps its own key either way. A reload that approves a new tool on an entry whose reach
-//! check tool is withdrawn withdraws it at once, and logs it. Withdrawals live in this
-//! replica's memory until then, or until it restarts (section 7): a restarted replica withdraws
-//! a tool again only if its server still serves the changed definition. Each replica checks for
-//! itself; nothing is passed between them.
+//! keeps its own key either way. Each poll and each reach check still judge a tool withdrawn
+//! with its reach check tool, as they judge a served one: one whose definition changes, that
+//! the server no longer lists, or whose entry's reach is found wider, is withdrawn for that
+//! cause of its own instead, so a new approval of the reach check tool does not serve it, and
+//! a changed definition is withdrawn within the bound above. A reload that approves a new tool
+//! on an entry whose reach check tool is withdrawn withdraws it at once, and logs it.
+//! Withdrawals live in this replica's memory until then, or until it restarts (section 7): a
+//! restarted replica withdraws a tool again only if its server still serves the changed
+//! definition. Each replica checks for itself; nothing is passed between them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -495,6 +499,18 @@ struct State {
     reach_checks: BTreeMap<ConnectorName, ReachCheck>,
 }
 
+impl State {
+    /// Whether `tool` is withdrawn for a cause of its own. A tool withdrawn only with its
+    /// entry's reach check tool is still judged, by each poll and each reach check: a cause of
+    /// its own found then withdraws it for that cause, so a new approval of the reach check
+    /// tool alone does not serve it.
+    fn withdrawn_on_its_own(&self, tool: &ToolName) -> bool {
+        self.standing
+            .get(tool)
+            .is_some_and(|standing| standing.canary.is_none())
+    }
+}
+
 /// Each reach check `registry` gives, by server.
 fn reach_checks(registry: &Registry) -> BTreeMap<ConnectorName, ReachCheck> {
     registry
@@ -525,14 +541,9 @@ struct Standing {
 /// for a cause of its own, other than that tool and those withdrawn for a cause of their own.
 /// The entry can no longer be checked, so nothing is served under its credential. They follow
 /// the reach check tool's withdrawal: they stand while it does, whatever their own approvals,
-/// and go when it goes.
+/// and go when it goes, unless a poll or a reach check has found a cause of their own since.
 fn dependents(state: &State) -> BTreeMap<ToolName, Standing> {
-    let own = |tool: &ToolName| {
-        state
-            .standing
-            .get(tool)
-            .is_some_and(|standing| standing.canary.is_none())
-    };
+    let own = |tool: &ToolName| state.withdrawn_on_its_own(tool);
     let mut dependents = BTreeMap::new();
     for (server, check) in &state.reach_checks {
         if !own(&check.tool) {
@@ -723,8 +734,10 @@ impl Withdrawals {
     }
 
     /// Judges what `server`'s poll read against the tools approved on it now, and withdraws
-    /// each that changed or is gone. A tool whose key is not the one in `started`, the keys
-    /// when the poll began, is left for the next poll. A failed poll withdraws nothing.
+    /// each that changed or is gone, for that cause, one withdrawn only with its entry's reach
+    /// check tool included ([`State::withdrawn_on_its_own`]). A tool whose key is not the one
+    /// in `started`, the keys when the poll began, is left for the next poll. A failed poll
+    /// withdraws nothing.
     fn judge(
         &self,
         server: &ConnectorName,
@@ -751,7 +764,7 @@ impl Withdrawals {
         let state = self.state();
         let mut found = Vec::new();
         for (tool, approved) in &state.approved {
-            if approved.server != *server || state.standing.contains_key(tool) {
+            if approved.server != *server || state.withdrawn_on_its_own(tool) {
                 continue;
             }
             // Approved again, or newly, while the poll was outstanding: what it read may be
@@ -777,7 +790,8 @@ impl Withdrawals {
         self.withdraw(state, server, found);
     }
 
-    /// Withdraws each tool of `found`, all `server`'s, under `state`, and with an entry's reach
+    /// Withdraws each tool of `found`, all `server`'s, under `state`, for a cause of its own,
+    /// in place of any withdrawal with its entry's reach check tool, and with an entry's reach
     /// check tool the entry's other tools ([`dependents`]), and logs and counts each.
     fn withdraw(
         &self,
@@ -848,8 +862,8 @@ impl Withdrawals {
 
     /// Judges what `server`'s reach check came to (see the [module documentation](self)). A
     /// mismatch withdraws every tool approved on the server whose key is the one in `started`,
-    /// the keys when the check began; one approved again since is left for the next check.
-    /// Only a mismatch withdraws anything.
+    /// the keys when the check began, and that is not withdrawn for a cause of its own already;
+    /// one approved again since is left for the next check. Only a mismatch withdraws anything.
     fn judge_reach(
         &self,
         server: &ConnectorName,
@@ -888,7 +902,7 @@ impl Withdrawals {
                     .iter()
                     .filter(|(name, approved)| {
                         approved.server == *server
-                            && !state.standing.contains_key(*name)
+                            && !state.withdrawn_on_its_own(name)
                             && started.get(*name) == Some(&approved.key)
                     })
                     .map(|(_, approved)| (approved.key.clone(), Cause::ReachMismatch))

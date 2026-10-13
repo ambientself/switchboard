@@ -1572,17 +1572,21 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   be checked: each is logged as `tool_withdrawn` with the cause `reach check tool withdrawn` and
   `reach_check_tool` naming that tool (decision 0011, section 4, noted on 2026-10-12). They
   stand while that tool's withdrawal does, whatever their own approvals, and a new approval of
-  that tool or of the whole entry clears them. The check reads up to 8 times the largest
-  `max_result_bytes` a server may have, 1 MiB, plus 64 KiB for the gateway's envelope and
-  `_meta`: the gateway writes the server's result out again, and a number such as `1e9` comes
-  out as `1000000000.0`, but no part of the JSON grows by more than 8 times (#175). So a widened
-  canary answered near its server's cap is a mismatch, whatever numbers it holds. Each is
-  counted in `switchboard_reach_checks_total{server,result}`. `tests/reach.rs` has the held,
-  mismatch, failed and denied cases on the mock server, a mismatch at the largest cap, and of
-  compact numbers there, a check outstanding across a new approval, which withdraws nothing, a
-  check that hangs, which holds back no poll, and the start refused without the fields.
+  that tool or of the whole entry clears them. Each poll and reach check still judge them, and
+  one whose own definition changes, that is no longer listed, or whose entry's reach is found
+  wider, is withdrawn for that cause instead, so a new approval of the reach check tool alone
+  does not serve it. The check reads up to 8 times the largest `max_result_bytes` a server may
+  have, 1 MiB, plus 64 KiB for the gateway's envelope and `_meta`: the gateway writes the
+  server's result out again, and a number such as `1e9` comes out as `1000000000.0`, but no
+  part of the JSON grows by more than 8 times (#175). So a widened canary answered near its
+  server's cap is a mismatch, whatever numbers it holds. Each is counted in
+  `switchboard_reach_checks_total{server,result}`. `tests/reach.rs` has the held, mismatch,
+  failed and denied cases on the mock server, a mismatch at the largest cap, and of compact
+  numbers there, a check outstanding across a new approval, which withdraws nothing, a check
+  that hangs, which holds back no poll, and the start refused without the fields.
   `tests/drift.rs` has an entry withdrawn with its reach check tool, each new approval that
-  clears it or does not, and the start refused with an interval shorter than a call deadline.
+  clears it or does not, a tool withdrawn with it whose own definition then changes, and the
+  start refused with an interval shorter than a call deadline.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.

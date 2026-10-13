@@ -4740,14 +4740,18 @@ mutate("gw-reach-answer-cap-no-expansion", "the reach check reads only the envel
 mutate("gw-reach-stale-judgment-kept", "a mismatch is judged against the approvals in force when the answer comes, so a check begun before a new approval withdraws it", DRIFT,
        "                            && started.get(*name) == Some(&approved.key)\n", "")
 # Decision 0011, section 4, noted on 2026-10-12 (#172): a withdrawal of an entry's reach check
-# tool withdraws the entry's other tools, which stand while it does and clear with it.
-# tests/drift.rs watches each.
+# tool withdraws the entry's other tools, which stand while it does and clear with it. Each poll
+# still judges them, and one whose own definition changes is withdrawn for that cause, so the
+# reach check tool's new approval does not serve it. tests/drift.rs watches each.
 mutate("gw-drift-canary-withdrawal-leaves-entry", "a withdrawn reach check tool leaves its entry's other tools served, though the entry can no longer be checked", DRIFT,
        "        for (tool, standing) in dependents(&state) {\n",
        "        for (tool, standing) in dependents(&state).into_iter().take(0) {\n")
 mutate("gw-drift-canary-clear-leaves-dependents", "a new approval of the reach check tool leaves the tools withdrawn with it withdrawn", DRIFT,
        "                standing.canary.is_none()\n                    && approved\n",
        "                standing.canary.is_some()\n                    || approved\n")
+mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's reach check tool is never judged, so its changed definition is served once the reach check tool alone is approved again", DRIFT,
+       "            .is_some_and(|standing| standing.canary.is_none())\n",
+       "            .is_some()\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------

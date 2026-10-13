@@ -1325,3 +1325,88 @@ async fn a_withdrawal_with_the_reach_check_tool_clears_with_it() {
         [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
     );
 }
+
+/// A tool withdrawn with its entry's reach check tool is still judged at each poll.
+/// docs-team-a's reach check tool changes, and its read tool is withdrawn with it; then the read
+/// tool's own definition changes. The next poll withdraws it for that cause of its own, so a new
+/// approval of the reach check tool alone serves only that tool, and the read tool stays
+/// withdrawn until it is approved again itself.
+#[tokio::test]
+async fn a_tool_withdrawn_with_the_reach_check_tool_is_still_judged() {
+    use mock_docs_server::ToolName as Mock;
+    let (captured, _logging) = Captured::start();
+    let team_a = mock().await;
+    let team_b = mock().await;
+    let files = Files::new(
+        "drift-canary-judged",
+        &issuer().jwks_document(),
+        &team_a.url(),
+    );
+    let replica = Replica::split(&files, &team_a.url(), &team_b.url());
+    let both = BTreeSet::from([LIST_TOOL.to_owned(), READ_TOOL.to_owned()]);
+
+    team_a
+        .server()
+        .set_description(Mock::ListDocuments, Some(CHANGED_LIST.to_owned()));
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+
+    // The read tool's own definition changes while it is withdrawn with the reach check tool.
+    team_a
+        .server()
+        .set_description(Mock::ReadDocument, Some(CHANGED.to_owned()));
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+    let withdrawn = captured.events("tool_withdrawn");
+    assert_eq!(withdrawn.len(), 3, "{withdrawn:?}");
+    let (level, fields) = &withdrawn[2];
+    assert_eq!(level, "ERROR");
+    assert_eq!(fields["tool"], READ_TOOL);
+    assert_eq!(fields["cause"], "definition changed");
+    assert_eq!(fields["reach_check_tool"], Value::Null);
+    assert_eq!(
+        fields["revision"],
+        format!("{KIND_REVISION}+withdrawn:{TEAM_A_TOOLS}").as_str()
+    );
+
+    // The reach check tool approved again alone: the read tool stays withdrawn for its own
+    // cause, and is not served.
+    let text = approval(
+        &files::registry(&team_a.url()),
+        LIST_TOOL,
+        CHANGED_LIST,
+        "2026-10-12T09:00:00Z",
+    );
+    assert_eq!(
+        replica.reload(&at_revision(&text, "demo-12")),
+        format!("demo-12+withdrawn:{READ_TOOL}")
+    );
+    assert_eq!(replica.withdrawn(), BTreeSet::from([READ_TOOL.to_owned()]));
+    assert_eq!(replica.listed().await, [LIST_TOOL]);
+    let (answer, revision) = replica.read().await;
+    assert_eq!(answer["error"]["code"], json!(DENIAL_CODE), "{answer}");
+    assert_eq!(revision, format!("demo-12+withdrawn:{READ_TOOL}"));
+    let cleared: Vec<String> = captured
+        .events("policy_withdrawal_cleared")
+        .into_iter()
+        .map(|(_, fields)| fields["tool"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(cleared, [LIST_TOOL]);
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), BTreeSet::from([READ_TOOL.to_owned()]));
+    assert_eq!(captured.events("tool_withdrawn").len(), 3);
+
+    // A new approval of the read tool, as served now, serves it, and it stays served.
+    let text = approval(&text, READ_TOOL, CHANGED, "2026-10-12T09:10:00Z");
+    assert_eq!(replica.reload(&at_revision(&text, "demo-13")), "demo-13");
+    assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
+    replica.drift.pass().await;
+    assert!(replica.withdrawn().is_empty());
+    let (answer, revision) = replica.read().await;
+    assert!(answer.get("result").is_some(), "{answer}");
+    assert_eq!(revision, "demo-13");
+    assert_eq!(
+        replica.listed_by_team_b().await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
+}
