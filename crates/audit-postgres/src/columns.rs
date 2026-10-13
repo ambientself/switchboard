@@ -1502,8 +1502,6 @@ mod tests {
         }
     }
 
-    /// Each value counts as the store sends it: text as its UTF-8, a text array as its
-    /// elements', JSON as its JSON text, and each integer as 8 bytes.
     /// The testkit's in-memory store holds this store's row bound with copies of its constants
     /// and of its count, since the testkit cannot depend on this crate. They must agree: each
     /// constant, and each column's bytes, for call rows of each principal kind, each kind of
@@ -1567,6 +1565,8 @@ mod tests {
         }
     }
 
+    /// Each value counts as the store sends it: text as its UTF-8, a text array as its
+    /// elements', JSON as its JSON text, and each integer as 8 bytes.
     #[test]
     fn each_value_counts_its_bytes_as_the_store_sends_it() {
         let row = BeginRow::from_record(&id(), &denied_user_with_delegation(), &budgets()).unwrap();

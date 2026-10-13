@@ -6,10 +6,10 @@
 //!
 //! - [`InMemoryAuditStore`] keeps rows in order under the identifier begin was given, sets
 //!   each row's deadline from its own clock as the Postgres store does, and refuses the
-//!   records that store cannot hold, a row over its bound ([`row_bound`]) among them. It can fail or hold `begin` and `finish`, lose a begin's
-//!   confirmation after writing, answer a finish past the answer budget and write it later,
-//!   and forget finishes as a lost process would. [`row_start`] makes a fresh identifier for a
-//!   test.
+//!   records that store cannot hold, a row over its bound ([`row_bound`]) among them. It can
+//!   fail or hold `begin` and `finish`, lose a begin's confirmation after writing, answer a
+//!   finish past the answer budget and write it later, and forget finishes as a lost process
+//!   would. [`row_start`] makes a fresh identifier for a test.
 //! - [`contract`] is the audit store contract suite: test functions that every store must
 //!   pass, run on [`InMemoryAuditStore`] by this crate's tests and on the Postgres store by
 //!   that crate's.

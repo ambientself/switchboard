@@ -204,8 +204,10 @@ fn refuse_non_uuid(id: &AuditRowId) -> Result<(), StoreError> {
 /// complete, a text value with U+0000, a count or an allowance past a `bigint`, a row over
 /// [`MAX_BEGUN_ROW_BYTES`], unknown resources or a reach with a count left out, a reach naming
 /// no entry, or a call record of kind `list`, which the table's `kind_shape` refuses whatever
-/// row the identifier already names. It checks them in the order that store does, so it
-/// refuses a record for the reason that store gives.
+/// row the identifier already names. It checks the allowance before the row bound, and the
+/// row bound before the table's own constraints, as that store does. Its other checks do not
+/// follow that store's order, so a record that breaks more than one rule may be refused for a
+/// different one of them.
 fn refused_at_begin(
     id: &AuditRowId,
     record: &AuditRecord,
