@@ -3398,6 +3398,157 @@ fn the_gateways_token_grant_must_name_only_the_entries_the_probe_and_the_registr
     );
 }
 
+/// #153: the kind run asks the API server for the gateway's token grant, in a step of its own.
+#[test]
+fn the_kind_run_checks_the_gateways_token_grant() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "the gateway's token grant (gateway-tokens.yaml)",
+    );
+    assert!(step.contains("\n  token_grants\n"), "{step}");
+    assert_eq!(driver.matches("\n  token_grants\n").count(), 1);
+}
+
+/// The kind run's step that asks the API server, with no token, for the issuer's keys and for
+/// a ConfigMap, run with a fake `k` that answers the issuer-discovery ClusterRole with `role`,
+/// the keys URL with `keys` and the ConfigMap with the HTTP status `configmap`. The cluster's
+/// keys, as the run fetched them before, have the key IDs `a` and `b`.
+fn anonymous_keys_step(name: &str, role: &Value, keys: &Value, configmap: &str) -> Run {
+    require(&["jq"]);
+    let dir = scratch(name);
+    write(
+        &dir,
+        "cluster-jwks.json",
+        &json!({"keys": [{"kid": "b"}, {"kid": "a"}]}).to_string(),
+    );
+    write(&dir, "role.json", &role.to_string());
+    write(&dir, "keys.json", &keys.to_string());
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "the API server gives its issuer's keys, and nothing else, to a caller with no token",
+    );
+    let dir = dir.display();
+    sourced(&format!(
+        "DEMO_DIR='{dir}'\nGATEWAY_POD=gateway-1\n\
+         k() {{ case \"$*\" in\n\
+           'get clusterrole system:service-account-issuer-discovery -o json') cat '{dir}/role.json' ;;\n\
+           '-n switchboard exec pod/gateway-1 -c gateway -- curl -sS --fail --cacert /etc/switchboard/cluster-ca/ca.crt https://kubernetes.default.svc.cluster.local/openid/v1/jwks') cat '{dir}/keys.json' ;;\n\
+           '-n switchboard exec pod/gateway-1 -c gateway -- curl -sS -o /dev/null -w %{{http_code}} --cacert /etc/switchboard/cluster-ca/ca.crt https://kubernetes.default.svc.cluster.local/api/v1/namespaces/switchboard/configmaps/registry') printf %s '{configmap}' ;;\n\
+           *) echo \"unexpected: k $*\" >&2; return 1 ;;\n\
+         esac; }}\n{step}\nFINISHED=1\nresult 0"
+    ))
+}
+
+/// The issuer-discovery ClusterRole as the API server serves it.
+fn discovery_role(rules: Value) -> Value {
+    json!({"kind": "ClusterRole", "metadata": {"name": "system:service-account-issuer-discovery"}, "rules": rules})
+}
+
+fn discovery_rule() -> Value {
+    json!({"verbs": ["get"], "nonResourceURLs": [
+        "/.well-known/openid-configuration", "/.well-known/openid-configuration/",
+        "/openid/v1/jwks", "/openid/v1/jwks/"
+    ]})
+}
+
+/// #153: the kind run's step "the API server gives its issuer's keys, and nothing else, to a
+/// caller with no token" holds its three checks: the discovery ClusterRole's exact rules, the
+/// keys an unauthenticated read gets against the cluster's key IDs, and a ConfigMap read with
+/// no token answered 403. Each fails when what it checks is not so.
+#[test]
+fn the_kind_run_checks_an_anonymous_caller_gets_the_keys_and_nothing_else() {
+    let keys = json!({"keys": [{"kid": "a"}, {"kid": "b"}]});
+    let role = discovery_role(json!([discovery_rule()]));
+    let names = [
+        "the issuer-discovery ClusterRole grants only get on the issuer's discovery document and keys",
+        "an unauthenticated read of https://kubernetes.default.svc.cluster.local/openid/v1/jwks gets the cluster's keys",
+        "an unauthenticated read of a ConfigMap is refused",
+    ];
+    let run = anonymous_keys_step("anonymous-keys", &role, &keys, "403");
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.lines("PASS "),
+        names.map(|name| format!("PASS {name}")),
+        "{}",
+        run.transcript()
+    );
+
+    let mut wider = discovery_rule();
+    wider["verbs"] = json!(["get", "list"]);
+    let mut more_urls = discovery_rule();
+    more_urls["nonResourceURLs"][0] = json!("/*");
+    let configmaps = json!({"verbs": ["get"], "apiGroups": [""], "resources": ["configmaps"]});
+    for (case, role, keys, configmap, failed) in [
+        (
+            "verbs",
+            discovery_role(json!([wider])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "urls",
+            discovery_role(json!([more_urls])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "extra rule",
+            discovery_role(json!([discovery_rule(), configmaps])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "other keys",
+            role.clone(),
+            json!({"keys": [{"kid": "a"}, {"kid": "c"}]}),
+            "403",
+            1,
+        ),
+        (
+            "one key",
+            role.clone(),
+            json!({"keys": [{"kid": "a"}]}),
+            "403",
+            1,
+        ),
+        ("configmap read", role.clone(), keys.clone(), "200", 2),
+        (
+            "configmap unauthorized",
+            role.clone(),
+            keys.clone(),
+            "401",
+            2,
+        ),
+    ] {
+        let run = anonymous_keys_step(&format!("anonymous-keys-{case}"), &role, &keys, configmap);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        let fails = run.lines("FAIL ");
+        assert_eq!(fails.len(), 1, "{case}: {}", run.transcript());
+        assert!(
+            fails[0].starts_with(&format!("FAIL {} (got ", names[failed])),
+            "{case}: {}",
+            run.transcript()
+        );
+        assert_eq!(run.lines("PASS ").len(), 2, "{case}: {}", run.transcript());
+    }
+
+    // The step runs once the gateway's pod is known, from that pod's gateway container.
+    let driver = common::read("deploy/demo/demo.sh");
+    let kind = function_body(&driver, "kind_run");
+    let boot = kind.find("\n  step \"the gateway's boot lines").unwrap();
+    let anonymous = kind
+        .find("\n  step \"the API server gives its issuer's keys, and nothing else")
+        .unwrap();
+    assert!(boot < anonymous);
+}
+
 /// A gateway log line as the gateway writes it: tracing's JSON, its fields under `fields`.
 fn boot_line(fields: &Value) -> String {
     json!({"timestamp": "2026-10-11T00:00:00Z", "level": "INFO", "fields": fields, "target": "gateway::start"})
