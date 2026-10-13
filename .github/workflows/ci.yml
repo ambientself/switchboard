@@ -39,6 +39,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      # The token guards also read `kustomize build deploy/kind/base`, which is what demo.sh
+      # applies. The runner image has kustomize and kubectl. With neither, the test says
+      # "skipped" and passes, which here would mean the built base went unchecked, so the step
+      # fails if it says that, or if the test did not run.
+      - name: Test the token guards on the built kind base
+        run: |
+          set -o pipefail
+          cargo test -p demo-checks --test manifests --locked -- --nocapture --exact \
+            the_token_guards_hold_on_the_built_kind_base 2>&1 | tee built-base-output.txt
+          if grep -q 'skipped: neither kustomize nor kubectl is installed' built-base-output.txt; then
+            echo "the built-base test was skipped, so the built kind base went unchecked"
+            exit 1
+          fi
+          if ! grep -q 'test the_token_guards_hold_on_the_built_kind_base ... ok' built-base-output.txt; then
+            echo "the built-base test did not run"
+            exit 1
+          fi
       - name: Docs
         run: cargo doc --workspace --no-deps --locked
         env:
