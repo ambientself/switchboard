@@ -198,10 +198,10 @@ gateway's own work on the call, timed from after its tick. So a widened reach is
 within one interval plus the call deadline and those 5 s when the interval is longer than the
 deadline plus 5 s, as at the defaults. When it is no longer, as in the demos (a 10 s interval
 and a 5 s deadline), a check can still be out at the next tick, which skips, and the reach is
-withdrawn within two intervals plus the deadline and the 5 s (30 s in the demos). At a 5 s
-interval with a 5 s deadline two ticks can skip, and it is within three intervals plus them
-(25 s). In every case it is within one interval plus twice the deadline and the 5 s. The owner
-accepted this on 2026-10-12 (#165).
+withdrawn within two intervals plus the deadline and the 5 s (30 s in the demos), except at a
+5 s interval with a 5 s deadline, where two ticks can skip and it is within three intervals plus
+them (25 s). In every case it is within one interval plus twice the sum of the deadline and the
+5 s. The owner accepted this on 2026-10-12 (#165).
 
 ### 6. Withdrawal in a replica
 

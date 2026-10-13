@@ -85,10 +85,10 @@
 //! allowance, as at the defaults, a widened reach is withdrawn within one interval plus the
 //! deadline and the allowance. With one no longer than that, as in the demos (10 s, with a 5 s
 //! deadline), a check can still be out at the next tick, which skips, and it is withdrawn within
-//! two intervals plus the deadline and the allowance (30 s in the demos). At a 5 s
-//! interval with a 5 s deadline, two ticks can skip, and it is withdrawn within three intervals
-//! plus them (25 s). In every case it is withdrawn within one interval plus twice the deadline
-//! and the allowance. What the answer means is
+//! two intervals plus the deadline and the allowance (30 s in the demos), except at a 5 s
+//! interval with a 5 s deadline, where two ticks can skip and it is withdrawn within three
+//! intervals plus them (25 s). In every case it is withdrawn within one interval plus twice the
+//! sum of the deadline and the allowance. What the answer means is
 //! [`reach::Verdict`](crate::reach::Verdict)'s:
 //!
 //! - **Held**, the server refused the canary: logged as [`REACH_HELD_EVENT`] at INFO and
@@ -1228,7 +1228,8 @@ async fn poll(withdrawals: Arc<Withdrawals>, entry: Entry) {
 /// - At a 5 s interval with a 5 s deadline, the second tick skips too, and it is withdrawn
 ///   within three intervals plus the deadline and the allowance (25 s).
 ///
-/// In every case that is within one interval plus twice the deadline and the allowance.
+/// In every case that is within one interval plus twice the sum of the deadline and the
+/// allowance.
 async fn poll_every(withdrawals: Arc<Withdrawals>, entry: Entry, interval: Duration) {
     let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
