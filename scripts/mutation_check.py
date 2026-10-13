@@ -1604,6 +1604,8 @@ mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate: not 
            (BOOT, RECEIPT_BEFORE_CONNECTING, "    let _ = snapshot;\n    Ok(())\n}\n"))
 mutate("gw-receipt-gate-config-path-skipped", "the JSON configuration's boot does not run the receipt-store gate", BOOT,
        RECEIPT_CONFIG_PATH, "")
+mutate("gw-boot-narrowing-config-path-skipped", "the JSON configuration's boot serves an entry narrowed per call or to the limit", BOOT,
+       "    narrowing_gate(&snapshot)?;\n", "")
 mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
            (BOOT, RECEIPT_REGISTRY_PATH, ""),
            (BOOT, REGISTRY_BOOT_POLICY,
@@ -4496,7 +4498,8 @@ mutate("gw-boot-registry-server-unconnected", "a registry server with no connect
        "        if !basis.connectors.contains(&route.server) {", "        if false {")
 # The narrowing gate (#163): nothing narrows a credential yet, so an entry narrowed per call or
 # to the limit is refused by the gates every registry's policy meets, at boot and on reload,
-# whoever wires the connectors.
+# whoever wires the connectors. The JSON configuration's boot runs it too
+# (gw-boot-narrowing-config-path-skipped, beside the receipt-store gate's).
 mutate("gw-boot-narrowing-accepted", "boot::check_registry and a reload serve an entry narrowed per call or to the limit", BOOT,
        "    narrowing_gate(policy.snapshot())?;\n", "")
 mutate("gw-boot-narrowing-call-accepted", "an entry narrowed per call passes the narrowing gate", BOOT,
