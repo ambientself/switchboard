@@ -640,11 +640,12 @@ async fn wait_for(path: &RequestPath, token: &str, tools: &[&str]) {
     );
 }
 
-/// Decision 0013, section 8: removing an approval withdraws the tool on reload. That holds for
-/// the tool team A's reach check names, and for the entry's last tool, with the entry and its
-/// reach check left as they are.
+/// Decision 0013, section 8: removing an approval withdraws the tool on reload. The tool team
+/// A's reach check names is withdrawn together with the entry's other tools, with the entry and
+/// its reach check left as they are. Removed alone, it is refused at load: the entry's read
+/// tool would be served under a credential whose reach is never checked again.
 #[tokio::test]
-async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() {
+async fn the_reach_check_tool_is_withdrawn_by_reload_with_its_entrys_other_tools() {
     let world = World::new("reload-last").await;
     let prepared = world.prepare().await.unwrap();
     let path = RequestPath::new(prepared.gates);
@@ -658,8 +659,8 @@ async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() 
         "the reach check names the list tool"
     );
 
-    // The list tool, which the reach check names: the approval and the surface entries removed,
-    // its team's surface's and the reach check's surface's.
+    // The list tool alone, which the reach check names: the approval and the surface entries
+    // removed, its team's surface's and the reach check's surface's.
     let without_list = without_tool(&original, LIST_TOOL)
         .replace(
             &format!("revision = \"{KIND_REVISION}\""),
@@ -673,13 +674,16 @@ async fn the_reach_check_tool_and_an_entrys_last_tool_are_withdrawn_by_reload() 
             &format!("tools = [\"{LIST_TOOL}\", \"{TEAM_B_LIST_TOOL}\"]"),
             &format!("tools = [\"{TEAM_B_LIST_TOOL}\"]"),
         );
-    let revision = reloader
-        .apply(&Registry::from_toml_str(&without_list).unwrap())
-        .unwrap();
-    assert_eq!(revision.as_str(), "demo-2");
-    assert_eq!(listed(&path, &team_a).await, [READ_TOOL]);
+    assert!(
+        matches!(
+            Registry::from_toml_str(&without_list),
+            Err(RegistryError::ReachCheckUnapproved { server, tool })
+                if server.as_str() == "docs-team-a" && tool.as_str() == LIST_TOOL
+        ),
+        "the list tool was withdrawn alone"
+    );
 
-    // Then the entry's last tool too, leaving the entry registered with nothing to serve.
+    // With the entry's read tool, its last, leaving the entry registered with nothing to serve.
     let without_both = without_tool(&without_list, READ_TOOL)
         .replace("revision = \"demo-2\"", "revision = \"demo-3-empty\"")
         .replace(&format!("tools = [\"{READ_TOOL}\"]"), "tools = []");

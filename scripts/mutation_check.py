@@ -2957,7 +2957,11 @@ mutate("registry-reach-check-not-required", "a server may have a reach and no re
        "            && server.reach_check.is_none()\n", "            && false\n")
 mutate("registry-reach-check-outside-system", "a reach check may name another server's tool or a malformed one", RR,
        "            && !under_system(&check.tool, &server.system)\n", "            && false\n")
-mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file", RR,
+mutate("registry-reach-check-unapproved-accepted", "a reach check's tool may be withdrawn while the entry's other tools stay", RR,
+       "            && !routes.contains_key(&check.tool)\n", "            && false\n")
+mutate("registry-reach-check-unapproved-any-entry", "another entry's approved tools keep a withdrawn reach check tool from loading", RR,
+       "            && routes.values().any(|route| route.server == server.name)\n", "            && !routes.is_empty()\n")
+mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file even with the entry's other tools withdrawn", RR,
        "    let surfaces = file\n",
        "    if servers.values().any(|server| server.reach_check.as_ref().is_some_and(|check| !routes.contains_key(&check.tool))) {\n"
        "        return Err(RegistryError::ReachCheckMissing(servers.keys().next().unwrap().clone()));\n"
@@ -4865,6 +4869,9 @@ mutate("gw-drift-canary-clear-leaves-dependents", "a new approval of the reach c
 mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's reach check tool is never judged, so its changed definition is served once the reach check tool alone is approved again", DRIFT,
        "            .is_some_and(|standing| standing.canary.is_none())\n",
        "            .is_some()\n")
+mutate("gw-reach-dependent-mismatch-unjudged", "a reach mismatch skips a tool withdrawn with its entry's reach check tool, so a new approval of the reach check tool alone serves it again", DRIFT,
+       "                            && !state.withdrawn_on_its_own(name)\n",
+       "                            && !state.standing.contains_key(*name)\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------

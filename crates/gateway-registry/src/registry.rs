@@ -149,10 +149,11 @@ pub struct ReachCheck {
     /// The tool, by its exposed name, which the loader requires to be `{system}__<tool>` for
     /// the server's own system. No two servers have the same system, and no system contains
     /// `__` or ends in `_`, so a name is under one system at most: the check cannot name
-    /// another server's tool or a malformed one. The loader does not require the tool to be
-    /// approved: removing a tool's approval withdraws it (decision 0013, section 8), and that
-    /// must stay possible for this tool and for an entry's last tool without editing the reach
-    /// check.
+    /// another server's tool or a malformed one. The loader requires the tool to be approved
+    /// while any other tool of the server is, so that nothing is served under a credential
+    /// whose reach can no longer be checked. Removing a tool's approval withdraws it (decision
+    /// 0013, section 8): this tool is withdrawn together with the server's others, which needs
+    /// no edit to the reach check.
     pub tool: ToolName,
     /// Its arguments.
     pub arguments: serde_json::Map<String, Value>,
@@ -278,6 +279,20 @@ pub enum RegistryError {
         tool: ToolName,
         /// The server's system.
         system: String,
+    },
+    /// A server's reach check calls a tool that is not approved, and another of the server's
+    /// tools is approved: that tool would be served under a credential whose reach can no
+    /// longer be checked.
+    #[error(
+        "server `{server}`'s reach check calls `{tool}`, which is not approved, and other tools \
+         of the server are: remove the server's approvals together, or name another tool in its \
+         reach check"
+    )]
+    ReachCheckUnapproved {
+        /// The server.
+        server: ConnectorName,
+        /// The tool its reach check names.
+        tool: ToolName,
     },
     /// A server has no probe record (decision 0013, section 9).
     #[error(
@@ -609,6 +624,22 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         routes.insert(name.clone(), checked.route);
         approvals.insert(name, checked.approval);
     }
+    // A reach check's tool stays approved while any other tool of its server is, so that
+    // nothing is served under a credential whose reach can no longer be checked; removing
+    // every approval of a server still loads (decision 0013, section 8). A tool is the
+    // server's when its route names the server, as the drift pass takes an entry's tools. Its
+    // name is under the server's system, as the reach check's is, so the two agree.
+    for server in servers.values() {
+        if let Some(check) = &server.reach_check
+            && !routes.contains_key(&check.tool)
+            && routes.values().any(|route| route.server == server.name)
+        {
+            return Err(RegistryError::ReachCheckUnapproved {
+                server: server.name.clone(),
+                tool: check.tool.clone(),
+            });
+        }
+    }
 
     let surfaces = file
         .surfaces
@@ -764,8 +795,8 @@ fn servers(
         {
             return Err(RegistryError::ReachCheckMissing(server.name));
         }
-        // The reach check calls one of the entry's own tools. It need not be approved, so that
-        // withdrawing it stays possible, but its name must be under the server's system.
+        // The reach check calls one of the entry's own tools: its name must be under the
+        // server's system. Whether it is approved is checked against the tools, in `build`.
         if let Some(check) = &server.reach_check
             && !under_system(&check.tool, &server.system)
         {
