@@ -90,6 +90,7 @@
         { "name": "github__delete_repository", "classification": "destructive", "connector": "github", "resources": "declared" },
         { "name": "jira__get_issue", "classification": "read", "connector": "jira", "resources": "declared" },
         { "name": "jira__create_issue", "classification": "propose", "connector": "jira", "resources": "declared" },
+        { "name": "jira__create_issue_as_user", "classification": "propose", "connector": "jira-per-user", "resources": "declared" },
         { "name": "jira__add_comment", "classification": "write", "connector": "jira", "resources": "declared" },
         { "name": "jira__transition_issue", "classification": "write", "connector": "jira", "resources": "declared" },
         { "name": "docs__search", "classification": "read", "connector": "docs", "resources": "no_resources" },
@@ -110,7 +111,7 @@
         },
         {
           "name": "employee",
-          "tools": ["docs__search", "github__get_file", "github__delete_branch", "jira__get_issue", "jira__create_issue", "jira__add_comment", "jira__transition_issue"],
+          "tools": ["docs__search", "github__get_file", "github__delete_branch", "jira__get_issue", "jira__create_issue_as_user", "jira__add_comment", "jira__transition_issue"],
           "groups": ["engineering", "finance-readers"],
           "principals": "any_in_teams_and_groups"
         },
@@ -152,7 +153,14 @@
             { "system": "jira", "kind": "project", "identifier": "FIN" }
           ]
         }
-      }
+      },
+      "entries": [
+        { "name": "github", "kind": "built_in", "credential": "team_service_identity", "principal": "github-app", "narrowing": "none", "permits": "destructive", "reach": [] },
+        { "name": "jira", "kind": "built_in", "credential": "team_service_identity", "principal": "jira-service", "narrowing": "none", "permits": "write", "reach": [] },
+        { "name": "jira-per-user", "kind": "built_in", "credential": "per_user_grant", "principal": "jira-user", "narrowing": "none", "permits": "propose", "reach": [] },
+        { "name": "docs", "kind": "built_in", "credential": "gateway_token", "principal": "docs-reader", "narrowing": "none", "permits": "read", "reach": [] },
+        { "name": "otto", "kind": "built_in", "credential": "gateway_token", "principal": "otto-status", "narrowing": "none", "permits": "propose", "reach": [] }
+      ]
     },
     "reach": {
       "revision": "reach-1",
@@ -241,7 +249,7 @@
     {
       "name": "an employee proposes through a tool the employee surface serves, within a group's limit",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
-      "profile": "employee", "surface": "employee", "tool": "jira__create_issue",
+      "profile": "employee", "surface": "employee", "tool": "jira__create_issue_as_user",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
       "expect": { "decision": "allow" }
     },
@@ -520,17 +528,17 @@
     {
       "name": "a profile whose data lists every classification still permits a proposal",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
-      "profile": "lists-everything", "surface": "employee", "tool": "jira__create_issue",
+      "profile": "lists-everything", "surface": "employee", "tool": "jira__create_issue_as_user",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
       "expect": { "decision": "allow" }
     },
     {
       "name": "a proposal is denied by a profile that permits only reads",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
-      "profile": "reads-only", "surface": "employee", "tool": "jira__create_issue",
+      "profile": "reads-only", "surface": "employee", "tool": "jira__create_issue_as_user",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
       "expect": { "decision": "deny", "reason": "classification_not_permitted",
-        "sentence": "Tool `jira__create_issue` is classified `propose`, which profile `reads-only` does not permit. Choose a tool whose classification this profile permits." }
+        "sentence": "Tool `jira__create_issue_as_user` is classified `propose`, which profile `reads-only` does not permit. Choose a tool whose classification this profile permits." }
     },
     {
       "name": "a read is denied by a profile that permits only proposals",
@@ -836,7 +844,7 @@
       "name": "a profile whose data lists every classification still lists no direct write or destructive tool",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
       "profile": "lists-everything", "surface": "employee",
-      "expect": ["docs__search", "github__get_file", "jira__create_issue", "jira__get_issue"]
+      "expect": ["docs__search", "github__get_file", "jira__create_issue_as_user", "jira__get_issue"]
     },
     {
       "name": "a narrowing delegation narrows the list",
@@ -854,7 +862,7 @@
       "name": "an employee sees the reads and proposals its surface serves",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
       "profile": "employee", "surface": "employee",
-      "expect": ["docs__search", "github__get_file", "jira__create_issue", "jira__get_issue"]
+      "expect": ["docs__search", "github__get_file", "jira__create_issue_as_user", "jira__get_issue"]
     },
     {
       "name": "a profile that permits only reads lists only reads",
@@ -866,7 +874,7 @@
       "name": "a profile that permits only proposals lists only proposals",
       "snapshot": "base", "principal": "eng-user", "delegation": null,
       "profile": "proposals-only", "surface": "employee",
-      "expect": ["jira__create_issue"]
+      "expect": ["jira__create_issue_as_user"]
     },
     {
       "name": "a profile that lists no classification lists nothing",
