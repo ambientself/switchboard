@@ -4457,6 +4457,14 @@ mutate("gw-deploy-groups-on-workload", "a workload issuer may carry a groups cla
 mutate("gw-deploy-manifest-for-user", "a user issuer may carry a team manifest", DEPLOY,
        "        (IssuerKindName::User, None, groups_claim) => IssuerKindEntry::User {",
        "        (IssuerKindName::User, _, groups_claim) => IssuerKindEntry::User {")
+# Decision 0013, section 8: a user issuer's tokens live at most 3600 s; a workload issuer's have no
+# such ceiling. tests/deployment.rs watches both.
+mutate("gw-deploy-user-lifetime-uncapped", "a user issuer whose tokens live a day loads", DEPLOY,
+       "        && issuer.max_lifetime_seconds > MAX_USER_LIFETIME_SECONDS\n",
+       "        && issuer.max_lifetime_seconds > MAX_USER_LIFETIME_SECONDS * 24\n")
+mutate("gw-deploy-workload-lifetime-capped", "a workload issuer's tokens are held to the user issuer's hour", DEPLOY,
+       "    if issuer.kind == IssuerKindName::User\n        && issuer.max_lifetime_seconds",
+       "    if matches!(issuer.kind, IssuerKindName::User | IssuerKindName::Workload)\n        && issuer.max_lifetime_seconds")
 mutate("gw-deploy-empty-database-url", "an empty database URL is taken as one", DEPLOY,
        "                Some(url) if !url.is_empty() => AuditChoice::Postgres { url },",
        "                Some(url) => AuditChoice::Postgres { url },")

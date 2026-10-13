@@ -406,6 +406,50 @@ fn a_user_issuer_takes_an_optional_groups_claim() {
     }
 }
 
+/// Decision 0013, section 8: a user's groups are as fresh as the token that carries them, so a
+/// user issuer's tokens may live at most an hour. A workload issuer's lifetime has no such
+/// ceiling.
+#[test]
+fn a_user_issuers_token_lifetime_is_at_most_an_hour() {
+    let workload = "kind = \"workload\"\naudiences = [\"switchboard\"]\nalgorithm = \"RS256\"\nkeys_file = \"jwks.json\"\nsubjects_file = \"teams.toml\"\nmax_lifetime_seconds = 3600\n";
+    let user = |seconds: u64| {
+        format!(
+            "kind = \"user\"\naudiences = [\"switchboard\"]\nalgorithm = \"RS256\"\nkeys_file = \"jwks.json\"\nmax_lifetime_seconds = {seconds}\n"
+        )
+    };
+    assert_eq!(gateway::deployment::MAX_USER_LIFETIME_SECONDS, 3600);
+    for seconds in [1, 3600] {
+        let loaded = load_edited(&format!("user-lifetime-{seconds}"), workload, &user(seconds))
+            .unwrap();
+        assert_eq!(
+            loaded.identity.enforce.unwrap()[0].max_lifetime_secs,
+            seconds
+        );
+    }
+    for seconds in [3601, 86_400, u64::MAX] {
+        let said = refused(&format!("user-lifetime-{seconds}"), workload, &user(seconds));
+        assert_eq!(
+            said,
+            format!(
+                "user issuer `{CLUSTER_ISSUER}` has `max_lifetime_seconds = {seconds}`; a user \
+                 issuer's must be at most 3600, since a user's groups are as fresh as the token"
+            )
+        );
+    }
+    for seconds in [3601, 86_400] {
+        let loaded = load_edited(
+            &format!("workload-lifetime-{seconds}"),
+            "max_lifetime_seconds = 3600\n",
+            &format!("max_lifetime_seconds = {seconds}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.identity.enforce.unwrap()[0].max_lifetime_secs,
+            seconds
+        );
+    }
+}
+
 #[test]
 fn the_registry_must_be_read_again_at_least_every_so_often() {
     let said = refused("poll-zero", "poll_seconds = 1", "poll_seconds = 0");

@@ -40,7 +40,7 @@
 //! keys_ca_file = "issuer-ca.pem"                  # needed for https; the only CAs trusted
 //! keys_token_file = "/run/secrets/issuer-token"   # optional; read again on every fetch
 //! keys_refresh_seconds = 300                      # 300 if left out; at least 30
-//! max_lifetime_seconds = 3600
+//! max_lifetime_seconds = 3600                     # at most 3600 for a user issuer
 //! leeway_seconds = 30
 //!
 //! [audit]
@@ -92,6 +92,10 @@
 //!     an `http` keys URL.
 //!   - `keys_refresh_seconds`, `keys_ca_file` and `keys_token_file` belong to `keys_url` and are
 //!     refused beside `keys_file`.
+//! - **A user issuer's token lifetime** is at most [`MAX_USER_LIFETIME_SECONDS`], 3600: a
+//!   user's groups are as fresh as the token that carries them (decision 0013, section 8). A
+//!   user issuer with a longer `max_lifetime_seconds` is refused. A workload issuer's has no
+//!   such ceiling here.
 //! - **The team manifest** is a TOML table of subject to team:
 //!
 //!   ```toml
@@ -191,6 +195,10 @@ pub const DEFAULT_PER_SERVER_IN_FLIGHT: usize = 32;
 /// How many calls may be in flight from one team to one proxied server in one instance, unless
 /// `[limits]` says otherwise.
 pub const DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT: usize = 8;
+
+/// The longest a user issuer may let its tokens live, in seconds (decision 0013, section 8):
+/// the groups a user's token carries are as fresh as the token.
+pub const MAX_USER_LIFETIME_SECONDS: u64 = 3600;
 
 /// The longest deadline a server's entry may set (decision 0014, section 1).
 pub const MAX_SERVER_DEADLINE: Duration = Duration::from_secs(60);
@@ -421,7 +429,8 @@ pub struct IssuerFile {
     /// it is not given.
     #[serde(default)]
     pub groups_claim: Option<String>,
-    /// The longest a token may live, in seconds.
+    /// The longest a token may live, in seconds. At most [`MAX_USER_LIFETIME_SECONDS`] for a
+    /// user issuer.
     pub max_lifetime_seconds: u64,
     /// Clock skew tolerated, in seconds.
     pub leeway_seconds: u64,
@@ -497,6 +506,17 @@ pub enum DeploymentError {
     /// A user issuer was given a team manifest.
     #[error("user issuer `{0}` has `subjects_file`, which only a workload issuer takes")]
     ManifestForUser(Issuer),
+    /// A user issuer's tokens may live longer than [`MAX_USER_LIFETIME_SECONDS`].
+    #[error(
+        "user issuer `{issuer}` has `max_lifetime_seconds = {seconds}`; a user issuer's must be \
+         at most {MAX_USER_LIFETIME_SECONDS}, since a user's groups are as fresh as the token"
+    )]
+    UserLifetimeTooLong {
+        /// The issuer.
+        issuer: Issuer,
+        /// The lifetime given, in seconds.
+        seconds: u64,
+    },
     /// A workload issuer was given a groups claim.
     #[error("workload issuer `{0}` has `groups_claim`, which only a user issuer takes")]
     GroupsForWorkload(Issuer),
@@ -904,6 +924,14 @@ fn issuer_entry(
     base: &Path,
     keys_urls: &mut Vec<KeysUrl>,
 ) -> Result<IssuerEntry, DeploymentError> {
+    if issuer.kind == IssuerKindName::User
+        && issuer.max_lifetime_seconds > MAX_USER_LIFETIME_SECONDS
+    {
+        return Err(DeploymentError::UserLifetimeTooLong {
+            issuer: issuer.issuer,
+            seconds: issuer.max_lifetime_seconds,
+        });
+    }
     let kind = match (issuer.kind, issuer.subjects_file, issuer.groups_claim) {
         (IssuerKindName::Workload, Some(manifest), None) => IssuerKindEntry::Workload {
             subjects: read_manifest(&base.join(manifest))?,
