@@ -4277,6 +4277,10 @@ mutate("demo-kind-yaml-tagged-key-read", "the manifest reader takes a tagged key
        MANIFESTS_TEST,
        "                    !key,\n",
        "                    true,\n")
+mutate("demo-kind-yaml-alias-key-read", "the manifest reader takes an alias as a key, which its loader reads as the node it names, and an alias of a tagged scalar it cannot convert shifts the rest of the mapping",
+       MANIFESTS_TEST,
+       '            assert!(!key, "an alias used as a mapping key, at {at}");\n',
+       "            let _ = key;\n")
 mutate("demo-kind-deprecated-service-account-read", "a pod that sets the deprecated serviceAccount passes, and the ServiceAccount it names goes unchecked",
        MANIFESTS_TEST,
        "        deprecated.is_none(),\n",
