@@ -12,9 +12,8 @@
 //! 4. **Policy** becomes a snapshot through the core's own checks, and passes the
 //!    receipt-store gate (decision 0009): until receipts exist, a tool not classified `read`
 //!    is served only by a development build, one with the `test-support` feature. It then
-//!    passes the [narrowing gate](narrowing_gate) (decision 0011): until something narrows a
-//!    credential, an entry narrowed per call or to the caller's limit is refused in every
-//!    build.
+//!    passes the narrowing gate (decision 0011): until something narrows a credential, an
+//!    entry narrowed per call or to the caller's limit is refused in every build.
 //! 5. **Tool definitions**: every approved tool has exactly one, and every one is for an
 //!    approved tool.
 //! 6. **Connectors**: none is registered twice, and every tool on a surface has its connector
