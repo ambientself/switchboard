@@ -40,12 +40,14 @@
 //! keys_ca_file = "issuer-ca.pem"                  # needed for https; the only CAs trusted
 //! keys_token_file = "/run/secrets/issuer-token"   # optional; read again on every fetch
 //! keys_refresh_seconds = 300                      # 300 if left out; at least 30
-//! max_lifetime_seconds = 3600
+//! max_lifetime_seconds = 3600                     # at most 3600 for a user issuer
 //! leeway_seconds = 30
 //!
 //! [audit]
 //! mode = "postgres"           # or "disabled" (test-support builds only), alone in the table
 //! url_env = "SWITCHBOARD_DATABASE_URL"
+//! begin_pool_size = 16        # 16 if left out; 1 to 64
+//! finish_pool_size = 4        # 4 if left out; 1 to 64
 //!
 //! [metrics]                   # optional; left out, nothing serves metrics
 //! listen = "0.0.0.0:9090"
@@ -92,6 +94,10 @@
 //!     an `http` keys URL.
 //!   - `keys_refresh_seconds`, `keys_ca_file` and `keys_token_file` belong to `keys_url` and are
 //!     refused beside `keys_file`.
+//! - **A user issuer's token lifetime** is at most [`MAX_USER_LIFETIME_SECONDS`], 3600: a
+//!   user's groups are as fresh as the token that carries them (decision 0013, section 8). A
+//!   user issuer with a longer `max_lifetime_seconds` is refused. A workload issuer's has no
+//!   such ceiling here.
 //! - **The team manifest** is a TOML table of subject to team:
 //!
 //!   ```toml
@@ -106,6 +112,11 @@
 //!   `tools/call` and `tools/list` are refused until a read succeeds.
 //! - **The database URL** is read from the environment variable `url_env` names, so no password
 //!   is written in the file.
+//! - **The audit pools** are `begin_pool_size` and `finish_pool_size` connections, 16 and 4
+//!   unless given (decision 0014, section 3), each from 1 to [`MAX_AUDIT_POOL_SIZE`]. The
+//!   open-row query's pool is always one connection. So an instance opens at most begin plus
+//!   finish plus 1 connections to the audit database, 21 at the defaults, and the database's
+//!   `max_connections` must hold that for every replica, plus the migrate job and readers.
 //! - **Credentials** map each registry server's credential reference to the file holding it.
 //!   Every server's reference must be here, and nothing else may be.
 //! - **Metrics** are served in Prometheus text at `GET /metrics` on a listener of their own
@@ -149,17 +160,18 @@
 //!   reach check, naming the entries (see [`crate::start`]).
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
-//! limits, each server's bounds and the drift interval have defaults, so a gateway not told
-//! where to listen is reachable from its own machine only. `[metrics]`, each server's CA file
-//! and the reach settings may be left out, each under the rules above. Any other missing field
-//! is an error, and so is a field that does not belong to the chosen mode or kind, such as
-//! `subjects_file` on a user issuer.
+//! audit pools, the limits, each server's bounds and the drift interval have defaults, so a
+//! gateway not told where to listen is reachable from its own machine only. `[metrics]`, each
+//! server's CA file and the reach settings may be left out, each under the rules above. Any
+//! other missing field is an error, and so is a field that does not belong to the chosen mode
+//! or kind, such as `subjects_file` on a user issuer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use audit_postgres::PoolSizes;
 use connector_proxy::{DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES};
 use gateway_core::{ConnectorName, DeploymentName, Issuer, Subject, TeamId};
 use serde::Deserialize;
@@ -191,6 +203,21 @@ pub const DEFAULT_PER_SERVER_IN_FLIGHT: usize = 32;
 /// How many calls may be in flight from one team to one proxied server in one instance, unless
 /// `[limits]` says otherwise.
 pub const DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT: usize = 8;
+
+/// The longest a user issuer may let its tokens live, in seconds (decision 0013, section 8):
+/// the groups a user's token carries are as fresh as the token.
+///
+/// The cap is enforced here, where the deployment file loads, and nowhere else. The JSON
+/// configuration's path ([`Config::from_json`](crate::Config::from_json)), kept for
+/// development and tests, does not enforce it: `gateway-identity` refuses only a lifetime of
+/// 0. The release binary loads only the deployment file.
+pub const MAX_USER_LIFETIME_SECONDS: u64 = 3600;
+
+/// The most connections `audit.begin_pool_size` or `audit.finish_pool_size` may give a pool:
+/// four times the begin pool's default. At this ceiling for both, an instance opens 129
+/// connections to the audit database, more than a default Postgres's `max_connections` of 100
+/// holds for one replica.
+pub const MAX_AUDIT_POOL_SIZE: usize = 64;
 
 /// The longest deadline a server's entry may set (decision 0014, section 1).
 pub const MAX_SERVER_DEADLINE: Duration = Duration::from_secs(60);
@@ -421,7 +448,8 @@ pub struct IssuerFile {
     /// it is not given.
     #[serde(default)]
     pub groups_claim: Option<String>,
-    /// The longest a token may live, in seconds.
+    /// The longest a token may live, in seconds. At most [`MAX_USER_LIFETIME_SECONDS`] for a
+    /// user issuer.
     pub max_lifetime_seconds: u64,
     /// Clock skew tolerated, in seconds.
     pub leeway_seconds: u64,
@@ -453,6 +481,12 @@ pub enum AuditFile {
     Postgres {
         /// The environment variable holding the database URL.
         url_env: String,
+        /// Connections in begin's pool: 1 to [`MAX_AUDIT_POOL_SIZE`], and 16 if left out.
+        #[serde(default)]
+        begin_pool_size: Option<usize>,
+        /// Connections in finish's pool: 1 to [`MAX_AUDIT_POOL_SIZE`], and 4 if left out.
+        #[serde(default)]
+        finish_pool_size: Option<usize>,
     },
     /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].
     Disabled {},
@@ -497,6 +531,17 @@ pub enum DeploymentError {
     /// A user issuer was given a team manifest.
     #[error("user issuer `{0}` has `subjects_file`, which only a workload issuer takes")]
     ManifestForUser(Issuer),
+    /// A user issuer's tokens may live longer than [`MAX_USER_LIFETIME_SECONDS`].
+    #[error(
+        "user issuer `{issuer}` has `max_lifetime_seconds = {seconds}`; a user issuer's must be \
+         at most {MAX_USER_LIFETIME_SECONDS}, since a user's groups are as fresh as the token"
+    )]
+    UserLifetimeTooLong {
+        /// The issuer.
+        issuer: Issuer,
+        /// The lifetime given, in seconds.
+        seconds: u64,
+    },
     /// A workload issuer was given a groups claim.
     #[error("workload issuer `{0}` has `groups_claim`, which only a user issuer takes")]
     GroupsForWorkload(Issuer),
@@ -547,6 +592,14 @@ pub enum DeploymentError {
     /// The database URL's environment variable is not set.
     #[error("the environment variable `{0}`, which `audit.url_env` names, is not set")]
     NoDatabaseUrl(String),
+    /// An audit pool's size is zero or past [`MAX_AUDIT_POOL_SIZE`].
+    #[error("`audit.{field}` is {size}; it must be from 1 to {MAX_AUDIT_POOL_SIZE}")]
+    PoolSizeOutOfRange {
+        /// `begin_pool_size` or `finish_pool_size`.
+        field: &'static str,
+        /// The size given.
+        size: usize,
+    },
     /// A cap in `[limits]` is zero.
     #[error("`limits.{0}` must be at least 1")]
     LimitZero(&'static str),
@@ -612,6 +665,9 @@ pub struct Deployment {
     pub keys_urls: Vec<KeysUrl>,
     /// The audit store.
     pub audit: AuditChoice,
+    /// The sizes of the audit store's begin and finish pools: the defaults unless the file
+    /// sets them, and the defaults when audit is disabled.
+    pub audit_pools: PoolSizes,
     /// Where metrics are served, or `None` for nowhere.
     pub metrics: Option<SocketAddr>,
     /// The caps on calls in flight.
@@ -639,6 +695,7 @@ impl std::fmt::Debug for Deployment {
             .field("listen", &self.listen)
             .field("registry_file", &self.registry_file)
             .field("audit", &self.audit)
+            .field("audit_pools", &self.audit_pools)
             .field("metrics", &self.metrics)
             .field("limits", &self.limits)
             .field("servers", &self.servers)
@@ -793,12 +850,19 @@ impl Deployment {
                 disabled: false,
             },
         };
-        let audit = match file.audit {
-            AuditFile::Disabled {} => AuditChoice::Disabled,
-            AuditFile::Postgres { url_env } => match var(&url_env) {
-                Some(url) if !url.is_empty() => AuditChoice::Postgres { url },
-                _ => return Err(DeploymentError::NoDatabaseUrl(url_env)),
-            },
+        let (audit, audit_pools) = match file.audit {
+            AuditFile::Disabled {} => (AuditChoice::Disabled, PoolSizes::default()),
+            AuditFile::Postgres {
+                url_env,
+                begin_pool_size,
+                finish_pool_size,
+            } => {
+                let pools = audit_pools(begin_pool_size, finish_pool_size)?;
+                match var(&url_env) {
+                    Some(url) if !url.is_empty() => (AuditChoice::Postgres { url }, pools),
+                    _ => return Err(DeploymentError::NoDatabaseUrl(url_env)),
+                }
+            }
         };
         Ok(Self {
             deployment: file.deployment,
@@ -810,6 +874,7 @@ impl Deployment {
             identity,
             keys_urls,
             audit,
+            audit_pools,
             metrics: file.metrics.map(|metrics| metrics.listen),
             limits,
             servers,
@@ -824,6 +889,23 @@ impl Deployment {
                 .collect(),
         })
     }
+}
+
+/// The audit pools' sizes, each defaulted, and refused if zero or past
+/// [`MAX_AUDIT_POOL_SIZE`].
+fn audit_pools(begin: Option<usize>, finish: Option<usize>) -> Result<PoolSizes, DeploymentError> {
+    let defaults = PoolSizes::default();
+    let size = |given: Option<usize>, default: usize, field: &'static str| match given {
+        None => Ok(default),
+        Some(size) if size == 0 || size > MAX_AUDIT_POOL_SIZE => {
+            Err(DeploymentError::PoolSizeOutOfRange { field, size })
+        }
+        Some(size) => Ok(size),
+    };
+    Ok(PoolSizes {
+        begin: size(begin, defaults.begin, "begin_pool_size")?,
+        finish: size(finish, defaults.finish, "finish_pool_size")?,
+    })
 }
 
 /// The caps `section` sets, each defaulted, and refused if zero.
@@ -904,6 +986,14 @@ fn issuer_entry(
     base: &Path,
     keys_urls: &mut Vec<KeysUrl>,
 ) -> Result<IssuerEntry, DeploymentError> {
+    if issuer.kind == IssuerKindName::User
+        && issuer.max_lifetime_seconds > MAX_USER_LIFETIME_SECONDS
+    {
+        return Err(DeploymentError::UserLifetimeTooLong {
+            issuer: issuer.issuer,
+            seconds: issuer.max_lifetime_seconds,
+        });
+    }
     let kind = match (issuer.kind, issuer.subjects_file, issuer.groups_claim) {
         (IssuerKindName::Workload, Some(manifest), None) => IssuerKindEntry::Workload {
             subjects: read_manifest(&base.join(manifest))?,

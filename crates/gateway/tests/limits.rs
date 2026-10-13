@@ -961,3 +961,29 @@ fn values_past_the_ceilings_or_zero_are_refused() {
         );
     }
 }
+
+/// Every refusal sentence the gateway makes fits the audit store's cap on `outcome_sentence`
+/// with a server and a tool name of 900 bytes each, so its row records it whole. The proxy's
+/// own refusals are fixed sentences.
+#[test]
+fn every_refusal_sentence_fits_the_audit_rows_cap_with_long_names() {
+    assert_eq!(outcome::NOT_SERVED.len(), 84);
+    assert_eq!(outcome::NO_CREDENTIAL.len(), 76);
+    assert_eq!(server_at_capacity("", "").len(), 137);
+    assert_eq!(team_at_capacity("", "").len(), 150);
+    assert_eq!(gateway::withdrawn_while_deciding("").len(), 138);
+    let name = "n".repeat(900);
+    for sentence in [
+        outcome::NOT_SERVED.to_owned(),
+        outcome::NO_CREDENTIAL.to_owned(),
+        server_at_capacity(&name, &name),
+        team_at_capacity(&name, &name),
+        gateway::withdrawn_while_deciding(&name),
+    ] {
+        assert!(
+            sentence.len() <= audit_postgres::MAX_OUTCOME_SENTENCE_BYTES,
+            "{}",
+            sentence.len()
+        );
+    }
+}

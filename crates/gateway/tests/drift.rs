@@ -921,6 +921,8 @@ async fn a_poll_outstanding_across_a_new_approval_does_not_withdraw_it() {
 struct Booted {
     address: SocketAddr,
     withdrawn: usize,
+    /// The withdrawals its drift pass counted, over every server.
+    withdrawals_counted: u64,
 }
 
 async fn boot(files: &Files) -> Booted {
@@ -932,6 +934,13 @@ async fn boot(files: &Files) -> Booted {
     .await
     .unwrap();
     let withdrawn = prepared.drift.withdrawals().standing().len();
+    let withdrawals_counted = prepared
+        .drift
+        .signals()
+        .counts()
+        .into_iter()
+        .map(|(_, counts)| counts.withdrawals)
+        .sum();
     // The drift pass's timer is not run: whatever is withdrawn was withdrawn during boot.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -945,7 +954,11 @@ async fn boot(files: &Files) -> Booted {
         Timeouts::default(),
         gateway::DEFAULT_MAX_IN_FLIGHT,
     ));
-    Booted { address, withdrawn }
+    Booted {
+        address,
+        withdrawn,
+        withdrawals_counted,
+    }
 }
 
 /// The names the first `tools/list` on team A's surface answers with, over the listener.
@@ -1002,17 +1015,41 @@ async fn a_definition_changed_at_boot_is_never_served_and_a_restart_detects_it_a
     assert_eq!(serving[0]["tools"], 2);
     assert_eq!(serving[0]["withdrawn"], 2);
 
+    // Each withdrawal is logged as tool_withdrawn at ERROR and counted.
+    let withdrawn_lines = |count: usize| {
+        let lines = captured.events("tool_withdrawn");
+        assert_eq!(lines.len(), count, "{lines:?}");
+        let tools: BTreeSet<String> = lines
+            .iter()
+            .map(|(level, fields)| {
+                assert_eq!(level, "ERROR", "{fields}");
+                fields["tool"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            BTreeSet::from([READ_TOOL.to_owned(), TEAM_B_READ_TOOL.to_owned()])
+        );
+    };
+    withdrawn_lines(2);
+    assert_eq!(first.withdrawals_counted, 2);
+
     // A restart with the server still changed: withdrawn again, before serving.
     let restarted = boot(&files).await;
     assert_eq!(restarted.withdrawn, 2);
     assert_eq!(first_list(restarted.address).await, [LIST_TOOL]);
+    withdrawn_lines(4);
+    assert_eq!(restarted.withdrawals_counted, 2);
 
     // The server restored, and the replica restarted: the tool is served again, with no new
-    // approval.
+    // approval. The earlier withdrawals' lines and counts are there before the restart, and
+    // the restart adds none.
     drift(&mock, None);
     let restored = boot(&files).await;
     assert_eq!(restored.withdrawn, 0);
+    assert_eq!(restored.withdrawals_counted, 0);
     assert_eq!(first_list(restored.address).await, [LIST_TOOL, READ_TOOL]);
+    withdrawn_lines(4);
     // The replicas that saw the change keep it withdrawn.
     assert_eq!(first_list(first.address).await, [LIST_TOOL]);
 }

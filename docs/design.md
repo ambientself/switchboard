@@ -701,19 +701,41 @@ written complete, has no finish, and is never open.
 - **A row's recorded resources are at most 147,648 characters:** 64 resources, each with a
   129-character system and kind and a 2,049-character identifier, the `…` included. That
   counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
-  quotes again, so as JSON they reach 297,675 characters, or 298,059 bytes, since `…` takes 3
-  bytes. Any call that gets a row can reach this, a denial included, and the row is written
-  before the tool runs. A row is at most 512 KiB, counted as the bytes of the values the
-  Postgres store sends, which holds this with room for the rest of the row; the bound and the
-  test that the largest row fits arrive with #11
-  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
+  quotes again, so as JSON they reach 297,665 characters, or 298,049 bytes, since `…` takes 3
+  bytes (decision 0014 counted 298,059). Any call that gets a row can reach this, a denial
+  included, and the row is written before the tool runs. That figure is for named resources:
+  a reach is recorded as `{"reach": entry}`, and the entry is a registry connector name, which
+  has no cap, so only an operator's name, never a caller's value, can make it longer.
+- **A row is at most 512 KiB**, counted as the bytes of the values the Postgres store sends,
+  the completion included ([decision
+  0014](decisions/0014-rollout-safeguards-and-audit-operations.md), section 7): every column
+  the row writes, a list row's kind `list`, which its statement writes itself, among them.
+  Finish cannot see the row begin wrote, so begin leaves room for the completion: it refuses a
+  call row over 522,203 bytes, 512 KiB less a reserve of 2,085 bytes for the completion (the
+  longest outcome, 7, the longest error kind, 22, the latency, 8, and the longest refusal
+  sentence finish writes, 2,048). Finish refuses a longer sentence, as it refuses one holding
+  U+0000 (the next entry but one). Every sentence the gateway makes fits in 2,048 bytes with a
+  server and tool name of 900 bytes each. A list row is never completed, and is refused over
+  512 KiB itself. Either refusal names the row's largest column, so the call or the list is
+  refused; a reach whose entry name is long enough is refused this way, naming `resources`.
+  Every value a caller chooses is capped, and in the largest row they take at most 316,129
+  bytes, leaving 206,074 of a begun row's 522,203 for the values from the gateway's own
+  configuration, which have no cap of their own. The largest row a call can begin, finished
+  with the longest completion finish writes, is at most 524,288 bytes
+  (`audit_postgres::MAX_ROW_BYTES` works it out, and its tests write that row, finish it, read
+  it back and count every column the table holds for it).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres
   text and jsonb cannot hold U+0000, and a caller chooses its tool-use identifier and the
   values it claims, so the Postgres store refuses a record with U+0000 in any text value,
-  naming the column, and a refusal sentence with one at finish. It refuses a latency or a
-  count past its `bigint` column the same way.
+  naming the column. It refuses a latency or a count past its `bigint` column the same way.
+  At finish it refuses a refusal sentence holding U+0000 or longer than 2,048 bytes, naming
+  the column (and for a long one, the cap), rather than write it changed or cut: nothing is
+  sent, the finish fails at once and is given up, counted under `other` in
+  `switchboard_audit_finishes_given_up_total` and logged as `audit_row_given_up`, the row
+  keeps no completion and is counted open once past its deadline, and the caller is answered
+  with the audit-failure sentence in place of the refusal.
 - **Proved and claimed are separate columns.**
 - **No foreign key to anything a caller owns,** so a caller's data retention cannot delete its
   audit trail.
@@ -1455,12 +1477,16 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   no call is ever sent again on a new connection. Each is tested.
 - Identity and audit opt-outs unavailable outside development builds: built (#132), in the
   opt-outs entry below.
-- The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
-  issuer's key age (#115), the policy's age and maximum age (#132), and the calls shed and
-  each proxied server's calls, latency and late or oversized answers (#139), and each proxied
-  server's drift polls, withdrawals, probe results and reach checks (the drift pass entry
-  below). Decision 0014 writes the alert conditions down, and there are no rules until a
-  metrics sink exists.
+- Expose the agreed metrics and write the alert conditions (the box as the owner restated it on
+  2026-10-13): built. Decision 0014, section 9's signals are exported in Prometheus text at
+  `GET /metrics` on the deployment file's `[metrics]` listener (`crates/gateway/src/metrics.rs`
+  names every series; deploy/README.md, "Metrics"): each proxied server's calls by outcome,
+  latency and late or oversized answers, and the calls shed by scope (#139); each proxied
+  server's drift polls, withdrawals, probe results and reach-check results (the drift pass
+  entry below); the policy's age and maximum age (#132); and each issuer's key age (#115),
+  beside decision 0009's audit counters. Its alert conditions are written in decision 0014,
+  section 9. There is no rules file and no paging until a metrics sink and an on-call rotation
+  exist (decision 0009, Still open 3 and 9).
 - The overload, hanging-server and drift demonstrations: built in both demos, Compose and kind
   (deploy/README.md, "#11's demonstrations"). A hanging server: team-a's read of mock-docs'
   `slow-doc` is answered at the 5 s deadline, its row `error` of the kind
@@ -1508,16 +1534,16 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   every registry's policy meets, at boot and on every reload, whoever wires the connectors.
   The JSON configuration's boot runs it too, and the start also runs it before it reads a
   credential.
-- The kind slice extended to show them: partly built. Both demos register the mock server
-  once per team and show each team's calls reaching it under its own entry's identity, for its
-  own project (the next entry), and both show the undeclared argument, the registry refused at
-  load, the hanging server, overload and drift (the demonstrations entry above). Both check,
-  after boot, that each entry's probe was refused and its reach check held, with rows by the
-  registry's principal, and both widen docs-team-a's caller in mock-docs to both projects: the
-  next reach check finds the mismatch, both of docs-team-a's tools are withdrawn within the
-  interval plus the deadline and the reach check's allowance, and a new approval, once the
-  caller is narrowed again, serves them again. No step shows the probe finding an open
-  server.
+- The kind slice extended to show them: built (#156, #169, #176). Both demos register the mock
+  server once per team and show each team's calls reaching it under its own entry's identity,
+  for its own project (the next entry), and both show the undeclared argument, the registry
+  refused at load, the hanging server, overload and drift (the demonstrations entry above).
+  Both check, after boot, that each entry's probe was refused and its reach check held, with
+  rows by the registry's principal, and both widen docs-team-a's caller in mock-docs to both
+  projects: the next reach check finds the mismatch, both of docs-team-a's tools are withdrawn
+  within the interval plus the deadline and the reach check's allowance, and a new approval,
+  once the caller is narrowed again, serves them again. No step shows the probe finding an
+  open server; `tests/probe.rs` does (the probe entry below).
 - The gateway's per-team identities: built in the demos (#11's kind slice), as decision 0013,
   section 10, has them. The registry lists the mock server twice, `docs-team-a` and
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
@@ -1601,7 +1627,14 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   start refused with an interval shorter than a call deadline.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
-- The 3600 s cap on user issuers' token lifetime: not built.
+- The 3600 s cap on user issuers' token lifetime: built. The deployment file refuses a user
+  issuer whose `max_lifetime_seconds` is over 3600, naming the issuer, the value and the cap
+  ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 8). A
+  workload issuer's lifetime has no such ceiling. `tests/deployment.rs` has both. The cap is
+  enforced where the deployment file loads, and only there: the JSON configuration's path
+  (`Config::from_json`), kept for development and tests, does not enforce it, since
+  `gateway-identity` refuses only a lifetime of 0. The release binary loads only the
+  deployment file.
 - The registration and drift probe: built. `connector_proxy::probe` sends decision 0010's
   three `tools/call` requests for `switchboard_probe_no_such_tool`, with no credential, with
   `Bearer not-a-token` and with the probe credential, held to the server's call deadline and
@@ -1621,15 +1654,47 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `switchboard_probe_results_total{server,result}`; its tools stay listed. A probe that
   showed nothing is logged at WARN. `tests/probe.rs` in `connector-proxy` and `gateway` has
   them. The token writer is built (the per-team identities entry above).
-- Decision 0013 section 11's acceptance scenarios: not built.
+- Decision 0013 section 11's acceptance scenarios: built, each a test on fakes. The stale
+  registry file: `tests/stale.rs`,
+  `a_registry_file_not_read_within_the_maximum_age_makes_the_policy_stale`. Two gateways each
+  withdrawing a changed definition: `tests/drift.rs`,
+  `two_replicas_over_one_server_each_withdraw`, with
+  `a_changed_description_is_withdrawn_within_one_interval` for the interval. A widened
+  reach: `tests/reach.rs`, `a_widened_caller_is_withdrawn`. A new approval bringing the tool
+  back, and a standing withdrawal surviving a reload under a revision naming the new base:
+  `tests/drift.rs`, `a_reload_keeps_a_withdrawal_and_a_new_approval_clears_it`. An open server
+  reported with its tools still listed: `tests/probe.rs`,
+  `an_open_server_is_reported_and_its_tools_stay_listed`. A restored server and a restarted
+  replica, with the earlier `tool_withdrawn` lines and count: `tests/drift.rs`,
+  `a_definition_changed_at_boot_is_never_served_and_a_restart_detects_it_again`. A server entry
+  changed without its tools approved again, refused at boot and at reload: `tests/wiring.rs`,
+  `the_wiring_refuses_to_start_on_what_it_cannot_serve` and
+  `a_new_registry_file_is_served_once_it_passes_and_refused_otherwise`, and the binding cases
+  in `gateway-registry`'s `tests/load_table.rs`. A revision containing `+`: the two revision
+  cases in `tests/load_table.rs`, through the loader that boot and every reload use.
 - The identity and audit opt-outs refused by the release binary, with CI checks: built (#132),
   in the opt-outs entry below.
-- Configurable audit pools and the `max_connections` sizing rule: not built.
-- The 512 KiB row bound and its test: not built.
-- The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
-  each proxied server's calls, latency and late or oversized answers (#139), and the policy's
-  age (#132), and each server's drift polls, withdrawals, probe results and reach-check
-  results, are exported.
+- Configurable audit pools and the `max_connections` sizing rule: built. `[audit]` takes
+  `begin_pool_size` and `finish_pool_size`, 16 and 4 unless given, each from 1 to 64, and the
+  open-row poll keeps its one connection. The database's `max_connections` must be at least the
+  replicas times begin plus finish plus 1, 21 at the defaults, plus the migrate job and readers
+  (deploy/README.md, "Metrics"; decision 0014, as amended on 2026-10-12).
+- The 512 KiB row bound and its test: built. The Postgres store counts a row as the bytes of
+  every value it writes, the completion and a list row's kind included. Begin refuses a call
+  row over 522,203 bytes, leaving a reserve of 2,085 bytes for the completion; finish refuses a
+  refusal sentence over 2,048 bytes, as it refuses one holding U+0000, so the row is its record
+  or keeps no completion (section 11); list refuses a list row, which is never completed, over
+  512 KiB. Each refusal at begin or list names the row's largest column, so the call or the
+  list is refused. `audit_postgres::MAX_ROW_BYTES` works out the largest row a call can make,
+  316,129 bytes of capped values. Tests write it at begin's bound to Postgres, finish it with
+  the longest completion finish writes, read it back, and count every column the table holds
+  for it, within 512 KiB; and write a list row at 512 KiB, which the table holds at exactly
+  that.
+- The decision 0014 signals other than each issuer's key age: built. The calls shed by scope
+  and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
+  policy's age (#132), and each server's drift polls, withdrawals, probe results and
+  reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
+  late or oversized count is of reads only until `unknown` is built (the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -1701,7 +1766,8 @@ checked; a schema that needs them cannot be approved yet.
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
   `oversized_or_late_read`, so a tool not classified `read` is not counted there until
   `unknown` is built. Both demos show overload and a hanging server (the demonstrations entry
-  under #11 above). Not built yet in #11: configurable audit pools, and the row's size bound.
+  under #11 above). The configurable audit pools and the row's size bound are in the #11 list
+  above.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1924,8 +1990,11 @@ that can do what Postgres cannot tests nothing.
 2. The stored row is exactly the record given, including the resources. A record the store
    cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
    leaves no row. The fake must refuse the same records. It refuses what the Postgres store's
-   column mapping refuses; of the table's own constraints, it checks only the shape of
-   unknown resources so far.
+   column mapping refuses, but for two of its refusals: it holds neither the 512 KiB row bound
+   (begin's 522,203 bytes for a call row, 512 KiB for a list row) nor the 2,048-byte cap on a
+   refusal sentence at finish, so a test on the fake can write a row or a completion that the
+   Postgres store refuses. Of the table's own constraints, it checks only the shape of unknown
+   resources so far.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
 4. Times and deadlines come from the store's clock: database time for Postgres, the

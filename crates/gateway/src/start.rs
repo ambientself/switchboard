@@ -86,7 +86,8 @@ use crate::reach::{ReachCaller, ReachSettings};
 use crate::reload::Reloader;
 
 /// The `event` field of the error logged for each audit row the Postgres store stops trying to
-/// complete: the finish deadline passed, or the database refused the completion. It names the
+/// complete: the finish deadline passed, the database refused the completion, or the store
+/// refused it before sending it (a U+0000, or a refusal sentence over its cap). It names the
 /// `row`, the `outcome` that was not written (`ok`, `error` or `refused`), and the `cause`.
 /// The row keeps an empty outcome.
 pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";
@@ -369,7 +370,7 @@ async fn prepare_with(
 
     let store = match &deployment.audit {
         AuditChoice::Disabled => None,
-        AuditChoice::Postgres { url } => Some(audit_store(url).await?),
+        AuditChoice::Postgres { url } => Some(audit_store(url, deployment.audit_pools).await?),
     };
     if let Some(store) = &store {
         wiring = wiring.audit_store(store.clone());
@@ -427,6 +428,8 @@ async fn prepare_with(
             audit = "postgres",
             role = %database_user(&deployment.audit),
             role_check = "passed",
+            begin_pool_size = deployment.audit_pools.begin,
+            finish_pool_size = deployment.audit_pools.finish,
             "audit rows go to Postgres"
         );
     } else {
@@ -779,14 +782,15 @@ fn credentials(
     Ok(FileCredentials::load(pairs)?)
 }
 
-/// Connects the Postgres store and runs its boot checks, within [`AUDIT_CHECK_BUDGET`]. TLS is
-/// not used: the demo's database is on the same private network as the gateway.
-async fn audit_store(url: &str) -> Result<Arc<PgAuditStore>, StartError> {
+/// Connects the Postgres store, with the begin and finish pools `pools` sizes, and runs its boot
+/// checks, within [`AUDIT_CHECK_BUDGET`]. TLS is not used: the demo's database is on the same
+/// private network as the gateway.
+async fn audit_store(url: &str, pools: PoolSizes) -> Result<Arc<PgAuditStore>, StartError> {
     let config: tokio_postgres::Config = url
         .parse()
         .map_err(|error: tokio_postgres::Error| StartError::DatabaseUrl(error.to_string()))?;
-    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?
-        .on_given_up(log_given_up);
+    let store =
+        PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?.on_given_up(log_given_up);
     match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {
         Err(_elapsed) => Err(StartError::AuditCheckTimedOut),
         Ok(Err(refused)) => Err(StartError::AuditCheck(refused)),
@@ -794,7 +798,8 @@ async fn audit_store(url: &str) -> Result<Arc<PgAuditStore>, StartError> {
     }
 }
 
-/// Logs one finish the store gave up as [`GIVEN_UP_EVENT`]. Called on the finish's own task.
+/// Logs one finish the store gave up as [`GIVEN_UP_EVENT`]. Called on the finish's own task, or
+/// on the caller's when the store refuses the completion before sending it.
 fn log_given_up(given_up: GivenUp<'_>) {
     tracing::error!(
         event = GIVEN_UP_EVENT,
@@ -1302,6 +1307,7 @@ mod tests {
             identity,
             keys_urls,
             audit,
+            audit_pools: PoolSizes::default(),
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),

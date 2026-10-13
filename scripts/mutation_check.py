@@ -3295,11 +3295,43 @@ mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is p
        '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
        "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
 mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
-       'Outcome::Refused { sentence } => (Some(stored("outcome_sentence", sentence)?), None),',
-       "Outcome::Refused { sentence } => (Some(sentence.clone()), None),")
+       '                    stored("outcome_sentence", sentence)?,\n                    MAX_OUTCOME_SENTENCE_BYTES,\n',
+       "                    sentence.clone(),\n                    MAX_OUTCOME_SENTENCE_BYTES,\n")
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
+# Decision 0014, section 7: a row is at most 512 KiB, counted as the bytes of the values the store
+# sends, the completion included, and one over it is refused naming its largest column. Begin
+# leaves room for the completion, and finish refuses a refusal sentence over its cap, the
+# completion's one value of no fixed size, rather than cut it. columns.rs's own tests watch the
+# bounds, the count, the column named and the cap; tests/store.rs writes the largest rows to
+# Postgres, finishes the call row, and counts every column of each row as the table holds it.
+mutate("pg-columns-row-bound-unchecked", "a row over its bound is sent to the database", PG_COLUMNS,
+       "    if bytes > bound {\n", "    if false && bytes > bound {\n")
+mutate("pg-columns-row-bound-refuses-at-bound", "a row of exactly its bound is refused", PG_COLUMNS,
+       "    if bytes > bound {\n", "    if bytes >= bound {\n")
+mutate("pg-columns-row-bound-no-completion-reserve", "begin leaves no room for the completion, so a finished row may be over 512 KiB", PG_COLUMNS,
+       "        within_bound(&row.sizes(), MAX_BEGUN_ROW_BYTES)?;\n",
+       "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n")
+mutate("pg-columns-outcome-sentence-uncapped", "a refusal's sentence of any length is written at finish", PG_COLUMNS,
+       "    if text.len() > cap {\n        return Err(PgAuditError::TooLong {\n",
+       "    if false && text.len() > cap {\n        return Err(PgAuditError::TooLong {\n")
+mutate("pg-columns-outcome-sentence-cut", "a refusal's sentence over the cap is cut to it rather than refused", PG_COLUMNS,
+       "    if text.len() > cap {\n        return Err(PgAuditError::TooLong {\n            column,\n"
+       "            bytes: text.len(),\n            cap,\n        });\n    }\n    Ok(text)\n",
+       "    let mut text = text;\n    let _ = column;\n"
+       "    text.truncate(text.floor_char_boundary(cap));\n    Ok(text)\n")
+mutate("pg-columns-row-bound-names-first-column", "a row over the bound names its first column, not its largest", PG_COLUMNS,
+       "            .max_by_key(|(_, bytes)| *bytes)\n", "            .find(|(_, bytes)| *bytes > 0)\n")
+mutate("pg-columns-row-bound-groups-uncounted", "a user's groups are left out of the row's size", PG_COLUMNS,
+       "    texts.map_or(0, |texts| texts.iter().map(|text| text.len()).sum())\n",
+       "    texts.map_or(0, |texts| texts.iter().map(|_| 0).sum())\n")
+mutate("pg-columns-list-row-unbounded", "a list row over 512 KiB is sent to the database", PG_COLUMNS,
+       "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n        Ok(row)\n",
+       "        Ok(row)\n")
+mutate("pg-columns-list-kind-uncounted", "a list row's kind, which its statement writes itself, is left out of its size", PG_COLUMNS,
+       '            ("kind", text_bytes(kind(RowKind::List))),\n',
+       '            ("kind", 0),\n')
 mutate("pg-sql-resources-nullable", "a call row may record no resources at all", PG_LIST_ROWS,
        "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
        "                AND resources_omitted IS NOT NULL\n")
@@ -3926,8 +3958,8 @@ mutate("pg-credential-columns-unshaped", "a credential mode may be stored withou
 mutate("pg-credential-grant-missing", "the gateway's role may not insert the credential identity", PG_REACH,
        "GRANT INSERT (credential_mode, credential_principal)\n    ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 mutate("pg-credential-not-written", "begin writes no credential identity", PG_COLUMNS,
-       "            credential_mode,\n            credential_principal,\n        })",
-       "            credential_mode: None,\n            credential_principal: None,\n        })")
+       "            credential_mode,\n            credential_principal,\n        };",
+       "            credential_mode: None,\n            credential_principal: None,\n        };")
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
@@ -4625,7 +4657,8 @@ mutate_all("gw-deploy-disabled-identity-takes-anything", "identity disabled igno
 mutate_all("gw-deploy-disabled-audit-takes-anything", "audit disabled ignores a URL variable still given",
            (DEPLOY, "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled {},",
             "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled,"),
-           (DEPLOY, "            AuditFile::Disabled {} => AuditChoice::Disabled,", "            AuditFile::Disabled => AuditChoice::Disabled,"))
+           (DEPLOY, "            AuditFile::Disabled {} => (AuditChoice::Disabled, PoolSizes::default()),",
+            "            AuditFile::Disabled => (AuditChoice::Disabled, PoolSizes::default()),"))
 mutate("gw-deploy-poll-zero", "the registry may be read again never", DEPLOY,
        "        if file.registry.poll_seconds == 0 {", "        if false {")
 mutate("gw-deploy-workload-without-manifest", "a workload issuer with no team manifest gets an empty one", DEPLOY,
@@ -4637,9 +4670,17 @@ mutate("gw-deploy-groups-on-workload", "a workload issuer may carry a groups cla
 mutate("gw-deploy-manifest-for-user", "a user issuer may carry a team manifest", DEPLOY,
        "        (IssuerKindName::User, None, groups_claim) => IssuerKindEntry::User {",
        "        (IssuerKindName::User, _, groups_claim) => IssuerKindEntry::User {")
+# Decision 0013, section 8: a user issuer's tokens live at most 3600 s; a workload issuer's have no
+# such ceiling. tests/deployment.rs watches both.
+mutate("gw-deploy-user-lifetime-uncapped", "a user issuer whose tokens live a day loads", DEPLOY,
+       "        && issuer.max_lifetime_seconds > MAX_USER_LIFETIME_SECONDS\n",
+       "        && issuer.max_lifetime_seconds > MAX_USER_LIFETIME_SECONDS * 24\n")
+mutate("gw-deploy-workload-lifetime-capped", "a workload issuer's tokens are held to the user issuer's hour", DEPLOY,
+       "    if issuer.kind == IssuerKindName::User\n        && issuer.max_lifetime_seconds",
+       "    if matches!(issuer.kind, IssuerKindName::User | IssuerKindName::Workload)\n        && issuer.max_lifetime_seconds")
 mutate("gw-deploy-empty-database-url", "an empty database URL is taken as one", DEPLOY,
-       "                Some(url) if !url.is_empty() => AuditChoice::Postgres { url },",
-       "                Some(url) => AuditChoice::Postgres { url },")
+       "                    Some(url) if !url.is_empty() => (AuditChoice::Postgres { url }, pools),",
+       "                    Some(url) => (AuditChoice::Postgres { url }, pools),")
 mutate("gw-deploy-paths-not-relative-to-file", "the registry path is read from the working directory", DEPLOY,
        "            registry_file: base.join(file.registry.file),", "            registry_file: file.registry.file,")
 
@@ -4660,8 +4701,24 @@ mutate("gw-start-audit-unchecked", "the audit store serves without its boot chec
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
 mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
-       "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
+       "        AuditChoice::Postgres { url } => Some(audit_store(url, deployment.audit_pools).await?),",
        "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
+# Decision 0014, section 3: the audit pools' sizes come from the deployment file, 16 and 4 unless
+# given, each from 1 to 64. tests/deployment.rs watches the defaults and the bounds; the sizes
+# reaching the store, tests/postgres.rs, which needs SWITCHBOARD_TEST_DATABASE_URL.
+mutate("gw-start-audit-pools-ignored", "the store is built with the default pools, whatever the deployment file sets", START,
+       "        PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?.on_given_up(log_given_up);\n",
+       "        PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?.on_given_up(log_given_up);\n"
+       "    let _ = pools;\n")
+mutate("gw-deploy-audit-pool-ceiling-unchecked", "an audit pool of more than 64 connections loads", DEPLOY,
+       "        Some(size) if size == 0 || size > MAX_AUDIT_POOL_SIZE => {\n",
+       "        Some(size) if size == 0 => {\n")
+mutate("gw-deploy-audit-pool-zero-accepted", "an audit pool of no connections loads", DEPLOY,
+       "        Some(size) if size == 0 || size > MAX_AUDIT_POOL_SIZE => {\n",
+       "        Some(size) if size > MAX_AUDIT_POOL_SIZE => {\n")
+mutate("gw-deploy-audit-pool-defaults-swapped", "an audit pool left out takes the other pool's default", DEPLOY,
+       "        begin: size(begin, defaults.begin, \"begin_pool_size\")?,\n",
+       "        begin: size(begin, defaults.finish, \"begin_pool_size\")?,\n")
 # Where each server is reached, checked before anything is read or connected to (decision 0013,
 # section 3). start.rs's own tests watch each.
 mutate("gw-start-ca-file-optional-for-https", "an https server with no CA file passes the start's check", START,
@@ -5082,7 +5139,7 @@ mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure cou
 # caught only against Postgres (SWITCHBOARD_TEST_DATABASE_URL).
 
 mutate("gw-given-up-not-logged", "a finish the store gives up is not logged", GW + "start.rs",
-       "        .on_given_up(log_given_up);\n", ";\n")
+       "?.on_given_up(log_given_up);\n", "?;\n")
 mutate("gw-given-up-wrong-event", "a finish given up is logged under another event", GW + "start.rs",
        'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";', 'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up_";')
 mutate("gw-given-up-row-unnamed", "the given-up event does not name its row", GW + "start.rs",

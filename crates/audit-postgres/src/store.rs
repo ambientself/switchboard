@@ -40,6 +40,39 @@ pub enum PgAuditError {
         /// The column.
         column: &'static str,
     },
+    /// A text value is longer than its column may hold: a refusal's sentence over
+    /// [`MAX_OUTCOME_SENTENCE_BYTES`](crate::MAX_OUTCOME_SENTENCE_BYTES) at finish. The
+    /// completion is refused rather than written cut short, as one holding U+0000 is, so a row
+    /// written is always exactly its record.
+    #[error(
+        "the audit column {column} would hold {bytes} bytes, more than the {cap} it may hold, so \
+         it is not written"
+    )]
+    TooLong {
+        /// The column.
+        column: &'static str,
+        /// The value's length, in bytes.
+        bytes: usize,
+        /// The most the column may hold, in bytes.
+        cap: usize,
+    },
+    /// The row would hold more than its bound, counted as the bytes of the values the store
+    /// sends (decision 0014, section 7): [`MAX_BEGUN_ROW_BYTES`](crate::MAX_BEGUN_ROW_BYTES)
+    /// for a call row at begin, which leaves room for its completion within
+    /// [`MAX_ROW_BYTES`](crate::MAX_ROW_BYTES), and `MAX_ROW_BYTES` for a list row. The record
+    /// is refused, naming the row's largest column.
+    #[error(
+        "the audit row would hold {bytes} bytes, more than the {bound} it may hold, so it is not \
+         written; its largest column is {column}"
+    )]
+    RowTooLarge {
+        /// The row's largest column.
+        column: &'static str,
+        /// The row's size, as the bound counts it.
+        bytes: usize,
+        /// The most the row may hold.
+        bound: usize,
+    },
     /// No connection could be had.
     #[error("no connection to the audit database: {0}")]
     Pool(#[from] PoolError),
@@ -382,9 +415,11 @@ fn begin_cause(error: &PgAuditError, connected: bool) -> BeginCause {
         PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,
         PgAuditError::BeginBudget { .. } => BeginCause::BudgetExceeded,
         PgAuditError::Pool(PoolError::Timeout(_)) => BeginCause::PoolTimeout,
-        PgAuditError::Nul { .. } | PgAuditError::Column(_) | PgAuditError::CompleteAtBegin => {
-            BeginCause::ValueRefused
-        }
+        PgAuditError::Nul { .. }
+        | PgAuditError::TooLong { .. }
+        | PgAuditError::RowTooLarge { .. }
+        | PgAuditError::Column(_)
+        | PgAuditError::CompleteAtBegin => BeginCause::ValueRefused,
         _ => BeginCause::DatabaseError,
     }
 }
@@ -589,8 +624,18 @@ pub struct OpenRows {
 ///   table's trigger holds the same rule for every role.
 /// - A row is exactly its record, or it is not written. Begin refuses a record with U+0000 in
 ///   any text value, which Postgres cannot store, with [`PgAuditError::Nul`], so the core
-///   refuses the call; finish refuses a refusal sentence with one, or a latency past its
-///   column's range, and gives up.
+///   refuses the call. Begin refuses a row over
+///   [`MAX_BEGUN_ROW_BYTES`](crate::MAX_BEGUN_ROW_BYTES), and list one over
+///   [`MAX_ROW_BYTES`](crate::MAX_ROW_BYTES), with [`PgAuditError::RowTooLarge`], naming its
+///   largest column. Finish refuses a completion it cannot write exactly: a refusal sentence
+///   holding U+0000, one longer than
+///   [`MAX_OUTCOME_SENTENCE_BYTES`](crate::MAX_OUTCOME_SENTENCE_BYTES) with
+///   [`PgAuditError::TooLong`], naming the column and the cap, or a latency past its column's
+///   range. It sends nothing and fails at once; the finish is given up, counted under `other`
+///   in [`StoreStats::finishes_given_up`] and reported, and the row keeps no completion, so
+///   the open-row query counts it once its deadline passes. The core answers a refused call
+///   whose finish failed with the audit-failure sentence. So a finished call row is within
+///   `MAX_ROW_BYTES` too.
 ///
 /// If the caller stops waiting for finish, its task still completes the row. If the runtime
 /// drops the task first, the finish is counted and reported as given up. So is the task that
