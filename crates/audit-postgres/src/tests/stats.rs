@@ -17,8 +17,8 @@ use super::budgets::{
 };
 use super::store::{Call, begun_row, completion};
 use crate::{
-    BeginFailures, Budgets, GivenUpCauses, LatencyHistogram, PgAuditError, PgAuditStore, PoolSizes,
-    PoolStats, StoreStats,
+    BeginFailures, Budgets, GivenUpCauses, LatencyHistogram, OPEN_ROWS_POOL_SIZE, PgAuditError,
+    PgAuditStore, PoolSizes, PoolStats, StoreStats,
 };
 
 fn allowed() -> Call {
@@ -160,7 +160,7 @@ async fn a_begin_refusing_a_value_counts_one_value_refused() {
 }
 
 /// Begins and finishes that succeed count their latency, one each, and nothing else. Once
-/// idle, no connection of either pool is in use.
+/// idle, no connection of any pool is in use.
 #[tokio::test]
 async fn the_latency_counts_equal_the_begins_and_finishes_and_success_counts_nothing_else() {
     let Some(db) = TestDatabase::create().await else {
@@ -178,6 +178,10 @@ async fn the_latency_counts_equal_the_begins_and_finishes_and_success_counts_not
             },
             finish_pool: PoolStats {
                 max_size: sizes.finish,
+                ..PoolStats::default()
+            },
+            open_rows_pool: PoolStats {
+                max_size: OPEN_ROWS_POOL_SIZE,
                 ..PoolStats::default()
             },
             ..StoreStats::default()
@@ -240,6 +244,22 @@ async fn the_latency_counts_equal_the_begins_and_finishes_and_success_counts_not
     assert_eq!(store.stats().finish_pool.in_use, 1);
     drop(held);
     assert_eq!(store.stats().finish_pool.in_use, 0);
+
+    // The open-row query's pool is counted the same way, apart from the other two.
+    store.open_rows().await.unwrap();
+    let held = store.open_rows_pool.get().await.unwrap();
+    let stats = store.stats();
+    assert_eq!(
+        stats.open_rows_pool,
+        PoolStats {
+            in_use: 1,
+            size: 1,
+            max_size: OPEN_ROWS_POOL_SIZE,
+        }
+    );
+    assert_eq!((stats.begin_pool.in_use, stats.finish_pool.in_use), (0, 0));
+    drop(held);
+    assert_eq!(store.stats().open_rows_pool.in_use, 0);
 }
 
 /// A finish slowed past its answer budget answers the caller and keeps trying: one answer
