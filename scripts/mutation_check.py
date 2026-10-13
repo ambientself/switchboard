@@ -2888,6 +2888,15 @@ mutate("registry-probe-open-accepted", "an entry whose probe found it open loads
        "                Some(probe) if probe.result == ProbeResult::NotShown => {\n")
 mutate("registry-duplicate-server", "a second server of one name replaces the first", RR,
        "        if servers.insert(server.name.clone(), checked).is_some() {", "        if servers.insert(server.name.clone(), checked).is_some() && false {")
+mutate("registry-system-duplicate-accepted", "two servers may have the same system", RR,
+       "        if let Some(first) = systems.insert(system.clone(), server.name.clone()) {",
+       "        if let Some(first) = systems.insert(system.clone(), server.name.clone()).filter(|_| false) {")
+mutate("registry-system-double-underscore-accepted", "a system may contain `__`", RR,
+       "        if server.system.contains(\"__\") || server.system.ends_with('_') {",
+       "        if server.system.ends_with('_') {")
+mutate("registry-system-trailing-underscore-accepted", "a system may end in `_`", RR,
+       "        if server.system.contains(\"__\") || server.system.ends_with('_') {",
+       "        if server.system.contains(\"__\") {")
 mutate("registry-address-unchecked", "any address is accepted", RR,
        "        let Some(host) = address_host(&server.address) else {",
        "        let Some(host) = address_host(&server.address).or(Some(server.identity.as_str())) else {")
