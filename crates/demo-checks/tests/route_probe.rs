@@ -205,6 +205,7 @@ fn assert_no_credential(server: &Recorder) {
 fn dropped_routes_are_refused_by_name_and_by_address() {
     let gateway = Recorder::start(401);
     let hole = dropped();
+    let hole = &hole.url;
     let by_name = named(&hole, "hole.test");
     let routes = format!(
         "# a comment\n\
@@ -247,6 +248,7 @@ fn dropped_routes_are_refused_by_name_and_by_address() {
 fn a_refused_connection_counts_as_refused_only_with_reject_ok() {
     let gateway = Recorder::start(401);
     let closed = closed_port();
+    let closed = &closed.url;
     let run = Probe::new(
         "closed",
         &gateway.url,
@@ -288,6 +290,7 @@ fn a_refused_connection_counts_as_refused_only_with_reject_ok() {
 fn a_refusal_after_a_connection_is_not_refused() {
     let gateway = Recorder::start(401);
     let closed = closed_port();
+    let closed = &closed.url;
     let run = Probe::new(
         "retried",
         &gateway.url,
@@ -375,6 +378,7 @@ fn an_address_literal_host_must_be_one_of_its_rows_addresses() {
     // The URL's own host among other addresses: each is tried. With `resolve`, the host stands
     // for itself, with no lookup.
     let hole = dropped();
+    let hole = &hole.url;
     let run = Probe::new(
         "literal-listed",
         &gateway.url,
@@ -406,6 +410,7 @@ fn an_address_literal_host_must_be_one_of_its_rows_addresses() {
 fn a_dotted_host_that_is_not_an_ipv4_address_fails_its_row() {
     let gateway = Recorder::start(401);
     let hole = dropped();
+    let hole = &hole.url;
     let hosts = [
         "10.0.0.256",
         "1.2.3.4.5",
@@ -440,6 +445,7 @@ fn the_proxy_variables_cannot_send_an_attempt_through_a_proxy() {
     let gateway = Recorder::start(401);
     let server = Recorder::start(200);
     let proxy = closed_port();
+    let proxy = &proxy.url;
     // NO_PROXY covers the gateway alone, so only the route attempt would use the proxy.
     let gateway_url = gateway.url.replace("127.0.0.1", "localhost");
     let run = Probe::new(
@@ -466,6 +472,7 @@ fn the_proxy_variables_cannot_send_an_attempt_through_a_proxy() {
 fn a_name_that_does_not_resolve_could_not_be_probed() {
     let gateway = Recorder::start(401);
     let hole = dropped();
+    let hole = &hole.url;
     let nowhere = named(&hole, "nowhere.test");
     let slow = named(&hole, "slow.test");
     let routes = format!(
@@ -504,6 +511,7 @@ fn a_name_that_does_not_resolve_could_not_be_probed() {
 fn a_resolve_row_tries_each_address_the_name_resolves_to() {
     let gateway = Recorder::start(401);
     let hole = dropped();
+    let hole = &hole.url;
     let by_name = named(&hole, "hole.test");
     let run = Probe::new(
         "resolve",
@@ -630,6 +638,7 @@ fn expect_open_inverts_the_result() {
     assert!(run.stdout.contains("PASS every route open (1 attempts)\n"));
 
     let hole = dropped();
+    let hole = &hole.url;
     let run = Probe::new(
         "expect-open-dropped",
         &gateway.url,
@@ -648,9 +657,11 @@ fn an_unreachable_gateway_fails_before_any_route_is_tried() {
     let server = Recorder::start(401);
     let by_name = named(&server.url, "server.test");
     let routes_text = format!("server\t{by_name}\t127.0.0.1\n");
+    let closed = closed_port();
+    let hole = dropped();
     for (name, gateway, exit) in [
-        ("refused", closed_port(), 7),
-        ("dropped", dropped(), 28),
+        ("refused", closed.url.clone(), 7),
+        ("dropped", hole.url.clone(), 28),
         ("silent", black_hole(), 28),
     ] {
         for expect in ["refused", "open"] {
@@ -809,6 +820,7 @@ fn a_url_glob_cannot_hide_a_connection_behind_a_refusal() {
 
     // The brackets of an IPv6 host are not a glob: the row is tried.
     let closed = closed_port();
+    let closed = &closed.url;
     let v6 = closed.replace("127.0.0.1", "[::1]");
     let run = Probe::new(
         "glob-ipv6-host",
@@ -827,6 +839,7 @@ fn a_url_glob_cannot_hide_a_connection_behind_a_refusal() {
 
     // Two requests' results from one curl run, however they came about, are not one attempt.
     let doubled = closed_port();
+    let doubled = &doubled.url;
     let run = Probe::new(
         "two-results",
         &gateway.url,
@@ -871,6 +884,7 @@ fn a_url_glob_cannot_hide_a_connection_behind_a_refusal() {
 fn every_curl_run_turns_globbing_and_proxies_off() {
     let gateway = Recorder::start(401);
     let hole = dropped();
+    let hole = &hole.url;
     let by_name = named(&hole, "hole.test");
     let probe = Probe::new(
         "globoff",
