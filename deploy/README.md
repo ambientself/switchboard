@@ -313,8 +313,9 @@ committed, finishes in flight, open rows and the oldest open row's deadline (pol
 through the open-row view; a failed poll is counted and keeps the last count), begin and finish
 latency histograms, the connections in use, open and maximum of each audit pool
 (`switchboard_audit_pool_connections_in_use{pool}` and its two neighbours, `pool` one of
-`begin`, `finish` and `open_rows`), and telemetry events and drops. Each proxied server's drift polls by result, the tools the drift
-pass withdrew from it, and how many tools are withdrawn now
+`begin`, `finish` and `open_rows`), and telemetry events and drops. Each proxied server's
+drift polls by result, the tools the drift pass withdrew from it, and how many tools are
+withdrawn now
 (`switchboard_drift_polls_total{server,result}`, `switchboard_drift_withdrawals_total{server}`,
 `switchboard_tools_withdrawn`). Receipts in `unknown` arrive with receipts (#10 stage 2). The
 Compose run checks that its database outage counted a begin failure and an audit-failure answer;
@@ -332,8 +333,8 @@ that tells an unreachable database from a small pool is #155.
 Each gateway instance opens at most 21 connections to the audit database: 16 for begins and list
 rows, 4 for finishes, and 1 for the open-row poll. The poll has its connection to itself, so a
 poll held up for its full 2 s never takes a connection a finish could use (#140). The pool
-metrics cover all three pools; the poll's is `pool="open_rows"`. So the database's
-`max_connections` must be at least the number of gateway replicas times 21, plus the
+metrics cover all three pools; the poll's is `pool="open_rows"`. The database's
+`max_connections` must therefore be at least the number of gateway replicas times 21, plus the
 connections the migrate job and readers use (decision 0014, as amended on 2026-10-12).
 
 ## Stopping the gateway
