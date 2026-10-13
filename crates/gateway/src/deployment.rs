@@ -144,13 +144,16 @@
 //!   other (see [`crate::drift::probe_credentials`]). `switchboard probe` reads the same file.
 //!   `drift.reach_token_file`, `drift.reach_url` and `drift.reach_host` set up the reach check
 //!   ([`crate::reach`]): given together or not at all, the URL plain `http` and the host one of
-//!   `http.allowed_hosts`.
+//!   `http.allowed_hosts`. Loading this file allows all three left out, since it does not read
+//!   the registry, but the gateway refuses to start without them while any registry entry has a
+//!   reach check, naming the entries (see [`crate::start`]).
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! limits, each server's bounds and the drift interval have defaults, so a gateway not told
-//! where to listen is reachable from its own machine only. Any other missing field is an error,
-//! and so is a field that does not belong to the chosen mode or kind, such as `subjects_file`
-//! on a user issuer.
+//! where to listen is reachable from its own machine only. `[metrics]`, each server's CA file
+//! and the reach settings may be left out, each under the rules above. Any other missing field
+//! is an error, and so is a field that does not belong to the chosen mode or kind, such as
+//! `subjects_file` on a user issuer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -622,7 +625,8 @@ pub struct Deployment {
     pub drift_interval: Duration,
     /// Each proxied server's probe credential file, from the deployment file's directory.
     pub probe_credentials: BTreeMap<ConnectorName, PathBuf>,
-    /// The reach check's settings, or `None` when no reach is checked.
+    /// The reach check's settings, or `None` when none are given, which the gateway's start
+    /// allows only for a registry none of whose entries has a reach check.
     pub reach: Option<ReachSettings>,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,

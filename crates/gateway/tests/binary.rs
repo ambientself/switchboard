@@ -243,6 +243,9 @@ fn a_refused_deployment_is_refused_before_the_address_is_bound() {
     );
     let unreachable_store =
         held_at("[audit]\nmode = \"postgres\"\nurl_env = \"SWITCHBOARD_BINARY_TEST_URL\"\n");
+    // The kind registry's entries have a reach check, which nothing could make.
+    let no_reach_settings =
+        files::without_reach_settings(&held_at("[audit]\nmode = \"disabled\"\n"));
     // With nothing naming the instance, an empty value counting as none, it refuses.
     let no_instance = held_at("[audit]\nmode = \"disabled\"\n");
     // An issuer whose keys URL nothing answers.
@@ -269,6 +272,12 @@ fn a_refused_deployment_is_refused_before_the_address_is_bound() {
             "unreachable-store",
             unreachable_store,
             "the audit store will not start",
+            INSTANCE,
+        ),
+        (
+            "no-reach-settings",
+            no_reach_settings,
+            "the registry gives `docs-team-a`, `docs-team-b` a reach check",
             INSTANCE,
         ),
         (

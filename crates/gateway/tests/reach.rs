@@ -831,14 +831,11 @@ async fn boot_makes_no_reach_check() {
     let (captured, _logging) = Captured::start();
     let mock = mock().await;
     let files = Files::new("reach-boot", &issuer().jwks_document(), &mock.url());
-    files.write("registry-token", &format!("{}\n", token(REGISTRY_SA)));
-    let deployment = files::deployment_file("[audit]\nmode = \"disabled\"\n").replace(
-        "[drift.probe_credentials]\n",
-        "[drift]\nreach_token_file = \"registry-token\"\n\
-         reach_url = \"http://127.0.0.1:9/mcp/registry-reach\"\nreach_host = \"127.0.0.1\"\n\n\
-         [drift.probe_credentials]\n",
+    // The deployment file gives the reach settings, at a URL where nothing listens.
+    files.write(
+        files::REACH_TOKEN_FILE,
+        &format!("{}\n", token(REGISTRY_SA)),
     );
-    files.write("gateway.toml", &deployment);
     let prepared = start::prepare(
         files.load(),
         InstanceName::new("reach-test"),
@@ -854,12 +851,46 @@ async fn boot_makes_no_reach_check() {
         .filter(|fields| fields.get("reach_url").is_some())
         .collect();
     assert_eq!(boot.len(), 1, "{boot:?}");
-    assert_eq!(
-        boot[0]["reach_url"],
-        "http://127.0.0.1:9/mcp/registry-reach"
-    );
+    assert_eq!(boot[0]["reach_url"], files::REACH_URL);
     for event in ["reach_held", "reach_mismatch", "reach_check_failed"] {
         assert!(captured.events(event).is_empty(), "{event}");
     }
     assert!(canary_calls(&mock).is_empty());
+}
+
+/// Start refuses a registry whose entries have a reach check when the deployment file gives no
+/// `[drift] reach_*` settings, naming the entries and the settings, as it refuses a server with
+/// no probe credential: their reach would never be checked. It refuses before the first drift
+/// pass, so nothing reaches the server.
+#[tokio::test]
+async fn start_refuses_entries_with_a_reach_check_and_no_reach_settings() {
+    let mock = mock().await;
+    let files = Files::new("reach-unset", &issuer().jwks_document(), &mock.url());
+    files.write(
+        "gateway.toml",
+        &files::without_reach_settings(&files::deployment_file("[audit]\nmode = \"disabled\"\n")),
+    );
+    let refused = start::prepare(
+        files.load(),
+        InstanceName::new("reach-test"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            start::StartError::NoReachSettings(entries)
+                if entries == &[ConnectorName::new("docs-team-a"), ConnectorName::new("docs-team-b")]
+        ),
+        "{refused:?}"
+    );
+    let said = refused.to_string();
+    for part in [
+        "`docs-team-a`, `docs-team-b`",
+        "`[drift] reach_token_file`, `reach_url` and `reach_host`",
+    ] {
+        assert!(said.contains(part), "{part}: {said}");
+    }
+    assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
 }

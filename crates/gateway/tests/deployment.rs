@@ -9,7 +9,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use files::{CLUSTER_ISSUER, Files, TEAM_A_SA, TEAM_B_SA, cluster_issuer, deployment_file};
+use files::{
+    CLUSTER_ISSUER, Files, REACH_TOKEN_FILE, REACH_URL, TEAM_A_SA, TEAM_B_SA, cluster_issuer,
+    deployment_file,
+};
 use gateway::deployment::{DeploymentFile, TeamManifest};
 use gateway::{AuditChoice, DeploymentError, IssuerKindEntry};
 use gateway_registry::Registry;
@@ -458,17 +461,19 @@ fn the_drift_interval_defaults_to_five_minutes_and_is_5_to_900_seconds() {
     let loaded = files("drift-default").load();
     assert_eq!(loaded.drift_interval, Duration::from_secs(300));
     assert_eq!(loaded.drift_interval, gateway::DEFAULT_DRIFT_INTERVAL);
-    let table = |seconds: &str| format!("[drift]\ninterval_seconds = {seconds}\n\n[credentials]\n");
-    let loaded = load_edited(
-        "drift-empty",
-        "[credentials]\n",
-        "[drift]\n\n[credentials]\n",
+    let table = |seconds: &str| format!("[drift]\ninterval_seconds = {seconds}\n");
+    // The deployment file's `[drift]` holds only the reach settings; without them it is empty.
+    let reach = format!(
+        "[drift]\nreach_token_file = \"{REACH_TOKEN_FILE}\"\nreach_url = \"{REACH_URL}\"\n\
+         reach_host = \"127.0.0.1\"\n"
     );
-    assert_eq!(loaded.unwrap().drift_interval, Duration::from_secs(300));
+    let loaded = load_edited("drift-empty", &reach, "[drift]\n").unwrap();
+    assert_eq!(loaded.drift_interval, Duration::from_secs(300));
+    assert_eq!(loaded.reach, None);
     for seconds in [5, 10, 900] {
         let loaded = load_edited(
             &format!("drift-{seconds}"),
-            "[credentials]\n",
+            "[drift]\n",
             &table(&seconds.to_string()),
         )
         .unwrap();
@@ -477,7 +482,7 @@ fn the_drift_interval_defaults_to_five_minutes_and_is_5_to_900_seconds() {
     for seconds in [0, 4, 901] {
         let said = refused(
             &format!("drift-{seconds}"),
-            "[credentials]\n",
+            "[drift]\n",
             &table(&seconds.to_string()),
         );
         assert_eq!(
@@ -487,8 +492,8 @@ fn the_drift_interval_defaults_to_five_minutes_and_is_5_to_900_seconds() {
     }
     let said = refused(
         "drift-unknown-field",
-        "[credentials]\n",
-        "[drift]\ninterval = 10\n\n[credentials]\n",
+        "[drift]\n",
+        "[drift]\ninterval = 10\n",
     );
     assert!(said.contains("not a valid deployment file"), "{said}");
 }

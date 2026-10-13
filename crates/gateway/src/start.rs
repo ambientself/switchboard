@@ -12,14 +12,16 @@
 //! where each proxied server is reached (decision 0013, section 3): an `https` server needs the
 //! CA file `[servers.<name>] ca_file` names, an `http` server may have none, and an address
 //! that is an IP literal the connector would never connect to is refused, loopback among them
-//! outside a development build. Then it loads each proxied server's credential, builds a
-//! [`ProxyConnector`] per server with its destination and CA file and with the deadline
-//! and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each in a
-//! [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
-//! ([`probe_credentials`]), fetches the keys of each issuer
-//! configured with a keys URL, connects the Postgres audit store and runs its
-//! boot checks (or, in a development build, takes audit as explicitly disabled), and then runs
-//! the boot gates ([`boot::check_registry`]). Any failure refuses to start, naming the reason,
+//! outside a development build. It refuses a registry whose entries have a reach check when the
+//! deployment file gives no `[drift] reach_*` settings, naming those entries, since their reach
+//! would never be checked (decision 0011, section 4). Then it loads each proxied server's
+//! credential, builds a [`ProxyConnector`] per server with its destination and CA file and with
+//! the deadline and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each
+//! in a [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
+//! ([`probe_credentials`]), fetches the keys of each issuer configured with a keys URL,
+//! connects the Postgres audit store and runs its boot checks (or, in a development build,
+//! takes audit as explicitly disabled), and then runs the boot gates
+//! ([`boot::check_registry`]). Any failure refuses to start, naming the reason,
 //! before anything is served. A `[servers.<name>]` for a server the registry does not name is
 //! refused: a bound meant for a server that is not there would be one nobody holds.
 //!
@@ -75,7 +77,7 @@ use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
 use crate::drift::{DriftPass, ProbeCredentialError, probe_credentials};
 use crate::keys::KeyRefresher;
-use crate::reach::ReachCaller;
+use crate::reach::{ReachCaller, ReachSettings};
 use crate::reload::Reloader;
 
 /// The `event` field of the error logged for each audit row the Postgres store stops trying to
@@ -147,6 +149,15 @@ pub enum StartError {
     /// A proxied server has no probe credential, or its file could not be loaded.
     #[error(transparent)]
     ProbeCredentials(#[from] ProbeCredentialError),
+    /// Registry entries have a reach check, and the deployment file does not say how to make
+    /// it (decision 0011, section 4): their reach would never be checked.
+    #[error(
+        "the registry gives {} a reach check, but the deployment file has no `[drift] \
+         reach_token_file`, `reach_url` and `reach_host`; give all three, so that each entry's \
+         reach is checked",
+        named(.0)
+    )]
+    NoReachSettings(Vec<ConnectorName>),
     /// An `https` server has no CA file in the deployment file (decision 0013, section 3).
     #[error(
         "server `{0}` has an https address, so `[servers.{0}]` must name the CA file its \
@@ -317,6 +328,7 @@ async fn prepare_with(
         Loopback::Refused
     };
     destinations(&registry, &deployment.ca_files, loopback)?;
+    reach_settings(&registry, deployment.reach.as_ref())?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
@@ -454,10 +466,10 @@ async fn prepare_with(
             );
             drift = drift.with_reach(ReachCaller::new(reach), &deployment.servers);
         }
-        None => tracing::warn!(
+        None => tracing::info!(
             event = "boot",
-            reach = "off",
-            "no entry's reach is checked: the deployment file has no [drift] reach_token_file, reach_url and reach_host"
+            reach = "none",
+            "no entry has a reach check, and the deployment file gives no [drift] reach settings"
         ),
     }
     drift.pass().await;
@@ -501,6 +513,30 @@ async fn prepare_with(
 
 /// The connector of each proxied server, by name, for the drift pass.
 type Connectors = BTreeMap<ConnectorName, Arc<ProxyConnector>>;
+
+/// `servers`, each in backquotes, separated by commas.
+fn named(servers: &[ConnectorName]) -> String {
+    servers
+        .iter()
+        .map(|server| format!("`{server}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuses a registry with an entry that has a reach check when the deployment file gives no
+/// reach settings: that entry's reach would never be checked (decision 0011, section 4).
+fn reach_settings(registry: &Registry, reach: Option<&ReachSettings>) -> Result<(), StartError> {
+    let checked: Vec<ConnectorName> = registry
+        .servers()
+        .iter()
+        .filter(|(_, server)| server.reach_check.is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if reach.is_none() && !checked.is_empty() {
+        return Err(StartError::NoReachSettings(checked));
+    }
+    Ok(())
+}
 
 /// The connector's class of a registry entry's destination.
 pub(crate) fn destination(destination: Destination) -> connector_proxy::Destination {

@@ -227,6 +227,13 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
     ] {
         assert!(registry.contains(line), "{line}: {registry}");
     }
+    // Its entry has a reach check, so the configuration gives the reach settings, without which
+    // the gateway would refuse to start for that instead.
+    assert!(registry.contains("[servers.reach_check]"), "{registry}");
+    assert!(
+        loopback.contains("[drift]\nreach_token_file = "),
+        "{loopback}"
+    );
     // The keys are public only: no private parameter of an EC or RSA key.
     for config in ["proxied-propose", "audit-disabled", "loopback-destination"] {
         let keys: Value =

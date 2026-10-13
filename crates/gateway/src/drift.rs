@@ -59,11 +59,13 @@
 //! [`TOOL_WITHDRAWN_EVENT`] at ERROR, naming the tool, its server, the cause and the base and
 //! derived revisions, and counted.
 //!
-//! **The reach check** (decision 0011, section 4; decision 0013, section 5, step 3). When the
-//! deployment file gives `[drift] reach_*` ([`ReachSettings`]), each server whose registry entry
-//! has a `reach_check` is checked on its schedule, beside each poll: [`ReachCaller`] sends the
-//! check's canary, a call outside the entry's reach, through this replica's own listener, under
-//! the registry's own workload identity, so it is decided and audited like any call. It goes
+//! **The reach check** (decision 0011, section 4; decision 0013, section 5, step 3). Each
+//! server whose registry entry has a `reach_check` is checked on its schedule, beside each
+//! poll: [`ReachCaller`] sends the check's canary, a call outside the entry's reach, through
+//! this replica's own listener, under the registry's own workload identity, so it is decided
+//! and audited like any call. The deployment file's `[drift] reach_*` ([`ReachSettings`]) say
+//! where and as whom, and the gateway refuses to start without them while any entry has a
+//! `reach_check` ([`crate::start`]), so no such entry goes unchecked. It goes
 //! through the listener, so it never runs in the boot pass, which comes before the listener is
 //! bound: [`DriftPass::run`] makes each entry's first check as soon as it starts, after the
 //! binary has bound the listener, and one more beside each poll after. That first check runs
@@ -156,7 +158,7 @@ pub const REACH_FAILED_EVENT: &str = "reach_check_failed";
 /// ```toml
 /// [drift]
 /// interval_seconds = 300      # 300 if left out; 5 to 900
-/// # The reach check: all three, or none.
+/// # The reach check: all three, needed while an entry has a reach_check.
 /// reach_token_file = "/var/run/switchboard/tokens/registry"
 /// reach_url = "http://127.0.0.1:8080/mcp/registry-reach"
 /// reach_host = "gateway.switchboard.svc.cluster.local"
@@ -173,7 +175,9 @@ pub const REACH_FAILED_EVENT: &str = "reach_check_failed";
 /// `reach_token_file`, `reach_url` and `reach_host` set up the reach check
 /// ([`ReachSettings`]): the registry's workload token, this replica's own listener and the
 /// surface the registry is admitted to, and the `Host` to call it with, one of
-/// `http.allowed_hosts`. Without them no reach is checked, and boot logs so at WARN.
+/// `http.allowed_hosts`. They are given together or not at all, and may be left out only when
+/// no registry entry has a reach check: otherwise the gateway refuses to start, naming the
+/// entries ([`crate::start`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DriftSection {

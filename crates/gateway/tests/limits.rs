@@ -710,6 +710,34 @@ async fn the_deployment_files_bounds_and_caps_reach_the_gateway() {
     assert_eq!(prepared.max_in_flight, gateway::DEFAULT_MAX_IN_FLIGHT);
 }
 
+/// Without `[drift] reach_*`, `start::prepare` starts a registry none of whose entries has a
+/// reach check, and checks no reach: the settings are required only for an entry with one.
+#[tokio::test]
+async fn without_reach_settings_it_starts_when_no_entry_has_a_reach_check() {
+    let slow = Scripted::answering().await;
+    let other = Scripted::answering().await;
+    let files = Files::new("no-reach", &issuer().jwks_document(), &slow.url);
+    files.write(
+        "registry/registry.toml",
+        &registry_text(&slow.url, &other.url),
+    );
+    files.write(
+        "gateway.toml",
+        &files::without_reach_settings(&deployment_file_probing(
+            "[audit]\nmode = \"disabled\"\n",
+            &[SLOW, OTHER],
+        )),
+    );
+    let prepared = prepare(
+        files.load(),
+        InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap();
+    assert!(!prepared.drift.checks_reach());
+}
+
 /// `start::prepare` holds the instance and each server to the caps `[limits]` sets, served as
 /// the binary serves it, with both servers hanging. With `per_server_in_flight = 1`, team-b's
 /// call to the server team-a's call holds is refused with the server's sentence. With

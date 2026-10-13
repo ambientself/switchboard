@@ -4470,6 +4470,10 @@ mutate("gw-start-destination-not-passed", "each server's connector is built with
        "        upstream.destination = destination(server.destination);\n", "")
 mutate("gw-start-destinations-unchecked", "where each server is reached is not checked until its connector is built, after its credential is read", START,
        "    destinations(&registry, &deployment.ca_files, loopback)?;\n", "")
+# An entry with a reach check needs the deployment file's reach settings (decision 0011, section
+# 4). tests/reach.rs and tests/binary.rs watch it.
+mutate("gw-start-reach-settings-optional", "a registry whose entries have a reach check starts without the reach settings, so their reach is never checked", START,
+       "        return Err(StartError::NoReachSettings(checked));\n", "        let _ = checked;\n")
 
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(outcome) => Box::pin(std::future::ready(outcome)),",

@@ -1548,24 +1548,27 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   restored server serves the tool again (decision 0013, section 7). `tests/drift.rs` has
   decision 0013's drift scenarios. Each poll also probes its server (the probe entry below).
   The reach check of the same pass is built (decision 0011, section 4; decision 0013, section
-  5, step 3). With `[drift] reach_token_file`, `reach_url` and `reach_host` set, given together
-  or not at all, each entry with a `reach_check` is checked beside each poll, and once as soon
-  as the drift pass starts, after the listener is bound; never in the boot pass, which comes
-  before it. That first check runs beside the entry's schedule and delays no poll; a poll that
+  5, step 3). With `[drift] reach_token_file`, `reach_url` and `reach_host`, given together,
+  each entry with a `reach_check` is checked beside each poll, and once as soon as the drift
+  pass starts, after the listener is bound; never in the boot pass, which comes before it. The
+  gateway refuses to start without the three fields while any entry has a `reach_check`,
+  naming the entries, so none goes unchecked. That first check runs beside the entry's schedule and delays no poll; a poll that
   comes while it is out makes no check of its own. The check sends the entry's canary as
   `tools/call` to the replica's own listener, on the `registry-reach` surface, with the
   registry's own workload token: a principal the surface admits alone, by issuer and subject,
   in team `registry`, whose limit holds each entry's reach and canary, so the call is decided,
   audited and sent with the entry's credential like any other. An error result whose text is
-  the proxy's upstream-refused sentence holds, logged as `reach_held`. A successful result is a mismatch: every tool of the
-  entry is withdrawn with the cause `reach mismatch`, judged against the approvals the check
-  began under, logged as `reach_mismatch` and `tool_withdrawn` at ERROR, and a new approval
-  clears it. Anything else, a denial, an audit failure, a token that cannot be read or no
-  answer within the call deadline plus 5 s, is a failed check, logged as `reach_check_failed`
-  at WARN, and withdraws nothing; so is a check whose canary tool is not served now, which
-  makes no call. Each is counted in `switchboard_reach_checks_total{server,result}`. Without
-  the fields no reach is checked, and boot says so at WARN. `tests/reach.rs` has the held,
-  mismatch, failed and denied cases on the mock server.
+  the proxy's upstream-refused sentence holds, logged as `reach_held`. A successful result is
+  a mismatch: every tool of the entry is withdrawn with the cause `reach mismatch`, judged
+  against the approvals the check began under, logged as `reach_mismatch` and
+  `tool_withdrawn` at ERROR, and a new approval clears it. Anything else, a denial, an audit
+  failure, a token that cannot be read, an answer larger than the check reads (any answer the
+  connector passes on fits) or none within the call deadline plus 5 s, is a failed check,
+  logged as `reach_check_failed` at WARN, and withdraws nothing; so is a check whose canary
+  tool is not served now, which makes no call. Each is counted in
+  `switchboard_reach_checks_total{server,result}`. `tests/reach.rs` has the held, mismatch,
+  failed and denied cases on the mock server, a check outstanding across a new approval, which
+  withdraws nothing, and the start refused without the fields.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.
@@ -1595,8 +1598,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The 512 KiB row bound and its test: not built.
 - The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
   each proxied server's calls, latency and late or oversized answers (#139), and the policy's
-  age (#132), and each server's drift polls, withdrawals and probe results, are exported.
-  Reach-check results are not built.
+  age (#132), and each server's drift polls, withdrawals, probe results and reach-check
+  results, are exported.
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
