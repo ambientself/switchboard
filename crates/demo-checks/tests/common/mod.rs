@@ -252,8 +252,9 @@ pub fn dropped() -> ClosedPort {
 }
 
 /// A loopback port that refuses connections, held for as long as this lives, and its URL
-/// `http://127.0.0.1:PORT/mcp`. Keep it for the whole test: once it is dropped, the port is free
-/// and another test in the same binary may listen on it.
+/// `http://127.0.0.1:PORT/mcp`. Keep it for the whole test: once it is dropped, nothing holds
+/// the port for this test, and another test in the same binary may listen on it. (The closed
+/// connection may leave the port in TIME_WAIT for a while, but nothing relies on that.)
 #[must_use = "the port is held only while this lives"]
 pub struct ClosedPort {
     pub url: String,
