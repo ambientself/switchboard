@@ -5004,7 +5004,7 @@ fn the_reach_reapproval_needs_both_of_docs_team_as_withdrawals_cleared() {
         checked(
             name,
             &format!(
-                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools'\" docs-team-a__list_documents docs-team-a__read_document"
+                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools' withdrawals cleared as approved again\" docs-team-a__list_documents docs-team-a__read_document"
             ),
             &[("log", &lines.join("\n"))],
         )
