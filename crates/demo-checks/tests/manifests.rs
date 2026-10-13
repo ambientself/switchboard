@@ -1,6 +1,7 @@
-//! The Compose file and the kind manifests hold to what the demo claims. Read as text, with no
-//! YAML parser: each check names the exact lines it relies on, so a change to them has to
-//! change the test too, on purpose.
+//! The Compose file and the kind manifests hold to what the demo claims. Most checks read them
+//! as text and name the exact lines they rely on, so a change to them has to change the test
+//! too, on purpose. The token guards read the kind manifests with a YAML parser instead, as the
+//! API server does, since no list of lines can name every way to write a token into a pod.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -11,6 +12,7 @@ use common::read;
 use gateway::deployment::DeploymentFile;
 use gateway::{READINESS_REMOVAL, SHUTDOWN_GRACE};
 use sha2::{Digest, Sha256};
+use yaml_rust2::{Yaml, YamlLoader, yaml::Hash};
 
 /// The block of a top-level Compose service: its lines up to the next service.
 fn compose_service(compose: &str, name: &str) -> String {
@@ -411,92 +413,228 @@ fn block_after(text: &str, header: &str) -> String {
         .join("\n")
 }
 
-/// The items of the YAML list that follows the line `header` in `text`, each from its `- ` line
-/// up to the next item. A comment between two items goes with the first.
-fn items(text: &str, header: &str) -> Vec<String> {
-    let block = block_after(text, header);
-    let indent = block
-        .lines()
-        .find(|line| line.trim_start().starts_with("- "))
-        .map(|line| line.len() - line.trim_start().len())
-        .unwrap_or_else(|| panic!("no list after `{header}`"));
-    let mut items: Vec<String> = Vec::new();
-    for line in block.lines() {
-        if line.len() - line.trim_start().len() == indent && line.trim_start().starts_with("- ") {
-            items.push(String::new());
-        }
-        if let Some(item) = items.last_mut() {
-            item.push_str(line);
-            item.push('\n');
-        }
-    }
-    items
+// The token guards' reader (#182). The guards that keep a token the API server accepts out of
+// the gateway container and the teams' workloads (decision 0013, section 10) read the manifests
+// with a YAML parser and walk the parsed pods, so aliases, anchors, tags, quoting, escapes,
+// blank lines and comments are the parser's to read. Where a field has a shape they do not
+// expect, they panic rather than read it as absent.
+
+/// The documents of a manifest, parsed, with each merge key (`<<`) applied as the API server's
+/// YAML reader applies it. The parser resolves aliases but leaves merge keys to this.
+fn manifest(text: &str) -> Vec<Yaml> {
+    YamlLoader::load_from_str(text)
+        .unwrap_or_else(|error| panic!("a manifest the parser cannot read: {error}"))
+        .into_iter()
+        .map(merged)
+        .collect()
 }
 
-/// The name of a list item that starts `- name: NAME`, or `- {name: NAME, ...}`.
-fn item_name(item: &str) -> &str {
-    let first = item.lines().next().unwrap().trim_start();
-    let name = first
-        .strip_prefix("- name: ")
-        .or_else(|| first.strip_prefix("- {name: "))
-        .unwrap_or_else(|| panic!("an item without a name first: {first}"));
-    name.split([',', '}']).next().unwrap().trim()
-}
-
-/// The audience of each projected ServiceAccount token source in `volume`, None for a source
-/// that names none and so gets the API server's. It reads a source block style
-/// (`- serviceAccountToken:`, then its fields on the lines under it, past blank lines and
-/// comments) or flow style (`- serviceAccountToken: {...}` or `- {serviceAccountToken: {...}}`,
-/// its fields closed on that line). It panics on any other line that names
-/// `serviceAccountToken`, on a flow mapping that does not close on its line, and on a field it
-/// cannot read as `audience`, `expirationSeconds` or `path` with a value. It is not a YAML
-/// parser: a quoted key, an alias, an anchor or tag on the audience, or an empty or null
-/// audience can still be misread, and #182 replaces it with one.
-fn token_audiences(volume: &str) -> Vec<Option<String>> {
-    let lines: Vec<&str> = volume.lines().collect();
-    let mut audiences = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        let text = line.trim_start();
-        if text.starts_with('#') || !text.contains("serviceAccountToken") {
-            continue;
-        }
-        let fields: Vec<&str> = if text == "- serviceAccountToken:" {
-            let indent = line.len() - text.len();
-            lines[at + 1..]
-                .iter()
-                .filter(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'))
-                .take_while(|next| next.len() - next.trim_start().len() > indent + 2)
-                .map(|next| next.trim())
-                .collect()
-        } else {
-            let rest = text
-                .strip_prefix("- serviceAccountToken: {")
-                .or_else(|| text.strip_prefix("- {serviceAccountToken: {"))
-                .unwrap_or_else(|| panic!("a token source it cannot read: {text}"));
-            let (fields, _) = rest.split_once('}').unwrap_or_else(|| {
-                panic!("a token source that does not close on its line: {text}")
-            });
-            fields
-                .split(',')
-                .map(str::trim)
-                .filter(|field| !field.is_empty())
-                .collect()
-        };
-        let mut audience = None;
-        for field in fields {
-            let (key, value) = field
-                .split_once(": ")
-                .unwrap_or_else(|| panic!("a token source field it cannot read: {field}"));
-            let value = value.split(" #").next().unwrap().trim();
-            match key {
-                "audience" => audience = Some(value.trim_matches(['"', '\'']).to_owned()),
-                "expirationSeconds" | "path" => {}
-                _ => panic!("a token source field it cannot read: {field}"),
+/// `node` with each merge key applied: a mapping gets each key of the mappings it merges that it
+/// does not set itself, from the first of them that sets it.
+fn merged(node: Yaml) -> Yaml {
+    match node {
+        Yaml::Array(items) => Yaml::Array(items.into_iter().map(merged).collect()),
+        Yaml::Hash(entries) => {
+            let mut own = Hash::new();
+            let mut merges = Vec::new();
+            for (key, value) in entries {
+                if key.as_str() == Some("<<") {
+                    match merged(value) {
+                        Yaml::Array(mappings) => merges.extend(mappings),
+                        mapping => merges.push(mapping),
+                    }
+                } else {
+                    own.insert(merged(key), merged(value));
+                }
             }
+            for mapping in merges {
+                let Yaml::Hash(mapping) = mapping else {
+                    panic!("a merge key whose value is not a mapping: {mapping:?}");
+                };
+                for (key, value) in mapping {
+                    if !own.contains_key(&key) {
+                        own.insert(key, value);
+                    }
+                }
+            }
+            Yaml::Hash(own)
         }
-        audiences.push(audience);
+        scalar => scalar,
     }
-    audiences
+}
+
+/// The one YAML value in `text`, to compare a part of a manifest with what it must be.
+fn yaml(text: &str) -> Yaml {
+    let mut documents = manifest(text);
+    assert_eq!(documents.len(), 1, "{text}");
+    documents.remove(0)
+}
+
+/// `node` as a mapping, or None if it is absent or null. It panics on anything else.
+fn mapping<'a>(node: &'a Yaml, what: &str) -> Option<&'a Hash> {
+    match node {
+        Yaml::Hash(entries) => Some(entries),
+        Yaml::BadValue | Yaml::Null => None,
+        other => panic!("{what} that is not a mapping: {other:?}"),
+    }
+}
+
+/// The items of the list `node`, none if it is absent or null. It panics on anything else.
+fn list<'a>(node: &'a Yaml, what: &str) -> &'a [Yaml] {
+    match node {
+        Yaml::Array(items) => items,
+        Yaml::BadValue | Yaml::Null => &[],
+        other => panic!("{what} that is not a list: {other:?}"),
+    }
+}
+
+/// The string `node`, which must be one.
+fn string<'a>(node: &'a Yaml, what: &str) -> &'a str {
+    node.as_str()
+        .unwrap_or_else(|| panic!("{what} that is not a string: {node:?}"))
+}
+
+/// The kind, namespace and name of a manifest's document.
+fn label(document: &Yaml) -> String {
+    let metadata = &document["metadata"];
+    format!(
+        "{} {}/{}",
+        document["kind"].as_str().unwrap_or("?"),
+        metadata["namespace"].as_str().unwrap_or(""),
+        metadata["name"].as_str().unwrap_or("?")
+    )
+}
+
+/// Every pod spec in a manifest's documents, each with its document: each mapping, at any depth,
+/// that has `containers` or `initContainers`. So a Pod's spec, the template of a Deployment, a
+/// Job or any other controller, and a CronJob's job template are all read, and so is the pod of
+/// a kind these tests do not name.
+fn pod_specs(documents: &[Yaml]) -> Vec<(&Yaml, &Yaml)> {
+    fn find<'a>(node: &'a Yaml, found: &mut Vec<&'a Yaml>) {
+        match node {
+            Yaml::Hash(entries) => {
+                if ["containers", "initContainers"]
+                    .iter()
+                    .any(|key| !node[*key].is_badvalue())
+                {
+                    found.push(node);
+                } else {
+                    entries.values().for_each(|value| find(value, found));
+                }
+            }
+            Yaml::Array(items) => items.iter().for_each(|item| find(item, found)),
+            _ => {}
+        }
+    }
+    let mut pods = Vec::new();
+    for document in documents {
+        let mut found = Vec::new();
+        find(document, &mut found);
+        pods.extend(found.into_iter().map(|pod| (document, pod)));
+    }
+    pods
+}
+
+/// The one pod spec in the manifest `text`.
+fn only_pod(text: &str) -> Yaml {
+    let documents = manifest(text);
+    let pods = pod_specs(&documents);
+    let labels: Vec<String> = pods.iter().map(|(document, _)| label(document)).collect();
+    assert_eq!(pods.len(), 1, "want one pod: {labels:?}");
+    pods[0].1.clone()
+}
+
+/// The lists of a pod spec's containers, init containers first.
+const CONTAINER_LISTS: [&str; 3] = ["initContainers", "containers", "ephemeralContainers"];
+
+/// A pod spec's containers of every kind, in the order of [`CONTAINER_LISTS`].
+fn pod_containers(pod: &Yaml) -> Vec<&Yaml> {
+    CONTAINER_LISTS
+        .iter()
+        .flat_map(|key| list(&pod[*key], key))
+        .collect()
+}
+
+/// A pod spec's containers, each by name with the name of each volume it mounts.
+fn containers(pod: &Yaml) -> Vec<(String, Vec<String>)> {
+    pod_containers(pod)
+        .into_iter()
+        .map(|container| {
+            let mounts = list(&container["volumeMounts"], "volumeMounts")
+                .iter()
+                .map(|mount| string(&mount["name"], "a volume mount's name").to_owned())
+                .collect();
+            let name = string(&container["name"], "a container's name");
+            (name.to_owned(), mounts)
+        })
+        .collect()
+}
+
+/// The container `name` of a pod spec.
+fn container<'a>(pod: &'a Yaml, name: &str) -> &'a Yaml {
+    let found: Vec<&Yaml> = pod_containers(pod)
+        .into_iter()
+        .filter(|container| container["name"].as_str() == Some(name))
+        .collect();
+    assert_eq!(found.len(), 1, "want one container `{name}`");
+    found[0]
+}
+
+/// The volume mounts of `container` that mount the volume `name`.
+fn mounts_of<'a>(container: &'a Yaml, name: &str) -> Vec<&'a Yaml> {
+    list(&container["volumeMounts"], "volumeMounts")
+        .iter()
+        .filter(|mount| mount["name"].as_str() == Some(name))
+        .collect()
+}
+
+/// The volume `name` of a pod spec.
+fn volume<'a>(pod: &'a Yaml, name: &str) -> &'a Yaml {
+    let found: Vec<&Yaml> = list(&pod["volumes"], "volumes")
+        .iter()
+        .filter(|volume| volume["name"].as_str() == Some(name))
+        .collect();
+    assert_eq!(found.len(), 1, "want one volume `{name}`");
+    found[0]
+}
+
+/// A pod spec's volumes, each by name with the audience of each ServiceAccount token it projects.
+fn volumes(pod: &Yaml) -> Vec<(String, Vec<Option<String>>)> {
+    list(&pod["volumes"], "volumes")
+        .iter()
+        .map(|volume| {
+            let name = string(&volume["name"], "a volume's name");
+            (name.to_owned(), token_audiences(volume))
+        })
+        .collect()
+}
+
+/// The audience of each ServiceAccount token source of `volume`, None for one that names none,
+/// or an empty or null one: the API server gives such a token its own audience. A source whose
+/// `serviceAccountToken` is null counts as one with no audience.
+fn token_audiences(volume: &Yaml) -> Vec<Option<String>> {
+    mapping(&volume["projected"], "a projected volume");
+    list(&volume["projected"]["sources"], "a projection's sources")
+        .iter()
+        .filter_map(|source| {
+            let source = mapping(source, "a projected source")?;
+            let token = source.get(&Yaml::String("serviceAccountToken".to_owned()))?;
+            Some(audience(token))
+        })
+        .collect()
+}
+
+/// The audience a projected token source names, None if it names none, or an empty or null one.
+/// The parser reads only `~`, `null` and an empty value as null, where the API server's reader
+/// reads `Null` and `NULL` as null too, so those are taken for null whether quoted or not.
+fn audience(token: &Yaml) -> Option<String> {
+    mapping(token, "a serviceAccountToken");
+    match &token["audience"] {
+        Yaml::BadValue | Yaml::Null => None,
+        Yaml::String(audience) if ["", "Null", "NULL"].contains(&audience.as_str()) => None,
+        Yaml::String(audience) => Some(audience.clone()),
+        other => panic!("an audience that is not a string: {other:?}"),
+    }
 }
 
 /// The audiences the kind cluster's API server accepts: its issuer's, which a projected token
@@ -507,137 +645,173 @@ fn api_audience(audience: Option<&str>) -> bool {
 
 const KIND_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
 
-/// A pod template's containers of both kinds, by name, each with the names of the volumes it
-/// mounts.
-fn containers(pod: &str) -> Vec<(String, Vec<String>)> {
-    let mut found = Vec::new();
-    for header in ["      initContainers:", "      containers:"] {
-        if !pod.contains(&format!("{header}\n")) {
-            continue;
-        }
-        for container in items(pod, header) {
-            let mounts = if container.contains("volumeMounts:\n") {
-                let header = container
-                    .lines()
-                    .find(|line| line.trim_start() == "volumeMounts:")
-                    .unwrap()
-                    .to_owned();
-                items(&container, &header)
-                    .iter()
-                    .map(|mount| item_name(mount).to_owned())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            found.push((item_name(&container).to_owned(), mounts));
-        }
-    }
-    found
-}
-
-/// The volumes of a pod template, by name, that hold a token the API server accepts.
-fn api_token_volumes(pod: &str) -> Vec<String> {
-    items(pod, "      volumes:")
-        .iter()
-        .filter(|volume| {
-            token_audiences(volume)
+/// The volumes of a pod spec, by name, that hold a token the API server accepts.
+fn api_token_volumes(pod: &Yaml) -> Vec<String> {
+    volumes(pod)
+        .into_iter()
+        .filter(|(_, audiences)| {
+            audiences
                 .iter()
                 .any(|audience| api_audience(audience.as_deref()))
         })
-        .map(|volume| item_name(volume).to_owned())
+        .map(|(name, _)| name)
         .collect()
 }
 
-/// Decision 0013, section 10: in the gateway pod only the token writer mounts a token the API
+/// Whether a pod spec turns on the default API token for its containers: it sets
+/// `automountServiceAccountToken`, and not to false. A YAML 1.1 `yes` or `on`, which the API
+/// server reads as true, turns it on too.
+fn turns_on_the_default_token(pod: &Yaml) -> bool {
+    !matches!(
+        pod["automountServiceAccountToken"],
+        Yaml::BadValue | Yaml::Null | Yaml::Boolean(false)
+    )
+}
+
+/// The ServiceAccount `name` in `namespace` turns off the default API token.
+fn account_turns_off_the_default_token(namespace: &str, name: &str) {
+    let accounts = manifest(&read("deploy/kind/base/serviceaccounts.yaml"));
+    let account: Vec<&Yaml> = accounts
+        .iter()
+        .filter(|document| label(document) == format!("ServiceAccount {namespace}/{name}"))
+        .collect();
+    assert_eq!(account.len(), 1, "ServiceAccount {namespace}/{name}");
+    assert_eq!(
+        account[0]["automountServiceAccountToken"],
+        Yaml::Boolean(false),
+        "ServiceAccount {namespace}/{name} mounts the default API token"
+    );
+}
+
+/// Decision 0013, section 10, in the gateway's pod: only the token writer mounts a token the API
 /// server accepts, a projected one with no audience or the API server's, and the gateway
 /// container mounts no ServiceAccount token at all. No container gets the default API token.
-#[test]
-fn only_the_token_writer_mounts_an_api_token_in_the_gateway_pod() {
-    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let api_volumes = api_token_volumes(&gateway);
-    assert_eq!(api_volumes, ["api-token"], "{gateway}");
-    let containers = containers(&gateway);
-    let names: Vec<&str> = containers.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["wait-for-audit-schema", "token-writer", "gateway"]);
+fn only_the_token_writer_holds_an_api_token(pod: &Yaml) {
+    let api_volumes = api_token_volumes(pod);
+    assert_eq!(
+        api_volumes,
+        ["api-token"],
+        "the volumes that hold a token the API server accepts"
+    );
+    let containers = containers(pod);
     let with_api_token: Vec<&str> = containers
         .iter()
         .filter(|(_, mounts)| mounts.iter().any(|mount| api_volumes.contains(mount)))
         .map(|(name, _)| name.as_str())
         .collect();
-    assert_eq!(with_api_token, ["token-writer"], "{gateway}");
+    assert_eq!(
+        with_api_token,
+        ["token-writer"],
+        "the containers that mount a token the API server accepts"
+    );
 
     // The gateway container mounts no projected ServiceAccount token, of any audience.
-    let token_volumes: Vec<String> = items(&gateway, "      volumes:")
-        .iter()
-        .filter(|volume| !token_audiences(volume).is_empty())
-        .map(|volume| item_name(volume).to_owned())
+    let token_volumes: Vec<String> = volumes(pod)
+        .into_iter()
+        .filter(|(_, audiences)| !audiences.is_empty())
+        .map(|(name, _)| name)
         .collect();
-    let (_, mounts) = containers
+    let mounts: Vec<&String> = containers
         .iter()
-        .find(|(name, _)| name == "gateway")
-        .unwrap();
+        .filter(|(name, _)| name == "gateway")
+        .flat_map(|(_, mounts)| mounts)
+        .collect();
+    assert!(!mounts.is_empty(), "the gateway container mounts nothing");
     assert!(
         !mounts.iter().any(|mount| token_volumes.contains(mount)),
         "the gateway container mounts a ServiceAccount token: {mounts:?}"
     );
 
-    // The token writer's API token is short-lived, and comes with the cluster's CA.
-    let api_token = items(&gateway, "      volumes:")
-        .into_iter()
-        .find(|volume| item_name(volume) == "api-token")
-        .unwrap();
     assert!(
-        api_token.contains("                  expirationSeconds: 600\n"),
-        "{api_token}"
+        !turns_on_the_default_token(pod),
+        "the gateway's pod turns on the default API token"
     );
-    assert!(
-        api_token.contains("                  name: kube-root-ca.crt\n"),
-        "{api_token}"
-    );
+}
 
-    // No container is given the default API token.
-    assert!(
-        !gateway.contains("automountServiceAccountToken: true"),
-        "{gateway}"
+/// No volume the container `name` of the gateway's pod mounts projects a token the API server
+/// accepts: each projected token names an audience, and not the API server's, which in kind is
+/// the issuer.
+fn no_api_token_mounted(pod: &Yaml, name: &str, issuer: &str) {
+    let (_, mounts) = containers(pod)
+        .into_iter()
+        .find(|(container, _)| container == name)
+        .unwrap_or_else(|| panic!("no container `{name}`"));
+    let volumes = volumes(pod);
+    for mounted in &mounts {
+        for (volume, audiences) in volumes.iter().filter(|(volume, _)| volume == mounted) {
+            for audience in audiences {
+                let audience = audience.as_deref().unwrap_or_else(|| {
+                    panic!("volume {volume} projects a token for the API server")
+                });
+                assert!(
+                    audience != issuer && !audience.starts_with("https://kubernetes.default.svc"),
+                    "volume {volume} projects a token for the API server's audience {audience}"
+                );
+            }
+        }
+    }
+}
+
+/// Decision 0013, section 10, for a team's workload: no volume of its pod holds a token the API
+/// server accepts, and the pod does not turn the default API token on.
+fn no_api_token_in_workload(document: &Yaml, pod: &Yaml) {
+    let label = label(document);
+    assert_eq!(
+        api_token_volumes(pod),
+        Vec::<String>::new(),
+        "{label}: the volumes that hold a token the API server accepts"
     );
-    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
-    let account = documents_with(&accounts, "  name: gateway\n");
-    assert_eq!(account.len(), 1);
-    assert!(account[0].contains("\nautomountServiceAccountToken: false"));
+    assert!(
+        !turns_on_the_default_token(pod),
+        "{label} turns on the default API token"
+    );
+}
+
+/// Decision 0013, section 10: in the gateway pod only the token writer mounts a token the API
+/// server accepts, and the gateway container mounts no ServiceAccount token at all. No container
+/// gets the default API token.
+#[test]
+fn only_the_token_writer_mounts_an_api_token_in_the_gateway_pod() {
+    let pod = only_pod(&read("deploy/kind/base/gateway.yaml"));
+    let names: Vec<String> = containers(&pod).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["wait-for-audit-schema", "token-writer", "gateway"]);
+    only_the_token_writer_holds_an_api_token(&pod);
+    no_api_token_mounted(&pod, "gateway", KIND_ISSUER);
+
+    // The token writer's API token is short-lived, and comes with the cluster's CA.
+    assert_eq!(
+        *volume(&pod, "api-token"),
+        yaml(
+            "name: api-token
+projected:
+  sources:
+    - serviceAccountToken: {expirationSeconds: 600, path: token}
+    - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}"
+        )
+    );
+    account_turns_off_the_default_token("switchboard", "gateway");
 }
 
 /// Decision 0013, section 10: no workload mounts a token the API server accepts, neither the
 /// default API token nor a projected one.
 #[test]
 fn no_workload_mounts_an_api_token() {
-    let workloads = read("deploy/kind/base/workloads.yaml");
-    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
-    let cronjobs = documents_with(&workloads, "kind: CronJob");
-    assert_eq!(cronjobs.len(), 3);
-    for cronjob in cronjobs {
-        // The pod template, unindented to a Deployment's depth so the helpers read it.
-        let pod: String = cronjob
-            .lines()
-            .map(|line| line.strip_prefix("    ").unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(api_token_volumes(&pod), Vec::<String>::new(), "{cronjob}");
-        assert!(
-            !cronjob.contains("automountServiceAccountToken: true"),
-            "{cronjob}"
-        );
-        let namespace = value_after(cronjob, "  namespace: ");
-        let account = value_after(cronjob, "          serviceAccountName: ");
-        let account = documents_with(
-            &accounts,
-            &format!("  name: {account}\n  namespace: {namespace}\n"),
-        );
-        assert_eq!(account.len(), 1, "{namespace}");
-        assert!(
-            account[0].contains("\nautomountServiceAccountToken: false"),
-            "{namespace}: {}",
-            account[0]
-        );
+    let documents = manifest(&read("deploy/kind/base/workloads.yaml"));
+    let pods = pod_specs(&documents);
+    let labels: Vec<String> = pods.iter().map(|(document, _)| label(document)).collect();
+    assert_eq!(
+        labels,
+        [
+            "CronJob team-a/mock-workload",
+            "CronJob team-b/mock-workload",
+            "CronJob team-a/stranger-workload",
+        ]
+    );
+    for (document, pod) in pods {
+        no_api_token_in_workload(document, pod);
+        let namespace = string(&document["metadata"]["namespace"], "a namespace");
+        let account = string(&pod["serviceAccountName"], "a serviceAccountName");
+        account_turns_off_the_default_token(namespace, account);
     }
 }
 
@@ -693,14 +867,8 @@ subjects:
         "            - {name: TOKEN_SERVICE_ACCOUNTS, value: \"docs-team-a docs-team-b registry-probe registry:switchboard\"}\n"
     ));
     assert!(gateway.contains("            - {name: TOKEN_NAMESPACE, value: switchboard}\n"));
-    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
     for account in ["docs-team-a", "docs-team-b", "registry-probe", "registry"] {
-        let found = documents_with(
-            &accounts,
-            &format!("  name: {account}\n  namespace: switchboard\n"),
-        );
-        assert_eq!(found.len(), 1, "{account}");
-        assert!(found[0].contains("\nautomountServiceAccountToken: false"));
+        account_turns_off_the_default_token("switchboard", account);
     }
     // No other file of the base grants a ServiceAccount anything or names ServiceAccounts in a
     // rule. A binding for other subjects, such as unauthenticated callers, is not checked here.
@@ -737,39 +905,34 @@ subjects:
 #[test]
 fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let containers = items(&gateway, "      containers:");
-    let container = containers
-        .iter()
-        .find(|container| item_name(container) == "gateway")
-        .unwrap();
+    let pod = only_pod(&gateway);
     // The gateway reads the tokens; only the token writer writes them.
-    assert!(container.contains(
-        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
-    ));
-    let writer = items(&gateway, "      initContainers:")
-        .into_iter()
-        .find(|container| item_name(container) == "token-writer")
-        .unwrap();
-    assert!(
-        writer.contains("          restartPolicy: Always\n"),
-        "{writer}"
+    assert_eq!(
+        mounts_of(container(&pod, "gateway"), "entry-tokens"),
+        [&yaml(
+            "{name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}"
+        )]
     );
-    assert!(
-        writer.contains(
-            "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens}\n"
-        )
-    );
-    assert!(
-        writer.contains("            - {name: TOKEN_DIR, value: /var/run/switchboard/tokens}\n")
+    let writer = container(&pod, "token-writer");
+    assert_eq!(writer["restartPolicy"].as_str(), Some("Always"));
+    assert_eq!(
+        mounts_of(writer, "entry-tokens"),
+        [&yaml(
+            "{name: entry-tokens, mountPath: /var/run/switchboard/tokens}"
+        )]
     );
     // The gateway starts only once the four tokens are written: it reads every credential,
     // the probe's included, at boot, and the reach check presents the registry's at once.
-    assert!(writer.contains(
-        "                - test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b && test -s /var/run/switchboard/tokens/registry-probe && test -s /var/run/switchboard/tokens/registry\n"
-    ), "{writer}");
-    assert!(gateway.contains(
-        "        - name: entry-tokens\n          emptyDir: {medium: Memory, sizeLimit: 1Mi}"
-    ));
+    assert_eq!(
+        writer["startupProbe"]["exec"]["command"],
+        yaml(
+            "[sh, -c, test -s /var/run/switchboard/tokens/docs-team-a && test -s /var/run/switchboard/tokens/docs-team-b && test -s /var/run/switchboard/tokens/registry-probe && test -s /var/run/switchboard/tokens/registry]"
+        )
+    );
+    assert_eq!(
+        *volume(&pod, "entry-tokens"),
+        yaml("{name: entry-tokens, emptyDir: {medium: Memory, sizeLimit: 1Mi}}")
+    );
     // No Secret volume, nor a Secret projected into one; the database URL comes from a Secret
     // by secretKeyRef, which is not a credential for mock-docs.
     for secret in ["secret:", "secretName"] {
@@ -800,10 +963,13 @@ fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
         ]
     );
     let writer_env = |name: &str| {
-        value_after(&writer, &format!("            - {{name: {name}, value: "))
-            .trim_end_matches('}')
-            .trim_matches('"')
-            .to_owned()
+        let values: Vec<&str> = list(&writer["env"], "env")
+            .iter()
+            .filter(|variable| variable["name"].as_str() == Some(name))
+            .map(|variable| string(&variable["value"], name))
+            .collect();
+        assert_eq!(values.len(), 1, "want one {name}");
+        values[0].to_owned()
     };
     assert!(
         writer_env("TOKEN_SERVICE_ACCOUNTS")
@@ -1024,312 +1190,570 @@ fn mock_docs_admin_endpoint_is_reached_only_from_inside_its_container() {
     }
 }
 
-/// The lines of the container `name` in a Deployment: from its `- name:` line to the next
-/// container, or the end of the pod's containers. Blank lines and comments, at any indent, do
-/// not end it.
-fn container(deployment: &str, name: &str) -> String {
-    let header = format!("        - name: {name}");
-    let mut lines = deployment.lines().skip_while(|line| *line != header);
-    let first = lines
-        .next()
-        .unwrap_or_else(|| panic!("no container `{name}`:\n{deployment}"));
-    let rest = lines.take_while(|line| {
-        line.starts_with("          ") || line.trim().is_empty() || line.trim().starts_with('#')
-    });
-    std::iter::once(first)
-        .chain(rest)
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The message of the panic `run` ends in. It must panic: `form` passed a guard it must fail.
+fn panic_message(form: &str, run: impl FnOnce()) -> String {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .err()
+        .unwrap_or_else(|| panic!("{form}: passed the guard"));
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_default()
 }
 
-/// The name of each volume the container mounts, from each item of its `volumeMounts:` list,
-/// flow style (`- {name: ..., mountPath: ...}`) or block style (`- name: ...`, then the rest on
-/// the lines under it). It reads every line up to the container's next key,
-/// passing over blank lines and comments, takes each line at the items' indent that starts `-`,
-/// a bare `-` among them, as an item, and panics on an item it cannot read the name of first or
-/// a line that belongs to no item. It is not a YAML parser; #182 replaces it with one.
-fn mounted(container: &str) -> Vec<String> {
-    let header = "          volumeMounts:";
-    let key_indent = header.len() - header.trim_start().len();
-    let list = container
-        .split_once(&format!("{header}\n"))
-        .unwrap_or_else(|| panic!("no line `{header}`:\n{container}"))
-        .1;
-    let mut item_indent = None;
-    let mut items: Vec<String> = Vec::new();
-    for line in list.lines() {
-        let text = line.trim_start();
-        if text.is_empty() || text.starts_with('#') {
-            continue;
-        }
-        let indent = line.len() - text.len();
-        if indent <= key_indent && !text.starts_with('-') {
-            // The container's next key.
-            break;
-        }
-        let at = *item_indent.get_or_insert(indent);
-        if indent == at && text.starts_with('-') {
-            items.push(String::new());
-        }
-        assert!(indent >= at, "a volume mount line outside any item: {line}");
-        let item = items
-            .last_mut()
-            .unwrap_or_else(|| panic!("a volume mount line outside any item: {line}"));
-        item.push_str(line);
-        item.push('\n');
-    }
-    items
-        .iter()
-        .map(|mount| item_name(mount).to_owned())
-        .collect()
-}
-
-/// No volume the gateway's `container` mounts projects a token the API server accepts: each
-/// projected token names an audience, and not the API server's, which in kind is the issuer.
-fn no_api_token_mounted(gateway: &str, container: &str, issuer: &str) {
-    for name in &mounted(container) {
-        for audience in token_audiences(&volume(gateway, name)) {
-            let audience = audience
-                .unwrap_or_else(|| panic!("volume {name} projects a token for the API server"));
-            assert!(
-                audience != issuer && !audience.starts_with("https://kubernetes.default.svc"),
-                "volume {name} projects a token for the API server's audience {audience}"
-            );
-        }
-    }
-}
-
-/// #153: `mounted` reads a block-style mount as well as a flow-style one, past blank lines and
-/// comments, and panics on an item whose name does not come first, a bare `-` among them,
-/// rather than leave it out.
+/// #153 and #182: the gateway's guards see the token writer's API token mounted into the gateway
+/// container however the mount is written.
 #[test]
-fn every_volume_mount_of_the_gateway_container_is_read_however_it_is_written() {
-    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let gateway_container = container(&gateway, "gateway");
-    assert_eq!(
-        mounted(&gateway_container),
-        ["config", "registry", "cluster-ca", "entry-tokens"]
-    );
-
-    // The token writer's API token, mounted into the gateway container block style.
-    let first = "          volumeMounts:\n";
-    let block = "            - name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n              readOnly: true\n";
-    let with_block = gateway_container.replacen(first, &format!("{first}{block}"), 1);
-    assert_ne!(with_block, gateway_container);
-    assert_eq!(
-        mounted(&with_block),
-        [
-            "api-token",
-            "config",
-            "registry",
-            "cluster-ca",
-            "entry-tokens"
-        ]
-    );
-    // The guard that the gateway container mounts no API token sees it: the volume names no
-    // audience, so its token is the API server's.
-    no_api_token_mounted(&gateway, &gateway_container, KIND_ISSUER);
-    let guarded =
-        std::panic::catch_unwind(|| no_api_token_mounted(&gateway, &with_block, KIND_ISSUER));
-    let message = guarded.expect_err("a block-style API token mount passed the guard");
-    assert_eq!(
-        message.downcast_ref::<String>().map(String::as_str),
-        Some("volume api-token projects a token for the API server")
-    );
-
-    // An item whose name is not on its first line is not passed over.
-    let unnamed_first = "            - mountPath: /var/run/secrets/switchboard/api\n              name: api-token\n";
-    let with_unnamed = gateway_container.replacen(first, &format!("{first}{unnamed_first}"), 1);
-    let read = std::panic::catch_unwind(|| mounted(&with_unnamed));
-    assert!(read.is_err(), "{:?}", read);
-
-    // The same mount after a blank line, or after a comment at column 0, is still in the list,
-    // and the guard sees it.
-    let last = "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n";
-    for (form, added) in [
-        ("after a blank line", format!("\n{block}")),
-        (
-            "after a comment at column 0",
-            format!("# The API token.\n{block}"),
-        ),
-    ] {
-        let changed = gateway.replacen(last, &format!("{last}{added}"), 1);
-        assert_ne!(changed, gateway, "{form}");
-        let container = container(&changed, "gateway");
-        assert_eq!(
-            mounted(&container),
-            [
-                "config",
-                "registry",
-                "cluster-ca",
-                "entry-tokens",
-                "api-token"
-            ],
-            "{form}"
-        );
-        let guarded =
-            std::panic::catch_unwind(|| no_api_token_mounted(&changed, &container, KIND_ISSUER));
-        let message = guarded.expect_err(form);
-        assert_eq!(
-            message.downcast_ref::<String>().map(String::as_str),
-            Some("volume api-token projects a token for the API server"),
-            "{form}"
-        );
-    }
-
-    // A bare `-` with the name on the next line, first in the list or last, is an item whose
-    // name does not come first: it panics, rather than being dropped or read as part of the
-    // item before it.
-    let bare = "            -\n              name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n";
+fn the_gateway_guards_see_an_api_token_mount_however_it_is_written() {
+    let gateway = read("deploy/kind/base/gateway.yaml");
     let config =
         "            - {name: config, mountPath: /etc/switchboard/config, readOnly: true}\n";
+    let last = "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n";
+    let writers = "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n";
+    let anchored = "            - &api-mount {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n";
+    let block = "            - name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n              readOnly: true\n";
+    let bare = "            -\n              name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n";
+    let first = |mount: &str| gateway.replacen(config, &format!("{mount}{config}"), 1);
+    let after_last = |mount: &str| gateway.replacen(last, &format!("{last}{mount}"), 1);
+    // The token writer's own mount, anchored, and the gateway container's by an alias of it.
+    let aliased = |mount: &str| {
+        gateway
+            .replacen(writers, anchored, 1)
+            .replacen(config, &format!("{mount}{config}"), 1)
+    };
     for (form, changed) in [
+        ("flow style", first(writers)),
+        ("block style", first(block)),
+        ("after a blank line", after_last(&format!("\n{block}"))),
         (
-            "first",
-            gateway.replacen(config, &format!("{bare}{config}"), 1),
+            "after a comment at column 0",
+            after_last(&format!("# The API token.\n{block}")),
         ),
-        ("last", gateway.replacen(last, &format!("{last}{bare}"), 1)),
+        ("a bare dash, first", first(bare)),
+        ("a bare dash, last", after_last(bare)),
+        (
+            "its name not first",
+            first(
+                "            - mountPath: /var/run/secrets/switchboard/api\n              name: api-token\n",
+            ),
+        ),
+        (
+            "a quoted key",
+            first(
+                "            - {\"name\": api-token, mountPath: /var/run/secrets/switchboard/api}\n",
+            ),
+        ),
+        (
+            "an escaped name",
+            first(
+                "            - {name: \"api\\x2dtoken\", mountPath: /var/run/secrets/switchboard/api}\n",
+            ),
+        ),
+        (
+            "a tagged name",
+            first(
+                "            - {name: !!str api-token, mountPath: /var/run/secrets/switchboard/api}\n",
+            ),
+        ),
+        ("an alias", aliased("            - *api-mount\n")),
+        (
+            "a merge key",
+            aliased("            - {<<: *api-mount, readOnly: true}\n"),
+        ),
     ] {
         assert_ne!(changed, gateway, "{form}");
-        let container = container(&changed, "gateway");
-        let read = std::panic::catch_unwind(|| mounted(&container));
-        let message = read.expect_err(form);
+        let pod = only_pod(&changed);
+        let (_, mounts) = containers(&pod)
+            .into_iter()
+            .find(|(name, _)| name == "gateway")
+            .unwrap();
+        assert!(
+            mounts.contains(&"api-token".to_owned()),
+            "{form}: {mounts:?}"
+        );
+        let message = panic_message(form, || only_the_token_writer_holds_an_api_token(&pod));
+        assert!(
+            message.contains("the containers that mount a token the API server accepts"),
+            "{form}: {message}"
+        );
         assert_eq!(
-            message.downcast_ref::<String>().map(String::as_str),
-            Some("an item without a name first: -"),
+            panic_message(form, || no_api_token_mounted(&pod, "gateway", KIND_ISSUER)),
+            "volume api-token projects a token for the API server",
             "{form}"
         );
     }
 }
 
-/// #153, decision 0013 section 10: `token_audiences` reads a projected token source flow style
-/// as well as block style, so the guards see a token for the API server however its source is
-/// written, and panics on a source it cannot read rather than leave it out.
-#[test]
-fn every_token_source_of_a_volume_is_read_however_it_is_written() {
-    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    assert_eq!(token_audiences(&volume(&gateway, "api-token")), [None]);
-    assert_eq!(api_token_volumes(&gateway), ["api-token"]);
+/// Projected token sources however they are written, for #153's and #182's guards: each the
+/// text of a source item, its lines indented by `$I`, and whether it reads as the issuer's
+/// audience, `$ISSUER`, rather than none. A token with no audience, or an empty or null one, is
+/// the API server's.
+const TOKEN_SOURCE_FORMS: &[(&str, &str, bool)] = &[
+    // Past blank lines and comments, in any style.
+    (
+        "after a blank line",
+        "\n$I- serviceAccountToken: {expirationSeconds: 600, path: token}\n",
+        false,
+    ),
+    (
+        "after a comment at column 0",
+        "# Another source.\n$I- serviceAccountToken: {expirationSeconds: 600, path: token}\n",
+        false,
+    ),
+    (
+        "block style",
+        "$I- serviceAccountToken:\n$I    expirationSeconds: 600\n$I    path: token\n",
+        false,
+    ),
+    (
+        "block style, past a blank line and a comment at column 0",
+        "$I- serviceAccountToken:\n\n# The API server's.\n$I    path: token\n$I    audience: $ISSUER\n",
+        true,
+    ),
+    (
+        "in a flow mapping",
+        "$I- {serviceAccountToken: {expirationSeconds: 600, path: token}}\n",
+        false,
+    ),
+    (
+        "a flow mapping over two lines",
+        "$I- serviceAccountToken: {path: token,\n$I    expirationSeconds: 600}\n",
+        false,
+    ),
+    (
+        "a flow mapping on the next line",
+        "$I- serviceAccountToken:\n$I    {path: token}\n",
+        false,
+    ),
+    (
+        "a comment after its key",
+        "$I- serviceAccountToken: # no audience\n$I    path: token\n",
+        false,
+    ),
+    (
+        "a bare dash",
+        "$I-\n$I  serviceAccountToken: {path: token}\n",
+        false,
+    ),
+    ("empty", "$I- serviceAccountToken: {}\n", false),
+    ("null", "$I- serviceAccountToken:\n", false),
+    // Its key however it is written.
+    (
+        "a double-quoted key",
+        "$I- \"serviceAccountToken\": {path: token}\n",
+        false,
+    ),
+    (
+        "a single-quoted key",
+        "$I- 'serviceAccountToken': {path: token}\n",
+        false,
+    ),
+    (
+        "an escaped key",
+        "$I- \"service\\x41ccountToken\": {path: token}\n",
+        false,
+    ),
+    (
+        "an explicit key",
+        "$I- ? serviceAccountToken\n$I  : {path: token}\n",
+        false,
+    ),
+    (
+        "a merge key",
+        "$I- <<: {serviceAccountToken: {path: token}}\n",
+        false,
+    ),
+    (
+        "a tagged source",
+        "$I- !!map {serviceAccountToken: {path: token}}\n",
+        false,
+    ),
+    // The API server's audience however it is written.
+    (
+        "the issuer",
+        "$I- serviceAccountToken: {path: token, audience: $ISSUER}\n",
+        true,
+    ),
+    (
+        "the issuer, double-quoted",
+        "$I- {serviceAccountToken: {path: token, audience: \"$ISSUER\"}}\n",
+        true,
+    ),
+    (
+        "the issuer, single-quoted, past a comment",
+        "$I- serviceAccountToken:\n$I    # The API server's.\n$I    audience: '$ISSUER' # quoted\n$I    path: token\n",
+        true,
+    ),
+    (
+        "the issuer, anchored",
+        "$I- serviceAccountToken: {path: token, audience: &audience $ISSUER}\n",
+        true,
+    ),
+    (
+        "the issuer, tagged",
+        "$I- serviceAccountToken: {path: token, audience: !!str $ISSUER}\n",
+        true,
+    ),
+    (
+        "the issuer, with escaped slashes",
+        "$I- serviceAccountToken: {path: token, audience: \"https:\\/\\/kubernetes.default.svc.cluster.local\"}\n",
+        true,
+    ),
+    (
+        "the issuer, with hex escapes",
+        "$I- serviceAccountToken: {path: token, audience: \"\\x68ttps://kubernetes\\x2edefault.svc.cluster.local\"}\n",
+        true,
+    ),
+    (
+        "the issuer, with a unicode escape",
+        "$I- serviceAccountToken: {path: token, audience: \"\\u0068ttps://kubernetes.default.svc.cluster.local\"}\n",
+        true,
+    ),
+    (
+        "the issuer, folded",
+        "$I- serviceAccountToken:\n$I    path: token\n$I    audience: >-\n$I      $ISSUER\n",
+        true,
+    ),
+    (
+        "the issuer, on the next line",
+        "$I- serviceAccountToken:\n$I    audience:\n$I      $ISSUER\n$I    path: token\n",
+        true,
+    ),
+    // An empty or null audience, which the API server fills in with its own.
+    (
+        "an empty audience, double-quoted",
+        "$I- serviceAccountToken: {path: token, audience: \"\"}\n",
+        false,
+    ),
+    (
+        "an empty audience, single-quoted",
+        "$I- serviceAccountToken: {path: token, audience: ''}\n",
+        false,
+    ),
+    (
+        "a null audience",
+        "$I- serviceAccountToken: {path: token, audience: null}\n",
+        false,
+    ),
+    (
+        "a Null audience",
+        "$I- serviceAccountToken: {path: token, audience: Null}\n",
+        false,
+    ),
+    (
+        "a NULL audience",
+        "$I- serviceAccountToken: {path: token, audience: NULL}\n",
+        false,
+    ),
+    (
+        "a ~ audience",
+        "$I- serviceAccountToken: {path: token, audience: ~}\n",
+        false,
+    ),
+    (
+        "an audience with no value",
+        "$I- serviceAccountToken:\n$I    audience:\n$I    path: token\n",
+        false,
+    ),
+    (
+        "an audience tagged null",
+        "$I- serviceAccountToken: {path: token, audience: !!null }\n",
+        false,
+    ),
+    (
+        "an empty audience tagged null",
+        "$I- serviceAccountToken: {path: token, audience: !!null ''}\n",
+        false,
+    ),
+];
 
-    // The token writer's API token, mounted into the gateway container too.
-    let cluster_ca = "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n";
-    let api_mount = "            - {name: api-token, mountPath: /var/run/secrets/switchboard/api, readOnly: true}\n";
-    let mounting = gateway.replacen(cluster_ca, &format!("{cluster_ca}{api_mount}"), 1);
-    assert_ne!(mounting, gateway);
-    let block = "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n";
-    assert!(mounting.contains(block));
+/// A token source form of [`TOKEN_SOURCE_FORMS`], its items indented by `indent` spaces.
+fn token_source(form: &str, indent: usize) -> String {
+    form.replace("$ISSUER", KIND_ISSUER)
+        .replace("$I", &" ".repeat(indent))
+}
 
-    // Each flow-style form of its source, with no audience or with the API server's: the
-    // pod-wide guard and the gateway container's guard both see it.
-    let unset = "volume api-token projects a token for the API server";
-    let issuer = format!("{unset}'s audience {KIND_ISSUER}");
-    for (source, audience, message) in [
-        (
-            "              - serviceAccountToken: {expirationSeconds: 600, path: token}\n"
-                .to_owned(),
-            None,
-            unset.to_owned(),
-        ),
-        (
-            "              - {serviceAccountToken: {expirationSeconds: 600, path: token}}\n"
-                .to_owned(),
-            None,
-            unset.to_owned(),
-        ),
-        (
-            "              - serviceAccountToken: {}\n".to_owned(),
-            None,
-            unset.to_owned(),
-        ),
-        (
-            format!(
-                "              - serviceAccountToken: {{path: token, audience: {KIND_ISSUER}}}\n"
-            ),
-            Some(KIND_ISSUER),
-            issuer.clone(),
-        ),
-        (
-            format!(
-                "              - {{serviceAccountToken: {{path: token, audience: \"{KIND_ISSUER}\"}}}}\n"
-            ),
-            Some(KIND_ISSUER),
-            issuer.clone(),
-        ),
-        (
-            format!(
-                "              - serviceAccountToken:\n                  # The API server's.\n                  audience: '{KIND_ISSUER}' # quoted\n                  path: token\n"
-            ),
-            Some(KIND_ISSUER),
-            issuer.clone(),
-        ),
-    ] {
-        let changed = mounting.replacen(block, &source, 1);
-        assert_ne!(changed, mounting, "{source}");
-        assert_eq!(
-            token_audiences(&volume(&changed, "api-token")),
-            [audience.map(str::to_owned)],
-            "{source}"
-        );
-        assert_eq!(api_token_volumes(&changed), ["api-token"], "{source}");
-        let container = container(&changed, "gateway");
-        let guarded =
-            std::panic::catch_unwind(|| no_api_token_mounted(&changed, &container, KIND_ISSUER));
-        let panicked = guarded.expect_err(&source);
-        assert_eq!(
-            panicked.downcast_ref::<String>(),
-            Some(&message),
-            "{source}"
-        );
-    }
-
-    // A blank line among a block-style source's fields does not end them.
-    let spaced = volume(&gateway, "api-token").replacen(
-        "- serviceAccountToken:\n",
-        &format!("- serviceAccountToken:\n\n                  audience: {KIND_ISSUER}\n"),
-        1,
-    );
-    assert_eq!(token_audiences(&spaced), [Some(KIND_ISSUER.to_owned())]);
-
-    // A flow-style source for another audience is read as that audience, and passes.
-    let other = "              - {serviceAccountToken: {audience: switchboard, path: token}}\n";
-    let changed = mounting.replacen(block, other, 1);
-    assert_eq!(
-        token_audiences(&volume(&changed, "api-token")),
-        [Some("switchboard".to_owned())]
-    );
-    assert_eq!(api_token_volumes(&changed), Vec::<String>::new());
-    no_api_token_mounted(&changed, &container(&changed, "gateway"), KIND_ISSUER);
-
-    // A source it cannot read panics, rather than being passed over.
-    for source in [
-        "              - serviceAccountToken: {path: token,\n                  audience: x}\n",
-        "              -\n                serviceAccountToken: {path: token}\n",
-        "              - \"serviceAccountToken\": {path: token}\n",
-        "              - serviceAccountToken: # no audience\n                  path: token\n",
-        "              - serviceAccountToken:\n                  {path: token}\n",
-        "              - serviceAccountToken:\n                  audience:\n                    x\n",
-    ] {
-        let changed = mounting.replacen(block, source, 1);
-        assert_ne!(changed, mounting, "{source}");
-        let api_token = volume(&changed, "api-token");
-        let read = std::panic::catch_unwind(|| token_audiences(&api_token));
-        assert!(read.is_err(), "{source}: {read:?}");
+/// What the gateway container's guard says of a token for the API server in `volume`.
+fn api_token_message(volume: &str, issuer: bool) -> String {
+    let unset = format!("volume {volume} projects a token for the API server");
+    if issuer {
+        format!("{unset}'s audience {KIND_ISSUER}")
+    } else {
+        unset
     }
 }
 
-/// The pod's volume `name`: its `- name:` line and those under it.
-fn volume(deployment: &str, name: &str) -> String {
-    let volumes = block_after(deployment, "      volumes:");
-    let header = format!("        - name: {name}");
-    let mut lines = volumes.lines().skip_while(|line| *line != header);
-    let first = lines
-        .next()
-        .unwrap_or_else(|| panic!("no volume `{name}`:\n{volumes}"));
-    let rest = lines.take_while(|line| line.starts_with("          "));
-    std::iter::once(first)
-        .chain(rest)
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Both of the gateway pod's guards fail on `changed`, a gateway.yaml in which the gateway
+/// container mounts `volume`, which projects a token for the API server.
+fn gateway_guards_fail(changed: &str, form: &str, volume: &str, issuer: bool) {
+    let pod = only_pod(changed);
+    let message = panic_message(form, || only_the_token_writer_holds_an_api_token(&pod));
+    assert!(
+        message.contains("the volumes that hold a token the API server accepts"),
+        "{form}: {message}"
+    );
+    assert_eq!(
+        panic_message(form, || no_api_token_mounted(&pod, "gateway", KIND_ISSUER)),
+        api_token_message(volume, issuer),
+        "{form}"
+    );
+}
+
+/// #153 and #182: the gateway's guards see a token for the API server in a volume the gateway
+/// container mounts, however its source is written.
+#[test]
+fn the_gateway_guards_see_an_api_token_source_however_it_is_written() {
+    let gateway = read("deploy/kind/base/gateway.yaml");
+    // The config volume, which the gateway container mounts, projecting its ConfigMap and a
+    // token: where it is, first of the volumes, or moved last.
+    let config = "        - name: config\n          configMap: {name: gateway-config}\n";
+    let projected = "        - name: config\n          projected:\n            sources:\n              - configMap: {name: gateway-config}\n";
+    let last = "          emptyDir: {medium: Memory, sizeLimit: 1Mi}\n";
+    for (form, source, issuer) in TOKEN_SOURCE_FORMS {
+        let with_source = format!("{projected}{}", token_source(source, 14));
+        for (place, changed) in [
+            ("first", gateway.replacen(config, &with_source, 1)),
+            (
+                "last",
+                gateway
+                    .replacen(config, "", 1)
+                    .replacen(last, &format!("{last}{with_source}"), 1),
+            ),
+        ] {
+            let form = format!("{form}, {place}");
+            assert_ne!(changed, gateway, "{form}");
+            let pod = only_pod(&changed);
+            let want = issuer.then(|| KIND_ISSUER.to_owned());
+            assert_eq!(token_audiences(volume(&pod, "config")), [want], "{form}");
+            gateway_guards_fail(&changed, &form, "config", *issuer);
+        }
+    }
+
+    // The entry-tokens volume, which the gateway container mounts, given the token writer's API
+    // token by an alias.
+    let entry_tokens = "          emptyDir: {medium: Memory, sizeLimit: 1Mi}\n";
+    let as_entry_tokens = |text: &str, projected: &str| {
+        text.replacen(
+            entry_tokens,
+            &format!("          projected: {projected}\n"),
+            1,
+        )
+    };
+    let source = "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n";
+    let anchored_source = gateway.replacen(
+        source,
+        "              - &api-source\n                serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n",
+        1,
+    );
+    let anchored_token = gateway.replacen(
+        "              - serviceAccountToken:\n",
+        "              - serviceAccountToken: &writer-token\n",
+        1,
+    );
+    // The issuer, anchored in an environment variable of the gateway container.
+    let rust_log = "            - name: RUST_LOG\n              value: info\n";
+    let anchored_issuer = gateway.replacen(
+        rust_log,
+        &format!("{rust_log}            - {{name: KIND_ISSUER, value: &issuer {KIND_ISSUER}}}\n"),
+        1,
+    );
+    for (form, changed, issuer) in [
+        (
+            "its sources by an alias",
+            as_entry_tokens(
+                &gateway.replacen(
+                    "            sources:\n",
+                    "            sources: &api-sources\n",
+                    1,
+                ),
+                "{sources: *api-sources}",
+            ),
+            false,
+        ),
+        (
+            "a source by an alias",
+            as_entry_tokens(&anchored_source, "{sources: [*api-source]}"),
+            false,
+        ),
+        (
+            "a source merged from an alias",
+            as_entry_tokens(&anchored_source, "{sources: [{<<: *api-source}]}"),
+            false,
+        ),
+        (
+            "its token by an alias",
+            as_entry_tokens(
+                &anchored_token,
+                "{sources: [{serviceAccountToken: *writer-token}]}",
+            ),
+            false,
+        ),
+        (
+            "its audience by an alias",
+            as_entry_tokens(
+                &anchored_issuer,
+                "{sources: [{serviceAccountToken: {path: token, audience: *issuer}}]}",
+            ),
+            true,
+        ),
+    ] {
+        assert_ne!(changed, gateway, "{form}");
+        let pod = only_pod(&changed);
+        let want = issuer.then(|| KIND_ISSUER.to_owned());
+        assert_eq!(
+            token_audiences(volume(&pod, "entry-tokens")),
+            [want],
+            "{form}"
+        );
+        gateway_guards_fail(&changed, form, "entry-tokens", issuer);
+    }
+
+    // A token for another audience is not the API server's, but the gateway container mounts no
+    // token of any audience.
+    let other = format!(
+        "{projected}              - {{serviceAccountToken: {{audience: switchboard, path: token}}}}\n"
+    );
+    let changed = gateway.replacen(config, &other, 1);
+    let pod = only_pod(&changed);
+    assert_eq!(
+        token_audiences(volume(&pod, "config")),
+        [Some("switchboard".to_owned())]
+    );
+    assert_eq!(api_token_volumes(&pod), ["api-token"]);
+    no_api_token_mounted(&pod, "gateway", KIND_ISSUER);
+    let message = panic_message("another audience", || {
+        only_the_token_writer_holds_an_api_token(&pod)
+    });
+    assert!(
+        message.starts_with("the gateway container mounts a ServiceAccount token: "),
+        "{message}"
+    );
+}
+
+/// #153 and #182: the workloads' guard sees a token for the API server in a workload's volume,
+/// however its source is written.
+#[test]
+fn the_workload_guard_sees_an_api_token_source_however_it_is_written() {
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    // team-a's wrong-audience token, and a source after it.
+    let wrong = "                      audience: not-switchboard\n                      expirationSeconds: 600\n                      path: token\n";
+    let with = |text: &str, source: &str| text.replacen(wrong, &format!("{wrong}{source}"), 1);
+    let mut forms: Vec<(String, String, bool)> = TOKEN_SOURCE_FORMS
+        .iter()
+        .map(|(form, source, issuer)| {
+            (
+                (*form).to_owned(),
+                with(&workloads, &token_source(source, 18)),
+                *issuer,
+            )
+        })
+        .collect();
+    // The issuer, anchored in an environment variable of team-a's workload.
+    let own = "                - {name: OWN_PROJECT, value: atlas}\n";
+    let anchored_issuer = workloads.replacen(
+        own,
+        &format!("{own}                - {{name: KIND_ISSUER, value: &issuer {KIND_ISSUER}}}\n"),
+        1,
+    );
+    forms.push((
+        "its audience by an alias".to_owned(),
+        with(
+            &anchored_issuer,
+            "                  - serviceAccountToken: {path: token, audience: *issuer}\n",
+        ),
+        true,
+    ));
+    // team-a's own token for the gateway, anchored, and merged into a source that empties its
+    // audience.
+    let anchored_token = workloads.replacen(
+        "                  - serviceAccountToken:\n                      audience: switchboard\n",
+        "                  - serviceAccountToken: &workload-token\n                      audience: switchboard\n",
+        1,
+    );
+    forms.push((
+        "its audience emptied over a merge key".to_owned(),
+        with(
+            &anchored_token,
+            "                  - serviceAccountToken: {<<: *workload-token, audience: ''}\n",
+        ),
+        false,
+    ));
+
+    for (form, changed, issuer) in forms {
+        assert_ne!(changed, workloads, "{form}");
+        let documents = manifest(&changed);
+        let (document, pod) = pod_specs(&documents)[0];
+        assert_eq!(label(document), "CronJob team-a/mock-workload", "{form}");
+        let want = issuer.then(|| KIND_ISSUER.to_owned());
+        assert_eq!(
+            token_audiences(volume(pod, "wrong-audience-token")),
+            [Some("not-switchboard".to_owned()), want],
+            "{form}"
+        );
+        let message = panic_message(&form, || no_api_token_in_workload(document, pod));
+        assert!(
+            message.contains(
+                "CronJob team-a/mock-workload: the volumes that hold a token the API server accepts"
+            ),
+            "{form}: {message}"
+        );
+    }
+}
+
+/// #182: the guards see the default API token turned on in the gateway's pod or a workload's,
+/// however it is written: `true`, or a YAML 1.1 `yes` or `on`, which the API server reads as
+/// true.
+#[test]
+fn the_guards_see_the_default_api_token_turned_on() {
+    let gateway = read("deploy/kind/base/gateway.yaml");
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    let gateway_account = "      serviceAccountName: gateway\n";
+    let workload_account = "          serviceAccountName: mock-workload\n";
+    let turned = |value: &str| {
+        (
+            gateway.replacen(
+                gateway_account,
+                &format!("{gateway_account}      automountServiceAccountToken: {value}\n"),
+                1,
+            ),
+            workloads.replacen(
+                workload_account,
+                &format!("{workload_account}          automountServiceAccountToken: {value}\n"),
+                1,
+            ),
+        )
+    };
+    for value in ["true", "True", "!!bool true", "yes", "on"] {
+        let (gateway_changed, workloads_changed) = turned(value);
+        assert_ne!(gateway_changed, gateway, "{value}");
+        let pod = only_pod(&gateway_changed);
+        assert_eq!(
+            panic_message(value, || only_the_token_writer_holds_an_api_token(&pod)),
+            "the gateway's pod turns on the default API token",
+            "{value}"
+        );
+        assert_ne!(workloads_changed, workloads, "{value}");
+        let documents = manifest(&workloads_changed);
+        let (document, pod) = pod_specs(&documents)[0];
+        assert_eq!(
+            panic_message(value, || no_api_token_in_workload(document, pod)),
+            "CronJob team-a/mock-workload turns on the default API token",
+            "{value}"
+        );
+    }
+    // Turned off, or left to the ServiceAccount, it passes.
+    for value in ["false", "False", "~"] {
+        let (gateway_changed, workloads_changed) = turned(value);
+        only_the_token_writer_holds_an_api_token(&only_pod(&gateway_changed));
+        let documents = manifest(&workloads_changed);
+        let (document, pod) = pod_specs(&documents)[0];
+        no_api_token_in_workload(document, pod);
+    }
 }
 
 /// #88, decision 0013 section 10: in kind the gateway fetches the cluster issuer's keys from the
@@ -1358,32 +1782,31 @@ fn the_kind_gateway_fetches_the_clusters_keys_with_no_token() {
     assert!((30..=300).contains(&refresh), "{refresh}");
 
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let container = container(&gateway, "gateway");
+    let pod = only_pod(&gateway);
+    let container = container(&pod, "gateway");
     let (ca_dir, ca_name) = ca_file.rsplit_once('/').unwrap();
     assert_eq!(ca_name, "ca.crt");
-    assert!(
-        container.contains(&format!(
-            "            - {{name: cluster-ca, mountPath: {ca_dir}, readOnly: true}}\n"
-        )),
-        "{container}"
+    assert_eq!(
+        mounts_of(container, "cluster-ca"),
+        [&yaml(&format!(
+            "{{name: cluster-ca, mountPath: {ca_dir}, readOnly: true}}"
+        ))]
     );
     assert_eq!(
-        volume(&gateway, "cluster-ca"),
-        "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}"
+        *volume(&pod, "cluster-ca"),
+        yaml("{name: cluster-ca, configMap: {name: kube-root-ca.crt}}")
     );
 
-    let mounts = mounted(&container);
-    assert!(mounts.contains(&"cluster-ca".to_owned()), "{mounts:?}");
-    no_api_token_mounted(&gateway, &container, issuer);
-    assert!(
-        !container.contains("/var/run/secrets/kubernetes.io/serviceaccount"),
-        "{container}"
-    );
-    assert!(!gateway.contains("automountServiceAccountToken: true"));
-    let accounts = read("deploy/kind/base/serviceaccounts.yaml");
-    let account = documents_with(&accounts, "  name: gateway\n");
-    assert_eq!(account.len(), 1);
-    assert!(account[0].contains("\nautomountServiceAccountToken: false"));
+    no_api_token_mounted(&pod, "gateway", issuer);
+    for mount in list(&container["volumeMounts"], "volumeMounts") {
+        let path = string(&mount["mountPath"], "a mountPath");
+        assert!(
+            !path.starts_with("/var/run/secrets/kubernetes.io/serviceaccount"),
+            "the gateway container mounts {path}"
+        );
+    }
+    assert!(!turns_on_the_default_token(&pod));
+    account_turns_off_the_default_token("switchboard", "gateway");
 
     // The cluster-issuer-keys copy is mock-docs' alone.
     assert!(!gateway.contains("cluster-issuer-keys"), "{gateway}");

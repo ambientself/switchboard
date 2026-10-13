@@ -32,6 +32,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
 # Reads the demo's deployment files for the longest call deadline they set.
 toml = "1"
+# Parses the kind manifests for the token guards (tests/manifests.rs), so aliases, anchors, tags,
+# quoting, escapes, blank lines and comments are read as the API server reads them.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true
