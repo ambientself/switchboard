@@ -447,10 +447,11 @@ fn item_name(item: &str) -> &str {
 /// that names none and so gets the API server's. It reads a source block style
 /// (`- serviceAccountToken:`, then its fields on the lines under it, past blank lines and
 /// comments) or flow style (`- serviceAccountToken: {...}` or `- {serviceAccountToken: {...}}`,
-/// its fields closed on that line). It fails closed: it panics on any other line that names
+/// its fields closed on that line). It panics on any other line that names
 /// `serviceAccountToken`, on a flow mapping that does not close on its line, and on a field it
-/// cannot read as `audience`, `expirationSeconds` or `path` with a value. So a token is never
-/// missed for how it is written.
+/// cannot read as `audience`, `expirationSeconds` or `path` with a value. It is not a YAML
+/// parser: a quoted key, an alias, an anchor or tag on the audience, or an empty or null
+/// audience can still be misread, and #182 replaces it with one.
 fn token_audiences(volume: &str) -> Vec<Option<String>> {
     let lines: Vec<&str> = volume.lines().collect();
     let mut audiences = Vec::new();
@@ -1043,10 +1044,10 @@ fn container(deployment: &str, name: &str) -> String {
 
 /// The name of each volume the container mounts, from each item of its `volumeMounts:` list,
 /// flow style (`- {name: ..., mountPath: ...}`) or block style (`- name: ...`, then the rest on
-/// the lines under it). It fails closed: it reads every line up to the container's next key,
+/// the lines under it). It reads every line up to the container's next key,
 /// passing over blank lines and comments, takes each line at the items' indent that starts `-`,
 /// a bare `-` among them, as an item, and panics on an item it cannot read the name of first or
-/// a line that belongs to no item. So a mount is never missed for how it is written.
+/// a line that belongs to no item. It is not a YAML parser; #182 replaces it with one.
 fn mounted(container: &str) -> Vec<String> {
     let header = "          volumeMounts:";
     let key_indent = header.len() - header.trim_start().len();
