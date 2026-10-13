@@ -4195,39 +4195,42 @@ mutate_all("demo-kind-gateway-keys-token-unset-audience", "the gateway container
             "          configMap: {name: kube-root-ca.crt}\n"
             "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
             "                  expirationSeconds: 600\n                  path: token\n"))
-# #153: the manifest guards read block-style mounts and flow-style token sources, and the kind
-# run holds the three checks of its anonymous key-fetch step.
-mutate("demo-kind-mounts-flow-style-only", "the manifest guards read only flow-style volume mounts, and miss a block-style one",
-       "crates/demo-checks/tests/manifests.rs",
-       """    items
-        .iter()
-        .map(|mount| item_name(mount).to_owned())
-        .collect()
-}
-""",
-       """    items
-        .iter()
-        .filter_map(|mount| mount.trim_start().strip_prefix("- {name: "))
-        .map(|rest| rest.split(',').next().unwrap().to_owned())
-        .collect()
-}
-""")
-mutate("demo-kind-mounts-end-at-blank-line", "the manifest guards end the gateway container's mounts at a blank line, and miss a mount after it",
-       "crates/demo-checks/tests/manifests.rs",
-       """        if text.is_empty() || text.starts_with('#') {\n            continue;\n        }\n""",
-       """        if text.is_empty() {\n            break;\n        }\n        if text.starts_with('#') {\n            continue;\n        }\n""")
-mutate("demo-kind-mounts-bare-dash-unread", "the manifest guards take a bare `-` for part of the mount before it, and miss the mount it starts",
-       "crates/demo-checks/tests/manifests.rs",
-       """        if indent == at && text.starts_with('-') {\n""",
-       """        if indent == at && text.starts_with("- ") {\n""")
-mutate("demo-kind-container-ends-at-comment", "the manifest guards end a container at a comment at column 0, and miss the mounts after it",
-       "crates/demo-checks/tests/manifests.rs",
-       """        line.starts_with("          ") || line.trim().is_empty() || line.trim().starts_with('#')\n""",
-       """        line.starts_with("          ") || line.trim().is_empty()\n""")
-mutate("demo-kind-token-sources-block-style-only", "the manifest guards read only block-style token sources, and miss a flow-style one for the API server",
-       "crates/demo-checks/tests/manifests.rs",
-       """        if text.starts_with('#') || !text.contains("serviceAccountToken") {\n""",
-       """        if text != "- serviceAccountToken:" {\n""")
+# #153: the kind run holds the three checks of its anonymous key-fetch step. #182: the manifest
+# guards read the kind manifests with a YAML parser and walk the parsed pods; each mutation breaks
+# one thing that reader must do (it replaced #153's hand-written readers, whose mutations went
+# with them).
+MANIFESTS_TEST = "crates/demo-checks/tests/manifests.rs"
+mutate("demo-kind-yaml-merge-keys-unapplied", "the manifest guards read a merge key as an ordinary key, and miss the mount or token source it merges",
+       MANIFESTS_TEST,
+       """                if key.as_str() == Some("<<") {\n""",
+       """                if key.as_str() == Some("<< (never)") {\n""")
+mutate("demo-kind-yaml-merge-overrides-own-keys", "a merge key overrides the mapping's own keys, so a merged audience hides the empty one it sets",
+       MANIFESTS_TEST,
+       "                    if !own.contains_key(&key) {\n",
+       "                    if own.contains_key(&key) || !own.contains_key(&key) {\n")
+mutate("demo-kind-pod-specs-top-level-only", "the manifest guards look for pods only at a document's top level, and miss a Deployment's or CronJob's pod template",
+       MANIFESTS_TEST,
+       "                    entries.values().for_each(|value| find(value, found));\n",
+       "                    let _ = entries;\n")
+mutate("demo-kind-mounts-init-containers-unread", "the manifest guards read a pod's containers but not its init containers, so the token writer's mounts go unread",
+       MANIFESTS_TEST,
+       'const CONTAINER_LISTS: [&str; 3] = ["initContainers", "containers", "ephemeralContainers"];\n',
+       'const CONTAINER_LISTS: [&str; 2] = ["containers", "ephemeralContainers"];\n')
+mutate("demo-kind-token-null-source-unread", "a projected source whose serviceAccountToken is null is not read as a token",
+       MANIFESTS_TEST,
+       "            Some(audience(token))\n",
+       "            token.as_hash().map(|_| audience(token))\n")
+mutate("demo-kind-token-empty-audience-set", "an empty audience, or `Null`, is read as an audience, though the API server fills in its own",
+       MANIFESTS_TEST,
+       """        Yaml::String(audience) if ["", "Null", "NULL"].contains(&audience.as_str()) => None,\n""", "")
+mutate("demo-kind-api-audience-issuer-unread", "the pod-wide guards take only a token with no audience for the API server's, and miss one for the issuer",
+       MANIFESTS_TEST,
+       "    audience.is_none_or(|audience| audience == KIND_ISSUER)\n",
+       "    audience.is_none()\n")
+mutate("demo-kind-default-token-yes-unread", "the guards take only `true` for the default API token turned on, and miss a YAML 1.1 `yes` or `on`",
+       MANIFESTS_TEST,
+       """    !matches!(\n        pod["automountServiceAccountToken"],\n        Yaml::BadValue | Yaml::Null | Yaml::Boolean(false)\n    )\n""",
+       """    pod["automountServiceAccountToken"] == Yaml::Boolean(true)\n""")
 mutate("demo-kind-anonymous-role-unchecked", "the kind run does not check the issuer-discovery ClusterRole's rules", DRIVER,
        """    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \\\n""",
        """    check '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \\\n""")
