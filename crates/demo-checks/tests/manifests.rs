@@ -989,14 +989,17 @@ fn mock_docs_admin_endpoint_is_reached_only_from_inside_its_container() {
 }
 
 /// The lines of the container `name` in a Deployment: from its `- name:` line to the next
-/// container, or the end of the pod's containers.
+/// container, or the end of the pod's containers. Blank lines and comments, at any indent, do
+/// not end it.
 fn container(deployment: &str, name: &str) -> String {
     let header = format!("        - name: {name}");
     let mut lines = deployment.lines().skip_while(|line| *line != header);
     let first = lines
         .next()
         .unwrap_or_else(|| panic!("no container `{name}`:\n{deployment}"));
-    let rest = lines.take_while(|line| line.starts_with("          ") || line.trim().is_empty());
+    let rest = lines.take_while(|line| {
+        line.starts_with("          ") || line.trim().is_empty() || line.trim().starts_with('#')
+    });
     std::iter::once(first)
         .chain(rest)
         .collect::<Vec<_>>()
@@ -1005,10 +1008,41 @@ fn container(deployment: &str, name: &str) -> String {
 
 /// The name of each volume the container mounts, from each item of its `volumeMounts:` list,
 /// flow style (`- {name: ..., mountPath: ...}`) or block style (`- name: ...`, then the rest on
-/// the lines under it). It fails closed: an item it cannot read the name of first panics, so a
-/// mount is never missed for how it is written.
+/// the lines under it). It fails closed: it reads every line up to the container's next key,
+/// passing over blank lines and comments, takes each line at the items' indent that starts `-`,
+/// a bare `-` among them, as an item, and panics on an item it cannot read the name of first or
+/// a line that belongs to no item. So a mount is never missed for how it is written.
 fn mounted(container: &str) -> Vec<String> {
-    items(container, "          volumeMounts:")
+    let header = "          volumeMounts:";
+    let key_indent = header.len() - header.trim_start().len();
+    let list = container
+        .split_once(&format!("{header}\n"))
+        .unwrap_or_else(|| panic!("no line `{header}`:\n{container}"))
+        .1;
+    let mut item_indent = None;
+    let mut items: Vec<String> = Vec::new();
+    for line in list.lines() {
+        let text = line.trim_start();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - text.len();
+        if indent <= key_indent && !text.starts_with('-') {
+            // The container's next key.
+            break;
+        }
+        let at = *item_indent.get_or_insert(indent);
+        if indent == at && text.starts_with('-') {
+            items.push(String::new());
+        }
+        assert!(indent >= at, "a volume mount line outside any item: {line}");
+        let item = items
+            .last_mut()
+            .unwrap_or_else(|| panic!("a volume mount line outside any item: {line}"));
+        item.push_str(line);
+        item.push('\n');
+    }
+    items
         .iter()
         .map(|mount| item_name(mount).to_owned())
         .collect()
@@ -1029,22 +1063,23 @@ fn no_api_token_mounted(gateway: &str, container: &str, issuer: &str) {
     }
 }
 
-/// #153: `mounted` reads a block-style mount as well as a flow-style one, and panics on an item
-/// whose name does not come first, rather than leave it out.
+/// #153: `mounted` reads a block-style mount as well as a flow-style one, past blank lines and
+/// comments, and panics on an item whose name does not come first, a bare `-` among them,
+/// rather than leave it out.
 #[test]
 fn every_volume_mount_of_the_gateway_container_is_read_however_it_is_written() {
     let gateway = only_deployment("deploy/kind/base/gateway.yaml");
-    let container = container(&gateway, "gateway");
+    let gateway_container = container(&gateway, "gateway");
     assert_eq!(
-        mounted(&container),
+        mounted(&gateway_container),
         ["config", "registry", "cluster-ca", "entry-tokens"]
     );
 
     // The token writer's API token, mounted into the gateway container block style.
     let first = "          volumeMounts:\n";
     let block = "            - name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n              readOnly: true\n";
-    let with_block = container.replacen(first, &format!("{first}{block}"), 1);
-    assert_ne!(with_block, container);
+    let with_block = gateway_container.replacen(first, &format!("{first}{block}"), 1);
+    assert_ne!(with_block, gateway_container);
     assert_eq!(
         mounted(&with_block),
         [
@@ -1057,7 +1092,7 @@ fn every_volume_mount_of_the_gateway_container_is_read_however_it_is_written() {
     );
     // The guard that the gateway container mounts no API token sees it: the volume names no
     // audience, so its token is the API server's.
-    no_api_token_mounted(&gateway, &container, KIND_ISSUER);
+    no_api_token_mounted(&gateway, &gateway_container, KIND_ISSUER);
     let guarded =
         std::panic::catch_unwind(|| no_api_token_mounted(&gateway, &with_block, KIND_ISSUER));
     let message = guarded.expect_err("a block-style API token mount passed the guard");
@@ -1068,9 +1103,67 @@ fn every_volume_mount_of_the_gateway_container_is_read_however_it_is_written() {
 
     // An item whose name is not on its first line is not passed over.
     let unnamed_first = "            - mountPath: /var/run/secrets/switchboard/api\n              name: api-token\n";
-    let with_unnamed = container.replacen(first, &format!("{first}{unnamed_first}"), 1);
+    let with_unnamed = gateway_container.replacen(first, &format!("{first}{unnamed_first}"), 1);
     let read = std::panic::catch_unwind(|| mounted(&with_unnamed));
     assert!(read.is_err(), "{:?}", read);
+
+    // The same mount after a blank line, or after a comment at column 0, is still in the list,
+    // and the guard sees it.
+    let last = "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n";
+    for (form, added) in [
+        ("after a blank line", format!("\n{block}")),
+        (
+            "after a comment at column 0",
+            format!("# The API token.\n{block}"),
+        ),
+    ] {
+        let changed = gateway.replacen(last, &format!("{last}{added}"), 1);
+        assert_ne!(changed, gateway, "{form}");
+        let container = container(&changed, "gateway");
+        assert_eq!(
+            mounted(&container),
+            [
+                "config",
+                "registry",
+                "cluster-ca",
+                "entry-tokens",
+                "api-token"
+            ],
+            "{form}"
+        );
+        let guarded =
+            std::panic::catch_unwind(|| no_api_token_mounted(&changed, &container, KIND_ISSUER));
+        let message = guarded.expect_err(form);
+        assert_eq!(
+            message.downcast_ref::<String>().map(String::as_str),
+            Some("volume api-token projects a token for the API server"),
+            "{form}"
+        );
+    }
+
+    // A bare `-` with the name on the next line, first in the list or last, is an item whose
+    // name does not come first: it panics, rather than being dropped or read as part of the
+    // item before it.
+    let bare = "            -\n              name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n";
+    let config =
+        "            - {name: config, mountPath: /etc/switchboard/config, readOnly: true}\n";
+    for (form, changed) in [
+        (
+            "first",
+            gateway.replacen(config, &format!("{bare}{config}"), 1),
+        ),
+        ("last", gateway.replacen(last, &format!("{last}{bare}"), 1)),
+    ] {
+        assert_ne!(changed, gateway, "{form}");
+        let container = container(&changed, "gateway");
+        let read = std::panic::catch_unwind(|| mounted(&container));
+        let message = read.expect_err(form);
+        assert_eq!(
+            message.downcast_ref::<String>().map(String::as_str),
+            Some("an item without a name first: -"),
+            "{form}"
+        );
+    }
 }
 
 /// The pod's volume `name`: its `- name:` line and those under it.

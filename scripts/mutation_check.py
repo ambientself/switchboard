@@ -4181,17 +4181,31 @@ mutate_all("demo-kind-gateway-keys-token-unset-audience", "the gateway container
 # its anonymous key-fetch step.
 mutate("demo-kind-mounts-flow-style-only", "the manifest guards read only flow-style volume mounts, and miss a block-style one",
        "crates/demo-checks/tests/manifests.rs",
-       """    items(container, "          volumeMounts:")
+       """    items
         .iter()
         .map(|mount| item_name(mount).to_owned())
         .collect()
+}
 """,
-       """    block_after(container, "          volumeMounts:")
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- {name: "))
+       """    items
+        .iter()
+        .filter_map(|mount| mount.trim_start().strip_prefix("- {name: "))
         .map(|rest| rest.split(',').next().unwrap().to_owned())
         .collect()
+}
 """)
+mutate("demo-kind-mounts-end-at-blank-line", "the manifest guards end the gateway container's mounts at a blank line, and miss a mount after it",
+       "crates/demo-checks/tests/manifests.rs",
+       """        if text.is_empty() || text.starts_with('#') {\n            continue;\n        }\n""",
+       """        if text.is_empty() {\n            break;\n        }\n        if text.starts_with('#') {\n            continue;\n        }\n""")
+mutate("demo-kind-mounts-bare-dash-unread", "the manifest guards take a bare `-` for part of the mount before it, and miss the mount it starts",
+       "crates/demo-checks/tests/manifests.rs",
+       """        if indent == at && text.starts_with('-') {\n""",
+       """        if indent == at && text.starts_with("- ") {\n""")
+mutate("demo-kind-container-ends-at-comment", "the manifest guards end a container at a comment at column 0, and miss the mounts after it",
+       "crates/demo-checks/tests/manifests.rs",
+       """        line.starts_with("          ") || line.trim().is_empty() || line.trim().starts_with('#')\n""",
+       """        line.starts_with("          ") || line.trim().is_empty()\n""")
 mutate("demo-kind-anonymous-role-unchecked", "the kind run does not check the issuer-discovery ClusterRole's rules", DRIVER,
        """    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \\\n""",
        """    check '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \\\n""")
