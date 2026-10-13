@@ -29,7 +29,8 @@ pub struct Server {
     /// The server's name. Approved tools name it as their connector.
     pub name: ConnectorName,
     /// The system part of its tools' exposed names: every tool on this server is exposed as
-    /// `{system}__{tool}`. No two servers have the same system.
+    /// `{system}__{tool}`. No two servers have the same system, and none contains `__` or ends
+    /// in `_`.
     pub system: String,
     /// The team that owns the server and answers for it.
     pub owner: String,
@@ -146,14 +147,12 @@ pub struct Probe {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReachCheck {
     /// The tool, by its exposed name, which the loader requires to be `{system}__<tool>` for
-    /// the server's own system, so that it is not a malformed name. No other server has that
-    /// system, so the check cannot name the tool of a server with the same system. It can
-    /// still name a tool of a server whose system overlaps this one: with systems `docs` and
-    /// `docs__wiki` (or `docs_`), the name `docs__wiki__search` (or `docs___search`) is under
-    /// both, and the loader does not yet refuse that. The loader does not require the tool to
-    /// be approved: removing a tool's approval withdraws it (decision 0013, section 8), and
-    /// that must stay possible for this tool and for an entry's last tool without editing the
-    /// reach check.
+    /// the server's own system. No two servers have the same system, and no system contains
+    /// `__` or ends in `_`, so a name is under one system at most: the check cannot name
+    /// another server's tool or a malformed one. The loader does not require the tool to be
+    /// approved: removing a tool's approval withdraws it (decision 0013, section 8), and that
+    /// must stay possible for this tool and for an entry's last tool without editing the reach
+    /// check.
     pub tool: ToolName,
     /// Its arguments.
     pub arguments: serde_json::Map<String, Value>,
@@ -193,7 +192,8 @@ pub enum RegistryError {
     DuplicateServer(ConnectorName),
     /// Two servers have the same system, so a tool named after it could be either's.
     #[error(
-        "servers `{first}` and `{second}` both have the system `{system}`; each server needs a system of its own"
+        "servers `{first}` and `{second}` both have the system `{system}`; each server needs a \
+         system of its own"
     )]
     DuplicateSystem {
         /// The system.
@@ -202,6 +202,18 @@ pub enum RegistryError {
         first: ConnectorName,
         /// The server registered second with it.
         second: ConnectorName,
+    },
+    /// A server's system contains `__` or ends in `_`, so a tool name under it could also be
+    /// under a shorter system, such as `docs` for `docs__wiki` or `docs_`.
+    #[error(
+        "server `{server}` has the system `{system}`, which contains `__` or ends in `_`; a \
+         tool name must be under one system only, so a system may do neither"
+    )]
+    SystemOverlaps {
+        /// The server.
+        server: ConnectorName,
+        /// Its system.
+        system: String,
     },
     /// A server's address is not an `http` or `https` URL with a host.
     #[error("server `{server}` has address `{address}`, which is not an http or https URL")]
@@ -693,6 +705,16 @@ fn servers(
         let place = || format!("server `{}`", server.name);
         require(server.name.as_str(), "name", place)?;
         require(&server.system, "system", place)?;
+        // A tool name is under a system when it is `{system}__<tool>`. If two systems s1 and a
+        // longer s2 are both prefixes of one name, each followed by `__`, then s2 begins with
+        // s1 and the `__` after it, so s2 is s1 followed by `_` (it ends in `_`) or contains
+        // `__`. Refusing both leaves every name under one system at most.
+        if server.system.contains("__") || server.system.ends_with('_') {
+            return Err(RegistryError::SystemOverlaps {
+                server: server.name,
+                system: server.system,
+            });
+        }
         require(&server.owner, "owner", place)?;
         require(&server.identity, "identity", place)?;
         require(&server.credential.reference, "credential.reference", place)?;
