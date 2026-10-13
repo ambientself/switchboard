@@ -4199,7 +4199,7 @@ mutate("demo-kind-anonymous-keys-unchecked", "the kind run does not compare the 
        """    check "$(jq -c '[.keys[].kid] | sort' <<<"$FETCHED")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \\\n""",
        """    check "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \\\n""")
 mutate("demo-kind-anonymous-configmap-unchecked", "the kind run does not check that an anonymous ConfigMap read is refused", DRIVER,
-       """    check "$FETCHED" 403 "an unauthenticated read of a ConfigMap is refused"\n""", "")
+       """    check "$FETCHED" 403 "an unauthenticated read of a ConfigMap is refused"\n""", "    :\n")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
        '    check "curl exit $code, ${connects:-no} connections"', '    check "curl exit $code, 0 connections"')
 mutate("demo-workload-idle-no-trap", "the idle workload has no trap, so SIGTERM kills it and it never passes", WORKLOAD,
