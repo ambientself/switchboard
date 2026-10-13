@@ -705,10 +705,10 @@ fn servers(
         let place = || format!("server `{}`", server.name);
         require(server.name.as_str(), "name", place)?;
         require(&server.system, "system", place)?;
-        // A tool name is under a system when it is `{system}__<tool>`. If two systems s1 and a
-        // longer s2 are both prefixes of one name, each followed by `__`, then s2 begins with
-        // s1 and the `__` after it, so s2 is s1 followed by `_` (it ends in `_`) or contains
-        // `__`. Refusing both leaves every name under one system at most.
+        // A tool name is under a system when it is `{system}__<tool>`. If a name is under two
+        // systems, s1 and a longer s2, then s2 and `s1__` are both prefixes of it, so s2 is
+        // `s1_` (it ends in `_`) or begins with `s1__` (it contains `__`). Refusing both leaves
+        // every name under one system at most.
         if server.system.contains("__") || server.system.ends_with('_') {
             return Err(RegistryError::SystemOverlaps {
                 server: server.name,
