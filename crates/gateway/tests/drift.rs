@@ -972,3 +972,53 @@ async fn a_server_down_at_boot_does_not_stop_it() {
     assert_eq!(booted.withdrawn, 0);
     assert_eq!(first_list(booted.address).await, [LIST_TOOL, READ_TOOL]);
 }
+
+/// Decision 0013, section 5, as noted on 2026-10-12: the gateway refuses to start with a drift
+/// interval shorter than a proxied server's call deadline, naming the server, its deadline and
+/// the interval, before it connects to anything. An interval equal to the deadline starts.
+#[tokio::test]
+async fn start_refuses_a_drift_interval_shorter_than_a_call_deadline() {
+    let mock = mock().await;
+    let files = Files::new("drift-interval", &issuer().jwks_document(), &mock.url());
+    let deployment = |deadline: u64| {
+        let text = files::deployment_file("[audit]\nmode = \"disabled\"\n");
+        assert_eq!(text.matches("[drift]\n").count(), 1, "{text}");
+        text.replace(
+            "[drift]\n",
+            &format!(
+                "[servers.docs-team-a]\ndeadline_seconds = {deadline}\n\n\
+                 [drift]\ninterval_seconds = 10\n"
+            ),
+        )
+    };
+
+    files.write("gateway.toml", &deployment(11));
+    let refused = start::prepare(
+        files.load(),
+        InstanceName::new("drift-test"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            start::StartError::IntervalBelowDeadline { server, deadline, interval }
+                if server.as_str() == "docs-team-a"
+                    && *deadline == Duration::from_secs(11)
+                    && *interval == Duration::from_secs(10)
+        ),
+        "{refused:?}"
+    );
+    let said = refused.to_string();
+    assert!(
+        said.contains("is 10 s, shorter than server `docs-team-a`'s call deadline of 11 s"),
+        "{said}"
+    );
+    assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
+
+    files.write("gateway.toml", &deployment(10));
+    let booted = boot(&files).await;
+    assert_eq!(booted.withdrawn, 0);
+    assert_eq!(first_list(booted.address).await, [LIST_TOOL, READ_TOOL]);
+}

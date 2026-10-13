@@ -14,7 +14,11 @@
 //! that is an IP literal the connector would never connect to is refused, loopback among them
 //! outside a development build. It refuses a registry whose entries have a reach check when the
 //! deployment file gives no `[drift] reach_*` settings, naming those entries, since their reach
-//! would never be checked (decision 0011, section 4). Then it loads each proxied server's
+//! would never be checked (decision 0011, section 4). It refuses a `[drift] interval_seconds`
+//! shorter than any proxied server's call deadline, the one `[servers.<name>]` sets or the
+//! default, naming the server, its deadline and the interval: a poll that answered late would
+//! hold back the next, and a changed definition could be served for longer than one interval
+//! plus the deadline (decision 0013, section 5). Then it loads each proxied server's
 //! credential, builds a [`ProxyConnector`] per server with its destination and CA file and with
 //! the deadline and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each
 //! in a [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
@@ -158,6 +162,24 @@ pub enum StartError {
         named(.0)
     )]
     NoReachSettings(Vec<ConnectorName>),
+    /// The drift interval is shorter than a proxied server's call deadline, so a poll that
+    /// answers late would hold back the next and a changed definition could stay served for
+    /// longer than one interval plus the deadline (decision 0013, section 5).
+    #[error(
+        "`drift.interval_seconds` is {interval} s, shorter than server `{server}`'s call deadline \
+         of {deadline} s; set the interval to at least every proxied server's call deadline, so \
+         a changed definition is withdrawn within one interval plus the deadline",
+        interval = .interval.as_secs(),
+        deadline = .deadline.as_secs()
+    )]
+    IntervalBelowDeadline {
+        /// The server.
+        server: ConnectorName,
+        /// Its call deadline: the one `[servers.<name>]` sets, or the default.
+        deadline: Duration,
+        /// The drift interval.
+        interval: Duration,
+    },
     /// An `https` server has no CA file in the deployment file (decision 0013, section 3).
     #[error(
         "server `{0}` has an https address, so `[servers.{0}]` must name the CA file its \
@@ -329,6 +351,11 @@ async fn prepare_with(
     };
     destinations(&registry, &deployment.ca_files, loopback)?;
     reach_settings(&registry, deployment.reach.as_ref())?;
+    drift_interval(
+        registry.servers().keys(),
+        &deployment.servers,
+        deployment.drift_interval,
+    )?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
@@ -534,6 +561,31 @@ fn reach_settings(registry: &Registry, reach: Option<&ReachSettings>) -> Result<
         .collect();
     if reach.is_none() && !checked.is_empty() {
         return Err(StartError::NoReachSettings(checked));
+    }
+    Ok(())
+}
+
+/// Refuses a drift `interval` shorter than the call deadline of any of `servers`, the
+/// registry's proxied servers: the one `bounds` sets for it, or the default (decision 0013,
+/// section 5, as noted on 2026-10-12). Each server is polled one poll at a time, and a poll
+/// takes up to the deadline, so only then does each poll end by the next tick, and a changed
+/// definition is withdrawn within one interval plus the deadline. The deadlines are the
+/// deployment file's, which is read only at start, and a reload that changes the registry's
+/// servers is refused, so this holds until the gateway stops.
+fn drift_interval<'a>(
+    servers: impl IntoIterator<Item = &'a ConnectorName>,
+    bounds: &BTreeMap<ConnectorName, ServerLimits>,
+    interval: Duration,
+) -> Result<(), StartError> {
+    for server in servers {
+        let deadline = bounds.get(server).copied().unwrap_or_default().deadline;
+        if deadline > interval {
+            return Err(StartError::IntervalBelowDeadline {
+                server: server.clone(),
+                deadline,
+                interval,
+            });
+        }
     }
     Ok(())
 }
@@ -866,6 +918,54 @@ mod tests {
             wired("set", &set).unwrap().call_deadlines(),
             &BTreeMap::from([(ConnectorName::new("mock-docs"), Duration::from_secs(17))])
         );
+    }
+
+    /// A drift interval shorter than a proxied server's call deadline is refused, naming the
+    /// server, its deadline and the interval; one equal to every deadline is accepted. A server
+    /// the deployment file gives no bounds has the default deadline, and it counts too: the
+    /// file cannot set an interval below it, but a deployment built another way can.
+    #[test]
+    fn a_drift_interval_shorter_than_a_call_deadline_is_refused() {
+        let servers = [ConnectorName::new("docs-a"), ConnectorName::new("docs-b")];
+        let bounds = BTreeMap::from([(
+            ConnectorName::new("docs-b"),
+            ServerLimits {
+                deadline: Duration::from_secs(12),
+                ..ServerLimits::default()
+            },
+        )]);
+        let refused = drift_interval(&servers, &bounds, Duration::from_secs(11)).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                StartError::IntervalBelowDeadline { server, deadline, interval }
+                    if server.as_str() == "docs-b"
+                        && *deadline == Duration::from_secs(12)
+                        && *interval == Duration::from_secs(11)
+            ),
+            "{refused:?}"
+        );
+        let said = refused.to_string();
+        for part in [
+            "`drift.interval_seconds` is 11 s",
+            "server `docs-b`'s call deadline of 12 s",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert!(drift_interval(&servers, &bounds, Duration::from_secs(12)).is_ok());
+
+        let default = connector_proxy::DEFAULT_DEADLINE;
+        let below = default - Duration::from_secs(1);
+        let refused = drift_interval(&servers, &BTreeMap::new(), below).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                StartError::IntervalBelowDeadline { server, deadline, .. }
+                    if server.as_str() == "docs-a" && *deadline == default
+            ),
+            "{refused:?}"
+        );
+        assert!(drift_interval(&servers, &BTreeMap::new(), default).is_ok());
     }
 
     /// Bounds for a server the registry does not name refuse the start, naming it.

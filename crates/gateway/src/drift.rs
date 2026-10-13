@@ -43,12 +43,12 @@
 //! polls each server every interval on a schedule of its own, one poll at a time, beside the
 //! registry reloader, until the binary aborts it at shutdown. A server that answers slowly, or
 //! not at all until its call deadline, delays only its own next poll, whatever the other
-//! servers do. When the interval is at least a server's call deadline, as at the defaults and
-//! in the demos, a changed definition on it is withdrawn within one interval plus that
-//! deadline. When the interval is shorter, a list that answers late but inside the deadline
-//! holds back the server's next poll until it arrives, so the worst case is about two call
-//! deadlines (#165). The interval is `[drift] interval_seconds` in the deployment file
-//! ([`DriftSection`]): 300 s unless given, and refused below 5 or above 900.
+//! servers do. A poll takes at most the server's call deadline, and the gateway refuses to
+//! start with an interval shorter than any proxied server's call deadline ([`crate::start`]),
+//! so each poll ends by the next tick, and a changed definition is withdrawn within one
+//! interval plus that deadline (decision 0013, section 5, as noted on 2026-10-12). The interval
+//! is `[drift] interval_seconds` in the deployment file ([`DriftSection`]): 300 s unless given,
+//! and refused below 5 or above 900.
 //!
 //! **A withdrawal** ([`Withdrawals`]) makes a policy of its own: the loaded registry's, with
 //! the withdrawn tools removed from the snapshot, every surface, the definitions and the
@@ -68,12 +68,14 @@
 //! `reach_check` ([`crate::start`]), so no entry is left unchecked for want of them. It goes
 //! through the listener, so it never runs in the boot pass, which comes before the listener is
 //! bound: [`DriftPass::run`] makes each entry's first check as soon as it starts, after the
-//! binary has bound the listener, and one more beside each poll after. That first check runs
-//! beside the entry's schedule, so it delays no poll. A check takes up to the call deadline
-//! plus [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE), and the next poll waits for the
-//! check beside the last, so with reach checked the bounds above hold when the interval is at
-//! least the deadline plus that allowance, as at the defaults and in the demos. What the answer
-//! means is [`reach::Verdict`](crate::reach::Verdict)'s:
+//! binary has bound the listener, and one more at each tick of the entry's schedule after,
+//! unless the last is still out. Each check runs beside the schedule, so no poll waits for one,
+//! and the bound above holds with reach checked too. A check takes up to the call deadline plus
+//! [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE): with an interval at least that long, as
+//! at the defaults and in the demos, a widened reach is withdrawn within one interval plus the
+//! deadline and the allowance, and with a shorter one, within one interval plus twice the
+//! deadline and the allowance. What the answer means is
+//! [`reach::Verdict`](crate::reach::Verdict)'s:
 //!
 //! - **Held**, the server refused the canary: logged as [`REACH_HELD_EVENT`] at INFO and
 //!   counted in `switchboard_reach_checks_total{result="held"}`.
@@ -991,8 +993,8 @@ impl DriftPass {
     /// server delays no other server's polls. Each server's first poll is an interval from now:
     /// boot ran one already, before the listener was bound. With a reach caller, each server's
     /// reach is checked at once, since the binary starts this only once the listener is bound,
-    /// and again beside each poll. That first check runs beside the schedule, so it delays no
-    /// poll.
+    /// and again at each tick unless the last check is still out. The checks run beside the
+    /// schedule, so no poll waits for one.
     pub async fn run(self) {
         let mut entries = JoinSet::new();
         for (server, connector) in &self.servers {
@@ -1044,14 +1046,6 @@ async fn check_reach(withdrawals: Arc<Withdrawals>, entry: Entry) {
     withdrawals.judge_reach(&entry.server, &check.tool, &started, verdict);
 }
 
-/// One poll of `entry` and, beside it, one reach check.
-async fn poll_and_check(withdrawals: Arc<Withdrawals>, entry: Entry) {
-    tokio::join!(
-        poll(Arc::clone(&withdrawals), entry.clone()),
-        check_reach(withdrawals, entry)
-    );
-}
-
 /// Reads `entry`'s tool list and judges it against the approvals in force when it began, and
 /// probes the server beside it (decision 0013, section 5). The probe runs while the list is
 /// read, so a poll takes no longer than one call deadline.
@@ -1073,37 +1067,38 @@ async fn poll(withdrawals: Arc<Withdrawals>, entry: Entry) {
 
 /// Polls `entry` every `interval`, the first an interval from now, for ever. A poll that runs
 /// past the interval delays the next one, which starts when it ends; the next is never run
-/// beside it. So with an interval of at least the server's call deadline, a change is withdrawn
-/// within one interval plus that deadline, and with a shorter one, within about two call
-/// deadlines (#165). A poll whose task fails is logged, and the next runs as usual.
+/// beside it. A poll takes at most the server's call deadline, and the gateway refuses to start
+/// with an interval shorter than any server's ([`crate::start`]), so each poll ends by the next
+/// tick and a change is withdrawn within one interval plus that deadline (decision 0013,
+/// section 5). A poll whose task fails is logged, and the next runs as usual.
 ///
-/// Its reach is checked at once, beside the schedule, and again beside each poll. The first
-/// check delays no poll: a poll that comes while it is still out makes no check of its own, so
-/// two checks of one entry never run together. A check takes up to the call deadline plus
-/// [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE), and the next poll waits for the check
-/// beside the last, so with reach checked the bounds above hold when the interval is at least
-/// the deadline plus that allowance, as at the defaults and in the demos. A reach that has
-/// widened is then withdrawn within one interval plus the call deadline and the allowance.
+/// Its reach is checked at once, and again at each tick, each check in a task beside the
+/// schedule, so no poll ever waits for one. A tick that comes while the last check is still out
+/// makes no check of its own, so two checks of one entry never run together. A check takes up
+/// to the call deadline plus [`REACH_ALLOWANCE`](crate::reach::REACH_ALLOWANCE). With an
+/// interval at least that long, as at the defaults and in the demos, every tick makes a check,
+/// and a reach that has widened is withdrawn within one interval plus the call deadline and the
+/// allowance. With a shorter one, a tick may find the last check still out, so it is withdrawn
+/// within one interval plus twice the deadline and the allowance.
 async fn poll_every(withdrawals: Arc<Withdrawals>, entry: Entry, interval: Duration) {
     let mut every = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Each in its own task, so a panic ends that poll or check alone; dropped with the set
-    // when the pass is aborted. The first check runs beside the schedule, not before it.
-    let mut first = JoinSet::new();
-    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));
+    // when the pass is aborted. The checks run beside the schedule, never before a poll.
+    let mut checking = JoinSet::new();
+    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));
     loop {
         every.tick().await;
-        while let Some(checked) = first.try_join_next() {
+        while let Some(checked) = checking.try_join_next() {
             if let Err(error) = checked {
                 tracing::error!(%error, server = %entry.server, "a reach check's task failed");
             }
         }
-        let mut one = JoinSet::new();
-        if first.is_empty() {
-            one.spawn(poll_and_check(Arc::clone(&withdrawals), entry.clone()));
-        } else {
-            one.spawn(poll(Arc::clone(&withdrawals), entry.clone()));
+        if checking.is_empty() {
+            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));
         }
+        let mut one = JoinSet::new();
+        one.spawn(poll(Arc::clone(&withdrawals), entry.clone()));
         if let Some(Err(error)) = one.join_next().await {
             tracing::error!(%error, server = %entry.server, "a drift poll's task failed");
         }

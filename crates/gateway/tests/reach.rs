@@ -967,6 +967,68 @@ async fn start_refuses_entries_with_a_reach_check_and_no_reach_settings() {
     assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
 }
 
+/// A check that hangs holds back no poll after it: each check runs beside the entry's schedule,
+/// so the polls come every interval while it waits for its answer (the call deadline plus the
+/// allowance), and a tick that comes while it is out makes no check of its own. Here each
+/// entry's first check fails at once, and every later one hangs.
+#[tokio::test]
+async fn a_hanging_check_does_not_delay_the_polls_after_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mock = mock().await;
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_address = silent.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = accepted.clone();
+    let held = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            // The first two connections are the entries' first checks: closed at once.
+            if counted.fetch_add(1, Ordering::SeqCst) >= 2 {
+                open.push(stream);
+            }
+        }
+    });
+    let replica =
+        Replica::reaching("reach-hang-later", &mock.url(), true, Some(silent_address)).await;
+    let signals = replica.drift.signals();
+    let running = tokio::spawn(replica.drift.run());
+    eventually("each entry's first check", || {
+        signals
+            .counts()
+            .iter()
+            .all(|(_, counts)| counts.reach_failed >= 1)
+    })
+    .await;
+
+    let from = Instant::now();
+    eventually("three polls of each entry", || {
+        signals
+            .counts()
+            .iter()
+            .all(|(_, counts)| counts.polls_ok >= 3)
+    })
+    .await;
+    let elapsed = from.elapsed();
+    let counts = signals.counts();
+    running.abort();
+    held.abort();
+    // About three intervals, far short of one hanging check's deadline and allowance.
+    assert!(elapsed < 5 * INTERVAL, "{elapsed:?}");
+    for (server, counts) in &counts {
+        assert_eq!(
+            (
+                counts.reach_held,
+                counts.reach_mismatch,
+                counts.reach_failed
+            ),
+            (0, 0, 1),
+            "{server}: {counts:?}"
+        );
+    }
+    // Each entry's first check, and one more each, still out: none beside it.
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+}
+
 /// A server that answers every `tools/call` with a successful result whose structured content
 /// is numbers written as compactly as JSON allows, `1e15`, in an HTTP body `bytes` long, and
 /// anything else with `404`. The gateway writes each number out again in full,
