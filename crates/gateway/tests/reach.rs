@@ -31,7 +31,7 @@ use gateway::{
     TELEMETRY_QUEUE, Telemetry, Timeouts, probe_credentials, serve_with_telemetry, start,
 };
 use gateway_core::audit::{DecisionKind, Outcome, RecordedResources};
-use gateway_core::{ConnectorName, InstanceName};
+use gateway_core::{ConnectorName, InstanceName, ToolName};
 use gateway_identity::SystemClock;
 use gateway_registry::Registry;
 use gateway_testkit::{InMemoryAuditStore, LocalIssuer};
@@ -193,22 +193,37 @@ impl Replica {
     /// As [`Replica::new`], with the reach check sent to `reach` in place of the replica's own
     /// listener when it is given.
     async fn reaching(name: &str, url: &str, with_token: bool, reach: Option<SocketAddr>) -> Self {
-        Self::build(name, url, with_token, reach, DEFAULT_MAX_RESPONSE_BYTES).await
+        Self::build(
+            name,
+            [url, url],
+            with_token,
+            reach,
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    /// As [`Replica::reaching`], with docs-team-a's server at `team_a` and docs-team-b's at
+    /// `team_b`, so one entry's server can change while the other's does not.
+    async fn split(name: &str, team_a: &str, team_b: &str, reach: SocketAddr) -> Self {
+        let urls = [team_a, team_b];
+        Self::build(name, urls, true, Some(reach), DEFAULT_MAX_RESPONSE_BYTES).await
     }
 
     /// As [`Replica::new`], each connector taking answers of up to `max_result_bytes`.
     async fn capped(name: &str, url: &str, max_result_bytes: usize) -> Self {
-        Self::build(name, url, true, None, max_result_bytes).await
+        Self::build(name, [url, url], true, None, max_result_bytes).await
     }
 
+    /// The replica, docs-team-a's server at `urls[0]` and docs-team-b's at `urls[1]`.
     async fn build(
         name: &str,
-        url: &str,
+        urls: [&str; 2],
         with_token: bool,
         reach: Option<SocketAddr>,
         max_result_bytes: usize,
     ) -> Self {
-        let files = Files::new(name, &issuer().jwks_document(), url);
+        let files = Files::new(name, &issuer().jwks_document(), urls[0]);
         files.write(
             "teams.toml",
             &format!(
@@ -247,7 +262,7 @@ impl Replica {
         let store = Arc::new(InMemoryAuditStore::new());
         let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
         let mut connectors = BTreeMap::new();
-        for entry in ["docs-team-a", "docs-team-b"] {
+        for (entry, url) in ["docs-team-a", "docs-team-b"].into_iter().zip(urls) {
             let connector = proxy(entry, url, &files, max_result_bytes);
             connectors.insert(ConnectorName::new(entry), connector.clone());
             wiring = wiring.proxied(entry, connector);
@@ -413,6 +428,54 @@ fn reapproved(text: &str, revision: &str) -> String {
     let line = format!("revision = \"{KIND_REVISION}\"\n");
     assert_eq!(text.matches(&line).count(), 1);
     text.replace(&line, &format!("revision = \"{revision}\"\n"))
+}
+
+/// The description docs-team-a's server serves for `list_documents`, its reach check tool,
+/// once it drifts.
+const CHANGED_LIST: &str = "List the documents of one project, and whatever else it holds.";
+
+/// A registry `text` in which `tool` is approved at `approved_at` with `description`, the
+/// definition's hash changed to match, under `revision`: an approval of what the server serves.
+fn approval(
+    text: &str,
+    tool: &str,
+    description: &str,
+    approved_at: &str,
+    revision: &str,
+) -> String {
+    let registry = Registry::from_toml_str(text).unwrap();
+    let name: ToolName = tool.parse().unwrap();
+    let definition = &registry.definitions()[&name];
+    let before = &registry.approvals()[&name];
+    let after = gateway_registry::definition_sha256(
+        &registry.routes()[&name].upstream_name,
+        definition.title.as_deref(),
+        description,
+        &definition.input_schema,
+    );
+    let start = text.find(&format!("[[tools]]\nname = \"{tool}\"")).unwrap();
+    let end = start
+        + 1
+        + text[start + 1..]
+            .find("[[tools]]")
+            .unwrap_or(text.len() - start - 1);
+    let mut block = text[start..end]
+        .replace(
+            &format!("description = \"{}\"", definition.description),
+            &format!("description = \"{description}\""),
+        )
+        .replace(
+            &format!("definition_sha256 = \"{}\"", before.definition_sha256),
+            &format!("definition_sha256 = \"{after}\""),
+        );
+    let at = block.find("approved_at = ").unwrap();
+    let line_end = at + block[at..].find('\n').unwrap();
+    block.replace_range(at..line_end, &format!("approved_at = {approved_at}"));
+    let text = format!("{}{block}{}", &text[..start], &text[end..]);
+    let line = |revision: &str| format!("revision = \"{revision}\"\n");
+    let current = registry.snapshot().revision().as_str().to_owned();
+    assert_eq!(text.matches(&line(&current)).count(), 1);
+    text.replace(&line(&current), &line(revision))
 }
 
 /// A refused canary holds: each entry's reach check is a call by the registry's principal on its
@@ -760,6 +823,144 @@ async fn a_check_outstanding_across_a_new_approval_does_not_withdraw_it() {
     );
     assert_eq!(captured.events("reach_mismatch").len(), 2);
     assert_eq!(captured.events("tool_withdrawn").len(), 2);
+}
+
+/// A reach check that finds a mismatch judges a tool withdrawn only with its entry's reach
+/// check tool, as a poll does: the check begins while docs-team-a's reach check tool is served,
+/// a poll withdraws that tool before the widened server's answer comes back, so the read tool
+/// is withdrawn with it, and the mismatch then withdraws the read tool for a cause of its own.
+/// A new approval of the reach check tool alone leaves the read tool withdrawn; a new approval
+/// of the read tool as well serves it.
+#[tokio::test]
+async fn a_mismatch_withdraws_a_tool_withdrawn_with_the_reach_check_tool_on_its_own() {
+    use mock_docs_server::ToolName as Mock;
+    let (captured, _logging) = Captured::start();
+    let team_a = mock().await;
+    let team_b = mock().await;
+    let relay = Relay::bind().await;
+    let replica = Replica::split(
+        "reach-dependent",
+        &team_a.url(),
+        &team_b.url(),
+        relay.address(),
+    )
+    .await;
+    let release = relay.start(replica.address);
+    assert!(
+        team_a
+            .server()
+            .set_projects(&team_a_caller(), Projects::only(["atlas", "borealis"]))
+    );
+    let both = BTreeSet::from([LIST_TOOL.to_owned(), READ_TOOL.to_owned()]);
+
+    let polling = async {
+        // Both checks' calls are decided, sent and answered, and the answers held.
+        eventually("both checks' rows", || {
+            let rows = replica.rows();
+            rows.len() == 2 && rows.iter().all(|row| !row.ends_with(" none"))
+        })
+        .await;
+        assert!(replica.rows().contains(&format!(
+            "{REGISTRY_SA} registry {REACH_SURFACE} {LIST_TOOL} borealis allow ok"
+        )));
+        // The reach check tool drifts, and a poll withdraws it, and the read tool with it.
+        team_a
+            .server()
+            .set_description(Mock::ListDocuments, Some(CHANGED_LIST.to_owned()));
+        replica.drift.pass().await;
+        assert_eq!(replica.withdrawn(), both);
+        release.send_replace(true);
+    };
+    tokio::join!(replica.drift.reach_pass(), polling);
+
+    let mismatch = captured.events("reach_mismatch");
+    assert_eq!(mismatch.len(), 1, "{mismatch:?}");
+    assert_eq!(mismatch[0].1["server"], "docs-team-a");
+    assert_eq!(mismatch[0].1["withdrawn"], 1);
+    assert_eq!(replica.withdrawn(), both);
+    let withdrawn: Vec<(String, String, Value)> = captured
+        .events("tool_withdrawn")
+        .into_iter()
+        .map(|(_, fields)| {
+            (
+                fields["tool"].as_str().unwrap().to_owned(),
+                fields["cause"].as_str().unwrap().to_owned(),
+                fields["reach_check_tool"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        withdrawn,
+        [
+            (
+                LIST_TOOL.to_owned(),
+                "definition changed".to_owned(),
+                Value::Null
+            ),
+            (
+                READ_TOOL.to_owned(),
+                "reach check tool withdrawn".to_owned(),
+                json!(LIST_TOOL)
+            ),
+            (
+                READ_TOOL.to_owned(),
+                "reach mismatch".to_owned(),
+                Value::Null
+            ),
+        ]
+    );
+
+    // The reach check tool approved again alone, as served now: the read tool stays withdrawn
+    // for its own cause, and is not served.
+    let text = approval(
+        &files::registry(&team_a.url()),
+        LIST_TOOL,
+        CHANGED_LIST,
+        "2026-10-12T09:00:00Z",
+        "demo-12",
+    );
+    assert_eq!(
+        replica.reload(&text),
+        format!("demo-12+withdrawn:{READ_TOOL}")
+    );
+    assert_eq!(replica.withdrawn(), BTreeSet::from([READ_TOOL.to_owned()]));
+    assert_eq!(replica.listed(SURFACE, TEAM_A_SA).await, [LIST_TOOL]);
+    let cleared: Vec<String> = captured
+        .events("policy_withdrawal_cleared")
+        .into_iter()
+        .map(|(_, fields)| fields["tool"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(cleared, [LIST_TOOL]);
+
+    // The caller narrowed again and the read tool approved again as well: both are served, and
+    // the next check and poll leave them so.
+    assert!(
+        team_a
+            .server()
+            .set_projects(&team_a_caller(), Projects::only(["atlas"]))
+    );
+    let read: ToolName = READ_TOOL.parse().unwrap();
+    let described = Registry::from_toml_str(&text).unwrap().definitions()[&read]
+        .description
+        .clone();
+    let text = approval(
+        &text,
+        READ_TOOL,
+        &described,
+        "2026-10-12T09:10:00Z",
+        "demo-13",
+    );
+    assert_eq!(replica.reload(&text), "demo-13");
+    assert!(replica.withdrawn().is_empty());
+    assert_eq!(
+        replica.listed(SURFACE, TEAM_A_SA).await,
+        [LIST_TOOL, READ_TOOL]
+    );
+    replica.drift.reach_pass().await;
+    replica.drift.pass().await;
+    assert!(replica.withdrawn().is_empty(), "{:?}", replica.withdrawn());
+    assert_eq!(captured.events("reach_mismatch").len(), 1);
+    assert_eq!(captured.events("tool_withdrawn").len(), 3);
 }
 
 /// A server that answers every `tools/call` with a successful result whose HTTP body is
