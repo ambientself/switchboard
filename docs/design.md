@@ -1491,9 +1491,12 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   an undeclared argument refused before forwarding.
   `PolicySnapshot::without` derives a withdrawal's snapshot for the drift pass. The gateway
   reads a team service identity's or gateway token's credential from its file and refuses a
-  per-user grant at start, until milestone 5. The reach check's tool need not be approved, so
-  removing it, or an entry's last tool, still withdraws it on reload (section 8); a surface that
-  serves it, such as `registry-reach`, must drop it too. The scheduled reach check is built
+  per-user grant at start, until milestone 5. The loader refuses a registry in which an entry's
+  reach check tool is not approved while another of its tools is, naming the entry and the
+  tool: those tools would be served under a credential whose reach is never checked again
+  (#178). Removing every approval of an entry, the reach check's tool with the rest, still
+  withdraws them on reload (section 8); a surface that serves them, such as `registry-reach`,
+  must drop them too. The scheduled reach check is built
   (the drift pass entry below). Not built: a check against a vendor's report of what a
   credential reaches, and narrowing a credential per call or to the caller's limit. The
   gateway sends the same credential on every call to a server, so it refuses an entry whose
