@@ -1493,8 +1493,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   the scheduled reach check, and narrowing a credential per call or to the caller's limit. The
   gateway sends the same credential on every call to a server, so it refuses an entry whose
   narrowing is not `none`, until the custodian client (#12). The refusal is one of the gates
-  every registry's policy meets, at boot and on every reload, whoever wires the connectors,
-  and the start also runs it before it reads a credential.
+  every registry's policy meets, at boot and on every reload, whoever wires the connectors.
+  The JSON configuration's boot runs it too, and the start also runs it before it reads a
+  credential.
 - The kind slice extended to show them: partly built. Both demos register the mock server
   once per team and show each team's calls reaching it under its own entry's identity, for its
   own project (the next entry), and both show the undeclared argument, the registry refused at
