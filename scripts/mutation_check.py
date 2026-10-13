@@ -3282,25 +3282,32 @@ mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is p
        '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
        "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
 mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
-       'Outcome::Refused { sentence } => (Some(stored("outcome_sentence", sentence)?), None),',
-       "Outcome::Refused { sentence } => (Some(sentence.clone()), None),")
+       '                Some(cut(\n                    stored("outcome_sentence", sentence)?,\n',
+       "                Some(cut(\n                    sentence.clone(),\n")
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
 # Decision 0014, section 7: a row is at most 512 KiB, counted as the bytes of the values the store
-# sends, and one over it is refused naming its largest column. columns.rs's own tests watch the
-# bound, the count and the column named; tests/store.rs writes the largest row to Postgres.
-mutate("pg-columns-row-bound-unchecked", "a row over 512 KiB is sent to the database", PG_COLUMNS,
-       "    if bytes > MAX_ROW_BYTES {\n", "    if false && bytes > MAX_ROW_BYTES {\n")
-mutate("pg-columns-row-bound-refuses-at-bound", "a row of exactly 512 KiB is refused", PG_COLUMNS,
-       "    if bytes > MAX_ROW_BYTES {\n", "    if bytes >= MAX_ROW_BYTES {\n")
+# sends, the completion included, and one over it is refused naming its largest column. Begin
+# leaves room for the completion, and finish caps the refusal sentence, the completion's one
+# value of no fixed size. columns.rs's own tests watch the bounds, the count, the column named
+# and the cap; tests/store.rs writes the largest row to Postgres and finishes it.
+mutate("pg-columns-row-bound-unchecked", "a row over its bound is sent to the database", PG_COLUMNS,
+       "    if bytes > bound {\n", "    if false && bytes > bound {\n")
+mutate("pg-columns-row-bound-refuses-at-bound", "a row of exactly its bound is refused", PG_COLUMNS,
+       "    if bytes > bound {\n", "    if bytes >= bound {\n")
+mutate("pg-columns-row-bound-no-completion-reserve", "begin leaves no room for the completion, so a finished row may be over 512 KiB", PG_COLUMNS,
+       "        within_bound(&row.sizes(), MAX_BEGUN_ROW_BYTES)?;\n",
+       "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n")
+mutate("pg-columns-outcome-sentence-uncapped", "a refusal's sentence of any length is written at finish", PG_COLUMNS,
+       "    if text.len() > cap {\n", "    if false && text.len() > cap {\n")
 mutate("pg-columns-row-bound-names-first-column", "a row over the bound names its first column, not its largest", PG_COLUMNS,
        "            .max_by_key(|(_, bytes)| *bytes)\n", "            .find(|(_, bytes)| *bytes > 0)\n")
 mutate("pg-columns-row-bound-groups-uncounted", "a user's groups are left out of the row's size", PG_COLUMNS,
        "    texts.map_or(0, |texts| texts.iter().map(|text| text.len()).sum())\n",
        "    texts.map_or(0, |texts| texts.iter().map(|_| 0).sum())\n")
 mutate("pg-columns-list-row-unbounded", "a list row over 512 KiB is sent to the database", PG_COLUMNS,
-       "        within_bound(&row.sizes())?;\n        Ok(row)\n    }\n\n"
+       "        within_bound(&row.sizes(), MAX_ROW_BYTES)?;\n        Ok(row)\n    }\n\n"
        "    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.\n"
        "    pub fn sizes(&self) -> [(&'static str, usize); 16] {\n",
        "        Ok(row)\n    }\n\n"

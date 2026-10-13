@@ -21,8 +21,11 @@ use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
 
 use super::{GATEWAY_ROLE, TestDatabase};
-use crate::columns::allowance_ms;
-use crate::{Budgets, FinishCounts, MAX_ROW_BYTES, PgAuditError, PgAuditStore, PoolSizes};
+use crate::columns::{BeginRow, FinishRow, allowance_ms};
+use crate::{
+    Budgets, FinishCounts, MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES,
+    PgAuditError, PgAuditStore, PoolSizes,
+};
 
 /// One call, as a test describes it.
 pub(super) struct Call {
@@ -408,8 +411,8 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
     assert_eq!(given_up.lock().unwrap().clone(), vec![error.to_string()]);
 }
 
-/// Decision 0014, section 7: the largest row a call can make, at the 512 KiB bound, is written
-/// and reads back exactly; a byte more is refused, naming its largest column, and no row is
+/// Decision 0014, section 7: the largest row a call can begin, at begin's bound, is written and
+/// reads back exactly; a byte more is refused, naming its largest column, and no row is
 /// written.
 #[tokio::test]
 async fn the_largest_row_is_written_and_a_row_over_the_bound_is_refused() {
@@ -419,7 +422,7 @@ async fn the_largest_row_is_written_and_a_row_over_the_bound_is_refused() {
     let store = db.store(PoolSizes::default());
     let admin = db.admin().await;
 
-    let largest = crate::columns::largest_record(MAX_ROW_BYTES);
+    let largest = crate::columns::largest_record(MAX_BEGUN_ROW_BYTES);
     let row = row_start().row;
     store.begin(&row, &largest).await.unwrap();
     // read_back leaves the credential out; it is read here.
@@ -455,13 +458,78 @@ async fn the_largest_row_is_written_and_a_row_over_the_bound_is_refused() {
             error,
             PgAuditError::RowTooLarge {
                 column: "resources",
-                bytes
-            } if *bytes == MAX_ROW_BYTES + 1
+                bytes,
+                bound: MAX_BEGUN_ROW_BYTES,
+            } if *bytes == MAX_BEGUN_ROW_BYTES + 1
         ),
         "{error}"
     );
     assert_eq!(row_count(&admin).await, 1);
     assert_eq!(store.stats().begin_failures.value_refused, 1);
+}
+
+/// Decision 0014, section 7 bounds the whole row: the largest row an allowed call can begin,
+/// finished with the longest completion, a refusal whose sentence is longer than the cap, is
+/// written and reads back with the sentence cut, and is at most 512 KiB.
+#[tokio::test]
+async fn the_largest_row_finished_with_the_longest_completion_is_within_the_bound() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+
+    let largest = crate::columns::largest_allowed_record(MAX_BEGUN_ROW_BYTES);
+    let row = row_start().row;
+    store.begin(&row, &largest).await.unwrap();
+    let refused = completion(
+        Outcome::Refused {
+            sentence: "s".repeat(MAX_OUTCOME_SENTENCE_BYTES * 2),
+        },
+        u64::from(u32::MAX),
+    );
+    store.finish_within_budget(&row, &refused).await.unwrap();
+
+    let cut = format!("{}…", "s".repeat(MAX_OUTCOME_SENTENCE_BYTES - 3));
+    let read = read_back(&admin, &row).await;
+    assert!(
+        read == AuditRecord {
+            credential: None,
+            completion: Some(completion(
+                Outcome::Refused {
+                    sentence: cut.clone()
+                },
+                u64::from(u32::MAX)
+            )),
+            ..largest.clone()
+        }
+    );
+    let begun: usize = BeginRow::from_record(&row, &largest, &Budgets::default())
+        .unwrap()
+        .sizes()
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .sum();
+    let finished: usize = FinishRow::from_completion(read.completion.as_ref().unwrap())
+        .unwrap()
+        .sizes()
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .sum();
+    assert_eq!(begun, MAX_BEGUN_ROW_BYTES);
+    assert_eq!(finished, "refused".len() + MAX_OUTCOME_SENTENCE_BYTES + 8);
+    assert!(begun + finished <= MAX_ROW_BYTES, "{}", begun + finished);
+    // The database holds the sentence at the cap, as the store counted it.
+    let stored: i32 = admin
+        .query_one(
+            "SELECT octet_length(outcome_sentence) FROM switchboard_audit.call_rows
+              WHERE id = ($1::text)::uuid",
+            &[&row.as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(usize::try_from(stored).unwrap(), MAX_OUTCOME_SENTENCE_BYTES);
 }
 
 /// The decided call `call` in the fixture's policy.
