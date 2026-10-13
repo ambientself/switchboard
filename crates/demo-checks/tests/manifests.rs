@@ -1130,7 +1130,7 @@ fn the_kind_gateway_fetches_the_clusters_keys_with_no_token() {
 
     let mounts = mounted(&container);
     assert!(mounts.contains(&"cluster-ca".to_owned()), "{mounts:?}");
-    no_api_token_mounted(&gateway, &container, &issuer);
+    no_api_token_mounted(&gateway, &container, issuer);
     assert!(
         !container.contains("/var/run/secrets/kubernetes.io/serviceaccount"),
         "{container}"

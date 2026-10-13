@@ -206,7 +206,7 @@ fn dropped_routes_are_refused_by_name_and_by_address() {
     let gateway = Recorder::start(401);
     let hole = dropped();
     let hole = &hole.url;
-    let by_name = named(&hole, "hole.test");
+    let by_name = named(hole, "hole.test");
     let routes = format!(
         "# a comment\n\
          dropped\t{by_name}\t127.0.0.1\t\n\
@@ -215,7 +215,7 @@ fn dropped_routes_are_refused_by_name_and_by_address() {
     );
     let run = Probe::new("dropped", &gateway.url, &routes)
         .host("hole.test", "127.0.0.1")
-        .dropping(&hole)
+        .dropping(hole)
         .run();
     assert_result(&run, true);
     assert_eq!(
@@ -296,7 +296,7 @@ fn a_refusal_after_a_connection_is_not_refused() {
         &gateway.url,
         &format!("retried\t{closed}\t127.0.0.1\treject_ok\n"),
     )
-    .retrying(&closed)
+    .retrying(closed)
     .run();
     assert_result(&run, false);
     assert_eq!(
@@ -387,7 +387,7 @@ fn an_address_literal_host_must_be_one_of_its_rows_addresses() {
              resolved\t{hole}\tresolve\n"
         ),
     )
-    .dropping(&hole)
+    .dropping(hole)
     .run();
     assert_result(&run, true);
     assert_eq!(
@@ -420,17 +420,17 @@ fn a_dotted_host_that_is_not_an_ipv4_address_fails_its_row() {
     ];
     let routes: String = hosts
         .iter()
-        .map(|host| format!("server\t{}\tresolve\treject_ok\n", named(&hole, host)))
+        .map(|host| format!("server\t{}\tresolve\treject_ok\n", named(hole, host)))
         .collect();
     let run = Probe::new("dotted", &gateway.url, &routes)
-        .dropping(&hole)
+        .dropping(hole)
         .run();
     assert_result(&run, false);
     for (line, host) in hosts.iter().enumerate() {
         let text = format!(
             "FAIL routes line {}: the URL has a host of digits and dots that is not an IPv4 address: {}\n",
             line + 1,
-            named(&hole, host)
+            named(hole, host)
         );
         assert!(run.stdout.contains(&text), "{host}\n{}", run.transcript());
     }
@@ -453,8 +453,8 @@ fn the_proxy_variables_cannot_send_an_attempt_through_a_proxy() {
         &gateway_url,
         &format!("server\t{}\t127.0.0.1\treject_ok\n", server.url),
     )
-    .with_env("http_proxy", &proxy)
-    .with_env("all_proxy", &proxy)
+    .with_env("http_proxy", proxy)
+    .with_env("all_proxy", proxy)
     .with_env("NO_PROXY", "localhost")
     .run();
     assert_result(&run, false);
@@ -473,8 +473,8 @@ fn a_name_that_does_not_resolve_could_not_be_probed() {
     let gateway = Recorder::start(401);
     let hole = dropped();
     let hole = &hole.url;
-    let nowhere = named(&hole, "nowhere.test");
-    let slow = named(&hole, "slow.test");
+    let nowhere = named(hole, "nowhere.test");
+    let slow = named(hole, "slow.test");
     let routes = format!(
         "unknown\t{nowhere}\t127.0.0.1\n\
          lookup\t{nowhere}\tresolve\n\
@@ -482,7 +482,7 @@ fn a_name_that_does_not_resolve_could_not_be_probed() {
     );
     let run = Probe::new("unresolved", &gateway.url, &routes)
         .host("slow.test", "slow")
-        .dropping(&hole)
+        .dropping(hole)
         .run();
     assert_result(&run, false);
     assert_eq!(
@@ -512,14 +512,14 @@ fn a_resolve_row_tries_each_address_the_name_resolves_to() {
     let gateway = Recorder::start(401);
     let hole = dropped();
     let hole = &hole.url;
-    let by_name = named(&hole, "hole.test");
+    let by_name = named(hole, "hole.test");
     let run = Probe::new(
         "resolve",
         &gateway.url,
         &format!("resolved\t{by_name}\tresolve\n"),
     )
     .host("hole.test", "127.0.0.1")
-    .dropping(&hole)
+    .dropping(hole)
     .run();
     assert_result(&run, true);
     assert_eq!(
@@ -645,7 +645,7 @@ fn expect_open_inverts_the_result() {
         &format!("dropped\t{hole}\t127.0.0.1\n"),
     )
     .expect("open")
-    .dropping(&hole)
+    .dropping(hole)
     .run();
     assert_result(&run, false);
     assert_eq!(attempts(&run), ["ROUTE dropped address 127.0.0.1 refused"]);
@@ -845,7 +845,7 @@ fn a_url_glob_cannot_hide_a_connection_behind_a_refusal() {
         &gateway.url,
         &format!("dual\t{doubled}\t127.0.0.1\treject_ok\n"),
     )
-    .doubling(&doubled)
+    .doubling(doubled)
     .run();
     assert_result(&run, false);
     assert_eq!(
@@ -885,14 +885,14 @@ fn every_curl_run_turns_globbing_and_proxies_off() {
     let gateway = Recorder::start(401);
     let hole = dropped();
     let hole = &hole.url;
-    let by_name = named(&hole, "hole.test");
+    let by_name = named(hole, "hole.test");
     let probe = Probe::new(
         "globoff",
         &gateway.url,
         &format!("dropped\t{by_name}\tresolve\n"),
     )
     .host("hole.test", "127.0.0.1")
-    .dropping(&hole);
+    .dropping(hole);
     let run = probe.run();
     assert_result(&run, true);
     let log = std::fs::read_to_string(probe.args_file()).unwrap();
