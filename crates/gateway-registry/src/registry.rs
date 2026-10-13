@@ -145,9 +145,11 @@ pub struct Probe {
 /// canary resource outside the reach.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReachCheck {
-    /// The tool, by its exposed name. The loader does not require it to be approved: removing
-    /// a tool's approval withdraws it (decision 0013, section 8), and that must stay possible
-    /// for this tool and for an entry's last tool without editing the reach check.
+    /// The tool, by its exposed name, which the loader requires to be `{system}__<tool>` for
+    /// the server's own system, so that the check cannot name another server's tool or a
+    /// malformed one. The loader does not require it to be approved: removing a tool's approval
+    /// withdraws it (decision 0013, section 8), and that must stay possible for this tool and
+    /// for an entry's last tool without editing the reach check.
     pub tool: ToolName,
     /// Its arguments.
     pub arguments: serde_json::Map<String, Value>,
@@ -235,6 +237,20 @@ pub enum RegistryError {
         "server `{0}` has a reach and no `reach_check`, the call outside it the reach check makes"
     )]
     ReachCheckMissing(ConnectorName),
+    /// A server's reach check calls a tool that is not named `{system}__<tool>` for the
+    /// server's own system: another server's tool, or a malformed name.
+    #[error(
+        "server `{server}`'s reach check calls `{tool}`, which is not one of its own tools: \
+         name it `{system}__<tool>`, after the server's system"
+    )]
+    ReachCheckOutsideSystem {
+        /// The server.
+        server: ConnectorName,
+        /// The tool its reach check names.
+        tool: ToolName,
+        /// The server's system.
+        system: String,
+    },
     /// A server has no probe record (decision 0013, section 9).
     #[error(
         "server `{0}` has no `probe` record; run `switchboard probe` and record its result and date"
@@ -709,6 +725,17 @@ fn servers(
         {
             return Err(RegistryError::ReachCheckMissing(server.name));
         }
+        // The reach check calls one of the entry's own tools. It need not be approved, so that
+        // withdrawing it stays possible, but its name must be under the server's system.
+        if let Some(check) = &server.reach_check
+            && !under_system(&check.tool, &server.system)
+        {
+            return Err(RegistryError::ReachCheckOutsideSystem {
+                tool: check.tool.clone(),
+                system: server.system,
+                server: server.name,
+            });
+        }
         let probe = match server.probe {
             Some(probe) => Some(Probe {
                 result: probe.result,
@@ -820,6 +847,14 @@ struct CheckedTool {
     declared_from: Option<DeclaredFrom>,
 }
 
+/// Whether `name` is `{system}__<tool>` for `system`, with something after the separator.
+fn under_system(name: &ToolName, system: &str) -> bool {
+    name.as_str()
+        .strip_prefix(system)
+        .and_then(|rest| rest.strip_prefix("__"))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 fn check_tool(
     tool: ToolFile,
     servers: &BTreeMap<ConnectorName, Server>,
@@ -832,12 +867,7 @@ fn check_tool(
             server: tool.server,
         });
     };
-    let under_system = name
-        .as_str()
-        .strip_prefix(server.system.as_str())
-        .and_then(|rest| rest.strip_prefix("__"))
-        .is_some_and(|rest| !rest.is_empty());
-    if !under_system {
+    if !under_system(&name, &server.system) {
         return Err(RegistryError::NameOutsideSystem {
             tool: name,
             system: server.system.clone(),
