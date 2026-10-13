@@ -420,14 +420,16 @@ fn block_after(text: &str, header: &str) -> String {
 // with a YAML parser and walk the parsed pods, so aliases, anchors, tags, quoting, escapes,
 // blank lines and comments are the parser's to read. Where a field has a shape they do not
 // expect, they panic rather than read it as absent, and so they do on a tag or a merge key the
-// parser would read otherwise than the API server does ([`ReadAsTheApiServer`]).
+// parser would read otherwise than the API server does ([`ReadAsTheApiServer`]), and on a merge
+// key that supplies a key the mapping also sets, which YAML readers do not agree on ([`merged`]).
 
-/// The documents of a manifest, parsed, with each merge key (`<<`) applied as the API server's
-/// YAML reader applies it. The parser resolves aliases but leaves merge keys to this. It panics
-/// on a manifest [`ReadAsTheApiServer`] refuses.
+/// The documents of a manifest, parsed, with each merge key (`<<`) applied where no key overlaps.
+/// The parser resolves aliases but leaves merge keys to this. YAML readers disagree on which key
+/// wins when a merge supplies a key the mapping also sets, so [`merged`] refuses an overlap, and
+/// the manifest fails to load. So does a manifest [`ReadAsTheApiServer`] refuses.
 fn manifest(text: &str) -> Vec<Yaml> {
     Parser::new_from_str(text)
-        .load(&mut ReadAsTheApiServer, true)
+        .load(&mut ReadAsTheApiServer::default(), true)
         .unwrap_or_else(|error| panic!("a manifest the parser cannot read: {error}"));
     YamlLoader::load_from_str(text)
         .unwrap_or_else(|error| panic!("a manifest the parser cannot read: {error}"))
@@ -436,8 +438,11 @@ fn manifest(text: &str) -> Vec<Yaml> {
         .collect()
 }
 
-/// `node` with each merge key applied: a mapping gets each key of the mappings it merges that it
-/// does not set itself, from the first of them that sets it.
+/// `node` with each merge key applied: a mapping gets the keys of the mappings it merges. It
+/// panics on a key that would come from two places, the mapping itself and a mapping it merges,
+/// or two mappings it merges, whatever their order. The YAML merge spec lets the mapping's own
+/// key win, but go-yaml v2, which kubectl reads with, lets a later `<<` override the keys before
+/// it.
 fn merged(node: Yaml) -> Yaml {
     match node {
         Yaml::Array(items) => Yaml::Array(items.into_iter().map(merged).collect()),
@@ -459,9 +464,13 @@ fn merged(node: Yaml) -> Yaml {
                     panic!("a merge key whose value is not a mapping: {mapping:?}");
                 };
                 for (key, value) in mapping {
-                    if !own.contains_key(&key) {
-                        own.insert(key, value);
-                    }
+                    assert!(
+                        !own.contains_key(&key),
+                        "a merge key that supplies a key the mapping already has: {}",
+                        key.as_str()
+                            .map_or_else(|| format!("{key:?}"), str::to_owned)
+                    );
+                    own.insert(key, value);
                 }
             }
             Yaml::Hash(own)
@@ -481,7 +490,15 @@ fn merged(node: Yaml) -> Yaml {
 /// - A `<<` that is quoted or tagged, other than `!!merge <<`. The loader keeps no scalar's style,
 ///   so it reads `'<<'`, `"<<"` and `!!str <<` as the plain merge key, where the API server reads
 ///   an ordinary key (and kustomize drops it).
-struct ReadAsTheApiServer;
+/// - A tagged scalar as a mapping's key, other than `!!merge <<`. The loader gives a key it
+///   cannot convert, such as `!!int 0x10`, `!!bool yes` or `!!null Null`, as no value, and reads
+///   the rest of the mapping shifted by one, each value as a key and each key as a value.
+#[derive(Default)]
+struct ReadAsTheApiServer {
+    /// The collections open at the current event, innermost last: for a mapping, whether its next
+    /// node is a key; None for a sequence.
+    open: Vec<Option<bool>>,
+}
 
 /// The core schema's tags, which the loader reads as the API server does.
 const CORE_TAGS: [&str; 7] = ["str", "map", "seq", "bool", "int", "float", "null"];
@@ -491,9 +508,40 @@ fn yaml_tag(tag: &Tag) -> Option<&str> {
     (tag.handle == "tag:yaml.org,2002:").then_some(tag.suffix.as_str())
 }
 
+impl ReadAsTheApiServer {
+    /// Whether the node that starts now is a mapping's key. The mapping's next node is then the
+    /// other of key and value.
+    fn starts_a_key(&mut self) -> bool {
+        match self.open.last_mut() {
+            Some(Some(next_is_key)) => {
+                let key = *next_is_key;
+                *next_is_key = !key;
+                key
+            }
+            _ => false,
+        }
+    }
+}
+
 impl MarkedEventReceiver for ReadAsTheApiServer {
     fn on_event(&mut self, event: Event, mark: Marker) {
         let at = format!("line {}, column {}", mark.line(), mark.col());
+        let key = match &event {
+            Event::Scalar(..)
+            | Event::Alias(_)
+            | Event::SequenceStart(..)
+            | Event::MappingStart(..) => self.starts_a_key(),
+            Event::SequenceEnd | Event::MappingEnd => {
+                self.open.pop();
+                false
+            }
+            _ => false,
+        };
+        match &event {
+            Event::SequenceStart(..) => self.open.push(None),
+            Event::MappingStart(..) => self.open.push(Some(true)),
+            _ => {}
+        }
         let tag = match &event {
             Event::Scalar(value, style, _, tag) if value == "<<" => {
                 assert!(
@@ -518,6 +566,13 @@ impl MarkedEventReceiver for ReadAsTheApiServer {
                 tag.handle,
                 tag.suffix
             );
+            if let Event::Scalar(value, ..) = &event {
+                assert!(
+                    !key,
+                    "a tagged mapping key, at {at}: !!{} {value}",
+                    tag.suffix
+                );
+            }
         }
     }
 }
@@ -728,6 +783,64 @@ fn turns_on_the_default_token(pod: &Yaml) -> bool {
     !matches!(set, None | Some(Yaml::Null | Yaml::Boolean(false)))
 }
 
+/// The ServiceAccount a pod spec runs as: its `serviceAccountName`, or `default` if it names
+/// none. It panics on a pod spec that sets `serviceAccount`, the field's deprecated name, which
+/// the API server reads as the ServiceAccount when `serviceAccountName` is unset.
+fn service_account(pod: &Yaml) -> &str {
+    let deprecated = mapping(pod, "a pod spec")
+        .and_then(|pod| pod.get(&Yaml::String("serviceAccount".to_owned())));
+    assert!(
+        deprecated.is_none(),
+        "a pod spec that sets serviceAccount, the deprecated serviceAccountName: {deprecated:?}"
+    );
+    match &pod["serviceAccountName"] {
+        Yaml::BadValue | Yaml::Null => "default",
+        name => string(name, "a serviceAccountName"),
+    }
+}
+
+/// Each Secret a pod spec references, by name, with how it references it: a `secret` volume, a
+/// projected volume's `secret` source, or an `env` `secretKeyRef` or `envFrom` `secretRef` of a
+/// container of any kind.
+fn secret_references(pod: &Yaml) -> Vec<(&'static str, String)> {
+    let mut found = Vec::new();
+    for volume in list(&pod["volumes"], "volumes") {
+        if mapping(&volume["secret"], "a secret volume").is_some() {
+            let name = string(
+                &volume["secret"]["secretName"],
+                "a secret volume's secretName",
+            );
+            found.push(("a secret volume", name.to_owned()));
+        }
+        mapping(&volume["projected"], "a projected volume");
+        for source in list(&volume["projected"]["sources"], "a projection's sources") {
+            mapping(source, "a projected source");
+            if mapping(&source["secret"], "a projected secret").is_some() {
+                let name = string(&source["secret"]["name"], "a projected secret's name");
+                found.push(("a projected secret", name.to_owned()));
+            }
+        }
+    }
+    for container in pod_containers(pod) {
+        for variable in list(&container["env"], "env") {
+            mapping(&variable["valueFrom"], "an env valueFrom");
+            let reference = &variable["valueFrom"]["secretKeyRef"];
+            if mapping(reference, "a secretKeyRef").is_some() {
+                let name = string(&reference["name"], "a secretKeyRef's name");
+                found.push(("an env secretKeyRef", name.to_owned()));
+            }
+        }
+        for source in list(&container["envFrom"], "envFrom") {
+            mapping(source, "an envFrom source");
+            if mapping(&source["secretRef"], "a secretRef").is_some() {
+                let name = string(&source["secretRef"]["name"], "a secretRef's name");
+                found.push(("an envFrom secretRef", name.to_owned()));
+            }
+        }
+    }
+    found
+}
+
 /// The ServiceAccount `name` in `namespace` turns off the default API token.
 fn account_turns_off_the_default_token(namespace: &str, name: &str) {
     let accounts = manifest(&read("deploy/kind/base/serviceaccounts.yaml"));
@@ -849,6 +962,7 @@ projected:
     - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}"
         )
     );
+    assert_eq!(service_account(&pod), "gateway");
     account_turns_off_the_default_token("switchboard", "gateway");
 }
 
@@ -870,8 +984,7 @@ fn no_workload_mounts_an_api_token() {
     for (document, pod) in pods {
         no_api_token_in_workload(document, pod);
         let namespace = string(&document["metadata"]["namespace"], "a namespace");
-        let account = string(&pod["serviceAccountName"], "a serviceAccountName");
-        account_turns_off_the_default_token(namespace, account);
+        account_turns_off_the_default_token(namespace, service_account(pod));
     }
 }
 
@@ -993,14 +1106,17 @@ fn the_kind_gateway_presents_each_entrys_token_and_holds_no_secret() {
         *volume(&pod, "entry-tokens"),
         yaml("{name: entry-tokens, emptyDir: {medium: Memory, sizeLimit: 1Mi}}")
     );
-    // No Secret volume, nor a Secret projected into one; the database URL comes from a Secret
-    // by secretKeyRef, which is not a credential for mock-docs.
-    for secret in ["secret:", "secretName"] {
-        assert!(
-            !gateway.contains(secret),
-            "the gateway mounts a Secret:\n{gateway}"
-        );
-    }
+    // No Secret volume, nor a Secret projected into one, nor one in the environment whole; the
+    // database URL comes from Secret database by secretKeyRef, which is not a credential for
+    // mock-docs.
+    let references = secret_references(&pod);
+    assert!(
+        references
+            .iter()
+            .all(|reference| *reference == ("an env secretKeyRef", "database".to_owned())),
+        "the gateway's pod references a Secret other than by the database's secretKeyRef: \
+         {references:?}"
+    );
 
     // The deployment file names each entry's token as its credential, under the registry's
     // references.
@@ -1321,10 +1437,7 @@ fn the_gateway_guards_see_an_api_token_mount_however_it_is_written() {
             ),
         ),
         ("an alias", aliased("            - *api-mount\n")),
-        (
-            "a merge key",
-            aliased("            - {<<: *api-mount, readOnly: true}\n"),
-        ),
+        ("a merge key", aliased("            - {<<: *api-mount}\n")),
     ] {
         assert_ne!(changed, gateway, "{form}");
         let pod = only_pod(&changed);
@@ -1728,22 +1841,6 @@ fn the_workload_guard_sees_an_api_token_source_however_it_is_written() {
         ),
         true,
     ));
-    // team-a's own token for the gateway, anchored, and merged into a source that empties its
-    // audience.
-    let anchored_token = workloads.replacen(
-        "                  - serviceAccountToken:\n                      audience: switchboard\n",
-        "                  - serviceAccountToken: &workload-token\n                      audience: switchboard\n",
-        1,
-    );
-    forms.push((
-        "its audience emptied over a merge key".to_owned(),
-        with(
-            &anchored_token,
-            "                  - serviceAccountToken: {<<: *workload-token, audience: ''}\n",
-        ),
-        false,
-    ));
-
     for (form, changed, issuer) in forms {
         assert_ne!(changed, workloads, "{form}");
         let documents = manifest(&changed);
@@ -1825,11 +1922,64 @@ fn the_guards_see_the_default_api_token_turned_on() {
     }
 }
 
+/// #182: the guards refuse a pod that sets `serviceAccount`, the deprecated name of
+/// `serviceAccountName`, in the gateway's pod and in a workload, beside its
+/// `serviceAccountName` or in its place.
+#[test]
+fn the_guards_refuse_the_deprecated_service_account_field() {
+    let gateway = read("deploy/kind/base/gateway.yaml");
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    let gateway_account = "      serviceAccountName: gateway\n";
+    let workload_account = "          serviceAccountName: mock-workload\n";
+    for (form, changed) in [
+        (
+            "the gateway's, beside serviceAccountName",
+            gateway.replacen(
+                gateway_account,
+                &format!("{gateway_account}      serviceAccount: default\n"),
+                1,
+            ),
+        ),
+        (
+            "the gateway's, in its place",
+            gateway.replacen(gateway_account, "      serviceAccount: gateway\n", 1),
+        ),
+        (
+            "team-a's, beside serviceAccountName",
+            workloads.replacen(
+                workload_account,
+                &format!("{workload_account}          serviceAccount: default\n"),
+                1,
+            ),
+        ),
+        (
+            "team-a's, in its place",
+            workloads.replacen(
+                workload_account,
+                "          serviceAccount: mock-workload\n",
+                1,
+            ),
+        ),
+    ] {
+        assert!(changed != gateway && changed != workloads, "{form}");
+        let documents = manifest(&changed);
+        let (_, pod) = pod_specs(&documents)[0];
+        let message = panic_message(form, || {
+            service_account(pod);
+        });
+        assert!(
+            message.starts_with("a pod spec that sets serviceAccount"),
+            "{form}: {message}"
+        );
+    }
+}
+
 /// #182: the reader refuses what its parser would read otherwise than the API server, in the
 /// gateway's pod and in a workload: a `!!binary` key that the API server decodes to
 /// `serviceAccountToken`, or a `!!binary` audience it decodes to the issuer, however the tag is
-/// spelled; and a `<<` that is quoted or tagged, which the API server reads as an ordinary key
-/// where the parser would merge it. `!!merge <<` and `? <<` still merge.
+/// spelled; a `<<` that is quoted or tagged, which the API server reads as an ordinary key
+/// where the parser would merge it; a tagged key, which the parser may read as no value; and a
+/// merge key that supplies a key the mapping already has. `!!merge <<` and `? <<` still merge.
 #[test]
 fn the_guards_refuse_a_tag_or_merge_key_the_parser_reads_otherwise() {
     let gateway = read("deploy/kind/base/gateway.yaml");
@@ -1923,6 +2073,66 @@ fn the_guards_refuse_a_tag_or_merge_key_the_parser_reads_otherwise() {
     ] {
         forms.push((form, with_source(source), merge));
     }
+    // A tagged key: the parser gives one it cannot convert as no value, and reads the rest of the
+    // mapping shifted by one. Any tagged key is refused, `!!str` too.
+    let tagged_key = "a tagged mapping key";
+    for (form, source) in [
+        (
+            "an !!int key",
+            "$I- serviceAccountToken: {path: token, !!int 0x10: x, audience: not-switchboard}\n",
+        ),
+        (
+            "a !!bool key",
+            "$I- serviceAccountToken: {path: token, !!bool yes: x, audience: not-switchboard}\n",
+        ),
+        (
+            "a !!null key",
+            "$I- serviceAccountToken:\n$I    path: token\n$I    !!null Null: audience\n$I    not-switchboard: x\n",
+        ),
+        (
+            "a !!str key",
+            "$I- !!str serviceAccountToken: {path: token, audience: not-switchboard}\n",
+        ),
+    ] {
+        forms.push((form, with_source(source), tagged_key));
+    }
+    // A merge key that supplies a key the mapping sets too, in either order, or that two merged
+    // mappings both set: YAML readers disagree on which wins.
+    let overlap = "a merge key that supplies a key the mapping already has: audience";
+    for (form, source) in [
+        (
+            "an audience before a merge that sets it",
+            "$I- serviceAccountToken: {path: token, audience: not-switchboard, <<: {audience: ''}}\n",
+        ),
+        (
+            "an audience after a merge that sets it",
+            "$I- serviceAccountToken: {<<: {audience: ''}, path: token, audience: not-switchboard}\n",
+        ),
+        (
+            "two merged audiences",
+            "$I- serviceAccountToken: {path: token, <<: [{audience: not-switchboard}, {audience: ''}]}\n",
+        ),
+    ] {
+        forms.push((form, with_source(source), overlap));
+    }
+    // team-a's own token for the gateway, anchored, and merged into a source that empties its
+    // audience.
+    let anchored_token = workloads.replacen(
+        "                  - serviceAccountToken:\n                      audience: switchboard\n",
+        "                  - serviceAccountToken: &workload-token\n                      audience: switchboard\n",
+        1,
+    );
+    forms.push((
+        "team-a's audience emptied over a merge key",
+        vec![anchored_token.replacen(
+            wrong,
+            &format!(
+                "{wrong}                  - serviceAccountToken: {{<<: *workload-token, audience: ''}}\n"
+            ),
+            1,
+        )],
+        overlap,
+    ));
     for (form, changed, refusal) in forms {
         for changed in changed {
             assert!(changed != gateway && changed != workloads, "{form}");
@@ -1984,19 +2194,36 @@ fn kustomize_build(directory: &str) -> Option<String> {
     None
 }
 
-/// Decision 0013, section 10, on what demo.sh applies, `kustomize build deploy/kind/base`, as well
-/// as on the files it is built from: in the gateway's pod only the token writer mounts a token
-/// the API server accepts, and the gateway container none; no other pod in the build holds one;
-/// and no pod gets the default API token, which each pod turns off itself or leaves to a
-/// ServiceAccount in the build that does. With neither kustomize nor kubectl installed it says it
-/// was skipped and passes; CI, whose runner has both, fails on that line.
-#[test]
-fn the_token_guards_hold_on_the_built_kind_base() {
-    let Some(built) = kustomize_build("deploy/kind/base") else {
-        eprintln!("skipped: neither kustomize nor kubectl is installed");
-        return;
+/// The type the API server fills a Secret of with a ServiceAccount's long-lived token.
+const SERVICE_ACCOUNT_TOKEN_SECRET: &str = "kubernetes.io/service-account-token";
+
+/// The token guards on `built`, a build of the kind base, for
+/// [`the_token_guards_hold_on_the_built_kind_base`].
+fn built_base_guards(built: &str) {
+    let documents = manifest(built);
+    let namespace = |document: &Yaml| {
+        let namespace = &document["metadata"]["namespace"];
+        string(namespace, "a namespace").to_owned()
     };
-    let documents = manifest(&built);
+    // No Secret holds a ServiceAccount's token. A Secret with no type is Opaque.
+    let secrets: Vec<(String, String)> = documents
+        .iter()
+        .filter(|document| document["kind"].as_str() == Some("Secret"))
+        .map(|secret| {
+            let label = label(secret);
+            match &secret["type"] {
+                Yaml::BadValue | Yaml::Null => {}
+                kind => assert_ne!(
+                    string(kind, "a Secret's type"),
+                    SERVICE_ACCOUNT_TOKEN_SECRET,
+                    "{label}: a Secret the API server fills with a ServiceAccount's token"
+                ),
+            }
+            let name = string(&secret["metadata"]["name"], "a Secret's name");
+            (namespace(secret), name.to_owned())
+        })
+        .collect();
+
     let pods = pod_specs(&documents);
     let labels: Vec<String> = pods.iter().map(|(document, _)| label(document)).collect();
     assert_eq!(
@@ -2019,9 +2246,17 @@ fn the_token_guards_hold_on_the_built_kind_base() {
         } else {
             no_api_token_in_workload(document, pod);
         }
+        let namespace = namespace(document);
+        // Every Secret the pod references is one of the build's, whose type is checked above.
+        for (how, secret) in secret_references(pod) {
+            assert!(
+                secrets.contains(&(namespace.clone(), secret.clone())),
+                "{name} references Secret {namespace}/{secret} by {how}, and the build has no \
+                 such Secret"
+            );
+        }
+        let account = service_account(pod);
         if pod["automountServiceAccountToken"] != Yaml::Boolean(false) {
-            let namespace = string(&document["metadata"]["namespace"], "a namespace");
-            let account = pod["serviceAccountName"].as_str().unwrap_or("default");
             let accounts: Vec<&Yaml> = documents
                 .iter()
                 .filter(|document| {
@@ -2035,6 +2270,94 @@ fn the_token_guards_hold_on_the_built_kind_base() {
                 "{name}: ServiceAccount {namespace}/{account} mounts the default API token"
             );
         }
+    }
+}
+
+/// Decision 0013, section 10, on what demo.sh applies, `kustomize build deploy/kind/base`, as well
+/// as on the files it is built from. In the gateway's pod only the token writer mounts a
+/// projected token the API server accepts, and the gateway container mounts no projected token.
+/// No other pod's volumes project a token the API server accepts. No pod gets the default API
+/// token: each turns it off itself or runs as a ServiceAccount in the build that does. No pod sets
+/// the deprecated `serviceAccount`. The build holds no Secret of type
+/// `kubernetes.io/service-account-token`, and every Secret a pod references, by a `secret`
+/// volume, a projected `secret` source, an `env` `secretKeyRef` or an `envFrom` `secretRef`, is a
+/// Secret in the build, so its type is checked too. Then each of those refusals is shown on a
+/// copy of the build changed to break it. With neither kustomize nor kubectl installed it says it
+/// was skipped and passes; CI, whose runner has both, fails on that line.
+#[test]
+fn the_token_guards_hold_on_the_built_kind_base() {
+    let Some(built) = kustomize_build("deploy/kind/base") else {
+        eprintln!("skipped: neither kustomize nor kubectl is installed");
+        return;
+    };
+    built_base_guards(&built);
+
+    // The build changed to break one guard: postgres's pod given a volume, a variable or a
+    // ServiceAccount, or the build given a Secret.
+    let postgres_volumes = "      volumes:\n      - emptyDir: {}\n        name: data\n";
+    let with_volume =
+        |volume: &str| built.replacen(postgres_volumes, &format!("{postgres_volumes}{volume}"), 1);
+    let postgres_env = "      - env:\n        - name: POSTGRES_PASSWORD\n";
+    let with_env = |variable: &str| {
+        built.replacen(
+            postgres_env,
+            &format!("      - env:\n{variable}        - name: POSTGRES_PASSWORD\n"),
+            1,
+        )
+    };
+    let postgres_image = "        imagePullPolicy: Never\n        name: postgres\n";
+    let token_secret = format!(
+        "---\napiVersion: v1\nkind: Secret\nmetadata:\n  annotations:\n    kubernetes.io/service-account.name: gateway\n  name: gateway-token\n  namespace: switchboard\ntype: {SERVICE_ACCOUNT_TOKEN_SECRET}\n"
+    );
+    let missing = |how: &str| {
+        format!(
+            "Deployment switchboard/postgres references Secret switchboard/gateway-token by {how}, and the build has no such Secret"
+        )
+    };
+    for (form, changed, refusal) in [
+        (
+            "a ServiceAccount token Secret",
+            format!("{built}{token_secret}"),
+            "Secret switchboard/gateway-token: a Secret the API server fills with a ServiceAccount's token".to_owned(),
+        ),
+        (
+            "the database Secret as a ServiceAccount token Secret",
+            built.replacen("\ntype: Opaque\n", &format!("\ntype: {SERVICE_ACCOUNT_TOKEN_SECRET}\n"), 1),
+            "a Secret the API server fills with a ServiceAccount's token".to_owned(),
+        ),
+        (
+            "a secret volume",
+            with_volume("      - name: api-token\n        secret:\n          secretName: gateway-token\n"),
+            missing("a secret volume"),
+        ),
+        (
+            "a projected secret",
+            with_volume("      - name: api-token\n        projected:\n          sources:\n          - secret:\n              name: gateway-token\n"),
+            missing("a projected secret"),
+        ),
+        (
+            "an env secretKeyRef",
+            with_env("        - name: API_TOKEN\n          valueFrom:\n            secretKeyRef:\n              key: token\n              name: gateway-token\n"),
+            missing("an env secretKeyRef"),
+        ),
+        (
+            "an envFrom secretRef",
+            built.replacen(postgres_image, &format!("        envFrom:\n        - secretRef:\n            name: gateway-token\n{postgres_image}"), 1),
+            missing("an envFrom secretRef"),
+        ),
+        (
+            "the deprecated serviceAccount",
+            built.replacen(
+                "      automountServiceAccountToken: false\n      containers:\n",
+                "      automountServiceAccountToken: false\n      serviceAccount: default\n      containers:\n",
+                1,
+            ),
+            "a pod spec that sets serviceAccount, the deprecated serviceAccountName".to_owned(),
+        ),
+    ] {
+        assert_ne!(changed, built, "{form}");
+        let message = panic_message(form, || built_base_guards(&changed));
+        assert!(message.contains(&refusal), "{form}: {message}");
     }
 }
 

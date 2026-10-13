@@ -4204,10 +4204,14 @@ mutate("demo-kind-yaml-merge-keys-unapplied", "the manifest guards read a merge 
        MANIFESTS_TEST,
        """                if key.as_str() == Some("<<") {\n""",
        """                if key.as_str() == Some("<< (never)") {\n""")
-mutate("demo-kind-yaml-merge-overrides-own-keys", "a merge key overrides the mapping's own keys, so a merged audience hides the empty one it sets",
+mutate("demo-kind-yaml-merge-overrides-own-keys", "a merge key overrides the mapping's own keys, as go-yaml v2 lets it, rather than the overlap being refused",
        MANIFESTS_TEST,
-       "                    if !own.contains_key(&key) {\n",
-       "                    if own.contains_key(&key) || !own.contains_key(&key) {\n")
+       "                        !own.contains_key(&key),\n",
+       "                        true,\n")
+mutate("demo-kind-yaml-merge-overlap-own-keys-win", "a mapping's own keys win over a merge key, as the YAML merge spec has it, rather than the overlap being refused",
+       MANIFESTS_TEST,
+       "                    assert!(\n                        !own.contains_key(&key),\n",
+       "                    if own.contains_key(&key) {\n                        continue;\n                    }\n                    assert!(\n                        !own.contains_key(&key),\n")
 mutate("demo-kind-pod-specs-top-level-only", "the manifest guards look for pods only at a document's top level, and miss a Deployment's or CronJob's pod template",
        MANIFESTS_TEST,
        "                    entries.values().for_each(|value| find(value, found));\n",
@@ -4251,6 +4255,38 @@ mutate("demo-kind-yaml-str-merge-key-read", "the manifest reader merges a `!!str
        MANIFESTS_TEST,
        """                            .is_none_or(|tag| yaml_tag(tag) == Some("merge")),\n""",
        """                            .is_none_or(|tag| yaml_tag(tag).is_some()),\n""")
+mutate("demo-kind-yaml-tagged-key-read", "the manifest reader takes a tagged key, which its loader gives as no value when it cannot convert it, shifting the rest of the mapping",
+       MANIFESTS_TEST,
+       "                    !key,\n",
+       "                    true,\n")
+mutate("demo-kind-deprecated-service-account-read", "a pod that sets the deprecated serviceAccount passes, and the ServiceAccount it names goes unchecked",
+       MANIFESTS_TEST,
+       "        deprecated.is_none(),\n",
+       "        deprecated.is_none() || deprecated.is_some(),\n")
+mutate("demo-kind-built-base-token-secret-unchecked", "the built-base guard does not check the type of the build's Secrets, so one holding a ServiceAccount's token passes",
+       MANIFESTS_TEST,
+       "                    SERVICE_ACCOUNT_TOKEN_SECRET,\n",
+       "                    \"no-such-type\",\n")
+mutate("demo-kind-built-base-secret-outside-build", "a pod of the built base may reference a Secret the build does not hold, whose type goes unchecked",
+       MANIFESTS_TEST,
+       "                secrets.contains(&(namespace.clone(), secret.clone())),\n",
+       "                secrets.contains(&(namespace.clone(), secret.clone())) || !secret.is_empty(),\n")
+mutate("demo-kind-secret-volume-unread", "a pod's secret volume is not read as a reference to a Secret",
+       MANIFESTS_TEST,
+       """            found.push(("a secret volume", name.to_owned()));\n""",
+       "            let _ = name;\n")
+mutate("demo-kind-projected-secret-unread", "a projected volume's secret source is not read as a reference to a Secret",
+       MANIFESTS_TEST,
+       """                found.push(("a projected secret", name.to_owned()));\n""",
+       "                let _ = name;\n")
+mutate("demo-kind-env-secret-key-ref-unread", "a container's env secretKeyRef is not read as a reference to a Secret",
+       MANIFESTS_TEST,
+       """                found.push(("an env secretKeyRef", name.to_owned()));\n""",
+       "                let _ = name;\n")
+mutate("demo-kind-env-from-secret-ref-unread", "a container's envFrom secretRef is not read as a reference to a Secret",
+       MANIFESTS_TEST,
+       """                found.push(("an envFrom secretRef", name.to_owned()));\n""",
+       "                let _ = name;\n")
 mutate("demo-kind-built-base-default-token-on", "a kustomize patch turns on the default API token in a pod of the built base, though no file it reads does",
        "deploy/kind/base/kustomization.yaml",
        "secretGenerator:\n",
