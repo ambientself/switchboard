@@ -3931,6 +3931,10 @@ mutate("demo-workload-direct-any-failure", "any failed direct call passes, not o
        '    check "curl exit $([ "$code" -ne 0 ] && echo 28 || echo "$code"), ${connects:-no} connections"')
 mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
        """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
+# #168: closed_port() holds its port for as long as its guard lives.
+mutate("demo-checks-closed-port-released", "closed_port() lets its port go once it has read it, so another test may take it",
+       "crates/demo-checks/tests/common/mod.rs",
+       "        _held: held,\n", "        _held: Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n")
 CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
 mutate("demo-driver-otto-dev-allowed", "the driver runs whatever cluster it is given", DRIVER,
        CLUSTER_CHECK, "if false; then")
@@ -4116,6 +4120,14 @@ mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kub
        """    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)\n""")
 mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
        "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
+# #140: after the policy, each team's pod is refused on the gateway's metrics port and answered
+# on its MCP port.
+mutate("demo-kind-metrics-port-untried", "the kind run never tries the gateway's metrics port from a team's pod", DRIVER,
+       "  metrics_port_probes\n", "")
+mutate("demo-kind-metrics-port-answer-passes", "a team's pod answered on the metrics port passes", DRIVER,
+       "        '000 0 7' | '000 0 28') pass", "        *) pass")
+mutate("demo-kind-metrics-port-mcp-unchecked", "the metrics-port step does not check that the MCP port answers the same pod", DRIVER,
+       """      check "$got" "200 1 0" "$team's pod is answered on the gateway's MCP port, 8080, at the same address"\n""", "")
 # #60: the operator checks read the RBAC rules bound to each team's workload too.
 mutate("demo-operator-rbac-unchecked", "the operator checks ask can-i and reviews alone, which cannot see a rule limited by resourceNames", DRIVER,
        "  done\n  operator_rbac\n}\n", "  done\n}\n")
@@ -4147,11 +4159,41 @@ mutate_all("demo-kind-gateway-keys-token", "the gateway container mounts a proje
             "          configMap: {name: kube-root-ca.crt}\n"
             "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
             "                  audience: https://kubernetes.default.svc.cluster.local\n                  expirationSeconds: 600\n                  path: token\n"))
-mutate("demo-kind-gateway-keys-token-unset-audience", "the gateway's CA volume also projects a token with no audience, which is the API server's",
-       "deploy/kind/base/gateway.yaml",
-       "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}\n",
-       "        - name: cluster-ca\n          projected:\n            sources:\n              - configMap: {name: kube-root-ca.crt}\n"
-       "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n")
+# #153: an API token volume of its own, with no audience, so the API server's, mounted into the
+# gateway container. The guard's unset-audience branch catches it, not the cluster-ca check.
+mutate_all("demo-kind-gateway-keys-token-unset-audience", "the gateway container mounts a projected token with no audience, which is the API server's",
+           ("deploy/kind/base/gateway.yaml",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n"
+            "            - {name: keys-token, mountPath: /var/run/secrets/switchboard/keys, readOnly: true}\n"),
+           ("deploy/kind/base/gateway.yaml",
+            "          configMap: {name: kube-root-ca.crt}\n",
+            "          configMap: {name: kube-root-ca.crt}\n"
+            "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
+            "                  expirationSeconds: 600\n                  path: token\n"))
+# #153: the manifest guards read block-style mounts, and the kind run holds the three checks of
+# its anonymous key-fetch step.
+mutate("demo-kind-mounts-flow-style-only", "the manifest guards read only flow-style volume mounts, and miss a block-style one",
+       "crates/demo-checks/tests/manifests.rs",
+       """    items(container, "          volumeMounts:")
+        .iter()
+        .map(|mount| item_name(mount).to_owned())
+        .collect()
+""",
+       """    block_after(container, "          volumeMounts:")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- {name: "))
+        .map(|rest| rest.split(',').next().unwrap().to_owned())
+        .collect()
+""")
+mutate("demo-kind-anonymous-role-unchecked", "the kind run does not check the issuer-discovery ClusterRole's rules", DRIVER,
+       """    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \\\n""",
+       """    check '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \\\n""")
+mutate("demo-kind-anonymous-keys-unchecked", "the kind run does not compare the keys an anonymous caller gets with the cluster's", DRIVER,
+       """    check "$(jq -c '[.keys[].kid] | sort' <<<"$FETCHED")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \\\n""",
+       """    check "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \\\n""")
+mutate("demo-kind-anonymous-configmap-unchecked", "the kind run does not check that an anonymous ConfigMap read is refused", DRIVER,
+       """    check "$FETCHED" 403 "an unauthenticated read of a ConfigMap is refused"\n""", "")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
        '    check "curl exit $code, ${connects:-no} connections"', '    check "curl exit $code, 0 connections"')
 mutate("demo-workload-idle-no-trap", "the idle workload has no trap, so SIGTERM kills it and it never passes", WORKLOAD,
@@ -4351,6 +4393,12 @@ mutate("demo-token-writer-truncates-on-failure", "the token writer empties the t
 mutate("demo-token-writer-wrong-audience", "the token writer asks for tokens for another audience than the server's", TOKEN_WRITER,
        "      spec: {audiences: [$audience], expirationSeconds: $seconds}}'\n",
        """      spec: {audiences: ["switchboard"], expirationSeconds: $seconds}}'\n""")
+# #153: each token is renamed into place, and the kind run asks for the gateway's token grant.
+mutate("demo-token-writer-writes-in-place", "the token writer writes each token straight into the file the gateway reads", TOKEN_WRITER,
+       """  if ! printf '%s\\n' "$token" >"$next" || ! mv -f "$next" "$target"; then\n""",
+       """  if ! printf '%s\\n' "$token" >"$target"; then\n""")
+mutate("demo-kind-token-grants-unchecked", "the kind run never asks for the gateway's token grant", DRIVER,
+       "  token_grants\n\n", "\n")
 mutate("demo-kind-gateway-mounts-api-token", "the gateway container mounts the token writer's API token", "deploy/kind/base/gateway.yaml",
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n",
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
