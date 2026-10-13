@@ -146,10 +146,14 @@ pub struct Probe {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReachCheck {
     /// The tool, by its exposed name, which the loader requires to be `{system}__<tool>` for
-    /// the server's own system, a system no other server has, so that the check cannot name
-    /// another server's tool or a malformed one. The loader does not require it to be approved: removing a tool's approval
-    /// withdraws it (decision 0013, section 8), and that must stay possible for this tool and
-    /// for an entry's last tool without editing the reach check.
+    /// the server's own system, so that it is not a malformed name. No other server has that
+    /// system, so the check cannot name the tool of a server with the same system. It can
+    /// still name a tool of a server whose system overlaps this one: with systems `docs` and
+    /// `docs__wiki` (or `docs_`), the name `docs__wiki__search` (or `docs___search`) is under
+    /// both, and the loader does not yet refuse that. The loader does not require the tool to
+    /// be approved: removing a tool's approval withdraws it (decision 0013, section 8), and
+    /// that must stay possible for this tool and for an entry's last tool without editing the
+    /// reach check.
     pub tool: ToolName,
     /// Its arguments.
     pub arguments: serde_json::Map<String, Value>,

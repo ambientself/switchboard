@@ -1475,8 +1475,12 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   reference and principal, its narrowing, what its credential permits, its reach, a dated
   reach test (required when the reach is not empty) and a reach check (required for every
   entry with a reach that is not per-user, whatever its narrowing). A reach check's tool must
-  be named `<system>__<tool>` for the entry's own system, and no two servers may have the same
-  system (#174), so it cannot name another server's tool or a malformed one.
+  be named `<system>__<tool>` for the entry's own system, so it cannot be a malformed name, and
+  no two servers may have the same system (#174), so it cannot name the tool of a server with
+  the same system. Two different systems can still overlap (`docs__wiki__search` is under both
+  `docs` and `docs__wiki`, and `docs___search` under both `docs` and `docs_`), so a reach check
+  can still name the tool of a server whose system overlaps its own; refusing overlapping
+  systems is a follow-up.
   `PolicySnapshot::new` refuses a snapshot that breaks a rule, naming
   the tool, entry, surface, team or group and resource; `tests/loader_rules.json` has a
   refusing and a passing case for each, and the properties include the reach property of
