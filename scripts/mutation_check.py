@@ -477,6 +477,16 @@ mutate("limit-user-falls-back-to-team", "a user's group falls back to the limit 
 mutate("limit-team-falls-back-to-group", "a workload's team falls back to the limit of a group with its name", SRC + "policy.rs",
        ".teams\n                .get(team)", ".teams\n                .get(team).or_else(|| self.groups.get(&GroupId::new(team.as_str())))")
 
+# A tool declared as its entry's reach names the entry's whole reach, from the gateway's one
+# constant adapter (crates/gateway/src/resources.rs), whatever its arguments.
+mutate("reach-not-named", "the reach adapter names its entry with an empty reach", "crates/gateway/src/resources.rs",
+       "                resources: entry.reach.iter().cloned().collect(),",
+       "                resources: Vec::new(),")
+mutate("reach-from-arguments", "a tool declared as the reach is read by its connector's adapter, from its arguments",
+       "crates/gateway/src/path.rs",
+       "        if approved.declared_from == Some(DeclaredFrom::Reach) {",
+       "        if false && approved.declared_from == Some(DeclaredFrom::Reach) {")
+
 # --- tools/list ----------------------------------------------------------------------------
 
 LIST = "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())"
@@ -527,7 +537,7 @@ mutate_all(
 # --- The snapshot loader's rules -----------------------------------------------------------
 #
 # Decision 0011, section 3: the nine rules PolicySnapshot::new checks for tools with a connector
-# entry, the refusal of a tool declared as the reach, and the withdrawal's derived snapshot
+# entry, the refusal of a tool declared as the reach with no entry, and the withdrawal's derived snapshot
 # (section 4). tests/loader_rules.json has a refusing and a passing case for each rule, and
 # tests/properties.rs the reach property and that a withdrawal only narrows.
 
@@ -557,8 +567,8 @@ mutate("snapshot-rule-9-removed", "a propose tool on a shared entry may be serve
 mutate("snapshot-rule-3-any-text-a-date", "anything recorded as a reach test's date counts as a test", SRC + "policy.rs",
        "        let tested = entry.reach_tested_on.as_deref().is_some_and(is_date);",
        "        let tested = entry.reach_tested_on.is_some();")
-mutate("snapshot-as-reach-accepted", "a tool declared as its entry's reach loads, though it is not built", SRC + "policy.rs",
-       "            .find(|tool| tool.declared_from == Some(DeclaredFrom::Reach))", "            .find(|_| false)")
+mutate("snapshot-reach-without-entry-accepted", "a tool declared as the reach loads with no entry to name", SRC + "policy.rs",
+       "                && !snapshot.entries.contains_key(&tool.connector)", "                && false")
 mutate("snapshot-declared-from-without-declared", "a tool not declared may say where it is declared from", SRC + "policy.rs",
        "            if tool.declared_from.is_some() && tool.resources != ResourceDeclaration::Declared {",
        "            if false {")
@@ -735,7 +745,8 @@ mutate("record-resources-omitted-miscounted", "the row's omitted count is off by
 mutate("record-resources-omitted-counts-repeats", "the row's omitted count includes repeats", SRC + "audit.rs",
        OMITTED, "    let omitted = named.len().saturating_sub(kept.len());")
 mutate("record-resources-unknown-as-none", "unknown resources are recorded as an empty list", SRC + "audit.rs",
-       "        return (RecordedResources::Unknown, 0);", "        return (RecordedResources::Named(Vec::new()), 0);")
+       "        Resources::Unknown => return (RecordedResources::Unknown, 0),",
+       "        Resources::Unknown => return (RecordedResources::Named(Vec::new()), 0),")
 DENIED_KEPT = (
     "    if let Some(denied) = denied\n"
     "        && !kept.contains(&denied)\n"
@@ -1355,6 +1366,10 @@ mutate("fake-connector-credential-refusal-ignored", "a refused credential does n
 mutate("fake-connector-echo-drops-credential", "the echo does not carry the credential label", K,
        '    json!({"tool": tool, "echo": arguments, "credential": credential})', '    json!({"tool": tool, "echo": arguments, "credential": ""})')
 mutate("fake-connector-time-not-taken", "a connector told to take time does not", K, "                clock.advance(duration);", "                let _ = (clock, duration);")
+
+mutate("fake-audit-credential-dropped", "the in-memory store drops a row's credential identity", A,
+       "                    state.rows.push((row.clone(), record.clone(), times));",
+       "                    state.rows.push((row.clone(), AuditRecord { credential: None, ..record.clone() }, times));")
 
 # --- The testkit's issuer, clocks and gate -------------------------------------------------
 
@@ -2667,10 +2682,55 @@ mutate("proxy-server-text-uncut", "the server's text reaches the caller at any l
 mutate("proxy-server-control-characters-kept", "the server's control characters reach the caller", PO,
        "        .map(|c| if c.is_control() { ' ' } else { c })\n", "")
 # Configuration.
-mutate("proxy-https-accepted", "a URL of any scheme is accepted", PC,
-       '    let acceptable = endpoint.scheme_str() == Some("http")\n', "    let acceptable = endpoint.scheme_str().is_some()\n")
-mutate("proxy-user-information-accepted", "a URL carrying a user name or password is accepted", PC,
+PT = PROXY + "src/transport.rs"
+PD = PROXY + "src/destination.rs"
+mutate("proxy-https-refused", "an https URL is refused, so no server outside the cluster can be reached", PT,
+       '    let acceptable = matches!(endpoint.scheme_str(), Some("http" | "https"))\n',
+       '    let acceptable = endpoint.scheme_str() == Some("http")\n')
+mutate("proxy-user-information-accepted", "a URL carrying a user name or password is accepted", PT,
        "        && !authority.as_str().contains('@');", ";")
+# Where the connector connects (decision 0013, sections 2 and 3). tests/destinations.rs, and the
+# unit tests in destination.rs and transport.rs, watch each.
+mutate("proxy-ca-ignored", "the CA file the deployment names is not trusted, so no https server is reached", PT,
+       "    let roots = trusted(upstream, ca_file)?;\n", "    let roots = RootCertStore::empty();\n")
+mutate("proxy-name-unchecked", "the certificate is verified against a fixed name, not the server's identity", PT,
+       "        Arc::new(FixedServerNameResolver::new(identity)),\n",
+       '        Arc::new(FixedServerNameResolver::new(ServerName::try_from("localhost").unwrap())),\n')
+mutate("proxy-ca-file-for-http-accepted", "a CA file beside a plain http URL is accepted, and verifies nothing", PT,
+       "            (Some(_), false) => return Err(UpstreamError::CaFileForHttp(connector.clone())),\n",
+       "            (Some(_), false) => return Ok(Self { endpoint, sender: Sender::Plain(client(HttpConnector::new_with_resolver(CheckedResolver::new(policy)))) }),\n")
+mutate("proxy-http-for-public-accepted", "a server outside the cluster is reached over plain http", PT,
+       "                if upstream.destination != Destination::InCluster {\n",
+       "                if false {\n")
+mutate("proxy-literal-unchecked", "an IP literal in the URL is never checked, since it is never resolved", PT,
+       "            && let Some(refusal) = policy.refusal(address)\n",
+       "            && let Some(refusal) = policy.refusal(address).filter(|_| false)\n")
+mutate("proxy-loopback-allowed", "an IPv4 loopback address is allowed in any build", PD,
+       "    let [first, second, ..] = address.octets();\n    if address.is_loopback() {\n",
+       "    let [first, second, ..] = address.octets();\n    if false {\n")
+mutate("proxy-link-local-allowed", "an IPv6 link-local address, fe80::/10, is allowed", PD,
+       "    } else if address.is_unicast_link_local() {\n", "    } else if false {\n")
+mutate("proxy-metadata-allowed", "an IPv4 link-local address, the metadata address 169.254.169.254 among them, is allowed", PD,
+       "    } else if address.is_link_local() {\n", "    } else if false {\n")
+mutate("proxy-private-allowed-for-public", "a private address is allowed for a server outside the cluster", PD,
+       "        Refusal::Private if destination == Destination::InCluster => None,\n",
+       "        Refusal::Private => None,\n")
+mutate("proxy-mapped-v6-not-unwrapped", "an IPv6 address carrying an IPv4 one is judged as IPv6, so ::ffff:127.0.0.1 and ::ffff:169.254.169.254 pass", PD,
+       "        class_v4(carried)\n", "        let _ = carried;\n        None\n")
+mutate("proxy-re-resolves", "the name is resolved again after the check, and the second answer is the one connected to", PD,
+       "            Ok(checked.into_iter())\n",
+       "            let _ = checked;\n"
+       "            Ok(inner.call(name).await.map_err(Into::into)?.collect::<Vec<_>>().into_iter())\n")
+mutate("proxy-retry-enabled", "a request the client believes the server never saw is sent again on a new connection", PT,
+       "        .retry_canceled_requests(false)\n", "        .retry_canceled_requests(true)\n")
+mutate("proxy-loopback-allowed-in-release", "loopback is allowed whatever the connector is told, so a release build reaches it", PD,
+       "        Refusal::Loopback if loopback != Loopback::Refused => None,\n",
+       "        Refusal::Loopback => None,\n")
+mutate("proxy-default-in-cluster", "a server whose destination is never set may use plain http and private addresses", PC,
+       "            destination: Destination::Public,\n", "            destination: Destination::InCluster,\n")
+mutate("proxy-destination-refusal-unreported", "a call refused for its address is reported as a server that could not be reached", PC,
+       "                ToolOutcome::error(ErrorKind::Other, outcome::DESTINATION_REFUSED)\n",
+       "                ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE)\n")
 mutate("proxy-no-tools-accepted", "a server exposing no tools is accepted", PC, "        if tools.is_empty() {", "        if false {")
 mutate("proxy-empty-upstream-name-accepted", "an empty upstream name is accepted", PC,
        ".find(|(_, upstream)| upstream.is_empty())", ".find(|_| false)")
@@ -2964,6 +3024,10 @@ mutate("registry-links-testkit", "the registry, and so the gateway, links the te
        'toml = "1"\ngateway-testkit = { path = "../gateway-testkit" }\n\n[dev-dependencies]\n')
 
 
+mutate("registry-as-reach-still-refused", "a tool declared as its entry's reach is refused at load", RR,
+       "        ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),",
+       "        ResourcesFile::AsReach => return Err(RegistryError::AdapterWithoutSources(name)),")
+
 # --- gateway-registry: schema validation ---------------------------------------------------
 #
 # The argument check against the approved schema's subset of JSON Schema 2020-12 (#11, #94), and
@@ -3149,7 +3213,7 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
-       '$24, $25\n        ) ON CONFLICT (id) DO NOTHING";', '$24, $25\n        )";')
+       '$26, $27\n        ) ON CONFLICT (id) DO NOTHING";', '$26, $27\n        )";')
 mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
        "    if decision == row.decision {", "    if true {")
 mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
@@ -3805,6 +3869,21 @@ mutate("pg-lost-begin-kind-differs", "a lost begin's row is completed as a vendo
        "                error_kind: Some(FinishRow::error_kind_name(ErrorKind::VendorRefusal)),")
 
 
+# Migration 0007: a reach recorded by its entry, and the configured entry's credential identity.
+PG_REACH = PG + "sql/migrations/0007_reach_and_credential.sql"
+mutate("pg-reach-check-allows-any-object", "the resources column takes any object as a reach", PG_REACH,
+       "        OR coalesce(\n            jsonb_typeof(resources) = 'object'\n            AND resources - 'reach' = '{}'::jsonb\n"
+       "            AND jsonb_typeof(resources -> 'reach') = 'string'\n            AND resources ->> 'reach' <> '',\n"
+       "            false\n        )",
+       "        OR jsonb_typeof(resources) = 'object'")
+mutate("pg-credential-columns-unshaped", "a credential mode may be stored without its principal, or the reverse", PG_REACH,
+       "        (credential_mode IS NULL) = (credential_principal IS NULL)", "        true")
+mutate("pg-credential-grant-missing", "the gateway's role may not insert the credential identity", PG_REACH,
+       "GRANT INSERT (credential_mode, credential_principal)\n    ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
+mutate("pg-credential-not-written", "begin writes no credential identity", PG_COLUMNS,
+       "            credential_mode,\n            credential_principal,\n        })",
+       "            credential_mode: None,\n            credential_principal: None,\n        })")
+
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
 
@@ -4379,6 +4458,18 @@ mutate("gw-start-audit-unchecked", "the audit store serves without its boot chec
 mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
        "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
        "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
+# Where each server is reached, checked before anything is read or connected to (decision 0013,
+# section 3). start.rs's own tests watch each.
+mutate("gw-start-ca-file-optional-for-https", "an https server with no CA file passes the start's check", START,
+       "            (true, false) => return Err(StartError::NoCaFile(server.name.clone())),\n",
+       "            (true, false) => {}\n")
+mutate("gw-start-ca-file-for-http-accepted", "a CA file for an http server passes the start's check", START,
+       "            (false, true) => return Err(StartError::CaFileForHttp(server.name.clone())),\n",
+       "            (false, true) => {}\n")
+mutate("gw-start-destination-not-passed", "each server's connector is built with the default destination, not its entry's, so an in_cluster server is held to the public class", START,
+       "        upstream.destination = destination(server.destination);\n", "")
+mutate("gw-start-destinations-unchecked", "where each server is reached is not checked until its connector is built, after its credential is read", START,
+       "    destinations(&registry, &deployment.ca_files, loopback)?;\n", "")
 
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(outcome) => Box::pin(std::future::ready(outcome)),",
@@ -4607,6 +4698,10 @@ mutate("demo-driver-down-compose-deletes-cluster", "taking Compose down deletes 
        "      compose) down_compose ;;", "      compose) down_compose && down_kind ;;")
 
 
+mutate("reach-recorded-as-list", "a reach is recorded as the list of its resources, not by its entry", SRC + "audit.rs",
+       "        Resources::Reach { entry, .. } => return (RecordedResources::Reach(entry.clone()), 0),",
+       "        Resources::Reach { resources, .. } => resources,")
+
 # --- first slice: the kind run's image ---------------------------------------------------------
 # A kind run deploys its image under a tag taken from the image's ID, so a run on an existing
 # cluster replaces the previous build's pods.
@@ -4626,7 +4721,8 @@ RELEASE_BUILD_LINE = "    cargo build --release --locked -p gateway --bin switch
 mutate("release-build-test-support", "the image's switchboard is built with test-support", DOCKERFILE,
        RELEASE_BUILD_LINE, "    cargo build --release --locked -p gateway --bin switchboard --features gateway/test-support; \\\n")
 mutate("release-build-test-support-default", "test-support is a default feature of the gateway", "crates/gateway/Cargo.toml",
-       "[features]\ntest-support = []\n", '[features]\ndefault = ["test-support"]\ntest-support = []\n')
+       '[features]\ntest-support = ["connector-proxy/test-support"]\n',
+       '[features]\ndefault = ["test-support"]\ntest-support = ["connector-proxy/test-support"]\n')
 mutate("release-build-workspace", "the image's switchboard is built with the workspace, taking its features", DOCKERFILE,
        RELEASE_BUILD_LINE, "    cargo build --release --locked --workspace --bins; \\\n")
 

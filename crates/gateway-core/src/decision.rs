@@ -481,7 +481,7 @@ fn classification_is_permitted(profile: &Profile, tool: &ApprovedTool) -> Result
 
 /// Check 6. Every named resource is checked, whatever the tool declares, so a wrong
 /// declaration cannot widen what a call reaches; the declaration only decides what an empty or
-/// unknown list means.
+/// unknown list means. A connector entry's reach is checked exactly as named resources are.
 fn resources_are_within_limit(
     limits: &ResourceLimits,
     principal: &Principal,
@@ -489,7 +489,13 @@ fn resources_are_within_limit(
     resources: &Resources,
 ) -> Result<(), Reason> {
     let problem = match (resources, tool.resources) {
-        (Resources::Named(named), declaration) => {
+        (
+            Resources::Named(named)
+            | Resources::Reach {
+                resources: named, ..
+            },
+            declaration,
+        ) => {
             match named
                 .iter()
                 .find(|resource| !limits.permits(principal, resource))

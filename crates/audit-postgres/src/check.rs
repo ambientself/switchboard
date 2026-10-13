@@ -47,11 +47,14 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("deadline", "timestamp with time zone"),
     ("listed_tools", "jsonb"),
     ("listed_omitted", "bigint"),
+    ("credential_mode", "text"),
+    ("credential_principal", "text"),
 ];
 
 /// The columns the gateway's role inserts: the identifier it chose and the first half of a row,
-/// with the instance, the kind and the allowance, and without the times, the deadline or the
-/// completion; and for a list row, the tools listed and their count.
+/// with the instance, the kind, the allowance and the credential identity, and without the
+/// times, the deadline or the completion; and for a list row, the tools listed and their
+/// count.
 pub(crate) const INSERTED: &[&str] = &[
     "id",
     "tool_use_id",
@@ -80,6 +83,8 @@ pub(crate) const INSERTED: &[&str] = &[
     "allowance_ms",
     "listed_tools",
     "listed_omitted",
+    "credential_mode",
+    "credential_principal",
 ];
 
 /// The columns the gateway's role updates: the completion, with an error's kind.

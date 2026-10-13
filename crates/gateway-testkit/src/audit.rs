@@ -46,6 +46,7 @@ pub fn row_start() -> RowStart {
         )),
         instance: InstanceName::new(FIXTURE_INSTANCE),
         call_deadline_ms: FIXTURE_CALL_DEADLINE_MS,
+        credential: None,
     }
 }
 
@@ -197,8 +198,9 @@ fn refuse_non_uuid(id: &AuditRowId) -> Result<(), StoreError> {
 /// The allowance for `record`'s deadline, or why the Postgres store would refuse to write it
 /// as the row `id`: an identifier that is not a lowercase hyphenated UUID, a record already
 /// complete, a text value with U+0000, a count or an allowance past a `bigint`, unknown
-/// resources with a count left out, or a call record of kind `list`, which the table's
-/// `kind_shape` refuses whatever row the identifier already names.
+/// resources or a reach with a count left out, a reach naming no entry, or a call record of
+/// kind `list`, which the table's `kind_shape` refuses whatever row the identifier already
+/// names.
 fn refused_at_begin(
     id: &AuditRowId,
     record: &AuditRecord,
@@ -215,6 +217,14 @@ fn refused_at_begin(
     )?;
     if record.resources == RecordedResources::Unknown && record.resources_omitted != 0 {
         return Err("unknown resources cannot have a count left out".into());
+    }
+    if let RecordedResources::Reach(entry) = &record.resources {
+        if record.resources_omitted != 0 {
+            return Err("a reach cannot have a count left out".into());
+        }
+        if entry.as_str().is_empty() {
+            return Err("a reach must name its connector entry".into());
+        }
     }
     let allowance = allowance_ms(budgets, record.call_deadline_ms);
     refuse_past_bigint("the row's allowance", allowance)?;
@@ -369,8 +379,10 @@ impl State {
 /// identifier that is not a UUID in the lowercase hyphenated form, a record handed to begin
 /// already complete, a record, list record or completion with U+0000 in a text value, a count
 /// of resources or tools left out or a latency past a Postgres `bigint`, and a call row whose
-/// allowance is past one. Of the table's own constraints it checks two: unknown resources with
-/// a count left out, and `kind_shape`, which refuses a call record of kind `list` at begin.
+/// allowance is past one. Of the table's own constraints it checks three: unknown resources or
+/// a reach with a count left out, a reach naming no entry, and `kind_shape`, which refuses a
+/// call record of kind `list` at begin. It keeps a row's credential identity as begin was
+/// given it, its mode and principal together, as the table's `credential_shape` requires.
 /// Of its triggers it follows both: `set_times`, which refuses a deadline past what a Postgres
 /// time holds, and `complete_once`.
 ///

@@ -8,8 +8,12 @@
 //!
 //! [`prepare`] reads the registry file. Before anything else, it refuses the identity and audit
 //! opt-outs outside a development build, and runs the receipt-store gate (decision 0014,
-//! section 4), so that a refusal of either comes before any connection is made. Then it loads
-//! each proxied server's credential, builds a [`ProxyConnector`] per server with the deadline
+//! section 4), so that a refusal of either comes before any connection is made. Then it checks
+//! where each proxied server is reached (decision 0013, section 3): an `https` server needs the
+//! CA file `[servers.<name>] ca_file` names, an `http` server may have none, and an address
+//! that is an IP literal the connector would never connect to is refused, loopback among them
+//! outside a development build. Then it loads each proxied server's credential, builds a
+//! [`ProxyConnector`] per server with its destination and CA file and with the deadline
 //! and answer cap the deployment file's `[servers.<name>]` sets for it, wraps each in a
 //! [`Bulkhead`] holding it to the caps of `[limits]`, loads each server's probe credential
 //! ([`probe_credentials`]), fetches the keys of each issuer
@@ -49,18 +53,19 @@
 //! binary, which binds it and serves it with [`crate::metrics::serve_metrics`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audit_postgres::{BootCheckError, GivenUp, PgAuditError, PgAuditStore, PoolSizes};
 use connector_proxy::{
-    CredentialFileError, FileCredentials, ProxyConnector, Upstream, UpstreamError,
+    CredentialFileError, FileCredentials, Loopback, ProxyConnector, Refusal, Upstream,
+    UpstreamError,
 };
 use gateway_core::{ConnectorName, CredentialMode, InstanceName, Issuer, Narrowing};
 use gateway_identity::Clock;
-use gateway_registry::{Registry, RegistryError};
+use gateway_registry::{Destination, Registry, RegistryError};
 use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
 use thiserror::Error;
 
@@ -142,6 +147,29 @@ pub enum StartError {
     /// A proxied server has no probe credential, or its file could not be loaded.
     #[error(transparent)]
     ProbeCredentials(#[from] ProbeCredentialError),
+    /// An `https` server has no CA file in the deployment file (decision 0013, section 3).
+    #[error(
+        "server `{0}` has an https address, so `[servers.{0}]` must name the CA file its \
+         certificate is verified against in `ca_file`"
+    )]
+    NoCaFile(ConnectorName),
+    /// The deployment file names a CA file for an `http` server, where nothing would be
+    /// verified against it.
+    #[error(
+        "`[servers.{0}]` names a CA file, but server `{0}` has a plain http address; remove \
+         `ca_file`, or give the server an https address"
+    )]
+    CaFileForHttp(ConnectorName),
+    /// A server's address is an IP literal the gateway does not connect to.
+    #[error("server `{server}`: the gateway does not connect to {address}, {refusal}")]
+    DestinationRefused {
+        /// The server.
+        server: ConnectorName,
+        /// The address in its URL.
+        address: IpAddr,
+        /// Why it is refused.
+        refusal: Refusal,
+    },
     /// A server's connector could not be built.
     #[error(transparent)]
     Upstream(#[from] UpstreamError),
@@ -283,6 +311,12 @@ async fn prepare_with(
         registry.snapshot(),
         development,
     )?;
+    let loopback = if development {
+        Loopback::of_this_build()
+    } else {
+        Loopback::Refused
+    };
+    destinations(&registry, &deployment.ca_files, loopback)?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
@@ -290,7 +324,11 @@ async fn prepare_with(
         &registry,
         &credentials,
         &deployment.limits,
-        &deployment.servers,
+        &Reaching {
+            bounds: &deployment.servers,
+            ca_files: &deployment.ca_files,
+            loopback,
+        },
         Wiring::new(clock),
     )?;
     let mut wiring = wiring.instance(instance.clone());
@@ -464,18 +502,71 @@ async fn prepare_with(
 /// The connector of each proxied server, by name, for the drift pass.
 type Connectors = BTreeMap<ConnectorName, Arc<ProxyConnector>>;
 
+/// The connector's class of a registry entry's destination.
+pub(crate) fn destination(destination: Destination) -> connector_proxy::Destination {
+    match destination {
+        Destination::InCluster => connector_proxy::Destination::InCluster,
+        Destination::Public => connector_proxy::Destination::Public,
+    }
+}
+
+/// Checks where each of the registry's servers is reached, before anything is read or
+/// connected to (decision 0013, section 3). An `https` server needs a CA file in `ca_files`,
+/// and an `http` server may not have one. An address that is an IP literal is refused if the
+/// connector would not connect to it, under `loopback`: an address named by DNS is checked
+/// each time it is resolved instead.
+fn destinations(
+    registry: &Registry,
+    ca_files: &BTreeMap<ConnectorName, PathBuf>,
+    loopback: Loopback,
+) -> Result<(), StartError> {
+    for server in registry.servers().values() {
+        let https = server.address.starts_with("https://");
+        match (https, ca_files.contains_key(&server.name)) {
+            (true, false) => return Err(StartError::NoCaFile(server.name.clone())),
+            (false, true) => return Err(StartError::CaFileForHttp(server.name.clone())),
+            _ => {}
+        }
+        let Some(host) = gateway_registry::address_host(&server.address) else {
+            continue;
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(address) = host.parse::<IpAddr>()
+            && let Some(refusal) =
+                connector_proxy::refusal(address, destination(server.destination), loopback)
+        {
+            return Err(StartError::DestinationRefused {
+                server: server.name.clone(),
+                address,
+                refusal,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How each proxied server is reached: the bounds the deployment file sets for its calls, its
+/// CA file, and whether loopback is allowed.
+struct Reaching<'a> {
+    bounds: &'a BTreeMap<ConnectorName, ServerLimits>,
+    ca_files: &'a BTreeMap<ConnectorName, PathBuf>,
+    loopback: Loopback,
+}
+
 /// `wiring` with a [`ProxyConnector`] for each of the registry's servers, built with the bounds
-/// `servers` sets for it or the defaults, in a [`Bulkhead`] holding it to `limits`. Each is
-/// given the call deadline its connector was built with, which every row of its calls
-/// includes in its deadline. Refuses bounds for a server the registry does not name. Each
-/// connector is returned too, for the drift pass, which reads the server's tool list with it.
+/// `reaching` sets for it or the defaults, its destination, its CA file, in a [`Bulkhead`]
+/// holding it to `limits`. Each is given the call deadline its connector was built with, which
+/// every row of its calls includes in its deadline. Refuses bounds for a server the registry
+/// does not name. Each connector is returned too, for the drift pass, which reads the server's
+/// tool list and probes it with it.
 fn proxied(
     registry: &Registry,
     credentials: &Arc<FileCredentials>,
     limits: &Limits,
-    servers: &BTreeMap<ConnectorName, ServerLimits>,
+    reaching: &Reaching<'_>,
     mut wiring: Wiring,
 ) -> Result<(Wiring, ProxiedSignals, Connectors), StartError> {
+    let servers = reaching.bounds;
     if let Some(unknown) = servers
         .keys()
         .find(|name| !registry.servers().contains_key(*name))
@@ -487,6 +578,9 @@ fn proxied(
     for server in registry.servers().values() {
         let bounds = servers.get(&server.name).copied().unwrap_or_default();
         let mut upstream = Upstream::new(server.name.clone(), server.address.clone());
+        upstream.destination = destination(server.destination);
+        upstream.ca_file = reaching.ca_files.get(&server.name).cloned();
+        upstream.loopback = reaching.loopback;
         upstream.deadline = bounds.deadline;
         upstream.max_response_bytes = bounds.max_result_bytes;
         for (tool, route) in registry.routes() {
@@ -701,7 +795,11 @@ mod tests {
             &registry,
             &credentials,
             &Limits::default(),
-            servers,
+            &Reaching {
+                bounds: servers,
+                ca_files: &BTreeMap::new(),
+                loopback: Loopback::of_this_build(),
+            },
             Wiring::new(Arc::new(gateway_identity::SystemClock)),
         );
         std::fs::remove_dir_all(&directory).unwrap();
@@ -751,6 +849,236 @@ mod tests {
             "`[servers.mock-dcos]` sets bounds for a server the registry does not name; remove \
              it, or name a server the registry has"
         );
+    }
+
+    /// The boot test registry with its one server at an `https` address, its identity the
+    /// address's host.
+    fn https_registry() -> Registry {
+        let text = registry_text_at(
+            "docs.example.test",
+            "https://docs.example.test/mcp",
+            "in_cluster",
+        );
+        Registry::from_toml_str(&text).unwrap()
+    }
+
+    /// The boot test registry's text with its one server's identity, address and destination
+    /// replaced, and its tool's binding hash to match.
+    fn registry_text_at(identity: &str, address: &str, destination: &str) -> String {
+        let mut server = crate::boot::tests::server();
+        let before = gateway_registry::binding_sha256(&server);
+        server.identity = identity.into();
+        server.address = address.into();
+        server.destination = match destination {
+            "public" => gateway_registry::Destination::Public,
+            _ => gateway_registry::Destination::InCluster,
+        };
+        crate::boot::tests::registry_text("read", true, "r1")
+            .replace(
+                "identity = \"127.0.0.1\"",
+                &format!("identity = \"{identity}\""),
+            )
+            .replace(
+                "address = \"http://127.0.0.1:9/mcp\"",
+                &format!("address = \"{address}\""),
+            )
+            .replace(
+                "destination = \"in_cluster\"",
+                &format!("destination = \"{destination}\""),
+            )
+            .replace(&before, &gateway_registry::binding_sha256(&server))
+    }
+
+    /// Decision 0013, section 3: an `https` server needs the CA file its certificate is
+    /// verified against, and an `http` server, where nothing would be verified, takes none.
+    #[test]
+    fn an_https_server_needs_a_ca_file_and_an_http_server_takes_none() {
+        let https = https_registry();
+        let http = crate::boot::tests::registry("read", true);
+        let named = BTreeMap::from([(ConnectorName::new("mock-docs"), PathBuf::from("ca.pem"))]);
+        let none = BTreeMap::new();
+
+        let refused = destinations(&https, &none, Loopback::Refused).unwrap_err();
+        assert!(
+            matches!(&refused, StartError::NoCaFile(server) if server.as_str() == "mock-docs"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "server `mock-docs` has an https address, so `[servers.mock-docs]` must name the CA \
+             file its certificate is verified against in `ca_file`"
+        );
+        assert!(destinations(&https, &named, Loopback::Refused).is_ok());
+
+        let refused = destinations(&http, &named, Loopback::of_this_build()).unwrap_err();
+        assert!(
+            matches!(&refused, StartError::CaFileForHttp(server) if server.as_str() == "mock-docs"),
+            "{refused}"
+        );
+        assert!(destinations(&http, &none, Loopback::of_this_build()).is_ok());
+    }
+
+    /// The CA file the deployment names reaches the server's connector, which is built with it
+    /// and could not be built without it.
+    #[test]
+    fn an_https_servers_connector_is_built_with_the_ca_file_the_deployment_names() {
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-ca-file-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let credential = directory.join("docs-credential");
+        std::fs::write(&credential, "dummy-credential-for-tests-only\n").unwrap();
+        let ca_file = directory.join("ca.pem");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(&ca_file, ca.pem()).unwrap();
+        let credentials = Arc::new(
+            FileCredentials::load([(ConnectorName::new("mock-docs"), &credential)]).unwrap(),
+        );
+        let registry = https_registry();
+        let built = |ca_files: &BTreeMap<ConnectorName, PathBuf>| {
+            proxied(
+                &registry,
+                &credentials,
+                &Limits::default(),
+                &Reaching {
+                    bounds: &BTreeMap::new(),
+                    ca_files,
+                    loopback: Loopback::Refused,
+                },
+                Wiring::new(Arc::new(gateway_identity::SystemClock)),
+            )
+            .map(|_| ())
+        };
+
+        let named = built(&BTreeMap::from([(
+            ConnectorName::new("mock-docs"),
+            ca_file,
+        )]));
+        let unnamed = built(&BTreeMap::new());
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(named.is_ok(), "{named:?}");
+        assert!(
+            matches!(
+                unnamed,
+                Err(StartError::Upstream(UpstreamError::NoCaFile(_)))
+            ),
+            "{unnamed:?}"
+        );
+    }
+
+    /// Decision 0013, section 3: a server whose entry is `public` is held to that class. Plain
+    /// `http` is refused as the registry loads, and a private address before anything is
+    /// connected to. The connector built for each server takes its entry's destination: a
+    /// `public` entry's connector refuses the private address too, and an `in_cluster` entry's
+    /// connector accepts it, which it would not if the destination were left at the default.
+    #[tokio::test]
+    async fn a_public_server_on_http_or_a_private_address_is_refused() {
+        let counted = Counted::start().await;
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-public-{}", std::process::id()));
+        let started = |text: String, ca_file: Option<PathBuf>| {
+            let mut deployment = deployment(&directory, &text, &counted, false, false);
+            if let Some(ca_file) = ca_file {
+                deployment.ca_files = BTreeMap::from([(ConnectorName::new("mock-docs"), ca_file)]);
+            }
+            prepare_with(
+                deployment,
+                InstanceName::new("start-test"),
+                Arc::new(gateway_identity::SystemClock),
+                true,
+            )
+        };
+        let ca_file = directory.join("ca.pem");
+
+        let http = started(
+            registry_text_at("127.0.0.1", "http://127.0.0.1:9/mcp", "public"),
+            None,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        let private = started(
+            registry_text_at("10.0.0.1", "https://10.0.0.1/mcp", "public"),
+            Some(ca_file.clone()),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &http,
+                StartError::Registry(RegistryError::DestinationScheme { server, .. })
+                    if server.as_str() == "mock-docs"
+            ),
+            "{http}"
+        );
+        assert!(
+            matches!(
+                &private,
+                StartError::DestinationRefused {
+                    refusal: Refusal::Private,
+                    ..
+                }
+            ),
+            "{private}"
+        );
+        assert_eq!(
+            private.to_string(),
+            "server `mock-docs`: the gateway does not connect to 10.0.0.1, a private address, \
+             which only a server whose destination is in_cluster may use"
+        );
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+
+        // The connectors, past the start's own check.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(&ca_file, ca.pem()).unwrap();
+        let credentials = Arc::new(
+            FileCredentials::load([(
+                ConnectorName::new("mock-docs"),
+                directory.join("docs-credential"),
+            )])
+            .unwrap(),
+        );
+        let ca_files = BTreeMap::from([(ConnectorName::new("mock-docs"), ca_file)]);
+        let built = |destination: &str| {
+            let text = registry_text_at("10.0.0.1", "https://10.0.0.1/mcp", destination);
+            proxied(
+                &Registry::from_toml_str(&text).unwrap(),
+                &credentials,
+                &Limits::default(),
+                &Reaching {
+                    bounds: &BTreeMap::new(),
+                    ca_files: &ca_files,
+                    loopback: Loopback::Refused,
+                },
+                Wiring::new(Arc::new(gateway_identity::SystemClock)),
+            )
+            .map(|_| ())
+        };
+        let public = built("public");
+        let in_cluster = built("in_cluster");
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(
+            matches!(
+                public,
+                Err(StartError::Upstream(UpstreamError::DestinationRefused {
+                    refusal: Refusal::Private,
+                    ..
+                }))
+            ),
+            "{public:?}"
+        );
+        assert!(in_cluster.is_ok(), "{in_cluster:?}");
     }
 
     /// A listener that counts the connections made to it and closes each at once: the audit
@@ -855,6 +1183,7 @@ mod tests {
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),
+            ca_files: BTreeMap::new(),
             drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
             probe_credentials: BTreeMap::from([(ConnectorName::new("mock-docs"), probe)]),
             reach: None,
@@ -1036,6 +1365,43 @@ mod tests {
             assert!(expected, "{name}: {refused}");
         }
         assert_eq!(counted.connections(), 0, "something was connected to first");
+    }
+
+    /// Decision 0013, section 3: a release build refuses a server whose address is a loopback
+    /// literal before it reads a credential or connects to anything. A development build, as
+    /// these tests are, allows it for the tests' local servers.
+    #[tokio::test]
+    async fn a_release_build_refuses_a_server_on_loopback_before_anything_is_connected() {
+        let counted = Counted::start().await;
+        let directory =
+            std::env::temp_dir().join(format!("switchboard-start-loopback-{}", std::process::id()));
+        let text = crate::boot::tests::registry_text("read", true, "r1");
+        let mut deployment = deployment(&directory, &text, &counted, false, false);
+        // A credential file that would refuse the start, were it read first.
+        deployment.credentials = BTreeMap::from([(
+            "docs-credential".to_owned(),
+            directory.join("no-such-credential"),
+        )]);
+        let refused = refused_as_release(deployment).await;
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(
+            matches!(
+                &refused,
+                StartError::DestinationRefused {
+                    refusal: Refusal::Loopback,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "server `mock-docs`: the gateway does not connect to 127.0.0.1, a loopback address"
+        );
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+        let registry = Registry::from_toml_str(&text).unwrap();
+        assert!(destinations(&registry, &BTreeMap::new(), Loopback::of_this_build()).is_ok());
     }
 
     #[test]

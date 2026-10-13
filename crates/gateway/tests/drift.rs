@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::routing::post;
-use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
+use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
 use files::{
     AUDIENCE, Files, KIND_REVISION, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, TEAM_B_READ_TOOL,
     call, cluster_issuer, kubernetes_token, listed,
@@ -78,15 +78,19 @@ fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
 fn proxy_within(entry: &str, url: &str, files: &Files, deadline: Duration) -> Arc<ProxyConnector> {
     let credential = files.path(&format!("{entry}-credential"));
     let credentials = FileCredentials::load([(entry.into(), credential)]).unwrap();
-    let mut upstream = Upstream::new(entry, url)
-        .tool(
-            format!("{entry}__read_document").parse().unwrap(),
-            "read_document",
-        )
-        .tool(
-            format!("{entry}__list_documents").parse().unwrap(),
-            "list_documents",
-        );
+    // The entry is in_cluster.
+    let mut upstream = Upstream {
+        destination: Destination::InCluster,
+        ..Upstream::new(entry, url)
+    }
+    .tool(
+        format!("{entry}__read_document").parse().unwrap(),
+        "read_document",
+    )
+    .tool(
+        format!("{entry}__list_documents").parse().unwrap(),
+        "list_documents",
+    );
     upstream.deadline = deadline;
     Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap())
 }

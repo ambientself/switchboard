@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
+use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
 use files::{
     AUDIENCE, CREDENTIAL, Files, KIND_REVISION, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA,
     TEAM_B_CREDENTIAL, TEAM_B_LIST_TOOL, TEAM_B_SA, TEAM_B_SURFACE, cluster_issuer,
@@ -151,15 +151,19 @@ impl Captured {
 fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
     let credential = files.path(&format!("{entry}-credential"));
     let credentials = FileCredentials::load([(entry.into(), credential)]).unwrap();
-    let upstream = Upstream::new(entry, url)
-        .tool(
-            format!("{entry}__read_document").parse().unwrap(),
-            "read_document",
-        )
-        .tool(
-            format!("{entry}__list_documents").parse().unwrap(),
-            "list_documents",
-        );
+    // The entry is in_cluster.
+    let upstream = Upstream {
+        destination: Destination::InCluster,
+        ..Upstream::new(entry, url)
+    }
+    .tool(
+        format!("{entry}__read_document").parse().unwrap(),
+        "read_document",
+    )
+    .tool(
+        format!("{entry}__list_documents").parse().unwrap(),
+        "list_documents",
+    );
     Arc::new(ProxyConnector::new(upstream, Arc::new(credentials)).unwrap())
 }
 
@@ -336,6 +340,7 @@ fn call_rows(store: &InMemoryAuditStore) -> Vec<String> {
                     .map(|resource| resource.identifier.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
+                RecordedResources::Reach(entry) => format!("reach:{}", entry.as_str()),
                 RecordedResources::Unknown => "unknown".to_owned(),
             };
             format!(

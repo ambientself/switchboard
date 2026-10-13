@@ -730,6 +730,8 @@ written complete, has no finish, and is never open.
   mode and vendor-side principal, never the secret. An entry has one credential and no
   fallback, so it is the identity the call runs under until per-user grants arrive in
   milestone 5 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
+  It is part of the row's first half, not of its completion: a row whose tool has no entry
+  records none, and rows written before it was recorded read as not recorded.
 - **A tool that checks its own scope reports what it reached** when it finishes, in place of
   `unknown`. This is required before milestone 4.
 - **A turn grant is recorded by what identifies it:** its digest (the SHA-256 of the grant as
@@ -1023,18 +1025,22 @@ turn-grant checking off, run with identity disabled, run with audit disabled
 loopback destinations, for the tests' local servers
 ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md)). The release
 build refuses the first four at boot, before it makes any connection, and refuses a loopback
-destination when it connects. `#[cfg(test)]` cannot provide them, because the harness runs the
-gateway from integration tests and other crates. Since a feature can be turned on in any
-build, CI checks the release artifact itself: started with a `propose` snapshot and no receipt
-store, with grant checking off, with identity disabled and with audit disabled, it must refuse
-each, and it must refuse a loopback destination. The identity and audit refusals, and CI's
-steps for them, are built (#11): the binary refuses each opt-out, and runs the receipt-store
-gate, as soon as the registry loads, before it reads a credential, fetches a key or connects
-to the audit database. Until built-in connectors exist (milestone 4), a registry cannot reach
-the receipt-store gate: the snapshot loader's rule 2 (decision 0011) refuses every proxied
-tool not classified `read` first, so CI's `propose` step checks that refusal instead (#26
-below). The loopback refusal and its step arrive in milestone 3 (#11). With identity disabled
-a development build lists nothing and refuses every `tools/call`, with no row.
+destination too: an address that is a loopback literal at boot, before it reads a credential,
+and a name that resolves to loopback when it connects. `#[cfg(test)]` cannot provide them,
+because the harness runs the gateway from integration tests and other crates. Since a feature
+can be turned on in any build, CI checks the release artifact itself: started with a
+`propose` snapshot and no receipt store, with grant checking off, with identity disabled and
+with audit disabled, it must refuse each, and it must refuse a loopback destination. The
+identity and audit refusals, and CI's steps for them, are built (#11): the binary refuses
+each opt-out, and runs the receipt-store gate, as soon as the registry loads, before it reads
+a credential, fetches a key or connects to the audit database. Until built-in connectors exist
+(milestone 4), a registry cannot reach the receipt-store gate: the snapshot loader's rule 2
+(decision 0011) refuses every proxied tool not classified `read` first, so CI's `propose` step
+checks that refusal instead (#26 below). The loopback refusal and its step are built (#11):
+connector-proxy's own `test-support` feature, which the gateway's turns on, is the only way to
+reach loopback, and CI starts the release binary with a server at `127.0.0.1` and expects
+that refusal. With identity disabled a development build lists nothing and refuses every
+`tools/call`, with no row.
 
 Turn-grant keys have their own checks
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)). The gateway refuses to start if
@@ -1317,11 +1323,24 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
   a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
-  Not built, for decisions 0011 and 0012: how the resources were found, with the reach by
-  reference, the credential identity, an unverified delegation's failure kind, and a grant's
-  digest, issuer, key ID, pod UID, egress setting and currency answer. With #12, a column for
-  the exception that allowed a call, since the row's shape constraint rightly allows no reason
-  on an allowed row.
+  How the resources were found, and the credential identity: built (#56). A tool declared as
+  its connector entry's reach is read by the gateway's one constant adapter, which names the
+  entry's whole reach from the policy version the call is decided from, whatever the
+  arguments; check 6 checks it as it checks named resources, and the decision function is
+  unchanged. The row records the reach by reference, as `{"reach": entry}` in `resources`,
+  with nothing left out, for an allowed call and a denial alike. The loader no longer refuses
+  `as_reach`; it refuses a tool declared as the reach whose connector has no entry. Each call
+  row records the configured identity of its tool's connector entry at begin, the entry's
+  credential mode and stated principal, never the secret, in `credential_mode` and
+  `credential_principal`, both or neither, and neither for a tool with no entry. Migration
+  0007 adds the reach to the resources check (`resources_known`, `reach_shape`) and the two
+  columns (`credential_mode_known`, `credential_shape`), which the gateway's role inserts and
+  does not read: a repeated begin still compares only the decision. Rows written before it
+  hold NULL in both, which means not recorded. Not built: the columns of decision 0012, an
+  unverified delegation's failure kind and a grant's digest, issuer, key ID, pod UID, egress
+  setting and currency answer, which go with #22; and, with #12, a column for the exception
+  that allowed a call, since the row's shape constraint rightly allows no reason on an allowed
+  row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
   `ListRecord`, with the caller columns, the policy revision and the first 64 tool names, each
@@ -1403,7 +1422,21 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   its credential permits, its reach and its reach test's date, but not the reach test's record,
   the probe record or the reach check (the connector entries entry below).
 - Drift detection and withdrawal: built (the drift pass entry below).
-- Destination limits, the server's identity verified and redirects refused: not built.
+- Destination limits, the server's identity verified and redirects refused: built. The
+  connector reaches an `https` server with its certificate verified against the server's
+  identity, the host in its address, trusting only the CA file `[servers.<name>] ca_file`
+  names: no roots are compiled in and none are read from the operating system. Plain `http` is
+  only for an `in_cluster` entry, and the gateway refuses to start with an `https` server that
+  has no CA file or an `http` server that has one. A DNS name is resolved once for each
+  connection by a resolver that drops every refused address, and the connector connects only
+  to the addresses it returned; an IP literal is checked when the connector is built, and at
+  boot. Loopback, unspecified, link-local (`169.254.169.254` among them), multicast and
+  broadcast addresses, and their IPv4-mapped and IPv4-compatible forms, are always refused,
+  and private and carrier-grade NAT ranges unless the entry is `in_cluster`. A refusal
+  is an error of the kind `other` with its own sentence, and a warning naming the server.
+  Loopback is allowed only in a development build (section 12), and CI checks the release
+  binary refuses it. Calls, tool lists and probes, `switchboard probe`'s included, go out on
+  the same checked client, which follows no redirect and reads no proxy setting.
 - Size limits, deadlines, bounded concurrency and per-team and per-server limits: built
   (#139). Each server's deadline and result size, and the caps on calls in flight in the
   instance, to each server and from each team to each server, are in the limits entry below.
@@ -1411,8 +1444,12 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   (`MAX_BODY_BYTES`).
 - Isolating a failing server: built (#139). A hanging server holds at most its own caps of
   slots until its calls' deadline (the limits entry below).
-- Upstream sessions isolated by server, credential identity and authorization context: not
-  built.
+- Upstream sessions isolated by server, credential identity and authorization context: built
+  as decision 0013, section 4 meets it. The connector keeps no upstream session and sends no
+  `initialize`. Each connector entry has its own client and connection pool, so two entries at
+  one address never share a connection, and the HTTP client's retry of cancelled requests is
+  turned off explicitly: a call the server read before the connection broke is an error, and
+  no call is ever sent again on a new connection. Each is tested.
 - Identity and audit opt-outs unavailable outside development builds: built (#132), in the
   opt-outs entry below.
 - The agreed metrics and alerts: the metrics are partly built, and nothing alerts. Built: each
@@ -1451,10 +1488,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   per-user grant at start, until milestone 5. The reach check's tool need not be approved, so
   removing it, or an entry's last tool, still withdraws it on reload (section 8); a surface that
   serves it, such as `registry-reach`, must drop it too. The scheduled reach check is built
-  (the drift pass entry below). Not built: a tool `declared` as the reach (the loader refuses
-  `as_reach`), the audit row's reach and credential columns, a check against a vendor's report
-  of what a credential reaches, and narrowing a credential per call or to the caller's
-  limit. The gateway sends the same credential on every call to a server, so it
+  (the drift pass entry below). Not built: a check against a vendor's report of what a
+  credential reaches, and narrowing a credential per call or to the caller's limit. The
+  gateway sends the same credential on every call to a server, so it
   refuses an entry whose narrowing is not `none` at start, until the custodian client (#12).
 - The kind slice extended to show them: partly built. Both demos register the mock server
   once per team and show each team's calls reaching it under its own entry's identity, for its
@@ -1488,7 +1524,7 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   for the dialect). Each server's destination class is recorded and bound, and the loader
   allows plain `http` only for `in_cluster`. Every proxied entry must record a probe whose
   result is `refused` (the probe entry below). Verified certificates, the address checks and
-  the refused addresses are not built.
+  the refused addresses are built in the connector (the destinations box above).
 - The drift pass, its derived revisions and standing withdrawals: built. Every replica reads
   each proxied server's `tools/list` with the entry's own credential, under its call deadline
   and answer cap, once during boot before the listener is bound and then every
@@ -1698,15 +1734,15 @@ off only in a development build, with CI's check of the release artifact; and th
   every registry reload refuse a snapshot serving a tool not classified `read`, since no
   receipt store can be configured yet; a tool approved but on no surface passes. The harness's
   crates enable `test-support`; deploy/Dockerfile builds `switchboard` on its own without it,
-  and CI builds it with the same command and checks it for three refusals: a proxied
-  `propose` tool, identity disabled and audit disabled (#11). Since the snapshot loader's rule
-  2 (decision 0011) refuses every proxied tool not classified `read` as the registry loads,
-  and every tool a registry approves is proxied, the gate cannot be reached from a release
-  registry until built-in connectors exist (milestone 4). CI's `propose` check therefore
-  expects rule 2's refusal, which shows the release binary applies the loader's rules before
-  it connects to anything; the opt-out checks still show it is not a development build. The
-  gate's own tests run it on snapshots with in-process connectors. The receipt store, audit
-  and identity condition arrives with receipts (#10).
+  and CI builds it with the same command and checks it for four refusals: a proxied
+  `propose` tool, identity disabled, audit disabled and a server on loopback (#11). Since the
+  snapshot loader's rule 2 (decision 0011) refuses every proxied tool not classified `read` as
+  the registry loads, and every tool a registry approves is proxied, the gate cannot be
+  reached from a release registry until built-in connectors exist (milestone 4). CI's
+  `propose` check therefore expects rule 2's refusal, which shows the release binary applies
+  the loader's rules before it connects to anything; the opt-out and loopback checks still
+  show it is not a development build. The gate's own tests run it on snapshots with in-process
+  connectors. The receipt store, audit and identity condition arrives with receipts (#10).
 - An allowed call whose connector is not registered completes its row as `error`: built
   (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test

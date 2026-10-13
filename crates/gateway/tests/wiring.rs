@@ -755,13 +755,13 @@ async fn the_wiring_refuses_to_start_on_what_it_cannot_serve() {
     world
         .files
         .write("docs-team-a-credential", files::CREDENTIAL);
-    // A server the proxy cannot reach over plain HTTP.
+    // An https server with no CA file to verify its certificate with.
     world.files.write(
         "registry/registry.toml",
         &registry("https://mock-docs.example.test/mcp"),
     );
     let said = refused(&world).await;
-    assert!(said.contains("must be http://"), "{said}");
+    assert!(said.contains("must name the CA file"), "{said}");
     // A server entry changed without its tools approved again.
     world.files.write(
         "registry/registry.toml",

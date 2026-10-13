@@ -138,7 +138,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7]);
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6],
+            vec![1, 2, 3, 4, 5, 6, 7],
             "each migration is applied once"
         );
     }
@@ -321,6 +321,8 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "claimed_acting_person"),
         ("INSERT", "claimed_team"),
         ("INSERT", "connector"),
+        ("INSERT", "credential_mode"),
+        ("INSERT", "credential_principal"),
         ("INSERT", "decision"),
         ("INSERT", "deployment"),
         ("INSERT", "id"),
@@ -861,7 +863,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
     assert_eq!(complete(&owner, &completed, "ok").await.unwrap(), 1);
     let refused = insert_row(&owner, &before_0003(denied())).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5, 6]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5, 6, 7]);
     for (id, due) in [
         (&open, "begun_at"),
         (&completed, "finished_at"),
@@ -1434,11 +1436,13 @@ async fn the_error_kind_is_written_with_the_completion_and_never_after() {
     assert_eq!(kind, "vendor_refusal");
 }
 
-/// Every row as JSON, without its error kind, by identifier.
+/// Every row as JSON, without its error kind or the credential columns 0007 adds after it, by
+/// identifier.
 async fn rows_without_error_kind(client: &Client) -> Vec<(String, serde_json::Value)> {
     client
         .query(
-            "SELECT id::text, to_jsonb(r) - 'error_kind'
+            "SELECT id::text,
+                    to_jsonb(r) - 'error_kind' - 'credential_mode' - 'credential_principal'
              FROM switchboard_audit.call_rows AS r ORDER BY id",
             &[],
         )
@@ -1495,7 +1499,7 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
     let denial = insert_row(&owner, &denied()).await;
     let before = rows_without_error_kind(&owner).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7]);
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
         (&failed, Some("before-0006")),
@@ -1518,4 +1522,211 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
     let error = complete(&owner, &failed, "error").await.unwrap_err();
     assert!(message(&error).contains("is already complete"), "{error}");
     assert_eq!(complete(&owner, &open, "error").await.unwrap(), 1);
+}
+
+/// A reach is recorded as `{"reach": entry}`: an object with that one key, naming an entry, with
+/// nothing left out. Any other object is refused, whoever writes it, and the gateway's role
+/// writes one.
+#[tokio::test]
+async fn a_reach_is_an_object_naming_one_entry_with_nothing_left_out() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    let reach = ("resources", "'{\"reach\": \"docs-team-a\"}'::jsonb");
+    insert_row(&gateway, &insert(&[reach])).await;
+    insert_row(
+        &gateway,
+        &insert(&[
+            reach,
+            ("decision", "'deny'"),
+            ("reason", "'resource_outside_limit'"),
+            ("sentence", "'Denied.'"),
+        ]),
+    )
+    .await;
+    for (case, resources) in [
+        ("an empty object", "'{}'::jsonb"),
+        ("an empty entry", "'{\"reach\": \"\"}'::jsonb"),
+        (
+            "an entry that is not a string",
+            "'{\"reach\": [\"docs-team-a\"]}'::jsonb",
+        ),
+        ("an entry that is null", "'{\"reach\": null}'::jsonb"),
+        (
+            "another key beside the entry",
+            "'{\"reach\": \"docs-team-a\", \"named\": []}'::jsonb",
+        ),
+        ("another key alone", "'{\"named\": []}'::jsonb"),
+        ("a number", "'7'::jsonb"),
+        ("another string", "'\"docs-team-a\"'::jsonb"),
+    ] {
+        for client in [&gateway, &owner] {
+            let error = client
+                .query_one(&insert(&[("resources", resources)]), &[])
+                .await
+                .unwrap_err();
+            assert!(refused_by(&error, "resources_known"), "{case}: {error}");
+        }
+    }
+    for client in [&gateway, &owner] {
+        let error = client
+            .query_one(&insert(&[reach, ("resources_omitted", "3")]), &[])
+            .await
+            .unwrap_err();
+        assert!(refused_by(&error, "reach_shape"), "{error}");
+    }
+}
+
+/// The credential identity is a mode the core names and its principal, written together at
+/// insert by the gateway's role, or neither. A row with neither is accepted: a call naming no
+/// tool with an entry, or a row written before 0007.
+#[tokio::test]
+async fn a_credential_identity_is_a_known_mode_with_its_principal_or_neither() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    for mode in ["team_service_identity", "gateway_token", "per_user_grant"] {
+        let mode = format!("'{mode}'");
+        let id = insert_row(
+            &gateway,
+            &insert(&[
+                ("credential_mode", &mode),
+                ("credential_principal", "'docs-team-a'"),
+            ]),
+        )
+        .await;
+        let stored: (String, String) = owner
+            .query_one(
+                &format!(
+                    "SELECT credential_mode, credential_principal
+                       FROM switchboard_audit.call_rows WHERE id = '{id}'"
+                ),
+                &[],
+            )
+            .await
+            .map(|row| (row.get(0), row.get(1)))
+            .unwrap();
+        assert_eq!(
+            stored,
+            (mode.trim_matches('\'').to_owned(), "docs-team-a".to_owned())
+        );
+    }
+    insert_row(&gateway, &insert(&[])).await;
+    for (constraint, changes) in [
+        (
+            "credential_mode_known",
+            vec![
+                ("credential_mode", "'service_account'"),
+                ("credential_principal", "'docs-team-a'"),
+            ],
+        ),
+        (
+            "credential_mode_known",
+            vec![
+                ("credential_mode", "'Gateway_Token'"),
+                ("credential_principal", "'docs-team-a'"),
+            ],
+        ),
+        (
+            "credential_shape",
+            vec![("credential_mode", "'team_service_identity'")],
+        ),
+        (
+            "credential_shape",
+            vec![("credential_principal", "'docs-team-a'")],
+        ),
+    ] {
+        for client in [&gateway, &owner] {
+            let error = client.query_one(&insert(&changes), &[]).await.unwrap_err();
+            assert!(refused_by(&error, constraint), "{changes:?}: {error}");
+        }
+    }
+    // The gateway's role writes them at begin and never again, and cannot read them back.
+    let id = insert_row(&gateway, &insert(&[])).await;
+    let error = gateway
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows
+                    SET credential_mode = 'gateway_token', credential_principal = 'x'
+                  WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
+    let error = gateway
+        .query(
+            "SELECT credential_mode, credential_principal FROM switchboard_audit.call_rows",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
+}
+
+/// Rows written before 0007 keep their resources, and record no credential identity: NULL,
+/// not recorded. The migration accepts every shape of resources they could hold.
+#[tokio::test]
+async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let mut owner = db.connect_as(OWNER_ROLE).await;
+    owner
+        .batch_execute("DROP SCHEMA switchboard_audit CASCADE")
+        .await
+        .unwrap();
+    owner
+        .batch_execute(
+            "CREATE SCHEMA switchboard_audit;
+             CREATE TABLE switchboard_audit.migrations (
+                 version    integer     PRIMARY KEY,
+                 name       text        NOT NULL,
+                 applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+             );",
+        )
+        .await
+        .unwrap();
+    for migration in &MIGRATIONS[..6] {
+        owner.batch_execute(migration.sql).await.unwrap();
+        owner
+            .execute(
+                "INSERT INTO switchboard_audit.migrations (version, name) VALUES ($1, $2)",
+                &[&migration.version, &migration.name],
+            )
+            .await
+            .unwrap();
+    }
+    let named = insert_row(&owner, &insert(&[])).await;
+    let unknown = insert_row(&owner, &insert(&[("resources", "'\"unknown\"'::jsonb")])).await;
+    let listed = insert_row(&owner, &list(&[])).await;
+    let read = |id: &str| {
+        format!(
+            "SELECT resources, credential_mode IS NULL AND credential_principal IS NULL
+               FROM switchboard_audit.call_rows WHERE id = '{id}'"
+        )
+    };
+    let resources =
+        |id: &str| format!("SELECT resources FROM switchboard_audit.call_rows WHERE id = '{id}'");
+    let mut before = Vec::new();
+    for id in [&named, &unknown, &listed] {
+        let row = owner.query_one(&resources(id), &[]).await.unwrap();
+        before.push(row.get::<_, Option<serde_json::Value>>(0));
+    }
+
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7]);
+    for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
+        let row = owner.query_one(&read(id), &[]).await.unwrap();
+        assert_eq!(
+            row.get::<_, Option<serde_json::Value>>(0),
+            resources,
+            "{id}"
+        );
+        assert!(row.get::<_, bool>(1), "{id} records a credential identity");
+    }
 }
