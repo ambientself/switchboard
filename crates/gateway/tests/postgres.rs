@@ -1,7 +1,8 @@
 //! The gateway built from files with its audit rows in Postgres, as the demo runs it: the store
 //! passes its boot checks as the gateway's role, an allowed call, a denial and a refusal each
 //! leave their row, due by the call deadline the deployment file sets for the server, a `tools/list` leaves a row of kind `list`, a completion the database refuses is logged as given up, naming its row,
-//! and a connection as a superuser refuses to start.
+//! the audit pool sizes the deployment file sets reach the store, and a connection as a superuser
+//! refuses to start.
 //!
 //! Runs only when `SWITCHBOARD_TEST_DATABASE_URL` names a superuser on a throwaway server, as
 //! the audit store's own database tests do; otherwise it says it was skipped and passes. It
@@ -141,7 +142,8 @@ async fn run(
     files.write(
         "gateway.toml",
         &files::deployment_file(
-            "[audit]\nmode = \"postgres\"\nurl_env = \"AUDIT_URL\"\n\n\
+            "[audit]\nmode = \"postgres\"\nurl_env = \"AUDIT_URL\"\n\
+             begin_pool_size = 5\nfinish_pool_size = 3\n\n\
              [servers.docs-team-a]\ndeadline_seconds = 7\n",
         ),
     );
@@ -174,7 +176,16 @@ async fn run(
     )
     .await
     .map_err(|error| error.to_string())?;
-    assert!(prepared.store.is_some());
+    // The pool sizes the deployment file sets reach the store; the open-row query's stays one.
+    let stats = prepared.store.as_ref().unwrap().stats();
+    assert_eq!(
+        (
+            stats.begin_pool.max_size,
+            stats.finish_pool.max_size,
+            stats.open_rows_pool.max_size
+        ),
+        (5, 3, 1)
+    );
     let path = RequestPath::new(prepared.gates);
     let token = kubernetes_token(&issuer, TEAM_A_SA, &[AUDIENCE]);
 

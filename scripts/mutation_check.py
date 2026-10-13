@@ -4445,7 +4445,8 @@ mutate_all("gw-deploy-disabled-identity-takes-anything", "identity disabled igno
 mutate_all("gw-deploy-disabled-audit-takes-anything", "audit disabled ignores a URL variable still given",
            (DEPLOY, "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled {},",
             "    /// Record nothing. An empty struct for the same reason as [`IdentityFile::Disabled`].\n    Disabled,"),
-           (DEPLOY, "            AuditFile::Disabled {} => AuditChoice::Disabled,", "            AuditFile::Disabled => AuditChoice::Disabled,"))
+           (DEPLOY, "            AuditFile::Disabled {} => (AuditChoice::Disabled, PoolSizes::default()),",
+            "            AuditFile::Disabled => (AuditChoice::Disabled, PoolSizes::default()),"))
 mutate("gw-deploy-poll-zero", "the registry may be read again never", DEPLOY,
        "        if file.registry.poll_seconds == 0 {", "        if false {")
 mutate("gw-deploy-workload-without-manifest", "a workload issuer with no team manifest gets an empty one", DEPLOY,
@@ -4466,8 +4467,8 @@ mutate("gw-deploy-workload-lifetime-capped", "a workload issuer's tokens are hel
        "    if issuer.kind == IssuerKindName::User\n        && issuer.max_lifetime_seconds",
        "    if matches!(issuer.kind, IssuerKindName::User | IssuerKindName::Workload)\n        && issuer.max_lifetime_seconds")
 mutate("gw-deploy-empty-database-url", "an empty database URL is taken as one", DEPLOY,
-       "                Some(url) if !url.is_empty() => AuditChoice::Postgres { url },",
-       "                Some(url) => AuditChoice::Postgres { url },")
+       "                    Some(url) if !url.is_empty() => (AuditChoice::Postgres { url }, pools),",
+       "                    Some(url) => (AuditChoice::Postgres { url }, pools),")
 mutate("gw-deploy-paths-not-relative-to-file", "the registry path is read from the working directory", DEPLOY,
        "            registry_file: base.join(file.registry.file),", "            registry_file: file.registry.file,")
 
@@ -4487,8 +4488,24 @@ mutate("gw-start-audit-unchecked", "the audit store serves without its boot chec
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")
 mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
-       "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
+       "        AuditChoice::Postgres { url } => Some(audit_store(url, deployment.audit_pools).await?),",
        "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
+# Decision 0014, section 3: the audit pools' sizes come from the deployment file, 16 and 4 unless
+# given, each from 1 to 64. tests/deployment.rs watches the defaults and the bounds; the sizes
+# reaching the store, tests/postgres.rs, which needs SWITCHBOARD_TEST_DATABASE_URL.
+mutate("gw-start-audit-pools-ignored", "the store is built with the default pools, whatever the deployment file sets", START,
+       "        PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?.on_given_up(log_given_up);\n",
+       "        PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?.on_given_up(log_given_up);\n"
+       "    let _ = pools;\n")
+mutate("gw-deploy-audit-pool-ceiling-unchecked", "an audit pool of more than 64 connections loads", DEPLOY,
+       "        Some(size) if size == 0 || size > MAX_AUDIT_POOL_SIZE => {\n",
+       "        Some(size) if size == 0 => {\n")
+mutate("gw-deploy-audit-pool-zero-accepted", "an audit pool of no connections loads", DEPLOY,
+       "        Some(size) if size == 0 || size > MAX_AUDIT_POOL_SIZE => {\n",
+       "        Some(size) if size > MAX_AUDIT_POOL_SIZE => {\n")
+mutate("gw-deploy-audit-pool-defaults-swapped", "an audit pool left out takes the other pool's default", DEPLOY,
+       "        begin: size(begin, defaults.begin, \"begin_pool_size\")?,\n",
+       "        begin: size(begin, defaults.finish, \"begin_pool_size\")?,\n")
 # Where each server is reached, checked before anything is read or connected to (decision 0013,
 # section 3). start.rs's own tests watch each.
 mutate("gw-start-ca-file-optional-for-https", "an https server with no CA file passes the start's check", START,
@@ -4864,7 +4881,7 @@ mutate("demo-driver-kind-identity-failures-whole-log", "the identity failure cou
 # caught only against Postgres (SWITCHBOARD_TEST_DATABASE_URL).
 
 mutate("gw-given-up-not-logged", "a finish the store gives up is not logged", GW + "start.rs",
-       "        .on_given_up(log_given_up);\n", ";\n")
+       "?.on_given_up(log_given_up);\n", "?;\n")
 mutate("gw-given-up-wrong-event", "a finish given up is logged under another event", GW + "start.rs",
        'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";', 'pub const GIVEN_UP_EVENT: &str = "audit_row_given_up_";')
 mutate("gw-given-up-row-unnamed", "the given-up event does not name its row", GW + "start.rs",

@@ -350,7 +350,7 @@ async fn prepare_with(
 
     let store = match &deployment.audit {
         AuditChoice::Disabled => None,
-        AuditChoice::Postgres { url } => Some(audit_store(url).await?),
+        AuditChoice::Postgres { url } => Some(audit_store(url, deployment.audit_pools).await?),
     };
     if let Some(store) = &store {
         wiring = wiring.audit_store(store.clone());
@@ -408,6 +408,8 @@ async fn prepare_with(
             audit = "postgres",
             role = %database_user(&deployment.audit),
             role_check = "passed",
+            begin_pool_size = deployment.audit_pools.begin,
+            finish_pool_size = deployment.audit_pools.finish,
             "audit rows go to Postgres"
         );
     } else {
@@ -741,14 +743,15 @@ fn credentials(
     Ok(FileCredentials::load(pairs)?)
 }
 
-/// Connects the Postgres store and runs its boot checks, within [`AUDIT_CHECK_BUDGET`]. TLS is
-/// not used: the demo's database is on the same private network as the gateway.
-async fn audit_store(url: &str) -> Result<Arc<PgAuditStore>, StartError> {
+/// Connects the Postgres store, with the begin and finish pools `pools` sizes, and runs its boot
+/// checks, within [`AUDIT_CHECK_BUDGET`]. TLS is not used: the demo's database is on the same
+/// private network as the gateway.
+async fn audit_store(url: &str, pools: PoolSizes) -> Result<Arc<PgAuditStore>, StartError> {
     let config: tokio_postgres::Config = url
         .parse()
         .map_err(|error: tokio_postgres::Error| StartError::DatabaseUrl(error.to_string()))?;
-    let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())?
-        .on_given_up(log_given_up);
+    let store =
+        PgAuditStore::connect(config, tokio_postgres::NoTls, pools)?.on_given_up(log_given_up);
     match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {
         Err(_elapsed) => Err(StartError::AuditCheckTimedOut),
         Ok(Err(refused)) => Err(StartError::AuditCheck(refused)),
@@ -1216,6 +1219,7 @@ mod tests {
             identity,
             keys_urls,
             audit,
+            audit_pools: PoolSizes::default(),
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),

@@ -105,6 +105,62 @@ fn the_database_url_comes_from_the_variable_the_file_names() {
     }
 }
 
+/// Decision 0014, section 3: the begin and finish pools are 16 and 4 connections unless the
+/// file says otherwise, each from 1 to 64.
+#[test]
+fn the_audit_pools_are_16_and_4_unless_given_and_each_from_1_to_64() {
+    let url = "postgres://switchboard_gateway:dummy@127.0.0.1:1/switchboard";
+    let load = |name: &str, pools: &str| {
+        let files = files(name);
+        files.write(
+            "gateway.toml",
+            &deployment_file(&format!(
+                "[audit]\nmode = \"postgres\"\nurl_env = \"TEST_AUDIT_URL\"\n{pools}"
+            )),
+        );
+        files.load_with(&[("TEST_AUDIT_URL", url)])
+    };
+    let sizes = |loaded: gateway::Deployment| (loaded.audit_pools.begin, loaded.audit_pools.finish);
+    assert_eq!(gateway::deployment::MAX_AUDIT_POOL_SIZE, 64);
+    assert_eq!(sizes(load("pools-default", "").unwrap()), (16, 4));
+    // With audit disabled there is no store, and the sizes are the defaults.
+    assert_eq!(sizes(files("pools-disabled").load()), (16, 4));
+    for (pools, expected) in [
+        ("begin_pool_size = 5\nfinish_pool_size = 3\n", (5, 3)),
+        ("begin_pool_size = 1\nfinish_pool_size = 64\n", (1, 64)),
+        ("begin_pool_size = 64\nfinish_pool_size = 1\n", (64, 1)),
+        ("begin_pool_size = 32\n", (32, 4)),
+        ("finish_pool_size = 8\n", (16, 8)),
+    ] {
+        assert_eq!(
+            sizes(load("pools-given", pools).unwrap()),
+            expected,
+            "{pools}"
+        );
+    }
+    for field in ["begin_pool_size", "finish_pool_size"] {
+        for size in [0, 65, 1_000] {
+            let error = load("pools-refused", &format!("{field} = {size}\n")).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("`audit.{field}` is {size}; it must be from 1 to 64"),
+            );
+        }
+        let error = load("pools-negative", &format!("{field} = -1\n")).unwrap_err();
+        assert!(
+            error.to_string().contains("not a valid deployment file"),
+            "{error}"
+        );
+    }
+    // The sizes belong to a Postgres store.
+    let said = refused(
+        "pools-disabled-audit",
+        "[audit]\nmode = \"disabled\"\n",
+        "[audit]\nmode = \"disabled\"\nbegin_pool_size = 8\n",
+    );
+    assert!(said.contains("unknown field `begin_pool_size`"), "{said}");
+}
+
 #[test]
 fn identity_and_audit_can_each_be_disabled_explicitly() {
     let files = files("disabled");
@@ -419,15 +475,23 @@ fn a_user_issuers_token_lifetime_is_at_most_an_hour() {
     };
     assert_eq!(gateway::deployment::MAX_USER_LIFETIME_SECONDS, 3600);
     for seconds in [1, 3600] {
-        let loaded = load_edited(&format!("user-lifetime-{seconds}"), workload, &user(seconds))
-            .unwrap();
+        let loaded = load_edited(
+            &format!("user-lifetime-{seconds}"),
+            workload,
+            &user(seconds),
+        )
+        .unwrap();
         assert_eq!(
             loaded.identity.enforce.unwrap()[0].max_lifetime_secs,
             seconds
         );
     }
     for seconds in [3601, 86_400, u64::MAX] {
-        let said = refused(&format!("user-lifetime-{seconds}"), workload, &user(seconds));
+        let said = refused(
+            &format!("user-lifetime-{seconds}"),
+            workload,
+            &user(seconds),
+        );
         assert_eq!(
             said,
             format!(

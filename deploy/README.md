@@ -393,12 +393,25 @@ for the load. The count does not say which, so a rise in it does not by itself m
 too small. A database that refuses connections counts as `database_error` instead. A signal
 that tells an unreachable database from a small pool is #155.
 
-Each gateway instance opens at most 21 connections to the audit database: 16 for begins and list
-rows, 4 for finishes, and 1 for the open-row poll. The poll has its connection to itself, so a
-poll held up for its full 2 s never takes a connection a finish could use (#140). The pool
-metrics cover all three pools; the poll's is `pool="open_rows"`. The database's
-`max_connections` must therefore be at least the number of gateway replicas times 21, plus the
-connections the migrate job and readers use (decision 0014, as amended on 2026-10-12).
+Each gateway instance opens at most begin plus finish plus 1 connections to the audit database:
+its begin pool, for begins and list rows, its finish pool, for finishes, and 1 for the open-row
+poll. The deployment file sets the first two, and both demos leave them at their defaults:
+
+```toml
+[audit]
+mode = "postgres"
+url_env = "SWITCHBOARD_DATABASE_URL"
+begin_pool_size = 16        # 16 if left out; 1 to 64
+finish_pool_size = 4        # 4 if left out; 1 to 64
+```
+
+A size of 0 or over 64 refuses the start, and so does either field beside `mode = "disabled"`.
+The open-row poll's pool is always 1 connection, so a poll held up for its full 2 s never takes
+a connection a finish could use (#140). The boot line `audit rows go to Postgres` logs both
+sizes. The pool metrics cover all three pools; the poll's is `pool="open_rows"`. The database's
+`max_connections` must therefore be at least the number of gateway replicas times begin plus
+finish plus 1, which is 21 at the defaults, plus the connections the migrate job and readers
+use (decision 0014, as amended on 2026-10-12).
 
 ## Stopping the gateway
 
