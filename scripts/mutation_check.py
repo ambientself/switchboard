@@ -1330,6 +1330,32 @@ mutate("testkit-interval-overflow-accepted", "the in-memory store writes an allo
        "    if product >= TWO_TO_THE_63 {", "    if false {")
 mutate("testkit-deadline-exact-arithmetic", "the in-memory store adds the allowance exactly, not through float8 as Postgres does", A,
        "    let span_micros = product as u64;", "    let span_micros = allowance_ms.saturating_mul(1000);")
+# The Postgres store's row bound and sentence cap (#191), held by the in-memory store with copies
+# of that store's constants and count. The contract suite tries each refusal at its edge on both
+# stores; audit-postgres's the_testkits_row_bound_is_this_stores checks the copied count.
+ROW_BOUND = TESTKIT_SRC + "row_bound.rs"
+mutate("testkit-row-bound-unchecked", "the in-memory store begins a call row over begin's bound", A,
+       "    refuse_over(&call_row_sizes(id, record), MAX_BEGUN_ROW_BYTES)?;\n",
+       "    let _ = refuse_over(&call_row_sizes(id, record), MAX_BEGUN_ROW_BYTES);\n")
+mutate("testkit-row-bound-no-completion-reserve", "the in-memory store's begin leaves no room for the completion", A,
+       "    refuse_over(&call_row_sizes(id, record), MAX_BEGUN_ROW_BYTES)?;\n",
+       "    refuse_over(&call_row_sizes(id, record), MAX_ROW_BYTES)?;\n")
+mutate("testkit-list-row-unbounded", "the in-memory store writes a list row over 512 KiB", A,
+       "    refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES)\n",
+       "    let _ = refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES);\n    Ok(())\n")
+mutate("testkit-outcome-sentence-uncapped", "the in-memory store writes a refusal's sentence of any length at finish", A,
+       "        refuse_long_sentence(sentence)?;\n", "        let _ = refuse_long_sentence(sentence);\n")
+mutate("testkit-outcome-sentence-refused-at-cap", "the in-memory store refuses a refusal's sentence of exactly the cap", ROW_BOUND,
+       "    if sentence.len() > MAX_OUTCOME_SENTENCE_BYTES {", "    if sentence.len() >= MAX_OUTCOME_SENTENCE_BYTES {")
+mutate("testkit-row-bound-refuses-at-bound", "the in-memory store refuses a row of exactly its bound", ROW_BOUND,
+       "    if bytes > bound {", "    if bytes >= bound {")
+mutate("testkit-row-bound-names-first-column", "a row over the bound names its first column, not its largest", ROW_BOUND,
+       "            .max_by_key(|(_, bytes)| *bytes)\n", "            .next()\n")
+mutate("testkit-row-bound-groups-uncounted", "the in-memory store leaves a user's groups out of the row's size", ROW_BOUND,
+       "                groups.iter().map(|group| group.as_str().len()).sum(),",
+       "                groups.iter().map(|group| group.as_str().len()).sum::<usize>() * 0,")
+mutate("testkit-list-kind-uncounted", "the in-memory store leaves a list row's kind out of its size", ROW_BOUND,
+       '        ("kind", kind(RowKind::List).len()),', '        ("kind", 0),')
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
