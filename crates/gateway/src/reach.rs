@@ -69,7 +69,8 @@ pub const REACH_ANSWER_HEADROOM: usize = 64 * 1024;
 /// - A number inside `u64` or `i64` with neither a fraction nor an exponent, other than `-0`,
 ///   is kept as an integer and written as sent: JSON allows no leading zero or plus sign.
 /// - Any other number is parsed as an `f64` and written in its shortest form, at most 24
-///   bytes: a sign, 17 digits, a point, and either a signed exponent of up to three digits (`-2.2250738585072014e-308`) or up to four zeros after `0.`
+///   bytes: a sign, 17 digits, a point, and either a signed exponent of up to three digits
+///   (`-2.2250738585072014e-308`) or up to four zeros after `0.`
 ///   (`-0.000012345678901234567`). Every such number is at least 3 bytes as sent (`1e9`,
 ///   `0.5`, an integer past `u64`), but `-0`, written `-0.0`, so it grows at most 8 times:
 ///   `1e9` becomes `1000000000.0`.
