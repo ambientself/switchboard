@@ -1496,16 +1496,16 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   credential reaches, and narrowing a credential per call or to the caller's limit. The
   gateway sends the same credential on every call to a server, so it
   refuses an entry whose narrowing is not `none` at start, until the custodian client (#12).
-- The kind slice extended to show them: partly built. Both demos register the mock server
-  once per team and show each team's calls reaching it under its own entry's identity, for its
-  own project (the next entry), and both show the undeclared argument, the registry refused at
-  load, the hanging server, overload and drift (the demonstrations entry above). Both check,
-  after boot, that each entry's probe was refused and its reach check held, with rows by the
-  registry's principal, and both widen docs-team-a's caller in mock-docs to both projects: the
-  next reach check finds the mismatch, both of docs-team-a's tools are withdrawn within the
-  interval plus the deadline and the reach check's allowance, and a new approval, once the
-  caller is narrowed again, serves them again. No step shows the probe finding an open
-  server.
+- The kind slice extended to show them: built (#156, #169, #176). Both demos register the mock
+  server once per team and show each team's calls reaching it under its own entry's identity,
+  for its own project (the next entry), and both show the undeclared argument, the registry
+  refused at load, the hanging server, overload and drift (the demonstrations entry above).
+  Both check, after boot, that each entry's probe was refused and its reach check held, with
+  rows by the registry's principal, and both widen docs-team-a's caller in mock-docs to both
+  projects: the next reach check finds the mismatch, both of docs-team-a's tools are withdrawn
+  within the interval plus the deadline and the reach check's allowance, and a new approval,
+  once the caller is narrowed again, serves them again. No step shows the probe finding an
+  open server; `tests/probe.rs` does (the probe entry below).
 - The gateway's per-team identities: built in the demos (#11's kind slice), as decision 0013,
   section 10, has them. The registry lists the mock server twice, `docs-team-a` and
   `docs-team-b`, at one address, each with its own credential reference, tools and surface,
@@ -1578,7 +1578,10 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   nothing, and the start refused without the fields.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
-- The 3600 s cap on user issuers' token lifetime: not built.
+- The 3600 s cap on user issuers' token lifetime: built. The deployment file refuses a user
+  issuer whose `max_lifetime_seconds` is over 3600, naming the issuer, the value and the cap
+  ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 8). A
+  workload issuer's lifetime has no such ceiling. `tests/deployment.rs` has both.
 - The registration and drift probe: built. `connector_proxy::probe` sends decision 0010's
   three `tools/call` requests for `switchboard_probe_no_such_tool`, with no credential, with
   `Bearer not-a-token` and with the probe credential, held to the server's call deadline and
@@ -1598,15 +1601,40 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `switchboard_probe_results_total{server,result}`; its tools stay listed. A probe that
   showed nothing is logged at WARN. `tests/probe.rs` in `connector-proxy` and `gateway` has
   them. The token writer is built (the per-team identities entry above).
-- Decision 0013 section 11's acceptance scenarios: not built.
+- Decision 0013 section 11's acceptance scenarios: built, each a test on fakes. The stale
+  registry file: `tests/stale.rs`,
+  `a_registry_file_not_read_within_the_maximum_age_makes_the_policy_stale`. Two gateways each
+  withdrawing a changed definition: `tests/drift.rs`,
+  `two_replicas_over_one_server_each_withdraw`, with
+  `a_changed_description_is_withdrawn_within_one_interval` for the interval. A widened
+  reach: `tests/reach.rs`, `a_widened_caller_is_withdrawn`. A new approval bringing the tool
+  back, and a standing withdrawal surviving a reload under a revision naming the new base:
+  `tests/drift.rs`, `a_reload_keeps_a_withdrawal_and_a_new_approval_clears_it`. An open server
+  reported with its tools still listed: `tests/probe.rs`,
+  `an_open_server_is_reported_and_its_tools_stay_listed`. A restored server and a restarted
+  replica, with the earlier `tool_withdrawn` lines and count: `tests/drift.rs`,
+  `a_definition_changed_at_boot_is_never_served_and_a_restart_detects_it_again`. A server entry
+  changed without its tools approved again, refused at boot and at reload: `tests/wiring.rs`,
+  `the_wiring_refuses_to_start_on_what_it_cannot_serve` and
+  `a_new_registry_file_is_served_once_it_passes_and_refused_otherwise`, and the binding cases
+  in `gateway-registry`'s `tests/load_table.rs`. A revision containing `+`: the two revision
+  cases in `tests/load_table.rs`, through the loader that boot and every reload use.
 - The identity and audit opt-outs refused by the release binary, with CI checks: built (#132),
   in the opt-outs entry below.
-- Configurable audit pools and the `max_connections` sizing rule: not built.
-- The 512 KiB row bound and its test: not built.
-- The decision 0014 signals other than each issuer's key age: partly built. The calls shed and
-  each proxied server's calls, latency and late or oversized answers (#139), and the policy's
-  age (#132), and each server's drift polls, withdrawals, probe results and reach-check
-  results, are exported.
+- Configurable audit pools and the `max_connections` sizing rule: built. `[audit]` takes
+  `begin_pool_size` and `finish_pool_size`, 16 and 4 unless given, each from 1 to 64, and the
+  open-row poll keeps its one connection. The database's `max_connections` must be at least the
+  replicas times begin plus finish plus 1, 21 at the defaults, plus the migrate job and readers
+  (deploy/README.md, "Metrics"; decision 0014, as amended on 2026-10-12).
+- The 512 KiB row bound and its test: built. The Postgres store counts a row as the bytes of
+  the values it sends and refuses one over 512 KiB, naming its largest column, so the call is
+  refused. `audit_postgres::MAX_ROW_BYTES` works out the largest row a call can make, 316,129
+  bytes of capped values, and a test writes it at the bound to Postgres (section 11).
+- The decision 0014 signals other than each issuer's key age: built. The calls shed by scope
+  and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
+  policy's age (#132), and each server's drift polls, withdrawals, probe results and
+  reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
+  late or oversized count is of reads only until `unknown` is built (the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -1678,7 +1706,8 @@ checked; a schema that needs them cannot be approved yet.
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
   `oversized_or_late_read`, so a tool not classified `read` is not counted there until
   `unknown` is built. Both demos show overload and a hanging server (the demonstrations entry
-  under #11 above). Not built yet in #11: configurable audit pools, and the row's size bound.
+  under #11 above). The configurable audit pools and the row's size bound are in the #11 list
+  above.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
