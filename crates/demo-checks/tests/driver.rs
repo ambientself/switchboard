@@ -3278,6 +3278,36 @@ fn a_token_the_writer_cannot_get_leaves_the_previous_one_in_place() {
     );
 }
 
+/// #153: each token is written whole to a new file and renamed over the old one, never written
+/// into the file the gateway may be reading. A hard link to the old file still holds the
+/// previous token after a write that succeeded; a write in place would change it too.
+#[test]
+fn the_token_writer_replaces_each_file_rather_than_writing_into_it() {
+    let dir = token_writer_dir("token-writer-renames");
+    let mut before = Vec::new();
+    for account in ["docs-team-a", "docs-team-b"] {
+        let old = write(&dir.join("tokens"), account, "previous-token\n");
+        let link = dir.join(format!("{account}.old"));
+        std::fs::hard_link(&old, &link).unwrap();
+        before.push((account, link));
+    }
+    let run = token_writer(&dir, "ok", &[]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    for (account, link) in before {
+        assert_eq!(
+            token_file(&dir, account),
+            Some(format!("{}\n", issued(account))),
+            "{}",
+            run.transcript()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            "previous-token\n",
+            "{account}'s token was written into the file in place"
+        );
+    }
+}
+
 #[test]
 fn the_token_writer_refuses_a_bad_configuration_before_asking() {
     for (name, value) in [
