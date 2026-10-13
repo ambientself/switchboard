@@ -337,7 +337,10 @@ async fn an_http_server_behind_an_https_url_fails() {
     let connector = over_tls(&server.url("https", "localhost"), &ca_file);
 
     // This server waits for a request it never gets, so the handshake ends at the deadline.
-    let listed = connector.list_tools().await;
+    // Bounded here too, so a list with no deadline fails this test instead of hanging it.
+    let listed = tokio::time::timeout(DEADLINE * 3, connector.list_tools())
+        .await
+        .expect("the list was not abandoned at the deadline");
     assert!(
         matches!(listed, Err(ListError::Unreachable | ListError::TimedOut)),
         "{listed:?}"
