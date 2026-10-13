@@ -1881,6 +1881,9 @@ mutate("gw-metrics-histogram-inf-read-apart", "a histogram's +Inf bucket is the 
 mutate("gw-metrics-histogram-count-read-apart", "a histogram's _count is the count read apart from the buckets", GW_METRICS,
        "        self.sample(&format!(\"{name}_count\"), labels, total);\n",
        "        self.sample(&format!(\"{name}_count\"), labels, histogram.count);\n")
+# #161: the open-row query's pool is exported beside the begin and finish pools.
+mutate("gw-metrics-open-rows-pool-not-exported", "the pool metrics leave out the open-row query's pool", GW_METRICS,
+       "        text.sample(name, &[(\"pool\", \"open_rows\")], of(&stats.open_rows_pool));\n", "")
 mutate("gw-demo-kind-open-rows-names-outage", "the kind run's open-row metrics check names a database outage it did not have",
        "deploy/demo/demo.sh",
        "  local open=\"one row\"\n",
@@ -3797,6 +3800,26 @@ mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time lim
 mutate("pg-open-rows-not-cancelled", "an open-row query past its time limit is not cancelled, and its connection goes back to the pool", PG_STORE,
        "                abandon(client, &self.cancel);\n                Err(PgAuditError::OpenRowsTimedOut { budget })",
        "                drop(client);\n                Err(PgAuditError::OpenRowsTimedOut { budget })")
+# #161: the open-row query's pool is in the store's stats beside the other two, and its sessions
+# carry the store's settings. The second keeps the caller's options and drops only the store's.
+mutate("pg-open-rows-pool-not-in-stats", "the store's stats leave out the open-row query's pool", PG_STORE,
+       "            open_rows_pool: pool_stats(&self.open_rows_pool),\n",
+       "            open_rows_pool: PoolStats::default(),\n")
+mutate("pg-open-rows-pool-settings-skipped", "the open-row query's pool is built without the store's session settings", PG_STORE,
+       "        let open_rows_pool = pool(OPEN_ROWS_POOL_SIZE)?;\n",
+       "        let open_rows_pool = {\n"
+       "            let mut plain = config.clone();\n"
+       "            let caller = config.get_options().unwrap_or_default();\n"
+       "            plain.options(caller.trim_end_matches(SESSION_OPTIONS).trim_end());\n"
+       "            let manager = Manager::from_config(\n"
+       "                plain,\n"
+       "                tls.clone(),\n"
+       "                ManagerConfig {\n"
+       "                    recycling_method: RecyclingMethod::Fast,\n"
+       "                },\n"
+       "            );\n"
+       "            Pool::builder(manager).max_size(OPEN_ROWS_POOL_SIZE).build()?\n"
+       "        };\n")
 # The error kind (#56, migration 0006): written with the completion, compared on a repeat, held to
 # the five kinds and to error rows alone, part of the completion for complete_once, granted to the
 # gateway, and `other` for a lost begin's completion, as for a guard given up.
