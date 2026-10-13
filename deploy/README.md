@@ -117,13 +117,19 @@ which comes before the listener is bound, and it never attempts a write: every p
   `reach mismatch`, until they are approved again.
 - Anything else, a denial, an audit failure, a token that cannot be read or no answer within the
   call deadline plus 5 s: `"event":"reach_check_failed"` at `WARN`, and nothing is withdrawn. So
-  is a check whose list tool is withdrawn, which makes no call.
+  is a check whose list tool is withdrawn, which makes no call; but then the entry's read tool
+  is withdrawn too, with the cause `reach check tool withdrawn`, since the entry can no longer
+  be checked, until the list tool is served again.
 
-Each is counted in `switchboard_reach_checks_total{server,result}`. With the 10 s interval a
-widened reach is withdrawn within 10 s plus the 5 s call deadline and the 5 s allowance; at the
-300 s default, within about 310 s. The canaries reach mock-docs every 10 s under the entries'
-identities, and it refuses each for its project; the runs' call counts leave them out, and hold
-each to the other team's project.
+Each is counted in `switchboard_reach_checks_total{server,result}`. A tick that finds the
+entry's last check still out makes no check. The 10 s interval is no longer than the 5 s call
+deadline plus the 5 s allowance, so a check that runs to its limit makes the next tick skip, and
+a widened reach is withdrawn within two intervals plus the deadline and the allowance, 30 s.
+mock-docs answers each check at once, so every tick checks, and step 7 finds the widening within
+one interval plus the deadline and the allowance, 20 s. At the 300 s default, with the 5 s
+default deadline, it is withdrawn within about 310 s. The canaries reach mock-docs every 10 s
+under the entries' identities, and it refuses each for its project; the runs' call counts leave
+them out, and hold each to the other team's project.
 
 ## #11's demonstrations
 
@@ -174,18 +180,21 @@ own rows leave out the reach check's, which come on the gateway's schedule:
 6. **Drift** (decision 0013, sections 5 to 7). The driver has mock-docs serve another
    description of `list_documents`. Both entries list it from the one server, so the gateway
    withdraws both list tools, each within the 10 s interval plus the 5 s deadline of the change,
-   for a changed definition from `demo-10`, and serves the literal derived revision
-   `demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents`. Team-a's
-   tools/list drops its list tool, a call to it is refused as an unknown tool, and both rows
-   carry that revision. The driver then has mock-docs serve the approved description again,
+   for a changed definition from `demo-10`. The list tool is each entry's reach check tool, so
+   each entry's read tool is withdrawn with it, for `reach check tool withdrawn` (decision 0011,
+   section 4), and the gateway serves the literal derived revision
+   `demo-10+withdrawn:docs-team-a__list_documents,docs-team-a__read_document,docs-team-b__list_documents,docs-team-b__read_document`.
+   Team-a's tools/list is empty, a call to its list tool is refused as an unknown tool, and both
+   rows carry that revision. The driver then has mock-docs serve the approved description again,
    waits for two more polls of each entry, and shows the tools still withdrawn: in milestone 3 a
    withdrawal lasts until a new approval or a restart. It then installs a variant of the
    registry approving both list tools again, unchanged (the same `definition_sha256`), with a
    new `approved_at` and a new revision, `demo-12-reapproved-<UTC time>`. The gateway serves that
-   revision with no withdrawal, logs both withdrawals cleared as approved again, and withdraws
-   nothing over the next two polls, and team-a's tools are served again. Last, the registry
-   served before goes back, and team-a's tools are served under `demo-10`. No step approves a
-   changed definition, so nothing flaps.
+   revision with no withdrawal, logs both list tools' withdrawals cleared as approved again and
+   both read tools' as their entry's reach check tool no longer withdrawn, and withdraws nothing
+   over the next two polls, and team-a's tools are served again. Last, the registry served
+   before goes back, and team-a's tools are served under `demo-10`. No step approves a changed
+   definition, so nothing flaps.
 7. **A widened reach** (decision 0011, section 4). The driver has mock-docs let `docs-team-a`'s
    credential read `borealis` too, through its admin endpoint. The next reach check's canary is
    answered: the gateway logs `reach_mismatch` for `docs-team-a`, once, within the 10 s interval

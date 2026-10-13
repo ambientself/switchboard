@@ -29,7 +29,8 @@ pub struct Server {
     /// The server's name. Approved tools name it as their connector.
     pub name: ConnectorName,
     /// The system part of its tools' exposed names: every tool on this server is exposed as
-    /// `{system}__{tool}`.
+    /// `{system}__{tool}`. No two servers have the same system, and none contains `__` or ends
+    /// in `_`.
     pub system: String,
     /// The team that owns the server and answers for it.
     pub owner: String,
@@ -146,10 +147,13 @@ pub struct Probe {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReachCheck {
     /// The tool, by its exposed name, which the loader requires to be `{system}__<tool>` for
-    /// the server's own system, so that the check cannot name another server's tool or a
-    /// malformed one. The loader does not require it to be approved: removing a tool's approval
-    /// withdraws it (decision 0013, section 8), and that must stay possible for this tool and
-    /// for an entry's last tool without editing the reach check.
+    /// the server's own system. No two servers have the same system, and no system contains
+    /// `__` or ends in `_`, so a name is under one system at most: the check cannot name
+    /// another server's tool or a malformed one. The loader requires the tool to be approved
+    /// while any other tool of the server is, so that nothing is served under a credential
+    /// whose reach can no longer be checked. Removing a tool's approval withdraws it (decision
+    /// 0013, section 8): this tool is withdrawn together with the server's others, which needs
+    /// no edit to the reach check.
     pub tool: ToolName,
     /// Its arguments.
     pub arguments: serde_json::Map<String, Value>,
@@ -187,6 +191,31 @@ pub enum RegistryError {
     /// Two servers share a name.
     #[error("server `{0}` is registered more than once")]
     DuplicateServer(ConnectorName),
+    /// Two servers have the same system, so a tool named after it could be either's.
+    #[error(
+        "servers `{first}` and `{second}` both have the system `{system}`; each server needs a \
+         system of its own"
+    )]
+    DuplicateSystem {
+        /// The system.
+        system: String,
+        /// The server registered first with it.
+        first: ConnectorName,
+        /// The server registered second with it.
+        second: ConnectorName,
+    },
+    /// A server's system contains `__` or ends in `_`, so a tool name under it could also be
+    /// under a shorter system, such as `docs` for `docs__wiki` or `docs_`.
+    #[error(
+        "server `{server}` has the system `{system}`, which contains `__` or ends in `_`; a \
+         tool name must be under one system only, so a system may do neither"
+    )]
+    SystemOverlaps {
+        /// The server.
+        server: ConnectorName,
+        /// Its system.
+        system: String,
+    },
     /// A server's address is not an `http` or `https` URL with a host.
     #[error("server `{server}` has address `{address}`, which is not an http or https URL")]
     AddressNotHttp {
@@ -250,6 +279,20 @@ pub enum RegistryError {
         tool: ToolName,
         /// The server's system.
         system: String,
+    },
+    /// A server's reach check calls a tool that is not approved, and another of the server's
+    /// tools is approved: that tool would be served under a credential whose reach can no
+    /// longer be checked.
+    #[error(
+        "server `{server}`'s reach check calls `{tool}`, which is not approved, and other tools \
+         of the server are: remove the server's approvals together, or name another tool in its \
+         reach check"
+    )]
+    ReachCheckUnapproved {
+        /// The server.
+        server: ConnectorName,
+        /// The tool its reach check names.
+        tool: ToolName,
     },
     /// A server has no probe record (decision 0013, section 9).
     #[error(
@@ -581,6 +624,22 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         routes.insert(name.clone(), checked.route);
         approvals.insert(name, checked.approval);
     }
+    // A reach check's tool stays approved while any other tool of its server is, so that
+    // nothing is served under a credential whose reach can no longer be checked; removing
+    // every approval of a server still loads (decision 0013, section 8). A tool is the
+    // server's when its route names the server, as the drift pass takes an entry's tools. Its
+    // name is under the server's system, as the reach check's is, so the two agree.
+    for server in servers.values() {
+        if let Some(check) = &server.reach_check
+            && !routes.contains_key(&check.tool)
+            && routes.values().any(|route| route.server == server.name)
+        {
+            return Err(RegistryError::ReachCheckUnapproved {
+                server: server.name.clone(),
+                tool: check.tool.clone(),
+            });
+        }
+    }
 
     let surfaces = file
         .surfaces
@@ -672,10 +731,21 @@ fn servers(
     probe_rule: ProbeRule,
 ) -> Result<BTreeMap<ConnectorName, Server>, RegistryError> {
     let mut servers = BTreeMap::new();
+    let mut systems = BTreeMap::new();
     for server in files {
         let place = || format!("server `{}`", server.name);
         require(server.name.as_str(), "name", place)?;
         require(&server.system, "system", place)?;
+        // A tool name is under a system when it is `{system}__<tool>`. If a name is under two
+        // systems, s1 and a longer s2, then s2 and `s1__` are both prefixes of it, so s2 is
+        // `s1_` (it ends in `_`) or begins with `s1__` (it contains `__`). Refusing both leaves
+        // every name under one system at most.
+        if server.system.contains("__") || server.system.ends_with('_') {
+            return Err(RegistryError::SystemOverlaps {
+                server: server.name,
+                system: server.system,
+            });
+        }
         require(&server.owner, "owner", place)?;
         require(&server.identity, "identity", place)?;
         require(&server.credential.reference, "credential.reference", place)?;
@@ -725,8 +795,8 @@ fn servers(
         {
             return Err(RegistryError::ReachCheckMissing(server.name));
         }
-        // The reach check calls one of the entry's own tools. It need not be approved, so that
-        // withdrawing it stays possible, but its name must be under the server's system.
+        // The reach check calls one of the entry's own tools: its name must be under the
+        // server's system. Whether it is approved is checked against the tools, in `build`.
         if let Some(check) = &server.reach_check
             && !under_system(&check.tool, &server.system)
         {
@@ -779,8 +849,18 @@ fn servers(
                 arguments: check.arguments,
             }),
         };
+        let system = checked.system.clone();
         if servers.insert(server.name.clone(), checked).is_some() {
             return Err(RegistryError::DuplicateServer(server.name));
+        }
+        // Every tool is named `{system}__<tool>` after its server's system, and so is a reach
+        // check's tool: a system shared by two servers would let one's names be the other's.
+        if let Some(first) = systems.insert(system.clone(), server.name.clone()) {
+            return Err(RegistryError::DuplicateSystem {
+                system,
+                first,
+                second: server.name,
+            });
         }
     }
     Ok(servers)

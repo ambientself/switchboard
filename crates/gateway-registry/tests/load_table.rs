@@ -338,6 +338,96 @@ fn cases() -> Vec<Case> {
             },
             Want::Error(E::DuplicateServer("docs-server".into())),
         ),
+        // Each server's tools, and its reach check's tool, are named after a system no other
+        // server has.
+        case(
+            "a second server with another server's system",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"wiki-mirror\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Error(E::DuplicateSystem {
+                system: "wiki".into(),
+                first: "wiki-server".into(),
+                second: "wiki-mirror".into(),
+            }),
+        ),
+        case(
+            "a second server with a system of its own",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"wiki-mirror\""));
+                copy.insert("system".into(), value("\"wiki-mirror\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Loads,
+        ),
+        // Nor may a system contain `__` or end in `_`, or a tool name could be under two systems:
+        // `docs__wiki__search` under `docs` and `docs__wiki`, `docs___search` under `docs` and
+        // `docs_`.
+        case(
+            "a second server whose system is another's, `__` and more",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"docs-wiki\""));
+                copy.insert("system".into(), value("\"docs__wiki\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Error(E::SystemOverlaps {
+                server: "docs-wiki".into(),
+                system: "docs__wiki".into(),
+            }),
+        ),
+        case(
+            "a system with `__` inside, whatever the other systems",
+            |t| set(t, "servers.1", "system", value("\"wiki__a\"")),
+            Want::Error(E::SystemOverlaps {
+                server: "wiki-server".into(),
+                system: "wiki__a".into(),
+            }),
+        ),
+        case(
+            "a second server whose system is another's and `_`",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"docs-under\""));
+                copy.insert("system".into(), value("\"docs_\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Error(E::SystemOverlaps {
+                server: "docs-under".into(),
+                system: "docs_".into(),
+            }),
+        ),
+        case(
+            "a system ending in `_`, whatever the other systems",
+            |t| set(t, "servers.1", "system", value("\"wiki_\"")),
+            Want::Error(E::SystemOverlaps {
+                server: "wiki-server".into(),
+                system: "wiki_".into(),
+            }),
+        ),
+        case(
+            "a second server whose system has one `_` inside",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"docs-team\""));
+                copy.insert("system".into(), value("\"docs_team\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Loads,
+        ),
+        case(
+            "a second server whose system has `-` inside",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"docs-team-a\""));
+                copy.insert("system".into(), value("\"docs-team-a\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Loads,
+        ),
         case(
             "an ftp address",
             |t| {
@@ -1022,7 +1112,8 @@ fn cases() -> Vec<Case> {
             Want::Loads,
         ),
         // Withdrawal removes a tool's approval (decision 0013, section 8). The reach check's
-        // tool, and an entry's last tool, can be withdrawn without touching the reach check.
+        // tool, with every other tool of its entry, can be withdrawn without touching the
+        // reach check.
         case(
             "withdrawing the reach check's tool, the entry's last, loads",
             |t| {
@@ -1031,8 +1122,71 @@ fn cases() -> Vec<Case> {
             },
             Want::Loads,
         ),
+        // Alone, it cannot: the entry's other tools would be served under a credential whose
+        // reach is never checked again. Here the wiki server's reach check calls its page tool.
+        case(
+            "the reach check's tool approved with the entry's other tools loads",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                )
+            },
+            Want::Loads,
+        ),
+        case(
+            "withdrawing the reach check's tool and keeping another tool of the entry",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                );
+                at(t, "tools").as_array_mut().unwrap().remove(2);
+                set(t, "surfaces.1", "tools", value("[]"));
+            },
+            Want::Error(E::ReachCheckUnapproved {
+                server: "wiki-server".into(),
+                tool: tool("wiki__page"),
+            }),
+        ),
+        case(
+            "withdrawing every tool of the entry, the reach check's with them, loads",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                );
+                at(t, "tools").as_array_mut().unwrap().truncate(1);
+                set(t, "surfaces.0", "tools", value("[\"docs__read\"]"));
+                set(t, "surfaces.1", "tools", value("[]"));
+            },
+            Want::Loads,
+        ),
+        // Another entry's approved tools do not count: the docs server's reach check calls a
+        // tool that was never approved and its one tool is withdrawn, while the wiki server's
+        // tools stay.
+        case(
+            "an unapproved reach check tool on an entry whose tools are all withdrawn loads",
+            |t| {
+                set(
+                    t,
+                    "servers.0.reach_check",
+                    "tool",
+                    value("\"docs__canary\""),
+                );
+                at(t, "tools").as_array_mut().unwrap().remove(0);
+                set(t, "surfaces.0", "tools", value("[\"wiki__search\"]"));
+            },
+            Want::Loads,
+        ),
         // The reach check calls one of the entry's own tools: its name is under the server's
-        // system, though the tool need not be approved.
+        // system.
         case(
             "a reach check naming another server's tool",
             |t| {
@@ -1077,7 +1231,10 @@ fn cases() -> Vec<Case> {
                     value("\"docs__canary\""),
                 )
             },
-            Want::Loads,
+            Want::Error(E::ReachCheckUnapproved {
+                server: "docs-server".into(),
+                tool: tool("docs__canary"),
+            }),
         ),
         // The destination against the address's scheme (decision 0013, section 3).
         case(
@@ -1772,5 +1929,54 @@ fn a_reach_check_outside_the_system_is_refused_naming_the_server_and_the_tool() 
         message,
         "server `docs-server`'s reach check calls `wiki__search`, which is not one of its own \
          tools: name it `docs__<tool>`, after the server's system"
+    );
+}
+
+/// The refusal of an entry whose reach check's tool is withdrawn while another of its tools is
+/// approved names the server and the tool, and says how to withdraw them.
+#[test]
+fn a_reach_check_tool_withdrawn_alone_is_refused_naming_the_server_and_the_tool() {
+    let mut table = base();
+    set(
+        &mut table,
+        "servers.1",
+        "reach_check",
+        value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+    );
+    at(&mut table, "tools").as_array_mut().unwrap().remove(2);
+    set(&mut table, "surfaces.1", "tools", value("[]"));
+    let message = load(&table).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        "server `wiki-server`'s reach check calls `wiki__page`, which is not approved, and other \
+         tools of the server are: remove the server's approvals together, or name another tool \
+         in its reach check"
+    );
+}
+
+/// The refusal of two servers with one system names the system and both servers.
+#[test]
+fn two_servers_with_one_system_are_refused_naming_the_system_and_both_servers() {
+    let mut table = base();
+    set(&mut table, "servers.1", "system", value("\"docs\""));
+    let message = load(&table).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        "servers `docs-server` and `wiki-server` both have the system `docs`; each server needs a \
+         system of its own"
+    );
+}
+
+/// The refusal of a system that could share a tool name with another names the server and the
+/// system, and says why.
+#[test]
+fn a_system_with_a_double_underscore_is_refused_naming_the_server_and_the_system() {
+    let mut table = base();
+    set(&mut table, "servers.1", "system", value("\"docs__wiki\""));
+    let message = load(&table).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        "server `wiki-server` has the system `docs__wiki`, which contains `__` or ends in `_`; a \
+         tool name must be under one system only, so a system may do neither"
     );
 }

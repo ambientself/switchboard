@@ -251,10 +251,71 @@ fn source(server: &Server, options: FetchOptions) -> KeySource {
     KeySource::new(&issuer(&server.origin()), &server.url(KEYS_PATH), options).unwrap()
 }
 
-/// A port nothing listens on: bound, read, and released.
-async fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+/// A loopback port that refuses connections, held for as long as this lives. Keep it for as long
+/// as the test connects to the port: once it is dropped, nothing holds the port for this test,
+/// and another test in the same binary may listen on it.
+#[must_use = "the port is held only while this lives"]
+struct ClosedPort {
+    port: u16,
+    _held: socket2::Socket,
+    _peer: std::net::TcpStream,
+}
+
+/// A port nothing listens on. A port that was only read and released could be taken meanwhile
+/// by another test's server, which would then answer this test's requests (#179). So a socket
+/// holds it: bound to it without SO_REUSEADDR, and connected to a peer of its own. A connection
+/// to a port with no listener is refused, on Linux and macOS alike; a socket bound and never
+/// listening would do on Linux, but macOS drops a connection to one. While it lives, Linux lets
+/// no other socket bind the port. macOS still lets one that sets SO_REUSEADDR bind it by
+/// number, but it hands out the ports for port 0, which the tests' servers bind, in order, and
+/// skips this one.
+fn closed_port() -> ClosedPort {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+    let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    held.bind(&any.into()).unwrap();
+    held.connect(&peer.local_addr().unwrap().into()).unwrap();
+    let (accepted, _) = peer.accept().unwrap();
+    let port = held
+        .local_addr()
+        .unwrap()
+        .as_socket()
+        .expect("an IPv4 address")
+        .port();
+    ClosedPort {
+        port,
+        _held: held,
+        _peer: accepted,
+    }
+}
+
+/// #179: a closed port refuses connections, and stays reserved while its guard lives: no socket
+/// that does not set SO_REUSEADDR can bind it, and on Linux, where CI runs, not even one that
+/// does, as tokio's listener does for the tests' servers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_port_refuses_connections_and_stays_reserved_while_held() {
+    let closed = closed_port();
+    let address: SocketAddr = ([127, 0, 0, 1], closed.port).into();
+    let error = tokio::net::TcpStream::connect(address).await.unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{error}"
+    );
+    let plain = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    assert!(
+        plain.bind(&address.into()).is_err(),
+        "another socket bound the held port {}",
+        closed.port
+    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            TcpListener::bind(address).await.is_err(),
+            "a listener bound the held port {}",
+            closed.port
+        );
+    }
 }
 
 /// A directory of its own for one test's files, removed when the test ends.
@@ -956,7 +1017,8 @@ async fn a_body_that_breaks_off_is_an_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_that_is_not_there_is_unreachable() {
-    let origin = format!("http://127.0.0.1:{}", closed_port().await);
+    let closed = closed_port();
+    let origin = format!("http://127.0.0.1:{}", closed.port);
     let source = KeySource::new(
         &issuer(&origin),
         &format!("{origin}{KEYS_PATH}"),
