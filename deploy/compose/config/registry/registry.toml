@@ -9,7 +9,7 @@
 # Every value here is a dummy.
 
 # Recorded with every decision made from this file. Change it with every edit.
-revision = "demo-7"
+revision = "demo-10"
 
 # --- Servers -------------------------------------------------------------------------------
 # A proxied MCP server, registered by its owner. `system` is the first part of every exposed
@@ -183,7 +183,7 @@ type = "string"
 
 # --- Surfaces ------------------------------------------------------------------------------
 # Served at /mcp/{name}. Who may use it is an allowlist of teams and groups. Each team has its
-# own surface, serving only its own entry's tools.
+# own surface, serving only its own entry's tools. The registry has one too, for the reach check.
 
 [[surfaces]]
 name = "docs-team-a"
@@ -196,6 +196,16 @@ name = "docs-team-b"
 tools = ["docs-team-b__list_documents", "docs-team-b__read_document"]
 teams = ["team-b"]
 principals = "any_in_teams_and_groups"
+
+# The reach check's surface (decision 0011, section 4). The gateway's drift pass sends each
+# entry's reach_check through it, as a call by the registry's own workload identity, so the check
+# is decided and audited like any call. Only that one principal may use it: team `registry`, and
+# of that team only this issuer and subject. It serves each entry's canary tool and nothing else.
+[[surfaces]]
+name = "registry-reach"
+tools = ["docs-team-a__list_documents", "docs-team-b__list_documents"]
+teams = ["registry"]
+principals = { only = [{ issuer = "https://dev-issuer.switchboard.test", subject = "workload:registry:reach-check" }] }
 
 # --- Profiles and how they are selected ----------------------------------------------------
 # A rule matches the issuer exactly, and either every workload it vouches for
@@ -213,8 +223,14 @@ principal = "workload"
 profile = "workload-read"
 
 # --- Resource limits -----------------------------------------------------------------------
-# Exact matches on system, kind and identifier. Each team reads its own project only.
+# Exact matches on system, kind and identifier. Each team reads its own project only. The
+# registry's team holds each entry's reach and each canary, both projects, so the reach check's
+# canary is allowed and goes to the server, which must refuse it (decision 0011, rule 5).
 
 [limits.teams]
 team-a = [{ system = "docs", kind = "project", identifier = "atlas" }]
 team-b = [{ system = "docs", kind = "project", identifier = "borealis" }]
+registry = [
+  { system = "docs", kind = "project", identifier = "atlas" },
+  { system = "docs", kind = "project", identifier = "borealis" },
+]

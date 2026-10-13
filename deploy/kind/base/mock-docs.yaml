@@ -8,10 +8,11 @@
 #
 # slow-doc keeps its default delay, 10 s, longer than the gateway's 5 s call deadline: demo.sh's
 # hanging-server and overload steps read it. The admin endpoint, which changes what the server
-# serves, is for demo.sh's drift step alone. It listens on the pod's loopback, with no
-# containerPort, Service or network policy naming it, so no other pod can reach it; demo.sh
-# reaches it with `kubectl exec`. With no admin credential it answers mock-docs' callers, and the
-# binary serves it nowhere but on loopback. crates/demo-checks holds the manifests to that.
+# serves and the projects each caller may name, is for demo.sh's drift and reach steps alone.
+# It listens on the pod's loopback, with no containerPort, Service or network policy naming it,
+# so no other pod can reach it; demo.sh reaches it with `kubectl exec`. With no admin credential
+# it answers mock-docs' callers, and the binary serves it nowhere but on loopback.
+# crates/demo-checks holds the manifests to that.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

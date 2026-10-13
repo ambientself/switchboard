@@ -49,6 +49,8 @@ enum Fake {
     Withdrawn,
     /// Team A's list tool has been withdrawn.
     WithdrawnList,
+    /// Both of team A's tools have been withdrawn, as a reach mismatch withdraws them.
+    WithdrawnAll,
     /// Forwards a call with an argument the tool's approval does not declare, and the server
     /// answers it.
     ForwardsUndeclared,
@@ -227,6 +229,7 @@ fn answer(
         "ping" => (200, Some(result(json!({})))),
         "tools/list" if fake == Fake::Withdrawn => (200, Some(tools(&[LIST_TOOL]))),
         "tools/list" if fake == Fake::WithdrawnList => (200, Some(tools(&[READ_TOOL]))),
+        "tools/list" if fake == Fake::WithdrawnAll => (200, Some(tools(&[]))),
         "tools/list" => (200, Some(tools(&[READ_TOOL, LIST_TOOL]))),
         "tools/call" => {
             let name = body["params"]["name"].as_str().unwrap_or_default();
@@ -237,6 +240,7 @@ fn answer(
             }
             if (fake == Fake::Withdrawn && name == READ_TOOL)
                 || (fake == Fake::WithdrawnList && name == LIST_TOOL)
+                || fake == Fake::WithdrawnAll
             {
                 return (
                     200,
@@ -663,7 +667,26 @@ fn a_withdrawn_list_tool_leaves_the_list_and_is_refused() {
     assert_failed(&run, "tools/list after withdrawal: names");
     let run =
         Workload::new("withdrawn-what", serve(Fake::Gateway)).run_with(&["withdrawn", "search"]);
-    assert_failed(&run, "setup: withdrawn takes read or list");
+    assert_failed(&run, "setup: withdrawn takes read, list or all");
+}
+
+/// After a reach mismatch both of the team's tools are withdrawn: tools/list lists nothing, and
+/// a call to the list tool is refused as not available.
+#[test]
+fn both_withdrawn_tools_leave_the_list_and_are_refused() {
+    assert_passed(
+        &Workload::new("withdrawn-all", serve(Fake::WithdrawnAll)).run_with(&["withdrawn", "all"]),
+    );
+    for (case, fake) in [
+        ("all-not-withdrawn", Fake::Gateway),
+        ("all-but-read", Fake::WithdrawnList),
+    ] {
+        let run = Workload::new(case, serve(fake)).run_with(&["withdrawn", "all"]);
+        assert_failed(&run, "tools/list after withdrawal: names");
+    }
+    let run = Workload::new("all-but-list", serve(Fake::Withdrawn)).run_with(&["withdrawn", "all"]);
+    assert_failed(&run, "tools/list after withdrawal: names");
+    assert_failed(&run, "call to the withdrawn tool: error code");
 }
 
 #[test]

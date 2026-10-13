@@ -44,7 +44,7 @@ fn the_demo_registry_loads_from_its_file() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("demo/registry.toml");
     let registry = Registry::load(&path).unwrap();
     let snapshot = registry.snapshot();
-    assert_eq!(snapshot.revision().as_str(), "demo-7");
+    assert_eq!(snapshot.revision().as_str(), "demo-10");
     assert_eq!(registry.servers().len(), 2);
 
     for (entry, team, own, other) in ENTRIES {
@@ -117,11 +117,40 @@ fn the_demo_registry_loads_from_its_file() {
         limits.teams[&"team-b".into()],
         [project("borealis")].into_iter().collect()
     );
+
+    // The reach check's surface: each entry's canary tool, its reach_check's, for team
+    // `registry` and, of it, only the registry's own ServiceAccount. Its limit holds both
+    // projects, each entry's reach and the other's canary.
+    let reach = snapshot.surface(&"registry-reach".into()).unwrap();
+    let canaries: Vec<ToolName> = ENTRIES
+        .iter()
+        .map(|(entry, ..)| {
+            let check = registry.servers()[&(*entry).into()]
+                .reach_check
+                .clone()
+                .unwrap();
+            assert_eq!(check.tool, tool(&format!("{entry}__list_documents")));
+            check.tool
+        })
+        .collect();
+    assert_eq!(reach.tools, canaries.into_iter().collect());
+    assert_eq!(reach.teams, ["registry".into()].into_iter().collect());
+    assert_eq!(
+        serde_json::to_value(&reach.principals).unwrap(),
+        json!({"only": [{"issuer": KIND_ISSUER, "subject": "system:serviceaccount:switchboard:registry"}]})
+    );
+    assert_eq!(
+        limits.teams[&"registry".into()],
+        [project("atlas"), project("borealis")]
+            .into_iter()
+            .collect()
+    );
 }
 
-/// The demo file with the testkit's workload issuer in place of the cluster's.
+/// The demo file with the testkit's workload issuer in place of the cluster's: in its profile
+/// rule, and in the one principal the reach check's surface admits.
 fn registry() -> Registry {
-    assert_eq!(DEMO.matches(KIND_ISSUER).count(), 1);
+    assert_eq!(DEMO.matches(KIND_ISSUER).count(), 2);
     Registry::from_toml_str(&DEMO.replace(KIND_ISSUER, WORKLOAD_ISSUER)).unwrap()
 }
 

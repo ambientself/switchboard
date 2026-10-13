@@ -4,3 +4,7 @@
 [subjects]
 "system:serviceaccount:team-a:mock-workload" = "team-a"
 "system:serviceaccount:team-b:mock-workload" = "team-b"
+# The registry's own workload identity, ServiceAccount registry, which the gateway's reach
+# check calls as (decision 0011, section 4). Its team's one surface is registry-reach, which
+# admits this subject alone.
+"system:serviceaccount:switchboard:registry" = "registry"
