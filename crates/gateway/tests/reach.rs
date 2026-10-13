@@ -966,3 +966,56 @@ async fn start_refuses_entries_with_a_reach_check_and_no_reach_settings() {
     }
     assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
 }
+
+/// A server that answers every `tools/call` with a successful result whose structured content
+/// is numbers written as compactly as JSON allows, `1e15`, in an HTTP body `bytes` long, and
+/// anything else with `404`. The gateway writes each number out again in full,
+/// `1000000000000000.0`, so its answer is several times longer than the server's.
+async fn answering_with_numbers(bytes: usize) -> String {
+    use http::header::CONTENT_TYPE;
+    const JSON: &str = "application/json";
+    let answer = move |body: axum::body::Bytes| async move {
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        if request["method"] != json!("tools/call") {
+            return (
+                http::StatusCode::NOT_FOUND,
+                [(CONTENT_TYPE, JSON)],
+                String::new(),
+            );
+        }
+        let envelope = |numbers: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"content":[{{"type":"text","text":"ok"}}],"structuredContent":{{"values":[{numbers}]}},"isError":false}}}}"#,
+                request["id"]
+            )
+        };
+        let room = bytes - envelope("1e15").len();
+        let numbers = format!("1e15{}", ",1e15".repeat(room / 5));
+        let answer = envelope(&numbers);
+        assert!(answer.len() <= bytes && answer.len() > bytes - 5);
+        (http::StatusCode::OK, [(CONTENT_TYPE, JSON)], answer)
+    };
+    let router = axum::Router::new().route("/mcp", axum::routing::post(answer));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    url
+}
+
+/// A widened server's answer to the canary near the largest answer a server may be allowed,
+/// made of numbers the gateway writes out again several times longer (#175), is read and judged
+/// a mismatch: the reach check reads what the gateway's writing of that answer can come to.
+#[tokio::test]
+async fn a_widened_answer_of_compact_numbers_at_the_largest_server_cap_is_a_mismatch() {
+    let (captured, _logging) = Captured::start();
+    let url = answering_with_numbers(MAX_SERVER_RESULT_BYTES - 64).await;
+    let replica = Replica::capped("reach-numbers", &url, MAX_SERVER_RESULT_BYTES).await;
+
+    replica.drift.reach_pass().await;
+
+    let failed = captured.events("reach_check_failed");
+    assert!(failed.is_empty(), "{failed:?}");
+    let mismatch = captured.events("reach_mismatch");
+    assert_eq!(mismatch.len(), 2, "{mismatch:?}");
+    assert_eq!(replica.withdrawn().len(), 4, "{:?}", replica.withdrawn());
+}

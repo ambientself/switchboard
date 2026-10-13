@@ -52,17 +52,43 @@ use crate::deployment::MAX_SERVER_RESULT_BYTES;
 /// and after the deadline that holds the call to the server.
 pub const REACH_ALLOWANCE: Duration = Duration::from_secs(5);
 
-/// The room the reach check reads past the largest answer a server may be allowed. The
-/// gateway's answer to the canary is the server's result, which the connector holds to the
-/// server's `max_result_bytes`, put in the gateway's own JSON-RPC envelope with `_meta` naming
-/// its audit row: a few hundred bytes more. 64 KiB covers that many times over.
+/// The room the reach check reads past what the server's result can become. The gateway's
+/// answer to the canary is the server's result put in the gateway's own JSON-RPC envelope with
+/// `_meta` naming its audit row: a few hundred bytes more. 64 KiB covers that many times over.
 pub const REACH_ANSWER_HEADROOM: usize = 64 * 1024;
 
-/// The largest answer the reach check reads: the largest `max_result_bytes` a server may have
-/// ([`MAX_SERVER_RESULT_BYTES`]) plus [`REACH_ANSWER_HEADROOM`]. So a widened canary answered
-/// near its server's cap is read and judged a mismatch, not failed as too large. A refusal is a
-/// few hundred bytes; a larger answer than this is a failed check, never a held one.
-pub const MAX_REACH_ANSWER_BYTES: usize = MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;
+/// How many times longer the gateway's writing of a server's result can be than the bytes the
+/// server sent: 8 (#175).
+///
+/// The connector holds the server's answer to its `max_result_bytes`, then parses it, and the
+/// gateway writes the result's `content` and `structuredContent` out again with `serde_json`,
+/// which this workspace builds without `arbitrary_precision`. Those are two separate parts of
+/// the answer, and the rest of it is dropped, so it is enough that no part of the JSON grows by
+/// more than 8 times:
+///
+/// - A number inside `u64` or `i64` with neither a fraction nor an exponent, other than `-0`,
+///   is kept as an integer and written as sent: JSON allows no leading zero or plus sign.
+/// - Any other number is parsed as an `f64` and written in its shortest form, at most 24
+///   bytes: a sign, 17 digits, a point, and either a signed exponent of up to three digits (`-2.2250738585072014e-308`) or up to four zeros after `0.`
+///   (`-0.000012345678901234567`). Every such number is at least 3 bytes as sent (`1e9`,
+///   `0.5`, an integer past `u64`), but `-0`, written `-0.0`, so it grows at most 8 times:
+///   `1e9` becomes `1000000000.0`.
+/// - A string is written with only `"`, `\` and control characters escaped, each of which the
+///   server had to escape too, in as many bytes or more; any other escape it sent is written as
+///   the character itself. So a string never grows.
+/// - Whitespace is dropped, a repeated key is kept once, and the rest of the structure is
+///   written as sent.
+pub const REACH_ANSWER_EXPANSION: usize = 8;
+
+/// The largest answer the reach check reads: what the largest `max_result_bytes` a server may
+/// have ([`MAX_SERVER_RESULT_BYTES`]) can become when the gateway writes it out again
+/// ([`REACH_ANSWER_EXPANSION`]), plus [`REACH_ANSWER_HEADROOM`]. So a widened canary answered
+/// near its server's cap is read and judged a mismatch, not failed as too large, whatever
+/// numbers it holds. The reader holds only this one local answer, so 8 MiB is acceptable. A
+/// refusal is a few hundred bytes; a larger answer than this is a failed check, never a held
+/// one.
+pub const MAX_REACH_ANSWER_BYTES: usize =
+    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;
 
 /// The MCP revision the reach check speaks: the one every caller of the gateway may.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -379,6 +405,45 @@ mod tests {
             settings("http://127.0.0.1:8080/mcp/registry-reach", "localhost"),
             Err(ReachSettingsError::HostNotAllowed("localhost".to_owned()))
         );
+    }
+
+    /// The argument of [`REACH_ANSWER_EXPANSION`], number by number: written again, a number
+    /// is at most 24 bytes and at most 8 times as long as sent, and a string never grows.
+    #[test]
+    fn a_number_written_again_is_at_most_24_bytes_and_8_times_as_long() {
+        let written = |sent: &str| serde_json::from_str::<Value>(sent).unwrap().to_string();
+        assert_eq!(written("1e9"), "1000000000.0");
+        assert_eq!(written("1e15"), "1000000000000000.0");
+        assert_eq!(
+            written("-2.2250738585072014e-308"),
+            "-2.2250738585072014e-308"
+        );
+        let small = written("-1.2345678901234567e-5");
+        assert!(small.starts_with("-0.00001234567890123456"), "{small}");
+        assert_eq!(small.len(), 24, "{small}");
+        assert_eq!(written("18446744073709551615"), "18446744073709551615");
+        assert_eq!(written("18446744073709551616"), "1.8446744073709552e+19");
+        assert_eq!(written("-0"), "-0.0");
+        let mut longest = 0;
+        for exponent in -330..330 {
+            for mantissa in ["1", "9", "-1", "1.2345678901234567", "-9.8765432109876543"] {
+                let sent = format!("{mantissa}e{exponent}");
+                let Ok(value) = serde_json::from_str::<Value>(&sent) else {
+                    continue;
+                };
+                let again = value.to_string();
+                assert!(again.len() <= 24, "{sent} is written as {again}");
+                assert!(
+                    again.len() <= REACH_ANSWER_EXPANSION * sent.len(),
+                    "{sent} is written as {again}"
+                );
+                longest = longest.max(again.len());
+            }
+        }
+        assert_eq!(longest, 24);
+        for sent in [r#""a\/bé\u0001\b""#, r#""\"\\\n""#] {
+            assert!(written(sent).len() <= sent.len(), "{sent}");
+        }
     }
 
     #[test]
