@@ -4229,8 +4229,34 @@ mutate("demo-kind-api-audience-issuer-unread", "the pod-wide guards take only a 
        "    audience.is_none()\n")
 mutate("demo-kind-default-token-yes-unread", "the guards take only `true` for the default API token turned on, and miss a YAML 1.1 `yes` or `on`",
        MANIFESTS_TEST,
-       """    !matches!(\n        pod["automountServiceAccountToken"],\n        Yaml::BadValue | Yaml::Null | Yaml::Boolean(false)\n    )\n""",
-       """    pod["automountServiceAccountToken"] == Yaml::Boolean(true)\n""")
+       "    !matches!(set, None | Some(Yaml::Null | Yaml::Boolean(false)))\n",
+       "    set == Some(&Yaml::Boolean(true))\n")
+mutate("demo-kind-default-token-unread-value-absent", "a value the parser cannot read, such as `!!bool yes`, is taken for the default API token left unset",
+       MANIFESTS_TEST,
+       """    let set = mapping(pod, "a pod spec")\n        .and_then(|pod| pod.get(&Yaml::String("automountServiceAccountToken".to_owned())));\n""",
+       """    let set = Some(&pod["automountServiceAccountToken"]).filter(|value| !value.is_badvalue());\n""")
+mutate("demo-kind-yaml-binary-tag-read", "the manifest reader takes a `!!binary` key or audience for its base64 text, which hides a token source or the issuer's audience",
+       MANIFESTS_TEST,
+       'const CORE_TAGS: [&str; 7] = ["str", "map", "seq", "bool", "int", "float", "null"];\n',
+       'const CORE_TAGS: [&str; 8] = ["str", "map", "seq", "bool", "int", "float", "null", "binary"];\n')
+mutate("demo-kind-yaml-other-tags-read", "the manifest reader takes a local or verbatim tag's scalar for a string",
+       MANIFESTS_TEST,
+       "                yaml_tag(tag).is_some_and(|name| CORE_TAGS.contains(&name)),\n",
+       "                yaml_tag(tag).is_none_or(|name| CORE_TAGS.contains(&name)),\n")
+mutate("demo-kind-yaml-quoted-merge-key-read", "the manifest reader merges a quoted `<<`, which the API server reads as an ordinary key",
+       MANIFESTS_TEST,
+       "                    *style == TScalarStyle::Plain\n",
+       "                    (*style == TScalarStyle::Plain || *style != TScalarStyle::Plain)\n")
+mutate("demo-kind-yaml-str-merge-key-read", "the manifest reader merges a `!!str <<`, which the API server reads as an ordinary key",
+       MANIFESTS_TEST,
+       """                            .is_none_or(|tag| yaml_tag(tag) == Some("merge")),\n""",
+       """                            .is_none_or(|tag| yaml_tag(tag).is_some()),\n""")
+mutate("demo-kind-built-base-default-token-on", "a kustomize patch turns on the default API token in a pod of the built base, though no file it reads does",
+       "deploy/kind/base/kustomization.yaml",
+       "secretGenerator:\n",
+       "patches:\n  - target: {kind: Deployment, name: postgres}\n    patch: |-\n"
+       "      - op: replace\n        path: /spec/template/spec/automountServiceAccountToken\n        value: true\n"
+       "secretGenerator:\n")
 mutate("demo-kind-anonymous-role-unchecked", "the kind run does not check the issuer-discovery ClusterRole's rules", DRIVER,
        """    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \\\n""",
        """    check '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \\\n""")

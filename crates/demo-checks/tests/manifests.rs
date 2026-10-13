@@ -12,6 +12,8 @@ use common::read;
 use gateway::deployment::DeploymentFile;
 use gateway::{READINESS_REMOVAL, SHUTDOWN_GRACE};
 use sha2::{Digest, Sha256};
+use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
+use yaml_rust2::scanner::{Marker, TScalarStyle};
 use yaml_rust2::{Yaml, YamlLoader, yaml::Hash};
 
 /// The block of a top-level Compose service: its lines up to the next service.
@@ -417,11 +419,16 @@ fn block_after(text: &str, header: &str) -> String {
 // the gateway container and the teams' workloads (decision 0013, section 10) read the manifests
 // with a YAML parser and walk the parsed pods, so aliases, anchors, tags, quoting, escapes,
 // blank lines and comments are the parser's to read. Where a field has a shape they do not
-// expect, they panic rather than read it as absent.
+// expect, they panic rather than read it as absent, and so they do on a tag or a merge key the
+// parser would read otherwise than the API server does ([`ReadAsTheApiServer`]).
 
 /// The documents of a manifest, parsed, with each merge key (`<<`) applied as the API server's
-/// YAML reader applies it. The parser resolves aliases but leaves merge keys to this.
+/// YAML reader applies it. The parser resolves aliases but leaves merge keys to this. It panics
+/// on a manifest [`ReadAsTheApiServer`] refuses.
 fn manifest(text: &str) -> Vec<Yaml> {
+    Parser::new_from_str(text)
+        .load(&mut ReadAsTheApiServer, true)
+        .unwrap_or_else(|error| panic!("a manifest the parser cannot read: {error}"));
     YamlLoader::load_from_str(text)
         .unwrap_or_else(|error| panic!("a manifest the parser cannot read: {error}"))
         .into_iter()
@@ -460,6 +467,58 @@ fn merged(node: Yaml) -> Yaml {
             Yaml::Hash(own)
         }
         scalar => scalar,
+    }
+}
+
+/// Refuses, from the parser's events, the YAML its loader keeps less of than the API server's
+/// reader reads, so that [`manifest`] fails rather than read a field otherwise:
+///
+/// - A tag other than the core schema's `str`, `map`, `seq`, `bool`, `int`, `float` and `null`,
+///   however it is spelled. The loader keeps a `!!binary` scalar's base64 text, where the API
+///   server decodes it, so a `!!binary` key could hide a `serviceAccountToken` source and a
+///   `!!binary` audience the API server's own; and it reads a scalar with a local or verbatim
+///   tag as a string.
+/// - A `<<` that is quoted or tagged, other than `!!merge <<`. The loader keeps no scalar's style,
+///   so it reads `'<<'`, `"<<"` and `!!str <<` as the plain merge key, where the API server reads
+///   an ordinary key (and kustomize drops it).
+struct ReadAsTheApiServer;
+
+/// The core schema's tags, which the loader reads as the API server does.
+const CORE_TAGS: [&str; 7] = ["str", "map", "seq", "bool", "int", "float", "null"];
+
+/// The name of a tag in the YAML tag namespace (`!!name`), or None for any other tag.
+fn yaml_tag(tag: &Tag) -> Option<&str> {
+    (tag.handle == "tag:yaml.org,2002:").then_some(tag.suffix.as_str())
+}
+
+impl MarkedEventReceiver for ReadAsTheApiServer {
+    fn on_event(&mut self, event: Event, mark: Marker) {
+        let at = format!("line {}, column {}", mark.line(), mark.col());
+        let tag = match &event {
+            Event::Scalar(value, style, _, tag) if value == "<<" => {
+                assert!(
+                    *style == TScalarStyle::Plain
+                        && tag
+                            .as_ref()
+                            .is_none_or(|tag| yaml_tag(tag) == Some("merge")),
+                    "a `<<` that is quoted or tagged, at {at}: the API server reads it as an \
+                     ordinary key, not a merge key"
+                );
+                return;
+            }
+            Event::Scalar(_, _, _, tag)
+            | Event::SequenceStart(_, tag)
+            | Event::MappingStart(_, tag) => tag,
+            _ => return,
+        };
+        if let Some(tag) = tag {
+            assert!(
+                yaml_tag(tag).is_some_and(|name| CORE_TAGS.contains(&name)),
+                "a tag the parser does not read as the API server does, at {at}: {}{}",
+                tag.handle,
+                tag.suffix
+            );
+        }
     }
 }
 
@@ -659,13 +718,14 @@ fn api_token_volumes(pod: &Yaml) -> Vec<String> {
 }
 
 /// Whether a pod spec turns on the default API token for its containers: it sets
-/// `automountServiceAccountToken`, and not to false. A YAML 1.1 `yes` or `on`, which the API
-/// server reads as true, turns it on too.
+/// `automountServiceAccountToken`, and not to null or false. A YAML 1.1 `yes` or `on`, which the
+/// API server reads as true, turns it on too, and so does a value the parser cannot read, which it
+/// gives as no value: `!!bool yes` or `!!bool on`, which the API server reads as true, and also
+/// `!!bool no`, which fails this guard though the API server reads it as false.
 fn turns_on_the_default_token(pod: &Yaml) -> bool {
-    !matches!(
-        pod["automountServiceAccountToken"],
-        Yaml::BadValue | Yaml::Null | Yaml::Boolean(false)
-    )
+    let set = mapping(pod, "a pod spec")
+        .and_then(|pod| pod.get(&Yaml::String("automountServiceAccountToken".to_owned())));
+    !matches!(set, None | Some(Yaml::Null | Yaml::Boolean(false)))
 }
 
 /// The ServiceAccount `name` in `namespace` turns off the default API token.
@@ -1706,8 +1766,8 @@ fn the_workload_guard_sees_an_api_token_source_however_it_is_written() {
 }
 
 /// #182: the guards see the default API token turned on in the gateway's pod or a workload's,
-/// however it is written: `true`, or a YAML 1.1 `yes` or `on`, which the API server reads as
-/// true.
+/// however it is written: `true`, or a YAML 1.1 `yes` or `on`, tagged `!!bool` or not, which the
+/// API server reads as true.
 #[test]
 fn the_guards_see_the_default_api_token_turned_on() {
     let gateway = read("deploy/kind/base/gateway.yaml");
@@ -1728,7 +1788,16 @@ fn the_guards_see_the_default_api_token_turned_on() {
             ),
         )
     };
-    for value in ["true", "True", "!!bool true", "yes", "on"] {
+    for value in [
+        "true",
+        "True",
+        "!!bool true",
+        "yes",
+        "on",
+        "!!bool yes",
+        "!!bool on",
+        "!!bool y",
+    ] {
         let (gateway_changed, workloads_changed) = turned(value);
         assert_ne!(gateway_changed, gateway, "{value}");
         let pod = only_pod(&gateway_changed);
@@ -1753,6 +1822,219 @@ fn the_guards_see_the_default_api_token_turned_on() {
         let documents = manifest(&workloads_changed);
         let (document, pod) = pod_specs(&documents)[0];
         no_api_token_in_workload(document, pod);
+    }
+}
+
+/// #182: the reader refuses what its parser would read otherwise than the API server, in the
+/// gateway's pod and in a workload: a `!!binary` key that the API server decodes to
+/// `serviceAccountToken`, or a `!!binary` audience it decodes to the issuer, however the tag is
+/// spelled; and a `<<` that is quoted or tagged, which the API server reads as an ordinary key
+/// where the parser would merge it. `!!merge <<` and `? <<` still merge.
+#[test]
+fn the_guards_refuse_a_tag_or_merge_key_the_parser_reads_otherwise() {
+    let gateway = read("deploy/kind/base/gateway.yaml");
+    let workloads = read("deploy/kind/base/workloads.yaml");
+    // The gateway's config volume, which the gateway container mounts, projecting its ConfigMap
+    // and a source; and a source after team-a's wrong-audience token.
+    let config = "        - name: config\n          configMap: {name: gateway-config}\n";
+    let projected = "        - name: config\n          projected:\n            sources:\n              - configMap: {name: gateway-config}\n";
+    let wrong = "                      audience: not-switchboard\n                      expirationSeconds: 600\n                      path: token\n";
+    let with_source = |source: &str| {
+        vec![
+            gateway.replacen(
+                config,
+                &format!("{projected}{}", token_source(source, 14)),
+                1,
+            ),
+            workloads.replacen(wrong, &format!("{wrong}{}", token_source(source, 18)), 1),
+        ]
+    };
+    // Directives go before the first document, which is the gateway's Deployment and team-a's
+    // workload.
+    let tag_directive = "%TAG !y! tag:yaml.org,2002:\n---\n";
+    let with_directive = |changed: Vec<String>| {
+        changed
+            .into_iter()
+            .map(|text| format!("{tag_directive}{text}"))
+            .collect::<Vec<_>>()
+    };
+    let issuer_in_base64 = "aHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWw=";
+    let binary = "a tag the parser does not read as the API server does";
+    let merge = "a `<<` that is quoted or tagged";
+    let mut forms = Vec::new();
+    for (form, source) in [
+        (
+            "a !!binary key",
+            "$I- !!binary c2VydmljZUFjY291bnRUb2tlbg==: {path: token}\n",
+        ),
+        (
+            "a verbatim binary key",
+            "$I- !<tag:yaml.org,2002:binary> c2VydmljZUFjY291bnRUb2tlbg==: {path: token}\n",
+        ),
+        (
+            "a !!binary audience",
+            "$I- serviceAccountToken: {path: token, audience: !!binary $BINARY}\n",
+        ),
+        (
+            "a local tag",
+            "$I- serviceAccountToken: {path: token, audience: !issuer $ISSUER}\n",
+        ),
+    ] {
+        forms.push((
+            form,
+            with_source(&source.replace("$BINARY", issuer_in_base64)),
+            binary,
+        ));
+    }
+    forms.push((
+        "a binary key under a %TAG directive",
+        with_directive(with_source(
+            "$I- !y!binary c2VydmljZUFjY291bnRUb2tlbg==: {path: token}\n",
+        )),
+        binary,
+    ));
+    // team-a's own wrong audience, given as the issuer's in base64.
+    forms.push((
+        "team-a's audience in !!binary",
+        vec![workloads.replacen(
+            "audience: not-switchboard\n",
+            &format!("audience: !!binary {issuer_in_base64}\n"),
+            1,
+        )],
+        binary,
+    ));
+    for (form, source) in [
+        (
+            "a single-quoted <<",
+            "$I- serviceAccountToken: {path: api-token, '<<': {audience: switchboard}}\n",
+        ),
+        (
+            "a double-quoted <<",
+            "$I- serviceAccountToken: {path: api-token, \"<<\": {audience: switchboard}}\n",
+        ),
+        (
+            "a !!str <<",
+            "$I- serviceAccountToken: {path: api-token, !!str <<: {audience: switchboard}}\n",
+        ),
+        (
+            "a single-quoted <<, block style",
+            "$I- serviceAccountToken:\n$I    path: api-token\n$I    '<<': {audience: switchboard}\n",
+        ),
+    ] {
+        forms.push((form, with_source(source), merge));
+    }
+    for (form, changed, refusal) in forms {
+        for changed in changed {
+            assert!(changed != gateway && changed != workloads, "{form}");
+            let message = panic_message(form, || {
+                manifest(&changed);
+            });
+            assert!(message.starts_with(refusal), "{form}: {message}");
+        }
+    }
+
+    // A plain `<<`, tagged `!!merge` or as an explicit key, is a merge key to the API server
+    // too: the source's audience is the gateway's, and the workload passes.
+    for (form, source) in [
+        (
+            "a !!merge <<",
+            "$I- serviceAccountToken: {path: api-token, !!merge <<: {audience: switchboard}}\n",
+        ),
+        (
+            "an explicit <<",
+            "$I- serviceAccountToken:\n$I    path: api-token\n$I    ? <<\n$I    : {audience: switchboard}\n",
+        ),
+    ] {
+        let changed = with_source(source).remove(1);
+        let documents = manifest(&changed);
+        let (document, pod) = pod_specs(&documents)[0];
+        assert_eq!(
+            token_audiences(volume(pod, "wrong-audience-token")),
+            [
+                Some("not-switchboard".to_owned()),
+                Some("switchboard".to_owned())
+            ],
+            "{form}"
+        );
+        no_api_token_in_workload(document, pod);
+    }
+}
+
+/// `kustomize build` of the kustomization `directory`, as demo.sh applies it, or None if neither
+/// kustomize nor kubectl is installed.
+fn kustomize_build(directory: &str) -> Option<String> {
+    for command in [&["kustomize", "build"][..], &["kubectl", "kustomize"]] {
+        let output = match std::process::Command::new(command[0])
+            .args(&command[1..])
+            .arg(directory)
+            .current_dir(common::repo())
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("{command:?} {directory}: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{command:?} {directory}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Some(String::from_utf8(output.stdout).unwrap());
+    }
+    None
+}
+
+/// Decision 0013, section 10, on what demo.sh applies, `kustomize build deploy/kind/base`, as well
+/// as on the files it is built from: in the gateway's pod only the token writer mounts a token
+/// the API server accepts, and the gateway container none; no other pod in the build holds one;
+/// and no pod gets the default API token, which each pod turns off itself or leaves to a
+/// ServiceAccount in the build that does. With neither kustomize nor kubectl installed it says it
+/// was skipped and passes; CI, whose runner has both, fails on that line.
+#[test]
+fn the_token_guards_hold_on_the_built_kind_base() {
+    let Some(built) = kustomize_build("deploy/kind/base") else {
+        eprintln!("skipped: neither kustomize nor kubectl is installed");
+        return;
+    };
+    let documents = manifest(&built);
+    let pods = pod_specs(&documents);
+    let labels: Vec<String> = pods.iter().map(|(document, _)| label(document)).collect();
+    assert_eq!(
+        labels,
+        [
+            "Deployment mock-docs/mock-docs",
+            "Deployment switchboard/gateway",
+            "Deployment switchboard/postgres",
+            "CronJob team-a/mock-workload",
+            "CronJob team-a/stranger-workload",
+            "CronJob team-b/mock-workload",
+            "Job switchboard/migrate",
+        ]
+    );
+    for (document, pod) in pods {
+        let name = label(document);
+        if name == "Deployment switchboard/gateway" {
+            only_the_token_writer_holds_an_api_token(pod);
+            no_api_token_mounted(pod, "gateway", KIND_ISSUER);
+        } else {
+            no_api_token_in_workload(document, pod);
+        }
+        if pod["automountServiceAccountToken"] != Yaml::Boolean(false) {
+            let namespace = string(&document["metadata"]["namespace"], "a namespace");
+            let account = pod["serviceAccountName"].as_str().unwrap_or("default");
+            let accounts: Vec<&Yaml> = documents
+                .iter()
+                .filter(|document| {
+                    label(document) == format!("ServiceAccount {namespace}/{account}")
+                })
+                .collect();
+            assert_eq!(accounts.len(), 1, "{name}: ServiceAccount {account}");
+            assert_eq!(
+                accounts[0]["automountServiceAccountToken"],
+                Yaml::Boolean(false),
+                "{name}: ServiceAccount {namespace}/{account} mounts the default API token"
+            );
+        }
     }
 }
 
