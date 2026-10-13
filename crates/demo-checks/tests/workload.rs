@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Run, black_hole, closed_port, dropped, fake_curl, repo, require, scratch, write};
+use common::{
+    ClosedPort, Run, black_hole, closed_port, dropped, fake_curl, repo, require, scratch, write,
+};
 use gateway_core::IDENTITY_FAILURE;
 use serde_json::{Value, json};
 
@@ -293,6 +295,8 @@ struct Workload {
     dir: PathBuf,
     /// A directory put first on PATH, holding the fake `curl`.
     bin: Option<PathBuf>,
+    /// The closed ports its URLs name, held as long as it lives.
+    held: Vec<ClosedPort>,
 }
 
 impl Workload {
@@ -307,6 +311,7 @@ impl Workload {
             own_project: true,
             dir,
             bin: None,
+            held: Vec::new(),
         }
     }
 
@@ -329,12 +334,13 @@ impl Workload {
     /// connects, as a dropped route does (exit 28, no connection made). Every other request goes
     /// to the real curl.
     fn direct_dropped(mut self) -> Self {
-        let url = dropped();
+        let hole = dropped();
         let bin = self.dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        fake_curl(&bin, &[&url]);
+        fake_curl(&bin, &[&hole.url]);
         self.bin = Some(bin);
-        self.direct = Some(url);
+        self.direct = Some(hole.url.clone());
+        self.held.push(hole);
         self
     }
 
@@ -514,8 +520,9 @@ fn an_identity_refusal_with_another_sentence_fails_the_run() {
 fn a_direct_call_that_is_refused_rather_than_dropped_fails_the_run() {
     // A refused connection (curl exit 7) is what a stopped server or a wrong port looks like.
     // It proves nothing about network policy.
+    let closed = closed_port();
     let run = Workload::new("direct-refused", serve(Fake::Gateway))
-        .direct(closed_port())
+        .direct(closed.url.clone())
         .run("full");
     assert_failed(&run, "direct call to the server refused");
 }
@@ -546,9 +553,43 @@ fn a_direct_call_the_server_answers_fails_the_run() {
     assert_failed(&run, "direct call to the server refused");
 }
 
+/// #168: a closed port refuses connections, to a socket and to curl, and stays reserved while
+/// its guard lives: no socket that does not set SO_REUSEADDR can bind it, and on Linux, where CI
+/// runs, not even one that does, as std's listener does for the tests' fake servers.
+#[test]
+fn a_closed_port_refuses_connections_and_stays_reserved_while_held() {
+    let closed = closed_port();
+    let port: u16 = common::port_of(&closed.url).parse().unwrap();
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let error = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{error}"
+    );
+    let curl = Command::new("curl")
+        .args(["-q", "-sS", "-o", "/dev/null", "-m", "5", &closed.url])
+        .output()
+        .unwrap();
+    assert_eq!(curl.status.code(), Some(7), "{curl:?}");
+
+    let plain = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    assert!(
+        plain.bind(&address.into()).is_err(),
+        "another socket bound the held port {port}"
+    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            TcpListener::bind(address).is_err(),
+            "a listener bound the held port {port}"
+        );
+    }
+}
+
 #[test]
 fn an_unreachable_gateway_fails_every_check_it_makes() {
-    let run = Workload::new("no-gateway", closed_port()).run("full");
+    let gateway = closed_port();
+    let run = Workload::new("no-gateway", gateway.url.clone()).run("full");
     assert_failed(
         &run,
         "initialize: HTTP status (got 'curl exit 7', want '200')",
@@ -604,7 +645,8 @@ fn before_the_policy_the_server_must_answer_401() {
         &refusing,
         "before policy: read own project through the gateway: isError",
     );
-    let unreachable = Workload::new("before-no-gateway", closed_port())
+    let gateway = closed_port();
+    let unreachable = Workload::new("before-no-gateway", gateway.url.clone())
         .direct(serve(Fake::Server401))
         .run("before-policy");
     assert_failed(
@@ -845,7 +887,9 @@ fn the_workloads_sentences_are_the_gateways() {
 
 /// Starts `workload.sh idle` and returns it, with its first line, once it says it is waiting.
 fn start_idle(name: &str, seconds: Option<&str>) -> (std::process::Child, String) {
-    let workload = Workload::new(name, closed_port());
+    // Idle makes no call, so the closed port need not outlive this.
+    let gateway = closed_port();
+    let workload = Workload::new(name, gateway.url.clone());
     let mut command = workload.command("idle");
     if let Some(seconds) = seconds {
         command.env("IDLE_SECONDS", seconds);
@@ -913,7 +957,8 @@ fn idle_ends_and_passes_after_its_seconds() {
 #[test]
 fn idle_waits_at_most_ten_minutes() {
     for seconds in ["0", "601", "ten"] {
-        let mut command = Workload::new("idle-bad", closed_port()).command("idle");
+        let gateway = closed_port();
+        let mut command = Workload::new("idle-bad", gateway.url.clone()).command("idle");
         let run = Run::from(command.env("IDLE_SECONDS", seconds).output().unwrap());
         assert_failed(&run, "setup: IDLE_SECONDS");
         assert!(run.lines("PASS ").is_empty(), "{}", run.transcript());

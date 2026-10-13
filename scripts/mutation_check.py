@@ -3953,6 +3953,16 @@ mutate("demo-workload-direct-any-failure", "any failed direct call passes, not o
        '    check "curl exit $([ "$code" -ne 0 ] && echo 28 || echo "$code"), ${connects:-no} connections"')
 mutate("demo-workload-before-policy-status-unchecked", "before the policy, any answer from the server passes", WORKLOAD,
        """  check "$status" 401 "before policy""", """  check 401 401 "before policy""")
+# #168: closed_port() holds its port for as long as its guard lives.
+# The socket that bound the port is never connected and is dropped once the port is read, as
+# before #168. (Dropping it after it connected would leave it in TIME_WAIT, still holding the
+# port.)
+mutate_all("demo-checks-closed-port-released", "closed_port() lets its port go once it has read it, so another test may take it",
+           ("crates/demo-checks/tests/common/mod.rs",
+            "    held.connect(&peer.local_addr().unwrap().into()).unwrap();\n    let (accepted, _) = peer.accept().unwrap();\n",
+            "    let accepted = TcpStream::connect(peer.local_addr().unwrap()).unwrap();\n"),
+           ("crates/demo-checks/tests/common/mod.rs",
+            "        _held: held,\n", "        _held: Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n"))
 CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
 mutate("demo-driver-otto-dev-allowed", "the driver runs whatever cluster it is given", DRIVER,
        CLUSTER_CHECK, "if false; then")
@@ -4138,6 +4148,14 @@ mutate("demo-operator-checks-kubectl-failure-aborts", "a SubjectAccessReview kub
        """    | k create -f - -o jsonpath='{.status.allowed}' 2>&1)\n""")
 mutate("demo-operator-checks-kubectl-error-swallowed", "a can-i kubectl cannot answer is judged by its last line alone", DRIVER,
        "        yes | no) answer=$last ;;\n", "        *) answer=$last ;;\n")
+# #140: after the policy, each team's pod is refused on the gateway's metrics port and answered
+# on its MCP port.
+mutate("demo-kind-metrics-port-untried", "the kind run never tries the gateway's metrics port from a team's pod", DRIVER,
+       "  metrics_port_probes\n", "")
+mutate("demo-kind-metrics-port-answer-passes", "a team's pod answered on the metrics port passes", DRIVER,
+       "        '000 0 7' | '000 0 28') pass", "        *) pass")
+mutate("demo-kind-metrics-port-mcp-unchecked", "the metrics-port step does not check that the MCP port answers the same pod", DRIVER,
+       """      check "$got" "200 1 0" "$team's pod is answered on the gateway's MCP port, 8080, at the same address"\n""", "")
 # #60: the operator checks read the RBAC rules bound to each team's workload too.
 mutate("demo-operator-rbac-unchecked", "the operator checks ask can-i and reviews alone, which cannot see a rule limited by resourceNames", DRIVER,
        "  done\n  operator_rbac\n}\n", "  done\n}\n")
@@ -4169,11 +4187,59 @@ mutate_all("demo-kind-gateway-keys-token", "the gateway container mounts a proje
             "          configMap: {name: kube-root-ca.crt}\n"
             "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
             "                  audience: https://kubernetes.default.svc.cluster.local\n                  expirationSeconds: 600\n                  path: token\n"))
-mutate("demo-kind-gateway-keys-token-unset-audience", "the gateway's CA volume also projects a token with no audience, which is the API server's",
-       "deploy/kind/base/gateway.yaml",
-       "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}\n",
-       "        - name: cluster-ca\n          projected:\n            sources:\n              - configMap: {name: kube-root-ca.crt}\n"
-       "              - serviceAccountToken:\n                  expirationSeconds: 600\n                  path: token\n")
+# #153: an API token volume of its own, with no audience, so the API server's, mounted into the
+# gateway container. The guard's unset-audience branch catches it, not the cluster-ca check.
+mutate_all("demo-kind-gateway-keys-token-unset-audience", "the gateway container mounts a projected token with no audience, which is the API server's",
+           ("deploy/kind/base/gateway.yaml",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n",
+            "            - {name: cluster-ca, mountPath: /etc/switchboard/cluster-ca, readOnly: true}\n"
+            "            - {name: keys-token, mountPath: /var/run/secrets/switchboard/keys, readOnly: true}\n"),
+           ("deploy/kind/base/gateway.yaml",
+            "          configMap: {name: kube-root-ca.crt}\n",
+            "          configMap: {name: kube-root-ca.crt}\n"
+            "        - name: keys-token\n          projected:\n            sources:\n              - serviceAccountToken:\n"
+            "                  expirationSeconds: 600\n                  path: token\n"))
+# #153: the manifest guards read block-style mounts and flow-style token sources, and the kind
+# run holds the three checks of its anonymous key-fetch step.
+mutate("demo-kind-mounts-flow-style-only", "the manifest guards read only flow-style volume mounts, and miss a block-style one",
+       "crates/demo-checks/tests/manifests.rs",
+       """    items
+        .iter()
+        .map(|mount| item_name(mount).to_owned())
+        .collect()
+}
+""",
+       """    items
+        .iter()
+        .filter_map(|mount| mount.trim_start().strip_prefix("- {name: "))
+        .map(|rest| rest.split(',').next().unwrap().to_owned())
+        .collect()
+}
+""")
+mutate("demo-kind-mounts-end-at-blank-line", "the manifest guards end the gateway container's mounts at a blank line, and miss a mount after it",
+       "crates/demo-checks/tests/manifests.rs",
+       """        if text.is_empty() || text.starts_with('#') {\n            continue;\n        }\n""",
+       """        if text.is_empty() {\n            break;\n        }\n        if text.starts_with('#') {\n            continue;\n        }\n""")
+mutate("demo-kind-mounts-bare-dash-unread", "the manifest guards take a bare `-` for part of the mount before it, and miss the mount it starts",
+       "crates/demo-checks/tests/manifests.rs",
+       """        if indent == at && text.starts_with('-') {\n""",
+       """        if indent == at && text.starts_with("- ") {\n""")
+mutate("demo-kind-container-ends-at-comment", "the manifest guards end a container at a comment at column 0, and miss the mounts after it",
+       "crates/demo-checks/tests/manifests.rs",
+       """        line.starts_with("          ") || line.trim().is_empty() || line.trim().starts_with('#')\n""",
+       """        line.starts_with("          ") || line.trim().is_empty()\n""")
+mutate("demo-kind-token-sources-block-style-only", "the manifest guards read only block-style token sources, and miss a flow-style one for the API server",
+       "crates/demo-checks/tests/manifests.rs",
+       """        if text.starts_with('#') || !text.contains("serviceAccountToken") {\n""",
+       """        if text != "- serviceAccountToken:" {\n""")
+mutate("demo-kind-anonymous-role-unchecked", "the kind run does not check the issuer-discovery ClusterRole's rules", DRIVER,
+       """    check "$(jq -c '[.rules[] | {verbs, nonResourceURLs, resources, apiGroups}]' <<<"$FETCHED")" \\\n""",
+       """    check '[{"verbs":["get"],"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"resources":null,"apiGroups":null}]' \\\n""")
+mutate("demo-kind-anonymous-keys-unchecked", "the kind run does not compare the keys an anonymous caller gets with the cluster's", DRIVER,
+       """    check "$(jq -c '[.keys[].kid] | sort' <<<"$FETCHED")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \\\n""",
+       """    check "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" "$(jq -c '[.keys[].kid] | sort' "$DEMO_DIR/cluster-jwks.json")" \\\n""")
+mutate("demo-kind-anonymous-configmap-unchecked", "the kind run does not check that an anonymous ConfigMap read is refused", DRIVER,
+       """    check "$FETCHED" 403 "an unauthenticated read of a ConfigMap is refused"\n""", "    :\n")
 mutate("demo-workload-direct-connected-counts-as-dropped", "a direct call that connected and got no answer in time counts as dropped", WORKLOAD,
        '    check "curl exit $code, ${connects:-no} connections"', '    check "curl exit $code, 0 connections"')
 mutate("demo-workload-idle-no-trap", "the idle workload has no trap, so SIGTERM kills it and it never passes", WORKLOAD,
@@ -4373,6 +4439,12 @@ mutate("demo-token-writer-truncates-on-failure", "the token writer empties the t
 mutate("demo-token-writer-wrong-audience", "the token writer asks for tokens for another audience than the server's", TOKEN_WRITER,
        "      spec: {audiences: [$audience], expirationSeconds: $seconds}}'\n",
        """      spec: {audiences: ["switchboard"], expirationSeconds: $seconds}}'\n""")
+# #153: each token is renamed into place, and the kind run asks for the gateway's token grant.
+mutate("demo-token-writer-writes-in-place", "the token writer writes each token straight into the file the gateway reads", TOKEN_WRITER,
+       """  if ! printf '%s\\n' "$token" >"$next" || ! mv -f "$next" "$target"; then\n""",
+       """  if ! printf '%s\\n' "$token" >"$target"; then\n""")
+mutate("demo-kind-token-grants-unchecked", "the kind run never asks for the gateway's token grant", DRIVER,
+       "  token_grants\n\n", "\n")
 mutate("demo-kind-gateway-mounts-api-token", "the gateway container mounts the token writer's API token", "deploy/kind/base/gateway.yaml",
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n",
        "            - {name: entry-tokens, mountPath: /var/run/switchboard/tokens, readOnly: true}\n"
@@ -4426,7 +4498,10 @@ mutate("demo-drift-withdrawal-unchecked", "the drift step passes a withdrawal ho
        """      [0-9]*:[0-9]*) check_at_most 0 $((DRIFT_INTERVAL + CALL_DEADLINE)) \\\n""")
 mutate("demo-drift-reapproval-unchecked", "the re-approval step passes without the withdrawals cleared", DRIVER,
        """  check "$(printf '%s\\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\\(.tool): \\(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \\\n""",
-       """  check "docs-team-a__list_documents: approved again;docs-team-b__list_documents: approved again" \\\n""")
+       """  check "$want" \\\n""")
+mutate("demo-drift-read-tools-unchecked", "the drift step passes with the read tools served, though their entries' reach check tool is withdrawn", DRIVER,
+       "  for tool in docs-team-a__list_documents docs-team-a__read_document docs-team-b__list_documents docs-team-b__read_document; do\n",
+       "  for tool in docs-team-a__list_documents docs-team-b__list_documents; do\n")
 mutate("demo-compose-mock-docs-admin-off-loopback", "Compose's mock-docs serves its admin endpoint to every container", COMPOSE,
        "      MOCK_DOCS_ADMIN_LISTEN: 127.0.0.1:9091\n", "      MOCK_DOCS_ADMIN_LISTEN: 0.0.0.0:9091\n")
 mutate("demo-kind-mock-docs-admin-service", "kind's mock-docs Service exposes the admin port", "deploy/kind/base/mock-docs.yaml",
@@ -4647,14 +4722,14 @@ mutate("gw-drift-poll-failure-withdraws", "a failed poll is read as an empty too
        "        let tools = match listed {\n",
        "        let listed = Ok::<_, ListError>(listed.unwrap_or_default());\n        let tools = match listed {\n")
 mutate("gw-drift-withdrawal-not-reapplied", "a reload drops every standing withdrawal, so a withdrawn tool is served again unapproved", DRIFT,
-       "            let keep = approved\n                .get(tool)\n                .is_some_and(|now| now.key == standing.key);\n",
-       "            let keep = false && approved.contains_key(tool);\n")
+       "                    && approved\n                        .get(*tool)\n                        .is_some_and(|now| now.key == standing.key)\n",
+       "                    && false\n                    && approved.contains_key(*tool)\n")
 mutate("gw-drift-reload-compares-derived", "a reload is compared with the derived policy served, whose revision no registry can have, so a changed file under the base revision is served while a withdrawal stands", RELOAD,
        "        let served = self.withdrawals.base();\n",
        "        let served = self.live.current();\n")
 mutate("gw-drift-reapproval-not-cleared", "a withdrawal is keyed by the tool's name alone, so approving it again does not clear it", DRIFT,
-       "                .is_some_and(|now| now.key == standing.key);\n",
-       "                .is_some_and(|now| now.key.tool == standing.key.tool);\n")
+       "                        .is_some_and(|now| now.key == standing.key)\n",
+       "                        .is_some_and(|now| now.key.tool == standing.key.tool)\n")
 mutate("gw-drift-revision-is-base", "a withdrawal's policy keeps the base revision, so its rows cannot tell it from the base", DRIFT,
        "            let revision = withdrawn_revision(state.base.revision(), &withdrawn);\n",
        "            let revision = state.base.revision().clone();\n")
@@ -4669,6 +4744,16 @@ mutate_all("gw-drift-first-pass-after-bind", "the first drift pass runs on the t
             "tokio::time::interval_at(tokio::time::Instant::now(), interval);"))
 mutate("gw-drift-interval-ceiling-unchecked", "a drift interval above 900 s loads", DRIFT,
        " || seconds > MAX_DRIFT_INTERVAL.as_secs() {", " {")
+# Decision 0013, section 5, noted on 2026-10-12 (#165): the gateway refuses to start with a drift
+# interval shorter than any proxied server's call deadline, its own or the default, so each poll
+# ends by the next tick. start.rs's own tests and tests/drift.rs watch it.
+mutate("gw-drift-interval-below-deadline-accepted", "a drift interval shorter than a server's call deadline starts, so a late poll holds back the next and a change outlasts its bound", START,
+       "        if deadline > interval {\n", "        if false && deadline > interval {\n")
+mutate("gw-drift-interval-default-deadline-uncounted", "a server the deployment file gives no bounds is not held to the default deadline, so an interval below the default starts", START,
+       "        let deadline = bounds.get(server).copied().unwrap_or_default().deadline;\n",
+       "        let Some(deadline) = bounds.get(server).map(|bounds| bounds.deadline) else {\n"
+       "            continue;\n"
+       "        };\n")
 mutate("gw-drift-entries-share-one-schedule", "the servers are polled together each interval, so a server that does not answer holds back every other server's next poll until its deadline", DRIFT,
        "        let mut entries = JoinSet::new();\n"
        "        for (server, connector) in &self.servers {\n"
@@ -4705,6 +4790,7 @@ mutate("gw-probe-open-withdraws", "a server the probe finds open has its tools w
        "                            let standing = Standing {\n"
        "                                key: approved.key.clone(),\n"
        "                                server: server.clone(),\n"
+       "                                canary: None,\n"
        "                            };\n"
        "                            (tool.clone(), standing)\n"
        "                        })\n"
@@ -4720,10 +4806,11 @@ mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for
        "    if finding != ProbeFinding::NotShown {\n")
 # Decision 0011, section 4: beside each poll, the reach check sends each entry's canary through
 # the gateway's own listener as the registry's workload. Only a successful canary withdraws the
-# entry's tools; a refusal holds and a failed check withdraws nothing. The first check runs
-# beside the schedule, so it delays no poll, and a check is judged only against the approvals
-# it began under. It reads past the largest answer a server may be allowed, so a widened canary
-# answered near that cap is a mismatch. tests/reach.rs watches each.
+# entry's tools; a refusal holds and a failed check withdraws nothing. Every check runs beside
+# the schedule, so it delays no poll, a tick makes none while the last is out, and a check is
+# judged only against the approvals it began under. It reads 8 times past the largest answer a
+# server may be allowed, plus the envelope, so a widened canary answered near that cap is a
+# mismatch, whatever numbers the gateway writes out again (#175). tests/reach.rs watches each.
 mutate("gw-reach-success-kept", "a canary the server answered withdraws nothing, so a widened reach stays served", DRIFT,
        "                self.withdraw(state, server, found);\n",
        "                let _ = (state, found);\n")
@@ -4739,13 +4826,35 @@ mutate("gw-reach-never-runs", "no reach check is ever made, so a widened reach i
        "    let Some((caller, deadline)) = &entry.reach else {\n",
        "    let Some((caller, deadline)) = entry.reach.as_ref().filter(|_| false) else {\n")
 mutate("gw-reach-first-check-delays-first-poll", "the first poll waits for the first reach check, so a check that hangs puts a changed definition past its withdrawal bound", DRIFT,
-       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
-       "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
-       "    while first.join_next().await.is_some() {}\n    loop {\n")
+       "    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
+       "    checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
+       "    while checking.join_next().await.is_some() {}\n    loop {\n")
+mutate("gw-reach-check-delays-next-poll", "each poll waits for the reach check made at its tick, so a check that hangs holds back the entry's next poll past the drift bound", DRIFT,
+       "            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n        }\n",
+       "            checking.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n        }\n"
+       "        while checking.join_next().await.is_some() {}\n")
+mutate("gw-reach-checks-overlap", "a tick makes a reach check while the entry's last is still out, so checks of one entry pile up", DRIFT,
+       "        if checking.is_empty() {\n", "        if true {\n")
 mutate("gw-reach-answer-cap-no-headroom", "the reach check reads no more than a server's largest answer, so the gateway's answer to a widened canary near that cap is a failed check, not a mismatch", GW + "reach.rs",
-       "MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "MAX_SERVER_RESULT_BYTES;\n")
+       "    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "    MAX_SERVER_RESULT_BYTES;\n")
+mutate("gw-reach-answer-cap-no-expansion", "the reach check reads only the envelope past a server's largest answer, so the gateway's answer to a widened canary of compact numbers near that cap, written out again longer, is a failed check, not a mismatch", GW + "reach.rs",
+       "    REACH_ANSWER_EXPANSION * MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n",
+       "    MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n")
 mutate("gw-reach-stale-judgment-kept", "a mismatch is judged against the approvals in force when the answer comes, so a check begun before a new approval withdraws it", DRIFT,
        "                            && started.get(*name) == Some(&approved.key)\n", "")
+# Decision 0011, section 4, noted on 2026-10-12 (#172): a withdrawal of an entry's reach check
+# tool withdraws the entry's other tools, which stand while it does and clear with it. Each poll
+# still judges them, and one whose own definition changes is withdrawn for that cause, so the
+# reach check tool's new approval does not serve it. tests/drift.rs watches each.
+mutate("gw-drift-canary-withdrawal-leaves-entry", "a withdrawn reach check tool leaves its entry's other tools served, though the entry can no longer be checked", DRIFT,
+       "        for (tool, standing) in dependents(&state) {\n",
+       "        for (tool, standing) in dependents(&state).into_iter().take(0) {\n")
+mutate("gw-drift-canary-clear-leaves-dependents", "a new approval of the reach check tool leaves the tools withdrawn with it withdrawn", DRIFT,
+       "                standing.canary.is_none()\n                    && approved\n",
+       "                standing.canary.is_some()\n                    || approved\n")
+mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's reach check tool is never judged, so its changed definition is served once the reach check tool alone is approved again", DRIFT,
+       "            .is_some_and(|standing| standing.canary.is_none())\n",
+       "            .is_some()\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------

@@ -3278,6 +3278,36 @@ fn a_token_the_writer_cannot_get_leaves_the_previous_one_in_place() {
     );
 }
 
+/// #153: each token is written whole to a new file and renamed over the old one, never written
+/// into the file the gateway may be reading. A hard link to the old file still holds the
+/// previous token after a write that succeeded; a write in place would change it too.
+#[test]
+fn the_token_writer_replaces_each_file_rather_than_writing_into_it() {
+    let dir = token_writer_dir("token-writer-renames");
+    let mut before = Vec::new();
+    for account in ["docs-team-a", "docs-team-b"] {
+        let old = write(&dir.join("tokens"), account, "previous-token\n");
+        let link = dir.join(format!("{account}.old"));
+        std::fs::hard_link(&old, &link).unwrap();
+        before.push((account, link));
+    }
+    let run = token_writer(&dir, "ok", &[]);
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    for (account, link) in before {
+        assert_eq!(
+            token_file(&dir, account),
+            Some(format!("{}\n", issued(account))),
+            "{}",
+            run.transcript()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&link).unwrap(),
+            "previous-token\n",
+            "{account}'s token was written into the file in place"
+        );
+    }
+}
+
 #[test]
 fn the_token_writer_refuses_a_bad_configuration_before_asking() {
     for (name, value) in [
@@ -3366,6 +3396,319 @@ fn the_gateways_token_grant_must_name_only_the_entries_the_probe_and_the_registr
         "{}",
         run.transcript()
     );
+}
+
+/// #153: the kind run asks the API server for the gateway's token grant, in a step of its own.
+#[test]
+fn the_kind_run_checks_the_gateways_token_grant() {
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "the gateway's token grant (gateway-tokens.yaml)",
+    );
+    assert!(step.contains("\n  token_grants\n"), "{step}");
+    assert_eq!(driver.matches("\n  token_grants\n").count(), 1);
+}
+
+/// The kind run's step that asks the API server, with no token, for the issuer's keys and for
+/// a ConfigMap, run with a fake `k` that answers the issuer-discovery ClusterRole with `role`,
+/// the keys URL with `keys` and the ConfigMap with the HTTP status `configmap`. The cluster's
+/// keys, as the run fetched them before, have the key IDs `a` and `b`.
+fn anonymous_keys_step(name: &str, role: &Value, keys: &Value, configmap: &str) -> Run {
+    require(&["jq"]);
+    let dir = scratch(name);
+    write(
+        &dir,
+        "cluster-jwks.json",
+        &json!({"keys": [{"kid": "b"}, {"kid": "a"}]}).to_string(),
+    );
+    write(&dir, "role.json", &role.to_string());
+    write(&dir, "keys.json", &keys.to_string());
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "the API server gives its issuer's keys, and nothing else, to a caller with no token",
+    );
+    let dir = dir.display();
+    sourced(&format!(
+        "DEMO_DIR='{dir}'\nGATEWAY_POD=gateway-1\n\
+         k() {{ case \"$*\" in\n\
+           'get clusterrole system:service-account-issuer-discovery -o json') cat '{dir}/role.json' ;;\n\
+           '-n switchboard exec pod/gateway-1 -c gateway -- curl -sS --fail --cacert /etc/switchboard/cluster-ca/ca.crt https://kubernetes.default.svc.cluster.local/openid/v1/jwks') cat '{dir}/keys.json' ;;\n\
+           '-n switchboard exec pod/gateway-1 -c gateway -- curl -sS -o /dev/null -w %{{http_code}} --cacert /etc/switchboard/cluster-ca/ca.crt https://kubernetes.default.svc.cluster.local/api/v1/namespaces/switchboard/configmaps/registry') printf %s '{configmap}' ;;\n\
+           *) echo \"unexpected: k $*\" >&2; return 1 ;;\n\
+         esac; }}\n{step}\nFINISHED=1\nresult 0"
+    ))
+}
+
+/// The issuer-discovery ClusterRole as the API server serves it.
+fn discovery_role(rules: Value) -> Value {
+    json!({"kind": "ClusterRole", "metadata": {"name": "system:service-account-issuer-discovery"}, "rules": rules})
+}
+
+fn discovery_rule() -> Value {
+    json!({"verbs": ["get"], "nonResourceURLs": [
+        "/.well-known/openid-configuration", "/.well-known/openid-configuration/",
+        "/openid/v1/jwks", "/openid/v1/jwks/"
+    ]})
+}
+
+/// #153: the kind run's step "the API server gives its issuer's keys, and nothing else, to a
+/// caller with no token" holds its three checks: the discovery ClusterRole's exact rules, the
+/// keys an unauthenticated read gets against the cluster's key IDs, and a ConfigMap read with
+/// no token answered 403. Each fails when what it checks is not so.
+#[test]
+fn the_kind_run_checks_an_anonymous_caller_gets_the_keys_and_nothing_else() {
+    let keys = json!({"keys": [{"kid": "a"}, {"kid": "b"}]});
+    let role = discovery_role(json!([discovery_rule()]));
+    let names = [
+        "the issuer-discovery ClusterRole grants only get on the issuer's discovery document and keys",
+        "an unauthenticated read of https://kubernetes.default.svc.cluster.local/openid/v1/jwks gets the cluster's keys",
+        "an unauthenticated read of a ConfigMap is refused",
+    ];
+    let run = anonymous_keys_step("anonymous-keys", &role, &keys, "403");
+    assert_eq!(run.status, Some(0), "{}", run.transcript());
+    assert_eq!(
+        run.lines("PASS "),
+        names.map(|name| format!("PASS {name}")),
+        "{}",
+        run.transcript()
+    );
+
+    let mut wider = discovery_rule();
+    wider["verbs"] = json!(["get", "list"]);
+    let mut more_urls = discovery_rule();
+    more_urls["nonResourceURLs"][0] = json!("/*");
+    let configmaps = json!({"verbs": ["get"], "apiGroups": [""], "resources": ["configmaps"]});
+    for (case, role, keys, configmap, failed) in [
+        (
+            "verbs",
+            discovery_role(json!([wider])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "urls",
+            discovery_role(json!([more_urls])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "extra rule",
+            discovery_role(json!([discovery_rule(), configmaps])),
+            keys.clone(),
+            "403",
+            0,
+        ),
+        (
+            "other keys",
+            role.clone(),
+            json!({"keys": [{"kid": "a"}, {"kid": "c"}]}),
+            "403",
+            1,
+        ),
+        (
+            "one key",
+            role.clone(),
+            json!({"keys": [{"kid": "a"}]}),
+            "403",
+            1,
+        ),
+        ("configmap read", role.clone(), keys.clone(), "200", 2),
+        (
+            "configmap unauthorized",
+            role.clone(),
+            keys.clone(),
+            "401",
+            2,
+        ),
+    ] {
+        let run = anonymous_keys_step(&format!("anonymous-keys-{case}"), &role, &keys, configmap);
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        let fails = run.lines("FAIL ");
+        assert_eq!(fails.len(), 1, "{case}: {}", run.transcript());
+        assert!(
+            fails[0].starts_with(&format!("FAIL {} (got ", names[failed])),
+            "{case}: {}",
+            run.transcript()
+        );
+        assert_eq!(run.lines("PASS ").len(), 2, "{case}: {}", run.transcript());
+    }
+
+    // The step runs once the gateway's pod is known, from that pod's gateway container.
+    let driver = common::read("deploy/demo/demo.sh");
+    let kind = function_body(&driver, "kind_run");
+    let boot = kind.find("\n  step \"the gateway's boot lines").unwrap();
+    let anonymous = kind
+        .find("\n  step \"the API server gives its issuer's keys, and nothing else")
+        .unwrap();
+    assert!(boot < anonymous);
+}
+
+/// The kind run's metrics-port step, `metrics_port_probes`, run with a fake `k`: the gateway
+/// pod's address is 10.244.0.9, the idle pods are pod-team-a and pod-team-b, and curl in a team
+/// pod answers 9090 with `metrics` and 8080 with `mcp`, each `OUT STATUS`: what curl printed and
+/// its exit status (`- 1` for a kubectl that could not run it). Returns the run and every `k`
+/// call, with the other calls the step makes.
+fn metrics_port_step(name: &str, metrics: &str, mcp: &str) -> (Run, String) {
+    require(&["jq"]);
+    let dir = scratch(name);
+    let calls = dir.join("calls");
+    let answer = |reply: &str| {
+        let (out, status) = reply.split_once(' ').unwrap();
+        let out = if out == "-" { "" } else { out };
+        format!("printf %s '{}'; return {status}", out.replace('_', " "))
+    };
+    let run = sourced(&format!(
+        "GATEWAY_POD=gateway-1\n\
+         start_idle() {{ JOB=idle-$1; echo \"start_idle $1\" >>'{calls}'; }}\n\
+         stop_idle() {{ echo \"stop_idle $*\" >>'{calls}'; }}\n\
+         sleep() {{ echo \"sleep $*\" >>'{calls}'; }}\n\
+         k() {{ echo \"k $*\" >>'{calls}'; case \"$*\" in\n\
+           '-n switchboard get pod/gateway-1 -o jsonpath={{.status.podIP}}') echo 10.244.0.9 ;;\n\
+           '-n team-a get pods -l job-name=idle-team-a -o jsonpath={{.items[0].metadata.name}}') echo pod-team-a ;;\n\
+           '-n team-b get pods -l job-name=idle-team-b -o jsonpath={{.items[0].metadata.name}}') echo pod-team-b ;;\n\
+           *' exec pod/pod-team-'?' -c workload -- curl -q -sS -o /dev/null --connect-timeout 3 -m 5 -w %{{http_code}} %{{num_connects}} http://10.244.0.9:9090/metrics') {} ;;\n\
+           *' exec pod/pod-team-'?' -c workload -- curl -q -sS -o /dev/null --connect-timeout 3 -m 5 -w %{{http_code}} %{{num_connects}} http://10.244.0.9:8080/readyz') {} ;;\n\
+           *) echo \"unexpected: k $*\" >&2; return 1 ;;\n\
+         esac; }}\nmetrics_port_probes\nFINISHED=1\nresult 0",
+        answer(metrics),
+        answer(mcp),
+        calls = calls.display(),
+    ));
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    (run, calls)
+}
+
+/// #140: after the policy, the kind run tries the gateway pod's metrics port, 9090, from a new
+/// pod of each team and requires it refused, and its MCP port, 8080, at the same address,
+/// answered. A metrics port that answers, an MCP port that does not, or a try that could not
+/// run fails, for each team.
+#[test]
+fn the_kind_run_tries_the_metrics_port_from_each_teams_pod() {
+    for (metrics, exit) in [("000_0 28", 28), ("000_0 7", 7)] {
+        let (run, calls) = metrics_port_step(&format!("metrics-port-{exit}"), metrics, "200_1 0");
+        assert_eq!(run.status, Some(0), "{}", run.transcript());
+        let mut want = Vec::new();
+        for team in ["team-a", "team-b"] {
+            want.push(format!(
+                "PASS {team}'s pod is refused on the gateway's metrics port, 9090 (curl exit {exit})"
+            ));
+            want.push(format!(
+                "PASS {team}'s pod is answered on the gateway's MCP port, 8080, at the same address"
+            ));
+        }
+        assert_eq!(run.lines("PASS "), want, "{}", run.transcript());
+        // A new idle pod of each team, 10 s, then both ports from each, then the pods go.
+        let order: Vec<&str> = calls
+            .lines()
+            .filter(|line| !line.contains(" get "))
+            .map(|line| {
+                line.split(" -- curl ")
+                    .next()
+                    .unwrap()
+                    .trim_end_matches(" -c workload")
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "start_idle team-a",
+                "start_idle team-b",
+                "sleep 10",
+                "k -n team-a exec pod/pod-team-a",
+                "k -n team-a exec pod/pod-team-a",
+                "k -n team-b exec pod/pod-team-b",
+                "k -n team-b exec pod/pod-team-b",
+                "stop_idle team-a idle-team-a",
+                "stop_idle team-b idle-team-b",
+            ],
+            "{calls}"
+        );
+        let execs: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.contains(" exec "))
+            .collect();
+        assert!(
+            execs[0].ends_with(" http://10.244.0.9:9090/metrics"),
+            "{calls}"
+        );
+        assert!(
+            execs[1].ends_with(" http://10.244.0.9:8080/readyz"),
+            "{calls}"
+        );
+    }
+
+    for (case, metrics, mcp, failed) in [
+        // The policy admitted the metrics port, or something answered it.
+        (
+            "metrics answered",
+            "200_1 0",
+            "200_1 0",
+            "metrics port, 9090 (got '200 1 0'",
+        ),
+        (
+            "metrics refused late",
+            "000_1 7",
+            "200_1 0",
+            "metrics port, 9090 (got '000 1 7'",
+        ),
+        (
+            "metrics not run",
+            "- 1",
+            "200_1 0",
+            "metrics port, 9090 (got '1'",
+        ),
+        // The MCP port dropped too: the pod reaches nothing, which shows nothing of the policy.
+        (
+            "mcp dropped",
+            "000_0 28",
+            "000_0 28",
+            "MCP port, 8080, at the same address (got '000 0 28'",
+        ),
+        (
+            "mcp not ready",
+            "000_0 28",
+            "503_1 0",
+            "MCP port, 8080, at the same address (got '503 1 0'",
+        ),
+    ] {
+        let (run, _) = metrics_port_step(
+            &format!("metrics-port-{}", case.replace(' ', "-")),
+            metrics,
+            mcp,
+        );
+        assert_eq!(run.status, Some(1), "{case}: {}", run.transcript());
+        let fails = run.lines("FAIL ");
+        assert_eq!(fails.len(), 2, "{case}: {}", run.transcript());
+        for (fail, team) in fails.iter().zip(["team-a", "team-b"]) {
+            assert!(
+                fail.starts_with(&format!("FAIL {team}'s pod is ")) && fail.contains(failed),
+                "{case}: {}",
+                run.transcript()
+            );
+        }
+    }
+
+    // The kind run takes the step after the policy and the route checks that follow it.
+    let driver = common::read("deploy/demo/demo.sh");
+    let step = step_text(
+        &driver,
+        "kind_run",
+        "after the policy: from a new idle pod of each team, 10 s after it started, the gateway pod's metrics port (9090) is refused",
+    );
+    assert!(step.contains("\n  metrics_port_probes\n"), "{step}");
+    let kind = function_body(&driver, "kind_run");
+    let policy = kind
+        .find("\n  k apply -k \"$ROOT/deploy/kind/policy\"\n")
+        .unwrap();
+    let probes = kind.find("\n  metrics_port_probes\n").unwrap();
+    assert!(policy < probes);
+    assert_eq!(driver.matches("\n  metrics_port_probes\n").count(), 1);
 }
 
 /// A gateway log line as the gateway writes it: tracing's JSON, its fields under `fields`.
@@ -3560,10 +3903,15 @@ fn the_demonstrations_rely_on_the_codes_caps_deadline_and_interval() {
         assert!(!text.contains("deadline_seconds"), "{config}");
     }
     let revision = driver_value("REVISION");
-    let withdrawn = ["docs-team-a__list_documents", "docs-team-b__list_documents"]
-        .into_iter()
-        .map(|name| gateway_core::ToolName::parse(name).unwrap())
-        .collect();
+    let withdrawn = [
+        "docs-team-a__list_documents",
+        "docs-team-a__read_document",
+        "docs-team-b__list_documents",
+        "docs-team-b__read_document",
+    ]
+    .into_iter()
+    .map(|name| gateway_core::ToolName::parse(name).unwrap())
+    .collect();
     assert_eq!(
         driver_value("DRIFTED_REVISION").replace("$REVISION", &revision),
         gateway::withdrawn_revision(&gateway_core::PolicyRevision::new(revision), &withdrawn)
@@ -4200,6 +4548,10 @@ fn the_overload_step_needs_one_call_over_the_team_cap_refused_and_team_b_answere
     }
 }
 
+/// The drift step's derived revision: both list tools withdrawn, and both read tools with them.
+const DRIFTED: &str = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-a__read_document,\
+                       docs-team-b__list_documents,docs-team-b__read_document";
+
 /// A tool_withdrawn line for `tool`, `seconds` after 10:00:00, deriving `revision`.
 fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> String {
     log_line(
@@ -4209,11 +4561,23 @@ fn withdrawn_line(tool: &str, seconds: u32, cause: &str, revision: &str) -> Stri
     )
 }
 
+/// The tool_withdrawn line of `entry`'s read tool, withdrawn with its list tool, its reach check
+/// tool, `seconds` after 10:00:00, deriving `revision`.
+fn read_withdrawn_line(entry: &str, seconds: u32, revision: &str) -> String {
+    log_line(
+        &format!("2026-10-12T10:00:{seconds:02}.250000Z"),
+        json!({"event": "tool_withdrawn", "tool": format!("{entry}__read_document"),
+               "server": entry, "cause": "reach check tool withdrawn",
+               "reach_check_tool": format!("{entry}__list_documents"),
+               "base": "demo-10", "revision": revision}),
+    )
+}
+
 #[test]
-fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revision() {
+fn the_drift_step_needs_every_tool_withdrawn_in_time_under_the_literal_revision() {
     // 10:00:00 UTC on 2026-10-12, and a little more.
     let changed = "1791799200.400000";
-    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = DRIFTED;
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
@@ -4223,12 +4587,16 @@ fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revi
             &[("log", &lines.join("\n"))],
         )
     };
-    let b = withdrawn_line(
-        "docs-team-b__list_documents",
-        7,
-        "definition changed",
-        "demo-10+withdrawn:docs-team-b__list_documents",
-    );
+    let team_b = "demo-10+withdrawn:docs-team-b__list_documents,docs-team-b__read_document";
+    let b = vec![
+        withdrawn_line(
+            "docs-team-b__list_documents",
+            7,
+            "definition changed",
+            team_b,
+        ),
+        read_withdrawn_line("docs-team-b", 7, team_b),
+    ];
     let a = |seconds: u32| {
         withdrawn_line(
             "docs-team-a__list_documents",
@@ -4237,48 +4605,67 @@ fn the_drift_step_needs_both_list_tools_withdrawn_in_time_under_the_literal_revi
             drifted,
         )
     };
-    assert_all_passed("withdrawn", &run_on("withdrawn", &[b.clone(), a(12)]), 5);
+    let a_read = |seconds: u32| read_withdrawn_line("docs-team-a", seconds, drifted);
+    let with = |more: &[String]| [b.clone(), more.to_vec()].concat();
+    assert_all_passed(
+        "withdrawn",
+        &run_on("withdrawn", &with(&[a(12), a_read(12)])),
+        9,
+    );
     for (case, lines, failure) in [
         (
             "late",
-            vec![b.clone(), a(40)],
+            with(&[a(40), a_read(40)]),
             "it was withdrawn within the 10 s interval plus the 5 s deadline of the change (seconds) (got 40",
         ),
         (
             "one",
-            vec![a(12)],
+            vec![a(12), a_read(12)],
             "the gateway withdrew docs-team-b__list_documents once",
         ),
         (
             "twice",
-            vec![b.clone(), a(12), a(14)],
+            with(&[a(12), a_read(12), a(14)]),
             "the gateway withdrew docs-team-a__list_documents once",
         ),
         (
+            "read tool kept",
+            with(&[a(12)]),
+            "the gateway withdrew docs-team-a__read_document once, with its entry's reach check tool, docs-team-a__list_documents",
+        ),
+        (
+            "read tool for another cause",
+            with(&[
+                a(12),
+                withdrawn_line(
+                    "docs-team-a__read_document",
+                    12,
+                    "definition changed",
+                    drifted,
+                ),
+            ]),
+            "the gateway withdrew docs-team-a__read_document once, with its entry's reach check tool",
+        ),
+        (
             "unlisted",
-            vec![
-                b.clone(),
+            with(&[
                 withdrawn_line(
                     "docs-team-a__list_documents",
                     12,
                     "no longer listed",
                     drifted,
                 ),
-            ],
+                a_read(12),
+            ]),
             "the gateway withdrew docs-team-a__list_documents once, for a changed definition",
         ),
         (
             "not the literal revision",
-            vec![
-                b,
-                withdrawn_line(
-                    "docs-team-a__list_documents",
-                    12,
-                    "definition changed",
-                    "demo-10+withdrawn:2",
-                ),
-            ],
-            "the revision served after both withdrawals is the literal derived one (got 'demo-10+withdrawn:2'",
+            with(&[
+                a(12),
+                read_withdrawn_line("docs-team-a", 12, "demo-10+withdrawn:4"),
+            ]),
+            "the revision served after all four withdrawals is the literal derived one (got 'demo-10+withdrawn:4'",
         ),
     ] {
         assert_fails(case, &run_on(case, &lines), failure);
@@ -4304,7 +4691,7 @@ fn drift_rows(revision: &str, listed: &[&str], decision: &str, result: &str) -> 
 
 #[test]
 fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
-    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = DRIFTED;
     let read = "docs-team-a__read_document";
     let both = "docs-team-a__list_documents,docs-team-a__read_document";
     let run_on = |name: &str, rows: Value, revision: &str, listed: &str, call: &str| {
@@ -4314,14 +4701,14 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
             &[("rows", &rows.to_string())],
         )
     };
-    let withdrawn = drift_rows(drifted, &[read], "deny", "unknown_tool");
+    let withdrawn = drift_rows(drifted, &[], "deny", "unknown_tool");
     assert_all_passed(
         "withdrawn",
         &run_on(
             "withdrawn",
             withdrawn.clone(),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         1,
@@ -4339,31 +4726,26 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
     );
     const CHECK: &str = "audit: team-a's list and call are recorded under revision";
     for (case, rows, revision, listed, call) in [
-        // Rows under the base revision while the tool is withdrawn.
+        // Rows under the base revision while the tools are withdrawn.
         (
             "base revision",
-            drift_rows("demo-10", &[read], "deny", "unknown_tool"),
+            drift_rows("demo-10", &[], "deny", "unknown_tool"),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         (
             "still listed",
-            drift_rows(
-                drifted,
-                &["docs-team-a__list_documents", read],
-                "deny",
-                "unknown_tool",
-            ),
+            drift_rows(drifted, &[read], "deny", "unknown_tool"),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         (
             "still served",
-            drift_rows(drifted, &[read], "allow", "ok"),
+            drift_rows(drifted, &[], "allow", "ok"),
             drifted,
-            read,
+            "",
             "deny unknown_tool",
         ),
         ("still withdrawn", withdrawn, "demo-10", both, "allow ok"),
@@ -4374,7 +4756,7 @@ fn the_drift_steps_rows_must_carry_the_revision_in_force_and_what_it_served() {
 }
 
 #[test]
-fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleared() {
+fn the_reapproval_step_needs_the_new_revision_served_and_every_withdrawal_cleared() {
     let revision = "demo-12-reapproved-20261012T100000Z";
     let reloaded = |served: &str| {
         log_line(
@@ -4391,6 +4773,11 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
     };
     let a = cleared("docs-team-a__list_documents", "approved again");
     let b = cleared("docs-team-b__list_documents", "approved again");
+    let with_canary = "its entry's reach check tool is no longer withdrawn";
+    let reads = [
+        cleared("docs-team-a__read_document", with_canary),
+        cleared("docs-team-b__read_document", with_canary),
+    ];
     let run_on = |name: &str, lines: &[String]| {
         checked(
             name,
@@ -4400,12 +4787,17 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
             &[("log", &lines.join("\n"))],
         )
     };
+    let all = |more: &[String]| [more.to_vec(), reads.to_vec()].concat();
     assert_all_passed(
         "reapproved",
-        &run_on("reapproved", &[reloaded(revision), a.clone(), b.clone()]),
+        &run_on(
+            "reapproved",
+            &all(&[reloaded(revision), a.clone(), b.clone()]),
+        ),
         3,
     );
-    const CLEARED: &str = "both list tools' withdrawals cleared as approved again";
+    const CLEARED: &str = "both list tools' withdrawals cleared as approved again, and both read \
+                           tools' as their entry's reach check tool no longer withdrawn";
     for (case, lines, failure) in [
         (
             "still withdrawn",
@@ -4414,24 +4806,33 @@ fn the_reapproval_step_needs_the_new_revision_served_and_both_withdrawals_cleare
             ))],
             "the gateway serves revision demo-12-reapproved-20261012T100000Z, with no withdrawal",
         ),
-        ("one cleared", vec![reloaded(revision), a.clone()], CLEARED),
+        (
+            "one cleared",
+            all(&[reloaded(revision), a.clone()]),
+            CLEARED,
+        ),
         (
             "removed, not approved",
-            vec![
+            all(&[
                 reloaded(revision),
                 a.clone(),
                 cleared("docs-team-b__list_documents", "no longer in the registry"),
-            ],
+            ]),
+            CLEARED,
+        ),
+        (
+            "read tools kept",
+            vec![reloaded(revision), a.clone(), b.clone()],
             CLEARED,
         ),
         (
             "withdrawn again",
-            vec![
+            all(&[
                 reloaded(revision),
                 a,
                 b,
                 withdrawn_line("docs-team-a__list_documents", 12, "definition changed", "x"),
-            ],
+            ]),
             "the drift pass withdrew nothing since (got '1'",
         ),
     ] {
@@ -4483,13 +4884,13 @@ fn a_run_stopped_with_the_withdrawals_held_says_how_to_clear_them() {
 /// shown its tools less those withdrawn; under a re-approval's revision, both of its tools.
 #[test]
 fn the_drift_steps_list_rows_are_judged_by_the_revision_they_record() {
-    let drifted = "demo-10+withdrawn:docs-team-a__list_documents,docs-team-b__list_documents";
+    let drifted = DRIFTED;
     let reapproved = "demo-12-reapproved-20261012T100000Z";
     let rows = |team_a: Value| {
         json!([
-            list_row("team-a", drifted, &["docs-team-a__read_document"]),
+            list_row("team-a", drifted, &[] as &[&str]),
             list_row("team-a", reapproved, &both_tools("team-a")),
-            list_row("team-b", drifted, &["docs-team-b__read_document"]),
+            list_row("team-b", drifted, &[] as &[&str]),
             team_a,
         ])
         .to_string()
@@ -4946,7 +5347,7 @@ fn the_reach_reapproval_needs_both_of_docs_team_as_withdrawals_cleared() {
         checked(
             name,
             &format!(
-                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools'\" docs-team-a__list_documents docs-team-a__read_document"
+                "check_reapproval \"$(events {{log}} 'select(.event == \"policy_reloaded\" or .event == \"policy_withdrawal_cleared\" or .event == \"tool_withdrawn\")')\" {revision} \"both of docs-team-a's tools' withdrawals cleared as approved again\" docs-team-a__list_documents docs-team-a__read_document"
             ),
             &[("log", &lines.join("\n"))],
         )
