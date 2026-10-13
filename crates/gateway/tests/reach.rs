@@ -647,6 +647,102 @@ async fn a_widened_caller_is_withdrawn() {
     assert_eq!(captured.events("reach_mismatch").len(), 1);
 }
 
+/// A relay between the reach check and the replica's listener that sends each request on at
+/// once and holds every answer until it is released.
+struct Relay {
+    listener: TcpListener,
+}
+
+impl Relay {
+    async fn bind() -> Self {
+        Self {
+            listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+
+    /// Relays each connection to `target` until the test ends, holding the answers until `true`
+    /// is sent on the sender it returns.
+    fn start(self, target: SocketAddr) -> tokio::sync::watch::Sender<bool> {
+        let (released, _) = tokio::sync::watch::channel(false);
+        let watched = released.clone();
+        let listener = self.listener;
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let mut release = watched.subscribe();
+                tokio::spawn(async move {
+                    let server = tokio::net::TcpStream::connect(target).await.unwrap();
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+                    tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+                    });
+                    if release.wait_for(|released| *released).await.is_ok() {
+                        let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+                    }
+                });
+            }
+        });
+        released
+    }
+}
+
+/// A reach check is judged against the approvals it began under, as a poll is. docs-team-a's
+/// tools are approved again while a check is out, and the widened server's answer to it comes
+/// after: the mismatch is logged, but it withdraws nothing, since it never checked the new
+/// approval. A check started after the approval withdraws both tools.
+#[tokio::test]
+async fn a_check_outstanding_across_a_new_approval_does_not_withdraw_it() {
+    let (captured, _logging) = Captured::start();
+    let mock = mock().await;
+    let relay = Relay::bind().await;
+    let replica = Replica::reaching("reach-stale", &mock.url(), true, Some(relay.address())).await;
+    let release = relay.start(replica.address);
+    assert!(
+        mock.server()
+            .set_projects(&team_a_caller(), Projects::only(["atlas", "borealis"]))
+    );
+    let again = reapproved(&files::registry(&mock.url()), "demo-12");
+
+    let approving = async {
+        // Both checks' calls are decided, sent and answered, and the answers held.
+        eventually("both checks' rows", || {
+            let rows = replica.rows();
+            rows.len() == 2 && rows.iter().all(|row| !row.ends_with(" none"))
+        })
+        .await;
+        assert!(replica.rows().contains(&format!(
+            "{REGISTRY_SA} registry {REACH_SURFACE} {LIST_TOOL} borealis allow ok"
+        )));
+        assert_eq!(replica.reload(&again), "demo-12");
+        release.send_replace(true);
+    };
+    tokio::join!(replica.drift.reach_pass(), approving);
+
+    let mismatch = captured.events("reach_mismatch");
+    assert_eq!(mismatch.len(), 1, "{mismatch:?}");
+    assert_eq!(mismatch[0].1["server"], "docs-team-a");
+    assert_eq!(mismatch[0].1["withdrawn"], 0);
+    assert!(replica.withdrawn().is_empty(), "{:?}", replica.withdrawn());
+    assert!(captured.events("tool_withdrawn").is_empty());
+    assert_eq!(
+        replica.listed(SURFACE, TEAM_A_SA).await,
+        [LIST_TOOL, READ_TOOL]
+    );
+
+    // The next check began under the new approval, and withdraws both tools.
+    replica.drift.reach_pass().await;
+    assert_eq!(
+        replica.withdrawn(),
+        BTreeSet::from([LIST_TOOL.to_owned(), READ_TOOL.to_owned()])
+    );
+    assert_eq!(captured.events("reach_mismatch").len(), 2);
+    assert_eq!(captured.events("tool_withdrawn").len(), 2);
+}
+
 /// A missing token is a failed check: logged at WARN and counted, nothing sent to the server
 /// and nothing withdrawn, even with a caller widened so a check would find a mismatch.
 #[tokio::test]
