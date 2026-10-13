@@ -187,10 +187,18 @@ async fn the_endpoint_answers_with_every_signal_and_nothing_else() {
             assert!(sample(&text, &series).is_some(), "{series}\n{text}");
         }
     }
-    for pool in ["begin", "finish"] {
+    for pool in ["begin", "finish", "open_rows"] {
         let series = format!("switchboard_audit_pool_connections_max{{pool=\"{pool}\"}}");
         assert!(sample(&text, &series).unwrap() >= 1.0, "{series}\n{text}");
     }
+    assert_eq!(
+        sample(
+            &text,
+            "switchboard_audit_pool_connections_max{pool=\"open_rows\"}"
+        ),
+        Some(1.0),
+        "{text}"
+    );
     assert!(
         text.contains(
             "pool_timeout: no connection was obtained in time, whether waiting for a pool permit \
