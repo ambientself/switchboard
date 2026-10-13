@@ -419,9 +419,10 @@ fn block_after(text: &str, header: &str) -> String {
 // the gateway container and the teams' workloads (decision 0013, section 10) read the manifests
 // with a YAML parser and walk the parsed pods, so aliases, anchors, tags, quoting, escapes,
 // blank lines and comments are the parser's to read. Where a field has a shape they do not
-// expect, they panic rather than read it as absent, and so they do on a tag or a merge key the
-// parser would read otherwise than the API server does ([`ReadAsTheApiServer`]), and on a merge
-// key that supplies a key the mapping also sets, which YAML readers do not agree on ([`merged`]).
+// expect, they panic rather than read it as absent, and so they do on a tag, an alias key or a
+// merge key the parser would read otherwise than the API server does ([`ReadAsTheApiServer`]),
+// and on a merge key that supplies a key the mapping also sets, which YAML readers do not agree
+// on ([`merged`]).
 
 /// The documents of a manifest, parsed, with each merge key (`<<`) applied where no key overlaps.
 /// The parser resolves aliases but leaves merge keys to this. YAML readers disagree on which key
@@ -493,6 +494,10 @@ fn merged(node: Yaml) -> Yaml {
 /// - A tagged scalar as a mapping's key, other than `!!merge <<`. The loader gives a key it
 ///   cannot convert, such as `!!int 0x10`, `!!bool yes` or `!!null Null`, as no value, and reads
 ///   the rest of the mapping shifted by one, each value as a key and each key as a value.
+/// - An alias as a mapping's key. It carries no tag, but the loader reads it as the node it
+///   names, and an alias of a tagged scalar it cannot convert shifts the mapping just as a tagged
+///   key does. The manifests use no alias as a key, so any is refused. An alias as a value is the
+///   node it names, and the guards read that.
 #[derive(Default)]
 struct ReadAsTheApiServer {
     /// The collections open at the current event, innermost last: for a mapping, whether its next
@@ -541,6 +546,10 @@ impl MarkedEventReceiver for ReadAsTheApiServer {
             Event::SequenceStart(..) => self.open.push(None),
             Event::MappingStart(..) => self.open.push(Some(true)),
             _ => {}
+        }
+        if let Event::Alias(_) = event {
+            assert!(!key, "an alias used as a mapping key, at {at}");
+            return;
         }
         let tag = match &event {
             Event::Scalar(value, style, _, tag) if value == "<<" => {
@@ -1978,8 +1987,9 @@ fn the_guards_refuse_the_deprecated_service_account_field() {
 /// gateway's pod and in a workload: a `!!binary` key that the API server decodes to
 /// `serviceAccountToken`, or a `!!binary` audience it decodes to the issuer, however the tag is
 /// spelled; a `<<` that is quoted or tagged, which the API server reads as an ordinary key
-/// where the parser would merge it; a tagged key, which the parser may read as no value; and a
-/// merge key that supplies a key the mapping already has. `!!merge <<` and `? <<` still merge.
+/// where the parser would merge it; a tagged key, which the parser may read as no value; an
+/// alias as a key (#188), which may name such a value; and a merge key that supplies a key the
+/// mapping already has. `!!merge <<` and `? <<` still merge, and an alias as a value is read.
 #[test]
 fn the_guards_refuse_a_tag_or_merge_key_the_parser_reads_otherwise() {
     let gateway = read("deploy/kind/base/gateway.yaml");
@@ -2096,6 +2106,61 @@ fn the_guards_refuse_a_tag_or_merge_key_the_parser_reads_otherwise() {
     ] {
         forms.push((form, with_source(source), tagged_key));
     }
+    // An alias as a key carries no tag, but the parser reads it as the node it names. An alias of
+    // a tagged scalar it cannot convert, here the projected volume's `defaultMode`, shifts the
+    // mapping just as a tagged key does: the source after it reads as `{x: serviceAccountToken}`.
+    // Any alias as a key is refused, in a block mapping, a flow one or as an explicit key, and one
+    // of a plain string too: the name of the ConfigMap the gateway's volume projects, and
+    // team-a's wrong audience.
+    let alias_key = "an alias used as a mapping key";
+    let int_anchor = [
+        (
+            "          projected:\n            sources:\n",
+            "          projected:\n            defaultMode: &k !!int 0x10\n            sources:\n",
+        ),
+        (
+            "            - name: wrong-audience-token\n              projected:\n",
+            "            - name: wrong-audience-token\n              projected:\n                defaultMode: &k !!int 0x10\n",
+        ),
+    ];
+    let string_anchor = [
+        (
+            "              - configMap: {name: gateway-config}\n",
+            "              - configMap: {name: &k gateway-config}\n",
+        ),
+        (
+            "audience: not-switchboard\n",
+            "audience: &k not-switchboard\n",
+        ),
+    ];
+    let with_anchor = |anchor: [(&str, &str); 2], source: &str| {
+        with_source(source)
+            .into_iter()
+            .zip(anchor)
+            .map(|(text, (plain, anchored))| {
+                let changed = text.replacen(plain, anchored, 1);
+                assert_ne!(changed, text, "{anchored}");
+                changed
+            })
+            .collect::<Vec<_>>()
+    };
+    let shifted = "$I- *k : x\n$I  serviceAccountToken: {path: token}\n";
+    for (form, anchor, source) in [
+        ("an alias key to an !!int", int_anchor, shifted),
+        (
+            "an alias key to an !!int, flow style",
+            int_anchor,
+            "$I- {*k : x, serviceAccountToken: {path: token}}\n",
+        ),
+        (
+            "an alias key to an !!int, as an explicit key",
+            int_anchor,
+            "$I- ? *k\n$I  : x\n$I  serviceAccountToken: {path: token}\n",
+        ),
+        ("an alias key to a string", string_anchor, shifted),
+    ] {
+        forms.push((form, with_anchor(anchor, source), alias_key));
+    }
     // A merge key that supplies a key the mapping sets too, in either order, or that two merged
     // mappings both set: YAML readers disagree on which wins.
     let overlap = "a merge key that supplies a key the mapping already has: audience";
@@ -2142,6 +2207,35 @@ fn the_guards_refuse_a_tag_or_merge_key_the_parser_reads_otherwise() {
             assert!(message.starts_with(refusal), "{form}: {message}");
         }
     }
+
+    // The refusal of an alias key names its line and column, here in the gateway's config
+    // volume. An alias as a value is still read: team-a's source by an alias of its own wrong
+    // audience is for that audience, and the workload passes.
+    let changed = with_anchor(int_anchor, shifted).remove(0);
+    let alias = changed.find("*k : x").expect("the alias key");
+    let line = changed[..alias].matches('\n').count() + 1;
+    let column = alias - changed[..alias].rfind('\n').expect("a line before") - 1;
+    assert_eq!(
+        panic_message("an alias key", || {
+            manifest(&changed);
+        }),
+        format!("{alias_key}, at line {line}, column {column}")
+    );
+    let changed = with_anchor(
+        string_anchor,
+        "$I- serviceAccountToken: {path: token, audience: *k}\n",
+    )
+    .remove(1);
+    let documents = manifest(&changed);
+    let (document, pod) = pod_specs(&documents)[0];
+    assert_eq!(
+        token_audiences(volume(pod, "wrong-audience-token")),
+        [
+            Some("not-switchboard".to_owned()),
+            Some("not-switchboard".to_owned())
+        ]
+    );
+    no_api_token_in_workload(document, pod);
 
     // A plain `<<`, tagged `!!merge` or as an explicit key, is a merge key to the API server
     // too: the source's audience is the gateway's, and the workload passes.
