@@ -40,6 +40,20 @@ pub enum PgAuditError {
         /// The column.
         column: &'static str,
     },
+    /// The row would hold more than [`MAX_ROW_BYTES`](crate::MAX_ROW_BYTES), counted as the
+    /// bytes of the values the store sends (decision 0014, section 7). The record is refused,
+    /// naming the row's largest column.
+    #[error(
+        "the audit row would hold {bytes} bytes, more than the {} a row may hold, so it is not \
+         written; its largest column is {column}",
+        crate::MAX_ROW_BYTES
+    )]
+    RowTooLarge {
+        /// The row's largest column.
+        column: &'static str,
+        /// The row's size, as the bound counts it.
+        bytes: usize,
+    },
     /// No connection could be had.
     #[error("no connection to the audit database: {0}")]
     Pool(#[from] PoolError),
@@ -382,9 +396,10 @@ fn begin_cause(error: &PgAuditError, connected: bool) -> BeginCause {
         PgAuditError::BeginBudget { .. } if !connected => BeginCause::PoolTimeout,
         PgAuditError::BeginBudget { .. } => BeginCause::BudgetExceeded,
         PgAuditError::Pool(PoolError::Timeout(_)) => BeginCause::PoolTimeout,
-        PgAuditError::Nul { .. } | PgAuditError::Column(_) | PgAuditError::CompleteAtBegin => {
-            BeginCause::ValueRefused
-        }
+        PgAuditError::Nul { .. }
+        | PgAuditError::RowTooLarge { .. }
+        | PgAuditError::Column(_)
+        | PgAuditError::CompleteAtBegin => BeginCause::ValueRefused,
         _ => BeginCause::DatabaseError,
     }
 }
@@ -590,7 +605,9 @@ pub struct OpenRows {
 /// - A row is exactly its record, or it is not written. Begin refuses a record with U+0000 in
 ///   any text value, which Postgres cannot store, with [`PgAuditError::Nul`], so the core
 ///   refuses the call; finish refuses a refusal sentence with one, or a latency past its
-///   column's range, and gives up.
+///   column's range, and gives up. Begin and list refuse a row over
+///   [`MAX_ROW_BYTES`](crate::MAX_ROW_BYTES) with [`PgAuditError::RowTooLarge`], naming its
+///   largest column.
 ///
 /// If the caller stops waiting for finish, its task still completes the row. If the runtime
 /// drops the task first, the finish is counted and reported as given up. So is the task that

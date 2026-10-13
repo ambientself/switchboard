@@ -3278,6 +3278,25 @@ mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
        """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
        """            .unwrap_or(i64::MAX);""")
+# Decision 0014, section 7: a row is at most 512 KiB, counted as the bytes of the values the store
+# sends, and one over it is refused naming its largest column. columns.rs's own tests watch the
+# bound, the count and the column named; tests/store.rs writes the largest row to Postgres.
+mutate("pg-columns-row-bound-unchecked", "a row over 512 KiB is sent to the database", PG_COLUMNS,
+       "    if bytes > MAX_ROW_BYTES {\n", "    if false && bytes > MAX_ROW_BYTES {\n")
+mutate("pg-columns-row-bound-refuses-at-bound", "a row of exactly 512 KiB is refused", PG_COLUMNS,
+       "    if bytes > MAX_ROW_BYTES {\n", "    if bytes >= MAX_ROW_BYTES {\n")
+mutate("pg-columns-row-bound-names-first-column", "a row over the bound names its first column, not its largest", PG_COLUMNS,
+       "            .max_by_key(|(_, bytes)| *bytes)\n", "            .find(|(_, bytes)| *bytes > 0)\n")
+mutate("pg-columns-row-bound-groups-uncounted", "a user's groups are left out of the row's size", PG_COLUMNS,
+       "    texts.map_or(0, |texts| texts.iter().map(|text| text.len()).sum())\n",
+       "    texts.map_or(0, |texts| texts.iter().map(|_| 0).sum())\n")
+mutate("pg-columns-list-row-unbounded", "a list row over 512 KiB is sent to the database", PG_COLUMNS,
+       "        within_bound(&row.sizes())?;\n        Ok(row)\n    }\n\n"
+       "    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.\n"
+       "    pub fn sizes(&self) -> [(&'static str, usize); 16] {\n",
+       "        Ok(row)\n    }\n\n"
+       "    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.\n"
+       "    pub fn sizes(&self) -> [(&'static str, usize); 16] {\n")
 mutate("pg-sql-resources-nullable", "a call row may record no resources at all", PG_LIST_ROWS,
        "                AND resources IS NOT NULL AND resources_omitted IS NOT NULL\n",
        "                AND resources_omitted IS NOT NULL\n")
@@ -3904,8 +3923,8 @@ mutate("pg-credential-columns-unshaped", "a credential mode may be stored withou
 mutate("pg-credential-grant-missing", "the gateway's role may not insert the credential identity", PG_REACH,
        "GRANT INSERT (credential_mode, credential_principal)\n    ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 mutate("pg-credential-not-written", "begin writes no credential identity", PG_COLUMNS,
-       "            credential_mode,\n            credential_principal,\n        })",
-       "            credential_mode: None,\n            credential_principal: None,\n        })")
+       "            credential_mode,\n            credential_principal,\n        };",
+       "            credential_mode: None,\n            credential_principal: None,\n        };")
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.

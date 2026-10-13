@@ -106,7 +106,8 @@ pub struct BeginFailures {
     /// or failed the statement, or already holds the row under its identifier in another form.
     /// A database that never answers is counted in `pool_timeout` instead.
     pub database_error: u64,
-    /// A value of the record could not be put in its column, such as text holding U+0000.
+    /// A value of the record could not be put in its column, such as text holding U+0000, or
+    /// the row would be larger than the bound.
     pub value_refused: u64,
 }
 

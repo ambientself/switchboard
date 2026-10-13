@@ -367,6 +367,56 @@ mod tests {
         );
     }
 
+    /// The most bytes a template renders to: its own text, and each value at its longest, the
+    /// principal's description at its longest and every other value [`MAX_RENDERED`] escaped
+    /// ASCII characters and a `…`.
+    fn longest(template: &str) -> usize {
+        let mut bytes = template.len();
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            let close = open + rest[open..].find('}').unwrap();
+            let name = &rest[open + 1..close];
+            bytes -= name.len() + 2;
+            bytes += if name == "principal" {
+                longest(WORKLOAD).max(longest(USER))
+            } else {
+                MAX_RENDERED + '…'.len_utf8()
+            };
+            rest = &rest[close + 1..];
+        }
+        bytes
+    }
+
+    /// A denial's sentence is stored on its audit row, so the largest row counts the longest
+    /// one: a resource outside the caller's limit, naming a workload. audit-postgres's
+    /// `MAX_ROW_BYTES` counts 1,046 bytes for it.
+    #[test]
+    fn the_longest_sentence_is_at_most_1046_bytes() {
+        assert_eq!(longest(WORKLOAD), 430);
+        assert_eq!(longest(RESOURCE_OUTSIDE_LIMIT), 1_046);
+        assert_eq!(SENTENCES.into_iter().map(longest).max(), Some(1_046));
+        let resource = crate::Resource {
+            system: "s".repeat(500),
+            kind: "k".repeat(500),
+            identifier: "i".repeat(5_000),
+        };
+        let principal = Principal {
+            id: crate::PrincipalId {
+                issuer: "u".repeat(500).as_str().into(),
+                subject: "w".repeat(500).as_str().into(),
+            },
+            kind: PrincipalKind::Workload {
+                team: "t".repeat(500).as_str().into(),
+            },
+        };
+        let rendered = render(&Reason::ResourceOutsideLimit(ResourceProblem::Outside {
+            tool: crate::ToolName::parse(&"x".repeat(MAX_TOOL_NAME)).unwrap(),
+            resource,
+            principal,
+        }));
+        assert!(rendered.len() <= 1_046, "{}", rendered.len());
+    }
+
     #[test]
     fn fill_replaces_every_occurrence() {
         assert_eq!(

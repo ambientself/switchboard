@@ -701,12 +701,16 @@ written complete, has no finish, and is never open.
 - **A row's recorded resources are at most 147,648 characters:** 64 resources, each with a
   129-character system and kind and a 2,049-character identifier, the `…` included. That
   counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
-  quotes again, so as JSON they reach 297,675 characters, or 298,059 bytes, since `…` takes 3
-  bytes. Any call that gets a row can reach this, a denial included, and the row is written
-  before the tool runs. A row is at most 512 KiB, counted as the bytes of the values the
-  Postgres store sends, which holds this with room for the rest of the row; the bound and the
-  test that the largest row fits arrive with #11
-  ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
+  quotes again, so as JSON they reach 297,665 characters, or 298,049 bytes, since `…` takes 3
+  bytes (decision 0014 counted 298,059). Any call that gets a row can reach this, a denial
+  included, and the row is written before the tool runs. A row is at most 512 KiB, counted as
+  the bytes of the values the Postgres store sends, which holds this with room for the rest of
+  the row ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). The
+  Postgres store refuses a row over the bound, naming its largest column, so the call is
+  refused. Every value a caller chooses is capped, and in the largest row they take at most
+  316,129 bytes, leaving 208,159 for the values from the gateway's own configuration, which
+  have no cap of their own (`audit_postgres::MAX_ROW_BYTES` works it out, and its tests write
+  that row).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres

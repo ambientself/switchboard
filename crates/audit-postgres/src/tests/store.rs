@@ -22,7 +22,7 @@ use tokio_postgres::{Client, NoTls};
 
 use super::{GATEWAY_ROLE, TestDatabase};
 use crate::columns::allowance_ms;
-use crate::{Budgets, FinishCounts, PgAuditError, PgAuditStore, PoolSizes};
+use crate::{Budgets, FinishCounts, MAX_ROW_BYTES, PgAuditError, PgAuditStore, PoolSizes};
 
 /// One call, as a test describes it.
 pub(super) struct Call {
@@ -406,6 +406,62 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
     assert_eq!(store.finishes().given_up, 1);
     assert_eq!(store.finishes().in_flight, 0);
     assert_eq!(given_up.lock().unwrap().clone(), vec![error.to_string()]);
+}
+
+/// Decision 0014, section 7: the largest row a call can make, at the 512 KiB bound, is written
+/// and reads back exactly; a byte more is refused, naming its largest column, and no row is
+/// written.
+#[tokio::test]
+async fn the_largest_row_is_written_and_a_row_over_the_bound_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+
+    let largest = crate::columns::largest_record(MAX_ROW_BYTES);
+    let row = row_start().row;
+    store.begin(&row, &largest).await.unwrap();
+    // read_back leaves the credential out; it is read here.
+    let read = read_back(&admin, &row).await;
+    assert!(
+        read == AuditRecord {
+            credential: None,
+            ..largest.clone()
+        }
+    );
+    let credential = admin
+        .query_one(
+            "SELECT credential_mode, credential_principal FROM switchboard_audit.call_rows
+              WHERE id = ($1::text)::uuid",
+            &[&row.as_str()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            credential.get::<_, String>(0),
+            credential.get::<_, String>(1)
+        ),
+        ("team_service_identity".to_owned(), "largest".to_owned())
+    );
+
+    let mut over = largest.clone();
+    over.policy_revision = format!("{}r", over.policy_revision).as_str().into();
+    let error = store.begin(&row_start().row, &over).await.unwrap_err();
+    let error = error.downcast_ref::<PgAuditError>().unwrap();
+    assert!(
+        matches!(
+            error,
+            PgAuditError::RowTooLarge {
+                column: "resources",
+                bytes
+            } if *bytes == MAX_ROW_BYTES + 1
+        ),
+        "{error}"
+    );
+    assert_eq!(row_count(&admin).await, 1);
+    assert_eq!(store.stats().begin_failures.value_refused, 1);
 }
 
 /// The decided call `call` in the fixture's policy.

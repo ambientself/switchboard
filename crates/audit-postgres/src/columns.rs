@@ -6,7 +6,8 @@
 //! cannot hold U+0000, and callers choose some values, such as their tool-use identifier. A
 //! record with U+0000 in any text value is refused with [`PgAuditError::Nul`], naming the
 //! column, rather than written with another character in its place: begin fails, so the core
-//! refuses the call. A latency or a count past its column's range is refused the same way.
+//! refuses the call. A latency or a count past its column's range is refused the same way, and
+//! so is a row larger than [`MAX_ROW_BYTES`], naming its largest column.
 
 use std::time::Duration;
 
@@ -19,6 +20,99 @@ use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
 use crate::store::{Budgets, PgAuditError};
+
+/// The most a row may hold, in bytes (decision 0014, section 7): 512 KiB, counted as the bytes
+/// of the values the store sends. A text value counts its UTF-8, a text array its elements'
+/// UTF-8, a JSON value its JSON text, and an integer its 8 bytes. Begin and list count the row
+/// they write and refuse one over the bound, naming its largest column, so the call or the
+/// list is refused.
+///
+/// The values a caller chooses, and the ones it can make long, are capped before they reach a
+/// row, so in the largest row a call can make they take at most 316,129 bytes, leaving 208,159
+/// for the rest:
+///
+/// - `resources`: 298,049. At most 64 resources (`MAX_RECORDED_RESOURCES`), each a system and a
+///   kind of at most 128 escaped characters and an identifier of at most 2,048, each cut with a
+///   3-byte `…`. Escaped text is ASCII, and JSON doubles at most each character, a backslash or
+///   a quote: so 2 + 2 × 128 + 3 = 261 bytes for a system or kind and 2 + 2 × 2,048 + 3 = 4,101
+///   for an identifier, quotes included; with the keys, braces and commas, 4,656 a resource, and
+///   64 × 4,656 + 63 commas + 2 brackets in all.
+/// - `proved_subject` and `proved_groups`: 16,384 together. Both come from one token, which is
+///   at most 16 KiB (`gateway_identity::MAX_TOKEN_BYTES`), and decoding it only shortens them.
+/// - `sentence`: 1,046. The longest denial, a resource outside the caller's limit, is its
+///   template's text and seven escaped values, the tool, the resource's system, kind and
+///   identifier, and the workload's subject, team and issuer, each at most 128 characters and a
+///   `…`, 131 bytes.
+/// - `tool_use_id`: 128 printable ASCII characters at most. `surface`, `tool` and `instance`:
+///   131 each, 128 escaped characters and a `…`.
+/// - The fixed words and numbers: `id` 36, `reason` 28, `credential_mode` 21, `classification`
+///   11, `proved_kind` 8, `decision` 5, `kind` 4, and `resources_omitted` and `allowance_ms` 8
+///   each.
+///
+/// The rest have no cap of their own. `deployment`, `profile`, `connector`, `policy_revision`,
+/// `proved_issuer`, `proved_team` and `credential_principal` come from the gateway's own
+/// configuration, its deployment file and registry, not from a caller.
+/// `proved_delegation_team`, `claimed_acting_person` and `claimed_team` are not set by the
+/// gateway yet. The completion, which finish writes, is an outcome and an error kind of at most
+/// 22 bytes each, a latency of 8, and a refusal sentence the gateway makes: the proxy's fixed
+/// sentences, and the capacity and withdrawal sentences, which name a configured server or
+/// tool. Finish cannot see the row begin wrote, so the completion is not counted against the
+/// bound.
+pub const MAX_ROW_BYTES: usize = 512 * 1024;
+
+/// The bytes of a text value, as the store sends it.
+fn text_bytes(text: &str) -> usize {
+    text.len()
+}
+
+/// The bytes of a text value that may be absent: none when it is.
+fn optional_bytes(text: Option<&str>) -> usize {
+    text.map_or(0, text_bytes)
+}
+
+/// The bytes of a text array: its elements'.
+fn array_bytes(texts: Option<&[String]>) -> usize {
+    texts.map_or(0, |texts| texts.iter().map(|text| text.len()).sum())
+}
+
+/// The bytes of a JSON value: its JSON text, as the store sends it.
+fn json_bytes(value: &Value) -> usize {
+    /// Counts what is written to it.
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+/// The bytes of an integer column.
+const INTEGER_BYTES: usize = std::mem::size_of::<i64>();
+
+/// Refuses a row whose columns, as `columns` counts them, hold more than [`MAX_ROW_BYTES`],
+/// naming the largest.
+fn within_bound(columns: &[(&'static str, usize)]) -> Result<(), PgAuditError> {
+    let bytes = columns
+        .iter()
+        .fold(0_usize, |total, (_, bytes)| total.saturating_add(*bytes));
+    if bytes > MAX_ROW_BYTES {
+        let column = columns
+            .iter()
+            .max_by_key(|(_, bytes)| *bytes)
+            .map_or("", |(column, _)| column);
+        return Err(PgAuditError::RowTooLarge { column, bytes });
+    }
+    Ok(())
+}
 
 /// The columns begin writes, in the order of [`BeginRow::INSERT`]'s parameters.
 #[derive(Debug, PartialEq)]
@@ -100,7 +194,7 @@ impl BeginRow {
         let (proved_kind, proved_team, proved_groups) = principal_kind(principal)?;
         let (resources, resources_omitted) = resources(record)?;
         let (credential_mode, credential_principal) = credential(record.credential.as_ref())?;
-        Ok(Self {
+        let row = Self {
             id: id.as_str().to_owned(),
             tool_use_id: optional(
                 "tool_use_id",
@@ -147,7 +241,51 @@ impl BeginRow {
                 .map_err(|_| PgAuditError::Column("an allowance past the column's range"))?,
             credential_mode,
             credential_principal,
-        })
+        };
+        within_bound(&row.sizes())?;
+        Ok(row)
+    }
+
+    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.
+    pub fn sizes(&self) -> [(&'static str, usize); 27] {
+        [
+            ("id", text_bytes(&self.id)),
+            ("tool_use_id", optional_bytes(self.tool_use_id.as_deref())),
+            ("deployment", text_bytes(&self.deployment)),
+            ("surface", text_bytes(&self.surface)),
+            ("profile", text_bytes(&self.profile)),
+            ("tool", text_bytes(&self.tool)),
+            ("connector", optional_bytes(self.connector.as_deref())),
+            ("classification", optional_bytes(self.classification)),
+            ("resources", json_bytes(&self.resources)),
+            ("resources_omitted", INTEGER_BYTES),
+            ("decision", text_bytes(self.decision)),
+            ("reason", optional_bytes(self.reason.as_deref())),
+            ("sentence", optional_bytes(self.sentence.as_deref())),
+            ("policy_revision", text_bytes(&self.policy_revision)),
+            ("proved_issuer", text_bytes(&self.proved_issuer)),
+            ("proved_subject", text_bytes(&self.proved_subject)),
+            ("proved_kind", text_bytes(self.proved_kind)),
+            ("proved_team", optional_bytes(self.proved_team.as_deref())),
+            ("proved_groups", array_bytes(self.proved_groups.as_deref())),
+            (
+                "proved_delegation_team",
+                optional_bytes(self.proved_delegation_team.as_deref()),
+            ),
+            (
+                "claimed_acting_person",
+                optional_bytes(self.claimed_acting_person.as_deref()),
+            ),
+            ("claimed_team", optional_bytes(self.claimed_team.as_deref())),
+            ("instance", text_bytes(&self.instance)),
+            ("kind", text_bytes(self.kind)),
+            ("allowance_ms", INTEGER_BYTES),
+            ("credential_mode", optional_bytes(self.credential_mode)),
+            (
+                "credential_principal",
+                optional_bytes(self.credential_principal.as_deref()),
+            ),
+        ]
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
@@ -273,15 +411,15 @@ impl ListRow {
         "SELECT kind FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
 
     /// The columns for `record`, as the row `id`. Refuses an identifier that is not a UUID in
-    /// the lowercase hyphenated form, a text value holding U+0000, and a count past the
-    /// column's range, as begin does.
+    /// the lowercase hyphenated form, a text value holding U+0000, a count past the column's
+    /// range, and a row over [`MAX_ROW_BYTES`], as begin does.
     pub fn from_record(id: &AuditRowId, record: &ListRecord) -> Result<Self, PgAuditError> {
         if !is_uuid(id.as_str()) {
             return Err(PgAuditError::Column("id"));
         }
         let principal = record.proved_principal.get();
         let (proved_kind, proved_team, proved_groups) = principal_kind(principal)?;
-        Ok(Self {
+        let row = Self {
             id: id.as_str().to_owned(),
             deployment: stored("deployment", record.deployment.as_str())?,
             surface: stored("surface", record.surface.as_str())?,
@@ -321,7 +459,37 @@ impl ListRow {
             listed_omitted: i64::try_from(record.tools_omitted).map_err(|_| {
                 PgAuditError::Column("a count of tools left out past the column's range")
             })?,
-        })
+        };
+        within_bound(&row.sizes())?;
+        Ok(row)
+    }
+
+    /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them.
+    pub fn sizes(&self) -> [(&'static str, usize); 16] {
+        [
+            ("id", text_bytes(&self.id)),
+            ("deployment", text_bytes(&self.deployment)),
+            ("surface", text_bytes(&self.surface)),
+            ("profile", text_bytes(&self.profile)),
+            ("policy_revision", text_bytes(&self.policy_revision)),
+            ("proved_issuer", text_bytes(&self.proved_issuer)),
+            ("proved_subject", text_bytes(&self.proved_subject)),
+            ("proved_kind", text_bytes(self.proved_kind)),
+            ("proved_team", optional_bytes(self.proved_team.as_deref())),
+            ("proved_groups", array_bytes(self.proved_groups.as_deref())),
+            (
+                "proved_delegation_team",
+                optional_bytes(self.proved_delegation_team.as_deref()),
+            ),
+            (
+                "claimed_acting_person",
+                optional_bytes(self.claimed_acting_person.as_deref()),
+            ),
+            ("claimed_team", optional_bytes(self.claimed_team.as_deref())),
+            ("instance", text_bytes(&self.instance)),
+            ("listed_tools", json_bytes(&self.listed_tools)),
+            ("listed_omitted", INTEGER_BYTES),
+        ]
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
@@ -513,6 +681,59 @@ impl FinishRow {
             && Some(self.latency_ms) == latency_ms
     }
 }
+
+/// The largest call row the gateway can begin, as [`MAX_ROW_BYTES`] counts it: every capped
+/// value at its cap, with the values that have no cap short, and `policy_revision`, which has
+/// none, as long as it must be for the row to hold `bytes`, which must leave it room.
+#[cfg(test)]
+pub(crate) fn largest_record(bytes: usize) -> AuditRecord {
+    // Escaped values are cut with `…`. A backslash is escaped again in JSON, so a value of
+    // backslashes is the longest JSON a recorded resource can be.
+    let cut = |text: &str, chars: usize| format!("{}…", text.repeat(chars));
+    let resource = json!({
+        "system": cut("\\", 128),
+        "kind": cut("\\", 128),
+        "identifier": cut("\\", 2048),
+    });
+    let mut record: AuditRecord = serde_json::from_value(json!({
+        "kind": "call",
+        "instance": cut("i", 128),
+        "call_deadline_ms": 60_000,
+        "tool_use_id": "t".repeat(128),
+        "deployment": "largest",
+        "surface": cut("s", 128),
+        "profile": "largest",
+        "tool": cut("x", 128),
+        "connector": "largest",
+        "classification": "destructive",
+        "resources": {"named": vec![resource; gateway_core::audit::MAX_RECORDED_RESOURCES]},
+        "resources_omitted": 1,
+        "decision": "deny",
+        "reason": "classification_not_permitted",
+        "sentence": "d".repeat(1_046),
+        "policy_revision": "",
+        "proved_principal": {
+            "id": {"issuer": "largest", "subject": "u".repeat(8_192)},
+            "kind": "user",
+            "groups": (1..=4).map(|n| format!("{n}{}", "g".repeat(2_047))).collect::<Vec<_>>()
+        },
+        "proved_delegation_team": null,
+        "claimed_acting_person": null,
+        "claimed_team": null,
+        "credential": {"mode": "team_service_identity", "principal": "largest"},
+        "completion": null
+    }))
+    .expect("the largest record is a record");
+    let row = BeginRow::from_record(&AuditRowId::new(LARGEST_ID), &record, &Budgets::default())
+        .expect("the largest record without its revision fits");
+    let held: usize = row.sizes().iter().map(|(_, bytes)| bytes).sum();
+    record.policy_revision = "r".repeat(bytes - held).as_str().into();
+    record
+}
+
+/// The identifier [`largest_record`] is counted under: a UUID, as every row's is.
+#[cfg(test)]
+pub(crate) const LARGEST_ID: &str = "0199c3a2-7b1e-7c3d-9f00-00000000000f";
 
 #[cfg(test)]
 mod tests {
@@ -924,6 +1145,140 @@ mod tests {
             ListRow::from_record(&id(), &record),
             Err(PgAuditError::Column(_))
         ));
+    }
+
+    /// Decision 0014, section 7: the largest row a call can make, every capped value at its
+    /// cap, fits in 512 KiB with room for the values that have no cap, as [`MAX_ROW_BYTES`]
+    /// works out; a row at the bound is begun, and a row a byte over it is refused, naming its
+    /// largest column.
+    #[test]
+    fn the_largest_row_fits_and_a_row_over_the_bound_is_refused_naming_its_largest_column() {
+        assert_eq!(MAX_ROW_BYTES, 524_288);
+        let at_bound = largest_record(MAX_ROW_BYTES);
+        let row = BeginRow::from_record(&AuditRowId::new(LARGEST_ID), &at_bound, &budgets())
+            .expect("a row at the bound is begun");
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes.values().sum::<usize>(), MAX_ROW_BYTES);
+        // Each capped value at the cap the arithmetic counts.
+        assert_eq!(sizes["resources"], 298_049);
+        assert_eq!(sizes["proved_subject"] + sizes["proved_groups"], 16_384);
+        assert_eq!(sizes["sentence"], 1_046);
+        assert_eq!(sizes["tool_use_id"], 128);
+        for column in ["surface", "tool", "instance"] {
+            assert_eq!(sizes[column], 131, "{column}");
+        }
+        for (column, most) in [
+            ("id", 36),
+            ("reason", 28),
+            ("credential_mode", 21),
+            ("classification", 11),
+            ("proved_kind", 8),
+            ("decision", 5),
+            ("kind", 4),
+            ("resources_omitted", 8),
+            ("allowance_ms", 8),
+        ] {
+            assert!(sizes[column] <= most, "{column}: {}", sizes[column]);
+        }
+        let capped = 298_049 + 16_384 + 1_046 + 128 + 3 * 131 + 36 + 28 + 21 + 11 + 8 + 5 + 4 + 16;
+        assert_eq!(capped, 316_129);
+        assert_eq!(MAX_ROW_BYTES - capped, 208_159);
+        // The resources' JSON is what the store sends: the decision's 298,059 bytes counted 10
+        // too many.
+        assert_eq!(row.resources.to_string().len(), 298_049);
+
+        let mut over = at_bound.clone();
+        over.policy_revision = format!("{}r", over.policy_revision).as_str().into();
+        match BeginRow::from_record(&AuditRowId::new(LARGEST_ID), &over, &budgets()) {
+            Err(PgAuditError::RowTooLarge { column, bytes }) => {
+                assert_eq!((column, bytes), ("resources", MAX_ROW_BYTES + 1));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            PgAuditError::RowTooLarge {
+                column: "resources",
+                bytes: MAX_ROW_BYTES + 1
+            }
+            .to_string(),
+            "the audit row would hold 524289 bytes, more than the 524288 a row may hold, so it \
+             is not written; its largest column is resources"
+        );
+    }
+
+    /// A row over the bound names whichever column is largest, a value with no cap of its own
+    /// included, and a list row is bounded as a call row is.
+    #[test]
+    fn a_row_over_the_bound_names_its_largest_column() {
+        let mut record = allowed_workload();
+        record.policy_revision = "r".repeat(MAX_ROW_BYTES).as_str().into();
+        assert!(matches!(
+            BeginRow::from_record(&id(), &record, &budgets()),
+            Err(PgAuditError::RowTooLarge {
+                column: "policy_revision",
+                ..
+            })
+        ));
+        let mut record = allowed_workload();
+        record.deployment = "d".repeat(MAX_ROW_BYTES / 2).as_str().into();
+        record.profile = "p".repeat(MAX_ROW_BYTES / 2 + 1).as_str().into();
+        assert!(matches!(
+            BeginRow::from_record(&id(), &record, &budgets()),
+            Err(PgAuditError::RowTooLarge {
+                column: "profile",
+                ..
+            })
+        ));
+
+        let row = ListRow::from_record(&id(), &list_record()).unwrap();
+        let held: usize = row.sizes().iter().map(|(_, bytes)| bytes).sum();
+        let mut list = list_record();
+        list.deployment = "d"
+            .repeat(MAX_ROW_BYTES - held + "fixture".len())
+            .as_str()
+            .into();
+        let row = ListRow::from_record(&id(), &list).expect("a list row at the bound is written");
+        assert_eq!(
+            row.sizes().iter().map(|(_, bytes)| bytes).sum::<usize>(),
+            MAX_ROW_BYTES
+        );
+        list.deployment = format!("{}d", list.deployment).as_str().into();
+        match ListRow::from_record(&id(), &list) {
+            Err(PgAuditError::RowTooLarge { column, bytes }) => {
+                assert_eq!((column, bytes), ("deployment", MAX_ROW_BYTES + 1));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Each value counts as the store sends it: text as its UTF-8, a text array as its
+    /// elements', JSON as its JSON text, and each integer as 8 bytes.
+    #[test]
+    fn each_value_counts_its_bytes_as_the_store_sends_it() {
+        let row = BeginRow::from_record(&id(), &denied_user_with_delegation(), &budgets()).unwrap();
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes.len(), row.parameters().len());
+        assert_eq!(sizes["id"], 36);
+        assert_eq!(sizes["tool_use_id"], "toolu_01".len());
+        assert_eq!(sizes["proved_groups"], "group-g".len() + "group-h".len());
+        assert_eq!(sizes["proved_team"], 0);
+        assert_eq!(sizes["resources"], row.resources.to_string().len());
+        assert_eq!(sizes["allowance_ms"], 8);
+        assert_eq!(sizes["resources_omitted"], 8);
+        assert_eq!(sizes["credential_mode"], "gateway_token".len());
+        let mut record = denied_user_with_delegation();
+        record.sentence = Some("caf\u{e9}".into());
+        let row = BeginRow::from_record(&id(), &record, &budgets()).unwrap();
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes["sentence"], 5);
+
+        let row = ListRow::from_record(&id(), &list_record()).unwrap();
+        let sizes: std::collections::BTreeMap<&str, usize> = row.sizes().into_iter().collect();
+        assert_eq!(sizes.len(), row.parameters().len());
+        assert_eq!(
+            sizes["listed_tools"],
+            r#"["fixture__read","fixture__write"]"#.len()
+        );
     }
 
     #[test]
