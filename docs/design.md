@@ -703,14 +703,25 @@ written complete, has no finish, and is never open.
   counts the escaped values, not what a store writes. JSON escapes a value's backslashes and
   quotes again, so as JSON they reach 297,665 characters, or 298,049 bytes, since `…` takes 3
   bytes (decision 0014 counted 298,059). Any call that gets a row can reach this, a denial
-  included, and the row is written before the tool runs. A row is at most 512 KiB, counted as
-  the bytes of the values the Postgres store sends, which holds this with room for the rest of
-  the row ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). The
-  Postgres store refuses a row over the bound, naming its largest column, so the call is
-  refused. Every value a caller chooses is capped, and in the largest row they take at most
-  316,129 bytes, leaving 208,159 for the values from the gateway's own configuration, which
-  have no cap of their own (`audit_postgres::MAX_ROW_BYTES` works it out, and its tests write
-  that row).
+  included, and the row is written before the tool runs. That figure is for named resources:
+  a reach is recorded as `{"reach": entry}`, and the entry is a registry connector name, which
+  has no cap, so only an operator's name, never a caller's value, can make it longer.
+- **A row is at most 512 KiB**, counted as the bytes of the values the Postgres store sends,
+  the completion included ([decision
+  0014](decisions/0014-rollout-safeguards-and-audit-operations.md), section 7). Finish cannot
+  see the row begin wrote, so begin leaves room for the completion: it refuses a call row over
+  522,203 bytes, 512 KiB less the completion's most, 2,085 (the longest outcome, 7, the
+  longest error kind, 22, the latency, 8, and the refusal sentence, which finish cuts to
+  2,048 bytes at a character boundary, marked with `…`). Every sentence the gateway makes fits
+  in 2,048 bytes with a server and tool name of 900 bytes each. A list row is never completed,
+  and is refused over 512 KiB itself. Either refusal names the row's largest column, so the
+  call or the list is refused; a reach whose entry name is long enough is refused this way,
+  naming `resources`. Every value a caller chooses is capped, and in the largest row they take
+  at most 316,129 bytes, leaving 206,074 of a begun row's 522,203 for the values from the
+  gateway's own configuration, which have no cap of their own. The largest row a call can
+  begin, finished with the longest completion, is at most 524,288 bytes
+  (`audit_postgres::MAX_ROW_BYTES` works it out, and its tests write that row, finish it and
+  read it back).
 - **Audit failure fails closed.** If the row cannot be written, the call is refused.
 - **A row is the record, or there is no row.** A store that cannot hold a value exactly refuses
   the record rather than store another value in its place, and the call is refused. Postgres
@@ -1588,7 +1599,11 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
 - The 3600 s cap on user issuers' token lifetime: built. The deployment file refuses a user
   issuer whose `max_lifetime_seconds` is over 3600, naming the issuer, the value and the cap
   ([decision 0013](decisions/0013-registry-freshness-drift-and-withdrawal.md), section 8). A
-  workload issuer's lifetime has no such ceiling. `tests/deployment.rs` has both.
+  workload issuer's lifetime has no such ceiling. `tests/deployment.rs` has both. The cap is
+  enforced where the deployment file loads, and only there: the JSON configuration's path
+  (`Config::from_json`), kept for development and tests, does not enforce it, since
+  `gateway-identity` refuses only a lifetime of 0. The release binary loads only the
+  deployment file.
 - The registration and drift probe: built. `connector_proxy::probe` sends decision 0010's
   three `tools/call` requests for `switchboard_probe_no_such_tool`, with no credential, with
   `Bearer not-a-token` and with the probe credential, held to the server's call deadline and
@@ -1634,9 +1649,13 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   replicas times begin plus finish plus 1, 21 at the defaults, plus the migrate job and readers
   (deploy/README.md, "Metrics"; decision 0014, as amended on 2026-10-12).
 - The 512 KiB row bound and its test: built. The Postgres store counts a row as the bytes of
-  the values it sends and refuses one over 512 KiB, naming its largest column, so the call is
-  refused. `audit_postgres::MAX_ROW_BYTES` works out the largest row a call can make, 316,129
-  bytes of capped values, and a test writes it at the bound to Postgres (section 11).
+  the values it sends, the completion included. Begin refuses a call row over 522,203 bytes,
+  leaving 2,085 for the completion, whose refusal sentence finish cuts to 2,048 bytes; list
+  refuses a list row, which is never completed, over 512 KiB. Each refusal names the row's
+  largest column, so the call is refused. `audit_postgres::MAX_ROW_BYTES` works out the
+  largest row a call can make, 316,129 bytes of capped values, and a test writes it at begin's
+  bound to Postgres, finishes it with the longest completion and reads it back within 512 KiB
+  (section 11).
 - The decision 0014 signals other than each issuer's key age: built. The calls shed by scope
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and

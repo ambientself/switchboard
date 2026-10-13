@@ -206,6 +206,11 @@ pub const DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT: usize = 8;
 
 /// The longest a user issuer may let its tokens live, in seconds (decision 0013, section 8):
 /// the groups a user's token carries are as fresh as the token.
+///
+/// The cap is enforced here, where the deployment file loads, and nowhere else. The JSON
+/// configuration's path ([`Config::from_json`](crate::Config::from_json)), kept for
+/// development and tests, does not enforce it: `gateway-identity` refuses only a lifetime of
+/// 0. The release binary loads only the deployment file.
 pub const MAX_USER_LIFETIME_SECONDS: u64 = 3600;
 
 /// The most connections `audit.begin_pool_size` or `audit.finish_pool_size` may give a pool:
