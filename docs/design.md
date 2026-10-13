@@ -1990,10 +1990,10 @@ that can do what Postgres cannot tests nothing.
 2. The stored row is exactly the record given, including the resources. A record the store
    cannot hold exactly, such as one with U+0000 in a text value, is refused at begin and
    leaves no row. The fake must refuse the same records. It refuses what the Postgres store's
-   column mapping refuses, but for two of its refusals: it holds neither the 512 KiB row bound
-   (begin's 522,203 bytes for a call row, 512 KiB for a list row) nor the 2,048-byte cap on a
-   refusal sentence at finish, so a test on the fake can write a row or a completion that the
-   Postgres store refuses. Of the table's own constraints, it checks only the shape of unknown
+   column mapping refuses, the 512 KiB row bound (begin's 522,203 bytes for a call row, 512 KiB
+   for a list row) and the 2,048-byte cap on a refusal sentence at finish included. It counts a
+   row with copies of that store's constants and count, which a test in `audit-postgres` checks
+   against the originals. Of the table's own constraints, it checks only the shape of unknown
    resources so far.
 3. `finish` completes a row once, accepts an identical repeat, refuses a different one, and
    touches only the completion columns. A refusal is a returned error, not a panic.
