@@ -1112,7 +1112,8 @@ fn cases() -> Vec<Case> {
             Want::Loads,
         ),
         // Withdrawal removes a tool's approval (decision 0013, section 8). The reach check's
-        // tool, and an entry's last tool, can be withdrawn without touching the reach check.
+        // tool, with every other tool of its entry, can be withdrawn without touching the
+        // reach check.
         case(
             "withdrawing the reach check's tool, the entry's last, loads",
             |t| {
@@ -1121,8 +1122,71 @@ fn cases() -> Vec<Case> {
             },
             Want::Loads,
         ),
+        // Alone, it cannot: the entry's other tools would be served under a credential whose
+        // reach is never checked again. Here the wiki server's reach check calls its page tool.
+        case(
+            "the reach check's tool approved with the entry's other tools loads",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                )
+            },
+            Want::Loads,
+        ),
+        case(
+            "withdrawing the reach check's tool and keeping another tool of the entry",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                );
+                at(t, "tools").as_array_mut().unwrap().remove(2);
+                set(t, "surfaces.1", "tools", value("[]"));
+            },
+            Want::Error(E::ReachCheckUnapproved {
+                server: "wiki-server".into(),
+                tool: tool("wiki__page"),
+            }),
+        ),
+        case(
+            "withdrawing every tool of the entry, the reach check's with them, loads",
+            |t| {
+                set(
+                    t,
+                    "servers.1",
+                    "reach_check",
+                    value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+                );
+                at(t, "tools").as_array_mut().unwrap().truncate(1);
+                set(t, "surfaces.0", "tools", value("[\"docs__read\"]"));
+                set(t, "surfaces.1", "tools", value("[]"));
+            },
+            Want::Loads,
+        ),
+        // Another entry's approved tools do not count: the docs server's reach check calls a
+        // tool that was never approved and its one tool is withdrawn, while the wiki server's
+        // tools stay.
+        case(
+            "an unapproved reach check tool on an entry whose tools are all withdrawn loads",
+            |t| {
+                set(
+                    t,
+                    "servers.0.reach_check",
+                    "tool",
+                    value("\"docs__canary\""),
+                );
+                at(t, "tools").as_array_mut().unwrap().remove(0);
+                set(t, "surfaces.0", "tools", value("[\"wiki__search\"]"));
+            },
+            Want::Loads,
+        ),
         // The reach check calls one of the entry's own tools: its name is under the server's
-        // system, though the tool need not be approved.
+        // system.
         case(
             "a reach check naming another server's tool",
             |t| {
@@ -1167,7 +1231,10 @@ fn cases() -> Vec<Case> {
                     value("\"docs__canary\""),
                 )
             },
-            Want::Loads,
+            Want::Error(E::ReachCheckUnapproved {
+                server: "docs-server".into(),
+                tool: tool("docs__canary"),
+            }),
         ),
         // The destination against the address's scheme (decision 0013, section 3).
         case(
@@ -1862,6 +1929,28 @@ fn a_reach_check_outside_the_system_is_refused_naming_the_server_and_the_tool() 
         message,
         "server `docs-server`'s reach check calls `wiki__search`, which is not one of its own \
          tools: name it `docs__<tool>`, after the server's system"
+    );
+}
+
+/// The refusal of an entry whose reach check's tool is withdrawn while another of its tools is
+/// approved names the server and the tool, and says how to withdraw them.
+#[test]
+fn a_reach_check_tool_withdrawn_alone_is_refused_naming_the_server_and_the_tool() {
+    let mut table = base();
+    set(
+        &mut table,
+        "servers.1",
+        "reach_check",
+        value("{ tool = \"wiki__page\", arguments = { space = \"ops\" } }"),
+    );
+    at(&mut table, "tools").as_array_mut().unwrap().remove(2);
+    set(&mut table, "surfaces.1", "tools", value("[]"));
+    let message = load(&table).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        "server `wiki-server`'s reach check calls `wiki__page`, which is not approved, and other \
+         tools of the server are: remove the server's approvals together, or name another tool \
+         in its reach check"
     );
 }
 

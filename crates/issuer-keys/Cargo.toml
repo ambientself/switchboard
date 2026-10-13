@@ -34,6 +34,11 @@ url = "2"
 [dev-dependencies]
 # A CA and its leaf certificates, made when a test runs: no key is checked in.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# Holds a loopback port with a socket bound to it without SO_REUSEADDR and connected to a peer
+# of its own, so nothing listens there and connections to it are refused (tests/fetch.rs,
+# closed_port). On Linux no other socket can bind the port while it is held; on macOS a socket
+# that sets SO_REUSEADDR can still bind it by number.
+socket2 = "0.6"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }
 # The loopback HTTPS server the tests fetch from.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
