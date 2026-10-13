@@ -2682,10 +2682,55 @@ mutate("proxy-server-text-uncut", "the server's text reaches the caller at any l
 mutate("proxy-server-control-characters-kept", "the server's control characters reach the caller", PO,
        "        .map(|c| if c.is_control() { ' ' } else { c })\n", "")
 # Configuration.
-mutate("proxy-https-accepted", "a URL of any scheme is accepted", PC,
-       '    let acceptable = endpoint.scheme_str() == Some("http")\n', "    let acceptable = endpoint.scheme_str().is_some()\n")
-mutate("proxy-user-information-accepted", "a URL carrying a user name or password is accepted", PC,
+PT = PROXY + "src/transport.rs"
+PD = PROXY + "src/destination.rs"
+mutate("proxy-https-refused", "an https URL is refused, so no server outside the cluster can be reached", PT,
+       '    let acceptable = matches!(endpoint.scheme_str(), Some("http" | "https"))\n',
+       '    let acceptable = endpoint.scheme_str() == Some("http")\n')
+mutate("proxy-user-information-accepted", "a URL carrying a user name or password is accepted", PT,
        "        && !authority.as_str().contains('@');", ";")
+# Where the connector connects (decision 0013, sections 2 and 3). tests/destinations.rs, and the
+# unit tests in destination.rs and transport.rs, watch each.
+mutate("proxy-ca-ignored", "the CA file the deployment names is not trusted, so no https server is reached", PT,
+       "    let roots = trusted(upstream, ca_file)?;\n", "    let roots = RootCertStore::empty();\n")
+mutate("proxy-name-unchecked", "the certificate is verified against a fixed name, not the server's identity", PT,
+       "        Arc::new(FixedServerNameResolver::new(identity)),\n",
+       '        Arc::new(FixedServerNameResolver::new(ServerName::try_from("localhost").unwrap())),\n')
+mutate("proxy-ca-file-for-http-accepted", "a CA file beside a plain http URL is accepted, and verifies nothing", PT,
+       "            (Some(_), false) => return Err(UpstreamError::CaFileForHttp(connector.clone())),\n",
+       "            (Some(_), false) => return Ok(Self { endpoint, sender: Sender::Plain(client(HttpConnector::new_with_resolver(CheckedResolver::new(policy)))) }),\n")
+mutate("proxy-http-for-public-accepted", "a server outside the cluster is reached over plain http", PT,
+       "                if upstream.destination != Destination::InCluster {\n",
+       "                if false {\n")
+mutate("proxy-literal-unchecked", "an IP literal in the URL is never checked, since it is never resolved", PT,
+       "            && let Some(refusal) = policy.refusal(address)\n",
+       "            && let Some(refusal) = policy.refusal(address).filter(|_| false)\n")
+mutate("proxy-loopback-allowed", "an IPv4 loopback address is allowed in any build", PD,
+       "    let [first, second, ..] = address.octets();\n    if address.is_loopback() {\n",
+       "    let [first, second, ..] = address.octets();\n    if false {\n")
+mutate("proxy-link-local-allowed", "an IPv6 link-local address, fe80::/10, is allowed", PD,
+       "    } else if address.is_unicast_link_local() {\n", "    } else if false {\n")
+mutate("proxy-metadata-allowed", "an IPv4 link-local address, the metadata address 169.254.169.254 among them, is allowed", PD,
+       "    } else if address.is_link_local() {\n", "    } else if false {\n")
+mutate("proxy-private-allowed-for-public", "a private address is allowed for a server outside the cluster", PD,
+       "        Refusal::Private if destination == Destination::InCluster => None,\n",
+       "        Refusal::Private => None,\n")
+mutate("proxy-mapped-v6-not-unwrapped", "an IPv6 address carrying an IPv4 one is judged as IPv6, so ::ffff:127.0.0.1 and ::ffff:169.254.169.254 pass", PD,
+       "        class_v4(carried)\n", "        let _ = carried;\n        None\n")
+mutate("proxy-re-resolves", "the name is resolved again after the check, and the second answer is the one connected to", PD,
+       "            Ok(checked.into_iter())\n",
+       "            let _ = checked;\n"
+       "            Ok(inner.call(name).await.map_err(Into::into)?.collect::<Vec<_>>().into_iter())\n")
+mutate("proxy-retry-enabled", "a request the client believes the server never saw is sent again on a new connection", PT,
+       "        .retry_canceled_requests(false)\n", "        .retry_canceled_requests(true)\n")
+mutate("proxy-loopback-allowed-in-release", "loopback is allowed whatever the connector is told, so a release build reaches it", PD,
+       "        Refusal::Loopback if loopback != Loopback::Refused => None,\n",
+       "        Refusal::Loopback => None,\n")
+mutate("proxy-default-in-cluster", "a server whose destination is never set may use plain http and private addresses", PC,
+       "            destination: Destination::Public,\n", "            destination: Destination::InCluster,\n")
+mutate("proxy-destination-refusal-unreported", "a call refused for its address is reported as a server that could not be reached", PC,
+       "                ToolOutcome::error(ErrorKind::Other, outcome::DESTINATION_REFUSED)\n",
+       "                ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE)\n")
 mutate("proxy-no-tools-accepted", "a server exposing no tools is accepted", PC, "        if tools.is_empty() {", "        if false {")
 mutate("proxy-empty-upstream-name-accepted", "an empty upstream name is accepted", PC,
        ".find(|(_, upstream)| upstream.is_empty())", ".find(|_| false)")
@@ -4404,6 +4449,18 @@ mutate("gw-start-audit-unchecked", "the audit store serves without its boot chec
 mutate("gw-start-postgres-ignored", "audit set to Postgres connects to nothing", START,
        "        AuditChoice::Postgres { url } => Some(audit_store(url).await?),",
        "        AuditChoice::Postgres { .. } => None::<Arc<PgAuditStore>>,")
+# Where each server is reached, checked before anything is read or connected to (decision 0013,
+# section 3). start.rs's own tests watch each.
+mutate("gw-start-ca-file-optional-for-https", "an https server with no CA file passes the start's check", START,
+       "            (true, false) => return Err(StartError::NoCaFile(server.name.clone())),\n",
+       "            (true, false) => {}\n")
+mutate("gw-start-ca-file-for-http-accepted", "a CA file for an http server passes the start's check", START,
+       "            (false, true) => return Err(StartError::CaFileForHttp(server.name.clone())),\n",
+       "            (false, true) => {}\n")
+mutate("gw-start-destination-not-passed", "each server's connector is built with the default destination, not its entry's, so an in_cluster server is held to the public class", START,
+       "        upstream.destination = destination(server.destination);\n", "")
+mutate("gw-start-destinations-unchecked", "where each server is reached is not checked until its connector is built, after its credential is read", START,
+       "    destinations(&registry, &deployment.ca_files, loopback)?;\n", "")
 
 mutate("gw-proxied-undeclared-forwarded", "a call with an undeclared argument is sent anyway", PROXIED,
        "            Err(outcome) => Box::pin(std::future::ready(outcome)),",
@@ -4631,7 +4688,8 @@ RELEASE_BUILD_LINE = "    cargo build --release --locked -p gateway --bin switch
 mutate("release-build-test-support", "the image's switchboard is built with test-support", DOCKERFILE,
        RELEASE_BUILD_LINE, "    cargo build --release --locked -p gateway --bin switchboard --features gateway/test-support; \\\n")
 mutate("release-build-test-support-default", "test-support is a default feature of the gateway", "crates/gateway/Cargo.toml",
-       "[features]\ntest-support = []\n", '[features]\ndefault = ["test-support"]\ntest-support = []\n')
+       '[features]\ntest-support = ["connector-proxy/test-support"]\n',
+       '[features]\ndefault = ["test-support"]\ntest-support = ["connector-proxy/test-support"]\n')
 mutate("release-build-workspace", "the image's switchboard is built with the workspace, taking its features", DOCKERFILE,
        RELEASE_BUILD_LINE, "    cargo build --release --locked --workspace --bins; \\\n")
 

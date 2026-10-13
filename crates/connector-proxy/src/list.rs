@@ -38,6 +38,10 @@ pub enum ListError {
     /// The server could not be connected to, or the exchange failed before an answer began.
     #[error("the server could not be reached")]
     Unreachable,
+    /// Every address the server's name resolved to is one the gateway does not connect to.
+    /// Nothing was sent.
+    #[error("the gateway does not connect to the address the server's name resolved to")]
+    DestinationRefused,
     /// The server answered with a status other than `200`. A redirect is not followed.
     #[error("the server answered with HTTP status {0}")]
     Status(u16),

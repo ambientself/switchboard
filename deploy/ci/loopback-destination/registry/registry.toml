@@ -1,0 +1,69 @@
+# CI's check of the release artifact (decision 0013, section 3): one in_cluster server on
+# loopback, which only a development build may reach. The release `switchboard` must refuse it
+# when it checks where each server is reached, before it reads a credential, fetches a key or
+# connects to anything. Every other field satisfies the loader, so that is the only refusal.
+# Nothing is reached. Every value here is a dummy.
+
+revision = "loopback-destination-1"
+
+# No profiles or rules: the gateway refuses before any caller could be given one.
+profiles = []
+profile_rules = []
+
+[[servers]]
+name = "mock-docs"
+system = "docs"
+owner = "platform"
+# Port 9 (discard) on loopback. Never connected to. The identity is the address's host.
+identity = "127.0.0.1"
+address = "http://127.0.0.1:9/mcp"
+credential = { mode = "team_service_identity", reference = "docs-credential", principal = "docs-team-a" }
+narrowing = "none"
+permits = "read"
+reach = [{ system = "docs", kind = "project", identifier = "atlas" }]
+destination = "in_cluster"
+# A dummy, like the reach test: nothing is there to probe. The loader needs a record.
+probe = { result = "refused", date = 2026-10-12 }
+
+[servers.reach_test]
+date = 2026-10-12
+record = "a dummy: nothing is reached"
+
+[servers.reach_check]
+tool = "docs__read_document"
+arguments = { project = "borealis", document = "plan" }
+
+[[tools]]
+name = "docs__read_document"
+server = "mock-docs"
+upstream_name = "read_document"
+classification = "read"
+title = "Read a document"
+description = "Reads one document in one project."
+approved_by = "ci-approver@example.test"
+approved_at = 2026-10-12T00:00:00Z
+definition_sha256 = "21beae63eb41232feea16057559d1de8d28115e68f827505a9d7e45b7b7aa942"
+binding_sha256 = "1652b446ad82a051916a72396ca2f0e68e6d72221d47baa489709852407b7a40"
+resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+
+[tools.input_schema]
+type = "object"
+required = ["project", "document"]
+additionalProperties = false
+
+[tools.input_schema.properties.project]
+type = "string"
+description = "The project, such as `atlas`."
+
+[tools.input_schema.properties.document]
+type = "string"
+description = "The document, such as `plan`."
+
+[[surfaces]]
+name = "docs"
+tools = ["docs__read_document"]
+teams = ["team-a"]
+principals = "any_in_teams_and_groups"
+
+[limits.teams]
+team-a = [{ system = "docs", kind = "project", identifier = "atlas" }]

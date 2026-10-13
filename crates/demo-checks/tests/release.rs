@@ -1,17 +1,18 @@
 //! The release `switchboard` is never a development build (decision 0009, design section 12).
 //!
 //! A build with the gateway's `test-support` feature is exempt from the receipt-store gate, so
-//! it serves tools not classified `read` with no receipt store, and it accepts the identity and
-//! audit opt-outs (decision 0014). Cargo unifies features across the packages of one build, and
-//! crates/gateway-dev turns `test-support` on, so a workspace build of `switchboard` would be
-//! one. deploy/Dockerfile builds it on its own, with `-p gateway` and no features, and copies it
-//! out before anything else is built; CI builds it with the same command and checks that the
-//! binary refuses each opt-out, which only a development build accepts, and a proxied `propose`
-//! tool as its registry loads (decision 0011, rule 2). The receipt-store gate cannot be reached
-//! from a registry until built-in connectors exist: rule 2 refuses every proxied tool not
-//! classified `read` first. These tests pin the command in both places, the three
-//! configurations CI starts it with and the refusal each must name, and the feature's absence
-//! from the gateway's defaults.
+//! it serves tools not classified `read` with no receipt store, it accepts the identity and
+//! audit opt-outs (decision 0014), and, through connector-proxy's own `test-support`, it may
+//! reach a server on loopback (decision 0013, section 3). Cargo unifies features across the
+//! packages of one build, and crates/gateway-dev turns `test-support` on, so a workspace build
+//! of `switchboard` would be one. deploy/Dockerfile builds it on its own, with `-p gateway` and
+//! no features, and copies it out before anything else is built; CI builds it with the same
+//! command and checks that the binary refuses each opt-out and a server on loopback, which only
+//! a development build accepts, and a proxied `propose` tool as its registry loads (decision
+//! 0011, rule 2). The receipt-store gate cannot be reached from a registry until built-in
+//! connectors exist: rule 2 refuses every proxied tool not classified `read` first. These tests
+//! pin the command in both places, the four configurations CI starts it with and the refusal
+//! each must name, and the feature's absence from the defaults.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -116,7 +117,7 @@ fn ci_checks_the_binary_the_dockerfile_builds() {
 
 /// Each configuration CI starts the release binary with, the stderr file its step writes, and
 /// the start of the refusal it must name.
-const REFUSALS: [(&str, &str, &str); 3] = [
+const REFUSALS: [(&str, &str, &str); 4] = [
     (
         "proxied-propose",
         "proxied-propose-stderr.txt",
@@ -132,6 +133,12 @@ const REFUSALS: [(&str, &str, &str); 3] = [
         "audit-disabled",
         "audit-disabled-stderr.txt",
         "refused to start: audit is disabled, which only a development build allows",
+    ),
+    (
+        "loopback-destination",
+        "loopback-destination-stderr.txt",
+        "refused to start: server `mock-docs`: the gateway does not connect to 127.0.0.1, a \
+         loopback address",
     ),
 ];
 
@@ -188,7 +195,16 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
         "{audit}"
     );
     assert!(audit.contains("[audit]\nmode = \"disabled\"\n"), "{audit}");
-    for text in [&proxied, &identity] {
+    let loopback = file("loopback-destination");
+    assert!(
+        loopback.contains("[identity]\nmode = \"enforce\"\n"),
+        "{loopback}"
+    );
+    assert!(
+        loopback.contains("[audit]\nmode = \"postgres\"\n"),
+        "{loopback}"
+    );
+    for text in [&proxied, &identity, &loopback] {
         assert!(
             text.contains("url_env = \"SWITCHBOARD_CI_DATABASE_URL\""),
             "{text}"
@@ -201,8 +217,18 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
             assert!(registry.contains(empty), "{config}: {registry}");
         }
     }
+    // The loopback configuration's one server is an in-cluster entry on loopback, serving a
+    // read tool, so where it is reached is the only refusal.
+    let registry = read("deploy/ci/loopback-destination/registry/registry.toml");
+    for line in [
+        "address = \"http://127.0.0.1:9/mcp\"",
+        "destination = \"in_cluster\"",
+        "classification = \"read\"",
+    ] {
+        assert!(registry.contains(line), "{line}: {registry}");
+    }
     // The keys are public only: no private parameter of an EC or RSA key.
-    for config in ["proxied-propose", "audit-disabled"] {
+    for config in ["proxied-propose", "audit-disabled", "loopback-destination"] {
         let keys: Value =
             serde_json::from_str(&read(&format!("deploy/ci/{config}/jwks.json"))).unwrap();
         for key in keys["keys"].as_array().unwrap() {
@@ -238,7 +264,21 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
         .iter()
         .find(|package| package["name"] == json!("gateway"))
         .unwrap();
-    assert_eq!(gateway["features"]["test-support"], json!([]));
+    // It turns on only connector-proxy's own, which alone lets a connector reach loopback.
+    assert_eq!(
+        gateway["features"]["test-support"],
+        json!(["connector-proxy/test-support"])
+    );
+    let connector = packages
+        .iter()
+        .find(|package| package["name"] == json!("connector-proxy"))
+        .unwrap();
+    assert_eq!(connector["features"]["test-support"], json!([]));
+    let defaults = connector["features"]["default"].as_array();
+    assert!(
+        defaults.is_none_or(|defaults| defaults.is_empty()),
+        "connector-proxy has default features: {defaults:?}"
+    );
     let defaults = gateway["features"]["default"].as_array();
     assert!(
         defaults.is_none_or(|defaults| defaults.is_empty()),
@@ -249,6 +289,9 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
     for dependency in gateway["dependencies"].as_array().unwrap() {
         if dependency["kind"] != json!("dev") {
             assert_ne!(dependency["name"], json!("gateway"), "{dependency}");
+            if dependency["name"] == json!("connector-proxy") {
+                assert_eq!(dependency["features"], json!([]), "{dependency}");
+            }
         }
     }
 }

@@ -12,7 +12,8 @@
 //!   - `OversizedOrLateRead` for the deadline, the size cap or an answer broken off, from a
 //!     tool classified `read`, and `Other` for the same from any other tool;
 //!   - `Other` for everything else that went wrong on the gateway's side or the server's: a
-//!     connection that failed, a credential the server did not accept, any other HTTP status,
+//!     connection that failed or was refused for its address ([`DESTINATION_REFUSED`]), a
+//!     credential the server did not accept, any other HTTP status,
 //!     an answer that is not MCP, a JSON-RPC error, and a tool result marked `isError`.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
@@ -48,6 +49,11 @@ pub const NOT_SENT: &str =
 
 /// The server could not be connected to, or the exchange failed before an answer began.
 pub const UNREACHABLE: &str = "The gateway could not reach this tool's server.";
+
+/// Every address the server's name resolved to is one the gateway does not connect to, such
+/// as a loopback or link-local address ([`destination`](crate::destination)). Nothing was sent.
+pub const DESTINATION_REFUSED: &str = "The gateway does not connect to the address this tool's \
+                                       server's name resolved to, so nothing was sent.";
 
 /// The call reached its deadline and was abandoned. The server may still have acted on it.
 pub const TIMED_OUT: &str =

@@ -1,0 +1,44 @@
+# CI's check of the release artifact: `switchboard --config=deploy/ci/loopback-destination/gateway.toml`
+# must exit 1, refusing a proxied server whose address is on loopback, which only a development
+# build may reach (decision 0013, section 3). Nothing else is refused before that check:
+# identity is enforced against a checked-in public key, audit names a database CI never
+# reaches, and the registry serves one read tool. Where the gateway connects is checked before
+# it reads a credential or connects to anything, so the refusal comes first. The format is in
+# crates/gateway/src/deployment.rs. Every value here is a dummy.
+
+deployment = "ci-loopback-destination"
+listen = "127.0.0.1:0"
+
+[http]
+allowed_hosts = ["localhost"]
+allowed_origins = []
+
+[registry]
+file = "registry/registry.toml"
+poll_seconds = 2
+
+[identity]
+mode = "enforce"
+
+# A key set holding one public key only. Nobody holds its private key: it was generated, its
+# public half written here, and the rest thrown away. No token can be signed for it.
+[[identity.issuers]]
+issuer = "https://ci-issuer.switchboard.test"
+kind = "workload"
+audiences = ["switchboard"]
+algorithm = "ES256"
+keys_file = "jwks.json"
+subjects_file = "teams.toml"
+max_lifetime_seconds = 3600
+leeway_seconds = 30
+
+[audit]
+mode = "postgres"
+# CI sets this to a database URL on a port nothing listens on. It is never connected to.
+url_env = "SWITCHBOARD_CI_DATABASE_URL"
+
+[drift.probe_credentials]
+mock-docs = "dummy-probe-credential"
+
+[credentials]
+docs-credential = "dummy-credential"

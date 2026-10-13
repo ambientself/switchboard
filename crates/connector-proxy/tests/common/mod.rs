@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use connector_proxy::{FileCredentials, ProxyConnector, Upstream};
+use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
 use gateway_core::audit::{self, Answer, Begun, RequestMetadata};
 use gateway_core::{
     AuditRecord, CallContext, ConnectorName, Principal, Proved, RequestedTool, Resources, ToolName,
@@ -166,10 +166,20 @@ pub fn credentials() -> Arc<FileCredentials> {
     credentials_for(CONNECTOR, GATEWAY_TOKEN)
 }
 
+/// A server at `url`, routed to by `connector`, whose destination is `in_cluster`: the tests'
+/// local servers stand in for Services in the cluster, reached over plain `http`.
+/// [`Upstream::new`] alone is held to the `public` class.
+pub fn in_cluster(connector: &str, url: impl Into<String>) -> Upstream {
+    Upstream {
+        destination: Destination::InCluster,
+        ..Upstream::new(connector, url)
+    }
+}
+
 /// The fixture's read tools, routed to the mock server's document tools at `url`, with the
-/// default bounds.
+/// default bounds, on an `in_cluster` server.
 pub fn upstream(url: &str) -> Upstream {
-    Upstream::new(CONNECTOR, url)
+    in_cluster(CONNECTOR, url)
         .tool(ToolName::parse(READ_TOOL).unwrap(), READ_UPSTREAM)
         .tool(ToolName::parse(SCOPED_READ_TOOL).unwrap(), LIST_UPSTREAM)
 }

@@ -246,7 +246,7 @@ async fn a_tool_with_no_upstream_name_is_refused_and_nothing_is_sent() {
     let server = mock().await;
     let harness = Harness::new();
     let connector = connector(
-        Upstream::new(CONNECTOR, server.url())
+        common::in_cluster(CONNECTOR, server.url())
             .tool(ToolName::parse(READ_TOOL).unwrap(), READ_UPSTREAM),
     );
 
@@ -271,7 +271,7 @@ async fn a_tool_routed_to_another_connector_is_refused_and_nothing_is_sent() {
     let harness = Harness::new();
     // A connector for another server that happens to map the same exposed name.
     let other = ProxyConnector::new(
-        Upstream::new("other-docs", server.url())
+        common::in_cluster("other-docs", server.url())
             .tool(ToolName::parse(READ_TOOL).unwrap(), READ_UPSTREAM),
         credentials_for("other-docs", GATEWAY_TOKEN),
     )
