@@ -59,6 +59,15 @@
 //! [`TOOL_WITHDRAWN_EVENT`] at ERROR, naming the tool, its server, the cause and the base and
 //! derived revisions, and counted.
 //!
+//! **An entry's reach check tool withdrawn withdraws the entry** (decision 0011, section 4, as
+//! noted on 2026-10-12). When a withdrawal, for any cause, takes the tool an entry's
+//! `reach_check` calls, the entry's reach can no longer be checked: the check would fail
+//! without a call for as long as the tool is withdrawn. So every other tool approved on the
+//! entry is withdrawn with it, in the same policy and revision, with the cause `reach check
+//! tool withdrawn` and the field `reach_check_tool` naming that tool, and nothing is served
+//! under the entry's credential until the reach check tool is served again. Another entry's
+//! tools are not touched.
+//!
 //! **The reach check** (decision 0011, section 4; decision 0013, section 5, step 3). Each
 //! server whose registry entry has a `reach_check` is checked on its schedule, beside each
 //! poll: [`ReachCaller`] sends the check's canary, a call outside the entry's reach, through
@@ -95,10 +104,16 @@
 //! `binding_sha256` and `approved_at` ([`WithdrawalKey`]). When the registry reloader serves a
 //! new version, every standing withdrawal whose key is unchanged is applied to it, and the
 //! derived revision names the new base. One whose tool was approved again (a new `approved_at`)
-//! or removed is dropped, and logged as [`WITHDRAWAL_CLEARED_EVENT`] at INFO. Withdrawals live
-//! in this replica's memory until then, or until it restarts (section 7): a restarted replica
-//! withdraws a tool again only if its server still serves the changed definition. Each replica
-//! checks for itself; nothing is passed between them.
+//! or removed is dropped, and logged as [`WITHDRAWAL_CLEARED_EVENT`] at INFO. A tool withdrawn
+//! with its entry's reach check tool has no key of its own: its withdrawal stands while the
+//! reach check tool's does, whatever its own approval, and is dropped with it, or when the tool
+//! is removed. So a new approval of the reach check tool, or of the whole entry, clears the
+//! entry's tools; one of another tool alone does not. A tool withdrawn for a cause of its own
+//! keeps its own key either way. A reload that approves a new tool on an entry whose reach
+//! check tool is withdrawn withdraws it at once, and logs it. Withdrawals live in this
+//! replica's memory until then, or until it restarts (section 7): a restarted replica withdraws
+//! a tool again only if its server still serves the changed definition. Each replica checks for
+//! itself; nothing is passed between them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -137,6 +152,10 @@ pub const POLL_FAILED_EVENT: &str = "drift_poll_failed";
 
 /// The `event` field of the line logged for each standing withdrawal a reload drops.
 pub const WITHDRAWAL_CLEARED_EVENT: &str = "policy_withdrawal_cleared";
+
+/// What the line logged for a dropped withdrawal of a tool's own says.
+const CLEARED_MESSAGE: &str =
+    "a withdrawn tool's approval changed, so its withdrawal no longer stands";
 
 /// The `event` field of the error logged for each probe that found a server open.
 pub const SERVER_OPEN_EVENT: &str = "server_open";
@@ -324,6 +343,9 @@ pub enum Cause {
     NoLongerListed,
     /// The server answered the reach check's canary, a call outside its entry's reach.
     ReachMismatch,
+    /// The entry's reach check tool is withdrawn, so the entry's reach can no longer be
+    /// checked.
+    ReachCheckToolWithdrawn,
 }
 
 impl Cause {
@@ -333,6 +355,7 @@ impl Cause {
             Self::DefinitionChanged => "definition changed",
             Self::NoLongerListed => "no longer listed",
             Self::ReachMismatch => "reach mismatch",
+            Self::ReachCheckToolWithdrawn => "reach check tool withdrawn",
         }
     }
 
@@ -347,6 +370,11 @@ impl Cause {
                 "withdrew the tool from every surface: its entry's server answered a call outside \
                  the entry's recorded reach; narrow the credential and approve it again, or \
                  remove it from the registry"
+            }
+            Self::ReachCheckToolWithdrawn => {
+                "withdrew the tool from every surface: its entry's reach check tool is withdrawn, \
+                 so the entry's reach can no longer be checked; approve the reach check tool \
+                 again, or remove the entry's tools from the registry"
             }
         }
     }
@@ -482,6 +510,44 @@ struct Approved {
 struct Standing {
     key: WithdrawalKey,
     server: ConnectorName,
+    /// The entry's reach check tool, when the tool is withdrawn because that tool is
+    /// ([`dependents`]); `None` when it is withdrawn for a cause of its own.
+    canary: Option<ToolName>,
+}
+
+/// The tools withdrawn because their entry's reach check tool is (decision 0011, section 4,
+/// noted on 2026-10-12): every tool approved on an entry whose reach check tool is withdrawn
+/// for a cause of its own, other than that tool and those withdrawn for a cause of their own.
+/// The entry can no longer be checked, so nothing is served under its credential. They follow
+/// the reach check tool's withdrawal: they stand while it does, whatever their own approvals,
+/// and go when it goes.
+fn dependents(state: &State) -> BTreeMap<ToolName, Standing> {
+    let own = |tool: &ToolName| {
+        state
+            .standing
+            .get(tool)
+            .is_some_and(|standing| standing.canary.is_none())
+    };
+    let mut dependents = BTreeMap::new();
+    for (server, check) in &state.reach_checks {
+        if !own(&check.tool) {
+            continue;
+        }
+        for (tool, approved) in &state.approved {
+            if approved.server != *server || *tool == check.tool || own(tool) {
+                continue;
+            }
+            dependents.insert(
+                tool.clone(),
+                Standing {
+                    key: approved.key.clone(),
+                    server: server.clone(),
+                    canary: Some(check.tool.clone()),
+                },
+            );
+        }
+    }
+    dependents
 }
 
 /// Each tool `registry` approves, with its server, its upstream name and its key.
@@ -566,37 +632,69 @@ impl Withdrawals {
     }
 
     /// Serves `policy`, `registry`'s, from now on, less every standing withdrawal whose key
-    /// `registry` still approves. The rest are dropped and logged. Returns the revision served.
+    /// `registry` still approves, and the tools of each entry whose reach check tool that
+    /// leaves withdrawn ([`dependents`]). The rest are dropped and logged, and a tool newly
+    /// withdrawn with its entry's reach check tool is logged as a withdrawal. Returns the
+    /// revision served.
     pub(crate) fn load(&self, registry: &Registry, policy: ServedPolicy) -> PolicyRevision {
         let mut state = self.state();
         state.base = Arc::new(policy);
         state.approved = approved(registry);
         state.reach_checks = reach_checks(registry);
-        let mut cleared = Vec::new();
+        let before = std::mem::take(&mut state.standing);
         let approved = state.approved.clone();
-        state.standing.retain(|tool, standing| {
-            let keep = approved
-                .get(tool)
-                .is_some_and(|now| now.key == standing.key);
-            if !keep {
-                cleared.push((standing.clone(), approved.contains_key(tool)));
-            }
-            keep
-        });
+        state.standing = before
+            .iter()
+            .filter(|(tool, standing)| {
+                standing.canary.is_none()
+                    && approved
+                        .get(*tool)
+                        .is_some_and(|now| now.key == standing.key)
+            })
+            .map(|(tool, standing)| (tool.clone(), standing.clone()))
+            .collect();
+        let dependents = dependents(&state);
+        state.standing.extend(dependents);
         let revision = self.serve(&state);
-        for (standing, still_approved) in cleared {
+        let base = state.base.revision().clone();
+        // A tool whose withdrawal ended, or changed from one of its own to its reach check
+        // tool's, is cleared; one now withdrawn with its reach check tool, and not before, is
+        // withdrawn.
+        let canary = |standing: Option<&Standing>| standing.map(|standing| standing.canary.clone());
+        let mut withdrawn = Vec::new();
+        for (tool, was) in &before {
+            let now = state.standing.get(tool);
+            if canary(now) == canary(Some(was)) {
+                continue;
+            }
+            let (reason, message) = if !approved.contains_key(tool) {
+                ("no longer in the registry", CLEARED_MESSAGE)
+            } else if was.canary.is_some() {
+                (
+                    "its entry's reach check tool is no longer withdrawn",
+                    "the withdrawal of the tool's entry's reach check tool no longer stands, so \
+                     neither does the tool's",
+                )
+            } else {
+                ("approved again", CLEARED_MESSAGE)
+            };
             tracing::info!(
                 event = WITHDRAWAL_CLEARED_EVENT,
-                tool = %standing.key.tool,
-                server = %standing.server,
-                reason = if still_approved {
-                    "approved again"
-                } else {
-                    "no longer in the registry"
-                },
+                tool = %tool,
+                server = %was.server,
+                reason,
                 %revision,
-                "a withdrawn tool's approval changed, so its withdrawal no longer stands"
+                "{message}"
             );
+        }
+        for (tool, now) in &state.standing {
+            if canary(before.get(tool)) != canary(Some(now)) {
+                withdrawn.push(now.clone());
+            }
+        }
+        drop(state);
+        for standing in withdrawn {
+            self.report_withdrawal(&standing, Cause::ReachCheckToolWithdrawn, &base, &revision);
         }
         revision
     }
@@ -674,7 +772,8 @@ impl Withdrawals {
         self.withdraw(state, server, found);
     }
 
-    /// Withdraws each tool of `found`, all `server`'s, under `state`, and logs and counts each.
+    /// Withdraws each tool of `found`, all `server`'s, under `state`, and with an entry's reach
+    /// check tool the entry's other tools ([`dependents`]), and logs and counts each.
     fn withdraw(
         &self,
         mut state: std::sync::MutexGuard<'_, State>,
@@ -684,31 +783,52 @@ impl Withdrawals {
         if found.is_empty() {
             return;
         }
-        for (key, _) in &found {
-            state.standing.insert(
-                key.tool.clone(),
-                Standing {
-                    key: key.clone(),
-                    server: server.clone(),
-                },
-            );
+        let mut withdrawn = Vec::new();
+        for (key, cause) in found {
+            let standing = Standing {
+                key: key.clone(),
+                server: server.clone(),
+                canary: None,
+            };
+            state.standing.insert(key.tool, standing.clone());
+            withdrawn.push((standing, cause));
+        }
+        for (tool, standing) in dependents(&state) {
+            if let std::collections::btree_map::Entry::Vacant(vacant) = state.standing.entry(tool) {
+                vacant.insert(standing.clone());
+                withdrawn.push((standing, Cause::ReachCheckToolWithdrawn));
+            }
         }
         let revision = self.serve(&state);
         let base = state.base.revision().clone();
         drop(state);
-        for (key, cause) in found {
-            self.signals.count(server, |counts| counts.withdrawals += 1);
-            tracing::error!(
-                event = TOOL_WITHDRAWN_EVENT,
-                tool = %key.tool,
-                %server,
-                cause = cause.as_str(),
-                base = %base,
-                %revision,
-                "{}",
-                cause.message()
-            );
+        for (standing, cause) in withdrawn {
+            self.report_withdrawal(&standing, cause, &base, &revision);
         }
+    }
+
+    /// Logs and counts the withdrawal of `standing`'s tool for `cause`, from `base`, which
+    /// serves `revision`.
+    fn report_withdrawal(
+        &self,
+        standing: &Standing,
+        cause: Cause,
+        base: &PolicyRevision,
+        revision: &PolicyRevision,
+    ) {
+        let server = &standing.server;
+        self.signals.count(server, |counts| counts.withdrawals += 1);
+        tracing::error!(
+            event = TOOL_WITHDRAWN_EVENT,
+            tool = %standing.key.tool,
+            %server,
+            cause = cause.as_str(),
+            reach_check_tool = standing.canary.as_ref().map(ToolName::as_str),
+            base = %base,
+            %revision,
+            "{}",
+            cause.message()
+        );
     }
 
     /// `server`'s reach check, and whether its canary tool is served now: approved and not
