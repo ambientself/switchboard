@@ -1283,10 +1283,73 @@ mod unit {
         }
     }
 
-    /// A port on this machine that nothing listens on.
-    fn closed_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    /// A loopback port that refuses connections, held for as long as this lives. Keep it for
+    /// as long as the test connects to the port: once it is dropped, nothing holds the port for
+    /// this test, and another test in the same binary may listen on it.
+    #[must_use = "the port is held only while this lives"]
+    struct ClosedPort {
+        port: u16,
+        _held: socket2::Socket,
+        _peer: std::net::TcpStream,
+    }
+
+    /// A port on this machine that nothing listens on. A port that was only read and released
+    /// could be taken meanwhile by another test's server, which would then answer this test's
+    /// connections (#179). So a socket holds it: bound to it without SO_REUSEADDR, and
+    /// connected to a peer of its own. A connection to a port with no listener is refused, on
+    /// Linux and macOS alike; a socket bound and never listening would do on Linux, but macOS
+    /// drops a connection to one. While it lives, Linux lets no other socket bind the port.
+    /// macOS still lets one that sets SO_REUSEADDR bind it by number, but it hands out the
+    /// ports for port 0, which the tests' servers bind, in order, and skips this one.
+    fn closed_port() -> ClosedPort {
+        use socket2::{Domain, Protocol, Type};
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = socket2::Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        held.bind(&any.into()).unwrap();
+        held.connect(&peer.local_addr().unwrap().into()).unwrap();
+        let (accepted, _) = peer.accept().unwrap();
+        let port = held
+            .local_addr()
+            .unwrap()
+            .as_socket()
+            .expect("an IPv4 address")
+            .port();
+        ClosedPort {
+            port,
+            _held: held,
+            _peer: accepted,
+        }
+    }
+
+    /// #179: a closed port refuses connections, and stays reserved while its guard lives: no
+    /// socket that does not set SO_REUSEADDR can bind it, and on Linux, where CI runs, not
+    /// even one that does, as std's and tokio's listeners do for the tests' servers.
+    #[test]
+    fn a_closed_port_refuses_connections_and_stays_reserved_while_held() {
+        let closed = closed_port();
+        let address: std::net::SocketAddr = ([127, 0, 0, 1], closed.port).into();
+        let error =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{error}"
+        );
+        let plain =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        assert!(
+            plain.bind(&address.into()).is_err(),
+            "another socket bound the held port {}",
+            closed.port
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                std::net::TcpListener::bind(address).is_err(),
+                "a listener bound the held port {}",
+                closed.port
+            );
+        }
     }
 
     /// A server that answers a client's startup as if it had logged it in, and then says
@@ -1327,8 +1390,9 @@ mod unit {
         assert!(PgAuditError::Database(closed).is_transient());
 
         // No SQLSTATE: the socket failed.
+        let closed = closed_port();
         let mut config = tokio_postgres::Config::new();
-        config.host("127.0.0.1").port(closed_port()).user("nobody");
+        config.host("127.0.0.1").port(closed.port).user("nobody");
         let Err(refused) = config.connect(tokio_postgres::NoTls).await else {
             panic!("a port nothing listens on took a connection");
         };
@@ -1419,8 +1483,9 @@ mod unit {
     /// keeps trying a port nothing listens on.
     #[test]
     fn a_finish_dropped_with_its_runtime_is_reported() {
+        let closed = closed_port();
         let mut config = tokio_postgres::Config::new();
-        config.host("127.0.0.1").port(closed_port()).user("nobody");
+        config.host("127.0.0.1").port(closed.port).user("nobody");
         let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
         let kept = Arc::clone(&reports);
         let store = PgAuditStore::connect(config, tokio_postgres::NoTls, PoolSizes::default())
@@ -1592,7 +1657,8 @@ mod unit {
     /// listens on the port.
     #[tokio::test]
     async fn a_begin_against_a_database_that_refuses_connections_counts_one_database_error() {
-        let store = store_at(closed_port());
+        let closed = closed_port();
+        let store = store_at(closed.port);
         assert_eq!(
             failed_begin(&store).await,
             BeginFailures {
