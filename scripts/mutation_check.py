@@ -4855,6 +4855,9 @@ mutate("gw-drift-canary-clear-leaves-dependents", "a new approval of the reach c
 mutate("gw-drift-dependent-drift-unjudged", "a tool withdrawn with its entry's reach check tool is never judged, so its changed definition is served once the reach check tool alone is approved again", DRIFT,
        "            .is_some_and(|standing| standing.canary.is_none())\n",
        "            .is_some()\n")
+mutate("gw-reach-dependent-mismatch-unjudged", "a reach mismatch skips a tool withdrawn with its entry's reach check tool, so a new approval of the reach check tool alone serves it again", DRIFT,
+       "                            && !state.withdrawn_on_its_own(name)\n",
+       "                            && !state.standing.contains_key(*name)\n")
 
 
 # --- first slice: resources on rows, naming what goes down ------------------------------------
