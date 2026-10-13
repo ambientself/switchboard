@@ -4453,8 +4453,8 @@ fn the_reapproval_step_needs_the_new_revision_served_and_every_withdrawal_cleare
         ),
         3,
     );
-    const CLEARED: &str =
-        "both list tools' and both read tools' withdrawals cleared as approved again";
+    const CLEARED: &str = "both list tools' withdrawals cleared as approved again, and both read \
+                           tools' as their entry's reach check tool no longer withdrawn";
     for (case, lines, failure) in [
         (
             "still withdrawn",

@@ -1155,11 +1155,13 @@ check_drift_rows() {
 # approving TOOLs again, under REVISION, was installed (policy_reloaded, policy_withdrawal_cleared
 # and tool_withdrawn). It served REVISION itself, with no withdrawal derived from it, and dropped
 # the TOOLs' withdrawals, and no other, as approved again; it withdrew nothing. A TOOL written
-# `TOOL: REASON` was dropped for REASON instead. WHAT names the TOOLs in the check. With no TOOL,
-# they are both list tools, as the drift step approves them, and both read tools, withdrawn with
-# them as their entries' reach check tools.
+# `TOOL: REASON` was dropped for REASON instead. WHAT says which withdrawals the check wants
+# dropped, and why. With no TOOL, they are both list tools', as the drift step approves them,
+# approved again, and both read tools', withdrawn with them as their entries' reach check tools,
+# since those are no longer withdrawn.
 check_reapproval() {
-  local events=$1 revision=$2 what="both list tools' and both read tools'" want tool
+  local events=$1 revision=$2 want tool
+  local what="both list tools' withdrawals cleared as approved again, and both read tools' as their entry's reach check tool no longer withdrawn"
   shift 2
   if [ $# -gt 0 ]; then
     what=$1
@@ -1173,7 +1175,7 @@ check_reapproval() {
     "$revision" "the gateway serves revision $revision, with no withdrawal"
   check "$(printf '%s\n' "$events" | jq -r 'select(.event == "policy_withdrawal_cleared") | "\(.tool): \(.reason)"' 2>/dev/null | sort | paste -sd ';' -)" \
     "$want" \
-    "$what withdrawals cleared as approved again"
+    "$what"
   check "$(printf '%s\n' "$events" | jq -c 'select(.event == "tool_withdrawn")' 2>/dev/null | awk 'END { print NR }')" 0 \
     "the drift pass withdrew nothing since"
 }
@@ -1539,7 +1541,7 @@ reach_steps() {
     'select(.event == "reach_held" and .server == "docs-team-a")' || true
   if fetch "the gateway's log" gateway_log "$approved_at"; then
     check_reapproval "$(events "$FETCHED" 'select(.event == "policy_reloaded" or .event == "policy_withdrawal_cleared" or .event == "tool_withdrawn")')" \
-      "$revision" "both of docs-team-a's tools'" "$list" "$read"
+      "$revision" "both of docs-team-a's tools' withdrawals cleared as approved again" "$list" "$read"
   fi
   step_mark
   workload "team-a after the new approval" team-a served
