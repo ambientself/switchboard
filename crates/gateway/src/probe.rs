@@ -7,8 +7,10 @@
 //! ([`Registry::server_entry`]), and nothing else: it does not apply the loader's probe rule,
 //! so an entry can be probed before it has a record, and it needs no database, issuer or
 //! credential of the gateway's own. It sends decision 0010's three calls to the entry's
-//! address ([`connector_proxy::probe()`]), with the bounds `[servers.<name>]` sets for its calls
-//! and, on the third, the probe credential `[drift.probe_credentials]` names for it.
+//! address ([`connector_proxy::probe()`]), reached as the gateway reaches it: checked against
+//! the entry's destination, and for an `https` address verified with only the CA file
+//! `[servers.<name>]` names. Each call has the bounds `[servers.<name>]` sets for the server's
+//! calls and, on the third, the probe credential `[drift.probe_credentials]` names for it.
 //!
 //! It prints each call's verdict, the result and the record line, such as
 //! `probe = { result = "refused", date = 2026-10-12 }`, dated today in UTC. A probe that could
@@ -18,7 +20,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use connector_proxy::{CredentialFileError, ProbeCredential, ProbeError, ProbeReport, probe};
+use connector_proxy::{
+    CredentialFileError, Loopback, ProbeCredential, ProbeError, ProbeReport, Upstream, probe,
+};
 use gateway_core::ConnectorName;
 use gateway_registry::{Registry, RegistryError};
 use thiserror::Error;
@@ -60,7 +64,8 @@ pub enum ProbeCommandError {
     /// The probe credential file could not be read, or does not hold one token.
     #[error("the probe credential: {0}")]
     ProbeCredential(#[from] CredentialFileError),
-    /// The probe could not begin, such as for an address it cannot reach over plain `http`.
+    /// The probe could not begin, such as for an address the gateway does not connect to, or
+    /// an `https` address with no CA file.
     #[error(transparent)]
     Probe(#[from] ProbeError),
 }
@@ -110,11 +115,15 @@ pub async fn run(config: &Path, server: &ConnectorName) -> Result<Probed, ProbeC
         .probe_credential(server)
         .ok_or_else(|| ProbeCommandError::NoProbeCredential(server.clone()))?;
     let credential = ProbeCredential::load(server.clone(), base.join(credential_file))?;
-    let bounds = connector_proxy::ProbeBounds {
+    let upstream = Upstream {
+        destination: crate::start::destination(entry.destination),
+        ca_file: file.ca_file(server).map(|path| base.join(path)),
+        loopback: Loopback::of_this_build(),
         deadline: limits.deadline,
         max_response_bytes: limits.max_result_bytes,
+        ..Upstream::new(server.clone(), entry.address.clone())
     };
-    let report = probe(&entry.address, bounds, &credential).await?;
+    let report = probe(&upstream, &credential).await?;
     Ok(Probed {
         server: server.clone(),
         address: entry.address,

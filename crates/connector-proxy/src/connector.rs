@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,17 +15,16 @@ use gateway_core::{
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue};
-use hyper::{Request, Response, StatusCode, Uri};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper::{Request, Response, StatusCode};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use crate::credentials::{FileCredentials, ProbeCredential, Secret};
+use crate::destination::{self, Destination, Loopback, Refusal};
 use crate::list::{ListError, ListedTool, tool_list};
 use crate::outcome;
 use crate::probe::{ProbeBounds, ProbeReport};
+use crate::transport::{CaFault, Transport};
 
 /// How long a call may take, from sending the request to the last byte of the answer, unless
 /// configured otherwise.
@@ -35,15 +36,25 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// The MCP revision the connector speaks to the proxied server.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// One proxied server: where it is, which tools the gateway exposes from it, and the bounds on
-/// each call.
+/// One proxied server: where it is and how it is reached, which tools the gateway exposes from
+/// it, and the bounds on each call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upstream {
     /// The connector name approved tools route by. The gateway's credential for the server is
     /// found under the same name.
     pub connector: ConnectorName,
-    /// The server's MCP endpoint, an `http://` URL.
+    /// The server's MCP endpoint, an `http://` or `https://` URL. Its host is the server's
+    /// identity: an `https` server's certificate is verified against it.
     pub url: String,
+    /// The class of the server's destination, which says whether plain `http` and private
+    /// addresses are allowed ([`destination`](crate::destination)).
+    pub destination: Destination,
+    /// The PEM bundle of the only CAs an `https` server's certificate may chain to, read when
+    /// the connector is built. Required for an `https` URL and refused beside an `http` one.
+    pub ca_file: Option<PathBuf>,
+    /// Whether the server may be reached at a loopback address. Only a development build can
+    /// allow it.
+    pub loopback: Loopback,
     /// Each exposed tool and the name the server knows it by.
     pub tools: BTreeMap<ToolName, String>,
     /// How long a call may take before it is abandoned.
@@ -54,11 +65,17 @@ pub struct Upstream {
 
 impl Upstream {
     /// A server at `url`, routed to by `connector`, with no tools yet and the default bounds:
-    /// [`DEFAULT_DEADLINE`] and [`DEFAULT_MAX_RESPONSE_BYTES`].
+    /// [`DEFAULT_DEADLINE`] and [`DEFAULT_MAX_RESPONSE_BYTES`]. Its destination is
+    /// [`Destination::Public`], the stricter class, so a caller that never sets it is held to
+    /// `https` and public addresses; set [`Destination::InCluster`] for a Service in the
+    /// cluster. It has no CA file, and loopback is as [`Loopback::of_this_build`] says.
     pub fn new(connector: impl Into<ConnectorName>, url: impl Into<String>) -> Self {
         Self {
             connector: connector.into(),
             url: url.into(),
+            destination: Destination::Public,
+            ca_file: None,
+            loopback: Loopback::of_this_build(),
             tools: BTreeMap::new(),
             deadline: DEFAULT_DEADLINE,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -75,9 +92,10 @@ impl Upstream {
 /// Why a proxied server's configuration was refused.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum UpstreamError {
-    /// The URL is not an `http://` URL with a host, or it carries a user name or password.
+    /// The URL is not an `http://` or `https://` URL with a host, or it carries a user name or
+    /// password.
     #[error(
-        "the upstream URL for connector `{connector}` must be http:// with a host and no user information: {url}"
+        "the upstream URL for connector `{connector}` must be http:// or https:// with a host and no user information: {url}"
     )]
     BadUrl {
         /// The connector.
@@ -85,6 +103,42 @@ pub enum UpstreamError {
         /// The URL as configured.
         url: String,
     },
+    /// The URL is plain `http`, and the server's destination is not `in_cluster` (decision
+    /// 0013, section 3).
+    #[error(
+        "connector `{0}` has a plain http URL; only a server whose destination is in_cluster may use http"
+    )]
+    HttpNotInCluster(ConnectorName),
+    /// The URL's host is an IP address the connector does not connect to.
+    #[error("connector `{connector}`: the gateway does not connect to {address}, {refusal}")]
+    DestinationRefused {
+        /// The connector.
+        connector: ConnectorName,
+        /// The address in the URL.
+        address: IpAddr,
+        /// Why it is refused.
+        refusal: Refusal,
+    },
+    /// The URL is `https`, and no CA file is given: the certificate could chain to nothing.
+    #[error("connector `{0}` has an https URL and no CA file to verify its certificate with")]
+    NoCaFile(ConnectorName),
+    /// A CA file is given beside a plain `http` URL, where nothing would verify against it.
+    #[error("connector `{0}` has a CA file beside a plain http URL")]
+    CaFileForHttp(ConnectorName),
+    /// The CA file cannot be used.
+    #[error("the CA file `{path}` for connector `{connector}` {fault}", path = path.display())]
+    CaFile {
+        /// The connector.
+        connector: ConnectorName,
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        fault: CaFault,
+    },
+    /// The TLS client could not be built, or the URL's host is not a name a certificate can
+    /// be verified against.
+    #[error("the TLS client for connector `{0}` could not be built")]
+    Tls(ConnectorName),
     /// No tools are exposed from the server.
     #[error("connector `{0}` exposes no tools")]
     NoTools(ConnectorName),
@@ -107,14 +161,17 @@ pub enum UpstreamError {
 /// It forwards each call as one JSON-RPC `tools/call` request, `POST`ed to the server's
 /// endpoint with the gateway's own bearer credential. The caller's token cannot be forwarded:
 /// a [`ToolCall`] does not carry it. It speaks session-less streamable HTTP and reads only a
-/// JSON answer, not an event stream. It follows no redirect and uses no proxy.
+/// JSON answer, not an event stream. It follows no redirect, uses no proxy and never retries a
+/// request. An `https` server's certificate is verified against its identity with only the
+/// configured CAs.
 ///
 /// Each call is bounded inside the connector: it is abandoned at the deadline, and an answer
 /// larger than the cap is discarded unread. Either way the outcome is [`ToolOutcome::Error`],
 /// of the kind [`ErrorKind::OversizedOrLateRead`] for a tool classified `read` and
 /// [`ErrorKind::Other`] for any other. So is any failure of the server or of the exchange, of
-/// the kind `Other`, and so are arguments that are not an object, which are never sent, of the
-/// kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its refusal of the call, an
+/// the kind `Other`, a connection refused for its address among them
+/// ([`destination`](crate::destination)), and so are arguments that are not an object, which
+/// are never sent, of the kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its refusal of the call, an
 /// error of the kind [`ErrorKind::VendorRefusal`]. A call this connector does not serve or has
 /// no credential for becomes [`ToolOutcome::Refused`]. See [`outcome`](crate::outcome) for
 /// every sentence.
@@ -122,12 +179,11 @@ pub enum UpstreamError {
 /// Running a call needs a Tokio runtime.
 pub struct ProxyConnector {
     connector: ConnectorName,
-    endpoint: Uri,
     tools: BTreeMap<ToolName, String>,
     deadline: Duration,
     max_response_bytes: usize,
     credentials: Arc<FileCredentials>,
-    client: Client<HttpConnector, Full<Bytes>>,
+    transport: Transport,
     next_id: AtomicU64,
 }
 
@@ -135,7 +191,7 @@ impl fmt::Debug for ProxyConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyConnector")
             .field("connector", &self.connector)
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &self.transport.endpoint)
             .field("tools", &self.tools)
             .field("deadline", &self.deadline)
             .field("max_response_bytes", &self.max_response_bytes)
@@ -146,22 +202,20 @@ impl fmt::Debug for ProxyConnector {
 
 impl ProxyConnector {
     /// A connector for `upstream`, using the gateway credential `credentials` holds for its
-    /// connector name. Refuses a configuration that could not forward a call.
+    /// connector name. Refuses a configuration that could not forward a call, and one whose
+    /// address it would not connect to.
     pub fn new(
         upstream: Upstream,
         credentials: Arc<FileCredentials>,
     ) -> Result<Self, UpstreamError> {
+        let transport = Transport::new(&upstream)?;
         let Upstream {
             connector,
-            url,
             tools,
             deadline,
             max_response_bytes,
+            ..
         } = upstream;
-        let endpoint = parse_endpoint(&url).ok_or_else(|| UpstreamError::BadUrl {
-            connector: connector.clone(),
-            url,
-        })?;
         if tools.is_empty() {
             return Err(UpstreamError::NoTools(connector));
         }
@@ -179,12 +233,11 @@ impl ProxyConnector {
         }
         Ok(Self {
             connector,
-            endpoint,
             tools,
             deadline,
             max_response_bytes,
             credentials,
-            client: client(),
+            transport,
             next_id: AtomicU64::new(1),
         })
     }
@@ -266,7 +319,7 @@ impl ProxyConnector {
         let mut authorization =
             HeaderValue::from_str(&format!("Bearer {}", secret.bearer())).ok()?;
         authorization.set_sensitive(true);
-        Request::post(self.endpoint.clone())
+        Request::post(self.transport.endpoint.clone())
             .header(AUTHORIZATION, authorization)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
@@ -283,11 +336,13 @@ impl ProxyConnector {
         request: Request<Full<Bytes>>,
         late: ErrorKind,
     ) -> Result<Received, ToolOutcome> {
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|_| ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE))?;
+        let response = self.transport.request(request).await.map_err(|error| {
+            if destination::refused(&error) {
+                ToolOutcome::error(ErrorKind::Other, outcome::DESTINATION_REFUSED)
+            } else {
+                ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE)
+            }
+        })?;
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED {
             return Err(ToolOutcome::error(
@@ -352,9 +407,9 @@ impl ProxyConnector {
     /// for the drift pass (decision 0013, section 5), made for no caller.
     ///
     /// It goes where a call goes and is held to the same bounds: `POST`ed to the server's
-    /// endpoint with the gateway's credential for this connector, abandoned at the deadline,
-    /// and discarded past the answer cap. It follows no redirect and uses no proxy, and it sends
-    /// no `initialize`. Only one page is read: an answer that names a next page is
+    /// endpoint with the gateway's credential for this connector, on the same client, so to an
+    /// address checked the same way, abandoned at the deadline, and discarded past the answer
+    /// cap. It follows no redirect and uses no proxy, and it sends no `initialize`. Only one page is read: an answer that names a next page is
     /// [`ListError::Paginated`]. Any failure is a [`ListError`], never a shorter list.
     pub async fn list_tools(&self) -> Result<Vec<ListedTool>, ListError> {
         let secret = self
@@ -373,7 +428,7 @@ impl ProxyConnector {
         let mut bearer = HeaderValue::from_str(&format!("Bearer {}", secret.bearer())).ok()?;
         bearer.set_sensitive(true);
         let body = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}});
-        let mut request = Request::post(self.endpoint.clone())
+        let mut request = Request::post(self.transport.endpoint.clone())
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json, text/event-stream")
             .header("mcp-protocol-version", PROTOCOL_VERSION)
@@ -385,11 +440,13 @@ impl ProxyConnector {
 
     /// Sends the list request and reads a `200` answer's body, up to the cap.
     async fn list_exchange(&self, request: Request<Full<Bytes>>) -> Result<Received, ListError> {
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|_| ListError::Unreachable)?;
+        let response = self.transport.request(request).await.map_err(|error| {
+            if destination::refused(&error) {
+                ListError::DestinationRefused
+            } else {
+                ListError::Unreachable
+            }
+        })?;
         match response.status() {
             StatusCode::OK => {}
             other => return Err(ListError::Status(other.as_u16())),
@@ -433,7 +490,7 @@ impl ProxyConnector {
             deadline: self.deadline,
             max_response_bytes: self.max_response_bytes,
         };
-        crate::probe::run(&self.client, &self.endpoint, bounds, foreign).await
+        crate::probe::run(&self.transport, bounds, foreign).await
     }
 }
 
@@ -447,24 +504,6 @@ impl Connector for ProxyConnector {
 struct Received {
     content_type: Option<String>,
     body: Vec<u8>,
-}
-
-/// The HTTP client every request to a proxied server goes out on. The legacy client follows no
-/// redirect and reads no proxy setting from the environment, so a credential goes to the
-/// configured endpoint or nowhere.
-pub(crate) fn client() -> Client<HttpConnector, Full<Bytes>> {
-    Client::builder(TokioExecutor::new())
-        .pool_timer(TokioTimer::new())
-        .build_http()
-}
-
-pub(crate) fn parse_endpoint(url: &str) -> Option<Uri> {
-    let endpoint: Uri = url.parse().ok()?;
-    let authority = endpoint.authority()?;
-    let acceptable = endpoint.scheme_str() == Some("http")
-        && !authority.host().is_empty()
-        && !authority.as_str().contains('@');
-    acceptable.then_some(endpoint)
 }
 
 fn declared_length(headers: &HeaderMap) -> Option<u64> {

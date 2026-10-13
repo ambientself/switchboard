@@ -59,6 +59,9 @@
 //! deadline_seconds = 5        # 5 if left out; 1 to 60
 //! max_result_bytes = 65536    # 64 KiB if left out; 1 to 1 MiB
 //!
+//! [servers.vendor-docs]       # an https server needs its entry, for its CA file
+//! ca_file = "vendor-docs-ca.pem"  # needed for https, refused for http; the only CAs trusted
+//!
 //! [drift]
 //! interval_seconds = 300      # 300 if left out; 5 to 900
 //!
@@ -119,6 +122,14 @@
 //!   answer's HTTP body. Zero, or a value past [`MAX_SERVER_DEADLINE`] or
 //!   [`MAX_SERVER_RESULT_BYTES`], is refused. The deployment's termination grace must cover
 //!   the longest deadline set (decision 0014, section 1).
+//! - **Each `https` server's CA file** is `[servers.<name>] ca_file`, a PEM bundle of the only
+//!   CAs the server's certificate may chain to (decision 0013, section 3). Trust is named, never
+//!   ambient: no roots are compiled in and none are read from the operating system. The
+//!   certificate is verified against the server's identity, the host in its address. The
+//!   gateway refuses to start with an `https` server that has no CA file, or with a CA file for
+//!   an `http` server, which only a server whose destination is `in_cluster` may be; loading
+//!   this file checks neither, since it does not read the registry. The file is read when the
+//!   gateway starts, and `switchboard probe` reads it too.
 //! - **The drift pass** reads each proxied server's tool list every `drift.interval_seconds`,
 //!   and withdraws a tool whose served definition no longer matches its approval (see
 //!   [`crate::drift`]): [`DEFAULT_DRIFT_INTERVAL`](crate::drift::DEFAULT_DRIFT_INTERVAL) if it
@@ -227,8 +238,13 @@ impl DeploymentFile {
     pub fn server_bounds(&self, server: &ConnectorName) -> Result<ServerLimits, DeploymentError> {
         server_limits(
             server,
-            self.servers.get(server).copied().unwrap_or_default(),
+            self.servers.get(server).cloned().unwrap_or_default(),
         )
+    }
+
+    /// The CA file `[servers.<name>]` names for `server`, as written.
+    pub fn ca_file(&self, server: &ConnectorName) -> Option<&Path> {
+        self.servers.get(server)?.ca_file.as_deref()
     }
 
     /// The file `drift.probe_credentials` names for `server`'s probe credential, as written.
@@ -257,8 +273,8 @@ pub struct LimitsSection {
     pub per_team_per_server_in_flight: Option<usize>,
 }
 
-/// One proxied server's bounds, as written. Each field left out has its default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+/// One proxied server's bounds and CA file, as written. Each bound left out has its default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
     /// How long a call may take, in seconds: 1 to 60, and [`DEFAULT_DEADLINE`] if left out.
@@ -268,6 +284,11 @@ pub struct ServerSection {
     /// [`DEFAULT_MAX_RESPONSE_BYTES`] if left out.
     #[serde(default)]
     pub max_result_bytes: Option<usize>,
+    /// The PEM bundle of the only CAs an `https` server's certificate may chain to, from the
+    /// deployment file's directory. Required for an `https` server and refused for an `http`
+    /// one, when the gateway starts.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
 }
 
 /// The caps on calls in flight in one instance (decision 0014, section 2).
@@ -588,6 +609,8 @@ pub struct Deployment {
     /// The bounds of each server the file gives an entry, within their ceilings. Every other
     /// server has [`ServerLimits::default`].
     pub servers: BTreeMap<ConnectorName, ServerLimits>,
+    /// Each `https` server's CA file, from the deployment file's directory.
+    pub ca_files: BTreeMap<ConnectorName, PathBuf>,
     /// How often the drift pass runs.
     pub drift_interval: Duration,
     /// Each proxied server's probe credential file, from the deployment file's directory.
@@ -606,6 +629,7 @@ impl std::fmt::Debug for Deployment {
             .field("metrics", &self.metrics)
             .field("limits", &self.limits)
             .field("servers", &self.servers)
+            .field("ca_files", &self.ca_files)
             .field("drift_interval", &self.drift_interval)
             .field("probe_credentials", &self.probe_credentials)
             .finish_non_exhaustive()
@@ -722,6 +746,14 @@ impl Deployment {
             .into_iter()
             .map(|(server, path)| (server, base.join(path)))
             .collect();
+        let ca_files = file
+            .servers
+            .iter()
+            .filter_map(|(server, section)| {
+                let path = section.ca_file.as_ref()?;
+                Some((server.clone(), base.join(path)))
+            })
+            .collect();
         let servers = file
             .servers
             .into_iter()
@@ -766,6 +798,7 @@ impl Deployment {
             metrics: file.metrics.map(|metrics| metrics.listen),
             limits,
             servers,
+            ca_files,
             drift_interval,
             probe_credentials,
             credentials: file
@@ -947,4 +980,47 @@ fn read_text(path: &Path) -> Result<String, DeploymentError> {
         path: path.to_owned(),
         source,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A server's CA file is read from the deployment file's directory, beside its bounds; a
+    /// server with bounds and no CA file has none.
+    #[test]
+    fn a_servers_ca_file_is_found_from_the_deployment_files_directory() {
+        let file: DeploymentFile = toml::from_str(
+            r#"
+deployment = "ca-files"
+[http]
+allowed_hosts = ["localhost"]
+allowed_origins = []
+[registry]
+file = "registry.toml"
+poll_seconds = 2
+[identity]
+mode = "disabled"
+[audit]
+mode = "disabled"
+[servers.vendor-docs]
+ca_file = "vendor-docs-ca.pem"
+[servers.mock-docs]
+deadline_seconds = 3
+[credentials]
+"#,
+        )
+        .unwrap();
+        let vendor = ConnectorName::new("vendor-docs");
+        assert_eq!(file.ca_file(&vendor), Some(Path::new("vendor-docs-ca.pem")));
+        assert_eq!(file.ca_file(&ConnectorName::new("mock-docs")), None);
+
+        let loaded = Deployment::from_file(file, Path::new("/etc/switchboard"), |_| None).unwrap();
+        assert_eq!(
+            loaded.ca_files,
+            BTreeMap::from([(vendor, PathBuf::from("/etc/switchboard/vendor-docs-ca.pem"))])
+        );
+        assert_eq!(loaded.servers.len(), 2);
+    }
 }

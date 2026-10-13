@@ -24,7 +24,9 @@
 //! The server is open if any call is open, and refused only if all three are. Anything else is
 //! not shown. The calls go where a tool call goes and are held to the same bounds: each is
 //! abandoned at the call deadline and its answer discarded past the answer cap. The three are
-//! sent together, so a probe takes no longer than one deadline. No redirect is followed and no
+//! sent together, so a probe takes no longer than one deadline. They go out on the connector's
+//! own client, so the address is checked as for a call ([`crate::destination`]), and an `https`
+//! server's certificate is verified with only its configured CAs. No redirect is followed and no
 //! proxy is read from the environment. The foreign token is sent on the third call only.
 
 use std::fmt;
@@ -37,13 +39,15 @@ use hyper::body::Bytes;
 use hyper::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE,
 };
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::connector::{DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION};
+use crate::connector::{
+    DEFAULT_DEADLINE, DEFAULT_MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Upstream, UpstreamError,
+};
 use crate::credentials::ProbeCredential;
+use crate::destination;
+use crate::transport::Transport;
 
 /// The tool every probe call names. No server has it, so a call that is dispatched runs
 /// nothing.
@@ -105,6 +109,10 @@ pub enum NotShown {
     /// The server could not be connected to, or the exchange failed before an answer began.
     #[error("the server could not be reached")]
     Unreachable,
+    /// Every address the server's name resolved to is one the gateway does not connect to.
+    /// Nothing was sent.
+    #[error("the gateway does not connect to the address the server's name resolved to")]
+    DestinationRefused,
     /// The server did not answer in full before the deadline.
     #[error("the server did not answer before the deadline")]
     TimedOut,
@@ -232,16 +240,15 @@ impl Default for ProbeBounds {
 /// Why a probe could not begin.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ProbeError {
-    /// The URL is not an `http://` URL with a host, or it carries a user name or password.
-    #[error("the server's URL must be http:// with a host and no user information: {0}")]
-    BadUrl(String),
-    /// A bound is zero.
-    #[error("the probe's deadline and answer cap must each be more than zero")]
-    ZeroBound,
+    /// The server could not be reached as its configuration says: its URL, destination, CA
+    /// file or bounds are refused, as a connector for it would refuse them.
+    #[error(transparent)]
+    Upstream(#[from] UpstreamError),
 }
 
-/// Probes the server at `url`, an `http://` URL, with its call bounds, presenting `foreign` on
-/// the third call (decision 0010, "Self-built servers at registration").
+/// Probes the server `upstream` describes, at its URL, with its destination, CA file and call
+/// bounds, presenting `foreign` on the third call (decision 0010, "Self-built servers at
+/// registration"). Its tools are not read: a probe names [`PROBE_TOOL`] alone.
 ///
 /// It sends three `tools/call` requests naming [`PROBE_TOOL`], a tool that does not exist:
 /// with no `Authorization`, with `Bearer not-a-token` ([`MALFORMED_CREDENTIAL`]), and with
@@ -250,27 +257,33 @@ pub enum ProbeError {
 /// answer. It is open when the answer, whatever its status, carries a JSON-RPC result or error.
 /// Anything else, a connection that failed or a timeout included, is not shown, and is never
 /// counted as refused ([`ProbeReport::finding`]). The three are sent together, each bounded as
-/// a call is; no redirect is followed and no proxy is read from the environment.
+/// a call is, on a client built as a connector's is: the address is checked, no redirect is
+/// followed and no proxy is read from the environment.
 pub async fn probe(
-    url: &str,
-    bounds: ProbeBounds,
+    upstream: &Upstream,
     foreign: &ProbeCredential,
 ) -> Result<ProbeReport, ProbeError> {
-    let endpoint =
-        crate::connector::parse_endpoint(url).ok_or_else(|| ProbeError::BadUrl(url.to_owned()))?;
-    if bounds.deadline.is_zero() || bounds.max_response_bytes == 0 {
-        return Err(ProbeError::ZeroBound);
+    let transport = Transport::new(upstream)?;
+    if upstream.deadline.is_zero() {
+        return Err(UpstreamError::ZeroDeadline(upstream.connector.clone()).into());
     }
-    Ok(run(&crate::connector::client(), &endpoint, bounds, foreign).await)
+    if upstream.max_response_bytes == 0 {
+        return Err(UpstreamError::ZeroCap(upstream.connector.clone()).into());
+    }
+    let bounds = ProbeBounds {
+        deadline: upstream.deadline,
+        max_response_bytes: upstream.max_response_bytes,
+    };
+    Ok(run(&transport, bounds, foreign).await)
 }
 
-/// The three calls to `endpoint`, sent together on `client`.
+/// The three calls to the server, sent together on its connector's client.
 pub(crate) async fn run(
-    client: &Client<HttpConnector, Full<Bytes>>,
-    endpoint: &Uri,
+    transport: &Transport,
     bounds: ProbeBounds,
     foreign: &ProbeCredential,
 ) -> ProbeReport {
+    let (client, endpoint) = (transport, &transport.endpoint);
     // The stranger's token, read from its file now, for the third call alone.
     let stranger = || {
         foreign
@@ -307,7 +320,7 @@ pub(crate) async fn run(
 
 /// One call, with `bearer` as its credential if it has one.
 async fn call(
-    client: &Client<HttpConnector, Full<Bytes>>,
+    client: &Transport,
     endpoint: &Uri,
     bounds: ProbeBounds,
     which: ProbeCall,
@@ -363,14 +376,17 @@ struct Answer {
 
 /// Sends the request and reads the answer, whatever its status, up to the cap.
 async fn exchange(
-    client: &Client<HttpConnector, Full<Bytes>>,
+    client: &Transport,
     request: Request<Full<Bytes>>,
     bounds: ProbeBounds,
 ) -> Result<Answer, NotShown> {
-    let response = client
-        .request(request)
-        .await
-        .map_err(|_| NotShown::Unreachable)?;
+    let response = client.request(request).await.map_err(|error| {
+        if destination::refused(&error) {
+            NotShown::DestinationRefused
+        } else {
+            NotShown::Unreachable
+        }
+    })?;
     let status = response.status().as_u16();
     let challenged = response
         .headers()

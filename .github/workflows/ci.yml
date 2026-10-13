@@ -44,11 +44,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The release artifact itself (decisions 0009, 0011 and 0014, design section 12). A
-  # `test-support` build is exempt from the receipt-store gate and may disable identity or audit,
-  # and a feature can be turned on in any build, so this builds `switchboard` with exactly
-  # deploy/Dockerfile's command and checks that it refuses each opt-out, which shows it is not a
-  # development build, and a proxied `propose` tool as its registry loads. The receipt-store gate
+  # The release artifact itself (decisions 0009, 0011, 0013 and 0014, design section 12). A
+  # `test-support` build is exempt from the receipt-store gate, may disable identity or audit,
+  # and may reach a server on loopback, and a feature can be turned on in any build, so this
+  # builds `switchboard` with exactly deploy/Dockerfile's command and checks that it refuses each
+  # opt-out and a server on loopback, which shows it is not a development build, and a proxied
+  # `propose` tool as its registry loads. The receipt-store gate
   # cannot be reached from a registry until built-in connectors exist (milestone 4): the loader
   # refuses every proxied tool not classified `read` first. crates/demo-checks/tests/release.rs
   # holds the commands, the configurations and the refusals to each other.
@@ -126,6 +127,24 @@ jobs:
           fi
           if ! grep -qF 'refused to start: audit is disabled, which only a development build allows' audit-disabled-stderr.txt; then
             echo "switchboard refused to start, but not for the audit opt-out"
+            exit 1
+          fi
+      # deploy/ci/loopback-destination/ registers a server at 127.0.0.1, which only a development
+      # build may reach (decision 0013, section 3). The binary must exit 1 and name that address.
+      - name: The release switchboard refuses a server on loopback
+        run: |
+          set +e
+          SWITCHBOARD_INSTANCE=ci timeout 60 target/release/switchboard \
+            --config=deploy/ci/loopback-destination/gateway.toml 2> loopback-destination-stderr.txt
+          status=$?
+          set -e
+          cat loopback-destination-stderr.txt
+          if [ "$status" -ne 1 ]; then
+            echo "expected switchboard to refuse to start with exit status 1, got $status"
+            exit 1
+          fi
+          if ! grep -qF 'refused to start: server `mock-docs`: the gateway does not connect to 127.0.0.1, a loopback address' loopback-destination-stderr.txt; then
+            echo "switchboard refused to start, but not for the server on loopback"
             exit 1
           fi
 
