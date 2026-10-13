@@ -3959,6 +3959,20 @@ mutate_all("demo-checks-closed-port-released", "closed_port() lets its port go o
             "    let accepted = TcpStream::connect(peer.local_addr().unwrap()).unwrap();\n"),
            ("crates/demo-checks/tests/common/mod.rs",
             "        _held: held,\n", "        _held: Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n"))
+# #179: the same for the copies of closed_port() in the audit store's tests and the issuer-keys
+# fetch tests.
+mutate_all("audit-postgres-closed-port-released", "the store tests' closed_port() lets its port go once it has read it, so another test may take it",
+           ("crates/audit-postgres/src/store.rs",
+            "        held.connect(&peer.local_addr().unwrap().into()).unwrap();\n        let (accepted, _) = peer.accept().unwrap();\n",
+            "        let accepted = std::net::TcpStream::connect(peer.local_addr().unwrap()).unwrap();\n"),
+           ("crates/audit-postgres/src/store.rs",
+            "            _held: held,\n", "            _held: socket2::Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n"))
+mutate_all("issuer-keys-closed-port-released", "the fetch tests' closed_port() lets its port go once it has read it, so another test may take it",
+           ("crates/issuer-keys/tests/fetch.rs",
+            "    held.connect(&peer.local_addr().unwrap().into()).unwrap();\n    let (accepted, _) = peer.accept().unwrap();\n",
+            "    let accepted = std::net::TcpStream::connect(peer.local_addr().unwrap()).unwrap();\n"),
+           ("crates/issuer-keys/tests/fetch.rs",
+            "        _held: held,\n", "        _held: Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),\n"))
 CLUSTER_CHECK = 'if [ "${SWITCHBOARD_DEMO_CLUSTER:-$CLUSTER}" != "$CLUSTER" ]; then'
 mutate("demo-driver-otto-dev-allowed", "the driver runs whatever cluster it is given", DRIVER,
        CLUSTER_CHECK, "if false; then")
