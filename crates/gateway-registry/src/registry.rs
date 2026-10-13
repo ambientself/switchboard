@@ -29,7 +29,7 @@ pub struct Server {
     /// The server's name. Approved tools name it as their connector.
     pub name: ConnectorName,
     /// The system part of its tools' exposed names: every tool on this server is exposed as
-    /// `{system}__{tool}`.
+    /// `{system}__{tool}`. No two servers have the same system.
     pub system: String,
     /// The team that owns the server and answers for it.
     pub owner: String,
@@ -146,8 +146,8 @@ pub struct Probe {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReachCheck {
     /// The tool, by its exposed name, which the loader requires to be `{system}__<tool>` for
-    /// the server's own system, so that the check cannot name another server's tool or a
-    /// malformed one. The loader does not require it to be approved: removing a tool's approval
+    /// the server's own system, a system no other server has, so that the check cannot name
+    /// another server's tool or a malformed one. The loader does not require it to be approved: removing a tool's approval
     /// withdraws it (decision 0013, section 8), and that must stay possible for this tool and
     /// for an entry's last tool without editing the reach check.
     pub tool: ToolName,
@@ -187,6 +187,18 @@ pub enum RegistryError {
     /// Two servers share a name.
     #[error("server `{0}` is registered more than once")]
     DuplicateServer(ConnectorName),
+    /// Two servers have the same system, so a tool named after it could be either's.
+    #[error(
+        "servers `{first}` and `{second}` both have the system `{system}`; each server needs a system of its own"
+    )]
+    DuplicateSystem {
+        /// The system.
+        system: String,
+        /// The server registered first with it.
+        first: ConnectorName,
+        /// The server registered second with it.
+        second: ConnectorName,
+    },
     /// A server's address is not an `http` or `https` URL with a host.
     #[error("server `{server}` has address `{address}`, which is not an http or https URL")]
     AddressNotHttp {
@@ -672,6 +684,7 @@ fn servers(
     probe_rule: ProbeRule,
 ) -> Result<BTreeMap<ConnectorName, Server>, RegistryError> {
     let mut servers = BTreeMap::new();
+    let mut systems = BTreeMap::new();
     for server in files {
         let place = || format!("server `{}`", server.name);
         require(server.name.as_str(), "name", place)?;
@@ -779,8 +792,18 @@ fn servers(
                 arguments: check.arguments,
             }),
         };
+        let system = checked.system.clone();
         if servers.insert(server.name.clone(), checked).is_some() {
             return Err(RegistryError::DuplicateServer(server.name));
+        }
+        // Every tool is named `{system}__<tool>` after its server's system, and so is a reach
+        // check's tool: a system shared by two servers would let one's names be the other's.
+        if let Some(first) = systems.insert(system.clone(), server.name.clone()) {
+            return Err(RegistryError::DuplicateSystem {
+                system,
+                first,
+                second: server.name,
+            });
         }
     }
     Ok(servers)

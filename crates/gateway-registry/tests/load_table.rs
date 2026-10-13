@@ -338,6 +338,31 @@ fn cases() -> Vec<Case> {
             },
             Want::Error(E::DuplicateServer("docs-server".into())),
         ),
+        // Each server's tools, and its reach check's tool, are named after a system no other
+        // server has.
+        case(
+            "a second server with another server's system",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"wiki-mirror\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Error(E::DuplicateSystem {
+                system: "wiki".into(),
+                first: "wiki-server".into(),
+                second: "wiki-mirror".into(),
+            }),
+        ),
+        case(
+            "a second server with a system of its own",
+            |t| {
+                let mut copy = table_at(t, "servers.1").clone();
+                copy.insert("name".into(), value("\"wiki-mirror\""));
+                copy.insert("system".into(), value("\"wiki-mirror\""));
+                at(t, "servers").as_array_mut().unwrap().push(copy.into());
+            },
+            Want::Loads,
+        ),
         case(
             "an ftp address",
             |t| {
@@ -1772,5 +1797,18 @@ fn a_reach_check_outside_the_system_is_refused_naming_the_server_and_the_tool() 
         message,
         "server `docs-server`'s reach check calls `wiki__search`, which is not one of its own \
          tools: name it `docs__<tool>`, after the server's system"
+    );
+}
+
+/// The refusal of two servers with one system names the system and both servers.
+#[test]
+fn two_servers_with_one_system_are_refused_naming_the_system_and_both_servers() {
+    let mut table = base();
+    set(&mut table, "servers.1", "system", value("\"docs\""));
+    let message = load(&table).unwrap_err().to_string();
+    assert_eq!(
+        message,
+        "servers `docs-server` and `wiki-server` both have the system `docs`; each server needs a \
+         system of its own"
     );
 }
