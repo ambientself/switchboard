@@ -1475,8 +1475,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   reference and principal, its narrowing, what its credential permits, its reach, a dated
   reach test (required when the reach is not empty) and a reach check (required for every
   entry with a reach that is not per-user, whatever its narrowing). A reach check's tool must
-  be named `<system>__<tool>` for the entry's own system, so it cannot name another server's
-  tool or a malformed one. `PolicySnapshot::new` refuses a snapshot that breaks a rule, naming
+  be named `<system>__<tool>` for the entry's own system, and no two servers may have the same
+  system (#174), so it cannot name another server's tool or a malformed one.
+  `PolicySnapshot::new` refuses a snapshot that breaks a rule, naming
   the tool, entry, surface, team or group and resource; `tests/loader_rules.json` has a
   refusing and a passing case for each, and the properties include the reach property of
   decision 0011's Consequences. Rules 1 to 8 apply to tools whose connector has an entry; the
