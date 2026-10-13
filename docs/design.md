@@ -1562,13 +1562,15 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   a mismatch: every tool of the entry is withdrawn with the cause `reach mismatch`, judged
   against the approvals the check began under, logged as `reach_mismatch` and
   `tool_withdrawn` at ERROR, and a new approval clears it. Anything else, a denial, an audit
-  failure, a token that cannot be read, an answer larger than the check reads (any answer the
-  connector passes on fits) or none within the call deadline plus 5 s, is a failed check,
-  logged as `reach_check_failed` at WARN, and withdraws nothing; so is a check whose canary
-  tool is not served now, which makes no call. Each is counted in
-  `switchboard_reach_checks_total{server,result}`. `tests/reach.rs` has the held, mismatch,
-  failed and denied cases on the mock server, a check outstanding across a new approval, which
-  withdraws nothing, and the start refused without the fields.
+  failure, a token that cannot be read, an answer larger than the check reads or none within
+  the call deadline plus 5 s, is a failed check, logged as `reach_check_failed` at WARN, and
+  withdraws nothing; so is a check whose canary tool is not served now, which makes no call.
+  The check reads up to the largest `max_result_bytes` a server may have, 1 MiB, plus 64 KiB
+  for the gateway's envelope and `_meta`, so a widened canary answered near its server's cap
+  is a mismatch. Each is counted in `switchboard_reach_checks_total{server,result}`.
+  `tests/reach.rs` has the held, mismatch, failed and denied cases on the mock server, a
+  mismatch at the largest cap, a check outstanding across a new approval, which withdraws
+  nothing, and the start refused without the fields.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.

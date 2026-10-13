@@ -45,14 +45,24 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::deployment::MAX_SERVER_RESULT_BYTES;
+
 /// How long past the entry's call deadline the reach check waits for the gateway's answer:
 /// the gateway's own work on the call, its token check, decision and audit row, comes before
 /// and after the deadline that holds the call to the server.
 pub const REACH_ALLOWANCE: Duration = Duration::from_secs(5);
 
-/// The largest answer the reach check reads. A refusal is a few hundred bytes; a larger answer
-/// is a failed check, never a held one.
-pub const MAX_REACH_ANSWER_BYTES: usize = 1024 * 1024;
+/// The room the reach check reads past the largest answer a server may be allowed. The
+/// gateway's answer to the canary is the server's result, which the connector holds to the
+/// server's `max_result_bytes`, put in the gateway's own JSON-RPC envelope with `_meta` naming
+/// its audit row: a few hundred bytes more. 64 KiB covers that many times over.
+pub const REACH_ANSWER_HEADROOM: usize = 64 * 1024;
+
+/// The largest answer the reach check reads: the largest `max_result_bytes` a server may have
+/// ([`MAX_SERVER_RESULT_BYTES`]) plus [`REACH_ANSWER_HEADROOM`]. So a widened canary answered
+/// near its server's cap is read and judged a mismatch, not failed as too large. A refusal is a
+/// few hundred bytes; a larger answer than this is a failed check, never a held one.
+pub const MAX_REACH_ANSWER_BYTES: usize = MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;
 
 /// The MCP revision the reach check speaks: the one every caller of the gateway may.
 const PROTOCOL_VERSION: &str = "2025-06-18";

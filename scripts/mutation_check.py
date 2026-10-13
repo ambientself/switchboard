@@ -4668,7 +4668,8 @@ mutate("gw-probe-subcommand-exit-zero-when-open", "switchboard probe exits 0 for
 # the gateway's own listener as the registry's workload. Only a successful canary withdraws the
 # entry's tools; a refusal holds and a failed check withdraws nothing. The first check runs
 # beside the schedule, so it delays no poll, and a check is judged only against the approvals
-# it began under. tests/reach.rs watches each.
+# it began under. It reads past the largest answer a server may be allowed, so a widened canary
+# answered near that cap is a mismatch. tests/reach.rs watches each.
 mutate("gw-reach-success-kept", "a canary the server answered withdraws nothing, so a widened reach stays served", DRIFT,
        "                self.withdraw(state, server, found);\n",
        "                let _ = (state, found);\n")
@@ -4687,6 +4688,8 @@ mutate("gw-reach-first-check-delays-first-poll", "the first poll waits for the f
        "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n    loop {\n",
        "    first.spawn(check_reach(Arc::clone(&withdrawals), entry.clone()));\n"
        "    while first.join_next().await.is_some() {}\n    loop {\n")
+mutate("gw-reach-answer-cap-no-headroom", "the reach check reads no more than a server's largest answer, so the gateway's answer to a widened canary near that cap is a failed check, not a mismatch", GW + "reach.rs",
+       "MAX_SERVER_RESULT_BYTES + REACH_ANSWER_HEADROOM;\n", "MAX_SERVER_RESULT_BYTES;\n")
 mutate("gw-reach-stale-judgment-kept", "a mismatch is judged against the approvals in force when the answer comes, so a check begun before a new approval withdraws it", DRIFT,
        "                            && started.get(*name) == Some(&approved.key)\n", "")
 

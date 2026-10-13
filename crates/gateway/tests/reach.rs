@@ -16,7 +16,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
+use connector_proxy::{
+    DEFAULT_MAX_RESPONSE_BYTES, Destination, FileCredentials, ProxyConnector, Upstream,
+};
 use files::{
     AUDIENCE, CREDENTIAL, Files, KIND_REVISION, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA,
     TEAM_B_CREDENTIAL, TEAM_B_LIST_TOOL, TEAM_B_SA, TEAM_B_SURFACE, cluster_issuer,
@@ -25,8 +27,8 @@ use files::{
 use gateway::boot::{self, Settings, Wiring};
 use gateway::reload::Reloader;
 use gateway::{
-    AuditSection, DriftPass, Metrics, ReachCaller, ReachSettings, TELEMETRY_QUEUE, Telemetry,
-    Timeouts, probe_credentials, serve_with_telemetry, start,
+    AuditSection, DriftPass, MAX_SERVER_RESULT_BYTES, Metrics, ReachCaller, ReachSettings,
+    TELEMETRY_QUEUE, Telemetry, Timeouts, probe_credentials, serve_with_telemetry, start,
 };
 use gateway_core::audit::{DecisionKind, Outcome, RecordedResources};
 use gateway_core::{ConnectorName, InstanceName};
@@ -147,13 +149,15 @@ impl Captured {
     }
 }
 
-/// The connector for `entry`, one of the mock server's entries, as the binary builds it.
-fn proxy(entry: &str, url: &str, files: &Files) -> Arc<ProxyConnector> {
+/// The connector for `entry`, one of the mock server's entries, as the binary builds it,
+/// taking answers of up to `max_result_bytes`.
+fn proxy(entry: &str, url: &str, files: &Files, max_result_bytes: usize) -> Arc<ProxyConnector> {
     let credential = files.path(&format!("{entry}-credential"));
     let credentials = FileCredentials::load([(entry.into(), credential)]).unwrap();
     // The entry is in_cluster.
     let upstream = Upstream {
         destination: Destination::InCluster,
+        max_response_bytes: max_result_bytes,
         ..Upstream::new(entry, url)
     }
     .tool(
@@ -189,6 +193,21 @@ impl Replica {
     /// As [`Replica::new`], with the reach check sent to `reach` in place of the replica's own
     /// listener when it is given.
     async fn reaching(name: &str, url: &str, with_token: bool, reach: Option<SocketAddr>) -> Self {
+        Self::build(name, url, with_token, reach, DEFAULT_MAX_RESPONSE_BYTES).await
+    }
+
+    /// As [`Replica::new`], each connector taking answers of up to `max_result_bytes`.
+    async fn capped(name: &str, url: &str, max_result_bytes: usize) -> Self {
+        Self::build(name, url, true, None, max_result_bytes).await
+    }
+
+    async fn build(
+        name: &str,
+        url: &str,
+        with_token: bool,
+        reach: Option<SocketAddr>,
+        max_result_bytes: usize,
+    ) -> Self {
         let files = Files::new(name, &issuer().jwks_document(), url);
         files.write(
             "teams.toml",
@@ -229,7 +248,7 @@ impl Replica {
         let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
         let mut connectors = BTreeMap::new();
         for entry in ["docs-team-a", "docs-team-b"] {
-            let connector = proxy(entry, url, &files);
+            let connector = proxy(entry, url, &files, max_result_bytes);
             connectors.insert(ConnectorName::new(entry), connector.clone());
             wiring = wiring.proxied(entry, connector);
         }
@@ -741,6 +760,60 @@ async fn a_check_outstanding_across_a_new_approval_does_not_withdraw_it() {
     );
     assert_eq!(captured.events("reach_mismatch").len(), 2);
     assert_eq!(captured.events("tool_withdrawn").len(), 2);
+}
+
+/// A server that answers every `tools/call` with a successful result whose HTTP body is
+/// `bytes` long, as a widened server answers a canary, and anything else with `404`.
+async fn answering_with(bytes: usize) -> String {
+    use http::header::CONTENT_TYPE;
+    const JSON: &str = "application/json";
+    let answer = move |body: axum::body::Bytes| async move {
+        let request: Value = serde_json::from_slice(&body).unwrap();
+        if request["method"] != json!("tools/call") {
+            return (
+                http::StatusCode::NOT_FOUND,
+                [(CONTENT_TYPE, JSON)],
+                String::new(),
+            );
+        }
+        let envelope = |text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"content": [{"type": "text", "text": text}], "isError": false},
+            })
+            .to_string()
+        };
+        let text = "x".repeat(bytes - envelope("").len());
+        let answer = envelope(&text);
+        assert_eq!(answer.len(), bytes);
+        (http::StatusCode::OK, [(CONTENT_TYPE, JSON)], answer)
+    };
+    let router = axum::Router::new().route("/mcp", axum::routing::post(answer));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    url
+}
+
+/// A widened server's answer to the canary near the largest answer a server may be allowed is
+/// read and judged a mismatch: the reach check reads the gateway's whole answer, the server's
+/// result in the gateway's envelope, past that cap.
+#[tokio::test]
+async fn a_widened_answer_at_the_largest_server_cap_is_a_mismatch() {
+    let (captured, _logging) = Captured::start();
+    // 64 bytes short of the cap, so the connector takes it, and the gateway's answer is longer.
+    let url = answering_with(MAX_SERVER_RESULT_BYTES - 64).await;
+    let replica = Replica::capped("reach-large", &url, MAX_SERVER_RESULT_BYTES).await;
+
+    replica.drift.reach_pass().await;
+
+    let failed = captured.events("reach_check_failed");
+    assert!(failed.is_empty(), "{failed:?}");
+    let mismatch = captured.events("reach_mismatch");
+    assert_eq!(mismatch.len(), 2, "{mismatch:?}");
+    assert_eq!(replica.withdrawn().len(), 4, "{:?}", replica.withdrawn());
+    assert!(MAX_SERVER_RESULT_BYTES + 64 * 1024 <= gateway::reach::MAX_REACH_ANSWER_BYTES);
 }
 
 /// A missing token is a failed check: logged at WARN and counted, nothing sent to the server
