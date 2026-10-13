@@ -1003,13 +1003,74 @@ fn container(deployment: &str, name: &str) -> String {
         .join("\n")
 }
 
-/// The name of each volume the container mounts, from its `- {name: ..., mountPath: ...}` lines.
+/// The name of each volume the container mounts, from each item of its `volumeMounts:` list,
+/// flow style (`- {name: ..., mountPath: ...}`) or block style (`- name: ...`, then the rest on
+/// the lines under it). It fails closed: an item it cannot read the name of first panics, so a
+/// mount is never missed for how it is written.
 fn mounted(container: &str) -> Vec<String> {
-    block_after(container, "          volumeMounts:")
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- {name: "))
-        .map(|rest| rest.split(',').next().unwrap().to_owned())
+    items(container, "          volumeMounts:")
+        .iter()
+        .map(|mount| item_name(mount).to_owned())
         .collect()
+}
+
+/// No volume the gateway's `container` mounts projects a token the API server accepts: each
+/// projected token names an audience, and not the API server's, which in kind is the issuer.
+fn no_api_token_mounted(gateway: &str, container: &str, issuer: &str) {
+    for name in &mounted(container) {
+        for audience in token_audiences(&volume(gateway, name)) {
+            let audience = audience
+                .unwrap_or_else(|| panic!("volume {name} projects a token for the API server"));
+            assert!(
+                audience != issuer && !audience.starts_with("https://kubernetes.default.svc"),
+                "volume {name} projects a token for the API server's audience {audience}"
+            );
+        }
+    }
+}
+
+/// #153: `mounted` reads a block-style mount as well as a flow-style one, and panics on an item
+/// whose name does not come first, rather than leave it out.
+#[test]
+fn every_volume_mount_of_the_gateway_container_is_read_however_it_is_written() {
+    let gateway = only_deployment("deploy/kind/base/gateway.yaml");
+    let container = container(&gateway, "gateway");
+    assert_eq!(
+        mounted(&container),
+        ["config", "registry", "cluster-ca", "entry-tokens"]
+    );
+
+    // The token writer's API token, mounted into the gateway container block style.
+    let first = "          volumeMounts:\n";
+    let block = "            - name: api-token\n              mountPath: /var/run/secrets/switchboard/api\n              readOnly: true\n";
+    let with_block = container.replacen(first, &format!("{first}{block}"), 1);
+    assert_ne!(with_block, container);
+    assert_eq!(
+        mounted(&with_block),
+        [
+            "api-token",
+            "config",
+            "registry",
+            "cluster-ca",
+            "entry-tokens"
+        ]
+    );
+    // The guard that the gateway container mounts no API token sees it: the volume names no
+    // audience, so its token is the API server's.
+    no_api_token_mounted(&gateway, &container, KIND_ISSUER);
+    let guarded =
+        std::panic::catch_unwind(|| no_api_token_mounted(&gateway, &with_block, KIND_ISSUER));
+    let message = guarded.expect_err("a block-style API token mount passed the guard");
+    assert_eq!(
+        message.downcast_ref::<String>().map(String::as_str),
+        Some("volume api-token projects a token for the API server")
+    );
+
+    // An item whose name is not on its first line is not passed over.
+    let unnamed_first = "            - mountPath: /var/run/secrets/switchboard/api\n              name: api-token\n";
+    let with_unnamed = container.replacen(first, &format!("{first}{unnamed_first}"), 1);
+    let read = std::panic::catch_unwind(|| mounted(&with_unnamed));
+    assert!(read.is_err(), "{:?}", read);
 }
 
 /// The pod's volume `name`: its `- name:` line and those under it.
@@ -1067,20 +1128,9 @@ fn the_kind_gateway_fetches_the_clusters_keys_with_no_token() {
         "        - name: cluster-ca\n          configMap: {name: kube-root-ca.crt}"
     );
 
-    // No volume the gateway container mounts projects a token the API server accepts: each
-    // projected token names an audience, and not the API server's, which in kind is the issuer.
     let mounts = mounted(&container);
     assert!(mounts.contains(&"cluster-ca".to_owned()), "{mounts:?}");
-    for name in &mounts {
-        for audience in token_audiences(&volume(&gateway, name)) {
-            let audience = audience
-                .unwrap_or_else(|| panic!("volume {name} projects a token for the API server"));
-            assert!(
-                audience != issuer && !audience.starts_with("https://kubernetes.default.svc"),
-                "volume {name} projects a token for the API server's audience {audience}"
-            );
-        }
-    }
+    no_api_token_mounted(&gateway, &container, &issuer);
     assert!(
         !container.contains("/var/run/secrets/kubernetes.io/serviceaccount"),
         "{container}"
