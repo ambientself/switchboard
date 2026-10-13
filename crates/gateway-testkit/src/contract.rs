@@ -60,6 +60,9 @@ use crate::fixture::{
     Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
     policy_data,
 };
+use crate::row_bound::{
+    MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
+};
 
 /// What a contract function needs of a store: the store, a read-back, its budgets and its clock.
 pub trait ContractStore {
@@ -584,6 +587,161 @@ pub async fn a_record_the_store_cannot_hold_is_refused_and_leaves_no_row(
     assert!(
         finished.failure().is_some(),
         "the store accepted a latency past a bigint"
+    );
+    assert_eq!(stored(contract, &start.row).await, before);
+}
+
+// --- Item 2: the row bound ---------------------------------------------------------------------
+
+/// The bytes of a row, as [`row_bound`](crate::row_bound) counts its columns.
+fn counted(columns: &[(&'static str, usize)]) -> usize {
+    columns.iter().map(|(_, bytes)| bytes).sum()
+}
+
+/// Decision 0014, section 7: a call row of exactly begin's bound, [`MAX_BEGUN_ROW_BYTES`] as
+/// the store counts it, is begun and stored as the record. One byte more is refused, naming the
+/// row's largest column, and leaves no row.
+pub async fn a_call_row_over_begins_bound_is_refused_naming_its_largest_column(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let row = row_start().row;
+    let mut record = records().swap_remove(0);
+    let held = counted(&call_row_sizes(&row, &record)) - record.policy_revision.as_str().len();
+    record.policy_revision = "r".repeat(MAX_BEGUN_ROW_BYTES - held).as_str().into();
+    assert_eq!(counted(&call_row_sizes(&row, &record)), MAX_BEGUN_ROW_BYTES);
+    store
+        .begin(&row, &record)
+        .await
+        .expect("the store refused a call row at begin's bound");
+    let at_bound = stored(contract, &row).await;
+    assert_eq!(at_bound.record, StoredRecord::Call(record.clone()));
+    assert_eq!(at_bound.completion, None);
+
+    let over = AuditRecord {
+        policy_revision: format!("{}r", record.policy_revision.as_str())
+            .as_str()
+            .into(),
+        ..record
+    };
+    let row = row_start().row;
+    let failure = store
+        .begin(&row, &over)
+        .await
+        .expect_err("the store began a call row over begin's bound")
+        .to_string();
+    assert!(
+        failure.contains(&format!(
+            "would hold {} bytes, more than the {MAX_BEGUN_ROW_BYTES}",
+            MAX_BEGUN_ROW_BYTES + 1
+        )) && failure.ends_with("its largest column is policy_revision"),
+        "a call row over begin's bound was refused for another reason: {failure}"
+    );
+    assert_eq!(contract.stored(&row).await, None);
+}
+
+/// Decision 0014, section 7: a list row of exactly the bound, [`MAX_ROW_BYTES`] as the store
+/// counts it, the kind its statement writes included, is written and stored as the record. One
+/// byte more is refused, naming the row's largest column, and leaves no row.
+pub async fn a_list_row_over_the_bound_is_refused_naming_its_largest_column(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let row = row_start().row;
+    let mut record = list_records().swap_remove(0);
+    let held = counted(&list_row_sizes(&row, &record)) - record.deployment.as_str().len();
+    record.deployment = "d".repeat(MAX_ROW_BYTES - held).as_str().into();
+    assert_eq!(counted(&list_row_sizes(&row, &record)), MAX_ROW_BYTES);
+    store
+        .list(&row, &record)
+        .await
+        .expect("the store refused a list row at the bound");
+    assert_eq!(
+        stored(contract, &row).await.record,
+        StoredRecord::List(record.clone())
+    );
+
+    let over = ListRecord {
+        deployment: format!("{}d", record.deployment.as_str()).as_str().into(),
+        ..record
+    };
+    let row = row_start().row;
+    let failure = store
+        .list(&row, &over)
+        .await
+        .expect_err("the store wrote a list row over the bound")
+        .to_string();
+    assert!(
+        failure.contains(&format!(
+            "would hold {} bytes, more than the {MAX_ROW_BYTES}",
+            MAX_ROW_BYTES + 1
+        )) && failure.ends_with("its largest column is deployment"),
+        "a list row over the bound was refused for another reason: {failure}"
+    );
+    assert_eq!(contract.stored(&row).await, None);
+}
+
+/// A connector that refuses every call with one sentence.
+struct RefusesWith(String);
+
+impl Connector for RefusesWith {
+    fn run(&self, _call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        Box::pin(std::future::ready(ToolOutcome::Refused(self.0.clone())))
+    }
+}
+
+/// A refusal's sentence of [`MAX_OUTCOME_SENTENCE_BYTES`] is written whole at finish. One byte
+/// longer is refused, not cut, as one holding U+0000 is: the finish fails, the caller gets the
+/// audit-failure sentence, and the row is left open as begin wrote it.
+pub async fn a_refusal_sentence_over_the_cap_is_refused_at_finish_and_leaves_the_row_open(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let whole = "w".repeat(MAX_OUTCOME_SENTENCE_BYTES);
+
+    let start = row_start();
+    let ran = audit::run(
+        &RefusesWith(whole.clone()),
+        guard(store, &fixture, &start, &ALLOWED).await,
+    )
+    .await;
+    let finished = audit::finish(store, ran, 3).await;
+    assert!(
+        finished.failure().is_none(),
+        "a sentence at the cap was refused: {:?}",
+        finished.failure()
+    );
+    assert_eq!(
+        stored(contract, &start.row).await.completion,
+        Some(Completion {
+            outcome: Outcome::Refused {
+                sentence: whole.clone()
+            },
+            latency_ms: 3,
+        })
+    );
+
+    let start = row_start();
+    let guard = guard(store, &fixture, &start, &ALLOWED).await;
+    let before = stored(contract, &start.row).await;
+    let ran = audit::run(&RefusesWith(format!("{whole}o")), guard).await;
+    let finished = audit::finish(store, ran, 3).await;
+    let failure = finished
+        .failure()
+        .expect("a sentence over the cap was written")
+        .to_string();
+    assert!(
+        failure.contains(&format!(
+            "outcome_sentence would hold {} bytes, more than the {MAX_OUTCOME_SENTENCE_BYTES}",
+            MAX_OUTCOME_SENTENCE_BYTES + 1
+        )),
+        "a sentence over the cap was refused for another reason: {failure}"
+    );
+    assert!(
+        matches!(finished.answer(), Answer::AuditFailed { .. }),
+        "{:?}",
+        finished.answer()
     );
     assert_eq!(stored(contract, &start.row).await, before);
 }
