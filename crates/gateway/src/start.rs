@@ -86,7 +86,8 @@ use crate::reach::{ReachCaller, ReachSettings};
 use crate::reload::Reloader;
 
 /// The `event` field of the error logged for each audit row the Postgres store stops trying to
-/// complete: the finish deadline passed, or the database refused the completion. It names the
+/// complete: the finish deadline passed, the database refused the completion, or the store
+/// refused it before sending it (a U+0000, or a refusal sentence over its cap). It names the
 /// `row`, the `outcome` that was not written (`ok`, `error` or `refused`), and the `cause`.
 /// The row keeps an empty outcome.
 pub const GIVEN_UP_EVENT: &str = "audit_row_given_up";
@@ -797,7 +798,8 @@ async fn audit_store(url: &str, pools: PoolSizes) -> Result<Arc<PgAuditStore>, S
     }
 }
 
-/// Logs one finish the store gave up as [`GIVEN_UP_EVENT`]. Called on the finish's own task.
+/// Logs one finish the store gave up as [`GIVEN_UP_EVENT`]. Called on the finish's own task, or
+/// on the caller's when the store refuses the completion before sending it.
 fn log_given_up(given_up: GivenUp<'_>) {
     tracing::error!(
         event = GIVEN_UP_EVENT,

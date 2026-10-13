@@ -32,9 +32,9 @@ use crate::store::{Budgets, PgAuditError};
 /// Finish cannot see the row begin wrote, so begin leaves room for the completion: it refuses a
 /// row over [`MAX_BEGUN_ROW_BYTES`], this bound less [`COMPLETION_RESERVE`], and finish refuses
 /// the one completion value that has no fixed size, the refusal sentence, when it is longer
-/// than [`MAX_OUTCOME_SENTENCE_BYTES`]. A list row is written complete and never completed, so list
-/// refuses one over this bound itself. Either refusal at begin or list names the row's largest
-/// column, and the call or the list is refused.
+/// than [`MAX_OUTCOME_SENTENCE_BYTES`]. A list row is written complete and never completed, so
+/// list refuses one over this bound itself. Either refusal at begin or list names the row's
+/// largest column, and the call or the list is refused.
 ///
 /// The values a caller chooses, and the ones it can make long, are capped before they reach a
 /// row, so in the largest row a call can begin they take at most 316,129 bytes, leaving 206,074
