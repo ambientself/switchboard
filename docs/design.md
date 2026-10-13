@@ -1125,27 +1125,30 @@ lookup by marker or by a person, and, for a proxied tool, whether its errors are
 the vendor did nothing (section 11). A connector attaches the receipt marker to what it makes,
 and sends the receipt identifier as the vendor's idempotency key where the vendor honors one.
 
-**Drift.** Every gateway replica runs a drift pass beside its registry reloader, every 300 s
-by default (from 5 s to 900 s; 10 s in the demos). For each proxied entry it reads the tool
-list with the entry's own credential, sends the three calls of step 2, and makes the reach
-check. A tool whose served definition no longer matches `definition_sha256`, or that the
-server no longer lists, is withdrawn. A description is text an agent reads as guidance, so a
-changed description is a changed interface and a possible attack. The hash detects a changed
-interface. It does not detect a changed implementation behind the same interface; that remains
-a risk, covered by the owner's accountability, monitoring and emergency withdrawal.
+**Drift.** Every gateway replica runs a drift pass beside its registry reloader, every 300 s by
+default (from 5 s to 900 s; 10 s in the demos), and no shorter than any proxied entry's call
+deadline: the gateway refuses to start with a shorter one. For each proxied entry it reads the
+tool list with the entry's own credential, sends the three calls of step 2, and makes the reach
+check. A tool whose served definition no longer matches `definition_sha256`, or that the server
+no longer lists, is withdrawn. A description is text an agent reads as guidance, so a changed
+description is a changed interface and a possible attack. The hash detects a changed interface.
+It does not detect a changed implementation behind the same interface; that remains a risk,
+covered by the owner's accountability, monitoring and emergency withdrawal.
 
 A withdrawal makes a snapshot of its own, with the revision `{base}+withdrawn:{names}`, the
 withdrawn tools' exposed names sorted and joined by commas. The loader refuses a registry
 revision containing `+`, so the derived form cannot be mistaken for a loaded one. It survives a
-reload while the tool's hashes and `approved_at` are unchanged; a new approval clears it. The
-first pass's tool lists and probes run at boot, before the replica binds the one listener that
-serves `/readyz` and every surface, so it serves nothing until they finish. Its reach checks
-are calls through that listener, so they run as soon as it is bound; until they finish, at
-most one call deadline plus 5 s, a reach that has widened is served, as between any two
-passes. They run beside the first scheduled polls and delay none of them. A poll
-that fails, by being unreachable, late or unparsable, is not drift: the tools stay served and
-the failure is counted and alerted on.
-Each replica checks for itself, so a change that lasts one interval plus one call deadline,
+reload while the tool's hashes and `approved_at` are unchanged; a new approval clears it. A
+withdrawal that takes the tool an entry's reach check calls takes the entry's other tools with
+it, since the entry can no longer be checked; they stand while that tool's withdrawal does, and
+a new approval of that tool or of the whole entry clears them. The first pass's tool lists and
+probes run at boot, before the replica binds the one listener that serves `/readyz` and every
+surface, so it serves nothing until they finish. Its reach checks are calls through that
+listener, so they run as soon as it is bound; until they finish, at most one call deadline plus
+5 s, a reach that has widened is served, as between any two passes. Every reach check runs
+beside the scheduled polls and delays none of them. A poll that fails, by being unreachable,
+late or unparsable, is not drift: the tools stay served and the failure is counted and alerted
+on. Each replica checks for itself, so a change that lasts one interval plus one call deadline,
 about 305 s at the defaults, is withdrawn on every replica whose polls succeed. While a
 replica's polls of an entry fail, a changed tool stays served on that replica, and the alert on
 failed polls covers it. In milestone 3 a withdrawal lives in each replica's memory: it lasts
@@ -1464,10 +1467,11 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   `oversized_or_late_read`. Overload: team-a's 9 reads at once, one over its cap of 8, give
   eight such rows and one `refused` with the team-capacity sentence, and the calls shed with
   scope `team` rise by one. Team-b's reads are answered throughout. Drift: mock-docs serves
-  another description of `list_documents`, and both entries' list tools are withdrawn within
-  the interval plus the deadline, with rows under the literal derived revision; they stay
-  withdrawn once the description is restored, and a new approval of the same definition, with
-  a new `approved_at`, clears them. `tests/limits.rs` shows overload and a hanging server in a
+  another description of `list_documents`, each entry's reach check tool, and both entries'
+  list tools are withdrawn within the interval plus the deadline, and each entry's read tool
+  with them, with rows under the literal derived revision; they stay withdrawn once the
+  description is restored, and a new approval of the same list tools, with a new
+  `approved_at`, clears all four. `tests/limits.rs` shows overload and a hanging server in a
   test too (#139).
 - Decision 0011, sections 1 to 5: schema validation before forwarding is built (#122, in the
   argument check entry below). Connector entries and the snapshot loader's nine rules are
@@ -1536,51 +1540,62 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   the refused addresses are built in the connector (the destinations box above).
 - The drift pass, its derived revisions and standing withdrawals: built. Every replica reads
   each proxied server's `tools/list` with the entry's own credential, under its call deadline
-  and answer cap, once during boot before the listener is bound and then every
-  `[drift] interval_seconds` (300 s by default, 5 to 900; the demos set 10), each server on a
-  schedule of its own, so a server that answers late holds back no other server's polls. Each
-  server is polled one poll at a time, so section 13's bound of one interval plus one call
-  deadline holds when the interval is at least the entry's call deadline, as at the defaults
-  and in the demos. With the reach check (below), the next poll also waits for the check beside
-  the last, so the bound holds when the interval is at least the deadline plus 5 s, as there
-  too. With a shorter interval, a list answered late but inside the deadline holds back that
-  server's next poll until it arrives, and the worst case is about two call deadlines (#165).
-  An approved tool whose served definition no longer hashes to its `definition_sha256`, by the
-  loader's own function, or that the server no longer lists, is withdrawn: the policy in
-  force less the tool, under the revision `{base}+withdrawn:{names}`, swapped in atomically,
-  with `tool_withdrawn` logged at ERROR and counted. A poll is judged only against the
-  approvals it began under, so a list read before a reload approved a tool again does not
-  withdraw it. A failed poll, including a list that names a next page, keeps the tools served
-  and is logged and counted. A withdrawal is keyed by the tool's name, both hashes and
-  `approved_at`, is applied again to each reload that keeps its key, and is cleared by a new
-  approval or by removing the tool; it lives in the replica's memory, so a restart against a
-  restored server serves the tool again (decision 0013, section 7). `tests/drift.rs` has
-  decision 0013's drift scenarios. Each poll also probes its server (the probe entry below).
-  The reach check of the same pass is built (decision 0011, section 4; decision 0013, section
-  5, step 3). With `[drift] reach_token_file`, `reach_url` and `reach_host`, given together,
-  each entry with a `reach_check` is checked beside each poll, and once as soon as the drift
-  pass starts, after the listener is bound; never in the boot pass, which comes before it. The
-  gateway refuses to start without the three fields while any entry has a `reach_check`,
-  naming the entries, so no entry is left unchecked for want of them. That first check runs
-  beside the entry's schedule and delays no poll; a poll that comes while it is out makes no
-  check of its own. The check sends the entry's canary as
-  `tools/call` to the replica's own listener, on the `registry-reach` surface, with the
-  registry's own workload token: a principal the surface admits alone, by issuer and subject,
-  in team `registry`, whose limit holds each entry's reach and canary, so the call is decided,
-  audited and sent with the entry's credential like any other. An error result whose text is
-  the proxy's upstream-refused sentence holds, logged as `reach_held`. A successful result is
-  a mismatch: every tool of the entry is withdrawn with the cause `reach mismatch`, judged
-  against the approvals the check began under, logged as `reach_mismatch` and
-  `tool_withdrawn` at ERROR, and a new approval clears it. Anything else, a denial, an audit
-  failure, a token that cannot be read, an answer larger than the check reads or none within
-  the call deadline plus 5 s, is a failed check, logged as `reach_check_failed` at WARN, and
-  withdraws nothing; so is a check whose canary tool is not served now, which makes no call.
-  The check reads up to the largest `max_result_bytes` a server may have, 1 MiB, plus 64 KiB
-  for the gateway's envelope and `_meta`, so a widened canary answered near its server's cap
-  is a mismatch. Each is counted in `switchboard_reach_checks_total{server,result}`.
-  `tests/reach.rs` has the held, mismatch, failed and denied cases on the mock server, a
-  mismatch at the largest cap, a check outstanding across a new approval, which withdraws
-  nothing, and the start refused without the fields.
+  and answer cap, once during boot before the listener is bound and then every `[drift]
+  interval_seconds` (300 s by default, 5 to 900; the demos set 10), each server on a schedule of
+  its own, so a server that answers late holds back no other server's polls. Each server is
+  polled one poll at a time, and the gateway refuses to start with an interval shorter than any
+  proxied entry's call deadline, its own or the default, naming the entry, its deadline and the
+  interval (decision 0013, section 5, noted on 2026-10-12). So each poll ends by the next, and
+  section 13's bound of one interval plus one call deadline holds as written. The reach check
+  (below) runs beside the polls, and no poll waits for it. An approved tool whose served
+  definition no longer hashes to its `definition_sha256`, by the loader's own function, or that
+  the server no longer lists, is withdrawn: the policy in force less the tool, under the
+  revision `{base}+withdrawn:{names}`, swapped in atomically, with `tool_withdrawn` logged at
+  ERROR and counted. A poll is judged only against the approvals it began under, so a list read
+  before a reload approved a tool again does not withdraw it. A failed poll, including a list
+  that names a next page, keeps the tools served and is logged and counted. A withdrawal is
+  keyed by the tool's name, both hashes and `approved_at`, is applied again to each reload that
+  keeps its key, and is cleared by a new approval or by removing the tool; it lives in the
+  replica's memory, so a restart against a restored server serves the tool again (decision 0013,
+  section 7). `tests/drift.rs` has decision 0013's drift scenarios. Each poll also probes its
+  server (the probe entry below). The reach check of the same pass is built (decision 0011,
+  section 4; decision 0013, section 5, step 3). With `[drift] reach_token_file`, `reach_url` and
+  `reach_host`, given together, each entry with a `reach_check` is checked beside each poll, and
+  once as soon as the drift pass starts, after the listener is bound; never in the boot pass,
+  which comes before it. The gateway refuses to start without the three fields while any entry
+  has a `reach_check`, naming the entries, so no entry is left unchecked for want of them. Every
+  check runs beside the entry's schedule and delays no poll; a tick that comes while the last
+  check is out makes no check of its own. The check sends the entry's canary as `tools/call` to
+  the replica's own listener, on the `registry-reach` surface, with the registry's own workload
+  token: a principal the surface admits alone, by issuer and subject, in team `registry`, whose
+  limit holds each entry's reach and canary, so the call is decided, audited and sent with the
+  entry's credential like any other. An error result whose text is the proxy's upstream-refused
+  sentence holds, logged as `reach_held`. A successful result is a mismatch: every tool of the
+  entry is withdrawn with the cause `reach mismatch`, judged against the approvals the check
+  began under, logged as `reach_mismatch` and `tool_withdrawn` at ERROR, and a new approval
+  clears it. Anything else, a denial, an audit failure, a token that cannot be read, an answer
+  larger than the check reads or none within the call deadline plus 5 s, is a failed check,
+  logged as `reach_check_failed` at WARN, and withdraws nothing; so is a check whose canary tool
+  is not served now, which makes no call. A withdrawal, for any cause, that takes the tool an
+  entry's reach check calls takes the entry's other tools with it, since the entry can no longer
+  be checked: each is logged as `tool_withdrawn` with the cause `reach check tool withdrawn` and
+  `reach_check_tool` naming that tool (decision 0011, section 4, noted on 2026-10-12). They
+  stand while that tool's withdrawal does, whatever their own approvals, and a new approval of
+  that tool or of the whole entry clears them. Each poll and reach check still judge them, and
+  one whose own definition changes, that is no longer listed, or whose entry's reach is found
+  wider, is withdrawn for that cause instead, so a new approval of the reach check tool alone
+  does not serve it. The check reads up to 8 times the largest `max_result_bytes` a server may
+  have, 1 MiB, plus 64 KiB for the gateway's envelope and `_meta`: the gateway writes the
+  server's result out again, and a number such as `1e9` comes out as `1000000000.0`, but no
+  part of the JSON grows by more than 8 times (#175). So a widened canary answered near its
+  server's cap is a mismatch, whatever numbers it holds. Each is counted in
+  `switchboard_reach_checks_total{server,result}`. `tests/reach.rs` has the held, mismatch,
+  failed and denied cases on the mock server, a mismatch at the largest cap, and of compact
+  numbers there, a check outstanding across a new approval, which withdraws nothing, a check
+  that hangs, which holds back no poll, and the start refused without the fields.
+  `tests/drift.rs` has an entry withdrawn with its reach check tool, each new approval that
+  clears it or does not, a tool withdrawn with it whose own definition then changes, and the
+  start refused with an interval shorter than a call deadline.
 - The maximum policy age and the stale-policy refusal: built (#132), in the opt-outs entry
   below.
 - The 3600 s cap on user issuers' token lifetime: not built.

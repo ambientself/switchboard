@@ -20,8 +20,9 @@ use axum::Router;
 use axum::routing::post;
 use connector_proxy::{Destination, FileCredentials, ProxyConnector, Upstream};
 use files::{
-    AUDIENCE, Files, KIND_REVISION, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, TEAM_B_READ_TOOL,
-    call, cluster_issuer, kubernetes_token, listed,
+    AUDIENCE, Files, KIND_REVISION, LIST_TOOL, READ_TOOL, SURFACE, TEAM_A_SA, TEAM_B_LIST_TOOL,
+    TEAM_B_READ_TOOL, TEAM_B_SA, TEAM_B_SURFACE, call, cluster_issuer, kubernetes_token, listed,
+    listed_on,
 };
 use gateway::boot::{self, Settings, Wiring};
 use gateway::path::RequestPath;
@@ -50,6 +51,14 @@ const CHANGED: &str = "Read one document of one project, and send it to the vend
 /// Both entries' read tools, withdrawn together when the shared server's `read_document`
 /// changes: the derived revision's names, sorted by byte.
 const BOTH_READS: &str = "docs-team-a__read_document,docs-team-b__read_document";
+
+/// The description the mock server serves for `list_documents`, each entry's reach check tool,
+/// once it drifts.
+const CHANGED_LIST: &str = "List the documents of one project, and whatever else it holds.";
+
+/// docs-team-a's two tools, withdrawn together when its reach check tool is: the derived
+/// revision's names.
+const TEAM_A_TOOLS: &str = "docs-team-a__list_documents,docs-team-a__read_document";
 
 fn issuer() -> &'static LocalIssuer {
     static ISSUER: OnceLock<LocalIssuer> = OnceLock::new();
@@ -98,6 +107,12 @@ fn proxy_within(entry: &str, url: &str, files: &Files, deadline: Duration) -> Ar
 impl Replica {
     /// A replica of the registry in `files`, its servers at `url`. The drift pass has not run.
     fn new(files: &Files, url: &str) -> Self {
+        Self::split(files, url, url)
+    }
+
+    /// As [`Replica::new`], with docs-team-a's server at `team_a` and docs-team-b's at
+    /// `team_b`, so a definition can drift on one entry alone.
+    fn split(files: &Files, team_a: &str, team_b: &str) -> Self {
         let deployment = files.load();
         let settings = Settings {
             deployment: deployment.deployment,
@@ -112,7 +127,7 @@ impl Replica {
         let store = Arc::new(InMemoryAuditStore::new());
         let mut wiring = Wiring::new(Arc::new(SystemClock)).audit_store(store.clone());
         let mut connectors = BTreeMap::new();
-        for entry in ["docs-team-a", "docs-team-b"] {
+        for (entry, url) in [("docs-team-a", team_a), ("docs-team-b", team_b)] {
             let connector = proxy(entry, url, files);
             connectors.insert(ConnectorName::new(entry), connector.clone());
             wiring = wiring.proxied(entry, connector);
@@ -144,6 +159,12 @@ impl Replica {
     /// The names team A's surface lists.
     async fn listed(&self) -> Vec<String> {
         listed(&self.path, &token()).await
+    }
+
+    /// The names team B's surface lists.
+    async fn listed_by_team_b(&self) -> Vec<String> {
+        let token = kubernetes_token(issuer(), TEAM_B_SA, &[AUDIENCE]);
+        listed_on(&self.path, TEAM_B_SURFACE, &token).await
     }
 
     /// Calls team A's read tool, and returns the answer and the revision its row recorded.
@@ -303,6 +324,42 @@ fn reapproved(text: &str, tool: &str, description: &str, revision: &str) -> Stri
         );
     let text = format!("{}{block}{}", &text[..start], &text[end..]);
     at_revision(&text, revision)
+}
+
+/// A registry `text` in which `tool` is approved at `approved_at` with `description`, the
+/// definition's hash changed to match: an approval of what the server serves, whatever the tool
+/// was approved as before.
+fn approval(text: &str, tool: &str, description: &str, approved_at: &str) -> String {
+    let registry = Registry::from_toml_str(text).unwrap();
+    let name: ToolName = tool.parse().unwrap();
+    let definition = &registry.definitions()[&name];
+    let before = &registry.approvals()[&name];
+    let upstream = &registry.routes()[&name].upstream_name;
+    let after = gateway_registry::definition_sha256(
+        upstream,
+        definition.title.as_deref(),
+        description,
+        &definition.input_schema,
+    );
+    let start = text.find(&format!("[[tools]]\nname = \"{tool}\"")).unwrap();
+    let end = start
+        + 1
+        + text[start + 1..]
+            .find("[[tools]]")
+            .unwrap_or(text.len() - start - 1);
+    let mut block = text[start..end]
+        .replace(
+            &format!("description = \"{}\"", definition.description),
+            &format!("description = \"{description}\""),
+        )
+        .replace(
+            &format!("definition_sha256 = \"{}\"", before.definition_sha256),
+            &format!("definition_sha256 = \"{after}\""),
+        );
+    let at = block.find("approved_at = ").unwrap();
+    let line_end = at + block[at..].find('\n').unwrap();
+    block.replace_range(at..line_end, &format!("approved_at = {approved_at}"));
+    format!("{}{block}{}", &text[..start], &text[end..])
 }
 
 /// `text` under `revision`.
@@ -971,4 +1028,385 @@ async fn a_server_down_at_boot_does_not_stop_it() {
     let booted = boot(&files).await;
     assert_eq!(booted.withdrawn, 0);
     assert_eq!(first_list(booted.address).await, [LIST_TOOL, READ_TOOL]);
+}
+
+/// Decision 0013, section 5, as noted on 2026-10-12: the gateway refuses to start with a drift
+/// interval shorter than a proxied server's call deadline, naming the server, its deadline and
+/// the interval, before it connects to anything. An interval equal to the deadline starts.
+#[tokio::test]
+async fn start_refuses_a_drift_interval_shorter_than_a_call_deadline() {
+    let mock = mock().await;
+    let files = Files::new("drift-interval", &issuer().jwks_document(), &mock.url());
+    let deployment = |deadline: u64| {
+        let text = files::deployment_file("[audit]\nmode = \"disabled\"\n");
+        assert_eq!(text.matches("[drift]\n").count(), 1, "{text}");
+        text.replace(
+            "[drift]\n",
+            &format!(
+                "[servers.docs-team-a]\ndeadline_seconds = {deadline}\n\n\
+                 [drift]\ninterval_seconds = 10\n"
+            ),
+        )
+    };
+
+    files.write("gateway.toml", &deployment(11));
+    let refused = start::prepare(
+        files.load(),
+        InstanceName::new("drift-test"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            start::StartError::IntervalBelowDeadline { server, deadline, interval }
+                if server.as_str() == "docs-team-a"
+                    && *deadline == Duration::from_secs(11)
+                    && *interval == Duration::from_secs(10)
+        ),
+        "{refused:?}"
+    );
+    let said = refused.to_string();
+    assert!(
+        said.contains("is 10 s, shorter than server `docs-team-a`'s call deadline of 11 s"),
+        "{said}"
+    );
+    assert!(mock.log_lines().is_empty(), "{:?}", mock.log_lines());
+
+    files.write("gateway.toml", &deployment(10));
+    let booted = boot(&files).await;
+    assert_eq!(booted.withdrawn, 0);
+    assert_eq!(first_list(booted.address).await, [LIST_TOOL, READ_TOOL]);
+}
+
+/// Decision 0011, section 4, as noted on 2026-10-12: a withdrawal of an entry's reach check
+/// tool withdraws the entry's other tools with it, since the entry's reach can no longer be
+/// checked. docs-team-a's server changes `list_documents`, its reach check tool: both of its
+/// tools are withdrawn in one policy, the read tool with the cause naming the reach check tool,
+/// and its rows record the derived revision naming both. docs-team-b's server, another, is
+/// unchanged, and its tools stay served.
+#[tokio::test]
+async fn a_withdrawn_reach_check_tool_withdraws_its_entrys_other_tools() {
+    let (captured, _logging) = Captured::start();
+    let team_a = mock().await;
+    let team_b = mock().await;
+    let files = Files::new("drift-canary", &issuer().jwks_document(), &team_a.url());
+    let replica = Replica::split(&files, &team_a.url(), &team_b.url());
+
+    team_a.server().set_description(
+        mock_docs_server::ToolName::ListDocuments,
+        Some(CHANGED_LIST.to_owned()),
+    );
+    replica.drift.pass().await;
+
+    let derived = format!("{KIND_REVISION}+withdrawn:{TEAM_A_TOOLS}");
+    assert_eq!(
+        replica.withdrawn(),
+        BTreeSet::from([LIST_TOOL.to_owned(), READ_TOOL.to_owned()])
+    );
+    assert_eq!(replica.revision(), derived);
+    assert!(replica.listed().await.is_empty());
+    let list_row = replica.store.list_rows().pop().unwrap().1;
+    assert_eq!(list_row.policy_revision.as_str(), derived);
+    let (answer, revision) = replica.read().await;
+    assert_eq!(answer["error"]["code"], json!(DENIAL_CODE), "{answer}");
+    assert_eq!(revision, derived);
+    assert_eq!(
+        replica.listed_by_team_b().await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
+
+    let withdrawn = captured.events("tool_withdrawn");
+    assert_eq!(withdrawn.len(), 2, "{withdrawn:?}");
+    let mut causes = BTreeMap::new();
+    for (level, fields) in &withdrawn {
+        assert_eq!(level, "ERROR");
+        assert_eq!(fields["server"], "docs-team-a");
+        assert_eq!(fields["base"], KIND_REVISION);
+        assert_eq!(fields["revision"], derived.as_str());
+        causes.insert(
+            fields["tool"].as_str().unwrap().to_owned(),
+            (fields["cause"].clone(), fields["reach_check_tool"].clone()),
+        );
+    }
+    assert_eq!(
+        causes,
+        BTreeMap::from([
+            (
+                LIST_TOOL.to_owned(),
+                (json!("definition changed"), Value::Null)
+            ),
+            (
+                READ_TOOL.to_owned(),
+                (json!("reach check tool withdrawn"), json!(LIST_TOOL))
+            ),
+        ])
+    );
+    let text = replica.metrics();
+    for (server, count) in [("docs-team-a", 2.0), ("docs-team-b", 0.0)] {
+        let withdrawals = format!("switchboard_drift_withdrawals_total{{server=\"{server}\"}}");
+        assert_eq!(sample(&text, &withdrawals), Some(count), "{text}");
+    }
+    assert_eq!(
+        sample(&text, "switchboard_tools_withdrawn"),
+        Some(2.0),
+        "{text}"
+    );
+
+    // Both stay withdrawn, and the next pass logs nothing more.
+    replica.drift.pass().await;
+    assert_eq!(captured.events("tool_withdrawn").len(), 2);
+    assert!(replica.listed().await.is_empty());
+}
+
+/// A tool withdrawn with its entry's reach check tool stands while that tool's withdrawal does,
+/// whatever its own approval: approving it again alone keeps it withdrawn, a new approval of the
+/// reach check tool clears both, and so does one of the whole entry. A tool withdrawn for a
+/// cause of its own keeps its own key: the reach check tool's new approval leaves it withdrawn.
+/// Approved again alone while the reach check tool is withdrawn, it is withdrawn at once with
+/// that tool, and logged. The other entry is never touched.
+#[tokio::test]
+async fn a_withdrawal_with_the_reach_check_tool_clears_with_it() {
+    use mock_docs_server::ToolName as Mock;
+    let (captured, _logging) = Captured::start();
+    let team_a = mock().await;
+    let team_b = mock().await;
+    let files = Files::new(
+        "drift-canary-cleared",
+        &issuer().jwks_document(),
+        &team_a.url(),
+    );
+    let replica = Replica::split(&files, &team_a.url(), &team_b.url());
+    let described = |tool: Mock| {
+        tool.definition()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (list, read) = (
+        described(Mock::ListDocuments),
+        described(Mock::ReadDocument),
+    );
+    let both = BTreeSet::from([LIST_TOOL.to_owned(), READ_TOOL.to_owned()]);
+    let lines = |event: &str, field: &str| -> Vec<String> {
+        captured
+            .events(event)
+            .into_iter()
+            .map(|(_, fields)| {
+                format!(
+                    "{}: {}",
+                    fields["tool"].as_str().unwrap(),
+                    fields[field].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    let cleared = || lines("policy_withdrawal_cleared", "reason");
+    let withdrawn = || lines("tool_withdrawn", "cause");
+    let with_canary = format!("{READ_TOOL}: its entry's reach check tool is no longer withdrawn");
+
+    // The reach check tool changes: both of docs-team-a's tools are withdrawn.
+    team_a
+        .server()
+        .set_description(Mock::ListDocuments, Some(CHANGED_LIST.to_owned()));
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+
+    // The read tool approved again alone: the entry still cannot be checked.
+    let text = approval(
+        &files::registry(&team_a.url()),
+        READ_TOOL,
+        &read,
+        "2026-10-12T09:00:00Z",
+    );
+    assert_eq!(
+        replica.reload(&at_revision(&text, "demo-12")),
+        format!("demo-12+withdrawn:{TEAM_A_TOOLS}")
+    );
+    assert_eq!(replica.withdrawn(), both);
+    assert!(cleared().is_empty(), "{:?}", cleared());
+    assert_eq!(withdrawn().len(), 2);
+
+    // The reach check tool approved again as served now: both are served again, and stay so.
+    let text = approval(&text, LIST_TOOL, CHANGED_LIST, "2026-10-12T09:10:00Z");
+    assert_eq!(replica.reload(&at_revision(&text, "demo-13")), "demo-13");
+    assert_eq!(
+        cleared(),
+        [format!("{LIST_TOOL}: approved again"), with_canary.clone()]
+    );
+    assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
+    replica.drift.pass().await;
+    assert!(replica.withdrawn().is_empty());
+
+    // It changes back, and both are withdrawn again. A new approval of the whole entry clears
+    // both.
+    team_a.server().set_description(Mock::ListDocuments, None);
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+    let text = approval(&text, LIST_TOOL, &list, "2026-10-12T09:20:00Z");
+    let text = approval(&text, READ_TOOL, &read, "2026-10-12T09:20:00Z");
+    assert_eq!(replica.reload(&at_revision(&text, "demo-14")), "demo-14");
+    assert!(replica.withdrawn().is_empty());
+    assert_eq!(
+        cleared()[2..],
+        [format!("{LIST_TOOL}: approved again"), with_canary.clone()]
+    );
+
+    // Both definitions change: each is withdrawn for a cause of its own.
+    team_a
+        .server()
+        .set_description(Mock::ListDocuments, Some(CHANGED_LIST.to_owned()));
+    team_a
+        .server()
+        .set_description(Mock::ReadDocument, Some(CHANGED.to_owned()));
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+    assert_eq!(
+        withdrawn()[4..],
+        [
+            format!("{LIST_TOOL}: definition changed"),
+            format!("{READ_TOOL}: definition changed")
+        ]
+    );
+
+    // The reach check tool approved again alone: the read tool's own withdrawal stands.
+    let text = approval(&text, LIST_TOOL, CHANGED_LIST, "2026-10-12T09:30:00Z");
+    assert_eq!(
+        replica.reload(&at_revision(&text, "demo-15")),
+        format!("demo-15+withdrawn:{READ_TOOL}")
+    );
+    assert_eq!(cleared()[4..], [format!("{LIST_TOOL}: approved again")]);
+
+    // The reach check tool changes back, and is withdrawn again, alone: the read tool already
+    // is.
+    team_a.server().set_description(Mock::ListDocuments, None);
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+    assert_eq!(
+        withdrawn()[6..],
+        [format!("{LIST_TOOL}: definition changed")]
+    );
+
+    // The read tool approved again alone, as served now: its own withdrawal is dropped, and it
+    // is withdrawn at once with the reach check tool, which still is.
+    let text = approval(&text, READ_TOOL, CHANGED, "2026-10-12T09:40:00Z");
+    let derived = format!("demo-16+withdrawn:{TEAM_A_TOOLS}");
+    assert_eq!(replica.reload(&at_revision(&text, "demo-16")), derived);
+    assert_eq!(cleared()[5..], [format!("{READ_TOOL}: approved again")]);
+    let again = captured.events("tool_withdrawn");
+    assert_eq!(again.len(), 8, "{again:?}");
+    let (level, fields) = &again[7];
+    assert_eq!(level, "ERROR");
+    assert_eq!(fields["tool"], READ_TOOL);
+    assert_eq!(fields["cause"], "reach check tool withdrawn");
+    assert_eq!(fields["reach_check_tool"], LIST_TOOL);
+    assert_eq!(fields["base"], "demo-16");
+    assert_eq!(fields["revision"], derived.as_str());
+
+    // The reach check tool approved again: both are served, and stay so.
+    let text = approval(&text, LIST_TOOL, &list, "2026-10-12T09:50:00Z");
+    assert_eq!(replica.reload(&at_revision(&text, "demo-17")), "demo-17");
+    assert_eq!(
+        cleared()[6..],
+        [format!("{LIST_TOOL}: approved again"), with_canary]
+    );
+    replica.drift.pass().await;
+    assert!(replica.withdrawn().is_empty());
+    assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
+    assert!(
+        captured
+            .events("tool_withdrawn")
+            .iter()
+            .all(|(_, fields)| fields["server"] == "docs-team-a")
+    );
+    assert_eq!(
+        replica.listed_by_team_b().await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
+}
+
+/// A tool withdrawn with its entry's reach check tool is still judged at each poll.
+/// docs-team-a's reach check tool changes, and its read tool is withdrawn with it; then the read
+/// tool's own definition changes. The next poll withdraws it for that cause of its own, so a new
+/// approval of the reach check tool alone serves only that tool, and the read tool stays
+/// withdrawn until it is approved again itself.
+#[tokio::test]
+async fn a_tool_withdrawn_with_the_reach_check_tool_is_still_judged() {
+    use mock_docs_server::ToolName as Mock;
+    let (captured, _logging) = Captured::start();
+    let team_a = mock().await;
+    let team_b = mock().await;
+    let files = Files::new(
+        "drift-canary-judged",
+        &issuer().jwks_document(),
+        &team_a.url(),
+    );
+    let replica = Replica::split(&files, &team_a.url(), &team_b.url());
+    let both = BTreeSet::from([LIST_TOOL.to_owned(), READ_TOOL.to_owned()]);
+
+    team_a
+        .server()
+        .set_description(Mock::ListDocuments, Some(CHANGED_LIST.to_owned()));
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+
+    // The read tool's own definition changes while it is withdrawn with the reach check tool.
+    team_a
+        .server()
+        .set_description(Mock::ReadDocument, Some(CHANGED.to_owned()));
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), both);
+    let withdrawn = captured.events("tool_withdrawn");
+    assert_eq!(withdrawn.len(), 3, "{withdrawn:?}");
+    let (level, fields) = &withdrawn[2];
+    assert_eq!(level, "ERROR");
+    assert_eq!(fields["tool"], READ_TOOL);
+    assert_eq!(fields["cause"], "definition changed");
+    assert_eq!(fields["reach_check_tool"], Value::Null);
+    assert_eq!(
+        fields["revision"],
+        format!("{KIND_REVISION}+withdrawn:{TEAM_A_TOOLS}").as_str()
+    );
+
+    // The reach check tool approved again alone: the read tool stays withdrawn for its own
+    // cause, and is not served.
+    let text = approval(
+        &files::registry(&team_a.url()),
+        LIST_TOOL,
+        CHANGED_LIST,
+        "2026-10-12T09:00:00Z",
+    );
+    assert_eq!(
+        replica.reload(&at_revision(&text, "demo-12")),
+        format!("demo-12+withdrawn:{READ_TOOL}")
+    );
+    assert_eq!(replica.withdrawn(), BTreeSet::from([READ_TOOL.to_owned()]));
+    assert_eq!(replica.listed().await, [LIST_TOOL]);
+    let (answer, revision) = replica.read().await;
+    assert_eq!(answer["error"]["code"], json!(DENIAL_CODE), "{answer}");
+    assert_eq!(revision, format!("demo-12+withdrawn:{READ_TOOL}"));
+    let cleared: Vec<String> = captured
+        .events("policy_withdrawal_cleared")
+        .into_iter()
+        .map(|(_, fields)| fields["tool"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(cleared, [LIST_TOOL]);
+    replica.drift.pass().await;
+    assert_eq!(replica.withdrawn(), BTreeSet::from([READ_TOOL.to_owned()]));
+    assert_eq!(captured.events("tool_withdrawn").len(), 3);
+
+    // A new approval of the read tool, as served now, serves it, and it stays served.
+    let text = approval(&text, READ_TOOL, CHANGED, "2026-10-12T09:10:00Z");
+    assert_eq!(replica.reload(&at_revision(&text, "demo-13")), "demo-13");
+    assert_eq!(replica.listed().await, [LIST_TOOL, READ_TOOL]);
+    replica.drift.pass().await;
+    assert!(replica.withdrawn().is_empty());
+    let (answer, revision) = replica.read().await;
+    assert!(answer.get("result").is_some(), "{answer}");
+    assert_eq!(revision, "demo-13");
+    assert_eq!(
+        replica.listed_by_team_b().await,
+        [TEAM_B_LIST_TOOL, TEAM_B_READ_TOOL]
+    );
 }
