@@ -2961,7 +2961,7 @@ mutate("registry-reach-check-unapproved-accepted", "a reach check's tool may be 
        "            && !routes.contains_key(&check.tool)\n", "            && false\n")
 mutate("registry-reach-check-unapproved-any-entry", "another entry's approved tools keep a withdrawn reach check tool from loading", RR,
        "            && routes.values().any(|route| route.server == server.name)\n", "            && !routes.is_empty()\n")
-mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file even with the entry's other tools", RR,
+mutate("registry-reach-check-requires-approval", "withdrawing the tool a reach check names refuses the file even with the entry's other tools withdrawn", RR,
        "    let surfaces = file\n",
        "    if servers.values().any(|server| server.reach_check.as_ref().is_some_and(|check| !routes.contains_key(&check.tool))) {\n"
        "        return Err(RegistryError::ReachCheckMissing(servers.keys().next().unwrap().clone()));\n"
