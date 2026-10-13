@@ -109,7 +109,7 @@ other, its row names the registry's principal, and it goes to mock-docs with the
 credential, which mock-docs limits to the team's own project. It never runs in the boot pass,
 which comes before the listener is bound, and it never attempts a write: every proxied tool is
 `read`. The gateway refuses to start without those three fields while any registry entry has a
-`reach_check`, naming the entries, so no entry's reach goes unchecked.
+`reach_check`, naming the entries, so no entry is left unchecked for want of them.
 
 - mock-docs refuses it (403): the reach holds, `"event":"reach_held"`.
 - mock-docs answers it: the credential reaches more than was recorded, `"event":"reach_mismatch"`

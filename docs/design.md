@@ -1552,8 +1552,9 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   each entry with a `reach_check` is checked beside each poll, and once as soon as the drift
   pass starts, after the listener is bound; never in the boot pass, which comes before it. The
   gateway refuses to start without the three fields while any entry has a `reach_check`,
-  naming the entries, so none goes unchecked. That first check runs beside the entry's schedule and delays no poll; a poll that
-  comes while it is out makes no check of its own. The check sends the entry's canary as
+  naming the entries, so no entry is left unchecked for want of them. That first check runs
+  beside the entry's schedule and delays no poll; a poll that comes while it is out makes no
+  check of its own. The check sends the entry's canary as
   `tools/call` to the replica's own listener, on the `registry-reach` surface, with the
   registry's own workload token: a principal the surface admits alone, by issuer and subject,
   in team `registry`, whose limit holds each entry's reach and canary, so the call is decided,

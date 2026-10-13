@@ -65,7 +65,7 @@
 //! this replica's own listener, under the registry's own workload identity, so it is decided
 //! and audited like any call. The deployment file's `[drift] reach_*` ([`ReachSettings`]) say
 //! where and as whom, and the gateway refuses to start without them while any entry has a
-//! `reach_check` ([`crate::start`]), so no such entry goes unchecked. It goes
+//! `reach_check` ([`crate::start`]), so no entry is left unchecked for want of them. It goes
 //! through the listener, so it never runs in the boot pass, which comes before the listener is
 //! bound: [`DriftPass::run`] makes each entry's first check as soon as it starts, after the
 //! binary has bound the listener, and one more beside each poll after. That first check runs
