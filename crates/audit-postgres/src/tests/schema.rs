@@ -58,12 +58,12 @@ const LISTED: &[(&str, &str)] = &[
 ];
 
 /// `ALLOWED`, with each of `changes` replacing or adding a column.
-fn insert(changes: &[(&str, &str)]) -> String {
+pub(super) fn insert(changes: &[(&str, &str)]) -> String {
     insert_from(ALLOWED, changes)
 }
 
 /// `LISTED`, with each of `changes` replacing or adding a column.
-fn list(changes: &[(&str, &str)]) -> String {
+pub(super) fn list(changes: &[(&str, &str)]) -> String {
     insert_from(LISTED, changes)
 }
 
@@ -85,7 +85,7 @@ fn insert_from(base: &[(&str, &str)], changes: &[(&str, &str)]) -> String {
 }
 
 /// The begin columns of a denial.
-fn denied() -> String {
+pub(super) fn denied() -> String {
     insert(&[
         ("decision", "'deny'"),
         ("reason", "'unknown_tool'"),
@@ -93,14 +93,18 @@ fn denied() -> String {
     ])
 }
 
-async fn insert_row(client: &Client, sql: &str) -> String {
+pub(super) async fn insert_row(client: &Client, sql: &str) -> String {
     client.query_one(sql, &[]).await.unwrap().get(0)
 }
 
 /// Completes `id` with `outcome` and a latency of 1, and an `error` with the kind `other`, as
 /// an error must have since 0006. Any other outcome is given no kind, so a row can be completed
 /// this way before 0006 too.
-async fn complete(client: &Client, id: &str, outcome: &str) -> Result<u64, tokio_postgres::Error> {
+pub(super) async fn complete(
+    client: &Client,
+    id: &str,
+    outcome: &str,
+) -> Result<u64, tokio_postgres::Error> {
     let kind = if outcome == "error" {
         ", error_kind = 'other'"
     } else {

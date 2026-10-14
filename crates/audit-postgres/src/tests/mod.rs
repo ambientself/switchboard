@@ -12,6 +12,7 @@ mod check;
 mod contract;
 mod latency;
 mod open_rows;
+mod receipts;
 mod recovery;
 mod schema;
 mod stats;
