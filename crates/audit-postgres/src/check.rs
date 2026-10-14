@@ -1051,8 +1051,11 @@ impl PgAuditStore {
     ///   partitioned, no table inherits from it or is a partition of it, and it inherits from
     ///   none. A partition or child has triggers, an owner and grants of its own, which this
     ///   check does not read.
+    /// - `switchboard_audit.receipts` is there, as a table that is not unlogged, with its
+    ///   trigger `receipt_moves` enabled to fire before each insert or update, which moves a
+    ///   receipt only as its state table allows (decision 0009, part 2).
     /// - The session's `session_replication_role` is not `replica`, which a role or database
-    ///   default can set, and under which neither trigger fires.
+    ///   default can set, and under which no trigger fires.
     /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
     ///   to another role.
     /// - The role is not a superuser, and cannot create roles or databases, replicate, or
@@ -1062,14 +1065,16 @@ impl PgAuditStore {
     /// - The role does not own the database, the schema, the table, the trigger function or
     ///   anything else in the schema, and is not a member of a role that does. The database's
     ///   owner can drop it, and every row with it, without CREATE on it.
-    /// - The role holds its own privileges: inserting the first half of a row, updating the
-    ///   completion, selecting the identifier, decision and completion, and using the schema.
+    /// - The role holds its own privileges: inserting the first half of a row or a reused key's
+    ///   answer, updating the completion, selecting the identifier, decision and completion,
+    ///   reserving, reading and moving a receipt, and using the schema.
     /// - Neither the role nor any role it is a member of holds more. A membership counts
     ///   whether or not it is inherited, since `SET ROLE` reaches a role that is not. So none
-    ///   holds the store's privileges with grant option; none holds anything on the table as a
-    ///   whole, so none can DELETE, TRUNCATE or add a trigger; none can CREATE in the schema or
-    ///   the database; none holds anything on any other table, view or sequence in the schema
-    ///   but SELECT on the open-row view;
+    ///   holds the store's privileges with grant option; none holds anything on either table as
+    ///   a whole, so none can DELETE, TRUNCATE or add a trigger; none holds a column privilege
+    ///   on `receipts` beyond the store's, so none can change a receipt's row, scope, key, call
+    ///   or time; none can CREATE in the schema or the database; none holds anything on any
+    ///   other table, view or sequence in the schema but SELECT on the open-row view;
     ///   none can set a setting only a superuser may set, such as `session_replication_role`,
     ///   which would silence both triggers; and none can change any setting with
     ///   `ALTER SYSTEM`, which reaches every session at the next reload.
@@ -1141,6 +1146,10 @@ impl PgAuditStore {
     ///   mapping or a function that holds another role's password, can reach `call_rows` as
     ///   that role. Only an administrator stores that password. A foreign table in
     ///   `switchboard_audit` is refused; one elsewhere is not followed to where it connects.
+    /// - The routes it follows to `call_rows`, through views, rules, definer functions and
+    ///   foreign keys' actions, it does not yet follow to `receipts`. A rule on `receipts`, a
+    ///   view over it in another schema, or a definer function whose owner can write it, is
+    ///   not refused.
     ///
     /// It asks whether a role is able once per role, where it used to ask that once for every
     /// pair of a definer function and a role, and its walk over definer functions reads small

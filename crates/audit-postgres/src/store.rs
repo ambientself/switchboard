@@ -707,7 +707,18 @@ pub(crate) const RECEIPT_PAST_DEADLINE: &str = "SB001";
 /// - List writes a row of kind `list`, complete, with begin's pool, budget and handling of
 ///   an identifier already stored: a list row under it is this list's own, and a call row is
 ///   an error.
-/// - Finish writes the completion columns of a row that has none, on a task of its own. It
+/// - Begin with a receipt, for an allowed call of a tool not classified `read`, is begin with
+///   the same pool, budget and retries, in one transaction: the reuse check, then the row
+///   open with its receipt reserved `pending`, or the row complete with the answer to its
+///   reused key. The unique index on a key in its scope decides between two begins at once,
+///   and the one that loses is answered from the other's receipt. A row it finds stored is a
+///   retried begin's, answered as its receipt or the answer it was written with say: see
+///   `found`. Nothing before the commit can write a row, so a begin with a receipt counts as
+///   possibly written only once its commit was sent.
+/// - Finish writes the completion columns of a row that has none, on a task of its own, in one
+///   transaction with the move of the receipt the row reserved, if it reserved one, while the
+///   row's deadline has not passed by the database's clock. After it, the row is completed and
+///   the receipt left `pending`. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
 ///   [`Budgets::finish_deadline`]. An attempt that fails that way gives up its connection,
