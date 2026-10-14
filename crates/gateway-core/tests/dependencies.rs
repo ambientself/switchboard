@@ -12,7 +12,7 @@
 
 use serde_json::{Value, json};
 
-const ALLOWED: [&str; 3] = ["serde", "serde_json", "thiserror"];
+const ALLOWED: [&str; 4] = ["serde", "serde_json", "sha2", "thiserror"];
 
 /// Every dependency of this crate that is not a dev-dependency, as `cargo metadata` gives it.
 fn built_with() -> Vec<Value> {
