@@ -10,10 +10,13 @@
 //!    both, is refused. Only a development build may disable it.
 //! 3. **HTTP** names at least one allowed host.
 //! 4. **Policy** becomes a snapshot through the core's own checks, and passes the
-//!    receipt-store gate (decision 0009): until receipts exist, a tool not classified `read`
-//!    is served only by a development build, one with the `test-support` feature. It then
-//!    passes the narrowing gate (decision 0011): until something narrows a credential, an
-//!    entry narrowed per call or to the caller's limit is refused in every build.
+//!    receipt-store gate (decision 0009, "Until receipts exist"): a tool not classified `read`
+//!    is served only when the audit store is the Postgres store, which keeps receipts, audit
+//!    is on and identity is on, or by a development build, one with the `test-support`
+//!    feature. The JSON configuration cannot name the Postgres store, so on its path only a
+//!    development build serves one. It then passes the narrowing gate (decision 0011): until
+//!    something narrows a credential, an entry narrowed per call or to the caller's limit is
+//!    refused in every build.
 //! 5. **Tool definitions**: every approved tool has exactly one, and every one is for an
 //!    approved tool.
 //! 6. **Connectors**: none is registered twice, and every tool on a surface has its connector
@@ -178,12 +181,13 @@ pub enum BootError {
     )]
     AdapterBesideRegistry(ConnectorName),
     /// A tool not classified `read` is on a surface, and there is no receipt store to make its
-    /// calls safe to answer after a lost outcome (decision 0009). Only a development build,
-    /// one with the `test-support` feature, serves such a tool.
+    /// calls safe to answer after a lost outcome (decision 0009): the audit store is not the
+    /// Postgres store, which keeps receipts, or audit or identity is off. Only a development
+    /// build, one with the `test-support` feature, serves such a tool without one.
     #[error(
         "tool `{tool}` is classified `{classification}` and served on a surface, but no receipt \
-         store is configured: until receipts exist only tools classified `read` may be served \
-         (decision 0009)"
+         store is configured: a tool not classified `read` is served only with audit in \
+         Postgres, which keeps receipts, and identity on (decision 0009)"
     )]
     NoReceiptStore {
         /// The tool.
@@ -371,13 +375,14 @@ pub struct Gates {
 
 /// What the gateway was started with that a policy reload cannot change: the issuers, which
 /// profile rules must name, and the registry's servers and routes, which the connectors were
-/// built for. And whether this build is exempt from the receipt-store gate, which only a
-/// development build is.
+/// built for. And, for the receipt-store gate, whether this build is exempt from it, which only
+/// a development build is, and whether a receipt store is configured.
 pub(crate) struct Basis {
     pub(crate) issuers: Option<Issuers>,
     pub(crate) registry: Registry,
     pub(crate) connectors: BTreeSet<ConnectorName>,
     pub(crate) receipt_exempt: bool,
+    pub(crate) receipt_store: bool,
 }
 
 impl fmt::Debug for Gates {
@@ -519,6 +524,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         return Err(BootError::ProxiedWithoutRegistry(name));
     }
     let issuers = configured_issuers(&config.identity);
+    let receipt_store = receipt_store_configured(&config.identity, &config.audit);
     let (identity, identity_state) = identity_gate(config.identity, clock.clone(), development)?;
     let (audit_store, audit_state) = audit_gate(&config.audit, audit_store, development)?;
     if config.http.allowed_hosts.is_empty() {
@@ -538,7 +544,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         .flat_map(|surface| surface.tools.iter().cloned())
         .collect();
     let snapshot = PolicySnapshot::new(config.policy)?;
-    receipt_gate(&snapshot, development)?;
+    receipt_gate(&snapshot, development, receipt_store)?;
     narrowing_gate(&snapshot)?;
 
     let catalog = ToolCatalog::new(config.catalog)?;
@@ -648,6 +654,7 @@ pub(crate) fn check_registry_with(
         return Err(BootError::AdapterBesideRegistry(name));
     }
     let issuers = configured_issuers(&settings.identity);
+    let receipt_store = receipt_store_configured(&settings.identity, &settings.audit);
     let (identity, identity_state) = identity_gate(settings.identity, clock.clone(), development)?;
     let (audit_store, audit_state) = audit_gate(&settings.audit, audit_store, development)?;
     if settings.http.allowed_hosts.is_empty() {
@@ -676,6 +683,7 @@ pub(crate) fn check_registry_with(
         registry,
         connectors: connectors.keys().cloned().collect(),
         receipt_exempt: development,
+        receipt_store,
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
 
@@ -708,7 +716,7 @@ pub(crate) fn check_registry_policy(
     policy: &ServedPolicy,
     basis: &Basis,
 ) -> Result<(), BootError> {
-    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;
+    receipt_gate(policy.snapshot(), basis.receipt_exempt, basis.receipt_store)?;
     narrowing_gate(policy.snapshot())?;
     for (tool, route) in registry.routes() {
         if !basis.connectors.contains(&route.server) {
@@ -751,14 +759,22 @@ pub(crate) fn check_registry_policy(
 
 /// The receipt-store gate (decision 0009, "Until receipts exist"; design section 12). A
 /// snapshot that serves a tool not classified `read` (on any surface) is refused unless a
-/// receipt store is configured, which none can be yet. A tool approved but on no surface is
-/// not served, and passes. It runs at boot and at every snapshot swap, whatever the snapshot's
-/// source, and no policy setting changes it.
+/// receipt store is configured: `store`, as [`receipt_store_configured`] says. A tool approved
+/// but on no surface is not served, and passes. It runs at boot and at every snapshot swap,
+/// whatever the snapshot's source, and no policy setting changes it.
 ///
 /// `exempt` is true only in a development build, one with the `test-support` feature, which
 /// the release build never enables: the callers pass `cfg!(feature = "test-support")`.
-pub(crate) fn receipt_gate(snapshot: &PolicySnapshot, exempt: bool) -> Result<(), BootError> {
-    if exempt || receipt_store_configured() {
+///
+/// A registry's snapshot does not reach this gate with such a tool today: the loader's rule 2
+/// (decision 0011) refuses every proxied tool not classified `read` first, and only built-in
+/// connectors (milestone 4) will serve one.
+pub(crate) fn receipt_gate(
+    snapshot: &PolicySnapshot,
+    exempt: bool,
+    store: bool,
+) -> Result<(), BootError> {
+    if exempt || store {
         return Ok(());
     }
     for surface in snapshot.surfaces() {
@@ -774,11 +790,13 @@ pub(crate) fn receipt_gate(snapshot: &PolicySnapshot, exempt: bool) -> Result<()
     Ok(())
 }
 
-/// Whether a receipt store is configured. None exists yet: receipts are #10 stage 2. That
-/// change makes this true only when a receipt store is configured, audit is on and identity is
-/// on, as decision 0009 requires, and passes it what it needs to tell.
-fn receipt_store_configured() -> bool {
-    false
+/// Whether a receipt store is configured, as decision 0009 requires before a tool not
+/// classified `read` is served: the audit store is the Postgres store, which keeps receipts,
+/// audit is on, and identity is on, so every call has a proved principal to scope its key to.
+/// Read from what the deployment configures, its audit database and its identity section; no
+/// setting of its own turns it on.
+pub(crate) fn receipt_store_configured(identity: &IdentitySection, audit: &AuditSection) -> bool {
+    audit.postgres && !audit.disabled && identity.enforce.is_some() && !identity.disabled
 }
 
 /// The narrowing gate. Decision 0011 lets an entry narrowed per call or to the caller's limit
@@ -833,7 +851,11 @@ pub(crate) fn before_connecting(
         opt_out(BootError::AuditOptOut, development)?;
     }
     narrowing_gate(snapshot)?;
-    receipt_gate(snapshot, development)
+    receipt_gate(
+        snapshot,
+        development,
+        receipt_store_configured(identity, audit),
+    )
 }
 
 /// An opt-out of the identity or audit gate: refused with `refusal` unless this is a
@@ -1115,13 +1137,14 @@ principals = "any_in_teams_and_groups"
     }
 
     /// What a release build of `registry` starts with: no issuers, its one server connected,
-    /// and no exemption from the receipt-store gate.
+    /// no exemption from the receipt-store gate and no receipt store.
     pub(crate) fn release_basis(registry: Registry) -> Basis {
         Basis {
             issuers: None,
             connectors: registry.servers().keys().cloned().collect(),
             registry,
             receipt_exempt: false,
+            receipt_store: false,
         }
     }
 
@@ -1140,14 +1163,14 @@ principals = "any_in_teams_and_groups"
 
     #[test]
     fn a_read_only_snapshot_passes_the_receipt_gate() {
-        assert!(receipt_gate(&in_process(Classification::Read, true), false).is_ok());
-        assert!(receipt_gate(registry("read", true).snapshot(), false).is_ok());
+        assert!(receipt_gate(&in_process(Classification::Read, true), false, false).is_ok());
+        assert!(receipt_gate(registry("read", true).snapshot(), false, false).is_ok());
     }
 
     #[test]
     fn a_served_propose_tool_is_refused_without_a_receipt_store() {
         refused_as(
-            receipt_gate(&in_process(Classification::Propose, true), false),
+            receipt_gate(&in_process(Classification::Propose, true), false, false),
             Classification::Propose,
         );
     }
@@ -1155,7 +1178,7 @@ principals = "any_in_teams_and_groups"
     #[test]
     fn a_served_write_tool_is_refused_without_a_receipt_store() {
         refused_as(
-            receipt_gate(&in_process(Classification::Write, true), false),
+            receipt_gate(&in_process(Classification::Write, true), false, false),
             Classification::Write,
         );
     }
@@ -1168,7 +1191,7 @@ principals = "any_in_teams_and_groups"
             Classification::Destructive,
         ] {
             assert!(
-                receipt_gate(&in_process(classification, false), false).is_ok(),
+                receipt_gate(&in_process(classification, false), false, false).is_ok(),
                 "{classification}"
             );
         }
@@ -1176,12 +1199,105 @@ principals = "any_in_teams_and_groups"
 
     #[test]
     fn only_a_development_build_is_exempt() {
-        assert!(receipt_gate(&in_process(Classification::Propose, true), true).is_ok());
+        assert!(receipt_gate(&in_process(Classification::Propose, true), true, false).is_ok());
+    }
+
+    /// The identity and audit sections a deployment with each of the three conditions has, or
+    /// lacks: identity on, audit on, and the audit store the Postgres store.
+    fn configured(
+        identity_on: bool,
+        audit_on: bool,
+        postgres: bool,
+    ) -> (IdentitySection, AuditSection) {
+        (
+            IdentitySection {
+                enforce: identity_on.then(Vec::new),
+                disabled: !identity_on,
+            },
+            AuditSection {
+                disabled: !audit_on,
+                postgres,
+            },
+        )
+    }
+
+    /// A receipt store is configured only when the audit store is the Postgres store, which
+    /// keeps receipts, audit is on and identity is on (decision 0009, "Until receipts exist"),
+    /// and then a release build serves a `propose` tool. Without any one of the three it is
+    /// refused.
+    #[test]
+    fn a_receipt_store_needs_the_postgres_store_audit_and_identity() {
+        let propose = in_process(Classification::Propose, true);
+        for (identity_on, audit_on, postgres) in [
+            (true, true, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            let (identity, audit) = configured(identity_on, audit_on, postgres);
+            let store = receipt_store_configured(&identity, &audit);
+            let all = identity_on && audit_on && postgres;
+            assert_eq!(
+                store, all,
+                "identity on: {identity_on}, audit on: {audit_on}, postgres: {postgres}"
+            );
+            let gated = receipt_gate(&propose, false, store);
+            if all {
+                assert!(gated.is_ok(), "{gated:?}");
+            } else {
+                refused_as(gated, Classification::Propose);
+            }
+        }
+        // Identity both enforced and disabled is no identity, whatever the gate does with it.
+        let identity = IdentitySection {
+            enforce: Some(Vec::new()),
+            disabled: true,
+        };
+        let audit = AuditSection {
+            disabled: false,
+            postgres: true,
+        };
+        assert!(!receipt_store_configured(&identity, &audit));
+        // So is audit both in Postgres and disabled.
+        let (identity, mut audit) = configured(true, true, true);
+        audit.disabled = true;
+        assert!(!receipt_store_configured(&identity, &audit));
+    }
+
+    /// The deployment file's Postgres store is the receipt store, and the JSON configuration
+    /// cannot name one.
+    #[test]
+    fn only_the_deployment_files_postgres_store_is_a_receipt_store() {
+        let postgres = crate::deployment::AuditChoice::Postgres {
+            url: "postgres://switchboard_gateway@db.fixture.test/switchboard".into(),
+        };
+        assert!(postgres.section().postgres);
+        assert!(!crate::deployment::AuditChoice::Disabled.section().postgres);
+        let section: AuditSection = serde_json::from_str("{}").unwrap();
+        assert!(!section.postgres);
+        assert!(serde_json::from_str::<AuditSection>(r#"{"postgres": true}"#).is_err());
+    }
+
+    /// Before it connects, the start of a release build serves a `propose` snapshot with the
+    /// Postgres store, audit and identity on, and refuses it without the Postgres store.
+    #[test]
+    fn before_connecting_runs_the_receipt_gate_with_what_the_deployment_configures() {
+        let propose = in_process(Classification::Propose, true);
+        let (identity, audit) = configured(true, true, true);
+        let started = before_connecting(&identity, &audit, &propose, false);
+        assert!(started.is_ok(), "{started:?}");
+        let (identity, audit) = configured(true, true, false);
+        refused_as(
+            before_connecting(&identity, &audit, &propose, false),
+            Classification::Propose,
+        );
     }
 
     #[test]
     fn the_refusal_names_the_tool_its_classification_and_the_reason() {
-        let error = receipt_gate(&in_process(Classification::Propose, true), false).unwrap_err();
+        let error =
+            receipt_gate(&in_process(Classification::Propose, true), false, false).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("`docs__list_documents`"), "{message}");
         assert!(message.contains("classified `propose`"), "{message}");
@@ -1348,7 +1464,10 @@ principals = "any_in_teams_and_groups"
             enforce: None,
             disabled: false,
         };
-        let audit = AuditSection { disabled: false };
+        let audit = AuditSection {
+            disabled: false,
+            postgres: false,
+        };
         for (written, narrowing) in [
             ("call", Narrowing::Call),
             ("limit", Narrowing::Limit),

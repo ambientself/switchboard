@@ -43,7 +43,10 @@ fn parts(files: &Files, disabled: bool) -> (Settings, Registry) {
     let settings = Settings {
         deployment: deployment.deployment,
         identity: deployment.identity,
-        audit: AuditSection { disabled },
+        audit: AuditSection {
+            disabled,
+            postgres: false,
+        },
         http: deployment.http,
         max_age: None,
         read_at: Instant::now(),
