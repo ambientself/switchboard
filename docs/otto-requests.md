@@ -397,6 +397,8 @@ before stage 1 as well.
   how it learns that such an action was later settled.
 - **Why:** a side effect whose outcome is unknown is never presented as safe to repeat, and
   Switchboard never repeats a tool call on its own ([decision 0009, Consequences][0009-cons]).
+- **When:** the sources tie this to building the adapter, not to a stage. It is listed here
+  because it governs side effects, which move in stage 3.
 - **Meanwhile:** writes stay on Otto's Go gateway.
 
 ### 18. Parity differences for side effects
@@ -411,6 +413,8 @@ before stage 1 as well.
   once receipts are on for Otto's profile, and moves to the group of expected differences.
 - **Why:** these follow from receipts and from never cancelling a side effect midway
   ([decision 0009, Consequences][0009-cons]).
+- **When:** the sources say "when the adapter is built", not a stage. It is listed here because
+  every difference in it concerns side effects, which move in stage 3.
 - **Meanwhile:** writes stay on Otto's Go gateway, so none of these differences reaches Otto.
 
 ### 19. Control-plane endpoints outside the Go gateway, and their vendor actions
@@ -448,6 +452,10 @@ before stage 1 as well.
   audit rows, so an identity failure writes no row and has no audit failure to report.
   Unverifiable grants and `tools/list` stay audit rows ([decision 0009, Still open 2][0009-open]
   and [Consequences][0009-cons]).
+- **When:** the sources say "when the adapter is built", not a stage. Unlike request 18, it is
+  listed as not blocking: Switchboard's own record does not depend on the answer, which decides
+  only what Otto's adapter also writes to `gateway_audit` and whether Otto accepts the two
+  differences. If Otto's owners want it settled before stage 1's comparison, it can move up.
 - **Meanwhile:** Switchboard writes no row for them, and these are recorded parity differences.
   They apply to reads as well as writes, so they first show in stage 1's comparison and reach
   Otto from stage 2.
@@ -602,7 +610,8 @@ When Switchboard serves Otto's tools, the differences from today that this proje
 are the ones named above: the new grant format and its checks (requests 2, 3 and 25); the
 differences in requests 6, 8, 18 and 20; and the refusals that requests 13, 14 and 16 add by
 stage 3: a grant presented from another pod, a side-effecting call whose turn Otto does not
-confirm as current, and a side-effecting call sent without a key.
+confirm as current, a side-effecting call sent without a key, and a key reused with a
+different tool-use identifier.
 
 [0002]: decisions/0002-replace-ottos-mcp-gateway.md
 [0002-decision]: decisions/0002-replace-ottos-mcp-gateway.md#decision
