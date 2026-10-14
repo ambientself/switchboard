@@ -110,4 +110,8 @@ pub struct ToolCall {
     /// `params._meta["claudecode/toolUseId"]` when it is a string, exactly as sent. It is
     /// unbounded here: the gateway bounds it before it reaches an audit row.
     pub tool_use_id: Option<String>,
+    /// `params._meta["switchboard/idempotencyKey"]` when it is a string, exactly as sent: a key
+    /// the caller chose for this one call. It is not checked here: the gateway keeps only a
+    /// valid key.
+    pub idempotency_key: Option<String>,
 }

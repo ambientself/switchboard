@@ -74,5 +74,15 @@ pub const TOOL_USE_ID_META: &str = "claudecode/toolUseId";
 /// may carry `_meta` under 2025-06-18 as well as 2026-07-28.
 pub const AUDIT_ROW_META: &str = "switchboard/auditRow";
 
+/// The `_meta` key a `tools/call` carries its idempotency key under, for a caller that is not a
+/// model and so has no tool-use identifier, such as a control plane (decision 0009, "The
+/// key"). Named beside [`AUDIT_ROW_META`], in the same form.
+pub const IDEMPOTENCY_KEY_META: &str = "switchboard/idempotencyKey";
+
+/// The header a `tools/call` may carry its idempotency key in. The gateway reads it only for a
+/// profile that declares its callers set it per request: MCP clients set headers once per
+/// server, so a header fixed in configuration would key every call alike.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
 /// The `error.data` field a JSON-RPC error names its audit row under, when it has one.
 pub const AUDIT_ROW_DATA: &str = "auditRow";

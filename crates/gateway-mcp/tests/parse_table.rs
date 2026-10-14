@@ -8,9 +8,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use common::Raw;
 use gateway_mcp::{
-    CLIENT_CAPABILITIES_META, Call, DENIAL_CODE, Era, HEADER_MISMATCH, INVALID_PARAMS,
-    INVALID_REQUEST, Inbound, METHOD_NOT_FOUND, MODERN, PARSE_ERROR, PROTOCOL_VERSION_META,
-    RejectionKind, Request, RequestId, TOOL_USE_ID_META, ToolCall, UNSUPPORTED_VERSION,
+    CLIENT_CAPABILITIES_META, Call, DENIAL_CODE, Era, HEADER_MISMATCH, IDEMPOTENCY_KEY_META,
+    INVALID_PARAMS, INVALID_REQUEST, Inbound, METHOD_NOT_FOUND, MODERN, PARSE_ERROR,
+    PROTOCOL_VERSION_META, RejectionKind, Request, RequestId, TOOL_USE_ID_META, ToolCall,
+    UNSUPPORTED_VERSION,
 };
 use http::Method;
 use serde_json::{Value, json};
@@ -31,6 +32,15 @@ fn request(id: i64, era: Era, call: Call) -> Expect {
 }
 
 fn call(name: &str, arguments: Value, tool_use_id: Option<&str>) -> Call {
+    keyed_call(name, arguments, tool_use_id, None)
+}
+
+fn keyed_call(
+    name: &str,
+    arguments: Value,
+    tool_use_id: Option<&str>,
+    idempotency_key: Option<&str>,
+) -> Call {
     let Value::Object(arguments) = arguments else {
         panic!("arguments must be an object")
     };
@@ -38,6 +48,7 @@ fn call(name: &str, arguments: Value, tool_use_id: Option<&str>) -> Call {
         name: name.to_owned(),
         arguments,
         tool_use_id: tool_use_id.map(str::to_owned),
+        idempotency_key: idempotency_key.map(str::to_owned),
     })
 }
 
@@ -112,6 +123,10 @@ fn table() -> Vec<(&'static str, Raw, Expect)> {
         ("tools/call", Raw::legacy(json!(1), "tools/call", read_call()), request(1, Legacy, call("read_document", json!({"document": "team-a-notes"}), None))),
         ("tools/call with a tool-use id", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {TOOL_USE_ID_META: "toolu_01"}})), request(1, Legacy, call("read_document", json!({}), Some("toolu_01")))),
         ("tools/call with a numeric tool-use id", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {TOOL_USE_ID_META: 7}})), request(1, Legacy, call("read_document", json!({}), None))),
+        ("tools/call with an idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: "turn-7-draft"}})), request(1, Legacy, keyed_call("read_document", json!({}), None, Some("turn-7-draft")))),
+        ("tools/call with a key and a tool-use id", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: "turn-7-draft", TOOL_USE_ID_META: "toolu_01"}})), request(1, Legacy, keyed_call("read_document", json!({}), Some("toolu_01"), Some("turn-7-draft")))),
+        ("tools/call with a numeric idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: 7}})), request(1, Legacy, call("read_document", json!({}), None))),
+        ("tools/call with a key in the wrong place", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", IDEMPOTENCY_KEY_META: "turn-7-draft"})), request(1, Legacy, call("read_document", json!({}), None))),
         ("tools/call with null arguments", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "arguments": null})), request(1, Legacy, call("read_document", json!({}), None))),
         ("tools/call without a name", Raw::legacy(json!(1), "tools/call", json!({"arguments": {}})), Refused(InvalidParams, 200, INVALID_PARAMS)),
         ("tools/call with a numeric name", Raw::legacy(json!(1), "tools/call", json!({"name": 3})), Refused(InvalidParams, 200, INVALID_PARAMS)),
@@ -126,6 +141,7 @@ fn table() -> Vec<(&'static str, Raw, Expect)> {
         ("tools/list with a cursor", Raw::modern(json!(1), "tools/list", json!({"cursor": "abc"})), Refused(InvalidParams, 400, INVALID_PARAMS)),
         ("tools/call", modern_call.clone(), request(1, Modern, call("read_document", json!({"document": "team-a-notes"}), None))),
         ("tools/call with a tool-use id", Raw::modern(json!(1), "tools/call", json!({"name": "read_document", "_meta": {TOOL_USE_ID_META: "toolu_01"}})), request(1, Modern, call("read_document", json!({}), Some("toolu_01")))),
+        ("tools/call with an idempotency key", Raw::modern(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: "turn-7-draft"}})), request(1, Modern, keyed_call("read_document", json!({}), None, Some("turn-7-draft")))),
         ("tools/call with a sentinel Mcp-Name", modern_call.clone().header("mcp-name", &sentinel("read_document")), request(1, Modern, call("read_document", json!({"document": "team-a-notes"}), None))),
         ("tools/call with a non-ASCII name in a sentinel", Raw::modern(json!(1), "tools/call", json!({"name": "lire_le_café"})).header("mcp-name", &sentinel("lire_le_café")), request(1, Modern, call("lire_le_café", json!({}), None))),
         ("tools/call with a sentinel naming another tool", modern_call.clone().header("mcp-name", &sentinel("delete_document")), Refused(HeaderMismatch, 400, HEADER_MISMATCH)),
