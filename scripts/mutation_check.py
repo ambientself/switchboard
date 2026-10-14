@@ -130,13 +130,21 @@ CHECK = {
         "    }\n"
     ),
 }
+# Where decision 0012's currency check goes, between checks 5 and 6 (#22).
+BETWEEN = {
+    (5, 6): (
+        "    // Decision 0012's currency check goes here, after check 5 and its exception step and\n"
+        "    // before check 6, and is skipped for `tools/list` as check 6 is (#22).\n"
+    ),
+}
 for first, second in [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]:
+    between = BETWEEN.get((first, second), "")
     mutate(
         f"order-swap-{first}-{second}",
         f"checks {first} and {second} run in the other order",
         SRC + "decision.rs",
-        CHECK[first] + CHECK[second],
-        CHECK[second] + CHECK[first],
+        CHECK[first] + between + CHECK[second],
+        CHECK[second] + between + CHECK[first],
     )
 mutate(
     "order-swap-3-5",
@@ -314,8 +322,13 @@ mutate_all(
     "a delegation whose tool list is null reads as one that lists no tools",
     (
         SRC + "principal.rs",
-        "    pub tools: BTreeSet<ToolName>,\n}",
-        "    #[serde(deserialize_with = \"null_is_empty\")]\n    pub tools: BTreeSet<ToolName>,\n}\n\n"
+        "    pub tools: BTreeSet<ToolName>,\n    /// The delegation's identifying fields",
+        "    #[serde(deserialize_with = \"null_is_empty\")]\n    pub tools: BTreeSet<ToolName>,\n    /// The delegation's identifying fields",
+    ),
+    (
+        SRC + "principal.rs",
+        "    pub key_scope: Option<DelegationKeyScope>,\n}",
+        "    pub key_scope: Option<DelegationKeyScope>,\n}\n\n"
         "fn null_is_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeSet<ToolName>, D::Error> {\n"
         "    Ok(Option::<BTreeSet<ToolName>>::deserialize(deserializer)?.unwrap_or_default())\n}",
     ),
@@ -487,6 +500,43 @@ mutate("reach-from-arguments", "a tool declared as the reach is read by its conn
        "        if approved.declared_from == Some(DeclaredFrom::Reach) {",
        "        if false && approved.declared_from == Some(DeclaredFrom::Reach) {")
 
+# --- The key check -------------------------------------------------------------------------
+
+# Decision 0006, amended on 2026-10-07: a call of a tool not classified `read` that carries no
+# key is denied by a last check, after check 6 and where decision 0012's currency check will go,
+# and the check is skipped for tools/list. tests/decision_table.json, tests/properties.rs and
+# the dev gateway's denial cases catch these.
+DECIDE_CHECKED = (
+    "    let checked = check(snapshot, &call.caller, &call.tool, Some(&call.resources))\n"
+    "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));\n"
+)
+mutate("key-check-on-list", "tools/list runs the key check, so a proposal is never listed", SRC + "decision.rs",
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())",
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).and_then(|tool| key_is_carried(tool, None).map(|()| tool)).ok())")
+mutate("key-check-before-resources", "the key check runs before check 6, so a call outside its limit is asked for a key", SRC + "decision.rs",
+       DECIDE_CHECKED,
+       "    let checked = check(snapshot, &call.caller, &call.tool, None)\n"
+       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
+       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(&call.resources)));\n")
+mutate("key-check-first", "the key check runs before every other check, so a denied write is asked for a key", SRC + "decision.rs",
+       DECIDE_CHECKED,
+       "    let checked = call.tool.name().ok().and_then(|name| snapshot.tool(&name))\n"
+       "        .map_or(Ok(()), |tool| key_is_carried(tool, call.key.as_ref()))\n"
+       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(&call.resources)));\n")
+KEY_CARRIED = "    if tool.classification == Classification::Read || key.is_some() {"
+mutate("key-check-removed", "a side effect with no key is allowed", SRC + "decision.rs",
+       KEY_CARRIED, "    if true || tool.classification == Classification::Read || key.is_some() {")
+mutate("key-check-on-reads", "a read needs a key too", SRC + "decision.rs",
+       KEY_CARRIED, "    if key.is_some() {")
+mutate("key-bound-short", "a key of 128 characters is refused", SRC + "receipt.rs",
+       "            && value.len() <= MAX_IDEMPOTENCY_KEY\n", "            && value.len() < MAX_IDEMPOTENCY_KEY\n")
+mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
+       "            && value.bytes().all(|byte| byte.is_ascii_graphic());",
+       "            && value.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ');")
+# The gateway fills the key from the caller's tool-use identifier, its first carrier.
+mutate("gw-key-not-from-tool-use-id", "the gateway never fills a call's key, so every proposal is denied", "crates/gateway/src/path.rs",
+       "            key: idempotency_key(tool_use_id.as_ref()),", "            key: None,")
+
 # --- tools/list ----------------------------------------------------------------------------
 
 LIST = "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())"
@@ -650,9 +700,11 @@ mutate("refusal-fields-public", "a refusal can be built or rewritten by hand", S
        "pub struct Refusal {\n    row: AuditRowId,\n    reason: Reason,\n    sentence: String,",
        "pub struct Refusal {\n    pub row: AuditRowId,\n    pub reason: Reason,\n    pub sentence: String,")
 mutate("ran-fields-public", "a run can be made up", SRC + "audit.rs",
-       "pub struct Ran {\n    row: AuditRowId,\n    outcome: ToolOutcome,", "pub struct Ran {\n    pub row: AuditRowId,\n    pub outcome: ToolOutcome,")
+       "pub struct Ran {\n    row: AuditRowId,\n    outcome: ToolOutcome,\n    reserved: bool,",
+       "pub struct Ran {\n    pub row: AuditRowId,\n    pub outcome: ToolOutcome,\n    pub reserved: bool,")
 mutate("row-completion-fields-public", "a store's finish can be called for any row", SRC + "audit.rs",
-       "pub struct RowCompletion {\n    row: AuditRowId,\n    completion: Completion,", "pub struct RowCompletion {\n    pub row: AuditRowId,\n    pub completion: Completion,")
+       "pub struct RowCompletion {\n    row: AuditRowId,\n    completion: Completion,\n    reference: Option<VendorReference>,",
+       "pub struct RowCompletion {\n    pub row: AuditRowId,\n    pub completion: Completion,\n    pub reference: Option<VendorReference>,")
 mutate("tool-call-constructor-public", "a connector can be called around the audited path", SRC + "connector.rs",
        "    pub(crate) fn new(call: CallContext", "    pub fn new(call: CallContext")
 mutate("connector-run-without-call", "a connector runs without being handed the call", SRC + "connector.rs",
@@ -671,8 +723,8 @@ mutate(
     "begin-failure-on-denial-swallowed",
     "a denial is answered even when its row could not be written",
     SRC + "audit.rs",
-    "    store\n        .begin(&row, &record)\n        .await\n        .map_err(AuditFailure::from_store)?;",
-    "    if let Err(error) = store.begin(&row, &record).await\n        && let Decided::Allow(_) = &decided\n    {\n        return Err(AuditFailure::from_store(error));\n    }",
+    "            store\n                .begin(&row, &record)\n                .await\n                .map_err(AuditFailure::from_store)?;\n",
+    "            if let Err(error) = store.begin(&row, &record).await\n                && let Decided::Allow(_) = &decided\n            {\n                return Err(AuditFailure::from_store(error));\n            }\n",
 )
 REFUSAL = "        } => Begun::Denied(Refusal {\n            row,\n            reason,\n            sentence,\n        }),"
 mutate("refusal-sentence-truncated", "the caller's sentence is not the recorded one", SRC + "audit.rs", REFUSAL,
@@ -856,6 +908,57 @@ mutate("core-list-acting-person-dropped", "a list row leaves out the delegation'
 mutate("core-list-claimed-team-dropped", "a list row leaves out the team the caller claimed", SRC + "audit.rs",
        "        claimed_team,\n        tools: tools\n",
        "        claimed_team: None,\n        tools: tools\n")
+
+# Receipts (decision 0009, part 2): begin reserves one for an allowed side effect, in the same
+# write as its row; a reused key is answered by the first line of the reuse table that matches;
+# finish settles the receipt with the row. tests/audit_flow.rs, receipt.rs's own tests and the
+# contract suite's item 6 catch these.
+mutate("receipt-reserved-for-denial", "begin asks the store to reserve a receipt for a denied side effect", SRC + "audit.rs",
+       "        Decided::Allow(tool) if tool.classification != Classification::Read => {",
+       "        Decided::Allow(tool) | Decided::Deny { tool: Some(tool), .. } if tool.classification != Classification::Read => {")
+mutate("receipt-scope-ignores-delegation", "a key is scoped to the principal alone, whatever the delegation", SRC + "audit.rs",
+       "            .and_then(|delegation| delegation.get().key_scope.clone()),",
+       "            .and_then(|_| None),")
+mutate("receipt-scope-ignored", "a key is unique across every scope", SRC + "receipt.rs",
+       "        receipt.scope == self.scope && receipt.key == self.key", "        receipt.key == self.key")
+mutate("receipt-reuse-ignores-digest", "reuse with other arguments is answered as the same call", SRC + "receipt.rs",
+       "        if earlier.tool != request.tool || earlier.digest != request.digest {",
+       "        if earlier.tool != request.tool {")
+mutate("receipt-reuse-ignores-tool-use-id", "a key reused with another tool-use identifier is not told apart", SRC + "receipt.rs",
+       "        if let Some(recorded) = &earlier.tool_use_id\n",
+       "        if false\n            && let Some(recorded) = &earlier.tool_use_id\n")
+REUSE_PENDING = "            ReceiptState::Pending | ReceiptState::Unknown => {\n                Reuse::MayHaveHappened { key, receipt }\n            }\n"
+REUSE_NOT_PERFORMED = "            ReceiptState::NotPerformed => Reuse::NotPerformed { key, receipt },\n"
+mutate_all("receipt-pending-as-not-performed", "a pending receipt is answered as one that did not take effect",
+           (SRC + "receipt.rs", REUSE_PENDING, REUSE_PENDING.replace("ReceiptState::Pending | ReceiptState::Unknown", "ReceiptState::Unknown")),
+           (SRC + "receipt.rs", REUSE_NOT_PERFORMED, REUSE_NOT_PERFORMED.replace("ReceiptState::NotPerformed", "ReceiptState::NotPerformed | ReceiptState::Pending")))
+mutate_all("receipt-unknown-as-not-performed", "an unknown receipt is answered as one that did not take effect",
+           (SRC + "receipt.rs", REUSE_PENDING, REUSE_PENDING.replace("ReceiptState::Pending | ReceiptState::Unknown", "ReceiptState::Pending")),
+           (SRC + "receipt.rs", REUSE_NOT_PERFORMED, REUSE_NOT_PERFORMED.replace("ReceiptState::NotPerformed", "ReceiptState::NotPerformed | ReceiptState::Unknown")))
+mutate("receipt-unknown-settled-as-not-performed", "finish settles an unknown outcome's receipt as not_performed", SRC + "receipt.rs",
+       "            Outcome::Unknown => Some(ReceiptState::Unknown),", "            Outcome::Unknown => Some(ReceiptState::NotPerformed),")
+mutate("receipt-reconciled-before-deadline", "reconciliation may settle a pending receipt still within its deadline", SRC + "receipt.rs",
+       "        (ReceiptState::Pending, _) => past_deadline && settled,", "        (ReceiptState::Pending, _) => settled,")
+mutate("receipt-digest-not-canonical", "the argument digest is over serde_json's form, not the canonical one", SRC + "receipt.rs",
+       "        Self(Sha256::digest(canonical(arguments).as_bytes()).into())",
+       "        Self(Sha256::digest(serde_json::to_string(arguments).unwrap_or_default().as_bytes()).into())")
+mutate_all("canonical-integers-as-doubles", "integers are written as the double nearest them, so two above 2^53 can share a digest",
+           (SRC + "canonical.rs", "    if let Some(unsigned) = number.as_u64() {", "    if let Some(unsigned) = number.as_u64().filter(|_| false) {"),
+           (SRC + "canonical.rs", "    } else if let Some(signed) = number.as_i64() {", "    } else if let Some(signed) = number.as_i64().filter(|_| false) {"))
+mutate("canonical-utf8-order", "members are sorted by UTF-8 bytes, not UTF-16 code units", SRC + "canonical.rs",
+       "    one.encode_utf16().cmp(other.encode_utf16())", "    one.cmp(other)")
+mutate("finish-reference-for-reads", "a read's vendor reference is handed to the store, which has no receipt for it", SRC + "audit.rs",
+       "            reference = reserved.then(|| made.recorded());", "            reference = Some(made.recorded());")
+mutate("finish-reference-unescaped", "a vendor reference reaches the receipt as the vendor gave it", SRC + "audit.rs",
+       "            reference = reserved.then(|| made.recorded());", "            reference = reserved.then(|| made);")
+mutate("finish-read-unknown", "a read that reports unknown is recorded as unknown", SRC + "audit.rs",
+       "        ToolOutcome::Unknown if reserved => (", "        ToolOutcome::Unknown if true || reserved => (")
+mutate("reused-fields-public", "the answer to a reused key can be made without its row", SRC + "audit.rs",
+       "pub struct Reused {\n    row: AuditRowId,\n    reuse: Reuse,", "pub struct Reused {\n    pub row: AuditRowId,\n    pub reuse: Reuse,")
+# The gateway answers a duplicate as a success, with the receipt and the reference.
+mutate("gw-duplicate-answered-as-refusal", "the gateway answers a duplicate as a refusal", "crates/gateway/src/path.rs",
+       "        Reuse::Duplicate {\n            receipt, reference, ..\n        } => Reply::ToolOk(",
+       "        Reuse::Duplicate {\n            receipt, reference, ..\n        } if false => Reply::ToolOk(")
 
 # --- Sentences -----------------------------------------------------------------------------
 
@@ -1356,6 +1459,21 @@ mutate("testkit-row-bound-groups-uncounted", "the in-memory store leaves a user'
        "                groups.iter().map(|group| group.as_str().len()).sum::<usize>() * 0,")
 mutate("testkit-list-kind-uncounted", "the in-memory store leaves a list row's kind out of its size", ROW_BOUND,
        '        ("kind", kind(RowKind::List).len()),', '        ("kind", 0),')
+
+# Receipts in the in-memory store (decision 0009, part 2), as its contract suite's item 6 and
+# the end-to-end reuse test check them.
+mutate("testkit-reuse-check-includes-own-row", "the reuse check finds the receipt reserved under the row being begun, so a retried begin refuses itself", A,
+       "            .find(|receipt| receipt.row != *id && request.same_key(receipt));",
+       "            .find(|receipt| request.same_key(receipt));")
+mutate("testkit-reused-row-left-open", "a row answered from an earlier receipt is written open", A,
+       "                row.completion = Some(reuse.completion());\n", "")
+mutate("testkit-receipt-not-settled", "finish completes the row and leaves its receipt pending", A,
+       "            receipt.state = settled;\n", "")
+mutate("testkit-retry-after-settled-runs", "a begin under a row whose receipt has left pending is answered as reserved, so its call runs again", A,
+       "            Some(receipt) if receipt.state == ReceiptState::Pending => Ok(Reservation::Reserved),",
+       "            Some(_) => Ok(Reservation::Reserved),")
+mutate("testkit-reference-dropped", "a receipt's vendor reference is not kept", A,
+       "            receipt.reference = reference.cloned();\n", "")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -1983,8 +2101,8 @@ mutate("gw-tool-use-id-unbounded", "a tool-use identifier of any length reaches 
 mutate("gw-tool-use-id-any-characters", "a tool-use identifier with control characters reaches the row", GW_PATH,
        "\n        && value.bytes().all(|byte| byte.is_ascii_graphic());", ";")
 mutate("gw-tool-use-id-dropped", "the tool-use identifier never reaches the row", GW_PATH,
-       "tool_use_id: bounded_tool_use_id(tool_use_id),",
-       "tool_use_id: bounded_tool_use_id(tool_use_id).filter(|_| false),")
+       "        let metadata = RequestMetadata {\n            tool_use_id,\n",
+       "        let metadata = RequestMetadata {\n            tool_use_id: tool_use_id.filter(|_| false),\n")
 mutate("gw-resources-always-empty", "the resource adapter is ignored", GW_PATH,
        "            Some(Reads::Adapter(adapter)) => adapter.resources(approved, arguments),",
        "            Some(Reads::Adapter(_)) => Resources::Named(Vec::new()),")
@@ -2358,7 +2476,8 @@ mutate("dev-clock-option-ignored", "the gateway verifies on the system clock wha
 mutate("dev-printer-not-wired", "asking for audit rows to be printed prints nothing", DEV_START,
        "            Some(out) => Arc::new(AuditPrinter::new(store.clone(), out)),", "            Some(_) => store.clone(),")
 mutate("dev-printer-swallows-begin-failure", "the printer turns a failed begin into success, so the call runs with no row", DEV_PRINTER,
-       "            begun\n        })", "            begun.or_else(|_| Ok(()))\n        })")
+       "            begun\n        })\n    }\n\n    fn begin_with_receipt",
+       "            begun.or_else(|_| Ok(()))\n        })\n    }\n\n    fn begin_with_receipt")
 mutate("dev-printer-swallows-list-failure", "the printer turns a failed list into success, so audit::listed hands out a Listed with no row stored", DEV_PRINTER,
        "            listed\n        })", "            listed.or_else(|_| Ok(()))\n        })")
 mutate("dev-printer-swallows-finish-failure", "the printer turns a failed finish into success, so a refusal the log does not hold is passed on as recorded", DEV_PRINTER,
