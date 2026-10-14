@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -23,6 +24,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +38,7 @@ import (
 const subject = "system:serviceaccount:conformance:agent"
 const team = "test-team"
 const actor = "person@example.invalid"
+const atlassianAccount = "atlassian-account-of-person"
 const fakeTokenPrefix = "installation-token-generated-for-local-conformance-only-"
 const grantHeader = "X-Otto-Turn-Grant"
 const grantDenial = "this gateway requires a verifiable turn grant on every call, and this call's did not verify"
@@ -102,11 +106,50 @@ type fakeVendor struct {
 	key          *rsa.PrivateKey
 	mu           sync.Mutex
 	requests     []observation
-	tokens       map[string]bool
+	tokens       map[string]map[string]any
 	mode         string
 	entered      chan struct{}
 	release      chan struct{}
 	appAuthValid bool
+	answers      map[string]answer
+	repo         *fakeRepo
+}
+
+// An answer is a canned vendor response for one method and path, set by a
+// scenario to shape what a tool reads back. Raw bodies are sent as they are;
+// anything else is encoded as JSON.
+type answer struct {
+	Status   int
+	Body     any
+	Raw      []byte
+	Location string
+}
+
+// answer sets the response to "METHOD /path" (query ignored) for the rest of a test.
+func (v *fakeVendor) answer(route string, a answer) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.answers[route] = a
+}
+
+func writeAnswer(w http.ResponseWriter, a answer) {
+	if a.Location != "" {
+		w.Header().Set("Location", a.Location)
+	}
+	status := a.Status
+	if status == 0 {
+		status = 200
+	}
+	if a.Raw != nil {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(status)
+		_, _ = w.Write(a.Raw)
+		return
+	}
+	w.WriteHeader(status)
+	if a.Body != nil {
+		_ = json.NewEncoder(w).Encode(a.Body)
+	}
 }
 
 // issued reports whether the vendor handed out this bearer value. The gateway
@@ -114,7 +157,28 @@ type fakeVendor struct {
 func (v *fakeVendor) issued(authorization string) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	_, ok := v.tokens[strings.TrimPrefix(authorization, "Bearer ")]
+	return ok
+}
+
+// scope is the permission set the gateway asked for when it was issued this
+// bearer value; the gateway reuses a token across calls that need the same set.
+func (v *fakeVendor) scope(authorization string) map[string]any {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	return v.tokens[strings.TrimPrefix(authorization, "Bearer ")]
+}
+
+// since is what reached the vendor after the first n requests, leaving out
+// the App's own token traffic.
+func (v *fakeVendor) since(n int) []observation {
+	out := []observation{}
+	for _, o := range v.snapshot()[n:] {
+		if !strings.HasPrefix(o.Path, "/app/") {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 func (v *fakeVendor) snapshot() []observation {
@@ -173,7 +237,7 @@ func (v *fakeVendor) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			v.mu.Lock()
 			token := fmt.Sprintf("%s%d", fakeTokenPrefix, len(v.tokens)+1)
-			v.tokens[token] = true
+			v.tokens[token], _ = body["permissions"].(map[string]any)
 			v.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 				"repository_selection": "selected", "repositories": repos, "permissions": permissions})
@@ -199,6 +263,16 @@ func (v *fakeVendor) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if mode == "error" {
 		http.Error(w, "fake upstream failure "+strings.TrimPrefix(o.Authorization, "Bearer ")+strings.Repeat("x", 400), 503)
+		return
+	}
+	v.mu.Lock()
+	canned, ok := v.answers[r.Method+" "+r.URL.Path]
+	v.mu.Unlock()
+	if ok {
+		writeAnswer(w, canned)
+		return
+	}
+	if v.repo.serve(w, r, body, &v.mu) {
 		return
 	}
 	var result any
@@ -234,6 +308,332 @@ func (v *fakeVendor) serve(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(result)
 }
 
+// fakeRepo is just enough of GitHub's repository, git data and pull request
+// API for the write tools to propose, repeat and amend a change in
+// test-org/repo. Blob and tree ids are hashes of what was written, so the same
+// write gives the same id and a different write does not, as in git. Each
+// commit gets a new id even when its tree, message and parents repeat, as on
+// GitHub, which stamps a commit with the time it was made when the request
+// gives none. Every method runs with the vendor's lock held.
+type fakeRepo struct {
+	blobs   map[string]string
+	trees   map[string]map[string]string
+	commits map[string]fakeCommit
+	refs    map[string]string
+	pulls   []map[string]any
+	// made counts the commits created; it stands in for GitHub's commit timestamp.
+	made int
+}
+
+type fakeCommit struct {
+	tree, message string
+	parents       []string
+}
+
+const repoPath = "/repos/test-org/repo"
+
+// seedContent is the one file on the default branch before any proposal.
+const seedContent = "seeded by the conformance suite\n"
+
+func objectID(kind string, parts ...string) string {
+	h := sha1.New()
+	h.Write([]byte(kind))
+	for _, p := range parts {
+		h.Write([]byte{0})
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func newFakeRepo() *fakeRepo {
+	f := &fakeRepo{blobs: map[string]string{}, trees: map[string]map[string]string{}, commits: map[string]fakeCommit{}, refs: map[string]string{}}
+	blob := f.putBlob(seedContent)
+	tree := f.putTree(map[string]string{"README.md": blob})
+	f.refs["heads/main"] = f.putCommit(fakeCommit{tree: tree, message: "initial"})
+	return f
+}
+
+func (f *fakeRepo) putBlob(content string) string {
+	id := objectID("blob", content)
+	f.blobs[id] = content
+	return id
+}
+
+func (f *fakeRepo) putTree(entries map[string]string) string {
+	paths := make([]string, 0, len(entries))
+	for p := range entries {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	parts := []string{}
+	for _, p := range paths {
+		parts = append(parts, p, entries[p])
+	}
+	id := objectID("tree", parts...)
+	f.trees[id] = entries
+	return id
+}
+
+func (f *fakeRepo) putCommit(c fakeCommit) string {
+	f.made++
+	id := objectID("commit", append([]string{fmt.Sprint(f.made), c.tree, c.message}, c.parents...)...)
+	f.commits[id] = c
+	return id
+}
+
+// branchFile reads one file at a branch's head, for scenarios checking what a
+// write committed.
+func (v *fakeVendor) branchFile(branch, path string) (string, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	f := v.repo
+	blob, ok := f.trees[f.commits[f.refs["heads/"+branch]].tree][path]
+	return f.blobs[blob], ok
+}
+
+// pullRequests copies the stored pull requests, oldest first.
+func (v *fakeVendor) pullRequests() []map[string]any {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	out := []map[string]any{}
+	for _, p := range v.repo.pulls {
+		c := map[string]any{}
+		for k, val := range p {
+			c[k] = val
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// setPull changes a stored pull request, as a human acting on GitHub would.
+func (v *fakeVendor) setPull(number int, changes map[string]any) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for _, p := range v.repo.pulls {
+		if p["number"] == number {
+			for k, val := range changes {
+				p[k] = val
+			}
+		}
+	}
+}
+
+// pullJSON is a stored pull request as GitHub returns it. Every one is
+// authored by the App's own login, in the same repository as its base.
+func (f *fakeRepo) pullJSON(p map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, val := range p {
+		out[k] = val
+	}
+	head := p["head_ref"].(string)
+	out["head"] = map[string]any{"ref": head, "sha": f.refs["heads/"+head], "repo": map[string]any{"full_name": "test-org/repo"}}
+	base := p["base_ref"].(string)
+	out["base"] = map[string]any{"ref": base, "sha": f.refs["heads/"+base], "repo": map[string]any{"full_name": "test-org/repo"}}
+	out["html_url"] = fmt.Sprintf("https://example.invalid/pull/%d", p["number"])
+	out["user"] = map[string]any{"login": botLogin, "type": "Bot"}
+	return out
+}
+
+func vendorError(w http.ResponseWriter, status int, message string) {
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"message": message})
+}
+
+// serve answers a request it knows and reports whether it did; anything else
+// falls through to the vendor's fixed answers.
+func (f *fakeRepo) serve(w http.ResponseWriter, r *http.Request, body map[string]any, mu *sync.Mutex) bool {
+	if !strings.HasPrefix(r.URL.Path, repoPath) {
+		return false
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	rest := strings.TrimPrefix(r.URL.Path, repoPath)
+	str := func(k string) string { s, _ := body[k].(string); return s }
+	reply := func(status int, v any) bool {
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+		return true
+	}
+	switch {
+	case rest == "" && r.Method == "GET":
+		return reply(200, map[string]any{"name": "repo", "full_name": "test-org/repo", "default_branch": "main", "private": true})
+	case strings.HasPrefix(rest, "/branches/") && r.Method == "GET":
+		name := strings.TrimPrefix(rest, "/branches/")
+		sha, ok := f.refs["heads/"+name]
+		if !ok {
+			vendorError(w, 404, "Branch not found")
+			return true
+		}
+		return reply(200, map[string]any{"name": name, "commit": map[string]any{"sha": sha, "commit": map[string]any{"tree": map[string]any{"sha": f.commits[sha].tree}}}})
+	case strings.HasPrefix(rest, "/git/ref/") && r.Method == "GET":
+		ref := strings.TrimPrefix(rest, "/git/ref/")
+		sha, ok := f.refs[ref]
+		if !ok {
+			vendorError(w, 404, "Not Found")
+			return true
+		}
+		return reply(200, map[string]any{"ref": "refs/" + ref, "object": map[string]any{"sha": sha, "type": "commit"}})
+	case strings.HasPrefix(rest, "/git/commits/") && r.Method == "GET":
+		sha := strings.TrimPrefix(rest, "/git/commits/")
+		c, ok := f.commits[sha]
+		if !ok {
+			vendorError(w, 404, "Not Found")
+			return true
+		}
+		parents := []any{}
+		for _, p := range c.parents {
+			parents = append(parents, map[string]any{"sha": p})
+		}
+		return reply(200, map[string]any{"sha": sha, "tree": map[string]any{"sha": c.tree}, "parents": parents, "message": c.message})
+	case strings.HasPrefix(rest, "/git/trees/") && r.Method == "GET":
+		sha := strings.TrimPrefix(rest, "/git/trees/")
+		entries, ok := f.trees[sha]
+		if !ok {
+			vendorError(w, 404, "Not Found")
+			return true
+		}
+		list := []any{}
+		for p, blob := range entries {
+			list = append(list, map[string]any{"path": p, "mode": "100644", "type": "blob", "sha": blob, "size": len(f.blobs[blob])})
+		}
+		return reply(200, map[string]any{"sha": sha, "tree": list, "truncated": false})
+	case rest == "/git/blobs" && r.Method == "POST":
+		content, err := base64.StdEncoding.DecodeString(str("content"))
+		if err != nil || str("encoding") != "base64" {
+			content = []byte(str("content"))
+		}
+		return reply(201, map[string]any{"sha": f.putBlob(string(content))})
+	case rest == "/git/trees" && r.Method == "POST":
+		entries := map[string]string{}
+		for p, blob := range f.trees[str("base_tree")] {
+			entries[p] = blob
+		}
+		items, _ := body["tree"].([]any)
+		for _, raw := range items {
+			e := raw.(map[string]any)
+			path := e["path"].(string)
+			if blob, ok := e["sha"].(string); ok {
+				entries[path] = blob
+			} else {
+				delete(entries, path)
+			}
+		}
+		return reply(201, map[string]any{"sha": f.putTree(entries)})
+	case rest == "/git/commits" && r.Method == "POST":
+		c := fakeCommit{tree: str("tree"), message: str("message")}
+		parents, _ := body["parents"].([]any)
+		for _, p := range parents {
+			c.parents = append(c.parents, p.(string))
+		}
+		sha := f.putCommit(c)
+		return reply(201, map[string]any{"sha": sha, "tree": map[string]any{"sha": c.tree}})
+	case rest == "/git/refs" && r.Method == "POST":
+		ref := strings.TrimPrefix(str("ref"), "refs/")
+		if _, exists := f.refs[ref]; exists {
+			vendorError(w, 422, "Reference already exists")
+			return true
+		}
+		f.refs[ref] = str("sha")
+		return reply(201, map[string]any{"ref": "refs/" + ref, "object": map[string]any{"sha": str("sha"), "type": "commit"}})
+	case strings.HasPrefix(rest, "/git/refs/") && r.Method == "PATCH":
+		ref := strings.TrimPrefix(rest, "/git/refs/")
+		if _, exists := f.refs[ref]; !exists {
+			vendorError(w, 422, "Reference does not exist")
+			return true
+		}
+		f.refs[ref] = str("sha")
+		return reply(200, map[string]any{"ref": "refs/" + ref, "object": map[string]any{"sha": str("sha"), "type": "commit"}})
+	case rest == "/pulls" && r.Method == "GET":
+		head := r.URL.Query().Get("head")
+		list := []any{}
+		for _, p := range f.pulls {
+			if head == "" || head == "test-org:"+p["head_ref"].(string) {
+				list = append(list, f.pullJSON(p))
+			}
+		}
+		return reply(200, list)
+	case rest == "/pulls" && r.Method == "POST":
+		for _, p := range f.pulls {
+			if p["head_ref"] == str("head") && p["state"] == "open" {
+				vendorError(w, 422, "Validation Failed: A pull request already exists for test-org:"+str("head")+".")
+				return true
+			}
+		}
+		draft, _ := body["draft"].(bool)
+		p := map[string]any{"number": 42 + len(f.pulls), "title": str("title"), "body": str("body"), "state": "open", "draft": draft, "merged": false, "head_ref": str("head"), "base_ref": str("base")}
+		f.pulls = append(f.pulls, p)
+		return reply(201, f.pullJSON(p))
+	case strings.HasPrefix(rest, "/pulls/"):
+		var n int
+		if _, err := fmt.Sscanf(strings.TrimPrefix(rest, "/pulls/"), "%d", &n); err != nil || strings.Contains(strings.TrimPrefix(rest, "/pulls/"), "/") {
+			return false
+		}
+		for _, p := range f.pulls {
+			if p["number"] != n {
+				continue
+			}
+			if r.Method == "PATCH" {
+				for _, k := range []string{"title", "body"} {
+					if s, ok := body[k].(string); ok {
+						p[k] = s
+					}
+				}
+			}
+			return reply(200, f.pullJSON(p))
+		}
+	}
+	return false
+}
+
+// fakeJira records what reaches Jira and answers the boot-time credential
+// check; scenarios set the rest with answer.
+type fakeJira struct {
+	server   *httptest.Server
+	mu       sync.Mutex
+	requests []observation
+	answers  map[string]answer
+}
+
+func (j *fakeJira) answer(route string, a answer) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.answers[route] = a
+}
+
+// snapshot leaves out the boot-time credential check, which is not a tool's request.
+func (j *fakeJira) snapshot() []observation {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := []observation{}
+	for _, o := range j.requests {
+		if o.Path != "/rest/api/3/myself" {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+func (j *fakeJira) serve(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	j.mu.Lock()
+	j.requests = append(j.requests, observation{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Authorization: r.Header.Get("Authorization"), Body: body})
+	canned, ok := j.answers[r.Method+" "+r.URL.Path]
+	j.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case ok:
+		writeAnswer(w, canned)
+	case r.URL.Path == "/rest/api/3/myself":
+		_ = json.NewEncoder(w).Encode(map[string]any{"accountId": "fake-account", "displayName": "Fake"})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 func verifyAppJWT(token string, key *rsa.PublicKey) bool {
 	p := strings.Split(token, ".")
 	if len(p) != 3 {
@@ -266,10 +666,12 @@ type harness struct {
 	grantKey                                 []byte
 	key                                      *rsa.PrivateKey
 	vendor                                   *fakeVendor
-	jira                                     *httptest.Server
+	jira                                     *fakeJira
 	stop                                     func()
 	seq                                      int
 	granted                                  []string
+	// extraArgs are passed to the gateway after the ones its mode implies.
+	extraArgs []string
 }
 
 var databaseSeq atomic.Int64
@@ -331,7 +733,7 @@ func newHarness(t *testing.T) *harness {
 	must(t, os.WriteFile(h.manifest, jsonBytes(t, map[string]any{
 		"id": team, "displayName": "Test team",
 		"sandbox":    map[string]any{"serviceAccount": subject},
-		"members":    []any{map[string]any{"email": actor}},
+		"members":    []any{map[string]any{"email": actor, "atlassianAccountId": atlassianAccount}},
 		"actOnRepos": []string{"repo"},
 	}), 0600))
 	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -347,19 +749,26 @@ func newHarness(t *testing.T) *harness {
 	}))
 	h.issuer = issuer.URL
 	t.Cleanup(issuer.Close)
-	h.vendor = &fakeVendor{pool: h.pool, key: h.key, tokens: map[string]bool{}, entered: make(chan struct{}, 1), release: make(chan struct{}), appAuthValid: true}
+	h.vendor = &fakeVendor{pool: h.pool, key: h.key, tokens: map[string]map[string]any{}, answers: map[string]answer{}, repo: newFakeRepo(), entered: make(chan struct{}, 1), release: make(chan struct{}), appAuthValid: true}
 	h.vendor.server = httptest.NewServer(http.HandlerFunc(h.vendor.serve))
 	t.Cleanup(h.vendor.server.Close)
-	// A minimal Jira: enough for the gateway's boot-time credential check.
-	h.jira = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Path == "/rest/api/3/myself" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"accountId": "fake-account", "displayName": "Fake"})
-			return
+	// Every token the gateway asks for, in every test, names exactly the team's
+	// repositories and a stated permission set; the vendor accepts only the
+	// tokens it issued, so this holds for every request a tool sends.
+	t.Cleanup(func() {
+		for _, o := range h.vendor.snapshot() {
+			if o.Path != "/app/installations/123/access_tokens" {
+				continue
+			}
+			permissions, _ := o.Body["permissions"].(map[string]any)
+			if !reflect.DeepEqual(o.Body["repositories"], []any{"repo"}) || len(permissions) == 0 {
+				t.Errorf("token asked for beyond the team's repositories or with no stated permissions: %v", o.Body)
+			}
 		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(h.jira.Close)
+	})
+	h.jira = &fakeJira{answers: map[string]answer{}}
+	h.jira.server = httptest.NewServer(http.HandlerFunc(h.jira.serve))
+	t.Cleanup(h.jira.server.Close)
 	for name := range readBaseline(t).Tools {
 		h.granted = append(h.granted, name)
 	}
@@ -367,7 +776,11 @@ func newHarness(t *testing.T) *harness {
 }
 
 // mode says which of the gateway's gates a test turns on.
-type mode struct{ identity, grant, audit, connector, jira bool }
+// botLogin names the App's own account, which the gateway needs before it
+// will amend a pull request or edit a comment.
+type mode struct{ identity, grant, audit, connector, jira, botLogin bool }
+
+const botLogin = "otto-conformance[bot]"
 
 var full = mode{identity: true, grant: true, audit: true, connector: true}
 
@@ -384,7 +797,7 @@ func (h *harness) connectorArgs() []string {
 }
 
 func (h *harness) jiraArgs() []string {
-	return []string{"-jira-base-url", h.jira.URL, "-jira-site-url", h.jira.URL, "-jira-email", "otto@example.invalid",
+	return []string{"-jira-base-url", h.jira.server.URL, "-jira-site-url", h.jira.server.URL, "-jira-email", "otto@example.invalid",
 		"-jira-api-token-file", h.jiraTokenPath, "-jira-projects", "TEST"}
 }
 
@@ -450,10 +863,13 @@ func (h *harness) start(m mode) {
 		h.startCustodian()
 		args = append(args, h.connectorArgs()...)
 	}
+	if m.botLogin {
+		args = append(args, "-github-bot-login", botLogin)
+	}
 	if m.jira {
 		args = append(args, h.jiraArgs()...)
 	}
-	h.url, h.stop = startProcess(h.t, args)
+	h.url, h.stop = startProcess(h.t, append(args, h.extraArgs...))
 }
 
 func startProcess(t *testing.T, args []string) (string, func()) {
@@ -585,8 +1001,9 @@ type rpcReply struct {
 	ID      any            `json:"id"`
 	Result  map[string]any `json:"result"`
 	Error   *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
+		Code    int            `json:"code"`
+		Message string         `json:"message"`
+		Data    map[string]any `json:"data"`
 	} `json:"error"`
 }
 

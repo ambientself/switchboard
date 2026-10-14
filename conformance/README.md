@@ -42,8 +42,14 @@ key and team manifest, a loopback issuer, fake GitHub and Jira servers, and its 
 and custodian processes. The gateway connects as Otto's narrow `otto_gateway` role; the
 suite inspects rows as the owner. Turn grants are minted by the suite from Otto's wire
 format, without importing Otto's code. The fake vendor validates App JWT signatures, issues
-dummy installation tokens scoped exactly as asked, and observes that an unfinished allowed
-audit row exists before downstream work.
+dummy installation tokens scoped exactly as asked, remembers which permissions each token was
+asked for, and observes that an unfinished allowed audit row exists before downstream work.
+After every test, the suite checks that each token was asked for with exactly the team's
+repositories and a stated permission set. The fake vendor keeps one repository's refs,
+commits and pull requests between calls, so the write tools can be repeated against it. Blob
+and tree ids are hashed from their contents; each commit gets a new id, as GitHub's carry the
+time they were made. A scenario can also set a canned answer for any method and path. The fake Jira records every request and
+answers what each scenario sets.
 No vendor or cluster credentials are needed. Inherited gateway configuration and proxy
 settings are not passed to the gateway.
 
@@ -64,12 +70,19 @@ fails with setup instructions instead of silently skipping the suite.
 | Protocol | Fixed negotiated revision, request IDs, initialization, ping, tool listing, notifications, malformed requests and unsupported methods; no client session ID. |
 | Identity | Signed local tokens; expiry, not-before, audience, issuer, subject, lifetime, algorithm, key ID and signature failures; opaque 401 with an audit row. |
 | Turn grants | Missing grant; sixteen kinds of unverifiable grant, including forged claims under a genuine signature; grant and pod team mismatch; a tool outside the grant; legacy headers accepted only with grant checking off. |
+| Grant key rotation | A previous key accepted alongside the current one until its retirement instant, and refused after it without a restart; a retirement instant already past; key files read once, at start; refusals to start without the instant, with an instant that is not RFC3339, with the same key twice, or with an unreadable previous key. |
 | Attribution | Proved, failed and disabled verification states; nothing from an unverified grant recorded; the caller's tool-use identifier recorded. |
 | Tools | Exactly eighteen tools with classifications and required arguments, none destructive; unconfigured connector serves a marked fixture. |
 | GitHub | Real custodian and connector code against a fake API; App JWT validation; tokens scoped by repository and permission; results of the five original tools; draft pull requests; scope refusals and argument errors told apart; result bounds and credential redaction. |
+| Newer GitHub reads | Releases and tags, an issue and its comments, a pull request's check runs, failing steps, annotations and statuses: each request, its token's permissions, the bounds and truncation notes, and a pull request's number given to the issue tool. A job log's redirect to a host other than the gateway's pinned one refused before any request to it; a log served without a redirect, or missing, an error. |
+| Repository config | The pull request template and `AGENTS.md`, read in the background at the default branch's head with a read-only token and answered as pending until loaded; `AGENTS.md` served only when CODEOWNERS gives it an owner, and then quoted inside a frame marked with a one-time token. |
+| Proposals | `github_propose_change`: a fresh `otto/` branch from the default branch, one commit whose message is the title, a draft pull request with the declared claims quoted above the body, tokens per step, and a proposal record; a repeat returns the existing proposal; other files or another body under the same key is a conflict; a proposal that changes nothing is an error; a repeat after a human closed the proposal is declined, with no new pull request. `github_amend_change`: one commit fast-forwarded onto the branch and the claims block rewritten, with tokens per step; a ready, closed or foreign pull request refused or failed with nothing written; a repeat needs the expected head; no amend without the App's login. |
+| Jira | Search confined by wrapping the caller's JQL after the project restriction, page bounds, `{me}` checked with Jira before use, and an answer naming another project withheld whole; an issue's restricted comments withheld and counted, and an issue under a security level refused; comments posted as paragraphs to the issue's id with a fixed attribution line; the shared account's credentials on every request. |
+| Declarations and skills | `declare_unverified_claim`'s result and its bounds, with no vendor request; `github_skill_body` without a skill set pinned for the turn. |
+| Refusals of the newer tools | Another organization, a repository outside the team's, a Jira project outside the allowlist, instruction, workflow and Atlantis files, unbalanced JQL and JQL functions that depend on the caller, all refused before any request; malformed arguments told apart as errors. |
 | Audit | Allowed, denied and refused records; audit before vendor requests; begin failure; finish failure; the answer waiting for finish; completion after client disconnect. |
-| Known gaps in Otto | Repeated comments are not deduplicated. |
-| Not covered | The behavior of thirteen newer tools, the three control-plane endpoints, grant key rotation and the custodian's peer check. See [observed behavior](../docs/otto-baseline.md). |
+| Known gaps in Otto | Repeated comments are not deduplicated, on GitHub or Jira. A retirement instant given without a previous key is accepted and ignored. |
+| Not covered | The three control-plane endpoints and the custodian's peer check. A job log's text, which the gateway reads only from GitHub's own blob host. A skill body's text, which needs a skill set pinned for the turn, and the tool interface cannot pin one. See [observed behavior](../docs/otto-baseline.md). |
 
 The negative scenarios are part of the baseline, not desired Switchboard behavior. See
 [observed behavior](../docs/otto-baseline.md) before using these tests as a migration gate.
@@ -99,7 +112,8 @@ the re-pin, `mintGrant` signs with an Ed25519 key it generates, with `aud` namin
 under test, and the `grant_signature` guard in `mutation_check.py` is rewritten. The sixteen
 unverifiable-grant assertions carry over unchanged. The new grant checks (replay, audience,
 pod, clock skew, key rotation, currency and revocation) live in the separate company-wide
-group, not here.
+group, not here. `TestGrantKeyRotation` covers how Otto's gateway rotates its `v1` key, as it
+behaves at the pin.
 
 The Rust gateway will refuse to start with grant checking off outside a development build, a
 build with the `test-support` cargo feature (design section 12). That gate is not built yet; it
