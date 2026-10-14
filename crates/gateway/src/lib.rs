@@ -56,6 +56,10 @@
 //!   answers has every tool withdrawn.
 //! - [`probe`] is `switchboard probe`: decision 0010's three calls to one registry entry, and
 //!   the probe record they make.
+//! - [`Reconciler`] works the queue of `unknown` receipts in every instance with audit in
+//!   Postgres ([`reconcile`]): it claims each receipt with a short lease, asks its connector's
+//!   lookup for the marker, records what was found, and hands a receipt to a person when there
+//!   is nothing to look in or its attempts are used up. It only looks: nothing is sent again.
 //!
 //! The `switchboard` binary is that, as a process: `switchboard --config=FILE` serves,
 //! `switchboard probe` probes one entry, and `switchboard migrate` brings the audit schema up
@@ -78,6 +82,7 @@ mod policy;
 pub mod probe;
 mod proxied;
 pub mod reach;
+pub mod reconcile;
 pub mod reload;
 mod resources;
 mod selector;
@@ -118,6 +123,13 @@ pub use path::{
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{invalid_argument, undeclared_argument, withdrawn_while_deciding};
 pub use reach::{ReachCaller, ReachSettings, ReachSettingsError};
+pub use reconcile::{
+    DEFAULT_RECONCILE_ATTEMPTS, DEFAULT_RECONCILE_INTERVAL, DEFAULT_RECONCILE_LEASE,
+    HANDED_TO_PERSON_EVENT, MAX_RECONCILE_ATTEMPTS, MAX_RECONCILE_INTERVAL, MAX_RECONCILE_LEASE,
+    MIN_RECONCILE_INTERVAL, MIN_RECONCILE_LEASE, PassReport, RECONCILE_BATCH,
+    RECONCILE_FAILED_EVENT, ReconcileCounts, ReconcileSettings, ReconcileSettingsError,
+    ReconcileSignals, Reconciler, ReconciliationSection, SETTLED_EVENT,
+};
 pub use reload::{Freshness, ReloadError, Reloader};
 pub use resources::ResourceAdapter;
 pub use selector::{

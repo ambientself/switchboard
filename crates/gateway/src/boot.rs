@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
     AuditStore, Classification, Connector, ConnectorName, DeploymentName, InstanceName, Issuer,
-    Narrowing, PolicySnapshot, ProfileName, SnapshotError, ToolName,
+    Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_registry::{Registry, RulePrincipal};
@@ -59,6 +59,7 @@ use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection};
 use crate::policy::{LivePolicy, ServedPolicy};
+use crate::reconcile::{ReconcileSettings, Reconciler};
 use crate::reload::{Freshness, Reloader};
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
@@ -227,7 +228,7 @@ pub struct Settings {
 }
 
 /// What code supplies to the gateway, beside its configuration: the clock, the instance, the
-/// audit store, and each connector with its resource adapter.
+/// audit store, each connector with its resource adapter, and each connector's lookup by marker.
 pub struct Wiring {
     clock: Arc<dyn Clock>,
     instance: InstanceName,
@@ -235,6 +236,7 @@ pub struct Wiring {
     connectors: Vec<(ConnectorName, Registered)>,
     proxied: Vec<(ConnectorName, Arc<dyn Connector>)>,
     call_deadlines: BTreeMap<ConnectorName, Duration>,
+    lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
 }
 
 impl Wiring {
@@ -248,6 +250,7 @@ impl Wiring {
             connectors: Vec::new(),
             proxied: Vec::new(),
             call_deadlines: BTreeMap::new(),
+            lookups: BTreeMap::new(),
         }
     }
 
@@ -282,6 +285,15 @@ impl Wiring {
         connector: Arc<dyn Connector>,
     ) -> Self {
         self.proxied.push((name.into(), connector));
+        self
+    }
+
+    /// Registers `lookup` as the connector `name`'s lookup by marker, which reconciliation asks
+    /// to settle an `unknown` receipt of its tools (decision 0009, "Reconciliation"). A
+    /// connector with none has each such receipt handed to a person at once. No connector has
+    /// one until the built-in GitHub and Jira connectors (#12).
+    pub fn lookup(mut self, name: impl Into<ConnectorName>, lookup: Arc<dyn Lookup>) -> Self {
+        self.lookups.insert(name.into(), lookup);
         self
     }
 
@@ -370,6 +382,7 @@ pub struct Gates {
     http: HttpSection,
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
+    lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
     freshness: Freshness,
 }
 
@@ -488,6 +501,23 @@ impl Gates {
         self.connectors.get(name)
     }
 
+    /// This instance's reconciliation of `unknown` receipts over `queue`, the store's queue,
+    /// with the lookups the wiring registered and `settings`. It follows the policy these gates
+    /// serve to find each receipt's connector. See [`crate::reconcile`].
+    pub fn reconciler(
+        &self,
+        queue: Arc<dyn ReceiptQueue>,
+        settings: ReconcileSettings,
+    ) -> Reconciler {
+        Reconciler::new(
+            queue,
+            self.policy.clone(),
+            self.lookups.clone(),
+            &self.instance,
+            settings,
+        )
+    }
+
     /// The policy served now, which the argument check reads to see whether a tool was
     /// withdrawn while a call was being decided.
     pub(crate) fn live_policy(&self) -> &LivePolicy {
@@ -519,6 +549,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         connectors: registrations,
         proxied,
         call_deadlines,
+        lookups,
     } = wiring;
     if let Some((name, _)) = proxied.into_iter().next() {
         return Err(BootError::ProxiedWithoutRegistry(name));
@@ -597,6 +628,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
             snapshot, catalog, selector,
         ))),
         connectors,
+        lookups,
         // No file is read again, so the policy never goes stale.
         freshness: Freshness::new(None, Instant::now()),
     })
@@ -649,6 +681,7 @@ pub(crate) fn check_registry_with(
         connectors: registrations,
         proxied,
         call_deadlines,
+        lookups,
     } = wiring;
     if let Some((name, _)) = registrations.into_iter().next() {
         return Err(BootError::AdapterBesideRegistry(name));
@@ -701,6 +734,7 @@ pub(crate) fn check_registry_with(
         http: settings.http,
         policy: live,
         connectors,
+        lookups,
         freshness,
     };
     Ok((gates, reloader))
