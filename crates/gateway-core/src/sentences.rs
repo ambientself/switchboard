@@ -72,7 +72,7 @@ const RESOURCES_UNKNOWN: &str = "Tool `{tool}` cannot say which resources this c
 const RESOURCES_NONE_NAMED: &str = "Tool `{tool}` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for.";
 
 /// A call of a tool not classified `read` carried no idempotency key (decision 0009, "The key").
-const KEY_MISSING: &str = "Tool `{tool}` is classified `{classification}`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key.";
+const KEY_MISSING: &str = "Tool `{tool}` is classified `{classification}`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`.";
 
 /// A key reused with a different tool-use identifier: what a key fixed in a client's
 /// configuration looks like (decision 0009, "Reuse").

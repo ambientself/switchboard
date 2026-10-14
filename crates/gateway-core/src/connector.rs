@@ -73,6 +73,12 @@ pub enum ToolOutcome {
     Ok(serde_json::Value),
     /// The tool ran and failed: the kind of failure, which the row records, and a message for
     /// the caller, which it does not.
+    ///
+    /// From a tool not classified `read`, a side effect, it means nothing took effect: nothing
+    /// was sent, or the vendor answered that it did not do it. The call's receipt is settled as
+    /// `not_performed` (decision 0009), and the caller may try again under a new key. A
+    /// side-effecting connector reports [`Unknown`](Self::Unknown) instead once anything may
+    /// have been sent and no definite answer came back.
     Error(ErrorKind, String),
     /// The connector refused because of what the call names. The sentence is returned to the
     /// caller and recorded on the row, and reaches the caller only after that row is finished.
@@ -82,11 +88,14 @@ pub enum ToolOutcome {
     /// call's receipt records. Recorded as `ok`. From a `read` tool, which has no receipt, the
     /// reference is dropped.
     Completed(serde_json::Value, VendorReference),
-    /// The connector sent a side effect's request and got no definite answer: a timeout, a
-    /// dropped connection, a server error after the request was sent, or a result over the
-    /// gateway's bound (decision 0009). Recorded as `unknown`, and the caller is told not to
-    /// repeat the call. A read never reports it: from a `read` tool it is recorded as an error
-    /// of the kind `other`.
+    /// A side effect's request may have been sent, and no definite answer came back: a timeout,
+    /// a connection broken off, a server error after the request was sent, an answer that
+    /// cannot be read, or a result over the gateway's bound (decision 0009). Recorded as
+    /// `unknown`, its receipt is `unknown`, and the caller is told not to repeat the call. A
+    /// side-effecting connector reports this, never [`Error`](Self::Error), for every failure
+    /// once anything may have been sent, unless the vendor answered that it did not do it. A
+    /// read never reports it: from a `read` tool it is recorded as an error of the kind
+    /// `other`.
     Unknown,
 }
 
@@ -98,15 +107,17 @@ impl ToolOutcome {
 }
 
 /// The kind of an `error` outcome (decisions 0009 and 0011). A closed set, so each kind can be
-/// counted from the rows. The row records the kind, not the caller's message.
+/// counted from the rows. The row records the kind, not the caller's message. For a side
+/// effect, an error of any kind means nothing took effect: see [`ToolOutcome::Error`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     /// The call's arguments failed a check, so nothing was sent.
     InvalidArguments,
     /// A tool classified `read` gave an answer too large to accept, or none by its deadline.
-    /// From a tool of any other classification the same failure is [`Other`](Self::Other),
-    /// until a connector reports the outcome `unknown`.
+    /// Only a read's error has this kind. From a tool of any other classification the same
+    /// failure is not an error at all: the request may have been sent, so its connector reports
+    /// [`ToolOutcome::Unknown`], and its receipt is `unknown`.
     OversizedOrLateRead,
     /// The credential custodian refused the credential an allowed call needed. Nothing reports
     /// it yet: no connector asks a custodian.
