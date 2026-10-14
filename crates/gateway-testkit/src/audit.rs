@@ -359,9 +359,17 @@ impl State {
     /// [`Reservation::Reserved`] while its receipt is `pending`. A row whose receipt has left
     /// `pending` is refused, since its call has run or has been settled without running, and
     /// so is a row begun with no receipt.
-    fn found(&self, id: &AuditRowId) -> Result<Reservation, StoreError> {
+    ///
+    /// `reuse` is the reuse check's answer for this begin. Since the row reserved its key or
+    /// was answered, the check finds no receipt under another row unless the row was answered
+    /// from it, and then the answer it was written with stands. One found otherwise is
+    /// answered as it says, as a retried begin that did not pass over its own receipt would be.
+    fn found(&self, id: &AuditRowId, reuse: Option<Reuse>) -> Result<Reservation, StoreError> {
         if let Some((_, reuse)) = self.reused.iter().find(|(row, _)| row == id) {
             return Ok(Reservation::Reused(reuse.clone()));
+        }
+        if let Some(reuse) = reuse {
+            return Ok(Reservation::Reused(reuse));
         }
         match self.receipts.iter().find(|receipt| receipt.row == *id) {
             Some(receipt) if receipt.state == ReceiptState::Pending => Ok(Reservation::Reserved),
@@ -870,16 +878,18 @@ impl InMemoryAuditStore {
             if state.list_rows.iter().any(|(id, _, _)| id == row) {
                 return Err(format!("audit row {} is a list row", row.as_str()).into());
             }
+            // The reuse check comes first, for a retried begin too, and passes over a receipt
+            // reserved under this row, so that a retried begin never refuses itself.
+            let reuse = state.reuse_answer(row, receipt)?;
             let mut reservation = None;
             match state.rows.iter().find(|(id, _, _)| id == row) {
                 None => {
                     let times = self
                         .times_for(allowance_ms)
                         .ok_or_else(|| StoreError::from("the row's deadline is out of range"))?;
-                    // The reuse check, then the row and its receipt or its answer, in one write.
-                    let reuse = state.reuse_answer(row, receipt)?;
+                    // The row and its receipt, or its answer, in one write.
                     state.rows.push((row.clone(), record.clone(), times));
-                    reservation = state.reserve(row, receipt, reuse);
+                    reservation = state.reserve(row, receipt, reuse.clone());
                 }
                 Some((_, stored, _)) if stored.decision == record.decision => {}
                 Some(_) => {
@@ -891,7 +901,7 @@ impl InMemoryAuditStore {
                 }
             }
             if receipt.is_some() && reservation.is_none() {
-                reservation = Some(state.found(row)?);
+                reservation = Some(state.found(row, reuse)?);
             }
             if state.confirmation_lost.take() {
                 // As the Postgres store completes a lost begin's row, and the core gives up a
