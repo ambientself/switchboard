@@ -49,12 +49,14 @@ pub(crate) const COLUMNS: &[(&str, &str)] = &[
     ("listed_omitted", "bigint"),
     ("credential_mode", "text"),
     ("credential_principal", "text"),
+    ("duplicate_of", "uuid"),
 ];
 
 /// The columns the gateway's role inserts: the identifier it chose and the first half of a row,
 /// with the instance, the kind, the allowance and the credential identity, and without the
-/// times, the deadline or the completion; and for a list row, the tools listed and their
-/// count.
+/// times or the deadline; for a list row, the tools listed and their count; and for the answer
+/// to a reused key, written complete at begin, its outcome, sentence, latency and the earlier
+/// receipt a `duplicate` names.
 pub(crate) const INSERTED: &[&str] = &[
     "id",
     "tool_use_id",
@@ -85,14 +87,18 @@ pub(crate) const INSERTED: &[&str] = &[
     "listed_omitted",
     "credential_mode",
     "credential_principal",
+    "outcome",
+    "outcome_sentence",
+    "latency_ms",
+    "duplicate_of",
 ];
 
 /// The columns the gateway's role updates: the completion, with an error's kind.
 pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "error_kind", "latency_ms"];
 
 /// The columns the gateway's role reads: which row, whether it was allowed, its completion,
-/// with an error's kind, and its kind and deadline, which say whether an empty completion is
-/// open.
+/// with an error's kind and the receipt a duplicate names, and its kind and deadline, which say
+/// whether an empty completion is open.
 pub(crate) const SELECTED: &[&str] = &[
     "id",
     "decision",
@@ -102,23 +108,76 @@ pub(crate) const SELECTED: &[&str] = &[
     "latency_ms",
     "kind",
     "deadline",
+    "duplicate_of",
 ];
 
-/// The triggers on `call_rows`, each calling the schema's function of the same name, and when
-/// each must fire, as `pg_trigger.tgtype` encodes it: for each row (1), before (2), on insert
-/// (4) or on update (16).
+/// The receipt table (decision 0009, part 2), which migration 0008 creates.
+pub(crate) const RECEIPTS: &str = "receipts";
+
+/// The columns of `receipts` the gateway's role inserts: everything a reservation holds but its
+/// state, how it was established and its time, which the defaults and the trigger give it.
+pub(crate) const RECEIPT_INSERTED: &[&str] = &[
+    "row_id",
+    "principal_issuer",
+    "principal_subject",
+    "delegation_scope",
+    "idempotency_key",
+    "tool",
+    "tool_use_id",
+    "digest",
+    "resources",
+    "resources_omitted",
+];
+
+/// The columns of `receipts` the gateway's role updates: a move's. Never its row, scope, key,
+/// call or time.
+pub(crate) const RECEIPT_UPDATED: &[&str] =
+    &["state", "established_by", "established_person", "reference"];
+
+/// The columns of `receipts` the gateway's role reads: every one, for the reuse check, a
+/// retried begin and the count of receipts in `unknown`.
+pub(crate) const RECEIPT_SELECTED: &[&str] = &[
+    "row_id",
+    "reserved_at",
+    "principal_issuer",
+    "principal_subject",
+    "delegation_scope",
+    "idempotency_key",
+    "tool",
+    "tool_use_id",
+    "digest",
+    "resources",
+    "resources_omitted",
+    "state",
+    "established_by",
+    "established_person",
+    "reference",
+];
+
+/// The triggers the store needs, each on its table and calling the schema's function of the
+/// same name, and when each must fire, as `pg_trigger.tgtype` encodes it: for each row (1),
+/// before (2), on insert (4) or on update (16).
 pub(crate) const TRIGGERS: &[Trigger] = &[
     Trigger {
+        table: "call_rows",
         name: "set_times",
         purpose: "sets both times and the deadline from the database's clock",
         fires: "before each insert",
         tgtype: 1 | 2 | 4,
     },
     Trigger {
+        table: "call_rows",
         name: "complete_once",
         purpose: "completes a row at most once",
         fires: "before each update",
         tgtype: 1 | 2 | 16,
+    },
+    Trigger {
+        table: RECEIPTS,
+        name: "receipt_moves",
+        purpose: "moves a receipt only as its state table allows, by the database's clock",
+        fires: "before each insert or update",
+        tgtype: 1 | 2 | 4 | 16,
     },
 ];
 
@@ -141,6 +200,7 @@ fn collapse(definition: &str) -> String {
 /// A trigger the table must have.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Trigger {
+    table: &'static str,
     name: &'static str,
     purpose: &'static str,
     fires: &'static str,
@@ -435,6 +495,8 @@ pub enum Problem {
     },
     /// `switchboard_audit.call_rows` is not there.
     TableMissing,
+    /// `switchboard_audit.receipts`, which keeps the receipts for side effects, is not there.
+    ReceiptsMissing,
     /// `switchboard_audit.call_rows` is partitioned. Each partition has its own triggers,
     /// each enabled or disabled on its own, its own owner and its own grants, and may be in
     /// another schema, so the store refuses a partitioned table rather than trust what the
@@ -473,6 +535,8 @@ pub enum Problem {
     /// A trigger the table needs is not on it, or does not fire on every row it must: it
     /// calls another function, fires at another time, or has a condition or a column list.
     TriggerMissing {
+        /// The table it must be on.
+        table: &'static str,
         /// The trigger.
         trigger: &'static str,
         /// What it does.
@@ -482,6 +546,8 @@ pub enum Problem {
     },
     /// A trigger is on the table but does not fire in an ordinary session.
     TriggerDisabled {
+        /// The table it is on.
+        table: &'static str,
         /// The trigger.
         trigger: &'static str,
     },
@@ -702,6 +768,11 @@ impl fmt::Display for Problem {
                  pooler, may have dropped them"
             ),
             Self::TableMissing => write!(f, "the table switchboard_audit.call_rows does not exist"),
+            Self::ReceiptsMissing => write!(
+                f,
+                "the table switchboard_audit.receipts, which keeps the receipts for side effects, \
+                 does not exist"
+            ),
             Self::Partitioned => write!(
                 f,
                 "the table switchboard_audit.call_rows is partitioned, and each partition has \
@@ -729,15 +800,16 @@ impl fmt::Display for Problem {
                 "the column call_rows.{column} is {found}, not {expected}"
             ),
             Self::TriggerMissing {
+                table,
                 trigger,
                 purpose,
                 fires,
             } => write!(
                 f,
-                "the trigger {trigger}, which {purpose}, is not on call_rows to fire {fires} on every row"
+                "the trigger {trigger}, which {purpose}, is not on {table} to fire {fires} on every row"
             ),
-            Self::TriggerDisabled { trigger } => {
-                write!(f, "the trigger {trigger} on call_rows is disabled")
+            Self::TriggerDisabled { table, trigger } => {
+                write!(f, "the trigger {trigger} on {table} is disabled")
             }
             Self::ReplicaSession => write!(
                 f,
@@ -1170,10 +1242,22 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
             inheritance(client, table, &mut problems).await?;
             unlogged(client, table, &mut problems).await?;
             columns(client, table, &mut problems).await?;
-            triggers(client, table, &mut problems).await?;
+            triggers(client, &mut problems).await?;
             rules(client, table, &mut problems).await?;
             referential_actions(client, table, &mut problems).await?;
-            column_privileges(client, table, &mut problems).await?;
+            column_privileges(
+                client,
+                table,
+                CALL_ROWS,
+                [
+                    ("INSERT", INSERTED),
+                    ("UPDATE", UPDATED),
+                    ("SELECT", SELECTED),
+                ],
+                &mut problems,
+            )
+            .await?;
+            receipts(client, &mut problems).await?;
         }
     }
     other_privileges(client, version, &mut problems).await?;
@@ -1397,23 +1481,27 @@ async fn columns(
 
 async fn triggers(
     client: &ClientWrapper,
-    table: tokio_postgres::types::Oid,
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     for trigger in TRIGGERS {
-        // Each trigger must call the schema's own function, at its time, on every row: no
-        // condition and no column list.
+        // Each trigger must be on its table in the schema and call the schema's own function, at
+        // its time, on every row: no condition and no column list. A table that is missing has
+        // none.
         let found = client
             .query_opt(
                 "SELECT t.tgenabled::text
                  FROM pg_catalog.pg_trigger t
+                     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+                     JOIN pg_catalog.pg_namespace cn ON cn.oid = c.relnamespace
                      JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
                      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-                 WHERE t.tgrelid = $1::oid AND t.tgname = $2 AND NOT t.tgisinternal
+                 WHERE cn.nspname = 'switchboard_audit' AND c.relname = $1
+                     AND c.relkind IN ('r', 'p')
+                     AND t.tgname = $2 AND NOT t.tgisinternal
                      AND n.nspname = 'switchboard_audit' AND p.proname = $2
                      AND t.tgtype = $3 AND t.tgqual IS NULL
                      AND cardinality(t.tgattr::int2[]) = 0",
-                &[&table, &trigger.name, &trigger.tgtype],
+                &[&trigger.table, &trigger.name, &trigger.tgtype],
             )
             .await?;
         problems.extend(trigger_problem(
@@ -1430,12 +1518,14 @@ async fn triggers(
 fn trigger_problem(trigger: &Trigger, enabled: Option<&str>) -> Option<Problem> {
     match enabled {
         None => Some(Problem::TriggerMissing {
+            table: trigger.table,
             trigger: trigger.name,
             purpose: trigger.purpose,
             fires: trigger.fires,
         }),
         Some("O" | "A") => None,
         Some(_) => Some(Problem::TriggerDisabled {
+            table: trigger.table,
             trigger: trigger.name,
         }),
     }
@@ -1524,9 +1614,14 @@ fn table_privileges(version: i32) -> Vec<&'static str> {
     privileges
 }
 
+/// The privileges the session's role holds on each column of `table`, named `name` in reports,
+/// must include `own`, its privilege and the columns it is held on; and neither it nor any role
+/// it can become may hold more there.
 async fn column_privileges(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
+    name: &str,
+    own: [(&str, &[&str]); 3],
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     // What the session's role holds itself, which must include the store's own privileges, and
@@ -1556,11 +1651,7 @@ async fn column_privileges(
         }
     }
     let mut expected = BTreeSet::new();
-    for (privilege, columns) in [
-        ("INSERT", INSERTED),
-        ("UPDATE", UPDATED),
-        ("SELECT", SELECTED),
-    ] {
+    for (privilege, columns) in own {
         for column in columns {
             expected.insert((privilege.to_owned(), (*column).to_owned()));
         }
@@ -1583,17 +1674,54 @@ async fn column_privileges(
         if !whole.contains(privilege) {
             problems.push(Problem::Extra {
                 privilege: privilege.clone(),
-                object: format!("{CALL_ROWS}.{column}"),
+                object: format!("{name}.{column}"),
             });
         }
     }
     for (privilege, column) in expected.difference(&held) {
         problems.push(Problem::Missing {
             privilege: privilege.clone(),
-            object: format!("{CALL_ROWS}.{column}"),
+            object: format!("{name}.{column}"),
         });
     }
     Ok(())
+}
+
+/// The receipt table is there, as a table that is not unlogged, and the session's role holds
+/// on its columns what the store needs of receipts and nothing more: [`RECEIPT_INSERTED`],
+/// [`RECEIPT_UPDATED`] and [`RECEIPT_SELECTED`]. Anything on the table as a whole, `DELETE`
+/// among them, is refused with the rest of the schema by `other_privileges`; its trigger is
+/// checked with the others.
+async fn receipts(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let table = client
+        .query_opt(
+            "SELECT c.oid FROM pg_catalog.pg_class c
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'switchboard_audit' AND c.relname = $1 AND c.relkind = 'r'",
+            &[&RECEIPTS],
+        )
+        .await?
+        .map(|row| row.get::<_, tokio_postgres::types::Oid>(0));
+    let Some(table) = table else {
+        problems.push(Problem::ReceiptsMissing);
+        return Ok(());
+    };
+    unlogged(client, table, problems).await?;
+    column_privileges(
+        client,
+        table,
+        &format!("switchboard_audit.{RECEIPTS}"),
+        [
+            ("INSERT", RECEIPT_INSERTED),
+            ("UPDATE", RECEIPT_UPDATED),
+            ("SELECT", RECEIPT_SELECTED),
+        ],
+        problems,
+    )
+    .await
 }
 
 async fn other_privileges(
@@ -1602,8 +1730,9 @@ async fn other_privileges(
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     // Nothing on any table, view or foreign table in the schema as a whole, and nothing at all
-    // on any but call_rows, for the session's role or any role it can become. SELECT on the
-    // open-row view is the exception, which `open_rows` checks.
+    // on any but call_rows and receipts, for the session's role or any role it can become.
+    // SELECT on the open-row view is the exception, which `open_rows` checks. The columns of
+    // call_rows and receipts are `column_privileges`' and `receipt_privileges`'.
     let privileges = table_privileges(version);
     let held = client
         .query(
@@ -1615,7 +1744,7 @@ async fn other_privileges(
                  WHERE n.nspname = 'switchboard_audit' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
                      AND NOT (c.relname = $2 AND c.relkind = 'v' AND p = 'SELECT')
                      AND ({}
-                         OR (c.relname <> 'call_rows'
+                         OR (c.relname NOT IN ('call_rows', 'receipts')
                              AND p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
                              AND {}))
                  UNION ALL
@@ -2131,7 +2260,7 @@ async fn server_functions(
 mod tests {
     use super::*;
     use crate::MIGRATIONS;
-    use crate::columns::{BeginRow, ListRow};
+    use crate::columns::{BeginRow, ListRow, ReceiptRow};
 
     #[test]
     fn the_checked_columns_are_the_ones_the_store_writes() {
@@ -2143,14 +2272,25 @@ mod tests {
                 .collect()
         };
         let begin = columns(BeginRow::INSERT);
+        let answered = columns(BeginRow::INSERT_ANSWERED);
         let list = columns(ListRow::INSERT);
         let inserted: BTreeSet<&str> = INSERTED.iter().copied().collect();
-        assert_eq!(&begin | &list, inserted);
+        assert_eq!(&(&begin | &answered) | &list, inserted);
         assert_eq!(
             &list - &begin,
             ["listed_tools", "listed_omitted"].into(),
             "a list row writes a column begin does not, besides its tools"
         );
+        assert_eq!(
+            &answered - &begin,
+            ["outcome", "outcome_sentence", "latency_ms", "duplicate_of"].into(),
+            "an answered row writes a column begin does not, besides its answer"
+        );
+        let receipt: BTreeSet<&str> = RECEIPT_INSERTED.iter().copied().collect();
+        assert_eq!(columns(ReceiptRow::RESERVE), receipt);
+        for column in RECEIPT_INSERTED.iter().chain(RECEIPT_UPDATED) {
+            assert!(RECEIPT_SELECTED.contains(column), "{column} is not read");
+        }
         for column in INSERTED.iter().chain(UPDATED).chain(SELECTED) {
             assert!(
                 COLUMNS.iter().any(|(name, _)| name == column),
@@ -2161,17 +2301,24 @@ mod tests {
 
     #[test]
     fn the_checked_privileges_are_the_ones_the_migrations_grant() {
-        // Every column the migrations grant `privilege` on, each granted once.
-        let granted = |privilege: &str| -> BTreeSet<String> {
+        // Every column of `table` the migrations grant `privilege` on, each granted once.
+        let granted = |privilege: &str, table: &str| -> BTreeSet<String> {
             let mut columns = BTreeSet::new();
             for migration in MIGRATIONS {
                 let grant = format!("GRANT {privilege} (");
                 let mut sql = migration.sql;
                 while let Some(start) = sql.find(&grant) {
                     let rest = &sql[start..];
-                    let inner = &rest[rest.find('(').unwrap() + 1..rest.find(')').unwrap()];
-                    for column in inner.split(',').map(|c| c.trim().to_owned()) {
-                        assert!(columns.insert(column), "granted twice");
+                    let close = rest.find(')').unwrap();
+                    let inner = &rest[rest.find('(').unwrap() + 1..close];
+                    let on = rest[close + 1..]
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>();
+                    if on == ["ON", &format!("switchboard_audit.{table}")] {
+                        for column in inner.split(',').map(|c| c.trim().to_owned()) {
+                            assert!(columns.insert(column), "granted twice");
+                        }
                     }
                     sql = &rest[grant.len()..];
                 }
@@ -2179,9 +2326,12 @@ mod tests {
             columns
         };
         let set = |columns: &[&str]| columns.iter().map(|c| (*c).to_owned()).collect();
-        assert_eq!(granted("INSERT"), set(INSERTED));
-        assert_eq!(granted("UPDATE"), set(UPDATED));
-        assert_eq!(granted("SELECT"), set(SELECTED));
+        assert_eq!(granted("INSERT", "call_rows"), set(INSERTED));
+        assert_eq!(granted("UPDATE", "call_rows"), set(UPDATED));
+        assert_eq!(granted("SELECT", "call_rows"), set(SELECTED));
+        assert_eq!(granted("INSERT", RECEIPTS), set(RECEIPT_INSERTED));
+        assert_eq!(granted("UPDATE", RECEIPTS), set(RECEIPT_UPDATED));
+        assert_eq!(granted("SELECT", RECEIPTS), set(RECEIPT_SELECTED));
     }
 
     #[test]
@@ -2204,6 +2354,7 @@ mod tests {
             assert_eq!(
                 trigger_problem(trigger, Some(never_here)),
                 Some(Problem::TriggerDisabled {
+                    table: "call_rows",
                     trigger: "set_times"
                 })
             );
@@ -2218,17 +2369,19 @@ mod tests {
 
     #[test]
     fn each_trigger_is_checked_for_the_time_the_migration_gives_it() {
-        let sql = MIGRATIONS[0].sql;
+        let sql: String = MIGRATIONS.iter().map(|migration| migration.sql).collect();
         for trigger in TRIGGERS {
             let event = match trigger.tgtype {
                 7 => "INSERT",
                 19 => "UPDATE",
+                23 => "INSERT OR UPDATE",
                 other => panic!("{}: tgtype {other}", trigger.name),
             };
             let created = format!(
-                "CREATE TRIGGER {name}\n    BEFORE {event} ON switchboard_audit.call_rows\n    \
+                "CREATE TRIGGER {name}\n    BEFORE {event} ON switchboard_audit.{table}\n    \
                  FOR EACH ROW EXECUTE FUNCTION switchboard_audit.{name}();",
-                name = trigger.name
+                name = trigger.name,
+                table = trigger.table,
             );
             assert!(sql.contains(&created), "{created}");
         }

@@ -25,9 +25,8 @@
 //! in its scope under concurrent calls, and two delegations under one principal may each use
 //! it; a begin retried after a lost confirmation finds its own receipt and runs once; a begin
 //! whose confirmation is lost on every attempt leaves its row `error` and its receipt
-//! `not_performed`; and each receipt state against each line of the reuse table. The Postgres
-//! store keeps no receipts yet, so its runner lists these functions as not yet run, and runs
-//! none of them.
+//! `not_performed`; and each receipt state against each line of the reuse table. Both stores
+//! run every one of them.
 //!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
@@ -101,7 +100,7 @@ pub trait ContractStore {
     fn now(&self) -> impl Future<Output = SystemTime>;
 
     /// Every receipt the store holds, as it holds them, in any order. For item 6's functions
-    /// only: a runner whose store keeps no receipts yet does not run them.
+    /// only.
     fn receipts(&self) -> impl Future<Output = Vec<Receipt>>;
 
     /// From here on, every begin writes its row and then reports failure: its confirmation is

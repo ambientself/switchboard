@@ -138,7 +138,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
             "each migration is applied once"
         );
     }
@@ -325,11 +325,15 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "credential_principal"),
         ("INSERT", "decision"),
         ("INSERT", "deployment"),
+        ("INSERT", "duplicate_of"),
         ("INSERT", "id"),
         ("INSERT", "instance"),
         ("INSERT", "kind"),
+        ("INSERT", "latency_ms"),
         ("INSERT", "listed_omitted"),
         ("INSERT", "listed_tools"),
+        ("INSERT", "outcome"),
+        ("INSERT", "outcome_sentence"),
         ("INSERT", "policy_revision"),
         ("INSERT", "profile"),
         ("INSERT", "proved_delegation_team"),
@@ -347,6 +351,7 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "tool_use_id"),
         ("SELECT", "deadline"),
         ("SELECT", "decision"),
+        ("SELECT", "duplicate_of"),
         ("SELECT", "error_kind"),
         ("SELECT", "id"),
         ("SELECT", "kind"),
@@ -379,8 +384,9 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         .collect();
     assert_eq!(table_wide, Vec::<String>::new());
 
-    // On anything else in the schema, the gateway's role holds SELECT on the open-row view,
-    // and nothing more.
+    // On anything else in the schema as a whole, the gateway's role holds SELECT on the
+    // open-row view, and nothing more. What it holds on the receipts' columns is
+    // the_gateway_holds_exactly_its_receipt_grants'.
     let elsewhere: Vec<(String, String)> = admin
         .query(
             "SELECT table_name::text, privilege_type::text
@@ -427,15 +433,42 @@ async fn the_gateway_writes_the_identifier_but_not_the_times_or_a_completion_at_
         ("begun_at", "now() - interval '1 day'"),
         ("finished_at", "now()"),
         ("deadline", "now() + interval '1 day'"),
-        ("outcome", "'ok'"),
         ("error_kind", "'other'"),
-        ("latency_ms", "1"),
     ] {
         let error = gateway
             .query_one(&insert(&[column]), &[])
             .await
             .unwrap_err();
         assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{}", column.0);
+    }
+    // It writes the answer to a reused key complete at insert (migration 0008), and the
+    // database gives it its completion time, the time at begin. The completion's columns are
+    // written together or not at all.
+    let answered = insert_row(
+        &gateway,
+        &insert(&[
+            ("outcome", "'refused'"),
+            ("outcome_sentence", "'Reused.'"),
+            ("latency_ms", "0"),
+        ]),
+    )
+    .await;
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let same: bool = owner
+        .query_one(
+            &format!(
+                "SELECT finished_at = begun_at FROM switchboard_audit.call_rows
+                 WHERE id = '{answered}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(same, "an answered row is complete at its time at begin");
+    for partial in [&[("outcome", "'ok'")][..], &[("latency_ms", "1")]] {
+        let error = gateway.query_one(&insert(partial), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(CHECK_VIOLATION), "{partial:?}");
     }
 }
 
@@ -863,7 +896,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
     assert_eq!(complete(&owner, &completed, "ok").await.unwrap(), 1);
     let refused = insert_row(&owner, &before_0003(denied())).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5, 6, 7]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![3, 4, 5, 6, 7, 8]);
     for (id, due) in [
         (&open, "begun_at"),
         (&completed, "finished_at"),
@@ -1312,15 +1345,21 @@ async fn the_gateway_cannot_insert_a_list_row_with_a_completion() {
     let gateway = db.connect_as(GATEWAY_ROLE).await;
     insert_row(&gateway, &list(&[])).await;
     for column in [
-        ("outcome", "'ok'"),
-        ("outcome_sentence", "'No.'"),
-        ("latency_ms", "1"),
         ("finished_at", "now()"),
         ("begun_at", "now()"),
         ("deadline", "now()"),
     ] {
         let error = gateway.query_one(&list(&[column]), &[]).await.unwrap_err();
         assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{}", column.0);
+    }
+    // It may insert a completion, for the answer to a reused key, but not on a list row.
+    for column in [
+        ("outcome", "'ok'"),
+        ("outcome_sentence", "'No.'"),
+        ("latency_ms", "1"),
+    ] {
+        let error = gateway.query_one(&list(&[column]), &[]).await.unwrap_err();
+        assert_eq!(code(&error), Some(CHECK_VIOLATION), "{}", column.0);
     }
     // Nor can the owner, which may insert a completion, write one on a list row.
     let owner = db.connect_as(OWNER_ROLE).await;
@@ -1443,6 +1482,7 @@ async fn rows_without_error_kind(client: &Client) -> Vec<(String, serde_json::Va
         .query(
             "SELECT id::text,
                     to_jsonb(r) - 'error_kind' - 'credential_mode' - 'credential_principal'
+                        - 'duplicate_of'
              FROM switchboard_audit.call_rows AS r ORDER BY id",
             &[],
         )
@@ -1499,7 +1539,7 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
     let denial = insert_row(&owner, &denied()).await;
     let before = rows_without_error_kind(&owner).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7, 8]);
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
         (&failed, Some("before-0006")),
@@ -1719,7 +1759,7 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, Option<serde_json::Value>>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7, 8]);
     for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
         let row = owner.query_one(&read(id), &[]).await.unwrap();
         assert_eq!(
