@@ -134,9 +134,14 @@ pub struct KeyScope {
 
 /// SHA-256 over a call's arguments in canonical form: RFC 8785, with integers written exactly
 /// (decision 0009, "The argument digest"). The core hashes the arguments the guard carries and
-/// does not parse a tool's argument format. See the canonical form's limits in the
-/// [`canonical`](crate::canonical) module: an integer outside 64 bits reaches the core as the
-/// nearest double.
+/// does not parse a tool's argument format.
+///
+/// The form has no whitespace, sorts an object's members by their names' UTF-16 code units,
+/// escapes only `"`, `\` and the characters below U+0020 in a string, writes an integer as its
+/// decimal digits and any other number as ECMAScript writes it. Its limit: `serde_json` in this
+/// workspace is built without `arbitrary_precision`, so an integer outside the range of `i64`
+/// and `u64` reaches the core already read as the nearest double, and two such integers nearest
+/// one double share a digest. Every integer within that range is written exactly.
 ///
 /// Written as 64 lowercase hex digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
