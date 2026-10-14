@@ -207,8 +207,8 @@ mutate(
     "surface-workload-admitted-by-group-name",
     "a workload whose team is named like a listed group is admitted",
     SRC + "policy.rs",
-    "            PrincipalKind::Workload { team } => self.teams.contains(team),",
-    "            PrincipalKind::Workload { team } => self.teams.contains(team) || self.groups.contains(&GroupId::new(team.as_str())),",
+    "            PrincipalKind::Workload { team, .. } => self.teams.contains(team),",
+    "            PrincipalKind::Workload { team, .. } => self.teams.contains(team) || self.groups.contains(&GroupId::new(team.as_str())),",
 )
 
 # --- Check 2: the tool ---------------------------------------------------------------------
@@ -621,6 +621,28 @@ mutate("proved-from-claimed", "a claimed value converts into a proved one", SRC 
        "impl<T: Provable> Proved<T> {", "impl<T: Provable> From<Claimed<T>> for Proved<T> {\n    fn from(c: Claimed<T>) -> Self {\n        Proved(c.0)\n    }\n}\n\nimpl<T: Provable> Proved<T> {")
 mutate("proved-deserialize", "a proved value can be read from JSON", SRC + "proof.rs",
        "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Proved<T>(T);", "#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]\n#[serde(transparent)]\npub struct Proved<T>(T);")
+# A workload's pod (decision 0012, #57) is carried and never decided on. The core's property
+# a_workloads_pod_never_changes_a_decision and the selector's own test watch each place a
+# decision could start reading it; the pod's form is checked wherever one is made.
+mutate("pod-denies-at-check-1", "check 1 admits a workload only when its token names no pod", SRC + "policy.rs",
+       "            PrincipalKind::Workload { team, .. } => self.teams.contains(team),",
+       "            PrincipalKind::Workload { team, pod } => pod.is_none() && self.teams.contains(team),")
+mutate("pod-narrows-resource-limits", "a workload in a pod reaches no resource", SRC + "policy.rs",
+       "            PrincipalKind::Workload { team, .. } => self\n                .teams\n                .get(team)",
+       "            PrincipalKind::Workload { team, pod } => self\n                .teams\n                .get(team)\n                .filter(|_| pod.is_none())")
+mutate("pod-selects-no-profile", "the profile selector gives a workload in a pod no profile", "crates/gateway/src/selector.rs",
+       "            PrincipalKind::Workload { team, .. } => self\n                .workloads\n                .get(issuer)",
+       "            PrincipalKind::Workload { team, pod } => self\n                .workloads\n                .get(issuer)\n                .filter(|_| pod.is_none())")
+mutate("pod-uid-any-case", "a pod UID may be in upper case", SRC + "names.rs",
+       "                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))",
+       "                        .all(|byte| byte.is_ascii_hexdigit())")
+mutate("pod-uid-any-grouping", "a pod UID may be grouped any way, or not at all", SRC + "names.rs",
+       "        let valid = groups.len() == 5\n            && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, length)| {\n                group.len() == length\n",
+       "        let valid = groups.concat().len() == 32\n            && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, length)| {\n                length > 0\n")
+mutate("pod-null-is-absent", "a pod of null in JSON is read as no pod", SRC + "principal.rs",
+       "    PodUid::deserialize(deserializer).map(Some)",
+       "    Option::<PodUid>::deserialize(deserializer)")
+
 mutate_all(
     "provable-team",
     "a verifier may prove a bare team",
@@ -1010,6 +1032,25 @@ mutate("identity-groups-null-is-none", "a groups claim of null is a user in no g
 mutate("identity-groups-string-is-one-group", "a groups claim that is a string is one group", V,
        "        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}",
        "        Some(Value::String(one)) => Ok([GroupId::from(one.as_str())].into()),\n        Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),\n    }\n}")
+# A workload's pod UID, from the `kubernetes.io` claim (decision 0012, #57).
+POD_READ = "                let pod = pod_of(&claims)?;\n"
+mutate("identity-pod-ignored", "a workload's pod is never read", V, POD_READ,
+       "                let pod = None;\n")
+mutate("identity-pod-malformed-is-none", "a malformed pod UID is read as no pod", V,
+       "        .map(Some)\n        .ok_or(malformed)\n}",
+       "        .map(Some)\n        .or(Some(None))\n        .ok_or(malformed)\n}")
+mutate("identity-pod-claim-of-another-type-is-none", "a kubernetes.io claim that is not an object names no pod", V,
+       "    let kubernetes = kubernetes.as_object().ok_or(malformed.clone())?;\n",
+       "    let Some(kubernetes) = kubernetes.as_object() else {\n        return Ok(None);\n    };\n")
+mutate("identity-pod-without-uid-is-none", "a pod with no uid names no pod", V,
+       "    pod.get(\"uid\")\n        .and_then(Value::as_str)",
+       "    let Some(uid) = pod.get(\"uid\") else {\n        return Ok(None);\n    };\n    Some(uid)\n        .and_then(Value::as_str)")
+mutate("identity-pod-before-subject", "the pod is read before the subject is looked up", V,
+       "                let team = subjects\n                    .get(&subject)\n                    .ok_or(VerifyError::UnknownSubject)?\n                    .clone();\n",
+       "                pod_of(&claims)?;\n                let team = subjects\n                    .get(&subject)\n                    .ok_or(VerifyError::UnknownSubject)?\n                    .clone();\n")
+mutate("identity-pod-read-for-a-user", "a user's token is refused for a malformed pod", V,
+       "                groups: groups_of(&claims, groups_claim)?,",
+       "                groups: pod_of(&claims).and_then(|_| groups_of(&claims, groups_claim))?,")
 
 mutate("identity-kid-not-required","the header's kid is ignored and the first key is used", V,
        "        let kid = header.kid.as_deref().ok_or(VerifyError::MissingKeyId)?;\n"
