@@ -293,7 +293,6 @@ func TestGrantKeyRotation(t *testing.T) {
 		require(t, row["decision"] == "denied" && row["actor_claimed"] == nil && row["team_claimed"] == nil, "%s: row: %v", name, row)
 	}
 	accepted("current key", h.grantKey)
-	// Nothing on the row says which of the two keys signed the grant.
 	accepted("previous key before it retires", previous)
 	refused("a key that is neither", []byte(strings.Repeat("u", 64)))
 	// Rewriting the current key file changes nothing until a restart.
