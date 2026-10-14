@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -309,15 +310,19 @@ func (v *fakeVendor) serve(w http.ResponseWriter, r *http.Request) {
 
 // fakeRepo is just enough of GitHub's repository, git data and pull request
 // API for the write tools to propose, repeat and amend a change in
-// test-org/repo. Object ids are hashes of what was written, so the same write
-// gives the same id and a different write does not, as in git. Every method
-// runs with the vendor's lock held.
+// test-org/repo. Blob and tree ids are hashes of what was written, so the same
+// write gives the same id and a different write does not, as in git. Each
+// commit gets a new id even when its tree, message and parents repeat, as on
+// GitHub, which stamps a commit with the time it was made when the request
+// gives none. Every method runs with the vendor's lock held.
 type fakeRepo struct {
 	blobs   map[string]string
 	trees   map[string]map[string]string
 	commits map[string]fakeCommit
 	refs    map[string]string
 	pulls   []map[string]any
+	// made counts the commits created; it stands in for GitHub's commit timestamp.
+	made int
 }
 
 type fakeCommit struct {
@@ -370,7 +375,8 @@ func (f *fakeRepo) putTree(entries map[string]string) string {
 }
 
 func (f *fakeRepo) putCommit(c fakeCommit) string {
-	id := objectID("commit", append([]string{c.tree, c.message}, c.parents...)...)
+	f.made++
+	id := objectID("commit", append([]string{fmt.Sprint(f.made), c.tree, c.message}, c.parents...)...)
 	f.commits[id] = c
 	return id
 }
@@ -746,6 +752,20 @@ func newHarness(t *testing.T) *harness {
 	h.vendor = &fakeVendor{pool: h.pool, key: h.key, tokens: map[string]map[string]any{}, answers: map[string]answer{}, repo: newFakeRepo(), entered: make(chan struct{}, 1), release: make(chan struct{}), appAuthValid: true}
 	h.vendor.server = httptest.NewServer(http.HandlerFunc(h.vendor.serve))
 	t.Cleanup(h.vendor.server.Close)
+	// Every token the gateway asks for, in every test, names exactly the team's
+	// repositories and a stated permission set; the vendor accepts only the
+	// tokens it issued, so this holds for every request a tool sends.
+	t.Cleanup(func() {
+		for _, o := range h.vendor.snapshot() {
+			if o.Path != "/app/installations/123/access_tokens" {
+				continue
+			}
+			permissions, _ := o.Body["permissions"].(map[string]any)
+			if !reflect.DeepEqual(o.Body["repositories"], []any{"repo"}) || len(permissions) == 0 {
+				t.Errorf("token asked for beyond the team's repositories or with no stated permissions: %v", o.Body)
+			}
+		}
+	})
 	h.jira = &fakeJira{answers: map[string]answer{}}
 	h.jira.server = httptest.NewServer(http.HandlerFunc(h.jira.serve))
 	t.Cleanup(h.jira.server.Close)

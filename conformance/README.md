@@ -44,9 +44,11 @@ suite inspects rows as the owner. Turn grants are minted by the suite from Otto'
 format, without importing Otto's code. The fake vendor validates App JWT signatures, issues
 dummy installation tokens scoped exactly as asked, remembers which permissions each token was
 asked for, and observes that an unfinished allowed audit row exists before downstream work.
-It keeps one repository's refs, commits and pull requests between calls, with object ids
-hashed from their contents, so the write tools can be repeated against it; a scenario can
-also set a canned answer for any method and path. The fake Jira records every request and
+After every test, the suite checks that each token was asked for with exactly the team's
+repositories and a stated permission set. The fake vendor keeps one repository's refs,
+commits and pull requests between calls, so the write tools can be repeated against it. Blob
+and tree ids are hashed from their contents; each commit gets a new id, as GitHub's carry the
+time they were made. A scenario can also set a canned answer for any method and path. The fake Jira records every request and
 answers what each scenario sets.
 No vendor or cluster credentials are needed. Inherited gateway configuration and proxy
 settings are not passed to the gateway.
@@ -74,12 +76,12 @@ fails with setup instructions instead of silently skipping the suite.
 | GitHub | Real custodian and connector code against a fake API; App JWT validation; tokens scoped by repository and permission; results of the five original tools; draft pull requests; scope refusals and argument errors told apart; result bounds and credential redaction. |
 | Newer GitHub reads | Releases and tags, an issue and its comments, a pull request's check runs, failing steps, annotations and statuses: each request, its token's permissions, the bounds and truncation notes, and a pull request's number given to the issue tool. A job log's redirect to a host other than the gateway's pinned one refused before any request to it; a log served without a redirect, or missing, an error. |
 | Repository config | The pull request template and `AGENTS.md`, read in the background at the default branch's head with a read-only token and answered as pending until loaded; `AGENTS.md` served only when CODEOWNERS gives it an owner, and then quoted inside a frame marked with a one-time token. |
-| Proposals | `github_propose_change`: a fresh `otto/` branch from the default branch, one commit whose message is the title, a draft pull request with the declared claims quoted above the body, tokens per step, and a proposal record; a repeat returns the existing proposal; other files or another body under the same key is a conflict; a proposal that changes nothing is an error. `github_amend_change`: one commit fast-forwarded onto the branch and the claims block rewritten; a ready, closed or foreign pull request refused or failed with nothing written; a repeat needs the expected head; no amend without the App's login. |
+| Proposals | `github_propose_change`: a fresh `otto/` branch from the default branch, one commit whose message is the title, a draft pull request with the declared claims quoted above the body, tokens per step, and a proposal record; a repeat returns the existing proposal; other files or another body under the same key is a conflict; a proposal that changes nothing is an error; a repeat after a human closed the proposal is declined, with no new pull request. `github_amend_change`: one commit fast-forwarded onto the branch and the claims block rewritten, with tokens per step; a ready, closed or foreign pull request refused or failed with nothing written; a repeat needs the expected head; no amend without the App's login. |
 | Jira | Search confined by wrapping the caller's JQL after the project restriction, page bounds, `{me}` checked with Jira before use, and an answer naming another project withheld whole; an issue's restricted comments withheld and counted, and an issue under a security level refused; comments posted as paragraphs to the issue's id with a fixed attribution line; the shared account's credentials on every request. |
 | Declarations and skills | `declare_unverified_claim`'s result and its bounds, with no vendor request; `github_skill_body` without a skill set pinned for the turn. |
 | Refusals of the newer tools | Another organization, a repository outside the team's, a Jira project outside the allowlist, instruction, workflow and Atlantis files, unbalanced JQL and JQL functions that depend on the caller, all refused before any request; malformed arguments told apart as errors. |
 | Audit | Allowed, denied and refused records; audit before vendor requests; begin failure; finish failure; the answer waiting for finish; completion after client disconnect. |
-| Known gaps in Otto | Repeated comments are not deduplicated, on GitHub or Jira. A retry after a human closed a proposal opens a second pull request from the same branch. A retirement instant given without a previous key is accepted and ignored. |
+| Known gaps in Otto | Repeated comments are not deduplicated, on GitHub or Jira. A retirement instant given without a previous key is accepted and ignored. |
 | Not covered | The three control-plane endpoints and the custodian's peer check. A job log's text, which the gateway reads only from GitHub's own blob host. A skill body's text, which needs a skill set pinned for the turn, and the tool interface cannot pin one. See [observed behavior](../docs/otto-baseline.md). |
 
 The negative scenarios are part of the baseline, not desired Switchboard behavior. See

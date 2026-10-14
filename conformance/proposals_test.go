@@ -102,10 +102,14 @@ func TestProposeChange(t *testing.T) {
 		reflect.DeepEqual(row["unverified_claims"], []any{"the latest widget is 1.2"}), "proposal record: %v", row)
 
 	t.Run("repeat_returns_the_existing_proposal", func(t *testing.T) {
+		before := len(h.vendor.snapshot())
 		r, c := h.call("github_propose_change", proposal("widget-1.2", nil))
 		p := toolPayload(t, r)
 		require(t, p["state"] == "already_proposed" && p["prNumber"] == float64(42), "repeat: %v", p)
 		requireOK(t, h, c, "github_propose_change")
+		for _, o := range writesIn(h.vendor.since(before)) {
+			require(t, !(o.Method == "POST" && o.Path == repoPath+"/pulls"), "a repeat asked to open a pull request")
+		}
 		require(t, len(h.vendor.pullRequests()) == 1 && len(h.proposalRows()) == 1, "a repeat made a second pull request or record")
 	})
 	t.Run("same_key_other_files_is_a_conflict", func(t *testing.T) {
@@ -127,20 +131,21 @@ func TestProposeChange(t *testing.T) {
 		_, made := h.ref("otto/noop")
 		require(t, !made, "an empty proposal made a branch")
 	})
-	// A known gap: the description promises "proposal_declined" for a retry after
-	// a human closed the proposal. GitHub accepts a new pull request from a branch
-	// whose only pull request is closed, and the pinned gateway opens one.
-	t.Run("a_closed_proposal_is_proposed_again", func(t *testing.T) {
+	// A retry after a human closed the proposal unmerged is declined: the closed
+	// pull request is reported and no new one is opened from the branch.
+	t.Run("a_closed_proposal_is_declined", func(t *testing.T) {
 		toolPayload(t, mustCall(h, "github_propose_change", proposal("declined", nil)))
 		h.vendor.setPull(43, map[string]any{"state": "closed"})
 		before := len(h.vendor.snapshot())
 		r, c := h.call("github_propose_change", proposal("declined", nil))
 		p := toolPayload(t, r)
-		require(t, p["state"] == "proposed" && p["prNumber"] == float64(44) && p["branch"] == "otto/declined", "retry after a decline: %v", p)
+		require(t, p["state"] == "proposal_declined" && p["prNumber"] == float64(43) && strings.Contains(p["message"].(string), "never reopen"), "retry after a decline: %v", p)
 		requireOK(t, h, c, "github_propose_change")
-		require(t, reflect.DeepEqual(writePaths(h.vendor.since(before)), []string{"POST /git/blobs", "POST /git/trees", "POST /git/commits", "POST /git/refs", "POST /pulls"}), "retry writes: %v", writePaths(h.vendor.since(before)))
+		for _, o := range writesIn(h.vendor.since(before)) {
+			require(t, !(o.Method == "POST" && o.Path == repoPath+"/pulls"), "a declined proposal opened a pull request")
+		}
 		pulls := h.vendor.pullRequests()
-		require(t, len(pulls) == 3 && pulls[1]["head_ref"] == "otto/declined" && pulls[2]["head_ref"] == "otto/declined" && pulls[1]["state"] == "closed", "pull requests: %v", pulls)
+		require(t, len(pulls) == 2 && pulls[1]["head_ref"] == "otto/declined" && pulls[1]["state"] == "closed", "pull requests: %v", pulls)
 	})
 	for _, o := range h.vendor.snapshot() {
 		if o.Method == "POST" && o.Path == repoPath+"/pulls" {
@@ -171,6 +176,10 @@ func TestAmendChange(t *testing.T) {
 	// One commit on top of the branch, a fast-forward of it, and the claims block rewritten.
 	require(t, reflect.DeepEqual(writes[2].Body["parents"], []any{first}) && writes[2].Body["message"] == "Amend pull request #42", "commit: %v", writes[2].Body)
 	require(t, writes[3].Body["force"] == false && writes[3].Body["sha"] == p["headSha"], "branch update: %v", writes[3].Body)
+	for _, o := range writes[:4] {
+		require(t, reflect.DeepEqual(h.vendor.scope(o.Authorization), map[string]any{"contents": "write"}), "%s %s written with a token scoped %v", o.Method, o.Path, h.vendor.scope(o.Authorization))
+	}
+	require(t, reflect.DeepEqual(h.vendor.scope(writes[4].Authorization), map[string]any{"contents": "read", "pull_requests": "write"}), "pull request edited with a token scoped %v", h.vendor.scope(writes[4].Authorization))
 	body := writes[4].Body["body"].(string)
 	require(t, strings.Contains(body, "the widget's API is unchanged") && !strings.Contains(body, "the latest widget is 1.2") && strings.HasSuffix(body, "\n\nWhy this change") &&
 		writes[4].Body["title"] == nil, "refreshed body: %q", body)

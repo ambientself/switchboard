@@ -158,9 +158,11 @@ func TestJiraGetIssue(t *testing.T) {
 	jiraOnly(t, h, before)
 
 	// An issue Jira does not show is an error, not a refusal.
+	before = len(h.jira.snapshot())
 	r, c = h.call("jira_get_issue", map[string]any{"key": "TEST-3"})
 	require(t, r.Error != nil && decision(r) == "errored" && strings.Contains(r.Error.Message, "was not found"), "missing issue: %s", r.Raw)
 	h.auditRow(c, "allowed", "error")
+	jiraOnly(t, h, before)
 }
 
 func TestJiraComment(t *testing.T) {
@@ -179,7 +181,7 @@ func TestJiraComment(t *testing.T) {
 		comment := p["comment"].(map[string]any)
 		require(t, p["posted"] == true && comment["id"] == "900" && comment["issue"] == "TEST-1" && comment["url"] == h.jira.server.URL+"/browse/TEST-1?focusedCommentId=900", "comment payload: %v", p)
 		requireOK(t, h, c, "jira_comment")
-		got := h.jira.snapshot()[before:]
+		got := jiraRequests(t, h, before)
 		require(t, len(got) == 2, "comment requests: %v", got)
 		// The issue is looked up first, then the comment is posted to its id.
 		q, err := url.ParseQuery(got[0].Query)
