@@ -136,14 +136,20 @@ fn profile_for(table: &[(&'static str, &'static str)], name: &str) -> Option<&'s
 /// group, each a single document. The read, draft and write tools declare their resources;
 /// the scoped read tool checks its own scope. So every kind of denial the decision function
 /// makes is reachable from here with one change to a call: another surface, tool or document.
+/// The draft and write tools' `unknown` receipts are settled by a person; a test that needs a
+/// lookup uses [`policy_data_with_draft_lookup`].
 pub fn policy_data() -> Value {
     let tool = |name: &str, classification: &str, resources: &str| {
-        json!({
+        let mut tool = json!({
             "name": name,
             "classification": classification,
             "connector": CONNECTOR,
             "resources": resources,
-        })
+        });
+        if classification != "read" {
+            tool["settlement"] = json!("person");
+        }
+        tool
     };
     let document = |identifier: &str| json!({"system": RESOURCE_SYSTEM, "kind": RESOURCE_KIND, "identifier": identifier});
     json!({
@@ -186,6 +192,23 @@ pub fn policy_data() -> Value {
             },
         },
     })
+}
+
+/// How [`DRAFT_TOOL`]'s `unknown` receipts are settled when a test needs a lookup: by a lookup
+/// by marker in the one document the call names.
+pub fn draft_lookup() -> Value {
+    json!({"lookup": {"system": RESOURCE_SYSTEM, "kind": RESOURCE_KIND}})
+}
+
+/// [`policy_data`], with [`DRAFT_TOOL`] settled by [`draft_lookup`] instead of by a person.
+pub fn policy_data_with_draft_lookup() -> Value {
+    let mut data = policy_data();
+    if let Some(tools) = data["tools"].as_array_mut() {
+        for tool in tools.iter_mut().filter(|tool| tool["name"] == DRAFT_TOOL) {
+            tool["settlement"] = draft_lookup();
+        }
+    }
+    data
 }
 
 /// The fixture policy, loaded through the core's validated path: the same deserialization that

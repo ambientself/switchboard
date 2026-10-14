@@ -84,17 +84,17 @@
         { "name": "github__get_file", "classification": "read", "connector": "github", "resources": "declared" },
         { "name": "github__search_code", "classification": "read", "connector": "github", "resources": "checks_own_scope" },
         { "name": "github__list_org_repos", "classification": "read", "connector": "github", "resources": "declared" },
-        { "name": "github__open_pull_request", "classification": "propose", "connector": "github", "resources": "declared" },
-        { "name": "github__comment_on_own_proposal", "classification": "propose", "connector": "github", "resources": "declared" },
-        { "name": "github__delete_branch", "classification": "destructive", "connector": "github", "resources": "declared" },
-        { "name": "github__delete_repository", "classification": "destructive", "connector": "github", "resources": "declared" },
+        { "name": "github__open_pull_request", "classification": "propose", "connector": "github", "resources": "declared", "settlement": { "lookup": { "system": "github", "kind": "repository" } } },
+        { "name": "github__comment_on_own_proposal", "classification": "propose", "connector": "github", "resources": "declared", "settlement": { "lookup": { "system": "github", "kind": "repository" } } },
+        { "name": "github__delete_branch", "classification": "destructive", "connector": "github", "resources": "declared", "settlement": { "lookup": { "system": "github", "kind": "repository" } } },
+        { "name": "github__delete_repository", "classification": "destructive", "connector": "github", "resources": "declared", "settlement": { "lookup": { "system": "github", "kind": "repository" } } },
         { "name": "jira__get_issue", "classification": "read", "connector": "jira", "resources": "declared" },
-        { "name": "jira__create_issue", "classification": "propose", "connector": "jira", "resources": "declared" },
-        { "name": "jira__create_issue_as_user", "classification": "propose", "connector": "jira-per-user", "resources": "declared" },
-        { "name": "jira__add_comment", "classification": "write", "connector": "jira", "resources": "declared" },
-        { "name": "jira__transition_issue", "classification": "write", "connector": "jira", "resources": "declared" },
+        { "name": "jira__create_issue", "classification": "propose", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
+        { "name": "jira__create_issue_as_user", "classification": "propose", "connector": "jira-per-user", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
+        { "name": "jira__add_comment", "classification": "write", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
+        { "name": "jira__transition_issue", "classification": "write", "connector": "jira", "resources": "declared", "settlement": { "lookup": { "system": "jira", "kind": "project" } } },
         { "name": "docs__search", "classification": "read", "connector": "docs", "resources": "no_resources" },
-        { "name": "otto__post_status", "classification": "propose", "connector": "otto", "resources": "no_resources" }
+        { "name": "otto__post_status", "classification": "propose", "connector": "otto", "resources": "no_resources", "settlement": "person" }
       ],
       "surfaces": [
         {

@@ -1666,6 +1666,9 @@ pub async fn a_receipt_is_reserved_with_its_row_or_not_at_all(contract: &impl Co
             state: ReceiptState::Pending,
             established_by: EstablishedBy::Call,
             reference: None,
+            target: None,
+            lookups: Vec::new(),
+            handed_to_person: None,
         }
     );
 

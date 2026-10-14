@@ -50,6 +50,9 @@ approved_at = 2026-10-11T00:00:00Z
 definition_sha256 = "9b55679f29a51538416c9ef29344343ce59c87690cfe9fa34c46e0f11c252489"
 binding_sha256 = "1652b446ad82a051916a72396ca2f0e68e6d72221d47baa489709852407b7a40"
 resources = { from_arguments = [{ from_argument = "project", system = "docs", kind = "project" }] }
+# How an `unknown` receipt of it is settled, which every tool not classified `read` declares
+# (decision 0009), so that the loader's refusal is still rule 2's alone.
+settlement = "person"
 
 [tools.input_schema]
 type = "object"

@@ -1104,6 +1104,8 @@ principals = "any_in_teams_and_groups"
                 connector: "mock-docs".into(),
                 resources: ResourceDeclaration::NoResources,
                 declared_from: None,
+                settlement: (classification != Classification::Read)
+                    .then_some(gateway_core::Settlement::Person),
             }],
             surfaces: vec![Surface {
                 name: "docs".into(),
@@ -1382,7 +1384,8 @@ principals = "any_in_teams_and_groups"
                 "name": "docs__list_documents",
                 "classification": "propose",
                 "connector": "mock-docs",
-                "resources": "no_resources"
+                "resources": "no_resources",
+                "settlement": "person"
             }),
             json!([]),
         );

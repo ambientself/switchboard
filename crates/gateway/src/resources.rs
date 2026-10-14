@@ -84,6 +84,7 @@ mod tests {
                 connector: "docs-team-a".into(),
                 resources: ResourceDeclaration::Declared,
                 declared_from: Some(DeclaredFrom::Reach),
+                settlement: None,
             }],
             surfaces: vec![Surface {
                 name: "docs-team-a".into(),

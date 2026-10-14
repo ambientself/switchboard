@@ -1,5 +1,5 @@
 {
-  "about": "The snapshot loader's rules (decision 0011, section 3), one refusing case and at least one passing case for each. Every case starts from `base`, a proxied entry reaching one project with a read tool declared from its arguments, served to the one team whose limit holds it. `tool`, `entry` and `surface` change fields of the base's first tool, entry and surface (null removes a field); `tools`, `entries`, `surfaces` and `limits` replace the base's. `expect` is `loads`, `does not parse`, or the SnapshotError variant refused with, and `names` lists text the refusal's message must contain. tests/loader_rules.rs runs every case and reports every one that fails.",
+  "about": "The snapshot loader's rules (decision 0011, section 3), one refusing case and at least one passing case for each, and decision 0009's rule that every tool not classified `read` says how its `unknown` receipts are settled. Every case starts from `base`, a proxied entry reaching one project with a read tool declared from its arguments, served to the one team whose limit holds it. `tool`, `entry` and `surface` change fields of the base's first tool, entry and surface (null removes a field); `tools`, `entries`, `surfaces` and `limits` replace the base's. `expect` is `loads`, `does not parse`, or the SnapshotError variant refused with, and `names` lists text the refusal's message must contain. tests/loader_rules.rs runs every case and reports every one that fails.",
   "base": {
     "revision": "rules-1",
     "tools": [
@@ -58,7 +58,7 @@
     },
     {
       "name": "rule 2: a built-in propose tool served to a team loads",
-      "tool": { "classification": "propose" },
+      "tool": { "classification": "propose", "settlement": "person" },
       "entry": { "kind": "built_in", "permits": "propose" },
       "expect": "loads"
     },
@@ -250,7 +250,7 @@
     },
     {
       "name": "rule 9: a propose tool on a surface that admits a group, on a per-user entry, loads",
-      "tool": { "classification": "propose" },
+      "tool": { "classification": "propose", "settlement": "person" },
       "entry": { "kind": "built_in", "permits": "propose", "credential": "per_user_grant" },
       "surface": { "teams": [], "groups": ["engineering"] },
       "expect": "loads"
@@ -328,9 +328,57 @@
     },
     {
       "name": "with no entries, as the JSON configuration has, rules 1 to 8 do not apply",
-      "tool": { "classification": "propose", "resources": "checks_own_scope", "declared_from": null },
+      "tool": { "classification": "propose", "resources": "checks_own_scope", "declared_from": null, "settlement": "person" },
       "entries": [],
       "expect": "loads"
+    },
+
+    {
+      "name": "settlement: a propose tool that does not say how its unknown receipts are settled is refused",
+      "tool": { "classification": "propose" },
+      "entry": { "kind": "built_in", "permits": "propose" },
+      "expect": "SettlementUndeclared", "names": ["`docs-a__list`", "`propose`", "settlement"]
+    },
+    {
+      "name": "settlement: a write tool that does not say is refused",
+      "tool": { "classification": "write" },
+      "entry": { "kind": "built_in", "permits": "write" },
+      "expect": "SettlementUndeclared", "names": ["`docs-a__list`", "`write`"]
+    },
+    {
+      "name": "settlement: a destructive tool that does not say is refused",
+      "tool": { "classification": "destructive" },
+      "entry": { "kind": "built_in", "permits": "destructive" },
+      "expect": "SettlementUndeclared", "names": ["`docs-a__list`", "`destructive`"]
+    },
+    {
+      "name": "settlement: a propose tool settled by a lookup in a kind of resource loads",
+      "tool": { "classification": "propose", "settlement": { "lookup": { "system": "docs", "kind": "project" } } },
+      "entry": { "kind": "built_in", "permits": "propose" },
+      "expect": "loads"
+    },
+    {
+      "name": "settlement: a write tool settled by a lookup loads",
+      "tool": { "classification": "write", "settlement": { "lookup": { "system": "docs", "kind": "project" } } },
+      "entry": { "kind": "built_in", "permits": "write" },
+      "expect": "loads"
+    },
+    {
+      "name": "settlement: a read tool, which has no receipt, may not declare one",
+      "tool": { "settlement": "person" },
+      "expect": "SettlementOnRead", "names": ["`docs-a__list`"]
+    },
+    {
+      "name": "settlement: one that is neither a lookup nor a person does not parse",
+      "tool": { "classification": "propose", "settlement": "nobody" },
+      "entry": { "kind": "built_in", "permits": "propose" },
+      "expect": "does not parse"
+    },
+    {
+      "name": "settlement: a lookup that names no kind of resource does not parse",
+      "tool": { "classification": "propose", "settlement": { "lookup": { "system": "docs" } } },
+      "entry": { "kind": "built_in", "permits": "propose" },
+      "expect": "does not parse"
     }
   ]
 }

@@ -13,12 +13,15 @@
 //! while the row's deadline has not passed; a later finish leaves it to reconciliation or a
 //! person.
 //!
-//! What is not built here: reconciliation, which settles an `unknown` receipt by a lookup; the
-//! vendor target a lookup needs and the lookups made, which a receipt will record once it
-//! exists; and resolution records, by which a person settles one (decision 0009, Still open
-//! 10). [`may_move`] already says which moves reconciliation and a person may make.
+//! A receipt also records what reconciliation needs and does: the vendor target a lookup looks
+//! in, taken at begin from the call's resources as the tool's
+//! [`Settlement`](crate::reconcile::Settlement) says, the lookups made, and whether and when it
+//! was handed to a person ([`crate::reconcile`]). What is not built here: resolution records,
+//! by which a person settles one (decision 0009, Still open 10). [`may_move`] already says
+//! which moves reconciliation and a person may make.
 
 use std::fmt;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -27,7 +30,9 @@ use thiserror::Error;
 use crate::audit::{AuditRowId, Completion, Outcome, RecordedResources};
 use crate::canonical::canonical;
 use crate::names::{Person, ToolName, ToolUseId};
+use crate::policy::Resource;
 use crate::principal::PrincipalId;
+use crate::reconcile::LookupRecord;
 use crate::sentences;
 
 /// The longest an [`IdempotencyKey`] may be, in characters.
@@ -337,6 +342,15 @@ pub struct Receipt {
     pub established_by: EstablishedBy,
     /// The vendor's reference for what was made, once known.
     pub reference: Option<VendorReference>,
+    /// Where a lookup looks for the effect: the resource the call named that the tool's
+    /// [`Settlement`](crate::reconcile::Settlement) declares, taken at begin. `None` for a tool settled by a person, and when
+    /// the call named no single such resource; such a receipt goes to a person at once.
+    pub target: Option<Resource>,
+    /// The lookups made, in order. Each is appended, and none is changed or removed.
+    pub lookups: Vec<LookupRecord>,
+    /// When the receipt was handed to a person, by the store's clock, if it was. It stays
+    /// `unknown` until a person settles it.
+    pub handed_to_person: Option<SystemTime>,
 }
 
 impl Receipt {
@@ -358,6 +372,7 @@ pub struct ReceiptRequest {
     digest: ArgumentDigest,
     resources: RecordedResources,
     resources_omitted: usize,
+    target: Option<Resource>,
 }
 
 impl ReceiptRequest {
@@ -368,6 +383,7 @@ impl ReceiptRequest {
         tool_use_id: Option<ToolUseId>,
         digest: ArgumentDigest,
         resources: (RecordedResources, usize),
+        target: Option<Resource>,
     ) -> Self {
         Self {
             scope,
@@ -377,6 +393,7 @@ impl ReceiptRequest {
             digest,
             resources: resources.0,
             resources_omitted: resources.1,
+            target,
         }
     }
 
@@ -405,13 +422,18 @@ impl ReceiptRequest {
         &self.digest
     }
 
+    /// The vendor target a lookup will look in, or `None` when the receipt goes to a person.
+    pub fn target(&self) -> Option<&Resource> {
+        self.target.as_ref()
+    }
+
     /// Whether `receipt` is for this request's key in its scope.
     pub fn same_key(&self, receipt: &Receipt) -> bool {
         receipt.scope == self.scope && receipt.key == self.key
     }
 
     /// The receipt this request reserves under `row`: `pending`, established by the call, with
-    /// no reference yet.
+    /// no reference, no lookups and not handed to a person.
     pub fn reserve(&self, row: &AuditRowId) -> Receipt {
         Receipt {
             row: row.clone(),
@@ -425,6 +447,9 @@ impl ReceiptRequest {
             state: ReceiptState::Pending,
             established_by: EstablishedBy::Call,
             reference: None,
+            target: self.target.clone(),
+            lookups: Vec::new(),
+            handed_to_person: None,
         }
     }
 }
@@ -772,6 +797,7 @@ mod tests {
             tool_use_id.map(ToolUseId::from),
             ArgumentDigest::of(&arguments),
             (RecordedResources::Named(Vec::new()), 0),
+            None,
         )
     }
 

@@ -237,6 +237,9 @@ impl ContractStore for Postgres {
                     "state": text("state"),
                     "established_by": established_by,
                     "reference": text("reference"),
+                    "target": null,
+                    "lookups": [],
+                    "handed_to_person": null,
                 }))
                 .unwrap()
             })
