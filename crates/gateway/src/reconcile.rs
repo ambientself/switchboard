@@ -69,9 +69,15 @@ pub const MIN_RECONCILE_LEASE: Duration = Duration::from_secs(10);
 pub const MAX_RECONCILE_LEASE: Duration = Duration::from_secs(3600);
 
 /// How many lookups a receipt gets before it is handed to a person, unless the deployment file
-/// says otherwise: five, about ten minutes at the default lease. A vendor whose search is slow
-/// to show a new effect gets several chances, and a person hears of one it never shows within
-/// a quarter of an hour.
+/// says otherwise: five. A vendor whose search is slow to show a new effect gets several
+/// chances, and a person hears of one it never shows about 12 to 13 minutes after the receipt
+/// became `unknown`, at the default interval and lease on one instance. The pass two minutes
+/// after a claim usually finds its lease a moment short of running out, so one instance's
+/// lookups land about three minutes apart; several instances bring that nearer two. That is an
+/// estimate, assuming no backlog, lookups that answer promptly and saves that succeed. A pass
+/// works through up to [`RECONCILE_BATCH`] receipts one at a time, each lookup may take half
+/// the lease, and a lookup whose save fails uses up no attempt, so a backlog, slow lookups or a
+/// failing store can make it much longer.
 pub const DEFAULT_RECONCILE_ATTEMPTS: u32 = 5;
 /// The most attempts the deployment file may give.
 pub const MAX_RECONCILE_ATTEMPTS: u32 = 20;

@@ -167,8 +167,13 @@
 //!   (see [`crate::reconcile`]). A pass is made every `reconciliation.interval_seconds`; a
 //!   claim holds a receipt for `lease_seconds`, and a lookup has half of that to answer; and a
 //!   receipt gets `attempts` lookups before it is handed to a person. The defaults are 60 s,
-//!   120 s and 5, which hand a receipt a vendor never shows to a person within about ten
-//!   minutes, while looking up any one receipt at most once every two minutes: see
+//!   120 s and 5. They look up any one receipt at most once every two minutes, and hand a
+//!   receipt a vendor never shows to a person about 12 to 13 minutes after it became `unknown`
+//!   with one instance, or a little sooner with several. That is an estimate, assuming no
+//!   backlog, lookups that answer promptly and saves that succeed: a pass works through up to
+//!   50 receipts one at a time, each lookup may take half the lease, and a lookup whose save
+//!   fails uses up no attempt, so a backlog, slow lookups or a failing store can make it much
+//!   longer. See
 //!   [`DEFAULT_RECONCILE_INTERVAL`](crate::reconcile::DEFAULT_RECONCILE_INTERVAL),
 //!   [`DEFAULT_RECONCILE_LEASE`](crate::reconcile::DEFAULT_RECONCILE_LEASE) and
 //!   [`DEFAULT_RECONCILE_ATTEMPTS`](crate::reconcile::DEFAULT_RECONCILE_ATTEMPTS). They are
