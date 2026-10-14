@@ -17,7 +17,7 @@ use gateway_core::{
 };
 use gateway_testkit::{
     CONNECTOR, Caller, DRAFT_TOOL, Fixture, InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL,
-    SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, document, row_start,
+    SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT, document, fresh_key, row_start,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -236,6 +236,8 @@ impl Harness {
             caller: Fixture::context_for(self.principal.clone(), surface),
             tool: RequestedTool::new(tool),
             resources,
+            // A key of its own, which the draft tool needs and a read ignores.
+            key: Some(fresh_key()),
         };
         let decision = decide(&self.fixture.policy, &call);
         assert!(decision.is_allowed(), "{decision:?}");

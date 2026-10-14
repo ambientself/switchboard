@@ -1,6 +1,7 @@
 //! The audit store used when configuration explicitly turns audit off.
 
 use gateway_core::audit::{AuditRowId, ListRecord, RowCompletion, StoreError};
+use gateway_core::receipt::{ReceiptRequest, Reservation};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 
 /// An [`AuditStore`] that writes nothing, for a deployment whose configuration says
@@ -31,6 +32,20 @@ impl AuditStore for DisabledAuditStore {
         _record: &'a AuditRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Refused: a receipt is what stops a side effect running twice, and a store that writes
+    /// nothing keeps none, so no call of a tool not classified `read` runs with audit disabled
+    /// (decision 0009, "Until receipts exist").
+    fn begin_with_receipt<'a>(
+        &'a self,
+        _row: &'a AuditRowId,
+        _record: &'a AuditRecord,
+        _receipt: &'a ReceiptRequest,
+    ) -> BoxFuture<'a, Result<Reservation, StoreError>> {
+        Box::pin(async {
+            Err("audit is disabled, so no receipt can be kept and no side effect runs".into())
+        })
     }
 
     fn finish<'a>(

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use gateway_core::{
     BoxFuture, Connector, ConnectorName, CredentialSource, ErrorKind, GroupId, PrincipalId,
-    PrincipalKind, Resource, Resources, TeamId, ToolCall, ToolOutcome,
+    PrincipalKind, Resource, Resources, TeamId, ToolCall, ToolOutcome, VendorReference,
 };
 use serde_json::{Value, json};
 
@@ -117,7 +117,8 @@ struct State {
 ///   opened it against the same document, and is refused with [`DRAFT_REFUSAL`] otherwise:
 ///   [`FOREIGN_DRAFT`], a draft not yet opened, or another document's draft. The document is
 ///   checked against the caller's limit by the decision function, so a team cannot revise
-///   another team's draft. Opening and revising each record a write.
+///   another team's draft. Opening and revising each record a write. Each reports the draft as
+///   the vendor's reference for what it made, which the call's receipt records.
 /// - The write tool is never reached through the fixture policy, because the decision function
 ///   denies a `write` tool in every profile. It records a write the same way the draft tool
 ///   does, so a write that did reach it would show in `writes()`.
@@ -336,8 +337,10 @@ impl Connector for FixtureConnector {
                 DRAFT_TOOL => match self.draft(&arguments) {
                     Some(draft) => {
                         self.record(write);
-                        ToolOutcome::Ok(
+                        // The draft is what a vendor would name what it made.
+                        ToolOutcome::Completed(
                             json!({"tool": tool, "draft": draft, "credential": credential}),
+                            VendorReference::new(draft),
                         )
                     }
                     None => ToolOutcome::Refused(DRAFT_REFUSAL.to_owned()),

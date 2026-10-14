@@ -367,6 +367,8 @@ fn call_rows(store: &InMemoryAuditStore) -> Vec<String> {
                 Some(Outcome::Ok) => "ok".to_owned(),
                 Some(Outcome::Error { error_kind }) => format!("error:{error_kind:?}"),
                 Some(Outcome::Refused { .. }) => "refused".to_owned(),
+                Some(Outcome::Unknown) => "unknown".to_owned(),
+                Some(Outcome::Duplicate { .. }) => "duplicate".to_owned(),
             };
             let project = match &row.resources {
                 RecordedResources::Named(named) => named

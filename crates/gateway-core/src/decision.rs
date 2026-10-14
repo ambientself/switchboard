@@ -2,7 +2,8 @@
 //!
 //! [`decide`] reads the snapshot and the call context and nothing else: no clock, no network,
 //! no global state. It first finds the caller's profile in the snapshot, then runs the six
-//! checks of decision 0006 in order, and the first that fails decides the reason.
+//! checks of decision 0006 in order, and then the key check, which its amendment of 2026-10-07
+//! adds last. The first that fails decides the reason.
 //!
 //! A decision does not give out the sentence a caller would read. That sentence exists only on
 //! the [`Refusal`](crate::audit::Refusal) that [`audit::begin`](crate::audit::begin) returns
@@ -24,6 +25,7 @@ use crate::policy::{
 };
 use crate::principal::{Delegation, Principal, PrincipalId};
 use crate::proof::Proved;
+use crate::receipt::IdempotencyKey;
 use crate::sentences;
 
 /// The part of a call context that does not depend on which tool is called. `tools/list`
@@ -59,6 +61,12 @@ pub struct CallContext {
     pub tool: RequestedTool,
     /// The resources the call names, from the tool's resource adapter.
     pub resources: Resources,
+    /// The call's idempotency key, if it carries one (decision 0009, "The key"). The decision
+    /// reads only whether there is one: a call of a tool not classified `read` without one is
+    /// denied by the key check. [`audit::begin`](crate::audit::begin) takes the key from here,
+    /// through the decision, to reserve the call's receipt, so the key the decision saw is the
+    /// key the receipt holds.
+    pub key: Option<IdempotencyKey>,
 }
 
 /// Why a call was denied: one of a fixed set of kinds, with the details its sentence names.
@@ -115,6 +123,14 @@ pub enum Reason {
     /// A resource the call names is outside what the caller may reach, or the resources the
     /// call reaches are not known well enough to check.
     ResourceOutsideLimit(ResourceProblem),
+    /// The tool is not classified `read`, and the call carries no idempotency key (decision
+    /// 0009). The key check, last.
+    KeyMissing {
+        /// The tool the call named.
+        tool: ToolName,
+        /// The tool's classification, which is not `read`.
+        classification: Classification,
+    },
 }
 
 /// How a delegation failed check 3.
@@ -187,11 +203,13 @@ pub enum ReasonKind {
     ClassificationNotPermitted,
     /// See [`Reason::ResourceOutsideLimit`].
     ResourceOutsideLimit,
+    /// See [`Reason::KeyMissing`].
+    KeyMissing,
 }
 
 impl ReasonKind {
     /// Every kind of reason.
-    pub const ALL: [ReasonKind; 8] = [
+    pub const ALL: [ReasonKind; 9] = [
         ReasonKind::ProfileUnknown,
         ReasonKind::UnknownTool,
         ReasonKind::ToolNotOnSurface,
@@ -200,6 +218,7 @@ impl ReasonKind {
         ReasonKind::DelegationDisagrees,
         ReasonKind::ClassificationNotPermitted,
         ReasonKind::ResourceOutsideLimit,
+        ReasonKind::KeyMissing,
     ];
 }
 
@@ -215,6 +234,7 @@ impl Reason {
             Reason::DelegationDisagrees(_) => ReasonKind::DelegationDisagrees,
             Reason::ClassificationNotPermitted { .. } => ReasonKind::ClassificationNotPermitted,
             Reason::ResourceOutsideLimit(_) => ReasonKind::ResourceOutsideLimit,
+            Reason::KeyMissing { .. } => ReasonKind::KeyMissing,
         }
     }
 
@@ -295,9 +315,12 @@ impl Decision {
     }
 }
 
-/// Decides one `tools/call`.
+/// Decides one `tools/call`: every check [`list_tools`] runs, then check 6, then the key check,
+/// last.
 pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
-    let verdict = match check(snapshot, &call.caller, &call.tool, Some(&call.resources)) {
+    let checked = check(snapshot, &call.caller, &call.tool, Some(&call.resources))
+        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));
+    let verdict = match checked {
         Ok(tool) => Verdict::Allow(tool.clone()),
         Err(reason) => Verdict::Deny {
             reason,
@@ -317,7 +340,10 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
 }
 
 /// Answers `tools/list`: the tools on the caller's surface that pass every check, decided
-/// one at a time by the same checks as [`decide`], with no resources.
+/// one at a time by the same checks as [`decide`], with no resources and no key. Check 6 and
+/// the key check are skipped, as decision 0012's currency check will be: a list request names
+/// no resources and carries no key, so a `propose` tool is listed to a caller who may call it,
+/// and is denied on `tools/call` without a key.
 pub fn list_tools<'s>(
     snapshot: &'s PolicySnapshot,
     caller: &CallerContext,
@@ -334,7 +360,8 @@ pub fn list_tools<'s>(
 
 /// The checks, in order. The order is the contract: a call that fails two checks is reported
 /// by the earlier one. Checks 1 to 6 are decision 0006's; the profile lookup comes first
-/// because none of them means anything without a profile.
+/// because none of them means anything without a profile. The key check is not here: it is
+/// last, after check 6, and [`decide`] runs it once these pass.
 ///
 /// `resources` is `None` for `tools/list`, which decides with no resources at all, and the
 /// call's resources otherwise.
@@ -351,6 +378,8 @@ fn check<'s>(
     delegation_agrees(caller, profile, principal)?;
     delegation_lists_tool(caller.delegation.as_ref(), tool)?;
     classification_is_permitted(profile, tool)?;
+    // Decision 0012's currency check goes here, after check 5 and its exception step and
+    // before check 6, and is skipped for `tools/list` as check 6 is (#22).
     if let Some(resources) = resources {
         resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;
     }
@@ -521,4 +550,19 @@ fn resources_are_within_limit(
         }
     };
     Err(Reason::ResourceOutsideLimit(problem))
+}
+
+/// The key check, last (decision 0006, amended on 2026-10-07). A call of a tool not classified
+/// `read` must carry an idempotency key, so that a retry of its side effect is answered from
+/// its receipt rather than run again. A `read` tool needs none. Run only for a `tools/call`: a
+/// list request carries no key.
+fn key_is_carried(tool: &ApprovedTool, key: Option<&IdempotencyKey>) -> Result<(), Reason> {
+    if tool.classification == Classification::Read || key.is_some() {
+        Ok(())
+    } else {
+        Err(Reason::KeyMissing {
+            tool: tool.name.clone(),
+            classification: tool.classification,
+        })
+    }
 }

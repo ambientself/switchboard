@@ -5,7 +5,8 @@
 //! ```text
 //! decide ─▶ Decision ─▶ begin ─┬─▶ AuditGuard ─┬─▶ run ─▶ Ran ─▶ finish ─▶ Finished
 //!                              │               └─▶ give_up ─▶ GaveUp (the row as error)
-//!                              └─▶ Refusal (the denial's sentence)
+//!                              ├─▶ Refusal (the denial's sentence)
+//!                              └─▶ Reused (the answer to a reused key; nothing runs)
 //! ```
 //!
 //! Each arrow is a value with private fields that only the step before it can make, and each
@@ -17,12 +18,20 @@
 //!   owns the call's arguments; the refusal holds the sentence for the caller, which nothing
 //!   else in the crate's public interface can produce. So a call path that skips the row has
 //!   no guard to run with and no sentence to answer with.
+//! - For an allowed call of a tool not classified `read`, a side effect, [`begin`] asks the
+//!   store to reserve a receipt in the same write as the row
+//!   ([`AuditStore::begin_with_receipt`]). If the call's key already has a receipt in its
+//!   scope, the store writes the row already complete instead, and `begin` returns a
+//!   [`Reused`]: the answer to the reused key, and no guard (decision 0009, "Reuse"). A denial
+//!   reserves nothing.
 //! - [`run`] consumes the guard, hands the connector a [`ToolCall`] that only
 //!   it can make, and returns a [`Ran`]. One guard runs one call, once. [`run_unless`] does the
 //!   same, except that a read whose caller goes away is cancelled and recorded as `error`.
 //! - [`finish`] consumes the `Ran`, completes the row through a [`RowCompletion`] that only it
 //!   and `give_up` can make, and only then gives out the answer, including a connector's
-//!   refusal sentence.
+//!   refusal sentence. A side effect's receipt is settled in the same write, unless the row's
+//!   deadline has passed by the store's clock, when the row is completed and the receipt stays
+//!   `pending` for reconciliation or a person.
 //! - [`give_up`] consumes a guard instead of running it, calls no connector, and completes the
 //!   row as `error` with a latency of zero. It returns a [`GaveUp`], which holds no answer:
 //!   nothing ran, so the caller chooses its own reply.
@@ -64,6 +73,9 @@ use crate::policy::{
 };
 use crate::principal::Principal;
 use crate::proof::{Claimed, WasProved};
+use crate::receipt::{
+    ArgumentDigest, KeyScope, ReceiptRequest, Reservation, Reuse, VendorReference,
+};
 use crate::sentences;
 
 /// The most named resources one audit row records. A call can name any number, so the rest are
@@ -190,12 +202,24 @@ pub enum Outcome {
         /// The connector's sentence: exactly the text the caller receives.
         sentence: String,
     },
+    /// A side effect was sent and no definite answer came back (decision 0009). Never the
+    /// outcome of a read. Its receipt is `unknown`.
+    Unknown,
+    /// Nothing ran, because the same call under the same key was already completed: the answer
+    /// to a reused key whose earlier receipt is `completed` (decision 0009, "Reuse"). Written
+    /// at begin, never by finish.
+    Duplicate {
+        /// The earlier call's receipt, which is its row.
+        receipt: AuditRowId,
+    },
 }
 
-/// The second half of an allowed call's audit row, written after the tool returns.
+/// The second half of an allowed call's audit row, written after the tool returns, or at begin
+/// for the answer to a reused key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Completion {
-    /// `ok`, `error` with its kind, or `refused` with its sentence.
+    /// `ok`, `error` with its kind, `refused` with its sentence, `unknown`, or `duplicate`
+    /// with the earlier receipt.
     #[serde(flatten)]
     pub outcome: Outcome,
     /// How long the tool took, measured by the caller of this crate: the core reads no clock.
@@ -276,7 +300,9 @@ pub struct AuditRecord {
     pub credential: Option<CredentialIdentity>,
     /// The outcome and latency. Empty when the row is begun, and always empty for a denial;
     /// filled by [`finish`]. An allowed row that stays empty is evidence that the gateway
-    /// allowed a call and never learned what happened.
+    /// allowed a call and never learned what happened. The one row written complete is the
+    /// answer to a reused key, which the store completes at begin, in the same write
+    /// ([`AuditStore::begin_with_receipt`]); the record begin hands the store is still empty.
     pub completion: Option<Completion>,
 }
 
@@ -368,14 +394,59 @@ pub trait AuditStore: Send + Sync {
         record: &'a AuditRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Fills in the outcome and latency of a row that [`begin`](AuditStore::begin) wrote.
-    /// Takes a [`RowCompletion`], which only [`finish`] can make, from a call that ran, and
-    /// only [`give_up`], as `error`, from a guard given up without running.
+    /// Writes `record`, the begin of an allowed call of a tool not classified `read`, as the
+    /// row `row`, and in the same write reserves the receipt `receipt` asks for or answers the
+    /// reuse of its key (decision 0009, part 2). [`begin`] calls this, and not
+    /// [`begin`](AuditStore::begin), for every such call, and for nothing else.
+    ///
+    /// - First the reuse check: a receipt for the same key in the same scope
+    ///   ([`ReceiptRequest::same_key`]) reserved under a row other than `row`. A receipt
+    ///   reserved under `row` itself is passed over, so a retried begin never refuses itself.
+    /// - If there is one, the row is written already complete, with the
+    ///   [`completion`](Reuse::completion) of [`Reuse::answer`] for that receipt, nothing is
+    ///   reserved and the earlier receipt is left as it is, and this returns
+    ///   [`Reservation::Reused`] with that answer.
+    /// - Otherwise the row is written open, the receipt
+    ///   [`ReceiptRequest::reserve`] makes is reserved under it as `pending`, and this returns
+    ///   [`Reservation::Reserved`].
+    /// - It is one write: when this returns `Ok`, the row is durable with its receipt or with
+    ///   its answer, and not before. Two calls with one key in one scope never both reserve.
+    /// - A second call with an identifier already stored, whose stored decision is the same,
+    ///   writes nothing and returns what the first wrote: [`Reservation::Reserved`] while the
+    ///   row's receipt is `pending`, and the same answer for a row written as one. A row
+    ///   whose receipt has left `pending` is refused, since its call has run or has been
+    ///   settled without running, and must not run again; so is a row of another decision, as
+    ///   at [`begin`](AuditStore::begin), and a row stored with no receipt and no answer.
+    /// - A record that is not an allowed call is refused, and nothing is written: a denial
+    ///   reserves nothing.
+    /// - A store that keeps no receipts refuses every call, and nothing runs.
+    fn begin_with_receipt<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a AuditRecord,
+        receipt: &'a ReceiptRequest,
+    ) -> BoxFuture<'a, Result<Reservation, StoreError>>;
+
+    /// Fills in the outcome and latency of a row that [`begin`](AuditStore::begin) or
+    /// [`begin_with_receipt`](AuditStore::begin_with_receipt) wrote open. Takes a
+    /// [`RowCompletion`], which only [`finish`] can make, from a call that ran, and only
+    /// [`give_up`], as `error`, from a guard given up without running.
     ///
     /// A repeat of the completion a row already has, the same outcome, with the same error kind
     /// or sentence, and the same latency, returns `Ok`, so finish can be retried. A different
     /// completion of a row already complete, an error of another kind included, returns `Err`,
     /// and the first completion stands.
+    ///
+    /// For a row that reserved a receipt, the receipt moves in the same write, established by
+    /// the call, to the state the outcome settles it in
+    /// ([`ReceiptState::settled_by`](crate::ReceiptState::settled_by)), with the completion's
+    /// [`reference`](RowCompletion::reference), as
+    /// [`may_move`](crate::receipt::may_move) allows. A receipt that reconciliation or a person
+    /// has already settled is left as it is, and the row is still completed (decision 0009).
+    /// So is a receipt whose row's deadline has passed, judged by the store's own clock at the
+    /// time of the write: it stays `pending` for reconciliation or a person.
+    /// An `unknown` outcome or a vendor reference for a row that reserved no receipt is
+    /// refused, since a read reports neither, and so is a `duplicate`, which only begin writes.
     fn finish<'a>(&'a self, completion: &'a RowCompletion)
     -> BoxFuture<'a, Result<(), StoreError>>;
 
@@ -417,6 +488,7 @@ pub struct RowStart {
 pub struct RowCompletion {
     row: AuditRowId,
     completion: Completion,
+    reference: Option<VendorReference>,
 }
 
 impl RowCompletion {
@@ -428,6 +500,12 @@ impl RowCompletion {
     /// The outcome and latency to write.
     pub fn completion(&self) -> &Completion {
         &self.completion
+    }
+
+    /// The vendor's reference for what a side effect made, for its receipt: set only for a
+    /// call that reserved a receipt and whose connector reported one, made safe and capped.
+    pub fn reference(&self) -> Option<&VendorReference> {
+        self.reference.as_ref()
     }
 }
 
@@ -458,6 +536,12 @@ impl AuditGuard {
     /// The approved tool the decision allowed.
     pub fn tool(&self) -> &ApprovedTool {
         &self.tool
+    }
+
+    /// Whether begin reserved a receipt under this guard's row: for every tool not classified
+    /// `read`, since [`begin`] hands out a guard for one only once its receipt is reserved.
+    fn reserved(&self) -> bool {
+        self.tool.classification != Classification::Read
     }
 }
 
@@ -511,14 +595,48 @@ impl Listed {
     }
 }
 
+/// A call allowed by the decision function and answered from an earlier receipt under its key:
+/// its row was written complete with the answer, and nothing runs (decision 0009, "Reuse").
+/// Made only by [`begin`].
+#[derive(Debug)]
+pub struct Reused {
+    row: AuditRowId,
+    reuse: Reuse,
+}
+
+impl Reused {
+    /// The row that records this answer.
+    pub fn row(&self) -> &AuditRowId {
+        &self.row
+    }
+
+    /// Which of the five answers it is: a `duplicate`, answered as a success with the earlier
+    /// receipt and the vendor's reference, or one of four refusals.
+    pub fn reuse(&self) -> &Reuse {
+        &self.reuse
+    }
+
+    /// The sentence for the caller. For a refusal it is the sentence the row holds.
+    pub fn sentence(&self) -> String {
+        self.reuse.sentence()
+    }
+}
+
 /// What [`begin`] returns once the row is written.
 #[must_use]
+// A `Begun` is made once per call and taken apart at once, so boxing the guard would add an
+// allocation to every allowed call to save a copy on a path that runs once.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Begun {
     /// The call may run; pass the guard to [`run`].
     Allowed(AuditGuard),
     /// The call is denied; return the refusal's sentence.
     Denied(Refusal),
+    /// The call was allowed, and its key already has a receipt in its scope, so it does not
+    /// run: answer with the [`Reused`]'s sentence, as a success for a `duplicate` and as a
+    /// refusal otherwise.
+    Reused(Reused),
 }
 
 /// An audit row could not be written. At [`begin`] the call is refused, whatever the decision
@@ -547,8 +665,14 @@ impl AuditFailure {
 ///
 /// Returns [`Begun::Allowed`] with the guard that running the tool requires, which owns
 /// `arguments`, or [`Begun::Denied`] with the sentence for the caller. The arguments are not
-/// part of the decision or the record, and the core never reads them. If the row cannot be
+/// part of the decision or the record, and the core never parses them. If the row cannot be
 /// written, returns [`AuditFailure`] and the call must be refused, whatever the decision was.
+///
+/// An allowed call of a tool not classified `read` is begun through
+/// [`AuditStore::begin_with_receipt`], with a receipt for the key the decided call carries,
+/// scoped to its proved principal and its delegation's key scope, and the
+/// [`ArgumentDigest`] of `arguments`. If its key already has a receipt in its scope, this
+/// returns [`Begun::Reused`] and no guard. A denial reserves nothing.
 pub async fn begin(
     store: &dyn AuditStore,
     start: RowStart,
@@ -631,10 +755,30 @@ pub async fn begin(
         credential: tool.and(credential),
         completion: None,
     };
-    store
-        .begin(&row, &record)
-        .await
-        .map_err(AuditFailure::from_store)?;
+    let receipt = match &decided {
+        Decided::Allow(tool) if tool.classification != Classification::Read => {
+            Some(receipt_request(&call, tool, &arguments, &record)?)
+        }
+        _ => None,
+    };
+    let reservation = match &receipt {
+        Some(receipt) => Some(
+            store
+                .begin_with_receipt(&row, &record, receipt)
+                .await
+                .map_err(AuditFailure::from_store)?,
+        ),
+        None => {
+            store
+                .begin(&row, &record)
+                .await
+                .map_err(AuditFailure::from_store)?;
+            None
+        }
+    };
+    if let Some(Reservation::Reused(reuse)) = reservation {
+        return Ok(Begun::Reused(Reused { row, reuse }));
+    }
     Ok(match decided {
         Decided::Allow(tool) => Begun::Allowed(AuditGuard {
             row,
@@ -747,6 +891,43 @@ fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResour
     (RecordedResources::Named(recorded), omitted)
 }
 
+/// The receipt to reserve for `call`, an allowed call of `tool`, which is not classified `read`:
+/// its key, scoped to its proved principal and its delegation's key scope, the tool, the
+/// tool-use identifier and resources its row records, and the digest of `arguments`.
+///
+/// The decision function denies such a call when it carries no key, so an allowed one always
+/// carries one. If one did not, nothing would run: the call is refused as an audit failure,
+/// before anything is written.
+fn receipt_request(
+    call: &CallContext,
+    tool: &ApprovedTool,
+    arguments: &serde_json::Value,
+    record: &AuditRecord,
+) -> Result<ReceiptRequest, AuditFailure> {
+    let Some(key) = call.key.clone() else {
+        return Err(AuditFailure::from_store(
+            "an allowed call of a tool not classified `read` carried no key, so no receipt can be reserved for it"
+                .into(),
+        ));
+    };
+    let scope = KeyScope {
+        principal: call.caller.principal.get().id.clone(),
+        delegation: call
+            .caller
+            .delegation
+            .as_ref()
+            .and_then(|delegation| delegation.get().key_scope.clone()),
+    };
+    Ok(ReceiptRequest::new(
+        scope,
+        key,
+        tool.name.clone(),
+        record.tool_use_id.clone(),
+        ArgumentDigest::of(arguments),
+        (record.resources.clone(), record.resources_omitted),
+    ))
+}
+
 // Large for the reason a check's `Err` is (see decision.rs): a reason carries the principal,
 // pod and all, and the resource its sentence names. One is made per call and moved once.
 #[allow(clippy::large_enum_variant)]
@@ -765,10 +946,12 @@ enum Decided {
 pub struct Ran {
     row: AuditRowId,
     outcome: ToolOutcome,
+    reserved: bool,
 }
 
 /// Runs the guarded call on `connector`, consuming the guard.
 pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
+    let reserved = guard.reserved();
     let AuditGuard {
         row,
         call,
@@ -776,7 +959,11 @@ pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
         arguments,
     } = guard;
     let outcome = connector.run(ToolCall::new(call, tool, arguments)).await;
-    Ran { row, outcome }
+    Ran {
+        row,
+        outcome,
+        reserved,
+    }
 }
 
 /// Runs the guarded call on `connector`, as [`run`] does, unless its caller goes away first:
@@ -812,6 +999,7 @@ pub async fn run_unless(
         return Ran {
             row,
             outcome: cancelled(),
+            reserved: false,
         };
     }
     let mut running = connector.run(ToolCall::new(call, tool, arguments));
@@ -824,7 +1012,11 @@ pub async fn run_unless(
     .await;
     // On a cancellation, this is what cancels the read.
     drop(running);
-    Ran { row, outcome }
+    Ran {
+        row,
+        outcome,
+        reserved: false,
+    }
 }
 
 /// What to answer the caller with, once [`finish`] has tried to complete the row.
@@ -836,6 +1028,9 @@ pub enum Answer {
     Error(String),
     /// The connector refused; its sentence, which the row also holds.
     Refused(String),
+    /// A side effect was sent and no definite answer came back: the sentence saying it may
+    /// have taken effect, must not be repeated, and will be checked as its receipt.
+    Unknown(String),
     /// The connector refused and the row could not be completed, so the refusal was never
     /// recorded. Nothing ran, so the call fails closed with the audit-failure sentence.
     AuditFailed {
@@ -866,11 +1061,35 @@ impl Finished {
 }
 
 /// Completes the row for a call that ran, with its outcome and latency, and only then gives
-/// out the answer.
+/// out the answer. A side effect's receipt is settled in the same write, with the vendor's
+/// reference when its connector reported one, unless the row's deadline has passed by the
+/// store's clock, when the receipt stays `pending` for reconciliation or a person.
+///
+/// A connector that reports [`ToolOutcome::Unknown`] for a `read` tool, which has no receipt,
+/// has its call recorded as an error of the kind `other`: a read never reports `unknown`.
 pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finished {
-    let Ran { row, outcome } = ran;
+    let Ran {
+        row,
+        outcome,
+        reserved,
+    } = ran;
+    let mut reference = None;
     let (recorded, answer) = match outcome {
         ToolOutcome::Ok(result) => (Outcome::Ok, Answer::Ok(result)),
+        ToolOutcome::Completed(result, made) => {
+            reference = reserved.then(|| made.recorded());
+            (Outcome::Ok, Answer::Ok(result))
+        }
+        ToolOutcome::Unknown if reserved => (
+            Outcome::Unknown,
+            Answer::Unknown(sentences::render_unknown(&row)),
+        ),
+        ToolOutcome::Unknown => (
+            Outcome::Error {
+                error_kind: ErrorKind::Other,
+            },
+            Answer::Error(sentences::NO_DEFINITE_ANSWER.to_owned()),
+        ),
         ToolOutcome::Error(error_kind, message) => {
             (Outcome::Error { error_kind }, Answer::Error(message))
         }
@@ -887,6 +1106,7 @@ pub async fn finish(store: &dyn AuditStore, ran: Ran, latency_ms: u64) -> Finish
             outcome: recorded,
             latency_ms,
         },
+        reference,
     };
     match store.finish(&completion).await {
         Ok(()) => Finished {
@@ -930,7 +1150,9 @@ impl GaveUp {
 /// Gives up a guard without running its call: consumes the guard, calls no connector, and
 /// completes the row as `error`, of the kind [`ErrorKind::Other`], with a latency of zero
 /// (decision 0009). A row can overstate what ran, never understate it, so a call that never ran
-/// is never recorded as `ok`.
+/// is never recorded as `ok`. A side effect's receipt is settled as `not_performed` in the same
+/// write, since nothing was sent, unless the row's deadline has passed by the store's clock,
+/// when the receipt stays `pending` for reconciliation or a person.
 ///
 /// The caller chooses its own reply, since nothing ran.
 pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
@@ -943,6 +1165,7 @@ pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
             },
             latency_ms: 0,
         },
+        reference: None,
     };
     let failure = store
         .finish(&completion)

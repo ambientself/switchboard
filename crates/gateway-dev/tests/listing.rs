@@ -9,7 +9,7 @@ use gateway_testkit::{
     Caller, DRAFT_TOOL, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, WRITE_TOOL,
 };
 use serde_json::json;
-use support::{call, document, list};
+use support::{document, list, propose};
 
 const ERAS: [Era; 2] = [Era::Legacy, Era::Modern];
 
@@ -60,7 +60,9 @@ async fn every_listed_tool_can_be_called_and_an_unlisted_one_on_the_surface_cann
         let (listed, _) = list(&gateway, Some(&token), Era::Modern, SURFACE_ALL).await;
         let own = document(caller.own_document());
         for tool in [READ_TOOL, DRAFT_TOOL, WRITE_TOOL, SCOPED_READ_TOOL] {
-            let answer = call(
+            // Each call carries a key, as a client sends a tool-use identifier: a listed
+            // proposal needs one, and a read ignores it.
+            let answer = propose(
                 &gateway,
                 caller,
                 Era::Modern,

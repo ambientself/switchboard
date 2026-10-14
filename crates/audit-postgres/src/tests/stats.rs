@@ -135,6 +135,7 @@ async fn a_begin_refusing_a_value_counts_one_value_refused() {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
+        key: None,
     };
     let metadata = RequestMetadata {
         tool_use_id: Some(ToolUseId::new("toolu_\u{0}x")),
@@ -203,6 +204,7 @@ async fn the_latency_counts_equal_the_begins_and_finishes_and_success_counts_not
             .caller_context(denied.caller, denied.surface)
             .unwrap(),
         tool: RequestedTool::new(denied.tool),
+        key: None,
     };
     let decision = decide(&fixture.policy, &context);
     let begun = audit::begin(

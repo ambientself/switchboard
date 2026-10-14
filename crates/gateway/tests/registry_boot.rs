@@ -21,6 +21,7 @@ use gateway::{
     withdrawn_while_deciding,
 };
 use gateway_core::audit::{AuditRowId, ErrorKind, ListRecord, Outcome, RowCompletion, StoreError};
+use gateway_core::receipt::{ReceiptRequest, Reservation};
 use gateway_core::{
     ApprovedTool, AuditRecord, AuditStore, BoxFuture, Narrowing, Principal, PrincipalId,
     PrincipalKind, Resources,
@@ -367,6 +368,18 @@ impl AuditStore for HeldStore {
         Box::pin(async move {
             self.gate.wait().await;
             self.inner.begin(row, record).await
+        })
+    }
+
+    fn begin_with_receipt<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a AuditRecord,
+        receipt: &'a ReceiptRequest,
+    ) -> BoxFuture<'a, Result<Reservation, StoreError>> {
+        Box::pin(async move {
+            self.gate.wait().await;
+            self.inner.begin_with_receipt(row, record, receipt).await
         })
     }
 

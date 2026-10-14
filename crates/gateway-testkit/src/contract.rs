@@ -16,8 +16,18 @@
 //! with its time at begin from the store's clock, and is never completed, and that a call
 //! record of kind `list` is refused at begin. That the store overwrites times an insert
 //! carries cannot be tried through [`AuditStore`], whose callers pass no times: the Postgres
-//! schema tests try it. The open-row query and receipts are not
-//! here: the query is Postgres's alone for now, and receipts are not built.
+//! schema tests try it. The open-row query is not here: it is Postgres's alone for now.
+//!
+//! It covers item 6, receipts (decision 0009, part 2), with the functions under "Item 6": a
+//! receipt is reserved with its row or not at all, and moves with its finish, but not once its
+//! row's deadline has passed, when a late finish completes the row and leaves the receipt
+//! `pending`, read as `unknown`, for reconciliation or a person; a key is unique
+//! in its scope under concurrent calls, and two delegations under one principal may each use
+//! it; a begin retried after a lost confirmation finds its own receipt and runs once; a begin
+//! whose confirmation is lost on every attempt leaves its row `error` and its receipt
+//! `not_performed`; and each receipt state against each line of the reuse table. The Postgres
+//! store keeps no receipts yet, so its runner lists these functions as not yet run, and runs
+//! none of them.
 //!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
@@ -34,8 +44,11 @@
     reason = "these are test functions, and a broken expectation fails the test"
 )]
 
-use std::future::Future;
+use std::convert::Infallible;
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::RecordedResources;
@@ -43,17 +56,20 @@ use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
     MAX_RECORDED_RESOURCES, Outcome, RequestMetadata, RowKind, RowStart,
 };
+use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
-    AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, Claimed, Connector,
-    CredentialIdentity, CredentialMode, Decision, RequestedTool, Resource, Resources, TeamId,
-    ToolCall, ToolOutcome, ToolUseId, decide,
+    ArgumentDigest, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
+    Claimed, Connector, CredentialIdentity, CredentialMode, Decision, Delegation,
+    DelegationKeyScope, IdempotencyKey, KeyScope, Proved, Receipt, ReceiptState, RequestedTool,
+    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, VendorReference,
+    Verifier, decide,
 };
 use serde_json::{Value, json};
 
-use crate::audit::{InMemoryAuditStore, StoreBudgets, row_start};
+use crate::audit::{InMemoryAuditStore, StoreBudgets, fresh_key, row_start};
 use crate::connector::{
-    DOCUMENT_ARGUMENT, FORBIDDEN_DOCUMENT, FixtureConnector, READ_TOOL, SCOPED_READ_TOOL,
-    WRITE_TOOL, document,
+    DOCUMENT_ARGUMENT, DRAFT_TOOL, FORBIDDEN_DOCUMENT, FixtureConnector, READ_TOOL,
+    SCOPED_READ_TOOL, WRITE_TOOL, document,
 };
 use crate::credentials::FakeCredentialSource;
 use crate::fixture::{
@@ -83,6 +99,20 @@ pub trait ContractStore {
     /// The time on the store's own clock: database time for Postgres, the store's clock for the
     /// in-memory store. A row begun between two readings has its time at begin between them.
     fn now(&self) -> impl Future<Output = SystemTime>;
+
+    /// Every receipt the store holds, as it holds them, in any order. For item 6's functions
+    /// only: a runner whose store keeps no receipts yet does not run them.
+    fn receipts(&self) -> impl Future<Output = Vec<Receipt>>;
+
+    /// From here on, every begin writes its row and then reports failure: its confirmation is
+    /// lost on every attempt within the begin budget, as decision 0009 says a begin may be. The
+    /// store then completes an allowed row as `error` and settles its receipt as
+    /// `not_performed`. For item 6's functions only.
+    fn lose_every_begin_confirmation(&self);
+
+    /// Moves the store's clock past the deadline of the call row `row`, which must have one.
+    /// For item 6's functions only.
+    fn pass_deadline(&self, row: &AuditRowId) -> impl Future<Output = ()>;
 }
 
 /// The record a row holds.
@@ -210,6 +240,7 @@ fn decision_context(fixture: &Fixture, call: &Call) -> CallContext {
             .caller_context(call.caller, call.surface)
             .expect("the fixture knows the caller"),
         tool: RequestedTool::new(call.tool),
+        key: None,
     }
 }
 
@@ -1006,6 +1037,7 @@ pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
             .expect("the fixture knows team A"),
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
+        key: None,
     };
     let begun = audit::begin(
         store,
@@ -1047,6 +1079,7 @@ async fn finish_touches_only_its_completion(
         Answer::Refused(sentence) => Outcome::Refused {
             sentence: sentence.clone(),
         },
+        Answer::Unknown(_) => Outcome::Unknown,
         Answer::AuditFailed { .. } => panic!("{:?}", finished.answer()),
     };
     let completion = Completion {
@@ -1442,5 +1475,720 @@ pub async fn a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row(
             "a call record of kind list was refused for another reason: {failure}"
         );
         assert_eq!(stored(contract, &row).await, first);
+    }
+}
+
+// --- Item 6: receipts ---------------------------------------------------------------------------
+
+/// A connector that answers every call with one outcome, and counts its calls.
+struct Answering {
+    outcome: ToolOutcome,
+    calls: AtomicUsize,
+}
+
+impl Answering {
+    fn with(outcome: ToolOutcome) -> Self {
+        Self {
+            outcome,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Connector for Answering {
+    fn run(&self, _call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(self.outcome.clone()))
+    }
+}
+
+/// Proves a delegation exactly as it is given. The contract suite's own, for item 6's scope
+/// case: the fixture has no delegation verifier, and a key's scope reads the delegation's key
+/// scope, which no verifier fills until #22. Every `impl Verifier` creates proof, so it is
+/// private to this module and used only there.
+struct DelegationAsGiven;
+
+impl Verifier for DelegationAsGiven {
+    type Evidence = Delegation;
+    type Fact = Delegation;
+    type Error = Infallible;
+
+    fn verify(&self, evidence: &Delegation) -> Result<Delegation, Infallible> {
+        Ok(evidence.clone())
+    }
+}
+
+/// A proposal: team A calls the draft tool on its own document, with `text`.
+fn proposal(text: &str) -> Value {
+    json!({ DOCUMENT_ARGUMENT: TEAM_A_DOCUMENT, "text": text })
+}
+
+/// A proposal by team A carrying `key`, as its tool-use identifier says, decided.
+fn keyed_proposal(fixture: &Fixture, arguments: &Value, key: Option<&IdempotencyKey>) -> Decision {
+    keyed_decision(
+        fixture,
+        fixture
+            .caller_context(Caller::TeamA, SURFACE_ALL)
+            .expect("the fixture knows team A"),
+        arguments,
+        key,
+    )
+}
+
+fn keyed_decision(
+    fixture: &Fixture,
+    caller: CallerContext,
+    arguments: &Value,
+    key: Option<&IdempotencyKey>,
+) -> Decision {
+    let context = CallContext {
+        caller,
+        tool: RequestedTool::new(DRAFT_TOOL),
+        resources: FixtureConnector::resources_of(DRAFT_TOOL, arguments),
+        key: key.cloned(),
+    };
+    decide(&fixture.policy, &context)
+}
+
+/// Begins `decision` as the row `start` names, with `arguments` and the tool-use identifier
+/// `tool_use_id`.
+async fn begin_keyed(
+    store: &dyn AuditStore,
+    start: &RowStart,
+    decision: Decision,
+    arguments: &Value,
+    tool_use_id: Option<&str>,
+) -> Result<Begun, AuditFailure> {
+    audit::begin(
+        store,
+        start.clone(),
+        decision,
+        arguments.clone(),
+        RequestMetadata {
+            tool_use_id: tool_use_id.map(ToolUseId::from),
+            claimed_team: None,
+        },
+    )
+    .await
+}
+
+/// The guard of team A's proposal with `arguments` under `key`, which must be allowed, begun as
+/// the row `start` names with `key` as its tool-use identifier.
+async fn proposal_guard(
+    store: &dyn AuditStore,
+    fixture: &Fixture,
+    start: &RowStart,
+    arguments: &Value,
+    key: &IdempotencyKey,
+) -> AuditGuard {
+    let decision = keyed_proposal(fixture, arguments, Some(key));
+    match begin_keyed(store, start, decision, arguments, Some(key.as_str())).await {
+        Ok(Begun::Allowed(guard)) => guard,
+        other => panic!("a keyed proposal was not begun as allowed: {other:?}"),
+    }
+}
+
+/// The receipts the store holds whose key is `key`.
+async fn receipts_for(contract: &impl ContractStore, key: &IdempotencyKey) -> Vec<Receipt> {
+    let mut found: Vec<Receipt> = contract
+        .receipts()
+        .await
+        .into_iter()
+        .filter(|receipt| receipt.key == *key)
+        .collect();
+    found.sort_by(|one, other| one.row.as_str().cmp(other.row.as_str()));
+    found
+}
+
+/// The one receipt reserved under `row`, which there must be.
+async fn receipt_under(contract: &impl ContractStore, row: &AuditRowId) -> Receipt {
+    let mut found: Vec<Receipt> = contract
+        .receipts()
+        .await
+        .into_iter()
+        .filter(|receipt| receipt.row == *row)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "{} receipts are reserved under {}",
+        found.len(),
+        row.as_str()
+    );
+    found.remove(0)
+}
+
+/// A receipt is reserved with its row or not at all (decision 0009, "How it is tested", item
+/// 6). An allowed side effect's begin stores its row open and a `pending` receipt under it,
+/// holding the scope, key, tool, tool-use identifier, digest and resources of the call. A
+/// begin the store refuses writes neither. A denial writes its row and reserves nothing, even
+/// with a key, and so uses up no key; nor does a read.
+pub async fn a_receipt_is_reserved_with_its_row_or_not_at_all(contract: &impl ContractStore) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("A first proposal.");
+
+    let start = row_start();
+    let _ = proposal_guard(store, &fixture, &start, &arguments, &key).await;
+    let row = stored(contract, &start.row).await;
+    let StoredRecord::Call(record) = &row.record else {
+        panic!("a call was stored as {:?}", row.record);
+    };
+    assert_eq!(
+        (row.completion.as_ref(), record.decision),
+        (None, DecisionKind::Allow)
+    );
+    let principal = fixture
+        .caller_context(Caller::TeamA, SURFACE_ALL)
+        .expect("the fixture knows team A")
+        .principal
+        .get()
+        .id
+        .clone();
+    assert_eq!(
+        receipt_under(contract, &start.row).await,
+        Receipt {
+            row: start.row.clone(),
+            scope: KeyScope {
+                principal,
+                delegation: None,
+            },
+            key: key.clone(),
+            tool: DRAFT_TOOL.parse().expect("a valid tool name"),
+            tool_use_id: Some(ToolUseId::new(key.as_str())),
+            digest: ArgumentDigest::of(&arguments),
+            resources: record.resources.clone(),
+            resources_omitted: 0,
+            state: ReceiptState::Pending,
+            established_by: EstablishedBy::Call,
+            reference: None,
+        }
+    );
+
+    // A begin the store refuses, here for a tool-use identifier Postgres cannot hold, writes
+    // no row and reserves no receipt.
+    let refused = fresh_key();
+    let start = row_start();
+    let begun = begin_keyed(
+        store,
+        &start,
+        keyed_proposal(&fixture, &arguments, Some(&refused)),
+        &arguments,
+        Some("toolu_\u{0}"),
+    )
+    .await;
+    assert!(
+        begun.is_err(),
+        "a record the store cannot hold was begun: {begun:?}"
+    );
+    assert_eq!(contract.stored(&start.row).await, None);
+    assert_eq!(receipts_for(contract, &refused).await, Vec::new());
+
+    // A denial, with a key: team B may not propose. And a read.
+    let denied_key = fresh_key();
+    let start = row_start();
+    let team_b = fixture
+        .caller_context(Caller::TeamB, SURFACE_ALL)
+        .expect("the fixture knows team B");
+    let begun = begin_keyed(
+        store,
+        &start,
+        keyed_decision(&fixture, team_b, &arguments, Some(&denied_key)),
+        &arguments,
+        Some(denied_key.as_str()),
+    )
+    .await;
+    assert!(matches!(begun, Ok(Begun::Denied(_))), "{begun:?}");
+    assert!(contract.stored(&start.row).await.is_some());
+    let read = guard(store, &fixture, &row_start(), &ALLOWED).await;
+    assert_eq!(receipts_for(contract, &denied_key).await, Vec::new());
+    assert!(
+        contract
+            .receipts()
+            .await
+            .iter()
+            .all(|receipt| receipt.row != *read.row())
+    );
+
+    // The denial used up no key: team A may still use it.
+    let _ = proposal_guard(store, &fixture, &row_start(), &arguments, &denied_key).await;
+    assert_eq!(receipts_for(contract, &denied_key).await.len(), 1);
+}
+
+/// A receipt moves with its finish, in the same write as the row's completion: `ok` settles it
+/// as `completed` with the vendor's reference, `error` and `refused` as `not_performed`, and
+/// `unknown` as `unknown`, each established by the call. A guard given up settles it as
+/// `not_performed`. A finish the store refuses leaves both the row and the receipt as they
+/// were, and an identical repeat changes neither.
+pub async fn a_receipt_moves_with_its_finish(contract: &impl ContractStore) {
+    let store = contract.store();
+    let fixture = fixture();
+    let cases = [
+        (
+            ToolOutcome::Completed(json!({"draft": "d-1"}), VendorReference::new("d-1")),
+            ReceiptState::Completed,
+            Some(VendorReference::new("d-1")),
+        ),
+        (
+            ToolOutcome::Ok(json!({"draft": "d-2"})),
+            ReceiptState::Completed,
+            None,
+        ),
+        (
+            ToolOutcome::error(ErrorKind::VendorRefusal, "The vendor said no."),
+            ReceiptState::NotPerformed,
+            None,
+        ),
+        (
+            ToolOutcome::Refused("The connector refused.".into()),
+            ReceiptState::NotPerformed,
+            None,
+        ),
+        (ToolOutcome::Unknown, ReceiptState::Unknown, None),
+    ];
+    for (reported, settled, reference) in cases {
+        let start = row_start();
+        let key = fresh_key();
+        let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &key).await;
+        let connector = Answering::with(reported.clone());
+        let ran = audit::run(&connector, guard).await;
+        let finished = audit::finish(store, ran, 4).await;
+        assert!(
+            finished.failure().is_none(),
+            "{reported:?}: {:?}",
+            finished.failure()
+        );
+        let completion = stored(contract, &start.row)
+            .await
+            .completion
+            .expect("the row was completed");
+        assert_eq!(
+            ReceiptState::settled_by(&completion.outcome),
+            Some(settled),
+            "{reported:?}"
+        );
+        let receipt = receipt_under(contract, &start.row).await;
+        assert_eq!(
+            (receipt.state, &receipt.reference, &receipt.established_by),
+            (settled, &reference, &EstablishedBy::Call),
+            "{reported:?}"
+        );
+    }
+
+    let start = row_start();
+    let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &fresh_key()).await;
+    let gave_up = audit::give_up(store, guard).await;
+    assert!(gave_up.failure().is_none(), "{:?}", gave_up.failure());
+    assert_eq!(
+        receipt_under(contract, &start.row).await.state,
+        ReceiptState::NotPerformed
+    );
+
+    // A finish the store refuses: a refusal's sentence over the cap. Nothing moves.
+    let start = row_start();
+    let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &fresh_key()).await;
+    let ran = audit::run(
+        &RefusesWith("o".repeat(MAX_OUTCOME_SENTENCE_BYTES + 1)),
+        guard,
+    )
+    .await;
+    let finished = audit::finish(store, ran, 4).await;
+    assert!(finished.failure().is_some(), "a refused finish was written");
+    assert_eq!(stored(contract, &start.row).await.completion, None);
+    assert_eq!(
+        receipt_under(contract, &start.row).await.state,
+        ReceiptState::Pending
+    );
+}
+
+/// A finish that arrives after its row's deadline is still written to the row, but does not
+/// move the receipt (decision 0009, "What a receipt is"): a `pending` receipt past its
+/// deadline leaves `pending` only by reconciliation or a person, and is read as `unknown`
+/// until then, whatever the late finish reported.
+pub async fn a_late_finish_completes_its_row_and_leaves_its_receipt_pending(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let cases = [
+        ToolOutcome::Completed(json!({"draft": "d-1"}), VendorReference::new("d-1")),
+        ToolOutcome::error(ErrorKind::VendorRefusal, "The vendor said no."),
+        ToolOutcome::Unknown,
+    ];
+    for reported in cases {
+        let start = row_start();
+        let key = fresh_key();
+        let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &key).await;
+        let connector = Answering::with(reported.clone());
+        let ran = audit::run(&connector, guard).await;
+        contract.pass_deadline(&start.row).await;
+        let finished = audit::finish(store, ran, 4).await;
+        assert!(
+            finished.failure().is_none(),
+            "{reported:?}: {:?}",
+            finished.failure()
+        );
+        assert!(
+            stored(contract, &start.row).await.completion.is_some(),
+            "{reported:?}: the late finish was not written to the row"
+        );
+        let receipt = receipt_under(contract, &start.row).await;
+        assert_eq!(
+            (receipt.state, &receipt.reference, &receipt.established_by),
+            (ReceiptState::Pending, &None, &EstablishedBy::Call),
+            "{reported:?}"
+        );
+        assert_eq!(receipt.state.as_read(true), ReceiptState::Unknown);
+    }
+}
+
+/// Polls every future in `futures` together until each is ready, so that none waits for
+/// another to finish before it starts: the store sees them at once.
+async fn all_at_once<T>(futures: Vec<BoxFuture<'_, T>>) -> Vec<T> {
+    let mut running: Vec<Option<BoxFuture<'_, T>>> = futures.into_iter().map(Some).collect();
+    let mut done: Vec<Option<T>> = running.iter().map(|_| None).collect();
+    poll_fn(|context| {
+        for (future, slot) in running.iter_mut().zip(done.iter_mut()) {
+            if let Some(polled) = future
+                && let Poll::Ready(output) = polled.as_mut().poll(context)
+            {
+                *slot = Some(output);
+                *future = None;
+            }
+        }
+        if running.iter().all(Option::is_none) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    done.into_iter()
+        .map(|output| output.expect("every future finished"))
+        .collect()
+}
+
+/// A key stays unique in its scope under concurrent calls: of eight begins of one call under
+/// one key, at once, exactly one reserves the receipt and runs, and each of the others is
+/// answered from that receipt, which is `pending`, as one that may already have happened.
+pub async fn a_key_is_unique_in_its_scope_under_concurrent_calls(contract: &impl ContractStore) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("At once.");
+    let starts: Vec<RowStart> = (0..8).map(|_| row_start()).collect();
+    let begins: Vec<BoxFuture<'_, Result<Begun, AuditFailure>>> = starts
+        .iter()
+        .map(|start| {
+            let decision = keyed_proposal(&fixture, &arguments, Some(&key));
+            let arguments = arguments.clone();
+            let key = key.clone();
+            Box::pin(async move {
+                begin_keyed(store, start, decision, &arguments, Some(key.as_str())).await
+            }) as BoxFuture<'_, _>
+        })
+        .collect();
+    let begun = all_at_once(begins).await;
+    let mut reserved = Vec::new();
+    let mut answered = Vec::new();
+    for begun in begun {
+        match begun {
+            Ok(Begun::Allowed(guard)) => reserved.push(guard.row().clone()),
+            Ok(Begun::Reused(reused)) => answered.push(reused),
+            other => panic!("a concurrent begin was neither reserved nor reused: {other:?}"),
+        }
+    }
+    assert_eq!(
+        reserved.len(),
+        1,
+        "{} begins reserved the one key",
+        reserved.len()
+    );
+    assert_eq!(answered.len(), 7);
+    for reused in answered {
+        assert_eq!(
+            reused.reuse(),
+            &Reuse::MayHaveHappened {
+                key: key.clone(),
+                receipt: reserved[0].clone(),
+            }
+        );
+    }
+    let receipts = receipts_for(contract, &key).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].row, reserved[0]);
+}
+
+/// A key is scoped to the principal and the delegation's identifying fields: two delegations
+/// under one principal may each use the same key, and each reserves its own receipt. Within
+/// one delegation the key is used once.
+pub async fn two_delegations_under_one_principal_may_use_the_same_key(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Under a delegation.");
+    let in_turn = |turn: &str| {
+        let mut caller = fixture
+            .caller_context(Caller::TeamA, SURFACE_ALL)
+            .expect("the fixture knows team A");
+        let delegation = Delegation {
+            acting_person: Claimed::new("requester@example.test".into()),
+            team: TEAM_A.into(),
+            tools: [DRAFT_TOOL.parse().expect("a valid tool name")].into(),
+            key_scope: Some(DelegationKeyScope::new(turn)),
+        };
+        caller.delegation = Some(match Proved::verify(&DelegationAsGiven, &delegation) {
+            Ok(proved) => proved,
+            Err(never) => match never {},
+        });
+        keyed_decision(&fixture, caller, &arguments, Some(&key))
+    };
+    let mut rows = Vec::new();
+    for turn in ["session-1/turn-1", "session-1/turn-2"] {
+        let start = row_start();
+        let begun = begin_keyed(store, &start, in_turn(turn), &arguments, Some(key.as_str())).await;
+        assert!(matches!(begun, Ok(Begun::Allowed(_))), "{turn}: {begun:?}");
+        rows.push(start.row);
+    }
+    let receipts = receipts_for(contract, &key).await;
+    assert_eq!(receipts.len(), 2);
+    let scopes: Vec<Option<&str>> = receipts
+        .iter()
+        .map(|receipt| {
+            receipt
+                .scope
+                .delegation
+                .as_ref()
+                .map(DelegationKeyScope::as_str)
+        })
+        .collect();
+    assert!(scopes.contains(&Some("session-1/turn-1")), "{scopes:?}");
+    assert!(scopes.contains(&Some("session-1/turn-2")), "{scopes:?}");
+
+    let again = begin_keyed(
+        store,
+        &row_start(),
+        in_turn("session-1/turn-2"),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    assert!(
+        matches!(&again, Ok(Begun::Reused(reused)) if reused.reuse()
+            == &Reuse::MayHaveHappened { key: key.clone(), receipt: rows[1].clone() }),
+        "{again:?}"
+    );
+    assert_eq!(receipts_for(contract, &key).await.len(), 2);
+}
+
+/// A begin retried after a lost confirmation finds its own receipt, runs once, and is not
+/// refused as reuse. The retry is a second begin under the same row, as the store's own retry
+/// by identifier is; whatever the first answered is thrown away, as a lost confirmation's is.
+/// Once the call has run, a begin under its row is refused, and runs nothing.
+pub async fn a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Retried.");
+    let start = row_start();
+    let decide_again = || keyed_proposal(&fixture, &arguments, Some(&key));
+
+    let _lost = begin_keyed(
+        store,
+        &start,
+        decide_again(),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    let retried = begin_keyed(
+        store,
+        &start,
+        decide_again(),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    let Ok(Begun::Allowed(guard)) = retried else {
+        panic!("a retried begin was not answered with its own reservation: {retried:?}");
+    };
+    assert_eq!(guard.row(), &start.row);
+    assert_eq!(receipts_for(contract, &key).await.len(), 1);
+
+    let connector = Answering::with(ToolOutcome::Completed(
+        json!({"draft": "d-1"}),
+        VendorReference::new("d-1"),
+    ));
+    let ran = audit::run(&connector, guard).await;
+    let finished = audit::finish(store, ran, 2).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert_eq!(connector.calls(), 1);
+    assert_eq!(
+        receipt_under(contract, &start.row).await.state,
+        ReceiptState::Completed
+    );
+
+    let after = stored(contract, &start.row).await;
+    let again = begin_keyed(
+        store,
+        &start,
+        decide_again(),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    assert!(again.is_err(), "a call that ran was begun again: {again:?}");
+    assert_eq!(stored(contract, &start.row).await, after);
+    assert_eq!(connector.calls(), 1);
+}
+
+/// A begin whose confirmation was lost on every attempt leaves its row completed as `error`,
+/// of the kind `other` with a latency of zero, and its receipt `not_performed`: the instance
+/// knows nothing ran.
+pub async fn a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_error_and_its_receipt_not_performed(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Lost.");
+    let start = row_start();
+    contract.lose_every_begin_confirmation();
+    let begun = begin_keyed(
+        store,
+        &start,
+        keyed_proposal(&fixture, &arguments, Some(&key)),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    assert!(
+        begun.is_err(),
+        "a begin whose confirmation was lost succeeded: {begun:?}"
+    );
+    assert_eq!(
+        stored(contract, &start.row).await.completion,
+        Some(Completion {
+            outcome: Outcome::Error {
+                error_kind: ErrorKind::Other
+            },
+            latency_ms: 0,
+        })
+    );
+    let receipt = receipt_under(contract, &start.row).await;
+    assert_eq!(
+        (receipt.state, receipt.established_by),
+        (ReceiptState::NotPerformed, EstablishedBy::Call)
+    );
+}
+
+/// Each receipt state against each line of the reuse table (decision 0009, "Reuse"). For an
+/// earlier receipt in each state, `pending`, `completed`, `not_performed` and `unknown`, a call
+/// under its key with another tool-use identifier is refused as a different call; one with the
+/// same identifier and other arguments as conflicting reuse; and the same call is a
+/// `duplicate` of a `completed` receipt, may have happened for `pending` and `unknown`, and
+/// needs a new key for `not_performed`. None of them runs or reserves a receipt, each row is
+/// written complete with its answer, and the earlier receipt is left as it was.
+pub async fn each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table_that_matches(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let arguments = proposal("The first call.");
+    let states = [
+        (None, ReceiptState::Pending),
+        (
+            Some(ToolOutcome::Completed(
+                json!({"draft": "d-1"}),
+                VendorReference::new("d-1"),
+            )),
+            ReceiptState::Completed,
+        ),
+        (
+            Some(ToolOutcome::error(ErrorKind::VendorRefusal, "No.")),
+            ReceiptState::NotPerformed,
+        ),
+        (Some(ToolOutcome::Unknown), ReceiptState::Unknown),
+    ];
+    for (outcome, state) in states {
+        let key = fresh_key();
+        let first = row_start();
+        let guard = proposal_guard(store, &fixture, &first, &arguments, &key).await;
+        match outcome {
+            Some(outcome) => {
+                let ran = audit::run(&Answering::with(outcome), guard).await;
+                let finished = audit::finish(store, ran, 1).await;
+                assert!(finished.failure().is_none(), "{:?}", finished.failure());
+            }
+            // Begun and never finished: still pending.
+            None => drop(guard),
+        }
+        let earlier = receipt_under(contract, &first.row).await;
+        assert_eq!(earlier.state, state);
+
+        let receipt = first.row.clone();
+        let same_call = match state {
+            ReceiptState::Completed => Reuse::Duplicate {
+                key: key.clone(),
+                receipt: receipt.clone(),
+                reference: Some(VendorReference::new("d-1")),
+            },
+            ReceiptState::Pending | ReceiptState::Unknown => Reuse::MayHaveHappened {
+                key: key.clone(),
+                receipt: receipt.clone(),
+            },
+            ReceiptState::NotPerformed => Reuse::NotPerformed {
+                key: key.clone(),
+                receipt: receipt.clone(),
+            },
+        };
+        let other_arguments = proposal("Another call.");
+        for (tool_use_id, call_arguments, expected) in [
+            (
+                "toolu_another_call",
+                &arguments,
+                Reuse::DifferentCall { key: key.clone() },
+            ),
+            (
+                key.as_str(),
+                &other_arguments,
+                Reuse::Conflicting { key: key.clone() },
+            ),
+            (key.as_str(), &arguments, same_call),
+        ] {
+            let start = row_start();
+            let begun = begin_keyed(
+                store,
+                &start,
+                keyed_proposal(&fixture, call_arguments, Some(&key)),
+                call_arguments,
+                Some(tool_use_id),
+            )
+            .await;
+            let Ok(Begun::Reused(reused)) = begun else {
+                panic!("{state:?}, {tool_use_id}: not answered from the receipt: {begun:?}");
+            };
+            assert_eq!(reused.reuse(), &expected, "{state:?}, {tool_use_id}");
+            let row = stored(contract, &start.row).await;
+            assert_eq!(
+                row.completion,
+                Some(expected.completion()),
+                "{state:?}, {tool_use_id}"
+            );
+            let StoredRecord::Call(record) = &row.record else {
+                panic!("a call was stored as {:?}", row.record);
+            };
+            assert_eq!(record.decision, DecisionKind::Allow);
+        }
+        assert_eq!(receipts_for(contract, &key).await, vec![earlier]);
     }
 }

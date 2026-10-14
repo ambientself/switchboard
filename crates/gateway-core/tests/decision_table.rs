@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gateway_core::audit::{self, Begun, DecisionKind, MAX_RECORDED_RESOURCES, RequestMetadata};
 use gateway_core::{
-    AuditRecord, CallContext, CallerContext, Claimed, Delegation, DeploymentName, PolicySnapshot,
-    Principal, ProfileName, ReasonKind, RequestedTool, Resource, Resources, SnapshotData,
-    SurfaceName, TeamId, ToolName, WasProved, decide, list_tools,
+    AuditRecord, CallContext, CallerContext, Claimed, Classification, Delegation, DeploymentName,
+    IdempotencyKey, PolicySnapshot, Principal, ProfileName, ReasonKind, ReceiptState,
+    RequestedTool, Resource, Resources, SnapshotData, SurfaceName, TeamId, ToolName, WasProved,
+    decide, list_tools,
 };
 use serde::Deserialize;
 
@@ -60,6 +61,9 @@ struct Case {
     surface: SurfaceName,
     tool: RequestedTool,
     resources: Resources,
+    /// The call's idempotency key. A call of a tool not classified `read` needs one.
+    #[serde(default)]
+    key: Option<IdempotencyKey>,
     expect: Expected,
 }
 
@@ -356,6 +360,7 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
             caller,
             tool: case.tool.clone(),
             resources: case.resources.clone(),
+            key: case.key.clone(),
         };
         let decision = decide(snapshot, &call);
         if decision.policy_revision() != snapshot.revision() {
@@ -386,6 +391,13 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
                 reason: refusal.reason().kind(),
                 sentence: refusal.sentence().to_owned(),
             },
+            Begun::Reused(reused) => {
+                failures.push(format!(
+                    "case `{}`: a fresh store answered a reused key: {reused:?}",
+                    case.name
+                ));
+                continue;
+            }
         };
         if got != case.expect {
             failures.push(format!(
@@ -399,6 +411,28 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
         if rows != [want.clone()] {
             failures.push(format!(
                 "case `{}`: the audit row is wrong\n    expected {want:?}\n    got      {rows:?}",
+                case.name
+            ));
+        }
+        // An allowed side effect reserves one `pending` receipt, under its row and for its key,
+        // and nothing else reserves any: a denial uses up no key.
+        let side_effect = case.expect == Expected::Allow
+            && want
+                .classification
+                .is_some_and(|classification| classification != Classification::Read);
+        let receipts = store.receipts();
+        let reserved = match receipts.as_slice() {
+            [] => false,
+            [receipt] => {
+                receipt.row == store.ids()[0]
+                    && Some(&receipt.key) == case.key.as_ref()
+                    && receipt.state == ReceiptState::Pending
+            }
+            _ => true,
+        };
+        if reserved != side_effect || receipts.len() > 1 {
+            failures.push(format!(
+                "case `{}`: a side effect: {side_effect}; receipts: {receipts:?}",
                 case.name
             ));
         }

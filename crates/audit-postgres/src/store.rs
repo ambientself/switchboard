@@ -10,6 +10,7 @@ use deadpool_postgres::{
 use gateway_core::audit::{
     AuditRowId, Completion, ErrorKind, ListRecord, RowCompletion, StoreError,
 };
+use gateway_core::receipt::{ReceiptRequest, Reservation};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -96,6 +97,14 @@ pub enum PgAuditError {
         /// The row begin or list named.
         row: String,
     },
+    /// The store does not keep receipts yet (decision 0009, part 2; #55). A begin that would
+    /// reserve one, which every allowed call of a tool not classified `read` makes, is refused
+    /// before anything is sent, so the call is refused and nothing runs. So is a completion
+    /// only such a call can have: `unknown`, `duplicate`, or one carrying a vendor reference.
+    /// The boot gates already refuse a snapshot serving such a tool outside a development
+    /// build.
+    #[error("the Postgres audit store keeps no receipts yet, so {0}; nothing was written")]
+    NoReceipts(&'static str),
     /// Finish named a row the table does not hold.
     #[error("audit row {row} does not exist")]
     NoSuchRow {
@@ -1263,11 +1272,29 @@ impl AuditStore for PgAuditStore {
         })
     }
 
+    fn begin_with_receipt<'a>(
+        &'a self,
+        _row: &'a AuditRowId,
+        _record: &'a AuditRecord,
+        _receipt: &'a ReceiptRequest,
+    ) -> BoxFuture<'a, Result<Reservation, StoreError>> {
+        Box::pin(async {
+            Err(StoreError::from(PgAuditError::NoReceipts(
+                "a call of a tool not classified `read` cannot be begun",
+            )))
+        })
+    }
+
     fn finish<'a>(
         &'a self,
         completion: &'a RowCompletion,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
+            if completion.reference().is_some() {
+                return Err(StoreError::from(PgAuditError::NoReceipts(
+                    "a completion with a vendor reference cannot be written",
+                )));
+            }
             self.finish_within_budget(completion.row(), completion.completion())
                 .await
                 .map_err(StoreError::from)
@@ -1664,6 +1691,7 @@ mod unit {
             resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
             caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
             tool: RequestedTool::new(READ_TOOL),
+            key: None,
         };
         let decision = decide(&fixture.policy, &context);
         let begin = audit::begin(

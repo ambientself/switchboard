@@ -10,9 +10,9 @@ use std::time::Duration;
 use gateway_dev::FixtureGateway;
 use gateway_mcp::{
     CLIENT_CAPABILITIES_META, DENIAL_CODE, Era, METHOD_HEADER, MODERN, NAME_HEADER,
-    PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_META, SESSION_ID_HEADER,
+    PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_META, SESSION_ID_HEADER, TOOL_USE_ID_META,
 };
-use gateway_testkit::{Caller, DOCUMENT_ARGUMENT};
+use gateway_testkit::{Caller, DOCUMENT_ARGUMENT, fresh_key};
 use serde_json::{Value, json};
 
 /// A 2025-06-18 request body.
@@ -277,6 +277,14 @@ pub fn call_params(tool: &str, arguments: Value) -> Value {
     json!({"name": tool, "arguments": arguments})
 }
 
+/// `tools/call` parameters for `tool` with `arguments`, carrying a fresh tool-use identifier in
+/// `_meta`, which is the call's idempotency key: what a call of a tool not classified `read`
+/// needs (decision 0009).
+pub fn keyed_call_params(tool: &str, arguments: Value) -> Value {
+    let key = fresh_key();
+    json!({"name": tool, "arguments": arguments, "_meta": {TOOL_USE_ID_META: key.as_str()}})
+}
+
 /// The arguments that name `document`.
 pub fn document(document: &str) -> Value {
     json!({ DOCUMENT_ARGUMENT: document })
@@ -296,6 +304,27 @@ pub async fn call(
         &gateway.url(surface),
         "tools/call",
         call_params(tool, arguments),
+    )
+    .bearer(&gateway.token(caller))
+    .send()
+    .await
+}
+
+/// `caller` calls `tool` with `arguments` on `surface`, in `era`, with a fresh tool-use
+/// identifier, which is the call's key.
+pub async fn propose(
+    gateway: &FixtureGateway,
+    caller: Caller,
+    era: Era,
+    surface: &str,
+    tool: &str,
+    arguments: Value,
+) -> Answer {
+    Request::in_era(
+        era,
+        &gateway.url(surface),
+        "tools/call",
+        keyed_call_params(tool, arguments),
     )
     .bearer(&gateway.token(caller))
     .send()

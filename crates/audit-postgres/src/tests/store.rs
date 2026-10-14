@@ -13,9 +13,9 @@ use gateway_core::{
     decide, list_tools,
 };
 use gateway_testkit::{
-    Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
+    Caller, DRAFT_TOOL, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
     InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT,
-    TEAM_B_DOCUMENT, WRITE_TOOL, document, row_start,
+    TEAM_B_DOCUMENT, WRITE_TOOL, document, fresh_key, row_start,
 };
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
@@ -77,6 +77,7 @@ pub(super) async fn through_core(
             .unwrap_or_else(|| FixtureConnector::resources_of(call.tool, &call.arguments)),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
+        key: None,
     };
     let decision = decide(&fixture.policy, &context);
     let begun = audit::begin(
@@ -90,6 +91,7 @@ pub(super) async fn through_core(
     .unwrap();
     match begun {
         Begun::Denied(refusal) => refusal.row().clone(),
+        Begun::Reused(reused) => panic!("the Postgres store reserves no receipts: {reused:?}"),
         Begun::Allowed(guard) => {
             let row = guard.row().clone();
             let ran = audit::run(&connector, guard).await;
@@ -368,6 +370,7 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
             resources: FixtureConnector::resources_of(call.tool, &call.arguments),
             caller: fixture.caller_context(call.caller, call.surface).unwrap(),
             tool: RequestedTool::new(call.tool),
+            key: None,
         };
         let decision = decide(&fixture.policy, &context);
         let failure = audit::begin(&store, row_start(), decision, call.arguments, metadata)
@@ -710,6 +713,7 @@ fn decided(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
+        key: None,
     };
     decide(&fixture.policy, &context)
 }
@@ -721,6 +725,43 @@ async fn row_count(admin: &Client) -> i64 {
         .await
         .unwrap()
         .get(0)
+}
+
+/// The store keeps no receipts yet (#55). An allowed call of a tool not classified `read`
+/// carrying a key is refused at begin with a plain error, and nothing is written, so nothing
+/// runs. The core's MemoryStore and the testkit's store keep receipts; this one fails closed
+/// until it does.
+#[tokio::test]
+async fn a_side_effect_is_refused_until_the_store_keeps_receipts() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let store = db.store(PoolSizes::default());
+    let admin = db.admin().await;
+    let arguments = json!({"document": TEAM_A_DOCUMENT});
+    let context = CallContext {
+        caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
+        tool: RequestedTool::new(DRAFT_TOOL),
+        resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
+        key: Some(fresh_key()),
+    };
+    let decision = decide(&fixture.policy, &context);
+    assert!(decision.is_allowed(), "{decision:?}");
+    let failure = audit::begin(
+        &store,
+        row_start(),
+        decision,
+        arguments,
+        RequestMetadata::default(),
+    )
+    .await
+    .expect_err("a side effect was begun without a receipt store");
+    assert!(
+        failure.to_string().contains("keeps no receipts yet"),
+        "{failure}"
+    );
+    assert_eq!(row_count(&admin).await, 0);
 }
 
 #[tokio::test]
@@ -851,6 +892,7 @@ pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditR
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
+        key: None,
     };
     let decision = decide(&fixture.policy, &context);
     match audit::begin(store, row_start(), decision, call.arguments, call.metadata)
@@ -859,6 +901,7 @@ pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditR
     {
         Begun::Allowed(guard) => guard.row().clone(),
         Begun::Denied(refusal) => panic!("denied: {}", refusal.sentence()),
+        Begun::Reused(reused) => panic!("the Postgres store reserves no receipts: {reused:?}"),
     }
 }
 
@@ -1101,6 +1144,7 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
+        key: None,
     };
     let decision = decide(&fixture.policy, &context);
     let failure = audit::begin(&store, row_start(), decision, call.arguments, call.metadata)

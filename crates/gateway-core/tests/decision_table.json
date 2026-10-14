@@ -209,6 +209,46 @@
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
       "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_proposal_1",
+      "expect": { "decision": "allow" }
+    },
+    {
+      "name": "a proposal that carries no key is denied, asking for one",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "expect": { "decision": "deny", "reason": "key_missing",
+        "sentence": "Tool `github__open_pull_request` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key." }
+    },
+    {
+      "name": "an employee's proposal that carries no key is denied, asking for one",
+      "snapshot": "base", "principal": "eng-user", "delegation": null,
+      "profile": "employee", "surface": "employee", "tool": "jira__create_issue_as_user",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "expect": { "decision": "deny", "reason": "key_missing",
+        "sentence": "Tool `jira__create_issue_as_user` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key." }
+    },
+    {
+      "name": "order: a resource outside the limit is reported before a missing key",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__open_pull_request",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/handbook" }] },
+      "expect": { "decision": "deny", "reason": "resource_outside_limit",
+        "sentence": "Tool `github__open_pull_request` names github repository `example-org/handbook`, which is outside what workload `system:serviceaccount:otto:sandbox-payments` of team `payments` from issuer `https://cluster-a.example.test` may reach. Name only resources within that limit." }
+    },
+    {
+      "name": "order: a direct write is reported before a missing key",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "jira__transition_issue",
+      "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "PAY" }] },
+      "expect": { "decision": "deny", "reason": "classification_not_permitted",
+        "sentence": "Tool `jira__transition_issue` is classified `write`: it changes something directly instead of proposing a change for a person to review, and direct writes are denied in every profile. Use a tool that proposes the change, or ask a person to make it." }
+    },
+    {
+      "name": "a read needs no key",
+      "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
+      "profile": "otto", "surface": "otto-sandbox", "tool": "github__get_file",
+      "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
       "expect": { "decision": "allow" }
     },
     {
@@ -216,6 +256,7 @@
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn",
       "profile": "otto", "surface": "otto-sandbox", "tool": "github__comment_on_own_proposal",
       "resources": { "named": [{ "system": "github", "kind": "repository", "identifier": "example-org/payments-api" }] },
+      "key": "toolu_proposal_2",
       "expect": { "decision": "allow" }
     },
     {
@@ -251,6 +292,7 @@
       "snapshot": "base", "principal": "eng-user", "delegation": null,
       "profile": "employee", "surface": "employee", "tool": "jira__create_issue_as_user",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "key": "toolu_proposal_3",
       "expect": { "decision": "allow" }
     },
     {
@@ -272,6 +314,7 @@
       "snapshot": "base", "principal": "inventory-service", "delegation": null,
       "profile": "service", "surface": "service", "tool": "jira__create_issue",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "INV" }] },
+      "key": "toolu_proposal_4",
       "expect": { "decision": "allow" }
     },
     {
@@ -279,6 +322,7 @@
       "snapshot": "base", "principal": "control-plane", "delegation": null,
       "profile": "service", "surface": "otto-control", "tool": "otto__post_status",
       "resources": { "named": [] },
+      "key": "toolu_proposal_5",
       "expect": { "decision": "allow" }
     },
     {
@@ -530,6 +574,7 @@
       "snapshot": "base", "principal": "eng-user", "delegation": null,
       "profile": "lists-everything", "surface": "employee", "tool": "jira__create_issue_as_user",
       "resources": { "named": [{ "system": "jira", "kind": "project", "identifier": "ENG" }] },
+      "key": "toolu_proposal_6",
       "expect": { "decision": "allow" }
     },
     {

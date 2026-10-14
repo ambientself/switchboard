@@ -1,9 +1,11 @@
-error[E0451]: fields `row` and `outcome` of struct `Ran` are private
- --> tests/compile-fail/ran_by_hand.rs:8:9
-  |
-7 |     Ran {
-  |     --- in this type
-8 |         row: guard.row().clone(),
-  |         ^^^ private field
-9 |         outcome: ToolOutcome::Ok(serde_json::Value::Null),
-  |         ^^^^^^^ private field
+error[E0451]: fields `row`, `outcome` and `reserved` of struct `Ran` are private
+  --> tests/compile-fail/ran_by_hand.rs:8:9
+   |
+ 7 |     Ran {
+   |     --- in this type
+ 8 |         row: guard.row().clone(),
+   |         ^^^ private field
+ 9 |         outcome: ToolOutcome::Ok(serde_json::Value::Null),
+   |         ^^^^^^^ private field
+10 |         reserved: false,
+   |         ^^^^^^^^ private field

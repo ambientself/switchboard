@@ -7,6 +7,7 @@ fn made_up(guard: AuditGuard) -> Ran {
     Ran {
         row: guard.row().clone(),
         outcome: ToolOutcome::Ok(serde_json::Value::Null),
+        reserved: false,
     }
 }
 

@@ -4,6 +4,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gateway_core::audit::{AuditRowId, ListRecord, RowCompletion, StoreError};
+use gateway_core::receipt::{ReceiptRequest, Reservation};
 use gateway_core::{AuditRecord, AuditStore, BoxFuture};
 use gateway_testkit::InMemoryAuditStore;
 use serde_json::{Value, json};
@@ -12,6 +13,8 @@ use serde_json::{Value, json};
 /// store does, once it has done it:
 ///
 /// - `{"audit": "begun", "row": ..., "record": {...}}` when a row is written;
+///   a side effect's adds `"receipt": "reserved"`, or `"receipt": "reused"` and the
+///   `"answer"` its row was written with when its key already had a receipt;
 /// - `{"audit": "finished", "row": ..., "completion": {...}}` when it is completed;
 /// - `{"audit": "listed", "row": ..., "record": {...}}` when a list row is written;
 /// - `{"audit": "begin_failed", "row": ..., "error": ...}`, `{"audit": "finish_failed",
@@ -59,6 +62,38 @@ impl AuditStore for AuditPrinter {
             let begun = self.store.begin(row, record).await;
             match &begun {
                 Ok(()) => self.print(&json!({"audit": "begun", "row": row, "record": record})),
+                Err(error) => self.print(&json!({
+                    "audit": "begin_failed",
+                    "row": row,
+                    "error": error.to_string(),
+                })),
+            }
+            begun
+        })
+    }
+
+    fn begin_with_receipt<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        record: &'a AuditRecord,
+        receipt: &'a ReceiptRequest,
+    ) -> BoxFuture<'a, Result<Reservation, StoreError>> {
+        Box::pin(async move {
+            let begun = self.store.begin_with_receipt(row, record, receipt).await;
+            match &begun {
+                Ok(Reservation::Reserved) => self.print(&json!({
+                    "audit": "begun",
+                    "row": row,
+                    "record": record,
+                    "receipt": "reserved",
+                })),
+                Ok(Reservation::Reused(reuse)) => self.print(&json!({
+                    "audit": "begun",
+                    "row": row,
+                    "record": record,
+                    "receipt": "reused",
+                    "answer": reuse.sentence(),
+                })),
                 Err(error) => self.print(&json!({
                     "audit": "begin_failed",
                     "row": row,

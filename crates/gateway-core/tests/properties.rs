@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, ConnectorEntry, CredentialMode,
-    Decision, DeclaredFrom, Delegation, EntryKind, GroupId, Issuer, Narrowing, PodUid,
-    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
+    Decision, DeclaredFrom, Delegation, EntryKind, GroupId, IdempotencyKey, Issuer, Narrowing,
+    PodUid, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
     ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
     ResourceProblem, Resources, SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName,
     Verdict, decide, list_tools,
@@ -41,6 +41,7 @@ const GROUPS: [&str; 2] = ["group-1", "group-2"];
 const TOOLS: [&str; 3] = ["sys__one", "sys__two", "sys__three"];
 const UNAPPROVED_TOOL: &str = "sys__unapproved";
 const SURFACES: [&str; 2] = ["surface-a", "surface-b"];
+const KEY: &str = "toolu_property_1";
 const MISSING_SURFACE: &str = "surface-missing";
 const PODS: [&str; 2] = [
     "0f8fad5b-d9cb-469f-a165-70867728950e",
@@ -60,6 +61,8 @@ struct World {
     surface: SurfaceName,
     tool: ToolName,
     resources: Resources,
+    /// The call's idempotency key, if it carries one.
+    key: Option<IdempotencyKey>,
 }
 
 impl World {
@@ -85,6 +88,7 @@ impl World {
             caller: self.caller(),
             tool: self.tool.clone().into(),
             resources: self.resources.clone(),
+            key: self.key.clone(),
         }
     }
 
@@ -188,6 +192,7 @@ fn open_up(world: &mut World) {
                     acting_person: gateway_core::Claimed::new("requester@example.test".into()),
                     team: team.clone(),
                     tools: BTreeSet::new(),
+                    key_scope: None,
                 });
             }
             if let Some(delegation) = &mut world.delegation {
@@ -232,6 +237,9 @@ fn open_up(world: &mut World) {
     if let Some(approved) = world.approved_tool_mut() {
         approved.resources = ResourceDeclaration::ChecksOwnScope;
     }
+
+    // The key check, last: the call carries a key.
+    world.key = Some(IdempotencyKey::parse(KEY).unwrap());
 }
 
 fn subset<T: Clone + std::fmt::Debug + 'static>(items: Vec<T>) -> impl Strategy<Value = Vec<T>> {
@@ -353,6 +361,7 @@ fn any_delegation() -> impl Strategy<Value = Option<Delegation>> {
             acting_person: gateway_core::Claimed::new("requester@example.test".into()),
             team: team.into(),
             tools: tool_names(tools),
+            key_scope: None,
         }),
     )
 }
@@ -389,11 +398,12 @@ fn any_world() -> impl Strategy<Value = World> {
         select(reachable),
         select(callable),
         resources,
+        proptest::option::of(Just(KEY)),
     );
     (data, call).prop_map(
         |(
             (one, two, three, a, b, limits),
-            (principal, delegation, profile, unknown_profile, surface, tool, resources),
+            (principal, delegation, profile, unknown_profile, surface, tool, resources, key),
         )| {
             World {
                 data: SnapshotData {
@@ -415,6 +425,7 @@ fn any_world() -> impl Strategy<Value = World> {
                 surface: surface.into(),
                 tool: tool_name(tool),
                 resources,
+                key: key.map(|key| IdempotencyKey::parse(key).unwrap()),
             }
         },
     )
@@ -529,22 +540,59 @@ proptest! {
         let listed: BTreeSet<ToolName> = list_tools(&snapshot, &caller).iter().map(|tool| tool.name.clone()).collect();
         let served: BTreeSet<ToolName> = snapshot.surface(&world.surface).map(|surface| surface.tools.clone()).unwrap_or_default();
         prop_assert!(listed.is_subset(&served));
-        // `tools/list` decides with no resources at all; a call with an empty list differs only
-        // for a tool that declares its resources, which check 6 then refuses with `NoneNamed`.
+        // The list is what `decide` allows, except check 6, the currency check and the key
+        // check (decision 0006, amended on 2026-10-07). `tools/list` decides with no resources
+        // and no key; a call with an empty list of resources and no key differs only for a tool
+        // that declares its resources, which check 6 then refuses with `NoneNamed`, and for a
+        // tool not classified `read`, which the key check, last, refuses with `KeyMissing`.
+        // There is no currency check yet (#22).
         for tool in served {
-            let call = CallContext { caller: caller.clone(), tool: tool.clone().into(), resources: Resources::Named(Vec::new()) };
+            let call = CallContext { caller: caller.clone(), tool: tool.clone().into(), resources: Resources::Named(Vec::new()), key: None };
             let decision = decide(&snapshot, &call);
-            let passes_all_but_resources = decision.is_allowed() || matches!(
+            let passes_all_but_resources_and_key = decision.is_allowed() || matches!(
                 decision.reason(),
-                Some(Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { .. }))
+                Some(Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { .. }) | Reason::KeyMissing { .. })
             );
-            prop_assert_eq!(passes_all_but_resources, listed.contains(&tool), "tool {}", tool);
+            prop_assert_eq!(passes_all_but_resources_and_key, listed.contains(&tool), "tool {}", tool);
         }
     }
 
+    /// A call of a tool not classified `read` that carries no key is never allowed, and the key
+    /// check is last: without a key, a call is denied for the reason it is denied with one, and
+    /// a call allowed with one is denied with `KeyMissing` unless its tool is `read`.
+    #[test]
+    fn a_side_effect_without_a_key_is_never_allowed_and_the_key_check_is_last(world in world()) {
+        let snapshot = world.snapshot();
+        let mut keyed = world.call();
+        keyed.key = Some(IdempotencyKey::parse(KEY).unwrap());
+        let mut unkeyed = keyed.clone();
+        unkeyed.key = None;
+        let with_key = decide(&snapshot, &keyed);
+        let without_key = decide(&snapshot, &unkeyed);
+        match with_key.tool() {
+            Some(tool) if with_key.is_allowed() && tool.classification != Classification::Read => {
+                prop_assert!(!without_key.is_allowed());
+                prop_assert_eq!(
+                    without_key.reason().map(Reason::kind),
+                    Some(ReasonKind::KeyMissing)
+                );
+            }
+            _ => {
+                prop_assert_eq!(with_key.is_allowed(), without_key.is_allowed());
+                prop_assert_eq!(with_key.reason(), without_key.reason());
+            }
+        }
+        if let Some(tool) = without_key.tool().filter(|_| without_key.is_allowed()) {
+            prop_assert_eq!(tool.classification, Classification::Read);
+        }
+    }
+
+    /// `open_up` gives the call a key and opens every other check, so a `propose` tool is
+    /// allowed as a `read` one is (decision 0006, amended on 2026-10-07).
     #[test]
     fn an_opened_world_is_allowed(mut world in any_world(), classification in select(vec![Classification::Read, Classification::Propose])) {
         open_up(&mut world);
+        prop_assert!(world.key.is_some(), "open_up left the call without a key");
         if let Some(approved) = world.approved_tool_mut() {
             approved.classification = classification;
         }
@@ -793,6 +841,7 @@ fn row_and_denied(world: &World, call: &CallContext) -> (AuditRecord, Option<Res
             _ => None,
         },
         Begun::Allowed(_) => None,
+        Begun::Reused(reused) => panic!("a fresh store answered a reused key: {reused:?}"),
     };
     (store.last(), denied)
 }

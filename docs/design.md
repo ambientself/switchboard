@@ -857,8 +857,10 @@ A receipt is reserved as `pending` in the same transaction as the begin of an al
 denied call reserves none. It leaves `pending` once, for `completed` (the vendor confirmed it),
 `not_performed` (established, not assumed, that nothing took effect) or `unknown` (the request
 may have reached the vendor). A receipt still `pending` after its row's deadline is read as
-`unknown`. It leaves `unknown` only by reconciliation or a person. Every move records how it
-was established, and the gateway never deletes a receipt.
+`unknown`. It leaves `unknown`, or `pending` past its row's deadline, only by reconciliation
+or a person: a finish that arrives after the deadline is written to its row and leaves the
+receipt as it is. Every move records how it was established, and the gateway never deletes a
+receipt.
 
 - **The key is chosen per request,** never per connection: the caller's tool-use identifier, a
   named `_meta` field for callers that are not models, and a header only from a profile that
@@ -1350,7 +1352,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   the completion. Error rows written before it read `before-0006`. The argument check is
   `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
   refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
-  a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
+  a `read` tool and `other` for any other, until a connector reports `unknown`; a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
   How the resources were found, and the credential identity: built (#56). A tool declared as
   its connector entry's reach is read by the gateway's one constant adapter, which names the
@@ -1379,9 +1381,14 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   own columns with `kind_shape`. `complete_once` now refuses to complete a list row, which its
   old test of the decision let through.
 - For part 2: the outcomes `unknown` and `duplicate`, and an insert grant and shape constraint
-  that let a row be written complete at begin, for the answers to a reused key. Today the
-  outcome allows only `ok`, `error` and `refused`, and the gateway's role cannot insert an
-  outcome.
+  that let a row be written complete at begin, for the answers to a reused key. The core has
+  both outcomes and writes a reused key's row complete through its store (#55, below), but in
+  Postgres the outcome still allows only `ok`, `error` and `refused`, and the gateway's role
+  cannot insert an outcome. Until the package that stores receipts in Postgres adds them, the
+  Postgres store refuses a begin that would reserve a receipt, and an `unknown` or
+  `duplicate` outcome or a vendor reference at finish, before it writes anything, so no side
+  effect runs against it; the receipt-store gate already keeps a release build from serving
+  one.
 - The boot check covers all three triggers. Today it covers the two on the audit table:
   `set_times`, which now sets the deadline too and is still checked, and the one that
   completes a row once. The third is the receipt table's (part 2).
@@ -1407,11 +1414,37 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   nothing. The second half is built in the core: `audit::give_up` consumes a guard, calls no
   connector, and completes its row as `error` with a latency of zero. The gateway does not
   call it yet: that is #40.
-- In the core: `Begun` gains the answers to a reused key;
-  `ToolOutcome` gains `unknown` and a vendor reference; `RequestMetadata` gains the key; the
-  key check joins `decide` after check 6, skipped for `tools/list`; and the properties
-  `tools_list_is_decide_run_once_per_tool` and `an_opened_world_is_allowed` are restated for
-  it (decision 0006, amended 2026-10-07).
+- In the core: built (#55, part 1). The key is an `IdempotencyKey`, 1 to 128 printable ASCII
+  characters other than space, the bound the gateway already keeps a tool-use identifier
+  within. The call context carries it, rather than `RequestMetadata`, so the key the
+  decision saw is the one the receipt holds. The key check joins `decide` last, after check 6
+  and after a comment marking where decision 0012's currency check goes (#22), denies a call
+  of a tool not classified `read` that carries no key with the reason kind `key_missing` and
+  a sentence asking for one, and is skipped for `tools/list`. The decision table has the
+  cases, and the properties `tools_list_is_decide_run_once_per_tool` and
+  `an_opened_world_is_allowed` are restated for it (decision 0006, amended 2026-10-07). The
+  argument digest is SHA-256 over RFC 8785's canonical form with integers written exactly;
+  `serde_json` here has no `arbitrary_precision`, so an integer outside 64 bits reaches the
+  core as the nearest double, and two such integers can share a digest. A receipt holds its
+  row, which is its identifier, the key's scope, the key, the tool, the tool-use identifier,
+  the digest, the resources, its state, how that was established and the vendor's reference;
+  the vendor target and the lookups wait for reconciliation. The scope is the proved
+  principal and the delegation's key scope, which no verifier fills until the delegation
+  carries Otto's session, turn and execution (#22, decision 0009 Still open 8), so a key is
+  scoped to the principal alone today. The moves the state table allows, among them that the
+  call settles its receipt only before its row's deadline, and a `pending` receipt past its
+  deadline read as `unknown`, are the core's; the in-memory store completes a late finish's
+  row and leaves its receipt `pending`. `begin` reserves a `pending` receipt for an allowed
+  side effect through the store's `begin_with_receipt`, in the same write as the row, after
+  the reuse check, which passes over a receipt under the call's own row; a reused key's
+  answer is a row written complete, and `Begun::Reused` carries one of the five answers, a
+  `duplicate` answered as a success with the receipt and the reference. A denial reserves
+  nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
+  gains `unknown` and a vendor reference for a completed side effect, and the row's outcome
+  `unknown` and `duplicate`. The gateway fills the key from the caller's tool-use identifier
+  only; the named `_meta` field and the header come with the gateway package. Not built:
+  receipts in Postgres, reconciliation, resolution records, and the signals for `unknown`
+  receipts.
 - With #25, the harness's in-memory store can also write and then report failure, lose the
   process between run and finish, and keep the answer budget, so the contract suite runs on
   it: built. Already built for both test stores, the core's and the harness's: an identical second
@@ -1426,10 +1459,14 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   table's own constraints it checks the shape of unknown resources and of a reach (no count
   left out, an entry named) and `kind_shape`; the others are not checked in the fake yet. It
   works out a deadline in whole milliseconds without wrapping, as that store does. The
-  contract suite is built and runs on it and on the Postgres store (section 18).
+  contract suite is built and runs on it and on the Postgres store (section 18). Both test
+  stores keep receipts (#55): they reserve, answer and settle them as the core's interface
+  says, a lost begin's receipt as `not_performed` with its row, and the harness's store runs
+  every begin, with a receipt or without, through the same checks and fault switches.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
-  stopped, but no outcome carries a vendor reference yet.
+  stopped. A completion carries a vendor reference now, but only for a call that reserved a
+  receipt, which the Postgres store does not yet allow.
 - Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
   finish pool of its own, the open-row query's single connection apart from it, finish
   waiting at most the answer budget and then retrying on its own task until the deadline, an
@@ -1699,7 +1736,7 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
-  late or oversized count is of reads only until `unknown` is built (the limits entry below).
+  late or oversized count is of reads only until a connector reports `unknown` (the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -2026,7 +2063,9 @@ database's clock as the superuser. Like the other Postgres tests, that runner is
 a test database, and CI's Postgres job fails on a skip. The read-backs are equally strict: the
 whole record, its kind and completion, the time at begin, whether the deadline was set, and the
 deadline less the time at begin. Each expectation is written to what Postgres does. The open-row query of item 5
-is tested on Postgres alone for now (#47), and item 6 waits for receipts. The fault modes below
+is tested on Postgres alone for now (#47). Item 6, receipts, runs on the in-memory store; the
+Postgres runner lists each of its functions as ignored, with the reason, until that store keeps
+receipts, and a test there shows it refuses a side effect meanwhile (#55). The fault modes below
 are each store's own, and keep their own tests.
 
 The fake can be told to fail before writing; to write and then report failure, which is a lost

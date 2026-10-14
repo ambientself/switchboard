@@ -724,6 +724,16 @@ impl FinishRow {
             ),
             Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),
             Outcome::Ok => (None, None),
+            Outcome::Unknown => {
+                return Err(PgAuditError::NoReceipts(
+                    "an `unknown` outcome cannot be written",
+                ));
+            }
+            Outcome::Duplicate { .. } => {
+                return Err(PgAuditError::NoReceipts(
+                    "a `duplicate` outcome cannot be written",
+                ));
+            }
         };
         let latency_ms = i64::try_from(completion.latency_ms)
             .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;
@@ -756,6 +766,8 @@ impl FinishRow {
             Outcome::Ok => "ok",
             Outcome::Error { .. } => "error",
             Outcome::Refused { .. } => "refused",
+            Outcome::Unknown => "unknown",
+            Outcome::Duplicate { .. } => "duplicate",
         }
     }
 
@@ -1700,6 +1712,27 @@ mod tests {
         for kind in gateway_core::ReasonKind::ALL {
             let name = name_of(&kind).unwrap();
             assert!(!name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+        }
+    }
+
+    /// The store keeps no receipts yet (#55), so it refuses an outcome only a call with one has,
+    /// before anything is sent: finish then gives up, and the row stays open.
+    #[test]
+    fn an_unknown_or_duplicate_outcome_is_refused_until_receipts_are_kept() {
+        for outcome in [
+            Outcome::Unknown,
+            Outcome::Duplicate {
+                receipt: AuditRowId::new("01a00000-0000-7000-8000-000000000000"),
+            },
+        ] {
+            let refused = FinishRow::from_completion(&Completion {
+                outcome: outcome.clone(),
+                latency_ms: 0,
+            });
+            assert!(
+                matches!(refused, Err(PgAuditError::NoReceipts(_))),
+                "{outcome:?}: {refused:?}"
+            );
         }
     }
 

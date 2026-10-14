@@ -16,14 +16,16 @@ use gateway_core::audit::{
     RecordedResources, RequestMetadata,
 };
 use gateway_core::{
-    CallContext, Classification, IDENTITY_FAILURE, ReasonKind, RequestedTool, decide,
+    CallContext, Classification, IDENTITY_FAILURE, IdempotencyKey, ReasonKind, ReceiptState,
+    RequestedTool, ToolUseId, decide,
 };
 use gateway_identity::{Identity, Verification, VerifyError};
 use gateway_testkit::{
     Caller, DRAFT_REFUSAL, DRAFT_TOOL, FOREIGN_DRAFT, FakeCredentialSource, Fixture,
     FixtureConnector, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND,
     RESOURCE_SYSTEM, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock,
-    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, block_on, policy_data, poll_once, row_start,
+    TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, block_on, fresh_key, policy_data, poll_once,
+    row_start,
 };
 use serde_json::{Value, json};
 
@@ -46,6 +48,8 @@ enum Response {
     },
     /// The call ran. `row_completed` is whether the audit row was finished.
     Answered { answer: Answer, row_completed: bool },
+    /// Answered from the receipt of an earlier call under the same key, with its sentence.
+    Reused(String),
 }
 
 struct Gateway {
@@ -79,13 +83,27 @@ impl Gateway {
         self.fixture.token(caller)
     }
 
-    /// Steps 1 to 9 of the request path for one `tools/call`.
+    /// Steps 1 to 9 of the request path for one `tools/call`, with a key of its own.
     async fn handle(
         &self,
         token: Option<&str>,
         surface: &str,
         tool: &str,
         arguments: Value,
+    ) -> Response {
+        self.handle_keyed(token, surface, tool, arguments, Some(fresh_key()))
+            .await
+    }
+
+    /// Steps 1 to 9 of the request path for one `tools/call` carrying `key` as its tool-use
+    /// identifier, which is its idempotency key, or carrying none.
+    async fn handle_keyed(
+        &self,
+        token: Option<&str>,
+        surface: &str,
+        tool: &str,
+        arguments: Value,
+        key: Option<IdempotencyKey>,
     ) -> Response {
         let principal = match self.identity.check(token) {
             Verification::Proved(principal) => principal,
@@ -101,6 +119,7 @@ impl Gateway {
             resources: FixtureConnector::resources_of(tool, &arguments),
             caller: Fixture::context_for(principal, surface),
             tool: RequestedTool::new(tool),
+            key: key.clone(),
         };
         let decision = decide(&self.fixture.policy, &call);
         let begun = match audit::begin(
@@ -108,7 +127,10 @@ impl Gateway {
             row_start(),
             decision,
             arguments,
-            RequestMetadata::default(),
+            RequestMetadata {
+                tool_use_id: key.map(|key| ToolUseId::new(key.as_str())),
+                claimed_team: None,
+            },
         )
         .await
         {
@@ -120,6 +142,7 @@ impl Gateway {
                 sentence: refusal.sentence().to_owned(),
                 reason: refusal.reason().kind(),
             },
+            Begun::Reused(reused) => Response::Reused(reused.sentence()),
             Begun::Allowed(guard) => {
                 let started = self.clock.unix_millis();
                 let ran = audit::run(&self.connector, guard).await;
@@ -136,6 +159,17 @@ impl Gateway {
     fn call(&self, caller: Caller, surface: &str, tool: &str, arguments: Value) -> Response {
         let token = self.token(caller);
         block_on(self.handle(Some(&token), surface, tool, arguments))
+    }
+
+    fn call_keyed(
+        &self,
+        caller: Caller,
+        tool: &str,
+        arguments: Value,
+        key: Option<IdempotencyKey>,
+    ) -> Response {
+        let token = self.token(caller);
+        block_on(self.handle_keyed(Some(&token), SURFACE_ALL, tool, arguments, key))
     }
 
     /// Nothing reached the connector or the credential source.
@@ -425,6 +459,100 @@ fn a_direct_write_is_denied_to_every_caller_and_the_same_change_proposed_is_allo
 
 /// A `propose` tool's refusal of something the gateway did not create is recorded like a scope
 /// refusal: the outcome `refused`, on a row the decision function allowed.
+/// A side effect is not run again under the same key (decision 0009, "How it is tested"): the
+/// fixture's draft tool, called twice with one key, opens one draft. The second call is
+/// answered from the first call's receipt as a `duplicate`, a success naming the receipt and
+/// the draft the vendor made, and its row is complete before anything could run. The same key
+/// for other arguments is refused, and runs nothing; a call with no key is denied, asking for
+/// one.
+#[test]
+fn a_side_effect_called_twice_with_one_key_runs_once() {
+    let gateway = Gateway::new();
+    let key = fresh_key();
+    let Response::Answered {
+        answer: Answer::Ok(opened),
+        row_completed: true,
+    } = gateway.call_keyed(
+        Caller::TeamA,
+        DRAFT_TOOL,
+        own(Caller::TeamA),
+        Some(key.clone()),
+    )
+    else {
+        panic!("team A's draft was not opened")
+    };
+    assert_eq!(opened["draft"], "draft-1");
+    let receipts = gateway.store.receipts();
+    let [receipt] = receipts.as_slice() else {
+        panic!("one call reserved {receipts:?}")
+    };
+    assert_eq!(receipt.state, ReceiptState::Completed);
+    assert_eq!(
+        receipt
+            .reference
+            .as_ref()
+            .map(|reference| reference.as_str()),
+        Some("draft-1")
+    );
+
+    let Response::Reused(answer) = gateway.call_keyed(
+        Caller::TeamA,
+        DRAFT_TOOL,
+        own(Caller::TeamA),
+        Some(key.clone()),
+    ) else {
+        panic!("the same call under the same key was not answered from its receipt")
+    };
+    assert_eq!(
+        answer,
+        format!(
+            "This call was already made under the key `{key}`, and it completed, so it was not \
+             made again. It is receipt `{}`, and the vendor's reference for what it made is \
+             `draft-1`.",
+            receipt.row.as_str()
+        )
+    );
+    assert_eq!(
+        gateway.connector.writes().len(),
+        1,
+        "the draft was made twice"
+    );
+    assert_eq!(gateway.connector.received().len(), 1);
+    let row = gateway.store.row(1).unwrap();
+    assert_eq!(row.decision, DecisionKind::Allow);
+    assert_eq!(
+        row.completion,
+        Some(Completion {
+            outcome: Outcome::Duplicate {
+                receipt: receipt.row.clone()
+            },
+            latency_ms: 0,
+        })
+    );
+
+    // Other arguments under the same key: refused, naming the key, and nothing runs.
+    let Response::Reused(conflict) = gateway.call_keyed(
+        Caller::TeamA,
+        DRAFT_TOOL,
+        json!({"document": TEAM_A_DOCUMENT, "text": "Something else."}),
+        Some(key.clone()),
+    ) else {
+        panic!("other arguments under a used key were not refused")
+    };
+    assert!(conflict.contains(key.as_str()), "{conflict}");
+    assert!(conflict.contains("nothing ran"), "{conflict}");
+
+    // No key: denied by the decision function, with nothing reserved.
+    let Response::Denied { reason, .. } =
+        gateway.call_keyed(Caller::TeamA, DRAFT_TOOL, own(Caller::TeamA), None)
+    else {
+        panic!("a proposal with no key was not denied")
+    };
+    assert_eq!(reason, ReasonKind::KeyMissing);
+    assert_eq!(gateway.connector.received().len(), 1);
+    assert_eq!(gateway.store.receipts().len(), 1);
+}
+
 #[test]
 fn a_proposal_on_something_the_gateway_did_not_create_is_the_outcome_refused() {
     let gateway = Gateway::new();

@@ -37,7 +37,7 @@ use gateway_testkit::{
     PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL,
     SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT,
     TEAM_B_SUBJECT, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, document,
-    poll_once,
+    fresh_key, poll_once,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use serde_json::{Value, json};
@@ -210,6 +210,17 @@ impl World {
             Some(&self.token(caller)),
             surface,
             tools_call(tool, arguments),
+        )
+    }
+
+    /// A 2026-07-28 `tools/call` from `caller` carrying a fresh tool-use identifier, which is
+    /// its idempotency key: what a call of a tool not classified `read` needs.
+    fn propose(&self, caller: Caller, surface: &str, tool: &str, arguments: Value) -> Got {
+        let key = fresh_key();
+        self.send(
+            Some(&self.token(caller)),
+            surface,
+            tools_call_with_id(tool, arguments, key.as_str()),
         )
     }
 
@@ -587,7 +598,7 @@ fn an_allowed_proposal_runs_under_the_callers_credential_and_completes_its_row()
     let world = World::new();
     let arguments = json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."});
     let result = world
-        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, arguments.clone())
+        .propose(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, arguments.clone())
         .result();
     assert_eq!(result["isError"], json!(false));
     assert_eq!(result["structuredContent"]["draft"], json!("draft-1"));
@@ -604,7 +615,7 @@ fn an_allowed_proposal_runs_under_the_callers_credential_and_completes_its_row()
     // A draft the gateway did not open is refused by the connector when it runs, and the row
     // records the refusal.
     let sentence = world
-        .call(
+        .propose(
             Caller::TeamA,
             SURFACE_ALL,
             DRAFT_TOOL,
@@ -624,6 +635,50 @@ fn an_allowed_proposal_runs_under_the_callers_credential_and_completes_its_row()
         world.connector.writes().len(),
         1,
         "the refused revision wrote nothing"
+    );
+}
+
+/// A call's key is its tool-use identifier, the first carrier (decision 0009, "The key"). A
+/// proposal sent with none is denied, asking for one, and nothing runs. Sent twice with one
+/// identifier, it runs once: the second is answered from the first's receipt as a duplicate, a
+/// success naming the receipt and the vendor's reference, and its row is complete.
+#[test]
+fn a_proposals_key_is_its_tool_use_identifier() {
+    let world = World::new();
+    let arguments = json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."});
+    let sentence = world
+        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, arguments.clone())
+        .denial();
+    assert!(sentence.contains("tool-use identifier"), "{sentence}");
+    assert_eq!(world.row(0).reason, Some(ReasonKind::KeyMissing));
+    world.assert_nothing_ran();
+
+    let token = world.token(Caller::TeamA);
+    let send = || {
+        world.send(
+            Some(&token),
+            SURFACE_ALL,
+            tools_call_with_id(DRAFT_TOOL, arguments.clone(), "toolu_one_call"),
+        )
+    };
+    let first = send().result();
+    assert_eq!(first["structuredContent"]["draft"], json!("draft-1"));
+    let again = send().result();
+    assert_eq!(again["isError"], json!(false), "{again}");
+    let receipt = world.store.receipts()[0].row.clone();
+    assert_eq!(
+        again["structuredContent"]["receipt"],
+        json!(receipt.as_str())
+    );
+    assert_eq!(again["structuredContent"]["reference"], json!("draft-1"));
+    assert_eq!(
+        world.connector.writes().len(),
+        1,
+        "the draft was made twice"
+    );
+    assert_eq!(
+        world.row(2).completion.map(|completion| completion.outcome),
+        Some(Outcome::Duplicate { receipt })
     );
 }
 
@@ -1828,7 +1883,7 @@ fn a_tool_declared_as_the_reach_names_its_entrys_reach_whatever_the_arguments() 
     // A tool not declared as the reach is still read by its connector's adapter, and records
     // what its call named, under the same entry's identity.
     world
-        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA))
+        .propose(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamA))
         .result();
     let row = world.row(2);
     assert_eq!(

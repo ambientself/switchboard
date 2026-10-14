@@ -4,8 +4,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use gateway_core::AuditStore;
 use gateway_core::audit::{AuditRowId, RowKind};
+use gateway_core::{AuditStore, Receipt};
 use gateway_testkit::StoreBudgets;
 use gateway_testkit::contract::{self, ContractStore, StoredRecord, StoredRow};
 use serde_json::{Value, json};
@@ -188,6 +188,22 @@ impl ContractStore for Postgres {
             .unwrap();
         micros_since_epoch(now.get(0))
     }
+
+    /// The store keeps no receipts yet, so the functions that read them are not run here: see
+    /// [`NOT_YET_ON_POSTGRES`].
+    async fn receipts(&self) -> Vec<Receipt> {
+        panic!("{NOT_YET_ON_POSTGRES}")
+    }
+
+    /// As [`receipts`](Self::receipts): only item 6's functions lose confirmations.
+    fn lose_every_begin_confirmation(&self) {
+        panic!("{NOT_YET_ON_POSTGRES}")
+    }
+
+    /// As [`receipts`](Self::receipts): only item 6's functions pass a row's deadline.
+    async fn pass_deadline(&self, _row: &AuditRowId) {
+        panic!("{NOT_YET_ON_POSTGRES}")
+    }
 }
 
 /// A time Postgres gave in whole microseconds since the epoch.
@@ -229,4 +245,41 @@ contract!(
     the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget,
     a_list_row_is_stored_complete_with_no_deadline,
     a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row,
+);
+
+/// Why item 6 of the contract suite, receipts, is not run against Postgres: the store keeps
+/// none yet (#55), and refuses every begin that would reserve one, so nothing runs. Each of
+/// its functions is listed below, ignored with this reason, so that `cargo test` reports each
+/// as not run rather than leaving it out. The package that stores receipts in Postgres runs
+/// them.
+const NOT_YET_ON_POSTGRES: &str = "the Postgres store keeps no receipts yet (#55), so item 6 of the contract suite is not run against it";
+
+macro_rules! not_yet_on_postgres {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[tokio::test]
+            #[ignore = "the Postgres store keeps no receipts yet (#55)"]
+            async fn $name() {
+                let Some(db) = TestDatabase::create().await else {
+                    return;
+                };
+                let postgres = Postgres {
+                    store: db.store(PoolSizes::default()).with_budgets(BUDGETS),
+                    admin: db.admin().await,
+                };
+                contract::$name(&postgres).await;
+            }
+        )*
+    };
+}
+
+not_yet_on_postgres!(
+    a_receipt_is_reserved_with_its_row_or_not_at_all,
+    a_receipt_moves_with_its_finish,
+    a_late_finish_completes_its_row_and_leaves_its_receipt_pending,
+    a_key_is_unique_in_its_scope_under_concurrent_calls,
+    two_delegations_under_one_principal_may_use_the_same_key,
+    a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once,
+    a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_error_and_its_receipt_not_performed,
+    each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table_that_matches,
 );

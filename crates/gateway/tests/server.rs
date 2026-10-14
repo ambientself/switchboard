@@ -351,7 +351,7 @@ async fn send_and_wait(server: &Server, request: Http) -> TcpStream {
 
 /// Team A's call to the draft tool, a side effect.
 fn propose(server: &Server) -> Http {
-    server.call(
+    server.call_with_key(
         Caller::TeamA,
         SURFACE_ALL,
         DRAFT_TOOL,

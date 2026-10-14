@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::decision::CallContext;
 use crate::policy::ApprovedTool;
+use crate::receipt::VendorReference;
 
 /// A boxed future that can move between threads.
 ///
@@ -76,6 +77,17 @@ pub enum ToolOutcome {
     /// The connector refused because of what the call names. The sentence is returned to the
     /// caller and recorded on the row, and reaches the caller only after that row is finished.
     Refused(String),
+    /// A side effect the vendor confirmed, with the vendor's reference for what it made, such
+    /// as a pull request's number: its result, for the caller, and the reference, which the
+    /// call's receipt records. Recorded as `ok`. From a `read` tool, which has no receipt, the
+    /// reference is dropped.
+    Completed(serde_json::Value, VendorReference),
+    /// The connector sent a side effect's request and got no definite answer: a timeout, a
+    /// dropped connection, a server error after the request was sent, or a result over the
+    /// gateway's bound (decision 0009). Recorded as `unknown`, and the caller is told not to
+    /// repeat the call. A read never reports it: from a `read` tool it is recorded as an error
+    /// of the kind `other`.
+    Unknown,
 }
 
 impl ToolOutcome {
@@ -94,7 +106,7 @@ pub enum ErrorKind {
     InvalidArguments,
     /// A tool classified `read` gave an answer too large to accept, or none by its deadline.
     /// From a tool of any other classification the same failure is [`Other`](Self::Other),
-    /// until the outcome `unknown` is built.
+    /// until a connector reports the outcome `unknown`.
     OversizedOrLateRead,
     /// The credential custodian refused the credential an allowed call needed. Nothing reports
     /// it yet: no connector asks a custodian.
