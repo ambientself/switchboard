@@ -540,7 +540,7 @@ impl Reuse {
 pub enum Reservation {
     /// The row was written open, and a `pending` receipt reserved under it. A retried begin
     /// that finds both, written by an earlier attempt whose confirmation was lost, answers
-    /// this too.
+    /// this too, until the row's deadline passes.
     Reserved,
     /// The key already had a receipt in its scope, reserved under another row. This call's
     /// row was written complete, with the answer's [`completion`](Reuse::completion), and no

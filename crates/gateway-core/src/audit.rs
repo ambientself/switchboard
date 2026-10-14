@@ -413,10 +413,12 @@ pub trait AuditStore: Send + Sync {
     ///   its answer, and not before. Two calls with one key in one scope never both reserve.
     /// - A second call with an identifier already stored, whose stored decision is the same,
     ///   writes nothing and returns what the first wrote: [`Reservation::Reserved`] while the
-    ///   row's receipt is `pending`, and the same answer for a row written as one. A row
-    ///   whose receipt has left `pending` is refused, since its call has run or has been
-    ///   settled without running, and must not run again; so is a row of another decision, as
-    ///   at [`begin`](AuditStore::begin), and a row stored with no receipt and no answer.
+    ///   row's receipt is `pending` and the row's deadline has not passed, and the same answer
+    ///   for a row written as one. A row whose receipt has left `pending` is refused, since its
+    ///   call has run or has been settled without running, and must not run again. So is one
+    ///   whose receipt is still `pending` past the row's deadline, which reads as `unknown`, so
+    ///   its call may have run; a row of another decision, as at
+    ///   [`begin`](AuditStore::begin); and a row stored with no receipt and no answer.
     /// - A record that is not an allowed call is refused, and nothing is written: a denial
     ///   reserves nothing.
     /// - A store that keeps no receipts refuses every call, and nothing runs.

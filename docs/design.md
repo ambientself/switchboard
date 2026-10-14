@@ -1468,16 +1468,18 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   unique index makes the second reservation wait for the first to commit and then insert
   nothing; that begin is undone and made again from the check, which now finds the receipt and
   writes the row complete with its answer. A retried begin of a row it finds stored answers
-  `Reserved` while the row's receipt is `pending`, the answer the row was written with (one of
-  the five for the earlier receipt, whatever has become of it since), and refuses a row whose
-  receipt has left `pending`, one begun without a receipt, or one of another decision or kind.
-  Finish, the completion of a lost begin's row and `give_up` complete the row and settle its
-  receipt in one transaction, with the vendor's reference, while it is `pending` and the row's
-  deadline has not passed by the database's clock; after it the row is completed and the
-  receipt left `pending`. If the deadline passes between the store's test and the trigger's,
-  the trigger refuses with SQLSTATE `SB001` and the store completes the row again, leaving the
-  receipt `pending`. `unknown`, or a reference, for a row that reserved no receipt is refused,
-  and so is a `duplicate` at finish. The Postgres runner runs item 6 of the contract suite.
+  `Reserved` while the row's receipt is `pending` and the row's deadline has not passed by the
+  database's clock, the answer the row was written with (one of the five for the earlier
+  receipt, whatever has become of it since), and refuses a row whose receipt has left
+  `pending`, one whose receipt is still `pending` past the deadline, which reads as `unknown`,
+  one begun without a receipt, or one of another decision or kind. Finish, the completion of a
+  lost begin's row and `give_up` complete the row and settle its receipt in one transaction,
+  with the vendor's reference, while it is `pending` and the row's deadline has not passed by
+  the database's clock; after it the row is completed and the receipt left `pending`. If the
+  deadline passes between the store's test and the trigger's, the trigger refuses with
+  SQLSTATE `SB001` and the store completes the row again, leaving the receipt `pending`.
+  `unknown`, or a reference, for a row that reserved no receipt is refused, and so is a
+  `duplicate` at finish. The Postgres runner runs item 6 of the contract suite.
   A begin whose confirmation is lost after it wrote a reused key's row gives that row up as
   completed differently, where the in-memory store keeps its answer silently. The row is the
   same in both. The in-memory store's silence is the behaviour to match: that row's completion
@@ -1560,9 +1562,10 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   says, a lost begin's receipt as `not_performed` with its row, and the harness's store runs
   every begin, with a receipt or without, through the same checks and fault switches. The
   harness's store reads a receipt still `pending` past its row's deadline as `unknown` in
-  the receipts it gives back, in the answer to a reused key and on a retried begin of its own
-  row, which it refuses rather than answer as reserved; the contract suite's runner reads
-  receipts as held.
+  the receipts it gives back and in the answer to a reused key; the contract suite's runner
+  reads receipts as held. Both stores read it as `unknown` on a retried begin of its own row,
+  the Postgres store by the database's clock, and refuse that begin rather than answer it as
+  reserved, and item 6 of the contract suite checks that on each.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped. A completion carries a vendor reference for a call that reserved a receipt, which
@@ -2163,8 +2166,10 @@ that can do what Postgres cannot tests nothing.
 6. Once receipts are built: a receipt is reserved with its row or not at all, and moves with
    its finish. A key stays unique in its scope under concurrent calls, and two delegations
    under one principal can use the same key. A begin retried after a lost confirmation finds
-   its own receipt, runs once, and is not refused as reuse. A begin whose confirmation was lost
-   on every attempt leaves its row completed as `error` and its receipt `not_performed`.
+   its own receipt, runs once, and is not refused as reuse; retried once its row's deadline
+   has passed with the receipt still `pending`, it is refused and runs nothing. A begin whose
+   confirmation was lost on every attempt leaves its row completed as `error` and its receipt
+   `not_performed`.
 
 Items 1 to 3 are built. Of item 4, the suite checks that a call row's time at begin comes from
 the store's clock and that its deadline is that time plus the begin budget, the call deadline,
