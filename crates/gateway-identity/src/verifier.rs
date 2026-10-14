@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use gateway_core::{GroupId, Principal, PrincipalId, PrincipalKind, Verifier};
+use gateway_core::{GroupId, PodUid, Principal, PrincipalId, PrincipalKind, Verifier};
 use jsonwebtoken::jwk::{
     AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm, KeyOperations, PublicKeyUse,
 };
@@ -129,7 +129,10 @@ impl TokenVerifier {
                     .get(&subject)
                     .ok_or(VerifyError::UnknownSubject)?
                     .clone();
-                PrincipalKind::Workload { team }
+                // Last, so a token is refused for its pod only once everything else about it
+                // has passed.
+                let pod = pod_of(&claims)?;
+                PrincipalKind::Workload { team, pod }
             }
             IssuerKind::User { groups_claim } => PrincipalKind::User {
                 groups: groups_of(&claims, groups_claim)?,
@@ -534,4 +537,28 @@ fn groups_of(claims: &Claims, name: &str) -> Result<BTreeSet<GroupId>, VerifyErr
             .ok_or(VerifyError::MalformedClaim(Claim::Groups)),
         Some(_) => Err(VerifyError::MalformedClaim(Claim::Groups)),
     }
+}
+
+/// A workload's pod UID, from the `kubernetes.io` claim of a Kubernetes projected
+/// ServiceAccount token: `{"kubernetes.io": {"pod": {"name": ..., "uid": ...}, ...}}`.
+///
+/// Read only for a workload issuer, and only from claims the signature covers. A token with
+/// no `kubernetes.io` claim, or with no `pod` in it, such as a token not bound to a pod, names
+/// no pod: `None`. A `kubernetes.io` or `pod` that is not an object, a `pod` with no `uid`, and
+/// a `uid` that is not a pod UID each refuse the token. The refusal names the claim and carries
+/// nothing from it.
+fn pod_of(claims: &Claims) -> Result<Option<PodUid>, VerifyError> {
+    let malformed = VerifyError::MalformedClaim(Claim::Kubernetes);
+    let Some(kubernetes) = claims.get("kubernetes.io") else {
+        return Ok(None);
+    };
+    let kubernetes = kubernetes.as_object().ok_or(malformed.clone())?;
+    let Some(pod) = kubernetes.get("pod") else {
+        return Ok(None);
+    };
+    pod.get("uid")
+        .and_then(Value::as_str)
+        .and_then(|uid| PodUid::parse(uid).ok())
+        .map(Some)
+        .ok_or(malformed)
 }
