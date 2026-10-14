@@ -67,6 +67,9 @@ async fn answer_with(body: impl Fn(&Value) -> Value + Send + Sync + 'static) -> 
     answer_to(move |request| vec![Step::Write(json_response(&body(request)))]).await
 }
 
+/// A script made at run time, for a table of cases.
+type BoxedScript = Box<dyn Fn(&Value) -> Vec<Step> + Send + Sync>;
+
 fn not_mcp() -> Answer {
     Answer::Error(outcome::NOT_MCP.to_owned())
 }
@@ -291,7 +294,7 @@ async fn a_side_effect_with_no_definite_answer_is_unknown() {
             ))]
         }
     };
-    let cases: Vec<(&str, Box<dyn Fn(&Value) -> Vec<Step> + Send + Sync>)> = vec![
+    let cases: Vec<(&str, BoxedScript)> = vec![
         ("500", Box::new(status("500 Internal Server Error"))),
         ("502", Box::new(status("502 Bad Gateway"))),
         ("202", Box::new(status("202 Accepted"))),
@@ -337,11 +340,7 @@ async fn a_side_effect_the_server_refused_is_an_error_and_not_performed() {
     let status = |status: &'static str| {
         move |_: &Value| vec![Step::Write(response(status, "text/plain", b"no"))]
     };
-    let cases: Vec<(
-        &str,
-        Box<dyn Fn(&Value) -> Vec<Step> + Send + Sync>,
-        ErrorKind,
-    )> = vec![
+    let cases: Vec<(&str, BoxedScript, ErrorKind)> = vec![
         ("400", Box::new(status("400 Bad Request")), ErrorKind::Other),
         (
             "401",

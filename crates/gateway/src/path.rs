@@ -56,9 +56,9 @@
 //! A client that disconnects is told apart by the [`Disconnect`] `respond` is given (decision
 //! 0009, "Where a call runs"). If it has fired by the moment the connector would be invoked,
 //! checked immediately before, the connector is not called and the row is completed as
-//! `error`, a side effect's receipt as `not_performed`. If it fires while a read runs, the read is
-//! cancelled and recorded as `error`. A side effect runs to completion whatever it does. Either
-//! way the answer is still made; nobody is left to read it.
+//! `error`, a side effect's receipt as `not_performed`. If it fires while a read runs, the read
+//! is cancelled and recorded as `error`. A side effect runs to completion whatever it does.
+//! Either way the answer is still made; nobody is left to read it.
 //!
 //! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
 //! everything from it, so a registry reload never splits one request across two versions.
