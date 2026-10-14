@@ -13,7 +13,7 @@ use gateway_otto::format::{MAX_GRANT_BYTES, VERSION};
 use gateway_otto::minter::{
     TestMinter, encode, padded, parts, with_non_canonical_s, with_part, with_trailing_bits,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
 
 #[test]
@@ -341,6 +341,39 @@ fn signed_claims_of_the_wrong_shape_are_malformed() {
     ] {
         malformed(with(changes).to_string().as_bytes());
     }
+    // Every claim, in order, as a JSON array rather than an object: with and without the pod
+    // and egress setting, and for an issuer that requires them.
+    let positional = json!([
+        [DEPLOYMENT],
+        NOW,
+        NOW + 600,
+        "team-canary-payments",
+        ["github_get_pr"],
+        7,
+        "session-canary",
+        "turn-canary",
+        "execution-canary",
+        "actor-canary@example.test",
+        POD,
+        "sealed",
+    ]);
+    let short = Value::Array(positional.as_array().unwrap()[..10].to_vec()).to_string();
+    let positional = positional.to_string();
+    malformed(positional.as_bytes());
+    malformed(format!(" \n{positional}").as_bytes());
+    malformed(short.as_bytes());
+    let strict = strict_verifier(&minter);
+    refused_as(
+        &strict,
+        &minter.mint_bytes(positional.as_bytes()),
+        Malformed,
+        true,
+    );
+    // The object form of the same claims, with leading whitespace, verifies.
+    accepted(
+        &strict,
+        &minter.mint_bytes(format!(" \n{}", claims()).as_bytes()),
+    );
     // A claim this format names, given twice.
     let twice = claims()
         .to_string()

@@ -409,6 +409,14 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 
 impl Claims {
     fn parse(bytes: &[u8], require_pod: bool, require_egress: bool) -> Option<Self> {
+        // The claims are a JSON object. A derived struct would also read an array of the values
+        // in field order, so anything that does not open with `{` is refused before parsing.
+        let opening = bytes
+            .iter()
+            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+        if opening != Some(&b'{') {
+            return None;
+        }
         let wire: Wire = serde_json::from_slice(bytes).ok()?;
         let text = |value: Option<String>| value.filter(|value| !value.is_empty());
         let tools = wire

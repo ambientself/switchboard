@@ -1472,6 +1472,25 @@ mutate("otto-grant-empty-tool-name-accepted", "a grant listing an empty tool nam
 mutate("otto-grant-empty-claim-accepted", "an empty team, session, turn, execution or actor is accepted", OV,
        "        let text = |value: Option<String>| value.filter(|value| !value.is_empty());",
        "        let text = |value: Option<String>| value;")
+mutate("otto-grant-absent-audience-accepted", "a grant without aud is read as one for no deployment", OV,
+       "            aud: wire.aud?,", "            aud: wire.aud.unwrap_or_default(),")
+mutate("otto-grant-absent-iat-accepted", "a grant without iat is read as issued at the epoch", OV,
+       "            iat: wire.iat.filter(|iat| *iat >= 0)?,", "            iat: wire.iat.filter(|iat| *iat >= 0).unwrap_or(0),")
+mutate("otto-grant-absent-team-accepted", "a grant without team is accepted", OV,
+       "            team: text(wire.team)?,", "            team: text(wire.team).unwrap_or_default(),")
+mutate("otto-grant-absent-epoch-accepted", "a grant without epoch is read as epoch 1", OV,
+       "                .and_then(|epoch| u64::try_from(epoch).ok())?,",
+       "                .and_then(|epoch| u64::try_from(epoch).ok())\n                .unwrap_or(1),")
+mutate("otto-grant-absent-actor-accepted", "a grant without actor is accepted", OV,
+       "            actor: text(wire.actor)?,", "            actor: text(wire.actor).unwrap_or_default(),")
+mutate("otto-grant-claims-array-accepted", "claims given as a JSON array of the values in field order are accepted", OV,
+       "        if opening != Some(&b'{') {", "        if false {")
+mutate("otto-grant-extra-parts-accepted", "a grant with parts after the signature is accepted", OV,
+       "        let [version, key_id, claims, signature] = parts[..] else {",
+       "        let [version, key_id, claims, signature, ..] = parts[..] else {")
+mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with a configured key", OV,
+       "            .and_then(|id| self.keys.keys.get_key_value(id))\n",
+       "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
 mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
        ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
 mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
