@@ -1010,8 +1010,8 @@ async fn a_receipt_that_commits_between_an_attempts_read_and_its_update_is_settl
     let held: String = admin
         .query_one(
             "SELECT query FROM pg_catalog.pg_stat_activity
-             WHERE usename = $1 AND state = 'idle in transaction'",
-            &[&GATEWAY_ROLE],
+             WHERE usename = $1 AND datname = $2 AND state = 'idle in transaction'",
+            &[&GATEWAY_ROLE, &db.name()],
         )
         .await
         .unwrap()
