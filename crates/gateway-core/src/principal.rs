@@ -390,6 +390,9 @@ impl UnverifiedDelegation {
 /// A delegation the request carried: verified, or not. The call context holds an
 /// `Option<PresentedDelegation>`, so a delegation is absent, present and verified, or present
 /// and unverified (decision 0006, amended on 2026-10-07).
+// One is made per call, and a verified delegation is the usual case, so boxing it would add an
+// allocation to most calls to save space on the rarer one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresentedDelegation {
     /// The delegation verified.

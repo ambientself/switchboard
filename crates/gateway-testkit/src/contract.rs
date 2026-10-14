@@ -136,6 +136,8 @@ pub trait ContractStore {
 }
 
 /// The record a row holds.
+// Test-only, made once per read-back: boxing a call record would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredRecord {
     /// A row of kind `call`, with its completion once finished.
