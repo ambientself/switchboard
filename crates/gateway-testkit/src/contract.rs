@@ -23,10 +23,11 @@
 //! row's deadline has passed, when a late finish completes the row and leaves the receipt
 //! `pending`, read as `unknown`, for reconciliation or a person; a key is unique
 //! in its scope under concurrent calls, and two delegations under one principal may each use
-//! it; a begin retried after a lost confirmation finds its own receipt and runs once; a begin
-//! whose confirmation is lost on every attempt leaves its row `error` and its receipt
-//! `not_performed`; and each receipt state against each line of the reuse table. Both stores
-//! run every one of them.
+//! it; a begin retried after a lost confirmation finds its own receipt and runs once, but once
+//! its row's deadline has passed with the receipt still `pending` it is refused and runs
+//! nothing; a begin whose confirmation is lost on every attempt leaves its row `error` and its
+//! receipt `not_performed`; and each receipt state against each line of the reuse table. Both
+//! stores run every one of them.
 //!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
@@ -2048,6 +2049,63 @@ pub async fn a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and
     assert!(again.is_err(), "a call that ran was begun again: {again:?}");
     assert_eq!(stored(contract, &start.row).await, after);
     assert_eq!(connector.calls(), 1);
+}
+
+/// A begin retried under a row whose receipt is still `pending` is answered with its own
+/// reservation while the row's deadline has not passed, and refused once it has (decision
+/// 0009, "What a receipt is"): the receipt then reads as `unknown`, wherever it is read, so its
+/// call may have run and is no longer the call's to run. The refused begin runs nothing and
+/// writes nothing: the row stays open, and the receipt is held `pending`.
+pub async fn a_retried_begin_of_a_receipt_pending_past_its_deadline_is_refused_and_runs_nothing(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let key = fresh_key();
+    let arguments = proposal("Retried late.");
+    let start = row_start();
+    let decide_again = || keyed_proposal(&fixture, &arguments, Some(&key));
+
+    // Begun and never run, as a begin whose confirmation was lost is.
+    let _lost = proposal_guard(store, &fixture, &start, &arguments, &key).await;
+    let retried = begin_keyed(
+        store,
+        &start,
+        decide_again(),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    assert!(
+        matches!(&retried, Ok(Begun::Allowed(guard)) if guard.row() == &start.row),
+        "a retried begin before its row's deadline was not answered with its own reservation: \
+         {retried:?}"
+    );
+
+    contract.pass_deadline(&start.row).await;
+    let before = stored(contract, &start.row).await;
+    let late = begin_keyed(
+        store,
+        &start,
+        decide_again(),
+        &arguments,
+        Some(key.as_str()),
+    )
+    .await;
+    // Refused, the begin hands out no guard, so nothing can run.
+    assert!(
+        late.is_err(),
+        "a retried begin of a receipt pending past its row's deadline was answered: {late:?}"
+    );
+    let receipts = receipts_for(contract, &key).await;
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(
+        (&receipts[0].row, receipts[0].state),
+        (&start.row, ReceiptState::Pending)
+    );
+    let after = stored(contract, &start.row).await;
+    assert_eq!(after, before);
+    assert_eq!(after.completion, None);
 }
 
 /// A begin whose confirmation was lost on every attempt leaves its row completed as `error`,

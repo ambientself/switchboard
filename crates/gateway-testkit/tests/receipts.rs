@@ -1,8 +1,8 @@
 //! The in-memory store reads a receipt still `pending` past its row's deadline as `unknown`
-//! (decision 0009, "What a receipt is"): in the receipts it gives back, in the answer to a
-//! reused key, and on a retried begin of the receipt's own row, which must not be answered as
-//! reserved. The shared contract suite reads receipts as a store holds them, so these cases
-//! are here and not there.
+//! (decision 0009, "What a receipt is"): in the receipts it gives back, and in the answer to a
+//! reused key. The shared contract suite reads receipts as a store holds them, so these cases
+//! are here and not there. A retried begin of the receipt's own row, which both stores refuse
+//! rather than answer as reserved, is the contract suite's.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
@@ -111,34 +111,6 @@ fn a_pending_receipt_past_its_rows_deadline_reads_as_unknown() {
         before,
         "the store changed what it holds"
     );
-}
-
-/// A begin retried under a row whose receipt is still `pending` is answered as reserved while
-/// the row's deadline has not passed, and refused once it has: the receipt reads as `unknown`,
-/// and its call is no longer the call's to run. Nothing more is reserved.
-#[test]
-fn a_retried_begin_of_a_pending_receipt_past_its_deadline_is_refused() {
-    let fixture = Fixture::new().unwrap();
-    let (store, clock) = store();
-    let start = row_start();
-    let key = fresh_key();
-    let Begun::Allowed(guard) = propose(&fixture, &store, &start, &key).unwrap() else {
-        panic!("the proposal was not allowed");
-    };
-    drop(guard);
-
-    let retried = propose(&fixture, &store, &start, &key).unwrap();
-    assert!(
-        matches!(&retried, Begun::Allowed(guard) if guard.row() == &start.row),
-        "{retried:?}"
-    );
-
-    pass_deadline(&store, &clock, &start);
-    let refused = propose(&fixture, &store, &start, &key);
-    assert!(refused.is_err(), "{refused:?}");
-    assert_eq!(store.held_receipts().len(), 1);
-    assert_eq!(store.rows().len(), 1);
-    assert_eq!(store.rows()[0].completion, None);
 }
 
 /// Another call under a key whose receipt is `pending` past its deadline is answered as one
