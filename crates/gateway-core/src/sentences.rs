@@ -230,7 +230,7 @@ fn describe(principal: &Principal) -> Rendered {
     use Piece::Text;
     let id = &principal.id;
     match &principal.kind {
-        PrincipalKind::Workload { team } => fill(
+        PrincipalKind::Workload { team, .. } => fill(
             WORKLOAD,
             &[
                 ("subject", Text(id.subject.as_str())),
@@ -407,6 +407,7 @@ mod tests {
             },
             kind: PrincipalKind::Workload {
                 team: "t".repeat(500).as_str().into(),
+                pod: None,
             },
         };
         let rendered = render(&Reason::ResourceOutsideLimit(ResourceProblem::Outside {

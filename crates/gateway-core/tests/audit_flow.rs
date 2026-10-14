@@ -150,6 +150,7 @@ fn principal() -> Principal {
         },
         kind: PrincipalKind::Workload {
             team: "payments".into(),
+            pod: None,
         },
     }
 }

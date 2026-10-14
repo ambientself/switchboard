@@ -46,6 +46,7 @@ fn workload(issuer: &str) -> Principal {
         },
         kind: PrincipalKind::Workload {
             team: "team-a".into(),
+            pod: None,
         },
     }
 }

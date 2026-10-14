@@ -290,7 +290,7 @@ impl Connector for FixtureConnector {
             // What the caller may reach through the scoped tool, read now so that a held call
             // is checked against the scope it was received under.
             let scope: BTreeSet<String> = match &caller.get().kind {
-                PrincipalKind::Workload { team } => {
+                PrincipalKind::Workload { team, .. } => {
                     state.team_scopes.get(team).cloned().unwrap_or_default()
                 }
                 PrincipalKind::User { groups } => groups

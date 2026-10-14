@@ -311,6 +311,7 @@ fn a_caller_no_registry_rule_covers_gets_no_profile() {
         },
         kind: PrincipalKind::Workload {
             team: "team-a".into(),
+            pod: None,
         },
     };
     let policy = gates.policy();

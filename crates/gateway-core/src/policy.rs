@@ -203,7 +203,7 @@ impl Surface {
     /// Whether `principal` may use this surface.
     pub fn permits(&self, principal: &Principal) -> bool {
         let by_team_or_group = match &principal.kind {
-            PrincipalKind::Workload { team } => self.teams.contains(team),
+            PrincipalKind::Workload { team, .. } => self.teams.contains(team),
             PrincipalKind::User { groups } => !self.groups.is_disjoint(groups),
         };
         let by_principal = match &self.principals {
@@ -245,7 +245,7 @@ impl ResourceLimits {
     /// Whether `resource` is within what `principal` may reach.
     pub fn permits(&self, principal: &Principal, resource: &Resource) -> bool {
         match &principal.kind {
-            PrincipalKind::Workload { team } => self
+            PrincipalKind::Workload { team, .. } => self
                 .teams
                 .get(team)
                 .is_some_and(|allowed| allowed.contains(resource)),
@@ -1022,7 +1022,10 @@ mod tests {
                 issuer: "i".into(),
                 subject: "w".into(),
             },
-            kind: PrincipalKind::Workload { team: team.into() },
+            kind: PrincipalKind::Workload {
+                team: team.into(),
+                pod: None,
+            },
         }
     }
 
