@@ -83,8 +83,8 @@ use std::time::{Duration, Instant, SystemTime};
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, Connector, Decision, DeclaredFrom,
-    IDENTITY_FAILURE, Principal, Proved, RequestedTool, Resources, SurfaceName, ToolUseId, decide,
-    list_tools,
+    IDENTITY_FAILURE, IdempotencyKey, Principal, Proved, RequestedTool, Resources, Reuse,
+    SurfaceName, ToolUseId, VendorReference, decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
@@ -617,16 +617,18 @@ impl RequestPath {
         let arguments = Value::Object(arguments);
         let requested = RequestedTool::new(name);
         let resources = self.resources(policy, &requested, &arguments);
+        let tool_use_id = bounded_tool_use_id(tool_use_id);
         let context = CallContext {
             caller: self.caller_context(policy, principal, surface),
             tool: requested,
             resources,
+            key: idempotency_key(tool_use_id.as_ref()),
         };
         let decided = Instant::now();
         let decision = decide(snapshot, &context);
         let decide_us = micros(decided.elapsed());
         let metadata = RequestMetadata {
-            tool_use_id: bounded_tool_use_id(tool_use_id),
+            tool_use_id,
             claimed_team: None,
         };
 
@@ -666,6 +668,19 @@ impl RequestPath {
                 );
                 let row = self.quotable(refusal.row());
                 return (Reply::Denied(refusal.sentence().to_owned()), row);
+            }
+            Ok(Begun::Reused(reused)) => {
+                // Decision 0009, "Reuse": nothing runs. A duplicate is answered as a success,
+                // with the earlier receipt and the vendor's reference; the rest as refusals.
+                tracing::info!(
+                    row = reused.row().as_str(),
+                    duplicate = reused.reuse().is_duplicate(),
+                    decide_us,
+                    begin_us,
+                    "answered a tool call from the receipt of an earlier call under its key"
+                );
+                let row = self.quotable(reused.row());
+                return (reused_reply(reused.reuse()), row);
             }
             Ok(Begun::Allowed(guard)) => guard,
         };
@@ -757,6 +772,7 @@ impl RequestPath {
             Answer::Ok(value) => Reply::ToolOk(value),
             Answer::Error(message) => Reply::ToolError(message),
             Answer::Refused(sentence) => Reply::Denied(sentence),
+            Answer::Unknown(sentence) => Reply::ToolError(sentence),
             Answer::AuditFailed { sentence } => self.audit_failed(sentence),
         };
         (reply, named)
@@ -872,6 +888,31 @@ fn bounded_tool_use_id(value: Option<String>) -> Option<ToolUseId> {
     }
 }
 
+/// The call's idempotency key, from its first carrier only: the caller's tool-use identifier,
+/// once [`bounded_tool_use_id`] has kept it (decision 0009, "The key"). The named `_meta` field
+/// and the header come later. Every tool-use identifier kept is a valid key, since both are 1
+/// to 128 printable ASCII characters; a call with none carries no key, and a call of a tool
+/// not classified `read` is then denied by the key check.
+fn idempotency_key(tool_use_id: Option<&ToolUseId>) -> Option<IdempotencyKey> {
+    tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok())
+}
+
+/// The reply to a call answered from the receipt of an earlier call under its key: a
+/// `duplicate` as a success, carrying the sentence, the earlier receipt and the vendor's
+/// reference, and every other answer as a refusal with its sentence, which its row holds.
+fn reused_reply(reuse: &Reuse) -> Reply {
+    match reuse {
+        Reuse::Duplicate {
+            receipt, reference, ..
+        } => Reply::ToolOk(serde_json::json!({
+            "duplicate": reuse.sentence(),
+            "receipt": receipt.as_str(),
+            "reference": reference.as_ref().map(VendorReference::as_str),
+        })),
+        _ => Reply::Denied(reuse.sentence()),
+    }
+}
+
 fn entry(tool: &ApprovedTool, definition: &ToolDefinition) -> ToolEntry {
     ToolEntry {
         name: tool.name.to_string(),
@@ -904,6 +945,7 @@ fn outcome_name(answer: &Answer) -> &'static str {
         Answer::Ok(_) => "ok",
         Answer::Error(_) => "error",
         Answer::Refused(_) => "refused",
+        Answer::Unknown(_) => "unknown",
         Answer::AuditFailed { .. } => "audit_failed",
     }
 }
