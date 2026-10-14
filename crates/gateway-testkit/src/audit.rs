@@ -524,16 +524,11 @@ impl State {
         Ok(())
     }
 
-    /// Whether the receipt `receipt` reads as `unknown` at `now`: the state `unknown`, or
-    /// `pending` past its row's deadline, as Postgres reads `deadline < clock_timestamp()`.
+    /// Whether the receipt `receipt` reads as `unknown` at `now`, as
+    /// [`as_read`](Self::as_read) reads it: the state `unknown`, or `pending` past its row's
+    /// deadline, as Postgres reads `deadline < clock_timestamp()`.
     fn reads_as_unknown(&self, receipt: &Receipt, now: SystemTime) -> bool {
-        let past = self
-            .rows
-            .iter()
-            .find(|(stored, _, _)| *stored == receipt.row)
-            .and_then(|(_, _, times)| times.deadline)
-            .is_none_or(|deadline| deadline < now);
-        receipt.state.as_read(past) == ReceiptState::Unknown
+        receipt.state.as_read(self.past_deadline(&receipt.row, now)) == ReceiptState::Unknown
     }
 
     /// Whether the lease on the receipt `row` is free at `now`: never set, or ended.
