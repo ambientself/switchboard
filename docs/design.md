@@ -477,6 +477,14 @@ records for Otto's two comment tools names it. Under the profile for Otto's sand
 of any tool not classified `read` also needs a current control plane
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
+**A profile can declare that its callers set the `Idempotency-Key` header per request,** with
+`idempotency_key_header = true`. It is false unless a policy says so, in the JSON
+configuration and in the registry file alike, and only then does the gateway read a side
+effect's key from that header (section 11). MCP clients set headers once per server, so a
+header fixed in a client's configuration would make every later side effect a reuse of one
+key; a profile declares it only for callers known to set it per request, such as a control
+plane. The decision function does not read the setting.
+
 **How a tool's resources are found** is stated in its approval, in one of four ways
 ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 1):
 
@@ -868,6 +876,20 @@ receipt.
   that sends no tool-use identifier and cannot set the `_meta` field cannot make side effects;
   Q13 checks each target client. The same key with a different tool-use identifier is refused
   with a sentence of its own.
+- **The carriers, in that order,** are read as a precedence: a key the caller sent on purpose
+  comes first, and the tool-use identifier is the key only when there is none. The explicit
+  carriers are the `_meta` field `switchboard/idempotencyKey`, beside the
+  `switchboard/auditRow` the answer names, and else the `Idempotency-Key` header, read only
+  for a profile whose `idempotency_key_header` is true; it is false unless a policy says so,
+  and a header from any other profile is ignored as if absent. The tool-use identifier,
+  `claudecode/toolUseId`, is recorded beside an explicit key, on the row and on the receipt.
+  That reading is what makes the refusal of one key with two tool-use identifiers reachable,
+  since a tool-use identifier that is itself the key cannot differ from it. It is also what
+  lets a key that stays the same across a turn Otto's control plane replays cover that turn,
+  whose model makes new tool-use identifiers: the replay is refused, not run again. A carried
+  value that is not a valid key, 1 to 128 printable ASCII characters other than space, is
+  dropped with a warning, as a tool-use identifier outside that bound is, and the call is keyed
+  as if it were absent.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
@@ -895,6 +917,15 @@ receipt.
   ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)) needs a key, a
   receipt and the gate below like any side effect, and declares a lookup by marker unless its
   exception says otherwise.
+- **A side effect's `error` means nothing took effect,** and settles its receipt as
+  `not_performed`: nothing was sent, or the vendor answered that it did not do it. A
+  side-effecting connector reports `unknown` instead once anything may have been sent and no
+  definite answer came back. The proxy connector does so for a side effect's answer that is too
+  late, too large or broken off, an exchange that failed after its connection was made, a
+  status that is neither `200` nor `4xx`, and a `200` that is not MCP; a credential it could
+  not get, a request it could not build, a connection it could not make and an argument
+  refusal stay errors. A client that leaves before its side effect's connector is invoked,
+  checked immediately before, is not called for, and the receipt is `not_performed`.
 - **The gateway never repeats a tool call on its own.** A connector may retry a side effect
   only if it failed before any byte was sent. A receipt does not make a side effect happen
   exactly once: a new key, a vendor's own retries and a turn that Otto's control plane replays
@@ -1352,7 +1383,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   the completion. Error rows written before it read `before-0006`. The argument check is
   `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
   refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
-  a `read` tool and `other` for any other, until a connector reports `unknown`; a guard given up, a lost
+  a `read` tool, and for any other tool not an error at all but the outcome `unknown` (#55,
+  section 11); a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
   How the resources were found, and the credential identity: built (#56). A tool declared as
   its connector entry's reach is read by the gateway's one constant adapter, which names the
@@ -1441,8 +1473,11 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `duplicate` answered as a success with the receipt and the reference. A denial reserves
   nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
   gains `unknown` and a vendor reference for a completed side effect, and the row's outcome
-  `unknown` and `duplicate`. The gateway fills the key from the caller's tool-use identifier
-  only; the named `_meta` field and the header come with the gateway package. Not built:
+  `unknown` and `duplicate`. The gateway reads the key from its three carriers, an explicit
+  key first, and records the tool-use identifier beside it (#55; section 11); the profile
+  setting `idempotency_key_header`, false unless a policy says so, is the declaration the
+  header needs. The core's docs say a side effect's `error` means nothing took effect, and the
+  proxy connector reports `unknown` once a side effect may have been sent. Not built:
   receipts in Postgres, reconciliation, resolution records, and the signals for `unknown`
   receipts.
 - With #25, the harness's in-memory store can also write and then report failure, lose the
@@ -1462,7 +1497,11 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   contract suite is built and runs on it and on the Postgres store (section 18). Both test
   stores keep receipts (#55): they reserve, answer and settle them as the core's interface
   says, a lost begin's receipt as `not_performed` with its row, and the harness's store runs
-  every begin, with a receipt or without, through the same checks and fault switches.
+  every begin, with a receipt or without, through the same checks and fault switches. The
+  harness's store reads a receipt still `pending` past its row's deadline as `unknown` in
+  the receipts it gives back, in the answer to a reused key and on a retried begin of its own
+  row, which it refuses rather than answer as reserved; the contract suite's runner reads
+  receipts as held.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped. A completion carries a vendor reference now, but only for a call that reserved a
@@ -1736,7 +1775,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
-  late or oversized count is of reads only until a connector reports `unknown` (the limits entry below).
+  late or oversized count is of reads only: a side effect's late or oversized answer is the
+  outcome `unknown` (#55), counted with the errors (the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -1806,10 +1846,10 @@ checked; a schema that needs them cannot be approved yet.
   registry only, `switchboard_proxied_calls_total{server,outcome}`,
   `switchboard_proxied_call_seconds{server}` and
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
-  `oversized_or_late_read`, so a tool not classified `read` is not counted there until
-  `unknown` is built. Both demos show overload and a hanging server (the demonstrations entry
-  under #11 above). The configurable audit pools and the row's size bound are in the #11 list
-  above.
+  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`,
+  counted with the errors (#55). Both demos show overload and a hanging server (the
+  demonstrations entry under #11 above). The configurable audit pools and the row's size bound
+  are in the #11 list above.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1858,9 +1898,12 @@ off only in a development build, with CI's check of the release artifact; and th
   told apart only by its cause, and is not counted apart.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled:
   built (#40). The handler holds a signal that fires when it is dropped, which is what a
-  client going away does, and the answer task is given it. A call whose client has gone once
-  its row is begun is given up through the core's `give_up`: the connector is not called and
-  the row is completed as `error`. A read is run through the core's `run_unless`, which drops
+  client going away does, and the answer task is given it. A call whose client has gone by
+  the time its connector would be invoked is given up through the core's `give_up`: the
+  connector is not called and the row is completed as `error`, a side effect's receipt as
+  `not_performed`. The signal is checked immediately before the connector is invoked, after it
+  is looked up and wrapped and the clock read, so a client that leaves in that window is not
+  called for either (#55). A read is run through the core's `run_unless`, which drops
   the connector's future if the signal fires first and records the read as `error`. Any other
   classification ignores the signal and runs to completion. Closing a connection at the end
   of the shutdown grace is a disconnect too. `notifications/cancelled` is still accepted and
@@ -1888,7 +1931,15 @@ off only in a development build, with CI's check of the release artifact; and th
   (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
   reaches it.
-- The key read from its carriers, the tool-use identifier and the named `_meta` field.
+- The key read from its carriers: built (#55). The `_meta` field
+  `switchboard/idempotencyKey`, or else the `Idempotency-Key` header for a profile that
+  declares it, and without either the tool-use identifier, which is recorded beside an
+  explicit key (section 11). Each answer to a reused key reaches the caller: a duplicate as a
+  success naming the receipt and the vendor's reference, the other four as refusals with
+  their sentences, and an `unknown` outcome as a tool error saying the call may have happened,
+  must not be repeated and will be checked as its receipt. With audit disabled, a development
+  build refuses a keyed side effect with the audit sentence, and nothing runs. No deadline of
+  the gateway's own surrounds a proxied call; the bound around in-process connectors is #12's.
 - Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
   The path keeps refusing every `tools/call` and listing nothing, with no row
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
