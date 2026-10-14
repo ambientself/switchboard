@@ -178,7 +178,7 @@ record says what holds until each is answered. When they are answered, retire Q9
 - **Asks of IT, vendor administrators and Otto's owners,** listed in the record: narrow service
   accounts and who owns them, OAuth applications for per-user grants, ownership of the Okta
   groups, and the review of Otto's eighteen tool declarations. The asks of Otto's owners go in
-  the one list of Otto requests under Q18.
+  the one list of Otto requests under Q18, [otto-requests.md](otto-requests.md).
 - Whether a per-user rate limit must come before employee proposals is tracked in Q12. How
   often the reach check runs is set by decision 0013. Whether Otto's `gateway_audit` table
   gains this record's audit columns is part of the question about that table in Q18.
@@ -274,7 +274,8 @@ until each is answered. When they are answered, retire Q17.
   credential, by address as well as by name, and what to do about `github.com` and AWS;
   whether `make egress-check` gains a refused row for each; whether the sandbox's Pod Identity
   association goes; whether the grant carries the turn's egress setting; and whether they own
-  or share the register entries for Otto. These go in the one list of Otto requests under Q18.
+  or share the register entries for Otto. These go in the one list of Otto requests under Q18,
+  [otto-requests.md](otto-requests.md).
   Until they answer, every Otto turn has the governed path.
 - **IT and vendor administrators:** whether to limit the gateway's credentials to its egress
   addresses; whether the zero-trust access layer filters laptop egress; managed client
@@ -293,11 +294,12 @@ until each is answered. When they are answered, retire Q17.
 
 Settled by [decision 0012](decisions/0012-what-a-turn-grant-binds.md), except the parts below.
 
-- **Who raises the Otto requests.** For the owner; the record made no recommendation. Every
-  request of Otto's owners from decisions 0009 to 0012 goes to them as one list, raised by
-  whoever the owner names: decision 0009's Still open 2 and 8, decision 0010's requests,
-  decision 0011's asks of Otto's owners, and decision 0012's changes and questions. Nothing
-  has been raised yet, and every item below waits on it.
+- **Who raises the Otto requests.** The owner takes them to Otto's owners, named on
+  2026-10-13. Every request of Otto's owners goes to them as one list,
+  [otto-requests.md](otto-requests.md): decision 0009's Still open 2 and 8, decision 0010's
+  requests, decision 0011's asks of Otto's owners, decision 0012's changes and questions, and
+  the question about Otto's audit table below. Nothing has been raised yet, and every item
+  below waits on it.
 - **Otto's owners:** agreement to the breaking change before stage 1 and whether Otto's
   schedule fits milestone 4; `pod` in the first change, and whether the harness can read the
   pod's projected token; `egress`; the ceiling and leeway in Otto's minter; the resolver's
