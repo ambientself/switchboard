@@ -28,6 +28,15 @@
 //! `not_performed`; and each receipt state against each line of the reuse table. Both stores
 //! run every one of them.
 //!
+//! It covers reconciliation (decision 0009, "Reconciliation") with the functions under "Item
+//! 7", through the store's [`ReceiptQueue`]: a receipt records the vendor target its tool's
+//! settlement takes from the call; two claimants never both hold a receipt's lease; an ended
+//! lease can be claimed again; the number of attempts is bounded, and the last hands the
+//! receipt to a person, who finds it still `unknown`; an authoritative search that found
+//! nothing settles `not_performed`, and one that is not never does; a found effect settles
+//! `completed` with its reference; a lookup record is appended and never changed; and a
+//! receipt settled by reconciliation is not moved by a late finish.
+//!
 //! Some of what the in-memory store copies from Postgres cannot be tried here, and its own
 //! tests try it. A deadline whose interval is past what Postgres holds is refused, but from
 //! any time at begin after 1999 so is the deadline it gives, and a runner cannot set the
@@ -59,9 +68,9 @@ use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
     ArgumentDigest, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
     Claimed, Connector, CredentialIdentity, CredentialMode, Decision, Delegation,
-    DelegationKeyScope, IdempotencyKey, KeyScope, Proved, Receipt, ReceiptState, RequestedTool,
-    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, VendorReference,
-    Verifier, decide,
+    DelegationKeyScope, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer, Proved, Receipt,
+    ReceiptQueue, ReceiptState, Recorded, RequestedTool, Resource, Resources, Reuse, TeamId,
+    ToolCall, ToolOutcome, ToolUseId, VendorReference, Verifier, decide,
 };
 use serde_json::{Value, json};
 
@@ -73,7 +82,7 @@ use crate::connector::{
 use crate::credentials::FakeCredentialSource;
 use crate::fixture::{
     Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    policy_data,
+    policy_data, policy_data_with_draft_lookup,
 };
 use crate::row_bound::{
     MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
@@ -110,8 +119,16 @@ pub trait ContractStore {
     fn lose_every_begin_confirmation(&self);
 
     /// Moves the store's clock past the deadline of the call row `row`, which must have one.
-    /// For item 6's functions only.
+    /// For item 6's and item 7's functions only.
     fn pass_deadline(&self, row: &AuditRowId) -> impl Future<Output = ()>;
+
+    /// The store's queue of `unknown` receipts. For item 7's functions only.
+    fn queue(&self) -> &dyn ReceiptQueue;
+
+    /// Ends the lease on the receipt reserved under `row` now, as if its time had passed: the
+    /// in-memory store's clock moves past it, and Postgres's lease is set to have ended. For
+    /// item 7's functions only.
+    fn pass_lease(&self, row: &AuditRowId) -> impl Future<Output = ()>;
 }
 
 /// The record a row holds.
@@ -2192,5 +2209,505 @@ pub async fn each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table
             assert_eq!(record.decision, DecisionKind::Allow);
         }
         assert_eq!(receipts_for(contract, &key).await, vec![earlier]);
+    }
+}
+
+// --- Item 7: reconciliation ---------------------------------------------------------------------
+
+/// The lease every claim in item 7 asks for: long enough that nothing ends it but
+/// [`ContractStore::pass_lease`].
+const LEASE: Duration = Duration::from_secs(600);
+
+/// The attempts every lookup in item 7 is recorded under, unless a function says otherwise.
+const ATTEMPTS: u32 = 5;
+
+fn holder(name: &str) -> LeaseHolder {
+    LeaseHolder::new(format!("contract-instance {name}"))
+}
+
+/// A receipt in `unknown`: team A's proposal, whose connector reported `unknown`, finished
+/// within its deadline.
+async fn unknown_receipt(contract: &impl ContractStore) -> AuditRowId {
+    let store = contract.store();
+    let start = row_start();
+    let guard = proposal_guard(store, &fixture(), &start, &proposal("p"), &fresh_key()).await;
+    let ran = audit::run(&Answering::with(ToolOutcome::Unknown), guard).await;
+    let finished = audit::finish(store, ran, 1).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert_eq!(
+        receipt_under(contract, &start.row).await.state,
+        ReceiptState::Unknown
+    );
+    start.row
+}
+
+/// Whether the queue lists the receipt `row` as due.
+async fn is_due(contract: &impl ContractStore, row: &AuditRowId) -> bool {
+    contract
+        .queue()
+        .due(1000)
+        .await
+        .expect("the queue could not be read")
+        .iter()
+        .any(|receipt| receipt.row == *row)
+}
+
+/// `holder` claims `row`, which must be claimed.
+async fn claimed(contract: &impl ContractStore, row: &AuditRowId, holder: &LeaseHolder) -> Receipt {
+    contract
+        .queue()
+        .claim(row, holder, LEASE)
+        .await
+        .expect("the claim failed")
+        .unwrap_or_else(|| panic!("{holder} could not claim {}", row.as_str()))
+}
+
+/// `holder` records `answer` on `row` under `attempts`, which must be written.
+async fn recorded(
+    contract: &impl ContractStore,
+    row: &AuditRowId,
+    holder: &LeaseHolder,
+    answer: LookupAnswer,
+    attempts: u32,
+) -> Recorded {
+    contract
+        .queue()
+        .record_lookup(row, holder, &answer, attempts)
+        .await
+        .unwrap_or_else(|error| panic!("{answer:?} was not recorded: {error}"))
+}
+
+/// A receipt records the vendor target its tool's settlement takes from the call: the one
+/// document a proposal names, when the draft tool is settled by a lookup in documents, and
+/// none when it is settled by a person. The queue gives it back with the receipt.
+pub async fn a_receipt_records_the_vendor_target_its_settlement_takes(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let mut by_lookup = fixture();
+    by_lookup.policy = serde_json::from_value(policy_data_with_draft_lookup())
+        .expect("the fixture policy with a lookup loads");
+    let start = row_start();
+    let guard = proposal_guard(store, &by_lookup, &start, &proposal("p"), &fresh_key()).await;
+    assert_eq!(
+        receipt_under(contract, &start.row).await.target,
+        Some(document(TEAM_A_DOCUMENT))
+    );
+    let ran = audit::run(&Answering::with(ToolOutcome::Unknown), guard).await;
+    assert!(audit::finish(store, ran, 1).await.failure().is_none());
+    let claimed = claimed(contract, &start.row, &holder("a")).await;
+    assert_eq!(claimed.target, Some(document(TEAM_A_DOCUMENT)));
+
+    let by_person = unknown_receipt(contract).await;
+    assert_eq!(receipt_under(contract, &by_person).await.target, None);
+}
+
+/// Two claimants never both hold a receipt's lease. Of six claims of one receipt at once,
+/// exactly one succeeds; the receipt is no longer due; and the others can record no lookup and
+/// hand it to no one, while the one that holds it can.
+pub async fn two_claimants_never_both_hold_a_receipts_lease(contract: &impl ContractStore) {
+    let queue = contract.queue();
+    for round in 0..3 {
+        let row = unknown_receipt(contract).await;
+        assert!(is_due(contract, &row).await, "round {round}");
+        let holders: Vec<LeaseHolder> = (0..6).map(|at| holder(&format!("{round}-{at}"))).collect();
+        let claims: Vec<BoxFuture<'_, _>> = holders
+            .iter()
+            .map(|holder| queue.claim(&row, holder, LEASE))
+            .collect();
+        let answers = all_at_once(claims).await;
+        let mut winners = Vec::new();
+        for (holder, answer) in holders.iter().zip(answers) {
+            if answer.expect("a claim failed").is_some() {
+                winners.push(holder.clone());
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: {winners:?} all hold the lease"
+        );
+        let winner = &winners[0];
+        assert!(
+            !is_due(contract, &row).await,
+            "a claimed receipt is still due"
+        );
+        for loser in holders.iter().filter(|holder| *holder != winner) {
+            assert_eq!(
+                queue
+                    .claim(&row, loser, LEASE)
+                    .await
+                    .expect("a claim failed"),
+                None,
+                "{loser} claimed a receipt {winner} holds"
+            );
+            assert!(
+                queue
+                    .record_lookup(&row, loser, &LookupAnswer::Failed, ATTEMPTS)
+                    .await
+                    .is_err(),
+                "{loser} recorded a lookup on a receipt {winner} holds"
+            );
+            assert!(
+                queue.hand_to_person(&row, loser).await.is_err(),
+                "{loser} handed off a receipt {winner} holds"
+            );
+        }
+        let receipt = receipt_under(contract, &row).await;
+        assert_eq!((receipt.lookups.len(), receipt.handed_to_person), (0, None));
+        assert_eq!(
+            recorded(contract, &row, winner, LookupAnswer::Failed, ATTEMPTS).await,
+            Recorded::Left
+        );
+    }
+}
+
+/// A lease that has ended can be claimed again, by another holder, who gets the receipt with
+/// the lookups made so far; the holder whose lease ended can then write nothing.
+pub async fn an_ended_lease_can_be_claimed_again(contract: &impl ContractStore) {
+    let queue = contract.queue();
+    let row = unknown_receipt(contract).await;
+    let (first, second) = (holder("first"), holder("second"));
+    claimed(contract, &row, &first).await;
+    assert_eq!(
+        recorded(contract, &row, &first, LookupAnswer::Failed, ATTEMPTS).await,
+        Recorded::Left
+    );
+    assert!(!is_due(contract, &row).await, "a held receipt is due");
+
+    contract.pass_lease(&row).await;
+    assert!(
+        is_due(contract, &row).await,
+        "a receipt whose lease ended is not due"
+    );
+    let again = claimed(contract, &row, &second).await;
+    assert_eq!(again.lookups.len(), 1);
+    assert_eq!(again.lookups[0].answer, LookupAnswer::Failed);
+    assert!(
+        queue
+            .record_lookup(&row, &first, &LookupAnswer::Failed, ATTEMPTS)
+            .await
+            .is_err(),
+        "a holder whose lease ended recorded a lookup"
+    );
+    assert!(queue.hand_to_person(&row, &first).await.is_err());
+    assert_eq!(
+        recorded(contract, &row, &second, LookupAnswer::Failed, ATTEMPTS).await,
+        Recorded::Left
+    );
+    assert_eq!(receipt_under(contract, &row).await.lookups.len(), 2);
+}
+
+/// The number of attempts is bounded. With two allowed, the second lookup that settles nothing
+/// hands the receipt to a person in the same write, with the store's time, and it stays
+/// `unknown`, established by its call; then no third lookup is recorded, it is not due, and no
+/// one can claim it or hand it off again. A receipt with nothing to look in is handed off
+/// directly, and stays `unknown` too.
+pub async fn the_number_of_attempts_is_bounded(contract: &impl ContractStore) {
+    let queue = contract.queue();
+    let row = unknown_receipt(contract).await;
+    let holder = holder("a");
+    claimed(contract, &row, &holder).await;
+    assert_eq!(
+        recorded(contract, &row, &holder, LookupAnswer::Failed, 2).await,
+        Recorded::Left
+    );
+    let before = contract.now().await;
+    let empty = LookupAnswer::NotFound {
+        authoritative: false,
+    };
+    assert_eq!(
+        recorded(contract, &row, &holder, empty, 2).await,
+        Recorded::HandedToPerson
+    );
+    let after = contract.now().await;
+    let receipt = receipt_under(contract, &row).await;
+    assert_eq!(
+        (
+            receipt.state,
+            &receipt.established_by,
+            receipt.lookups.len()
+        ),
+        (ReceiptState::Unknown, &EstablishedBy::Call, 2)
+    );
+    let handed = receipt
+        .handed_to_person
+        .expect("the receipt was not handed off");
+    assert!(
+        before <= handed && handed <= after,
+        "handed off at {handed:?}"
+    );
+    assert!(
+        queue
+            .record_lookup(&row, &holder, &LookupAnswer::Failed, 2)
+            .await
+            .is_err(),
+        "a third lookup was recorded"
+    );
+    assert!(
+        queue
+            .record_lookup(&row, &holder, &LookupAnswer::Failed, 3)
+            .await
+            .is_err(),
+        "a lookup was recorded on a receipt handed to a person"
+    );
+    assert!(queue.hand_to_person(&row, &holder).await.is_err());
+    assert!(
+        !is_due(contract, &row).await,
+        "a receipt handed off is still due"
+    );
+    contract.pass_lease(&row).await;
+    assert!(
+        !is_due(contract, &row).await,
+        "a receipt handed off is due again"
+    );
+    assert_eq!(
+        queue
+            .claim(&row, &holder, LEASE)
+            .await
+            .expect("a claim failed"),
+        None
+    );
+    assert_eq!(receipt_under(contract, &row).await, receipt);
+
+    let direct = unknown_receipt(contract).await;
+    claimed(contract, &direct, &holder).await;
+    queue
+        .hand_to_person(&direct, &holder)
+        .await
+        .expect("the receipt was not handed off");
+    let receipt = receipt_under(contract, &direct).await;
+    assert_eq!(
+        (receipt.state, receipt.lookups.len()),
+        (ReceiptState::Unknown, 0)
+    );
+    assert!(receipt.handed_to_person.is_some());
+    assert!(!is_due(contract, &direct).await);
+}
+
+/// An authoritative search that found nothing settles a receipt `not_performed`, established by
+/// reconciliation; a search that is not authoritative, or a failed lookup, never does, however
+/// often it is made. A `pending` receipt past its row's deadline is settled the same way; one
+/// within its deadline is not due, and cannot be claimed.
+pub async fn an_authoritative_empty_search_settles_not_performed_and_no_other_does(
+    contract: &impl ContractStore,
+) {
+    let row = unknown_receipt(contract).await;
+    let holder = holder("a");
+    claimed(contract, &row, &holder).await;
+    for answer in [
+        LookupAnswer::NotFound {
+            authoritative: false,
+        },
+        LookupAnswer::Failed,
+        LookupAnswer::NotFound {
+            authoritative: false,
+        },
+    ] {
+        assert_eq!(
+            recorded(contract, &row, &holder, answer.clone(), ATTEMPTS).await,
+            Recorded::Left,
+            "{answer:?}"
+        );
+        assert_eq!(
+            receipt_under(contract, &row).await.state,
+            ReceiptState::Unknown,
+            "{answer:?} settled the receipt"
+        );
+    }
+    let authoritative = LookupAnswer::NotFound {
+        authoritative: true,
+    };
+    assert_eq!(
+        recorded(contract, &row, &holder, authoritative.clone(), ATTEMPTS).await,
+        Recorded::Settled(ReceiptState::NotPerformed)
+    );
+    let receipt = receipt_under(contract, &row).await;
+    assert_eq!(
+        (receipt.state, &receipt.established_by, &receipt.reference),
+        (
+            ReceiptState::NotPerformed,
+            &EstablishedBy::Reconciliation,
+            &None
+        )
+    );
+    assert_eq!(receipt.handed_to_person, None);
+    assert!(!is_due(contract, &row).await);
+
+    // A pending receipt: not due within its deadline, and settled like any other past it.
+    let store = contract.store();
+    let start = row_start();
+    let guard = proposal_guard(store, &fixture(), &start, &proposal("p"), &fresh_key()).await;
+    assert!(
+        !is_due(contract, &start.row).await,
+        "a pending receipt is due"
+    );
+    assert_eq!(
+        contract
+            .queue()
+            .claim(&start.row, &holder, LEASE)
+            .await
+            .expect("a claim failed"),
+        None,
+        "a pending receipt within its deadline was claimed"
+    );
+    contract.pass_deadline(&start.row).await;
+    assert!(is_due(contract, &start.row).await);
+    claimed(contract, &start.row, &holder).await;
+    assert_eq!(
+        recorded(contract, &start.row, &holder, authoritative, ATTEMPTS).await,
+        Recorded::Settled(ReceiptState::NotPerformed)
+    );
+    drop(guard);
+}
+
+/// A found effect settles a receipt `completed`, established by reconciliation, with the
+/// vendor's reference made safe as a finish's is; it is then no longer due, and its holder can
+/// record nothing more on it.
+pub async fn a_found_effect_settles_completed_with_its_reference(contract: &impl ContractStore) {
+    let row = unknown_receipt(contract).await;
+    let holder = holder("a");
+    claimed(contract, &row, &holder).await;
+    assert_eq!(
+        recorded(contract, &row, &holder, LookupAnswer::Failed, ATTEMPTS).await,
+        Recorded::Left
+    );
+    let found = LookupAnswer::Found {
+        reference: VendorReference::new("draft\n9"),
+    };
+    assert_eq!(
+        recorded(contract, &row, &holder, found, ATTEMPTS).await,
+        Recorded::Settled(ReceiptState::Completed)
+    );
+    let safe = VendorReference::new("draft\\n9");
+    let receipt = receipt_under(contract, &row).await;
+    assert_eq!(
+        (receipt.state, &receipt.established_by, &receipt.reference),
+        (
+            ReceiptState::Completed,
+            &EstablishedBy::Reconciliation,
+            &Some(safe.clone())
+        )
+    );
+    assert_eq!(
+        receipt.lookups[1].answer,
+        LookupAnswer::Found { reference: safe }
+    );
+    assert!(!is_due(contract, &row).await);
+    assert!(
+        contract
+            .queue()
+            .record_lookup(&row, &holder, &LookupAnswer::Failed, ATTEMPTS)
+            .await
+            .is_err(),
+        "a lookup was recorded on a settled receipt"
+    );
+    assert!(
+        contract
+            .queue()
+            .hand_to_person(&row, &holder)
+            .await
+            .is_err()
+    );
+    assert_eq!(receipt_under(contract, &row).await, receipt);
+}
+
+/// A lookup record is appended and never changed: each lookup adds one record, in order, with
+/// the store's time, and the records already there stay exactly as they were.
+pub async fn a_lookup_record_is_append_only(contract: &impl ContractStore) {
+    let row = unknown_receipt(contract).await;
+    let holder = holder("a");
+    claimed(contract, &row, &holder).await;
+    let answers = [
+        LookupAnswer::Failed,
+        LookupAnswer::NotFound {
+            authoritative: false,
+        },
+        LookupAnswer::Failed,
+    ];
+    let mut kept = Vec::new();
+    for answer in answers.clone() {
+        let before = contract.now().await;
+        assert_eq!(
+            recorded(contract, &row, &holder, answer.clone(), ATTEMPTS).await,
+            Recorded::Left
+        );
+        let after = contract.now().await;
+        let lookups = receipt_under(contract, &row).await.lookups;
+        assert_eq!(lookups.len(), kept.len() + 1);
+        assert_eq!(lookups[..kept.len()], kept[..], "a lookup record changed");
+        let added = lookups.last().expect("a lookup was recorded").clone();
+        assert_eq!(added.answer, answer);
+        assert!(
+            before <= added.at && added.at <= after,
+            "recorded at {:?}",
+            added.at
+        );
+        kept.push(added);
+    }
+    assert_eq!(
+        kept.iter()
+            .map(|lookup| lookup.answer.clone())
+            .collect::<Vec<_>>(),
+        answers.to_vec()
+    );
+}
+
+/// A receipt settled by reconciliation is not moved by a late finish: a call whose answer
+/// arrives after its row's deadline, by which time a lookup has settled its receipt, completes
+/// its row, and the receipt keeps the state, the establishment and the reference the lookup
+/// gave it, whatever the late finish reported.
+pub async fn a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let holder = holder("a");
+    let cases = [
+        (
+            ToolOutcome::error(ErrorKind::VendorRefusal, "The vendor said no."),
+            LookupAnswer::Found {
+                reference: VendorReference::new("found-1"),
+            },
+            ReceiptState::Completed,
+        ),
+        (
+            ToolOutcome::Completed(json!({"draft": "d-2"}), VendorReference::new("d-2")),
+            LookupAnswer::NotFound {
+                authoritative: true,
+            },
+            ReceiptState::NotPerformed,
+        ),
+    ];
+    for (late, answer, settled) in cases {
+        let start = row_start();
+        let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &fresh_key()).await;
+        let ran = audit::run(&Answering::with(late.clone()), guard).await;
+        contract.pass_deadline(&start.row).await;
+        claimed(contract, &start.row, &holder).await;
+        assert_eq!(
+            recorded(contract, &start.row, &holder, answer.clone(), ATTEMPTS).await,
+            Recorded::Settled(settled)
+        );
+        let finished = audit::finish(store, ran, 4).await;
+        assert!(
+            finished.failure().is_none(),
+            "{late:?}: {:?}",
+            finished.failure()
+        );
+        assert!(
+            stored(contract, &start.row).await.completion.is_some(),
+            "{late:?}: the late finish was not written to the row"
+        );
+        let receipt = receipt_under(contract, &start.row).await;
+        assert_eq!(
+            (
+                receipt.state,
+                &receipt.established_by,
+                receipt.reference.as_ref()
+            ),
+            (settled, &EstablishedBy::Reconciliation, answer.reference()),
+            "{late:?}"
+        );
     }
 }

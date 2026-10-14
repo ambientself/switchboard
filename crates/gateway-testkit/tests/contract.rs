@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gateway_core::audit::AuditRowId;
-use gateway_core::{AuditStore, Receipt};
+use gateway_core::{AuditStore, Receipt, ReceiptQueue};
 use gateway_identity::Clock;
 use gateway_testkit::contract::{ContractStore, StoredRow};
 use gateway_testkit::{
@@ -77,6 +77,18 @@ impl ContractStore for InMemory {
             .unwrap_or_default();
         self.clock.advance(to_go + Duration::from_millis(1));
     }
+
+    fn queue(&self) -> &dyn ReceiptQueue {
+        &self.store
+    }
+
+    async fn pass_lease(&self, row: &AuditRowId) {
+        let Some(until) = self.store.lease_until(row) else {
+            panic!("the receipt {} was never leased", row.as_str());
+        };
+        let to_go = until.duration_since(self.clock.now()).unwrap_or_default();
+        self.clock.advance(to_go);
+    }
 }
 
 macro_rules! contract {
@@ -114,4 +126,12 @@ contract!(
     a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once,
     a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_error_and_its_receipt_not_performed,
     each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table_that_matches,
+    a_receipt_records_the_vendor_target_its_settlement_takes,
+    two_claimants_never_both_hold_a_receipts_lease,
+    an_ended_lease_can_be_claimed_again,
+    the_number_of_attempts_is_bounded,
+    an_authoritative_empty_search_settles_not_performed_and_no_other_does,
+    a_found_effect_settles_completed_with_its_reference,
+    a_lookup_record_is_append_only,
+    a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
 );
