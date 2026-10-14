@@ -19,7 +19,9 @@
 //! schema tests try it. The open-row query is not here: it is Postgres's alone for now.
 //!
 //! It covers item 6, receipts (decision 0009, part 2), with the functions under "Item 6": a
-//! receipt is reserved with its row or not at all, and moves with its finish; a key is unique
+//! receipt is reserved with its row or not at all, and moves with its finish, but not once its
+//! row's deadline has passed, when a late finish completes the row and leaves the receipt
+//! `pending`, read as `unknown`, for reconciliation or a person; a key is unique
 //! in its scope under concurrent calls, and two delegations under one principal may each use
 //! it; a begin retried after a lost confirmation finds its own receipt and runs once; a begin
 //! whose confirmation is lost on every attempt leaves its row `error` and its receipt
@@ -107,6 +109,10 @@ pub trait ContractStore {
     /// store then completes an allowed row as `error` and settles its receipt as
     /// `not_performed`. For item 6's functions only.
     fn lose_every_begin_confirmation(&self);
+
+    /// Moves the store's clock past the deadline of the call row `row`, which must have one.
+    /// For item 6's functions only.
+    fn pass_deadline(&self, row: &AuditRowId) -> impl Future<Output = ()>;
 }
 
 /// The record a row holds.
@@ -1798,6 +1804,47 @@ pub async fn a_receipt_moves_with_its_finish(contract: &impl ContractStore) {
         receipt_under(contract, &start.row).await.state,
         ReceiptState::Pending
     );
+}
+
+/// A finish that arrives after its row's deadline is still written to the row, but does not
+/// move the receipt (decision 0009, "What a receipt is"): a `pending` receipt past its
+/// deadline leaves `pending` only by reconciliation or a person, and is read as `unknown`
+/// until then, whatever the late finish reported.
+pub async fn a_late_finish_completes_its_row_and_leaves_its_receipt_pending(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let cases = [
+        ToolOutcome::Completed(json!({"draft": "d-1"}), VendorReference::new("d-1")),
+        ToolOutcome::error(ErrorKind::VendorRefusal, "The vendor said no."),
+        ToolOutcome::Unknown,
+    ];
+    for reported in cases {
+        let start = row_start();
+        let key = fresh_key();
+        let guard = proposal_guard(store, &fixture, &start, &proposal("p"), &key).await;
+        let connector = Answering::with(reported.clone());
+        let ran = audit::run(&connector, guard).await;
+        contract.pass_deadline(&start.row).await;
+        let finished = audit::finish(store, ran, 4).await;
+        assert!(
+            finished.failure().is_none(),
+            "{reported:?}: {:?}",
+            finished.failure()
+        );
+        assert!(
+            stored(contract, &start.row).await.completion.is_some(),
+            "{reported:?}: the late finish was not written to the row"
+        );
+        let receipt = receipt_under(contract, &start.row).await;
+        assert_eq!(
+            (receipt.state, &receipt.reference, &receipt.established_by),
+            (ReceiptState::Pending, &None, &EstablishedBy::Call),
+            "{reported:?}"
+        );
+        assert_eq!(receipt.state.as_read(true), ReceiptState::Unknown);
+    }
 }
 
 /// Polls every future in `futures` together until each is ready, so that none waits for

@@ -9,7 +9,9 @@
 //! first checks whether the call's key already has a receipt in its scope. If it has, the call
 //! does not run: [`Reuse::answer`] says what the caller reads, and the row is written already
 //! complete with [`Reuse::completion`]. [`audit::finish`](crate::audit::finish) settles the
-//! receipt in the same write as the row's completion, as [`ReceiptState::settled_by`] says.
+//! receipt in the same write as the row's completion, as [`ReceiptState::settled_by`] says,
+//! while the row's deadline has not passed; a later finish leaves it to reconciliation or a
+//! person.
 //!
 //! What is not built here: reconciliation, which settles an `unknown` receipt by a lookup; the
 //! vendor target a lookup needs and the lookups made, which a receipt will record once it
@@ -283,9 +285,10 @@ pub enum EstablishedBy {
 /// has passed or not (decision 0009, "What a receipt is"):
 ///
 /// - A receipt leaves `pending` once, for any of the other three. The call that reserved it
-///   may settle it so at any time, its deadline passed or not.
+///   may move it so only while its row's deadline has not passed.
 /// - A receipt leaves `unknown`, or a `pending` past its deadline, only by reconciliation or a
-///   person, and only for `completed` or `not_performed`.
+///   person, and only for `completed` or `not_performed`. A finish that arrives after the
+///   deadline is still written to its row, but leaves the receipt `pending`, read as `unknown`.
 /// - Nothing returns to `pending`, and `completed` and `not_performed` are final.
 ///
 /// A store moves a receipt only as this allows.
@@ -297,7 +300,9 @@ pub fn may_move(
 ) -> bool {
     let settled = matches!(to, ReceiptState::Completed | ReceiptState::NotPerformed);
     match (from, by) {
-        (ReceiptState::Pending, EstablishedBy::Call) => to != ReceiptState::Pending,
+        (ReceiptState::Pending, EstablishedBy::Call) => {
+            !past_deadline && to != ReceiptState::Pending
+        }
         (ReceiptState::Pending, _) => past_deadline && settled,
         (ReceiptState::Unknown, EstablishedBy::Call) => false,
         (ReceiptState::Unknown, _) => settled,
@@ -671,7 +676,7 @@ mod tests {
                         let by_call = by == EstablishedBy::Call;
                         let settled = matches!(to, Completed | NotPerformed);
                         let expected = match from {
-                            Pending if by_call => to != Pending,
+                            Pending if by_call => !past && to != Pending,
                             Pending => past && settled,
                             Unknown => !by_call && settled,
                             Completed | NotPerformed => false,
@@ -686,7 +691,8 @@ mod tests {
             }
         }
         // Spelled out: nothing returns to pending; reconciliation cannot take a pending
-        // receipt still in its deadline; the call cannot settle an unknown one.
+        // receipt still in its deadline; the call cannot settle an unknown one, nor a pending
+        // one past its deadline.
         for by in [EstablishedBy::Call, EstablishedBy::Reconciliation] {
             assert!(!may_move(Unknown, Pending, &by, true));
         }
@@ -697,7 +703,10 @@ mod tests {
             false
         ));
         assert!(!may_move(Unknown, Completed, &EstablishedBy::Call, true));
-        assert!(may_move(Pending, Unknown, &EstablishedBy::Call, true));
+        assert!(may_move(Pending, Unknown, &EstablishedBy::Call, false));
+        for to in [Completed, NotPerformed, Unknown] {
+            assert!(!may_move(Pending, to, &EstablishedBy::Call, true));
+        }
     }
 
     #[test]

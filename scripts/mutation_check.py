@@ -939,6 +939,8 @@ mutate("receipt-unknown-settled-as-not-performed", "finish settles an unknown ou
        "            Outcome::Unknown => Some(ReceiptState::Unknown),", "            Outcome::Unknown => Some(ReceiptState::NotPerformed),")
 mutate("receipt-reconciled-before-deadline", "reconciliation may settle a pending receipt still within its deadline", SRC + "receipt.rs",
        "        (ReceiptState::Pending, _) => past_deadline && settled,", "        (ReceiptState::Pending, _) => settled,")
+mutate("receipt-call-settles-past-deadline", "the call may settle its pending receipt after its row's deadline has passed", SRC + "receipt.rs",
+       "            !past_deadline && to != ReceiptState::Pending\n", "            to != ReceiptState::Pending\n")
 mutate("receipt-digest-not-canonical", "the argument digest is over serde_json's form, not the canonical one", SRC + "receipt.rs",
        "        Self(Sha256::digest(canonical(arguments).as_bytes()).into())",
        "        Self(Sha256::digest(serde_json::to_string(arguments).unwrap_or_default().as_bytes()).into())")
@@ -1370,7 +1372,7 @@ mutate("testkit-list-wrong-clock", "the in-memory store reads the system clock, 
 mutate("testkit-clock-ignored", "the in-memory store keeps its default clock, not the one it was given", A,
        "        self.clock = clock;\n        self\n", "        let _ = clock;\n        self\n")
 mutate("testkit-lost-confirmation-left-open", "an allowed row whose begin confirmation was lost is left open", A,
-       "                let _ = state.complete(row, &error);", "                let _ = &error;")
+       "                let _ = state.complete(row, &error, self.clock.now());", "                let _ = &error;")
 mutate("testkit-lost-confirmation-ignored", "a begin told to lose its confirmation succeeds", A,
        "            if state.confirmation_lost.take() {\n                // As the Postgres store",
        "            if false {\n                // As the Postgres store")
@@ -1474,6 +1476,9 @@ mutate("testkit-retry-after-settled-runs", "a begin under a row whose receipt ha
        "            Some(_) => Ok(Reservation::Reserved),")
 mutate("testkit-reference-dropped", "a receipt's vendor reference is not kept", A,
        "            receipt.reference = reference.cloned();\n", "")
+mutate("testkit-late-finish-settles-receipt", "a finish after its row's deadline settles the receipt, as if the deadline had not passed", A,
+       "            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)",
+       "            && may_move(receipt.state, settled, &EstablishedBy::Call, false)")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"

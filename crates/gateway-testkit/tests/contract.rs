@@ -9,7 +9,7 @@ use gateway_core::{AuditStore, Receipt};
 use gateway_identity::Clock;
 use gateway_testkit::contract::{ContractStore, StoredRow};
 use gateway_testkit::{
-    FIXTURE_NOW, FixedClock, InMemoryAuditStore, StoreBudgets, block_on, contract,
+    FIXTURE_NOW, InMemoryAuditStore, SteppableClock, StoreBudgets, block_on, contract,
 };
 
 /// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
@@ -24,15 +24,16 @@ const BUDGETS: StoreBudgets = StoreBudgets {
 /// store's default clock reads. It answers the suite with [`BUDGETS`] and that clock, not with
 /// anything the store holds, so a store that ignored either would fail the deadline and time
 /// cases. The day is a whole multiple of 16 seconds, so the deadline-end case still lands
-/// exactly on the end of what a Postgres time holds.
+/// exactly on the end of what a Postgres time holds. The clock moves only when a function
+/// passes a row's deadline.
 struct InMemory {
     store: InMemoryAuditStore,
-    clock: Arc<FixedClock>,
+    clock: Arc<SteppableClock>,
 }
 
 impl InMemory {
     fn new() -> Self {
-        let clock = Arc::new(FixedClock::at(FIXTURE_NOW + 86_400));
+        let clock = Arc::new(SteppableClock::at(FIXTURE_NOW + 86_400));
         Self {
             store: InMemoryAuditStore::new()
                 .with_budgets(BUDGETS)
@@ -66,6 +67,16 @@ impl ContractStore for InMemory {
     fn lose_every_begin_confirmation(&self) {
         self.store.lose_all_begin_confirmations();
     }
+
+    async fn pass_deadline(&self, row: &AuditRowId) {
+        let Some(deadline) = self.store.deadline(row) else {
+            panic!("the row {} has no deadline", row.as_str());
+        };
+        let to_go = deadline
+            .duration_since(self.clock.now())
+            .unwrap_or_default();
+        self.clock.advance(to_go + Duration::from_millis(1));
+    }
 }
 
 macro_rules! contract {
@@ -97,6 +108,7 @@ contract!(
     a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row,
     a_receipt_is_reserved_with_its_row_or_not_at_all,
     a_receipt_moves_with_its_finish,
+    a_late_finish_completes_its_row_and_leaves_its_receipt_pending,
     a_key_is_unique_in_its_scope_under_concurrent_calls,
     two_delegations_under_one_principal_may_use_the_same_key,
     a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once,

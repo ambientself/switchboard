@@ -199,6 +199,11 @@ impl ContractStore for Postgres {
     fn lose_every_begin_confirmation(&self) {
         panic!("{NOT_YET_ON_POSTGRES}")
     }
+
+    /// As [`receipts`](Self::receipts): only item 6's functions pass a row's deadline.
+    async fn pass_deadline(&self, _row: &AuditRowId) {
+        panic!("{NOT_YET_ON_POSTGRES}")
+    }
 }
 
 /// A time Postgres gave in whole microseconds since the epoch.
@@ -271,6 +276,7 @@ macro_rules! not_yet_on_postgres {
 not_yet_on_postgres!(
     a_receipt_is_reserved_with_its_row_or_not_at_all,
     a_receipt_moves_with_its_finish,
+    a_late_finish_completes_its_row_and_leaves_its_receipt_pending,
     a_key_is_unique_in_its_scope_under_concurrent_calls,
     two_delegations_under_one_principal_may_use_the_same_key,
     a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once,

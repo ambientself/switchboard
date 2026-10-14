@@ -857,8 +857,10 @@ A receipt is reserved as `pending` in the same transaction as the begin of an al
 denied call reserves none. It leaves `pending` once, for `completed` (the vendor confirmed it),
 `not_performed` (established, not assumed, that nothing took effect) or `unknown` (the request
 may have reached the vendor). A receipt still `pending` after its row's deadline is read as
-`unknown`. It leaves `unknown` only by reconciliation or a person. Every move records how it
-was established, and the gateway never deletes a receipt.
+`unknown`. It leaves `unknown`, or `pending` past its row's deadline, only by reconciliation
+or a person: a finish that arrives after the deadline is written to its row and leaves the
+receipt as it is. Every move records how it was established, and the gateway never deletes a
+receipt.
 
 - **The key is chosen per request,** never per connection: the caller's tool-use identifier, a
   named `_meta` field for callers that are not models, and a header only from a profile that
@@ -1425,13 +1427,15 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   the vendor target and the lookups wait for reconciliation. The scope is the proved
   principal and the delegation's key scope, which no verifier fills until the delegation
   carries Otto's session, turn and execution (#22, decision 0009 Still open 8), so a key is
-  scoped to the principal alone today. The moves the state table allows, and a `pending`
-  receipt past its deadline read as `unknown`, are the core's. `begin` reserves a `pending`
-  receipt for an allowed side effect through the store's `begin_with_receipt`, in the same
-  write as the row, after the reuse check, which passes over a receipt under the call's own
-  row; a reused key's answer is a row written complete, and `Begun::Reused` carries one of
-  the five answers, a `duplicate` answered as a success with the receipt and the reference. A
-  denial reserves nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
+  scoped to the principal alone today. The moves the state table allows, among them that the
+  call settles its receipt only before its row's deadline, and a `pending` receipt past its
+  deadline read as `unknown`, are the core's; the in-memory store completes a late finish's
+  row and leaves its receipt `pending`. `begin` reserves a `pending` receipt for an allowed
+  side effect through the store's `begin_with_receipt`, in the same write as the row, after
+  the reuse check, which passes over a receipt under the call's own row; a reused key's
+  answer is a row written complete, and `Begun::Reused` carries one of the five answers, a
+  `duplicate` answered as a success with the receipt and the reference. A denial reserves
+  nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
   gains `unknown` and a vendor reference for a completed side effect, and the row's outcome
   `unknown` and `duplicate`. The gateway fills the key from the caller's tool-use identifier
   only; the named `_meta` field and the header come with the gateway package. Not built:

@@ -225,6 +225,7 @@ impl MemoryStore {
                 Some(_) => return Err("the row was already finished differently".into()),
             },
         }
+        // It keeps no deadlines, so no receipt of its is ever past one.
         if let Some(receipt) = receipt
             && may_move(receipt.state, settled, &EstablishedBy::Call, false)
         {

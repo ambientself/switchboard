@@ -341,8 +341,8 @@ struct State {
 
 impl State {
     /// Writes each late completion whose gate has opened, as the Postgres store's own task
-    /// does once the database answers.
-    fn settle(&mut self) {
+    /// does once the database answers, at `now`.
+    fn settle(&mut self, now: SystemTime) {
         let (ready, waiting) = std::mem::take(&mut self.late)
             .into_iter()
             .partition::<Vec<_>, _>(|late| late.gate.is_open());
@@ -350,7 +350,7 @@ impl State {
         for late in ready {
             // A completion the row refuses is not written; the Postgres store's task gives
             // it up the same way.
-            let _ = self.complete_with(&late.row, &late.completion, late.reference.as_ref());
+            let _ = self.complete_with(&late.row, &late.completion, late.reference.as_ref(), now);
         }
     }
 
@@ -428,8 +428,13 @@ impl State {
     }
 
     /// [`complete_with`](Self::complete_with), with no vendor reference.
-    fn complete(&mut self, id: &AuditRowId, completion: &Completion) -> Result<(), StoreError> {
-        self.complete_with(id, completion, None)
+    fn complete(
+        &mut self,
+        id: &AuditRowId,
+        completion: &Completion,
+        now: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.complete_with(id, completion, None, now)
     }
 
     /// Completes the row `id` with `completion`, unless it is complete already, and settles
@@ -439,15 +444,17 @@ impl State {
     /// completed. Every call row is of kind `call`, since begin refuses any other.
     ///
     /// The receipt moves, established by the call, to the state the outcome settles it in,
-    /// with `reference`, only as [`may_move`] allows: one already settled is left as it is,
-    /// and the row is completed all the same. A `duplicate` is refused, since only begin
-    /// writes one, and so is `unknown` for a row with no receipt, since a read never reports
-    /// it.
+    /// with `reference`, only as [`may_move`] allows: one already settled, or one still
+    /// `pending` once its row's deadline has passed at `now` (which is then left to
+    /// reconciliation or a person), is left as it is, and the row is completed all the same.
+    /// A `duplicate` is refused, since only begin writes one, and so is `unknown` for a row
+    /// with no receipt, since a read never reports it.
     fn complete_with(
         &mut self,
         id: &AuditRowId,
         completion: &Completion,
         reference: Option<&VendorReference>,
+        now: SystemTime,
     ) -> Result<(), StoreError> {
         let Some(settled) = ReceiptState::settled_by(&completion.outcome) else {
             return Err("a duplicate is written at begin, never by finish".into());
@@ -468,9 +475,15 @@ impl State {
             .into());
         }
         self.complete_row(id, completion)?;
+        // Past the deadline as Postgres reads it: `deadline < clock_timestamp()`.
+        let past_deadline = self
+            .rows
+            .iter()
+            .find(|(stored, _, _)| stored == id)
+            .and_then(|(_, _, times)| times.deadline)
+            .is_some_and(|deadline| deadline < now);
         if let Some(receipt) = receipt.map(|at| &mut self.receipts[at])
-            // The call's own move is the same whether or not its row's deadline has passed.
-            && may_move(receipt.state, settled, &EstablishedBy::Call, false)
+            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)
         {
             receipt.state = settled;
             receipt.established_by = EstablishedBy::Call;
@@ -663,7 +676,7 @@ impl InMemoryAuditStore {
     /// The state, with every late completion whose gate has opened written.
     fn state(&self) -> MutexGuard<'_, State> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.settle();
+        state.settle(self.clock.now());
         state
     }
 
@@ -916,7 +929,7 @@ impl InMemoryAuditStore {
                 // with it. A denial is refused, and a row completed before, the answer to a
                 // reused key included, keeps its completion, as complete_once refuses and keeps
                 // them.
-                let _ = state.complete(row, &error);
+                let _ = state.complete(row, &error, self.clock.now());
                 return Err(lost());
             }
             Ok(reservation)
@@ -994,6 +1007,7 @@ impl AuditStore for InMemoryAuditStore {
                 completion.row(),
                 completion.completion(),
                 completion.reference(),
+                self.clock.now(),
             )
         })
     }
