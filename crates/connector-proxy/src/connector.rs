@@ -22,7 +22,7 @@ use thiserror::Error;
 use crate::credentials::{FileCredentials, ProbeCredential, Secret};
 use crate::destination::{self, Destination, Loopback, Refusal};
 use crate::list::{ListError, ListedTool, tool_list};
-use crate::outcome;
+use crate::outcome::{self, NOT_MCP, NotMcp};
 use crate::probe::{ProbeBounds, ProbeReport};
 use crate::transport::{CaFault, Transport};
 
@@ -166,15 +166,27 @@ pub enum UpstreamError {
 /// configured CAs.
 ///
 /// Each call is bounded inside the connector: it is abandoned at the deadline, and an answer
-/// larger than the cap is discarded unread. Either way the outcome is [`ToolOutcome::Error`],
-/// of the kind [`ErrorKind::OversizedOrLateRead`] for a tool classified `read` and
-/// [`ErrorKind::Other`] for any other. So is any failure of the server or of the exchange, of
-/// the kind `Other`, a connection refused for its address among them
-/// ([`destination`](crate::destination)), and so are arguments that are not an object, which
-/// are never sent, of the kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its refusal of the call, an
-/// error of the kind [`ErrorKind::VendorRefusal`]. A call this connector does not serve or has
-/// no credential for becomes [`ToolOutcome::Refused`]. See [`outcome`](crate::outcome) for
-/// every sentence.
+/// larger than the cap is discarded unread. From a tool classified `read`, either way the
+/// outcome is [`ToolOutcome::Error`] of the kind [`ErrorKind::OversizedOrLateRead`], and any
+/// other failure of the server or of the exchange is an error of the kind `Other`.
+///
+/// From any other tool, a side effect, an error means nothing took effect (decision 0009). So
+/// once the request may have been sent, every failure without a definite answer from the
+/// server is [`ToolOutcome::Unknown`] instead: the deadline, the cap, an answer broken off, an
+/// exchange that failed after its connection was made, a status that is neither `200` nor
+/// `4xx`, and a `200` that is not MCP. The deadline counts as that even when it passed before
+/// the connection was made, which the connector cannot tell apart. A `4xx`, a JSON-RPC error
+/// and a tool result marked `isError` are the server's answer that it did not do it, and stay
+/// errors.
+///
+/// Before anything is sent, a failure is an error whatever the tool, and its receipt is
+/// settled as `not_performed`: a credential that could not be had or a request that could not
+/// be built, of the kind `Other`; a connection that could not be made, or was refused for its
+/// address ([`destination`](crate::destination)), of the kind `Other`; and arguments that are
+/// not an object, of the kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its
+/// refusal of the call, an error of the kind [`ErrorKind::VendorRefusal`]. A call this
+/// connector does not serve or has no credential for becomes [`ToolOutcome::Refused`]. See
+/// [`outcome`](crate::outcome) for every sentence.
 ///
 /// Running a call needs a Tokio runtime.
 pub struct ProxyConnector {
@@ -286,19 +298,19 @@ impl ProxyConnector {
         let Some(request) = self.request(id, upstream_name, arguments, &secret) else {
             return ToolOutcome::error(ErrorKind::Other, outcome::NOT_SENT);
         };
-        // An answer too large or too late is a kind of its own from a read. From any other
-        // tool, decision 0011 records it as `unknown`, which is not built yet, so until then it
-        // is an error like any other.
-        let late = if tool.classification == Classification::Read {
-            ErrorKind::OversizedOrLateRead
+        // From here on the request may be sent. What a failure without a definite answer comes
+        // to depends on the tool: see `Sent`.
+        let sent = if tool.classification == Classification::Read {
+            Sent::Read
         } else {
-            ErrorKind::Other
+            Sent::SideEffect
         };
-        match tokio::time::timeout(self.deadline, self.exchange(request, late)).await {
-            Err(_elapsed) => ToolOutcome::error(late, outcome::TIMED_OUT),
+        match tokio::time::timeout(self.deadline, self.exchange(request, sent)).await {
+            Err(_elapsed) => sent.late(outcome::TIMED_OUT),
             Ok(Err(failed)) => failed,
             Ok(Ok(received)) => {
                 outcome::interpret(received.content_type.as_deref(), &received.body, id)
+                    .unwrap_or_else(|NotMcp| sent.without_answer(ErrorKind::Other, NOT_MCP))
             }
         }
     }
@@ -329,18 +341,21 @@ impl ProxyConnector {
     }
 
     /// Sends the request and reads a `200` answer's body, up to the cap. Any other status, and
-    /// any failure, is the call's outcome. `late` is the kind of an answer too large or broken
-    /// off.
+    /// any failure, is the call's outcome, as `sent` says for one that may have been sent.
     async fn exchange(
         &self,
         request: Request<Full<Bytes>>,
-        late: ErrorKind,
+        sent: Sent,
     ) -> Result<Received, ToolOutcome> {
         let response = self.transport.request(request).await.map_err(|error| {
             if destination::refused(&error) {
                 ToolOutcome::error(ErrorKind::Other, outcome::DESTINATION_REFUSED)
-            } else {
+            } else if error.is_connect() {
+                // No connection was made, so nothing was sent.
                 ToolOutcome::error(ErrorKind::Other, outcome::UNREACHABLE)
+            } else {
+                // The connection was made, and the request may have gone out on it.
+                sent.without_answer(ErrorKind::Other, outcome::UNREACHABLE)
             }
         })?;
         let status = response.status();
@@ -356,24 +371,30 @@ impl ProxyConnector {
                 outcome::UPSTREAM_REFUSED,
             ));
         }
-        if status != StatusCode::OK {
+        if status.is_client_error() {
+            // The server refused the request: nothing took effect.
             return Err(ToolOutcome::error(
                 ErrorKind::Other,
                 outcome::status(status.as_u16()),
             ));
         }
-        self.read(response, late).await
+        if status != StatusCode::OK {
+            // A server error, a redirect, or a success that is not an answer: the server may
+            // have acted on the request.
+            return Err(sent.without_answer(ErrorKind::Other, &outcome::status(status.as_u16())));
+        }
+        self.read(response, sent).await
     }
 
     /// Reads the body, refusing as soon as it is known to be larger than the cap: from its
-    /// declared length if it has one, and otherwise as it arrives. `late` is the kind of an
-    /// answer too large or broken off.
+    /// declared length if it has one, and otherwise as it arrives. An answer too large or
+    /// broken off is the outcome `sent` gives a late one.
     async fn read(
         &self,
         response: Response<Incoming>,
-        late: ErrorKind,
+        sent: Sent,
     ) -> Result<Received, ToolOutcome> {
-        let too_large = || ToolOutcome::error(late, outcome::TOO_LARGE);
+        let too_large = || sent.late(outcome::TOO_LARGE);
         if declared_length(response.headers())
             .is_some_and(|length| length > self.max_response_bytes as u64)
         {
@@ -387,7 +408,7 @@ impl ProxyConnector {
         let mut body = response.into_body();
         let mut received = Vec::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|_| ToolOutcome::error(late, outcome::BROKEN_OFF))?;
+            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;
             if let Ok(data) = frame.into_data() {
                 if received.len() + data.len() > self.max_response_bytes {
                     return Err(too_large());
@@ -497,6 +518,35 @@ impl ProxyConnector {
 impl Connector for ProxyConnector {
     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome> {
         Box::pin(self.forward(call))
+    }
+}
+
+/// What a call's failure comes to once its request may have been sent and no definite answer
+/// came back: a timeout, an answer too large or broken off, an exchange that failed after its
+/// connection was made, a status that is neither `200` nor `4xx`, or a `200` that is not MCP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    /// From a tool classified `read`, an error: of its own kind when the answer was too large
+    /// or too late, and otherwise as the failure says.
+    Read,
+    /// From any other tool, a side effect, the outcome `unknown` (decision 0009): the server
+    /// may have acted on the request, so the call must not be settled as `not_performed`, and
+    /// the caller must not repeat it.
+    SideEffect,
+}
+
+impl Sent {
+    /// An answer too large, too late or broken off, with `sentence` for a read.
+    fn late(self, sentence: &str) -> ToolOutcome {
+        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)
+    }
+
+    /// Any other failure without a definite answer, of `kind` with `sentence` for a read.
+    fn without_answer(self, kind: ErrorKind, sentence: &str) -> ToolOutcome {
+        match self {
+            Sent::Read => ToolOutcome::error(kind, sentence),
+            Sent::SideEffect => ToolOutcome::Unknown,
+        }
     }
 }
 

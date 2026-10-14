@@ -10,11 +10,20 @@
 //!   - `VendorRefusal` when the server answered `403`, its refusal of the call
 //!     ([`UPSTREAM_REFUSED`]);
 //!   - `OversizedOrLateRead` for the deadline, the size cap or an answer broken off, from a
-//!     tool classified `read`, and `Other` for the same from any other tool;
+//!     tool classified `read`;
 //!   - `Other` for everything else that went wrong on the gateway's side or the server's: a
-//!     connection that failed or was refused for its address ([`DESTINATION_REFUSED`]), a
-//!     credential the server did not accept, any other HTTP status,
-//!     an answer that is not MCP, a JSON-RPC error, and a tool result marked `isError`.
+//!     credential that could not be had or a request that could not be built, a connection
+//!     that could not be made or was refused for its address ([`DESTINATION_REFUSED`]), a
+//!     credential the server did not accept, any other HTTP status, an answer that is not
+//!     MCP, a JSON-RPC error, and a tool result marked `isError`.
+//! - [`ToolOutcome::Unknown`] in place of an error, from a tool not classified `read`, for
+//!   every failure once the request may have been sent, unless the server answered that it did
+//!   not do it: the deadline, the size cap, an answer broken off, an exchange that failed
+//!   after its connection was made, an HTTP status other than `200` outside `4xx`, and a `200`
+//!   that is not MCP. A side effect's error means nothing took effect (decision 0009): nothing
+//!   was sent, or the server answered `4xx`, a JSON-RPC error or a tool result marked
+//!   `isError`. The caller then reads the core's sentence that the call may have happened and
+//!   must not be repeated, not one of the sentences here.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
 //! A successful result is bounded only by the answer cap; the gateway passes its content and
@@ -97,19 +106,28 @@ pub fn rpc_error(code: i64, message: &str) -> String {
     )
 }
 
-/// The outcome of a `200` answer to the request with ID `id`.
-pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> ToolOutcome {
-    let not_mcp = || ToolOutcome::error(ErrorKind::Other, NOT_MCP);
+/// A `200` answer that is not one JSON-RPC response to the request, with a tool result or an
+/// error: [`NOT_MCP`] from a read, and `unknown` from a side effect, since it says nothing of
+/// what the server did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NotMcp;
+
+/// The outcome of a `200` answer to the request with ID `id`, or [`NotMcp`].
+pub(crate) fn interpret(
+    content_type: Option<&str>,
+    body: &[u8],
+    id: u64,
+) -> Result<ToolOutcome, NotMcp> {
     if !content_type.is_some_and(is_json) {
-        return not_mcp();
+        return Err(NotMcp);
     }
     let Ok(Value::Object(message)) = serde_json::from_slice::<Value>(body) else {
-        return not_mcp();
+        return Err(NotMcp);
     };
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || message.get("id").and_then(Value::as_u64) != Some(id)
     {
-        return not_mcp();
+        return Err(NotMcp);
     }
     match (message.get("result"), message.get("error")) {
         (Some(Value::Object(result)), None) => tool_result(result),
@@ -119,32 +137,32 @@ pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> Too
                 error.get("message").and_then(Value::as_str),
             ) {
                 (Some(code), Some(text)) => {
-                    ToolOutcome::error(ErrorKind::Other, rpc_error(code, text))
+                    Ok(ToolOutcome::error(ErrorKind::Other, rpc_error(code, text)))
                 }
-                _ => not_mcp(),
+                _ => Err(NotMcp),
             }
         }
-        _ => not_mcp(),
+        _ => Err(NotMcp),
     }
 }
 
-fn tool_result(result: &Map<String, Value>) -> ToolOutcome {
+fn tool_result(result: &Map<String, Value>) -> Result<ToolOutcome, NotMcp> {
     let Some(Value::Array(content)) = result.get("content") else {
-        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);
+        return Err(NotMcp);
     };
     if result.get("isError") != Some(&Value::Bool(true)) {
-        return ToolOutcome::Ok(Value::Object(result.clone()));
+        return Ok(ToolOutcome::Ok(Value::Object(result.clone())));
     }
     let text: Vec<&str> = content
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect();
-    if text.is_empty() {
+    Ok(if text.is_empty() {
         ToolOutcome::error(ErrorKind::Other, TOOL_FAILED)
     } else {
         ToolOutcome::error(ErrorKind::Other, bounded(&text.join("\n")))
-    }
+    })
 }
 
 /// `application/json`, with or without parameters, in any case.
