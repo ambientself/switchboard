@@ -229,11 +229,17 @@ async fn a_denied_call_never_reaches_the_connector_and_its_row_holds_its_answer(
     assert_eq!(gateway.connector().writes(), Vec::new());
     assert_eq!(gateway.credentials().requests(), Vec::new());
 
-    // Every kind of reason the fixture can reach without a delegation is covered.
+    // Every kind of reason the fixture can reach without a delegation is covered. Its profiles
+    // do not require currency, so the currency check's two reasons need a delegation's
+    // profile too.
     for kind in ReasonKind::ALL {
         let needs_a_delegation = matches!(
             kind,
-            ReasonKind::ToolNotInDelegation | ReasonKind::DelegationDisagrees
+            ReasonKind::ToolNotInDelegation
+                | ReasonKind::DelegationDisagrees
+                | ReasonKind::DelegationUnverified
+                | ReasonKind::NotCurrent
+                | ReasonKind::CurrencyUnconfirmed
         );
         assert_eq!(
             sentences.iter().any(|(reached, _)| *reached == kind),

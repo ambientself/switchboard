@@ -232,6 +232,12 @@ pub struct Profile {
     pub classifications: BTreeSet<Classification>,
     /// Whether a call under this profile must carry a delegation.
     pub requires_delegation: bool,
+    /// Whether a call of a tool not classified `read` under this profile is allowed only while
+    /// the control plane that issued its delegation says its turn is current (decision 0012,
+    /// "Currency"). False unless a policy says so, so a policy written before the setting
+    /// existed keeps its meaning. The profile for Otto's sandboxes sets it.
+    #[serde(default)]
+    pub requires_currency: bool,
     /// Whether this profile's callers set the `Idempotency-Key` header per request, so the
     /// gateway may take a call's key from it (decision 0009, "The key"). False unless a policy
     /// says so. MCP clients set headers once per server, so a header fixed in a client's
@@ -898,6 +904,7 @@ mod tests {
             name: name.into(),
             classifications: BTreeSet::new(),
             requires_delegation: false,
+            requires_currency: false,
             idempotency_key_header: false,
         }
     }

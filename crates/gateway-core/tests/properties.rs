@@ -15,11 +15,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, ConnectorEntry, CredentialMode,
-    Decision, DeclaredFrom, Delegation, EntryKind, GroupId, IdempotencyKey, Issuer, Narrowing,
-    PodUid, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
-    ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
-    ResourceProblem, Resources, Settlement, SnapshotData, Subject, Surface, SurfaceName, TeamId,
-    ToolName, Verdict, decide, list_tools,
+    Currency, CurrencyAnswer, Decision, DeclaredFrom, Delegation, DelegationFailure, EntryKind,
+    GroupId, IdempotencyKey, Issuer, Narrowing, PodUid, PolicySnapshot, Principal, PrincipalId,
+    PrincipalKind, PrincipalRestriction, Profile, ProfileName, Reason, ReasonKind, Resource,
+    ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Settlement, SnapshotData,
+    Subject, Surface, SurfaceName, TeamId, ToolName, UnverifiedDelegation, Verdict, decide,
+    list_tools,
 };
 
 use gateway_core::AuditRecord;
@@ -52,7 +53,11 @@ const PODS: [&str; 2] = [
 struct World {
     data: SnapshotData,
     principal: Principal,
+    /// The delegation the call carries, if it verified.
     delegation: Option<Delegation>,
+    /// The check the delegation the call carries failed, if it did not verify. When set, the
+    /// call carries this unverified delegation and not `delegation`.
+    unverified: Option<DelegationFailure>,
     /// The profile in the snapshot.
     profile: Profile,
     /// The profile the caller's context names: usually `profile`'s name, sometimes one the
@@ -63,6 +68,8 @@ struct World {
     resources: Resources,
     /// The call's idempotency key, if it carries one.
     key: Option<IdempotencyKey>,
+    /// The call's currency: what the control plane answered, or not asked.
+    currency: Currency,
 }
 
 impl World {
@@ -77,7 +84,10 @@ impl World {
     fn caller(&self) -> CallerContext {
         CallerContext {
             principal: common::proved(&self.principal),
-            delegation: self.delegation.as_ref().map(common::proved),
+            delegation: match self.unverified {
+                Some(failure) => Some(UnverifiedDelegation::new(failure).into()),
+                None => self.delegation.as_ref().map(common::presented),
+            },
             profile: self.profile_name.clone(),
             surface: self.surface.clone(),
             deployment: "test".into(),
@@ -90,6 +100,7 @@ impl World {
             tool: self.tool.clone().into(),
             resources: self.resources.clone(),
             key: self.key.clone(),
+            currency: self.currency,
         }
     }
 
@@ -196,16 +207,13 @@ fn open_up(world: &mut World) {
         surface.tools.insert(tool.clone());
     }
 
-    // Checks 3 and 4: any delegation agrees and lists the tool; one is present if required.
+    // Checks 3 and 4: any delegation verified, agrees and lists the tool; one is present if
+    // required.
+    world.unverified = None;
     match &principal.kind {
         PrincipalKind::Workload { team, .. } => {
             if world.profile.requires_delegation && world.delegation.is_none() {
-                world.delegation = Some(Delegation {
-                    acting_person: gateway_core::Claimed::new("requester@example.test".into()),
-                    team: team.clone(),
-                    tools: BTreeSet::new(),
-                    key_scope: None,
-                });
+                world.delegation = Some(common::delegation(team.as_str(), []));
             }
             if let Some(delegation) = &mut world.delegation {
                 delegation.team = team.clone();
@@ -249,6 +257,9 @@ fn open_up(world: &mut World) {
     if let Some(approved) = world.approved_tool_mut() {
         approved.resources = ResourceDeclaration::ChecksOwnScope;
     }
+
+    // The currency check: the turn is current.
+    world.currency = Currency::Asked(CurrencyAnswer::Current);
 
     // The key check, last: the call carries a key.
     world.key = Some(IdempotencyKey::parse(KEY).unwrap());
@@ -370,13 +381,22 @@ fn any_delegation() -> impl Strategy<Value = Option<Delegation>> {
     let mut listable = TOOLS.to_vec();
     listable.push(UNAPPROVED_TOOL);
     proptest::option::of(
-        (select(TEAMS.to_vec()), subset(listable)).prop_map(|(team, tools)| Delegation {
-            acting_person: gateway_core::Claimed::new("requester@example.test".into()),
-            team: team.into(),
-            tools: tool_names(tools),
-            key_scope: None,
-        }),
+        (select(TEAMS.to_vec()), subset(listable))
+            .prop_map(|(team, tools)| common::delegation(team, tool_names(tools))),
     )
+}
+
+/// A delegation that did not verify, now and then: the check it failed.
+fn any_failure() -> impl Strategy<Value = Option<DelegationFailure>> {
+    proptest::option::weighted(0.1, select(DelegationFailure::ALL.to_vec()))
+}
+
+/// Any currency: each answer, or not asked.
+fn any_currency() -> impl Strategy<Value = Currency> {
+    prop_oneof![
+        select(CurrencyAnswer::ALL.to_vec()).prop_map(Currency::Asked),
+        Just(Currency::NotAsked),
+    ]
 }
 
 fn any_world() -> impl Strategy<Value = World> {
@@ -392,32 +412,47 @@ fn any_world() -> impl Strategy<Value = World> {
         any_surface(SURFACES[1]),
         any_limits(),
     );
-    let profile = (subset(Classification::ALL.to_vec()), any::<bool>()).prop_map(
-        |(classifications, requires_delegation)| Profile {
-            name: "profile".into(),
-            classifications: classifications.into_iter().collect(),
-            requires_delegation,
-            idempotency_key_header: false,
-        },
-    );
+    let profile = (
+        subset(Classification::ALL.to_vec()),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(classifications, requires_delegation, requires_currency)| Profile {
+                name: "profile".into(),
+                classifications: classifications.into_iter().collect(),
+                requires_delegation,
+                requires_currency,
+                idempotency_key_header: false,
+            },
+        );
     let resources = prop_oneof![
         3 => subset(resource_pool()).prop_map(Resources::Named),
         1 => Just(Resources::Unknown),
     ];
     let call = (
         any_principal(),
-        any_delegation(),
+        (any_delegation(), any_failure()),
         profile,
         proptest::bool::weighted(0.1),
         select(reachable),
         select(callable),
         resources,
-        proptest::option::of(Just(KEY)),
+        (proptest::option::of(Just(KEY)), any_currency()),
     );
     (data, call).prop_map(
         |(
             (one, two, three, a, b, limits),
-            (principal, delegation, profile, unknown_profile, surface, tool, resources, key),
+            (
+                principal,
+                (delegation, unverified),
+                profile,
+                unknown_profile,
+                surface,
+                tool,
+                resources,
+                (key, currency),
+            ),
         )| {
             World {
                 data: SnapshotData {
@@ -430,6 +465,7 @@ fn any_world() -> impl Strategy<Value = World> {
                 },
                 principal,
                 delegation,
+                unverified,
                 profile_name: if unknown_profile {
                     "profile-missing".into()
                 } else {
@@ -440,6 +476,7 @@ fn any_world() -> impl Strategy<Value = World> {
                 tool: tool_name(tool),
                 resources,
                 key: key.map(|key| IdempotencyKey::parse(key).unwrap()),
+                currency,
             }
         },
     )
@@ -554,20 +591,32 @@ proptest! {
         let listed: BTreeSet<ToolName> = list_tools(&snapshot, &caller).iter().map(|tool| tool.name.clone()).collect();
         let served: BTreeSet<ToolName> = snapshot.surface(&world.surface).map(|surface| surface.tools.clone()).unwrap_or_default();
         prop_assert!(listed.is_subset(&served));
-        // The list is what `decide` allows, except check 6, the currency check and the key
-        // check (decision 0006, amended on 2026-10-07). `tools/list` decides with no resources
-        // and no key; a call with an empty list of resources and no key differs only for a tool
-        // that declares its resources, which check 6 then refuses with `NoneNamed`, and for a
-        // tool not classified `read`, which the key check, last, refuses with `KeyMissing`.
-        // There is no currency check yet (#22).
+        // The list is what `decide` allows, except the currency check, check 6 and the key
+        // check (decision 0006, amended on 2026-10-07). `tools/list` decides with no currency,
+        // no resources and no key; a call not asked for its currency, with an empty list of
+        // resources and no key, differs only for a tool not classified `read` under a profile
+        // that requires currency, which the currency check refuses with `CurrencyUnconfirmed`,
+        // for a tool that declares its resources, which check 6 then refuses with `NoneNamed`,
+        // and for a tool not classified `read`, which the key check, last, refuses with
+        // `KeyMissing`.
         for tool in served {
-            let call = CallContext { caller: caller.clone(), tool: tool.clone().into(), resources: Resources::Named(Vec::new()), key: None };
+            let call = CallContext {
+                caller: caller.clone(),
+                tool: tool.clone().into(),
+                resources: Resources::Named(Vec::new()),
+                key: None,
+                currency: Currency::NotAsked,
+            };
             let decision = decide(&snapshot, &call);
-            let passes_all_but_resources_and_key = decision.is_allowed() || matches!(
+            let passes_all_but_currency_resources_and_key = decision.is_allowed() || matches!(
                 decision.reason(),
-                Some(Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { .. }) | Reason::KeyMissing { .. })
+                Some(
+                    Reason::CurrencyUnconfirmed { .. }
+                        | Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { .. })
+                        | Reason::KeyMissing { .. }
+                )
             );
-            prop_assert_eq!(passes_all_but_resources_and_key, listed.contains(&tool), "tool {}", tool);
+            prop_assert_eq!(passes_all_but_currency_resources_and_key, listed.contains(&tool), "tool {}", tool);
         }
     }
 
@@ -601,17 +650,88 @@ proptest! {
         }
     }
 
-    /// `open_up` gives the call a key and opens every other check, so a `propose` tool is
-    /// allowed as a `read` one is (decision 0006, amended on 2026-10-07).
+    /// `open_up` gives the call a key and a current turn and opens every other check, so a
+    /// `propose` tool is allowed as a `read` one is, under a profile that requires currency or
+    /// not (decision 0006, amended on 2026-10-07).
     #[test]
     fn an_opened_world_is_allowed(mut world in any_world(), classification in select(vec![Classification::Read, Classification::Propose])) {
         open_up(&mut world);
         prop_assert!(world.key.is_some(), "open_up left the call without a key");
+        prop_assert_eq!(world.currency, Currency::Asked(CurrencyAnswer::Current), "open_up left the turn not current");
         if let Some(approved) = world.approved_tool_mut() {
             approved.classification = classification;
         }
         let decision = world.decide();
         prop_assert!(decision.is_allowed(), "open_up left a check closed: {decision:?}");
+    }
+
+    /// Decision 0012: under a profile that requires currency, a call of a tool not classified
+    /// `read` is never allowed unless its turn is current; and every other answer to a call that
+    /// would be allowed if current denies it at the currency check, not later.
+    #[test]
+    fn a_side_effect_is_never_allowed_unless_current_where_currency_is_required(
+        mut world in world(),
+        classification in select(Classification::ALL.to_vec()),
+        currency in any_currency(),
+    ) {
+        if let Some(approved) = world.approved_tool_mut() {
+            approved.classification = classification;
+        }
+        world.profile.requires_currency = true;
+        world.currency = currency;
+        let decision = world.decide();
+        let current = currency == Currency::Asked(CurrencyAnswer::Current);
+        if let Some(tool) = decision.tool().filter(|_| decision.is_allowed()) {
+            prop_assert!(tool.classification == Classification::Read || current, "allowed {} with {:?}: {:?}", tool.classification, currency, decision);
+        }
+        let mut current_world = world.clone();
+        current_world.currency = Currency::Asked(CurrencyAnswer::Current);
+        let if_current = current_world.decide();
+        let side_effect = if_current.tool().is_some_and(|tool| tool.classification != Classification::Read);
+        if if_current.is_allowed() && side_effect && !current {
+            let expected = if matches!(currency, Currency::Asked(CurrencyAnswer::Superseded | CurrencyAnswer::Ended | CurrencyAnswer::Revoked)) {
+                ReasonKind::NotCurrent
+            } else {
+                ReasonKind::CurrencyUnconfirmed
+            };
+            prop_assert_eq!(decision.reason().map(Reason::kind), Some(expected));
+        }
+    }
+
+    /// Decisions 0009 and 0012: a delegation that did not verify is never allowed and lists
+    /// nothing, whatever it failed and whatever the profile; its denial is at check 3 unless an
+    /// earlier check fails, and reads one sentence; and its row holds which check failed and
+    /// nothing from its claims.
+    #[test]
+    fn an_unverified_delegation_is_never_allowed_and_leaves_nothing_of_its_claims(
+        mut world in world(),
+        failure in select(DelegationFailure::ALL.to_vec()),
+    ) {
+        world.unverified = Some(failure);
+        let decision = world.decide();
+        prop_assert!(!decision.is_allowed(), "allowed an unverified delegation: {:?}", decision);
+        prop_assert!(list_tools(&world.snapshot(), &world.caller()).is_empty());
+        let mut opened = world.clone();
+        open_up(&mut opened);
+        opened.unverified = Some(failure);
+        let at_check_3 = opened.decide();
+        prop_assert_eq!(at_check_3.reason(), Some(&Reason::DelegationUnverified { failure }));
+        let store = common::MemoryStore::default();
+        let begun = common::ready(audit::begin(
+            &store,
+            common::start(),
+            at_check_3,
+            serde_json::Value::Null,
+            Default::default(),
+        ));
+        prop_assert!(begun.is_ok());
+        let row = store.last();
+        prop_assert_eq!(
+            row.sentence.as_deref(),
+            Some("This gateway requires a verifiable turn grant on every call, and this call's did not verify.")
+        );
+        prop_assert_eq!(row.delegation_failure.as_ref().map(|recorded| recorded.failure), Some(failure));
+        prop_assert!(row.proved_delegation_team.is_none() && row.claimed_acting_person.is_none() && row.delegation.is_none(), "{:?}", row);
     }
 
     /// Decision 0012: the pod a workload's token proves is carried, and no decision reads it.

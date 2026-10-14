@@ -78,6 +78,7 @@ pub(super) async fn through_core(
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     let begun = audit::begin(
@@ -371,6 +372,7 @@ async fn a_nul_in_a_value_refuses_the_record_and_writes_no_row() {
             caller: fixture.caller_context(call.caller, call.surface).unwrap(),
             tool: RequestedTool::new(call.tool),
             key: None,
+            currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&fixture.policy, &context);
         let failure = audit::begin(&store, row_start(), decision, call.arguments, metadata)
@@ -714,6 +716,7 @@ fn decided(fixture: &Fixture, call: &Call) -> gateway_core::Decision {
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)
 }
@@ -856,6 +859,7 @@ pub(super) async fn begun_row(store: &PgAuditStore, fixture: &Fixture) -> AuditR
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     match audit::begin(store, row_start(), decision, call.arguments, call.metadata)
@@ -1108,6 +1112,7 @@ async fn a_store_that_cannot_reach_its_database_refuses_the_call() {
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     let failure = audit::begin(&store, row_start(), decision, call.arguments, call.metadata)

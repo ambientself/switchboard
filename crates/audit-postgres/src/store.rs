@@ -2139,6 +2139,7 @@ mod unit {
             caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
             tool: RequestedTool::new(READ_TOOL),
             key: None,
+            currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&fixture.policy, &context);
         let begin = audit::begin(

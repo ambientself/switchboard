@@ -12,10 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gateway_core::audit::{self, Begun, DecisionKind, MAX_RECORDED_RESOURCES, RequestMetadata};
 use gateway_core::{
-    AuditRecord, CallContext, CallerContext, Claimed, Classification, Delegation, DeploymentName,
-    IdempotencyKey, PolicySnapshot, Principal, ProfileName, ReasonKind, ReceiptState,
-    RequestedTool, Resource, Resources, SnapshotData, SurfaceName, TeamId, ToolName, WasProved,
-    decide, list_tools,
+    AuditRecord, CallContext, CallerContext, Claimed, Classification, Currency, CurrencyAnswer,
+    Delegation, DelegationDigest, DelegationFailure, DeploymentName, Egress, IdempotencyKey,
+    Person, PolicySnapshot, PresentedDelegation, Principal, ProfileName, ReasonKind, ReceiptState,
+    RequestedTool, Resource, Resources, SnapshotData, SurfaceName, TeamId, ToolName,
+    UnverifiedDelegation, WasProved, decide, list_tools,
 };
 use serde::Deserialize;
 
@@ -33,10 +34,72 @@ struct Table {
     about: String,
     deployment: DeploymentName,
     principals: BTreeMap<String, Principal>,
-    delegations: BTreeMap<String, Delegation>,
+    delegations: BTreeMap<String, TableDelegation>,
     snapshots: BTreeMap<String, SnapshotData>,
     cases: Vec<Case>,
     lists: Vec<ListCase>,
+}
+
+/// A delegation as the table writes it: one that verified, with its person, team and tools, or
+/// one that did not, with the check it failed and, after a verified signature, its digest.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TableDelegation {
+    Unverified(TableUnverified),
+    Verified(TableVerified),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableUnverified {
+    unverified: DelegationFailure,
+    #[serde(default)]
+    digest: Option<DelegationDigest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableVerified {
+    acting_person: Claimed<Person>,
+    team: TeamId,
+    tools: BTreeSet<ToolName>,
+}
+
+impl TableDelegation {
+    /// The delegation as its verifier would present it. A verified one is issued for the turn
+    /// named like it, under a test key, and its digest is of its name; the narrow ones carry no
+    /// egress setting, and the rest a sealed one.
+    fn presented(self, name: &str) -> PresentedDelegation {
+        match self {
+            TableDelegation::Unverified(TableUnverified {
+                unverified,
+                digest: None,
+            }) => UnverifiedDelegation::new(unverified).into(),
+            TableDelegation::Unverified(TableUnverified {
+                unverified,
+                digest: Some(digest),
+            }) => UnverifiedDelegation::after_signature(unverified, digest)
+                .unwrap_or_else(|error| panic!("delegation `{name}`: {error}"))
+                .into(),
+            TableDelegation::Verified(TableVerified {
+                acting_person,
+                team,
+                tools,
+            }) => common::presented(&Delegation {
+                acting_person,
+                team,
+                tools,
+                issuer: "otto-test".into(),
+                digest: DelegationDigest::of(name.as_bytes()),
+                key_id: "key-1".into(),
+                session: "session-1".into(),
+                turn: name.into(),
+                execution: "execution-1".into(),
+                epoch: 7,
+                egress: (!name.ends_with("narrow")).then_some(Egress::Sealed),
+            }),
+        }
+    }
 }
 
 /// Who is calling, where and under which profile: the fields a decision case and a list case
@@ -64,6 +127,10 @@ struct Case {
     /// The call's idempotency key. A call of a tool not classified `read` needs one.
     #[serde(default)]
     key: Option<IdempotencyKey>,
+    /// What the control plane answered when asked whether the turn is current. Absent when it
+    /// was not asked.
+    #[serde(default)]
+    currency: Option<CurrencyAnswer>,
     expect: Expected,
 }
 
@@ -116,7 +183,7 @@ enum Expected {
 struct World {
     deployment: DeploymentName,
     principals: BTreeMap<String, Principal>,
-    delegations: BTreeMap<String, Delegation>,
+    delegations: BTreeMap<String, PresentedDelegation>,
     snapshots: BTreeMap<String, PolicySnapshot>,
     profiles: BTreeMap<String, Vec<ProfileName>>,
 }
@@ -145,7 +212,7 @@ impl World {
             snapshot,
             CallerContext {
                 principal: common::proved(principal),
-                delegation: delegation.map(common::proved),
+                delegation: delegation.cloned(),
                 profile: caller.profile.clone(),
                 surface: caller.surface.clone(),
                 deployment: self.deployment.clone(),
@@ -176,7 +243,14 @@ fn load() -> (World, Vec<Case>, Vec<ListCase>) {
     let world = World {
         deployment: table.deployment,
         principals: table.principals,
-        delegations: table.delegations,
+        delegations: table
+            .delegations
+            .into_iter()
+            .map(|(name, delegation)| {
+                let presented = delegation.presented(&name);
+                (name, presented)
+            })
+            .collect(),
         snapshots,
         profiles,
     };
@@ -191,10 +265,14 @@ fn expected_row(
     metadata: &RequestMetadata,
 ) -> AuditRecord {
     let principal = &world.principals[&case.principal];
-    let delegation = case
+    let presented = case
         .delegation
         .as_ref()
         .map(|name| &world.delegations[name]);
+    let delegation = presented
+        .and_then(PresentedDelegation::verified)
+        .map(|delegation| delegation.get());
+    let failure = presented.and_then(PresentedDelegation::unverified);
     let served = case
         .tool
         .name()
@@ -254,6 +332,24 @@ fn expected_row(
         "proved_delegation_team": delegation.map(|delegation| &delegation.team),
         "claimed_acting_person": delegation.map(|delegation| &delegation.acting_person),
         "claimed_team": metadata.claimed_team,
+        // Every value the table gives a delegation is printable ASCII, so nothing is escaped.
+        "delegation": delegation.map(|delegation| serde_json::json!({
+            "digest": delegation.digest,
+            "issuer": delegation.issuer,
+            "key_id": delegation.key_id,
+            "session": delegation.session,
+            "turn": delegation.turn,
+            "execution": delegation.execution,
+            "epoch": delegation.epoch,
+            "egress": delegation.egress,
+        })),
+        // A delegation that did not verify leaves which check it failed and, after a verified
+        // signature, its digest: nothing from its claims.
+        "delegation_failure": failure.map(|failure| serde_json::json!({
+            "failure": failure.failure(),
+            "digest": failure.digest(),
+        })),
+        "currency": case.currency,
         // The identity the served tool's entry states, if it has one.
         "credential": served
             .as_ref()
@@ -361,6 +457,7 @@ fn check_cases(world: &World, cases: &[Case]) -> Vec<String> {
             tool: case.tool.clone(),
             resources: case.resources.clone(),
             key: case.key.clone(),
+            currency: case.currency.map_or(Currency::NotAsked, Currency::Asked),
         };
         let decision = decide(snapshot, &call);
         if decision.policy_revision() != snapshot.revision() {

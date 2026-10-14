@@ -92,6 +92,32 @@ name!(
     /// the decision.
     ToolUseId
 );
+name!(
+    /// The issuer of a delegation, by the name the gateway's configuration gives the key that
+    /// verified it (decision 0012, "The issuer is the key"). Not a token issuer: a principal's
+    /// is an [`Issuer`].
+    DelegationIssuer
+);
+name!(
+    /// The identifier of the key a delegation's signature verified under, as the delegation
+    /// names it and the gateway's configuration holds it.
+    KeyId
+);
+name!(
+    /// The session a delegation was issued in, as its issuing control plane names it: for
+    /// Otto, the grant's `sid`.
+    SessionId
+);
+name!(
+    /// The turn a delegation was issued for, as its issuing control plane names it: for Otto,
+    /// the grant's `tid`.
+    TurnId
+);
+name!(
+    /// The execution a delegation's turn belongs to, as its issuing control plane names it: for
+    /// Otto, the grant's `eid`.
+    ExecutionId
+);
 
 /// The longest a tool name may be.
 pub const MAX_TOOL_NAME: usize = 64;

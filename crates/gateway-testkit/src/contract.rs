@@ -68,10 +68,11 @@ use gateway_core::audit::{
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
     ArgumentDigest, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
-    Claimed, Connector, CredentialIdentity, CredentialMode, Decision, Delegation,
-    DelegationKeyScope, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer, Proved, Receipt,
-    ReceiptQueue, ReceiptState, Recorded, RequestedTool, Resource, Resources, Reuse, TeamId,
-    ToolCall, ToolOutcome, ToolUseId, VendorReference, Verifier, decide,
+    Claimed, Connector, CredentialIdentity, CredentialMode, Decision, Delegation, DelegationDigest,
+    DelegationKeyScope, Egress, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer,
+    PresentedDelegation, Proved, Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
+    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, VendorReference,
+    Verifier, decide,
 };
 use serde_json::{Value, json};
 
@@ -258,6 +259,7 @@ fn decision_context(fixture: &Fixture, call: &Call) -> CallContext {
             .expect("the fixture knows the caller"),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     }
 }
 
@@ -1055,6 +1057,7 @@ pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let begun = audit::begin(
         store,
@@ -1524,10 +1527,31 @@ impl Connector for Answering {
 }
 
 /// Proves a delegation exactly as it is given. The contract suite's own, for item 6's scope
-/// case: the fixture has no delegation verifier, and a key's scope reads the delegation's key
-/// scope, which no verifier fills until #22. Every `impl Verifier` creates proof, so it is
-/// private to this module and used only there.
+/// case and the delegation columns: the fixture has no delegation verifier. Every
+/// `impl Verifier` creates proof, so it is private to this module and used only there.
 struct DelegationAsGiven;
+
+/// Team A's delegation for `turn` of one session and execution, listing the draft tool, as
+/// [`DelegationAsGiven`] proves it. Its digest is of the turn's name.
+fn turn_delegation(turn: &str) -> PresentedDelegation {
+    let delegation = Delegation {
+        acting_person: Claimed::new("requester@example.test".into()),
+        team: TEAM_A.into(),
+        tools: [DRAFT_TOOL.parse().expect("a valid tool name")].into(),
+        issuer: "otto-test".into(),
+        digest: DelegationDigest::of(turn.as_bytes()),
+        key_id: "key-1".into(),
+        session: "session-1".into(),
+        turn: turn.into(),
+        execution: "execution-1".into(),
+        epoch: 7,
+        egress: Some(Egress::Sealed),
+    };
+    PresentedDelegation::Verified(match Proved::verify(&DelegationAsGiven, &delegation) {
+        Ok(proved) => proved,
+        Err(never) => match never {},
+    })
+}
 
 impl Verifier for DelegationAsGiven {
     type Evidence = Delegation;
@@ -1567,6 +1591,7 @@ fn keyed_decision(
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, arguments),
         key: key.cloned(),
+        currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)
 }
@@ -1958,20 +1983,11 @@ pub async fn two_delegations_under_one_principal_may_use_the_same_key(
         let mut caller = fixture
             .caller_context(Caller::TeamA, SURFACE_ALL)
             .expect("the fixture knows team A");
-        let delegation = Delegation {
-            acting_person: Claimed::new("requester@example.test".into()),
-            team: TEAM_A.into(),
-            tools: [DRAFT_TOOL.parse().expect("a valid tool name")].into(),
-            key_scope: Some(DelegationKeyScope::new(turn)),
-        };
-        caller.delegation = Some(match Proved::verify(&DelegationAsGiven, &delegation) {
-            Ok(proved) => proved,
-            Err(never) => match never {},
-        });
+        caller.delegation = Some(turn_delegation(turn));
         keyed_decision(&fixture, caller, &arguments, Some(&key))
     };
     let mut rows = Vec::new();
-    for turn in ["session-1/turn-1", "session-1/turn-2"] {
+    for turn in ["turn-1", "turn-2"] {
         let start = row_start();
         let begun = begin_keyed(store, &start, in_turn(turn), &arguments, Some(key.as_str())).await;
         assert!(matches!(begun, Ok(Begun::Allowed(_))), "{turn}: {begun:?}");
@@ -1989,13 +2005,19 @@ pub async fn two_delegations_under_one_principal_may_use_the_same_key(
                 .map(DelegationKeyScope::as_str)
         })
         .collect();
-    assert!(scopes.contains(&Some("session-1/turn-1")), "{scopes:?}");
-    assert!(scopes.contains(&Some("session-1/turn-2")), "{scopes:?}");
+    assert!(
+        scopes.contains(&Some(r#"["session-1","execution-1","turn-1"]"#)),
+        "{scopes:?}"
+    );
+    assert!(
+        scopes.contains(&Some(r#"["session-1","execution-1","turn-2"]"#)),
+        "{scopes:?}"
+    );
 
     let again = begin_keyed(
         store,
         &row_start(),
-        in_turn("session-1/turn-2"),
+        in_turn("turn-2"),
         &arguments,
         Some(key.as_str()),
     )

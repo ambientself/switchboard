@@ -265,6 +265,7 @@ fn proposal(
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
         key: Some(key.clone()),
+        currency: gateway_core::Currency::NotAsked,
     };
     let decision = decide(&fixture.policy, &context);
     assert!(decision.is_allowed(), "{decision:?}");

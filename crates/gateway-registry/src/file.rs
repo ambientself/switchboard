@@ -152,6 +152,11 @@ pub(crate) struct ProfileFile {
     pub name: ProfileName,
     pub classifications: BTreeSet<Classification>,
     pub requires_delegation: bool,
+    /// Whether a call of a tool not classified `read` under the profile is allowed only while
+    /// its turn is current (decision 0012). Absent is false, so a file written before the
+    /// setting existed keeps its meaning.
+    #[serde(default)]
+    pub requires_currency: bool,
     /// Whether the profile's callers set the `Idempotency-Key` header per request. Absent is
     /// false, so a file written before the setting existed keeps its meaning.
     #[serde(default)]
