@@ -26,6 +26,10 @@ func TestBootRefusals(t *testing.T) {
 	noAudit := append(append([]string{}, noGrant...), "-audit-disabled")
 	badManifest := filepath.Join(h.dir, "bad.json")
 	must(t, os.WriteFile(badManifest, []byte(`{"id":"bad","sandbox":{"serviceAccount":"not-an-sa"}}`), 0600))
+	previousKey := filepath.Join(h.dir, "previous.key")
+	must(t, os.WriteFile(previousKey, []byte(strings.Repeat("p", 64)), 0600))
+	rotating := append(append(append([]string{}, noIdentity...), "-audit-disabled"), h.grantArgs()...)
+	until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	cases := []struct {
 		name string
 		args []string
@@ -44,6 +48,11 @@ func TestBootRefusals(t *testing.T) {
 		{"audit_as_owner", append(append([]string{}, noGrant...), "-database-url", strings.Replace(h.dsn, "otto_gateway:"+requiredEnv(t, "OTTO_TEST_GATEWAY_ROLE_PASSWORD"), "otto:local-conformance-only", 1)), "", `"otto" can write to session and outbox regardless of any grant`},
 		{"connector_partial", append(append([]string{}, noAudit...), "-github-org", "test-org"), "", "the github connector is half configured"},
 		{"legacy_app_key_variable", noAudit, "OTTO_GATEWAY_GITHUB_APP_ID=1234", "no longer reads the GitHub App key directly"},
+		// A key being rotated away from needs a fixed instant at which it retires.
+		{"previous_grant_key_without_retirement", append(append([]string{}, rotating...), "-turn-grant-previous-key-file", previousKey), "", "-turn-grant-previous-key-file is set without -turn-grant-previous-until"},
+		{"previous_grant_key_retirement_not_an_instant", append(append([]string{}, rotating...), "-turn-grant-previous-key-file", previousKey, "-turn-grant-previous-until", "1h"), "", `-turn-grant-previous-until "1h" is not an RFC3339 instant`},
+		{"previous_grant_key_is_the_current_key", append(append([]string{}, rotating...), "-turn-grant-previous-key-file", h.grantKeyPath, "-turn-grant-previous-until", until), "", "the current and previous signing keys are the same key"},
+		{"previous_grant_key_unreadable", append(append([]string{}, rotating...), "-turn-grant-previous-key-file", filepath.Join(h.dir, "missing.key"), "-turn-grant-previous-until", until), "", "read the turn-grant signing key"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -248,6 +257,70 @@ func TestTurnGrantIsRequiredAndVerified(t *testing.T) {
 		})
 	}
 	require(t, len(h.vendor.snapshot()) == 0, "grant denial reached vendor")
+}
+
+// The gateway takes a new grant key at start: the current key file, plus the
+// key being rotated away from and the instant it retires. Both files are read
+// once, at start.
+func TestGrantKeyRotation(t *testing.T) {
+	h := newHarness(t)
+	previous := []byte(strings.Repeat("p", 64))
+	previousPath := filepath.Join(h.dir, "previous.key")
+	must(t, os.WriteFile(previousPath, previous, 0600))
+	// RFC3339 has whole seconds; the calls before retirement take well under one.
+	retires := time.Now().Add(3 * time.Second).Truncate(time.Second)
+	h.extraArgs = []string{"-turn-grant-previous-key-file", previousPath, "-turn-grant-previous-until", retires.UTC().Format(time.RFC3339)}
+	h.start(full)
+	call := func(key []byte) (rpcReply, turn) {
+		c := h.turn(nil)
+		c.Headers[grantHeader] = mintGrant(t, key, h.claims(c.ID))
+		return h.request("tools/call", map[string]any{"name": "declare_unverified_claim", "arguments": map[string]any{"claim": "a release exists"}}, c.Headers), c
+	}
+	accepted := func(name string, key []byte) {
+		t.Helper()
+		r, c := call(key)
+		require(t, r.Error == nil, "%s: grant refused: %s", name, r.Raw)
+		row := h.auditRow(c, "allowed", "ok")
+		require(t, row["actor_claimed"] == actor && row["team_claimed"] == team && row["session_id"] == "session-test", "%s: row: %v", name, row)
+	}
+	refused := func(name string, key []byte) {
+		t.Helper()
+		before := h.auditCount()
+		r, c := call(key)
+		require(t, r.Error != nil && r.Error.Message == grantDenial, "%s: grant accepted: %s", name, r.Raw)
+		require(t, len(h.rows(c.ID)) == 0, "%s: an unverified grant's turn was recorded", name)
+		row := h.newestAuditRow(before)
+		require(t, row["decision"] == "denied" && row["actor_claimed"] == nil && row["team_claimed"] == nil, "%s: row: %v", name, row)
+	}
+	accepted("current key", h.grantKey)
+	// Nothing on the row says which of the two keys signed the grant.
+	accepted("previous key before it retires", previous)
+	refused("a key that is neither", []byte(strings.Repeat("u", 64)))
+	// Rewriting the current key file changes nothing until a restart.
+	rewritten := []byte(strings.Repeat("n", 64))
+	must(t, os.WriteFile(h.grantKeyPath, rewritten, 0600))
+	refused("the rewritten file's key", rewritten)
+	accepted("the key read at start", h.grantKey)
+	// Retirement takes effect at the instant, without a restart.
+	time.Sleep(time.Until(retires) + 300*time.Millisecond)
+	refused("previous key after it retired", previous)
+	accepted("current key after the previous retired", h.grantKey)
+	h.stop()
+
+	// A retirement instant already past is accepted at start, and the previous
+	// key is refused from the first call.
+	h.grantKey = rewritten
+	h.extraArgs = []string{"-turn-grant-previous-key-file", previousPath, "-turn-grant-previous-until", time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)}
+	h.url, h.stop = startProcess(t, append(append(append(h.identityArgs(), h.grantArgs()...), "-database-url", h.dsn), h.extraArgs...))
+	refused("previous key already retired", previous)
+	accepted("current key", rewritten)
+	h.stop()
+
+	// A retirement instant without a previous key is ignored rather than refused.
+	h.url, h.stop = startProcess(t, append(append(append(h.identityArgs(), h.grantArgs()...), "-database-url", h.dsn), "-turn-grant-previous-until", time.Now().Add(time.Hour).UTC().Format(time.RFC3339)))
+	accepted("current key with a stray retirement instant", rewritten)
+	refused("previous key never configured", previous)
+	require(t, len(h.vendor.snapshot()) == 0, "a declaration reached the vendor")
 }
 
 func TestGrantTeamMustMatchProvedTeam(t *testing.T) {
