@@ -12,7 +12,7 @@ use gateway_testkit::contract::{self, ContractStore, StoredRecord, StoredRow};
 use serde_json::{Value, json};
 use tokio_postgres::Client;
 
-use super::TestDatabase;
+use super::{DELEGATION_COLUMNS, DelegationRead, TestDatabase};
 use crate::{Budgets, PgAuditStore, PoolSizes};
 
 /// Budgets other than the defaults, so a store that ignores the ones it was given is caught,
@@ -41,7 +41,8 @@ impl ContractStore for Postgres {
         let row = self
             .admin
             .query_opt(
-                "SELECT kind, instance, allowance_ms, tool_use_id, deployment, surface, profile,
+                &format!(
+                    "SELECT kind, instance, allowance_ms, tool_use_id, deployment, surface, profile,
                         tool, connector, classification, resources, resources_omitted,
                         decision, reason, sentence, policy_revision,
                         proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
@@ -52,13 +53,15 @@ impl ContractStore for Postgres {
                         (extract(epoch FROM begun_at) * 1000000)::bigint AS begun_at_micros,
                         deadline IS NOT NULL AS deadline_set,
                         (extract(epoch FROM deadline - begun_at) * 1000000)::bigint
-                            AS deadline_micros
-                 FROM switchboard_audit.call_rows WHERE id::text = $1",
+                            AS deadline_micros, {DELEGATION_COLUMNS}
+                 FROM switchboard_audit.call_rows WHERE id::text = $1"
+                ),
                 &[&row.as_str()],
             )
             .await
             .unwrap()?;
         let text = |column: &str| row.get::<_, Option<String>>(column);
+        let read = DelegationRead::of(&row);
         let mut principal = json!({
             "id": {"issuer": text("proved_issuer"), "subject": text("proved_subject")},
             "kind": text("proved_kind"),
@@ -66,6 +69,9 @@ impl ContractStore for Postgres {
         match text("proved_kind").as_deref() {
             Some("workload") => principal["team"] = json!(text("proved_team")),
             _ => principal["groups"] = json!(row.get::<_, Option<Vec<String>>>("proved_groups")),
+        }
+        if let Some(pod) = &read.pod {
+            principal["pod"] = json!(pod);
         }
         let completion = text("outcome").map(|outcome| {
             let mut completion = json!({
@@ -137,6 +143,9 @@ impl ContractStore for Postgres {
                         "proved_delegation_team": text("proved_delegation_team"),
                         "claimed_acting_person": text("claimed_acting_person"),
                         "claimed_team": text("claimed_team"),
+                        "delegation": read.delegation,
+                        "delegation_failure": read.failure,
+                        "currency": read.currency,
                         "credential": credential,
                         "completion": completion,
                     }))
@@ -154,6 +163,7 @@ impl ContractStore for Postgres {
                     "proved_delegation_team": text("proved_delegation_team"),
                     "claimed_acting_person": text("claimed_acting_person"),
                     "claimed_team": text("claimed_team"),
+                    "delegation": read.delegation,
                     "tools": row.get::<_, Option<Value>>("listed_tools"),
                     "tools_omitted": row.get::<_, Option<i64>>("listed_omitted"),
                 }))
@@ -342,6 +352,8 @@ contract!(
     a_refusal_sentence_over_the_cap_is_refused_at_finish_and_leaves_the_row_open,
     a_reach_is_stored_as_the_entry_it_names,
     a_credential_identity_is_stored_as_begin_was_given_it,
+    a_delegation_and_its_currency_are_stored_as_begin_was_given_them,
+    a_delegation_of_the_wrong_shape_is_refused_and_leaves_no_row,
     a_repeated_begin_compares_the_decision_and_not_the_reach_or_credential,
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,

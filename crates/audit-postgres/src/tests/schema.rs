@@ -6,7 +6,8 @@ use tokio::time::{Instant, sleep};
 use tokio_postgres::Client;
 
 use super::{
-    CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, SETUP, TestDatabase, code, message,
+    ADDED_BY_0010, CHECK_VIOLATION, INSUFFICIENT_PRIVILEGE, NOT_NULL_VIOLATION, SETUP,
+    TestDatabase, code, message,
 };
 use crate::{GATEWAY_ROLE, MIGRATIONS, MigrateError, OWNER_ROLE, ROLES, migrate};
 
@@ -142,7 +143,7 @@ async fn migrating_again_applies_nothing() {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(recorded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 }
 
 #[tokio::test]
@@ -183,7 +184,7 @@ async fn two_migrators_at_once_take_turns() {
         applied.sort_unstable();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             "each migration is applied once"
         );
     }
@@ -327,7 +328,17 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "connector"),
         ("INSERT", "credential_mode"),
         ("INSERT", "credential_principal"),
+        ("INSERT", "currency"),
         ("INSERT", "decision"),
+        ("INSERT", "delegation_digest"),
+        ("INSERT", "delegation_egress"),
+        ("INSERT", "delegation_epoch"),
+        ("INSERT", "delegation_execution"),
+        ("INSERT", "delegation_failure"),
+        ("INSERT", "delegation_issuer"),
+        ("INSERT", "delegation_key_id"),
+        ("INSERT", "delegation_session"),
+        ("INSERT", "delegation_turn"),
         ("INSERT", "deployment"),
         ("INSERT", "duplicate_of"),
         ("INSERT", "id"),
@@ -344,6 +355,7 @@ async fn the_gateway_holds_exactly_its_column_grants() {
         ("INSERT", "proved_groups"),
         ("INSERT", "proved_issuer"),
         ("INSERT", "proved_kind"),
+        ("INSERT", "proved_pod"),
         ("INSERT", "proved_subject"),
         ("INSERT", "proved_team"),
         ("INSERT", "reason"),
@@ -902,7 +914,7 @@ async fn the_deadline_migration_keeps_the_rows_already_written() {
 
     assert_eq!(
         migrate(&mut owner).await.unwrap(),
-        vec![3, 4, 5, 6, 7, 8, 9]
+        vec![3, 4, 5, 6, 7, 8, 9, 10]
     );
     for (id, due) in [
         (&open, "begun_at"),
@@ -1487,10 +1499,12 @@ async fn the_error_kind_is_written_with_the_completion_and_never_after() {
 async fn rows_without_error_kind(client: &Client) -> Vec<(String, serde_json::Value)> {
     client
         .query(
-            "SELECT id::text,
+            &format!(
+                "SELECT id::text,
                     to_jsonb(r) - 'error_kind' - 'credential_mode' - 'credential_principal'
-                        - 'duplicate_of'
-             FROM switchboard_audit.call_rows AS r ORDER BY id",
+                        - 'duplicate_of' - {ADDED_BY_0010}
+                 FROM switchboard_audit.call_rows AS r ORDER BY id"
+            ),
             &[],
         )
         .await
@@ -1546,7 +1560,7 @@ async fn the_error_kind_migration_marks_the_errors_already_written() {
     let denial = insert_row(&owner, &denied()).await;
     let before = rows_without_error_kind(&owner).await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7, 8, 9]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![6, 7, 8, 9, 10]);
     assert_eq!(rows_without_error_kind(&owner).await, before);
     for (id, kind) in [
         (&failed, Some("before-0006")),
@@ -1766,7 +1780,7 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
         before.push(row.get::<_, Option<serde_json::Value>>(0));
     }
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7, 8, 9]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![7, 8, 9, 10]);
     for (id, resources) in [&named, &unknown, &listed].into_iter().zip(before) {
         let row = owner.query_one(&read(id), &[]).await.unwrap();
         assert_eq!(
@@ -1775,5 +1789,320 @@ async fn the_reach_and_credential_migration_keeps_the_rows_already_written() {
             "{id}"
         );
         assert!(row.get::<_, bool>(1), "{id} records a credential identity");
+    }
+}
+
+/// A digest, as migration 0010's `delegation_digest` holds one: 64 lowercase hex digits.
+const DIGEST: &str = "'9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'";
+
+/// The columns of a verified delegation, with its team and person, as `(column, value)` in SQL.
+const VERIFIED: &[(&str, &str)] = &[
+    ("proved_delegation_team", "'team-a'"),
+    ("claimed_acting_person", "'person@fixture.test'"),
+    ("delegation_digest", DIGEST),
+    ("delegation_issuer", "'otto-test'"),
+    ("delegation_key_id", "'key-1'"),
+    ("delegation_session", "'session-1'"),
+    ("delegation_turn", "'turn-1'"),
+    ("delegation_execution", "'execution-1'"),
+    ("delegation_epoch", "7"),
+];
+
+/// A row check 3 denied for a delegation whose signature did not verify.
+const AT_CHECK_3: &[(&str, &str)] = &[
+    ("decision", "'deny'"),
+    ("reason", "'delegation_unverified'"),
+    ("sentence", "'Denied.'"),
+    ("delegation_failure", "'signature'"),
+];
+
+/// Decision 0012's columns (migration 0010) hold the shapes the core writes and no others,
+/// whoever writes them: a verified delegation's columns together, with its team and person; a
+/// failure only on a row check 3 denied for it, beside nothing from the delegation's claims,
+/// and with a digest only after a verified signature; a currency answer only on a call row; and
+/// a pod UID only for a workload.
+#[tokio::test]
+async fn the_delegation_columns_hold_decision_0012s_shapes_and_no_others() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let owner = db.connect_as(OWNER_ROLE).await;
+    let gateway = db.connect_as(GATEWAY_ROLE).await;
+    fn with<'a>(
+        base: &[(&'a str, &'a str)],
+        more: &[(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let kept = base
+            .iter()
+            .filter(|(column, _)| !more.iter().any(|(added, _)| added == column));
+        kept.chain(more).copied().collect()
+    }
+    let pod = ("proved_pod", "'0f8fad5b-d9cb-469f-a165-70867728950e'");
+    for accepted in [
+        insert(VERIFIED),
+        insert(&with(
+            VERIFIED,
+            &[
+                ("delegation_egress", "'sealed'"),
+                ("currency", "'current'"),
+                pod,
+            ],
+        )),
+        insert(&with(VERIFIED, &[("delegation_egress", "'open'")])),
+        insert(AT_CHECK_3),
+        insert(&with(
+            AT_CHECK_3,
+            &[
+                ("delegation_failure", "'wrong_pod'"),
+                ("delegation_digest", DIGEST),
+                ("currency", "'revoked'"),
+            ],
+        )),
+        insert(&[("currency", "'unconfirmed'")]),
+        list(&with(VERIFIED, &[pod])),
+    ] {
+        insert_row(&gateway, &accepted).await;
+    }
+    for failure in [
+        "version",
+        "unknown_key",
+        "retired_key",
+        "encoding",
+        "signature",
+        "malformed",
+    ] {
+        let failure = format!("'{failure}'");
+        insert_row(
+            &gateway,
+            &insert(&with(AT_CHECK_3, &[("delegation_failure", &failure)])),
+        )
+        .await;
+    }
+    for failure in [
+        "expired",
+        "not_yet_valid",
+        "lifetime_over_ceiling",
+        "wrong_audience",
+        "wrong_pod",
+    ] {
+        let failure = format!("'{failure}'");
+        insert_row(
+            &gateway,
+            &insert(&with(
+                AT_CHECK_3,
+                &[
+                    ("delegation_failure", &failure),
+                    ("delegation_digest", DIGEST),
+                ],
+            )),
+        )
+        .await;
+    }
+
+    let user = [
+        ("proved_kind", "'user'"),
+        ("proved_team", ""),
+        ("proved_groups", "ARRAY['group-g']"),
+    ];
+    for (constraint, sql) in [
+        ("proved_pod_shape", insert(&[("proved_pod", "'pod-name'")])),
+        ("proved_pod_shape", insert(&with(&user, &[pod]))),
+        (
+            "delegation_digest_known",
+            insert(&with(VERIFIED, &[("delegation_digest", "'9F86'")])),
+        ),
+        (
+            "delegation_epoch_known",
+            insert(&with(VERIFIED, &[("delegation_epoch", "-1")])),
+        ),
+        (
+            "delegation_egress_known",
+            insert(&with(VERIFIED, &[("delegation_egress", "'closed'")])),
+        ),
+        (
+            "delegation_failure_known",
+            insert(&with(AT_CHECK_3, &[("delegation_failure", "'forged'")])),
+        ),
+        ("currency_known", insert(&[("currency", "'stale'")])),
+        (
+            "delegation_shape",
+            insert(&with(VERIFIED, &[("delegation_key_id", "")])),
+        ),
+        (
+            "delegation_shape",
+            insert(&with(VERIFIED, &[("proved_delegation_team", "")])),
+        ),
+        (
+            "delegation_shape",
+            insert(&with(VERIFIED, &[("claimed_acting_person", "")])),
+        ),
+        (
+            "delegation_shape",
+            insert(&with(VERIFIED, &[("delegation_digest", "")])),
+        ),
+        (
+            "delegation_shape",
+            insert(&[("delegation_egress", "'sealed'")]),
+        ),
+        (
+            "delegation_failure_shape",
+            insert(&[("delegation_failure", "'signature'")]),
+        ),
+        (
+            "delegation_failure_shape",
+            insert(&with(
+                AT_CHECK_3,
+                &[("reason", "'classification_not_permitted'")],
+            )),
+        ),
+        (
+            "delegation_failure_shape",
+            insert(&with(AT_CHECK_3, &[("delegation_failure", "")])),
+        ),
+        (
+            "delegation_failure_shape",
+            list(&[("delegation_failure", "'signature'")]),
+        ),
+        (
+            "delegation_failure_unclaimed",
+            insert(&with(
+                AT_CHECK_3,
+                &[("claimed_acting_person", "'person@fixture.test'")],
+            )),
+        ),
+        (
+            "delegation_failure_unclaimed",
+            insert(&with(AT_CHECK_3, &[("proved_delegation_team", "'team-a'")])),
+        ),
+        (
+            "delegation_failure_unclaimed",
+            insert(&with(AT_CHECK_3, VERIFIED)),
+        ),
+        (
+            "delegation_digest_shape",
+            insert(&with(AT_CHECK_3, &[("delegation_digest", DIGEST)])),
+        ),
+        (
+            "delegation_digest_shape",
+            insert(&with(
+                AT_CHECK_3,
+                &[
+                    ("delegation_failure", "'malformed'"),
+                    ("delegation_digest", DIGEST),
+                ],
+            )),
+        ),
+        (
+            "delegation_digest_shape",
+            insert(&[("delegation_digest", DIGEST)]),
+        ),
+        ("currency_shape", list(&[("currency", "'current'")])),
+    ] {
+        for client in [&gateway, &owner] {
+            let error = client.query_one(&sql, &[]).await.unwrap_err();
+            assert!(refused_by(&error, constraint), "{sql}: {error}");
+        }
+    }
+
+    // The gateway's role writes them at begin and never again, and cannot read them back.
+    let id = insert_row(&gateway, &insert(VERIFIED)).await;
+    let error = gateway
+        .execute(
+            &format!(
+                "UPDATE switchboard_audit.call_rows SET currency = 'current' WHERE id = '{id}'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
+    let error = gateway
+        .query(
+            "SELECT delegation_digest, delegation_failure, currency, proved_pod
+               FROM switchboard_audit.call_rows",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(INSUFFICIENT_PRIVILEGE), "{error}");
+}
+
+/// Rows written before 0010 keep every value they had, and record none of decision 0012's
+/// columns: NULL, not recorded. The migration's checks hold for each, a row with a delegation's
+/// team and person among them.
+#[tokio::test]
+async fn the_delegation_migration_keeps_the_rows_already_written() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let mut owner = db.connect_as(OWNER_ROLE).await;
+    owner
+        .batch_execute("DROP SCHEMA switchboard_audit CASCADE")
+        .await
+        .unwrap();
+    owner
+        .batch_execute(
+            "CREATE SCHEMA switchboard_audit;
+             CREATE TABLE switchboard_audit.migrations (
+                 version    integer     PRIMARY KEY,
+                 name       text        NOT NULL,
+                 applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+             );",
+        )
+        .await
+        .unwrap();
+    for migration in &MIGRATIONS[..9] {
+        owner.batch_execute(migration.sql).await.unwrap();
+        owner
+            .execute(
+                "INSERT INTO switchboard_audit.migrations (version, name) VALUES ($1, $2)",
+                &[&migration.version, &migration.name],
+            )
+            .await
+            .unwrap();
+    }
+    let delegated = [
+        ("proved_delegation_team", "'team-a'"),
+        ("claimed_acting_person", "'person@fixture.test'"),
+    ];
+    let rows = [
+        insert_row(&owner, &insert(&delegated)).await,
+        insert_row(&owner, &denied()).await,
+        insert_row(&owner, &list(&delegated)).await,
+    ];
+    let compared = format!(
+        "SELECT to_jsonb(r) - {ADDED_BY_0010} FROM switchboard_audit.call_rows r WHERE id::text = $1"
+    );
+    let mut before = Vec::new();
+    for id in &rows {
+        let row = owner.query_one(&compared, &[id]).await.unwrap();
+        before.push(row.get::<_, serde_json::Value>(0));
+    }
+
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![10]);
+    for (id, before) in rows.iter().zip(before) {
+        let row = owner.query_one(&compared, &[id]).await.unwrap();
+        assert_eq!(row.get::<_, serde_json::Value>(0), before, "{id}");
+        let added = owner
+            .query_one(
+                &format!(
+                    "SELECT to_jsonb(r) - (SELECT array_agg(k) FROM jsonb_object_keys(to_jsonb(r)) k
+                                            WHERE NOT k = ANY({ADDED_BY_0010}))
+                       FROM switchboard_audit.call_rows r WHERE id::text = $1"
+                ),
+                &[id],
+            )
+            .await
+            .unwrap()
+            .get::<_, serde_json::Value>(0);
+        let recorded: Vec<&str> = added
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(column, _)| column.as_str())
+            .collect();
+        assert_eq!(added.as_object().unwrap().len(), 11, "{added}");
+        assert!(recorded.is_empty(), "{id} records {recorded:?}");
     }
 }
