@@ -928,6 +928,9 @@ fn receipt_request(
     ))
 }
 
+// Large for the reason a check's `Err` is (see decision.rs): a reason carries the principal,
+// pod and all, and the resource its sentence names. One is made per call and moved once.
+#[allow(clippy::large_enum_variant)]
 enum Decided {
     Allow(ApprovedTool),
     Deny {

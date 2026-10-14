@@ -301,7 +301,7 @@ impl Fixture {
     /// gets a profile the snapshot does not hold, which the decision function denies.
     pub fn select_profile(principal: &Principal) -> ProfileName {
         let selected = match (principal.id.issuer.as_str(), &principal.kind) {
-            (WORKLOAD_ISSUER, PrincipalKind::Workload { team }) => {
+            (WORKLOAD_ISSUER, PrincipalKind::Workload { team, .. }) => {
                 profile_for(&TEAM_PROFILES, team.as_str())
             }
             (USER_ISSUER, PrincipalKind::User { groups }) => {

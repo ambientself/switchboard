@@ -266,7 +266,7 @@ a verified token to a principal, which is identified by issuer and subject toget
 
 | Principal | Proved facts | From |
 | --- | --- | --- |
-| Workload | Subject, and the team the manifest maps it to, and, for a pod's token, the pod UID once the verifier exposes it (milestone 4). | A ServiceAccount token. |
+| Workload | Subject, and the team the manifest maps it to, and, for a pod's token, the pod UID from its signed `kubernetes.io` claim. | A ServiceAccount token. |
 | User | Subject and group memberships. | An identity-provider token. |
 
 **Verification is strict and offline.** One signing algorithm, a key ID required, signing
@@ -344,8 +344,8 @@ those bounds a grant may be presented any number of times, and every row records
 reuse from another pod, or another deployment sharing this gateway's audit store, is one query.
 A call of any tool not classified `read` is also checked for currency: Otto's resolver says
 whether the turn is still current, which enforces the fencing epoch and lets Otto revoke one
-turn. Reads are not fenced. The Kubernetes verifier is to expose the pod UID its token proves,
-and the principal to carry it; neither does yet (section 17).
+turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves, and
+the principal carries it; grants are not yet bound to it (#22, section 17).
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -1305,8 +1305,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
 
 **#9, identity.**
 
-- The principal carries a Kubernetes workload's pod UID, read from its projected token
-  (decision 0012). Today neither the verifier nor the principal has it.
+- Built (#57): the principal carries a Kubernetes workload's pod UID, read from its projected
+  token (decision 0012). The verifier reads `kubernetes.io.pod.uid` for a workload issuer
+  only, after the signature and every other check. A token that names no pod proves none; a
+  pod UID that is not a lowercase hyphenated UUID refuses the token as a malformed
+  `kubernetes.io` claim, carrying nothing from it. No decision reads the pod, and no row, log
+  line or sentence records it yet: the row's pod column comes with #22 and #56.
 - Already built: the claimed issuer and subject are available beside a verification error,
   escaped and capped, for the identity-failure telemetry event (decision 0009), and the error
   itself still carries nothing from the token. The `identity_failed` event records them (#26).

@@ -117,6 +117,35 @@ fn graft_payload(token: String, setup: &Setup) -> String {
     format!("{}.{}.{}", ours[0], theirs[1], ours[2])
 }
 
+/// A pod UID in the form Kubernetes gives one.
+const POD_UID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+/// A `kubernetes.io` claim as a projected ServiceAccount token carries it, with `pod` as given
+/// or left out.
+fn kubernetes(pod: Option<serde_json::Value>) -> serde_json::Value {
+    let mut claim = json!({
+        "namespace": "team-one",
+        "serviceaccount": {"name": "sandbox", "uid": "6a1e2a43-8b52-4c19-9c3e-2d6f1b7e0a54"},
+    });
+    if let Some(pod) = pod {
+        claim["pod"] = pod;
+    }
+    claim
+}
+
+/// A `pod` member naming a pod with this UID.
+fn pod(uid: serde_json::Value) -> serde_json::Value {
+    json!({"name": "sandbox-0", "uid": uid})
+}
+
+fn with_pod(mut principal: Principal) -> Principal {
+    let PrincipalKind::Workload { pod, .. } = &mut principal.kind else {
+        panic!("a user has no pod");
+    };
+    *pod = Some(POD_UID.parse().unwrap());
+    principal
+}
+
 fn the_other_algorithm(setup: &Setup) -> &'static str {
     match setup.algorithm {
         gateway_identity::SigningAlgorithm::Rs256 => "ES256",
@@ -474,8 +503,156 @@ fn cases() -> Vec<Case> {
                 groups_claim: "roles".into(),
             }
         }),
+        // --- A workload's pod, from the `kubernetes.io` claim of a projected token.
+        accepted("no kubernetes.io claim: no pod", |t, _| {
+            t.without_claim("kubernetes.io")
+        })
+        .only(Kind::Workload),
+        accepted("a kubernetes.io claim naming no pod: no pod", |t, _| {
+            t.claim("kubernetes.io", kubernetes(None))
+        })
+        .only(Kind::Workload),
+        accepted("a pod UID", |t, _| {
+            t.claim("kubernetes.io", kubernetes(Some(pod(json!(POD_UID)))))
+        })
+        .only(Kind::Workload)
+        .proving(with_pod),
+        accepted("a pod with only a UID", |t, _| {
+            t.claim("kubernetes.io", json!({"pod": {"uid": POD_UID}}))
+        })
+        .only(Kind::Workload)
+        .proving(with_pod),
+        accepted("a user's pod UID, which is not read", |t, _| {
+            t.claim("kubernetes.io", kubernetes(Some(pod(json!(POD_UID)))))
+        })
+        .only(Kind::User),
+        accepted("a user's malformed pod UID, which is not read", |t, _| {
+            t.claim("kubernetes.io", kubernetes(Some(pod(json!(7)))))
+        })
+        .only(Kind::User),
+        accepted(
+            "a user's kubernetes.io of null, which is not read",
+            |t, _| t.claim("kubernetes.io", serde_json::Value::Null),
+        )
+        .only(Kind::User),
+        refused(
+            "a pod UID in upper case",
+            MalformedClaim(Kubernetes),
+            |t, _| {
+                t.claim(
+                    "kubernetes.io",
+                    kubernetes(Some(pod(json!(POD_UID.to_uppercase())))),
+                )
+            },
+        )
+        .only(Kind::Workload),
+        refused(
+            "a pod UID that is not a string",
+            MalformedClaim(Kubernetes),
+            |t, _| t.claim("kubernetes.io", kubernetes(Some(pod(json!(7))))),
+        )
+        .only(Kind::Workload),
+        refused("an empty pod UID", MalformedClaim(Kubernetes), |t, _| {
+            t.claim("kubernetes.io", kubernetes(Some(pod(json!("")))))
+        })
+        .only(Kind::Workload),
+        refused("a pod UID of null", MalformedClaim(Kubernetes), |t, _| {
+            t.claim(
+                "kubernetes.io",
+                kubernetes(Some(pod(serde_json::Value::Null))),
+            )
+        })
+        .only(Kind::Workload),
+        refused(
+            "a pod UID without its hyphens",
+            MalformedClaim(Kubernetes),
+            |t, _| {
+                t.claim(
+                    "kubernetes.io",
+                    kubernetes(Some(pod(json!(POD_UID.replace('-', ""))))),
+                )
+            },
+        )
+        .only(Kind::Workload),
+        refused(
+            "a pod UID with a trailing newline",
+            MalformedClaim(Kubernetes),
+            |t, _| {
+                t.claim(
+                    "kubernetes.io",
+                    kubernetes(Some(pod(json!(format!("{POD_UID}\n"))))),
+                )
+            },
+        )
+        .only(Kind::Workload),
+        refused("a pod with no UID", MalformedClaim(Kubernetes), |t, _| {
+            t.claim(
+                "kubernetes.io",
+                kubernetes(Some(json!({"name": "sandbox-0"}))),
+            )
+        })
+        .only(Kind::Workload),
+        refused(
+            "a pod that is a string",
+            MalformedClaim(Kubernetes),
+            |t, _| t.claim("kubernetes.io", kubernetes(Some(json!(POD_UID)))),
+        )
+        .only(Kind::Workload),
+        refused("a pod of null", MalformedClaim(Kubernetes), |t, _| {
+            t.claim("kubernetes.io", kubernetes(Some(serde_json::Value::Null)))
+        })
+        .only(Kind::Workload),
+        refused(
+            "a kubernetes.io claim that is a string",
+            MalformedClaim(Kubernetes),
+            |t, _| t.claim("kubernetes.io", json!(POD_UID)),
+        )
+        .only(Kind::Workload),
+        refused(
+            "a kubernetes.io claim of null",
+            MalformedClaim(Kubernetes),
+            |t, _| t.claim("kubernetes.io", serde_json::Value::Null),
+        )
+        .only(Kind::Workload),
         // --- Which check reports first, when a token is wrong in two ways. The order is
-        // signature, then exp, nbf, aud, lifetime, sub, then what depends on the subject.
+        // signature, then exp, nbf, aud, lifetime, sub, then what depends on the subject, the
+        // pod last.
+        refused(
+            "a bad signature on a token with a pod UID: the signature",
+            BadSignature,
+            |t, s| {
+                t.claim("kubernetes.io", kubernetes(Some(pod(json!(POD_UID)))))
+                    .signed_by(s.other)
+            },
+        )
+        .only(Kind::Workload),
+        refused(
+            "a bad signature and a malformed pod UID: the signature",
+            BadSignature,
+            |t, _| {
+                t.claim("kubernetes.io", kubernetes(Some(pod(json!(7)))))
+                    .corrupt_signature()
+            },
+        )
+        .only(Kind::Workload),
+        refused(
+            "expired and a malformed pod UID: expiry",
+            Expired,
+            |t, _| {
+                t.claim("kubernetes.io", kubernetes(Some(pod(json!(7)))))
+                    .expires_at(PAST)
+            },
+        )
+        .only(Kind::Workload),
+        refused(
+            "an unknown subject and a malformed pod UID: the subject",
+            UnknownSubject,
+            |t, _| {
+                t.claim("kubernetes.io", kubernetes(Some(pod(json!(7)))))
+                    .subject("system:serviceaccount:other:thing")
+            },
+        )
+        .only(Kind::Workload),
         refused(
             "a bad signature and a wrong algorithm: the algorithm",
             AlgorithmNotAllowed,
@@ -680,6 +857,7 @@ fn the_table_has_a_case_for_every_way_a_token_can_be_refused() {
         "MalformedClaim(IssuedAt)",
         "MalformedClaim(Subject)",
         "MalformedClaim(Groups)",
+        "MalformedClaim(Kubernetes)",
     ]
     .iter()
     .map(|name| (*name).to_owned())
@@ -774,6 +952,7 @@ fn a_refusal_over_a_claim_reads_as_a_sentence() {
         Claim::NotBefore,
         Claim::IssuedAt,
         Claim::Groups,
+        Claim::Kubernetes,
     ] {
         for sentence in [
             VerifyError::MissingClaim(claim.clone()).to_string(),
@@ -781,6 +960,37 @@ fn a_refusal_over_a_claim_reads_as_a_sentence() {
         ] {
             assert_eq!(sentence.matches("claim").count(), 1, "{sentence}");
             assert!(!sentence.contains("the the"), "{sentence}");
+        }
+    }
+}
+
+/// A refusal over a malformed pod names the claim and carries nothing from it, in the cause,
+/// the caller's sentence or the failure's `Debug`.
+#[test]
+fn a_refusal_over_the_pod_carries_nothing_from_the_token() {
+    let uid = "NOT-A-POD-UID-but-the-callers-text";
+    for setup in setups().into_iter().filter(|s| s.kind == Kind::Workload) {
+        let token = setup
+            .token()
+            .claim("kubernetes.io", kubernetes(Some(pod(json!(uid)))))
+            .build();
+        let failure = Proved::verify(&setup.verifier(), token.as_str()).unwrap_err();
+        assert_eq!(
+            failure.detail(),
+            &VerifyError::MalformedClaim(Claim::Kubernetes)
+        );
+        assert_eq!(
+            failure.detail().to_string(),
+            "the token's `kubernetes.io` claim is malformed"
+        );
+        for told in [
+            failure.outward().to_owned(),
+            failure.to_string(),
+            failure.detail().to_string(),
+            format!("{failure:?}"),
+        ] {
+            assert!(!told.contains(uid), "{told:?}");
+            assert!(!told.contains("sandbox-0"), "{told:?}");
         }
     }
 }

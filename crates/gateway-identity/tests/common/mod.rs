@@ -118,7 +118,10 @@ impl Setup {
                 subject: SUBJECT.into(),
             },
             kind: match self.kind {
-                Kind::Workload => PrincipalKind::Workload { team: TEAM.into() },
+                Kind::Workload => PrincipalKind::Workload {
+                    team: TEAM.into(),
+                    pod: None,
+                },
                 Kind::User => PrincipalKind::User {
                     groups: GROUPS.iter().map(|&group| group.into()).collect(),
                 },

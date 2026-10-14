@@ -96,7 +96,8 @@ async fn its_keys_file_verifies_the_tokens_it_signs_for_its_subjects_only() {
     assert_eq!(
         principal.get().kind,
         PrincipalKind::Workload {
-            team: "team-a".into()
+            team: "team-a".into(),
+            pod: None,
         }
     );
     let claims: Value =

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::names::{GroupId, Issuer, Person, Subject, TeamId, ToolName};
+use crate::names::{GroupId, Issuer, Person, PodUid, Subject, TeamId, ToolName};
 use crate::proof::Claimed;
 use crate::receipt::DelegationKeyScope;
 
@@ -30,6 +30,19 @@ pub enum PrincipalKind {
     Workload {
         /// The team the manifest maps this workload to.
         team: TeamId,
+        /// The UID of the pod the workload runs in, when its token proves one: a Kubernetes
+        /// projected ServiceAccount token names its pod in its signed `kubernetes.io` claim
+        /// (decision 0012). `None` for a token that names no pod.
+        ///
+        /// No decision reads it. A turn grant will be bound to it (#22).
+        ///
+        /// Absent in JSON is `None`; present, it must be a pod UID, and `null` is refused.
+        #[serde(
+            default,
+            deserialize_with = "present_pod",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pod: Option<PodUid>,
     },
     /// A person, signed in through an identity provider.
     User {
@@ -38,8 +51,16 @@ pub enum PrincipalKind {
     },
 }
 
+/// A pod that is present in JSON: a pod UID, never `null`. With `default`, an absent pod is
+/// `None`.
+fn present_pod<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PodUid>, D::Error> {
+    PodUid::deserialize(deserializer).map(Some)
+}
+
 /// The caller as the gateway proved it: who issued the token, the subject it names, and
-/// either a workload's team or a user's groups.
+/// either a workload's team, with its pod when the token proves one, or a user's groups.
 ///
 /// A `Principal` on its own is only a description. It becomes something policy may act on
 /// once it is wrapped in [`Proved`](crate::Proved), which only a verifier can do.
@@ -56,7 +77,15 @@ impl Principal {
     /// The workload's team, or `None` for a user.
     pub fn team(&self) -> Option<&TeamId> {
         match &self.kind {
-            PrincipalKind::Workload { team } => Some(team),
+            PrincipalKind::Workload { team, .. } => Some(team),
+            PrincipalKind::User { .. } => None,
+        }
+    }
+
+    /// The workload's pod UID, if its token proves one; `None` for a user.
+    pub fn pod(&self) -> Option<&PodUid> {
+        match &self.kind {
+            PrincipalKind::Workload { pod, .. } => pod.as_ref(),
             PrincipalKind::User { .. } => None,
         }
     }
@@ -116,6 +145,63 @@ mod tests {
             empty.map(|delegation| delegation.tools),
             Some(BTreeSet::new())
         );
+    }
+
+    #[test]
+    fn a_workload_without_a_pod_reads_and_writes_as_before() {
+        let json = r#"{"id": {"issuer": "https://cluster.example.test", "subject": "sa"}, "kind": "workload", "team": "payments"}"#;
+        let principal: Principal = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            principal.kind,
+            PrincipalKind::Workload {
+                team: "payments".into(),
+                pod: None
+            }
+        );
+        assert_eq!(principal.pod(), None);
+        let written = serde_json::to_value(&principal).unwrap();
+        assert_eq!(written.get("pod"), None, "{written}");
+    }
+
+    #[test]
+    fn a_pod_in_json_must_be_a_pod_uid() {
+        let parse = |pod: &str| {
+            serde_json::from_str::<Principal>(&format!(
+                r#"{{"id": {{"issuer": "https://cluster.example.test", "subject": "sa"}}, "kind": "workload", "team": "payments", "pod": {pod}}}"#
+            ))
+        };
+        let uid = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let principal = parse(&format!(r#""{uid}""#)).unwrap();
+        assert_eq!(principal.pod().map(PodUid::as_str), Some(uid));
+        let written = serde_json::to_value(&principal).unwrap();
+        assert_eq!(written["pod"], uid);
+        for malformed in [
+            r#""0F8FAD5B-D9CB-469F-A165-70867728950E""#,
+            r#""""#,
+            r#""pod-name""#,
+            "7",
+            "null",
+            r#"{"uid": "0f8fad5b-d9cb-469f-a165-70867728950e"}"#,
+        ] {
+            assert!(
+                parse(malformed).is_err(),
+                "a pod of {malformed} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_has_no_pod() {
+        let user = Principal {
+            id: PrincipalId {
+                issuer: "https://idp.example.test".into(),
+                subject: "person@example.test".into(),
+            },
+            kind: PrincipalKind::User {
+                groups: BTreeSet::new(),
+            },
+        };
+        assert_eq!(user.pod(), None);
     }
 
     #[test]
