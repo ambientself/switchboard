@@ -169,13 +169,16 @@ fn a_signature_that_does_not_verify_is_refused_without_a_digest() {
     let forged = other.sign(VERSION, minter.key_id().as_str(), &parts(&good)[2]);
     refused_as(&verifier, &forged, Signature, false);
     // A 64-byte hash keyed with the public key's bytes, as a verifier that confuses public and
-    // secret keys would make.
+    // secret keys would make. Its top four bits are cleared so that S is below the group order
+    // and the signature itself is what is checked, whatever the key.
     let mut hash = Sha512::new();
     hash.update(minter.public_key());
     hash.update(format!("v3.{}.{}", minter.key_id(), parts(&good)[2]));
+    let mut keyed: [u8; 64] = hash.finalize().into();
+    keyed[63] &= 0x0f;
     refused_as(
         &verifier,
-        &with_part(&good, 3, &encode(&hash.finalize())),
+        &with_part(&good, 3, &encode(&keyed)),
         Signature,
         false,
     );
@@ -363,7 +366,7 @@ fn claims_the_format_does_not_name_are_ignored() {
     accepted(&verifier, &minter.mint_bytes(twice.as_bytes()));
 }
 
-/// The sixteen kinds of unverifiable grant the conformance suite sends Otto's gateway
+/// The bad grants the conformance suite sends Otto's gateway
 /// (`TestTurnGrantIsRequiredAndVerified`), re-minted in this format.
 #[test]
 fn the_baseline_kinds_are_refused_in_the_new_format() {
@@ -459,9 +462,10 @@ fn the_baseline_kinds_are_refused_in_the_new_format() {
         assert_eq!(failure.kind(), kind, "{name}");
         assert_eq!(failure.digest().is_some(), signed, "{name}");
     }
-    // The sixteenth, `legacy_headers`, sends no grant: that is the request path's, not the
-    // verifier's. A grant naming a qualified tool verifies, and the name, which the mapping
-    // does not have, is dropped, so the grant permits nothing.
+    // Two of the suite's cases differ here. `legacy_headers` sends no grant, which is the
+    // request path's to refuse, not the verifier's. `qualified_tool` names a tool by its
+    // qualified name: Otto refuses the grant, while here it verifies and the name, which the
+    // mapping does not have, is dropped, so the grant permits nothing.
     let qualified = minter.mint(&with(
         json!({"tools": ["mcp__otto-gateway__github_get_pr"]}),
     ));
