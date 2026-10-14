@@ -59,6 +59,10 @@
 //!   - `switchboard_audit_finishes_in_flight`;
 //!   - `switchboard_audit_open_rows`, `switchboard_audit_oldest_open_row_deadline_seconds`
 //!     and `switchboard_audit_open_rows_poll_failures_total`, from the open-row poll below;
+//!   - `switchboard_audit_unknown_receipts`,
+//!     `switchboard_audit_oldest_unknown_receipt_reserved_seconds` and
+//!     `switchboard_audit_unknown_receipts_poll_failures_total`, from the same poll: the
+//!     receipts in `unknown` and the age of the oldest (design section 11, "Signals");
 //!   - `switchboard_audit_begin_latency_seconds` and `switchboard_audit_finish_latency_seconds`,
 //!     histograms with the store's fixed buckets;
 //!   - `switchboard_audit_pool_connections_in_use{pool}`, and beside it, as separate gauges,
@@ -74,10 +78,6 @@
 //!
 //! With audit disabled the audit signals are not written: there is no store to count.
 //!
-//! Section 11 also names receipts in `unknown` and the age of the oldest. They are not
-//! exported: receipts arrive with #10 stage 2, and a constant 0 would say no receipt is
-//! unknown when none can be.
-//!
 //! **Open rows.** A task polls [`PgAuditStore::open_rows`] every [`OPEN_ROWS_POLL`], the first
 //! time as soon as the listener serves. The query has a connection of its own, apart from the
 //! store's begin and finish pools, so a poll held up never delays a finish. It gives up 2 s
@@ -86,6 +86,16 @@
 //! succeeded, `switchboard_audit_open_rows` has no sample; the oldest deadline has one only
 //! while a row is open, as seconds since the Unix epoch. A scrape reads what the last poll
 //! found and never waits on the database.
+//!
+//! **Receipts in `unknown`.** The same task then counts them with
+//! [`PgAuditStore::unknown_receipts`], on the same connection of its own and with the same
+//! 2 s: the receipts in the state `unknown`, and those still `pending` past their row's
+//! deadline, which read as `unknown`, by the database's clock. The oldest is exported as the
+//! time it was reserved, in seconds since the Unix epoch, while one is in `unknown`, so its age
+//! is the time since. A count that fails is counted in
+//! `switchboard_audit_unknown_receipts_poll_failures_total`, and nothing is exported in its
+//! place: the two gauges have no sample until a count succeeds again, and none before the
+//! first. A constant would say no receipt is unknown when none was counted.
 //!
 //! Shutting down closes the listener, waits for the scrapes being answered, and then stops the
 //! poller (see [`serve_metrics`]). The binary shuts it down after the MCP listener has stopped
@@ -101,7 +111,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use audit_postgres::{
     LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram, OpenRows, PgAuditStore, PoolStats,
-    StoreStats,
+    StoreStats, UnknownReceipts,
 };
 use axum::Router;
 use axum::body::Body;
@@ -164,6 +174,9 @@ struct AuditSource {
     /// What the last poll that succeeded found, if one has.
     open: Mutex<Option<OpenRows>>,
     poll_failures: AtomicU64,
+    /// What the last count of receipts in `unknown` found, if it succeeded.
+    unknown: Mutex<Option<UnknownReceipts>>,
+    unknown_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -177,6 +190,8 @@ impl Metrics {
                     store,
                     open: Mutex::new(None),
                     poll_failures: AtomicU64::new(0),
+                    unknown: Mutex::new(None),
+                    unknown_failures: AtomicU64::new(0),
                 })
             }),
             issuer_keys: KeyAges::default(),
@@ -229,6 +244,7 @@ impl Metrics {
         issuer_key_signals(&mut text, &self.issuer_keys.ages());
         if let Some(audit) = &self.audit {
             let open = *audit.open.lock().unwrap_or_else(PoisonError::into_inner);
+            let unknown = *audit.unknown.lock().unwrap_or_else(PoisonError::into_inner);
             audit_signals(
                 &mut text,
                 &AuditSignals {
@@ -236,6 +252,8 @@ impl Metrics {
                     failure_answers: self.telemetry.counts().audit_failure_answers,
                     open,
                     poll_failures: audit.poll_failures.load(Ordering::Relaxed),
+                    unknown,
+                    unknown_failures: audit.unknown_failures.load(Ordering::Relaxed),
                 },
             );
         }
@@ -243,7 +261,8 @@ impl Metrics {
     }
 }
 
-/// Counts the open rows every [`OPEN_ROWS_POLL`], the first time at once, for ever.
+/// Counts the open rows, and then the receipts in `unknown`, every [`OPEN_ROWS_POLL`], the
+/// first time at once, for ever.
 async fn poll_open_rows(audit: Arc<AuditSource>) {
     let mut every = tokio::time::interval(OPEN_ROWS_POLL);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -262,6 +281,20 @@ async fn poll_open_rows(audit: Arc<AuditSource>) {
                 );
             }
         }
+        let unknown = match audit.store.unknown_receipts().await {
+            Ok(unknown) => Some(unknown),
+            Err(error) => {
+                audit.unknown_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    event = "unknown_receipts_poll_failed",
+                    %error,
+                    "could not count the receipts in unknown; the metrics show none until a \
+                     count succeeds"
+                );
+                None
+            }
+        };
+        *audit.unknown.lock().unwrap_or_else(PoisonError::into_inner) = unknown;
     }
 }
 
@@ -343,6 +376,8 @@ struct AuditSignals {
     failure_answers: u64,
     open: Option<OpenRows>,
     poll_failures: u64,
+    unknown: Option<UnknownReceipts>,
+    unknown_failures: u64,
 }
 
 fn telemetry_signals(text: &mut Text, counts: &TelemetryCounts) {
@@ -659,6 +694,39 @@ fn audit_signals(text: &mut Text, signals: &AuditSignals) {
         "Open-row polls that failed; the open-row gauges keep the last count.",
         signals.poll_failures,
     );
+    text.family(
+        "switchboard_audit_unknown_receipts",
+        "gauge",
+        "Receipts in unknown: in the state unknown, or pending past their row's deadline, as \
+         the last count that succeeded found them.",
+    );
+    if let Some(unknown) = &signals.unknown {
+        text.sample("switchboard_audit_unknown_receipts", &[], unknown.count);
+    }
+    text.family(
+        "switchboard_audit_oldest_unknown_receipt_reserved_seconds",
+        "gauge",
+        "When the oldest receipt in unknown was reserved, in seconds since the Unix epoch, \
+         while one is; its age is the time since.",
+    );
+    if let Some(reserved) = signals.unknown.and_then(|unknown| unknown.oldest_reserved) {
+        let seconds = reserved
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        text.sample(
+            "switchboard_audit_oldest_unknown_receipt_reserved_seconds",
+            &[],
+            seconds,
+        );
+    }
+    text.single(
+        "switchboard_audit_unknown_receipts_poll_failures_total",
+        "counter",
+        "Counts of the receipts in unknown that failed; the two gauges have no sample until \
+         one succeeds.",
+        signals.unknown_failures,
+    );
     text.histogram(
         "switchboard_audit_begin_latency_seconds",
         "How long each audit begin took, failed or not.",
@@ -914,6 +982,11 @@ mod tests {
                 oldest_deadline: Some(deadline),
             }),
             poll_failures: 16,
+            unknown: Some(UnknownReceipts {
+                count: 20,
+                oldest_reserved: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            }),
+            unknown_failures: 21,
         });
         let samples = lines(&text);
         for expected in [
@@ -937,9 +1010,53 @@ mod tests {
             "switchboard_audit_open_rows 15",
             "switchboard_audit_oldest_open_row_deadline_seconds 1800000000",
             "switchboard_audit_open_rows_poll_failures_total 16",
+            "switchboard_audit_unknown_receipts 20",
+            "switchboard_audit_oldest_unknown_receipt_reserved_seconds 1700000000",
+            "switchboard_audit_unknown_receipts_poll_failures_total 21",
         ] {
             assert!(samples.contains(&expected), "{expected}\n{text}");
         }
+    }
+
+    /// The receipts in `unknown` have no sample before a count succeeds, nor after one fails:
+    /// nothing stands in for a count not made. With none in `unknown`, the count is 0 and the
+    /// oldest has no sample.
+    #[test]
+    fn the_unknown_receipt_gauges_have_no_sample_when_they_could_not_be_counted() {
+        let signals = |unknown| AuditSignals {
+            stats: StoreStats::default(),
+            failure_answers: 0,
+            open: None,
+            poll_failures: 0,
+            unknown,
+            unknown_failures: 1,
+        };
+        let uncounted = rendered(&signals(None));
+        assert!(
+            uncounted.contains("# TYPE switchboard_audit_unknown_receipts gauge\n"),
+            "{uncounted}"
+        );
+        assert!(
+            !lines(&uncounted).iter().any(|line| {
+                line.starts_with("switchboard_audit_unknown_receipts ")
+                    || line.starts_with("switchboard_audit_oldest_unknown_receipt")
+            }),
+            "{uncounted}"
+        );
+        assert!(
+            lines(&uncounted).contains(&"switchboard_audit_unknown_receipts_poll_failures_total 1")
+        );
+        let none = rendered(&signals(Some(UnknownReceipts {
+            count: 0,
+            oldest_reserved: None,
+        })));
+        assert!(lines(&none).contains(&"switchboard_audit_unknown_receipts 0"));
+        assert!(
+            !lines(&none)
+                .iter()
+                .any(|line| line.starts_with("switchboard_audit_oldest_unknown_receipt")),
+            "{none}"
+        );
     }
 
     #[test]
@@ -949,6 +1066,8 @@ mod tests {
             failure_answers: 0,
             open: None,
             poll_failures: 1,
+            unknown: None,
+            unknown_failures: 0,
         });
         let closed = rendered(&AuditSignals {
             stats: StoreStats::default(),
@@ -958,6 +1077,8 @@ mod tests {
                 oldest_deadline: None,
             }),
             poll_failures: 0,
+            unknown: None,
+            unknown_failures: 0,
         });
         for text in [&none, &closed] {
             assert!(
