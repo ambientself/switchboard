@@ -110,8 +110,21 @@ pub struct ToolCall {
     /// `params._meta["claudecode/toolUseId"]` when it is a string, exactly as sent. It is
     /// unbounded here: the gateway bounds it before it reaches an audit row.
     pub tool_use_id: Option<String>,
-    /// `params._meta["switchboard/idempotencyKey"]` when it is a string, exactly as sent: a key
-    /// the caller chose for this one call. It is not checked here: the gateway keeps only a
-    /// valid key.
-    pub idempotency_key: Option<String>,
+    /// `params._meta["switchboard/idempotencyKey"]`, a key the caller chose for this one call:
+    /// `None` when it is absent or `null`. It is not checked here: the gateway keeps only a
+    /// valid key, and a value that is not a string is never one.
+    pub idempotency_key: Option<CarriedKey>,
+}
+
+/// What the `_meta` field `switchboard/idempotencyKey` held, when it held anything.
+///
+/// A value that is not a string is kept apart from an absent one, so the gateway can treat it
+/// as a key that is not valid, which leaves the call with no key, and not as no key sent,
+/// which lets the call be keyed by its next carrier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CarriedKey {
+    /// A string, exactly as sent.
+    Text(String),
+    /// A number, a boolean, an array or an object.
+    NotText,
 }

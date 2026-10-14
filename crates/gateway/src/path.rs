@@ -97,8 +97,8 @@ use gateway_core::{
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
-    Call, HttpResponse, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_KEY_META, Inbound, Rejection, Reply,
-    Request, ServerInfo, ToolCall, ToolEntry,
+    Call, CarriedKey, HttpResponse, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_KEY_META, Inbound,
+    Rejection, Reply, Request, ServerInfo, ToolCall, ToolEntry,
 };
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
@@ -641,7 +641,7 @@ impl RequestPath {
             .profile(&caller.profile)
             .is_some_and(|profile| profile.idempotency_key_header);
         let key = call_key(
-            explicit_key(IDEMPOTENCY_KEY_META, idempotency_key),
+            meta_key(idempotency_key),
             key_header.honoured(declares_header),
             tool_use_id.as_ref(),
         );
@@ -986,6 +986,23 @@ fn explicit_key(carrier: &'static str, value: Option<String>) -> Explicit {
                 length = value.len(),
                 "dropped an idempotency key that is not 1 to {MAX_IDEMPOTENCY_KEY} printable \
                  ASCII characters; the call carries no key"
+            );
+            Explicit::Invalid
+        }
+    }
+}
+
+/// What the `_meta` field `switchboard/idempotencyKey` carries. A value that is not a string
+/// holds no valid key, and is dropped with a warning like any other, so it too leaves the call
+/// with no key ([`call_key`]).
+fn meta_key(value: Option<CarriedKey>) -> Explicit {
+    match value {
+        None => Explicit::Absent,
+        Some(CarriedKey::Text(text)) => explicit_key(IDEMPOTENCY_KEY_META, Some(text)),
+        Some(CarriedKey::NotText) => {
+            tracing::warn!(
+                carrier = IDEMPOTENCY_KEY_META,
+                "dropped an idempotency key that is not a string; the call carries no key"
             );
             Explicit::Invalid
         }

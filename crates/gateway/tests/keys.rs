@@ -187,18 +187,33 @@ async fn the_header_is_ignored_on_a_profile_that_does_not_declare_it() {
     assert_eq!(server.store.receipts()[0].key, key("toolu_two"));
 }
 
-/// An explicit key that is not a valid key is dropped and leaves the call with no key: it is
-/// not passed over for the header or the tool-use identifier, so the side effect is denied
-/// for want of a key and nothing runs. The tool-use identifier is still recorded. A declared
-/// header that is not valid, or is sent twice, does the same.
+/// An explicit key that is not a valid key, whether a string or not, is dropped and leaves the
+/// call with no key: it is not passed over for the header or the tool-use identifier, so the
+/// side effect is denied for want of a key and nothing runs. The tool-use identifier is still
+/// recorded. A declared header that is not valid, or is sent twice, does the same.
 #[tokio::test]
 async fn an_invalid_explicit_key_leaves_the_call_with_no_key() {
     let server = Server::start_configured(declaring).await;
     let too_long = "k".repeat(129);
-    let cases: [(&str, Value, Vec<&str>); 5] = [
+    let cases: [(&str, Value, Vec<&str>); 8] = [
         (
             "_meta with a space",
             json!({IDEMPOTENCY_KEY_META: "session:turn 7", TOOL_USE_ID_META: "toolu_one"}),
+            vec![],
+        ),
+        (
+            "_meta a number",
+            json!({IDEMPOTENCY_KEY_META: 7, TOOL_USE_ID_META: "toolu_six"}),
+            vec![],
+        ),
+        (
+            "_meta an object, beside a valid header",
+            json!({IDEMPOTENCY_KEY_META: {"key": "turn-7"}, TOOL_USE_ID_META: "toolu_seven"}),
+            vec!["header-key-7"],
+        ),
+        (
+            "_meta a boolean",
+            json!({IDEMPOTENCY_KEY_META: true, TOOL_USE_ID_META: "toolu_eight"}),
             vec![],
         ),
         (

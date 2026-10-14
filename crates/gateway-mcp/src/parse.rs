@@ -8,7 +8,7 @@ use crate::constants::{
     PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_META, TOOL_USE_ID_META,
 };
 use crate::headers::{Single, accept_admits_json, content_type_is_json, header_name_value, single};
-use crate::message::{Call, Era, Inbound, Request, RequestId, ToolCall};
+use crate::message::{Call, CarriedKey, Era, Inbound, Request, RequestId, ToolCall};
 use crate::rejection::Rejection;
 
 /// Refuses what is not a JSON POST, from the method and headers alone: 405 for any method but
@@ -333,18 +333,23 @@ fn tools_call(
             ));
         }
     };
-    let meta_text = |key: &str| {
+    let meta = |key: &str| {
         params
             .get("_meta")
             .and_then(Value::as_object)
             .and_then(|meta| meta.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+            .filter(|value| !value.is_null())
     };
+    let idempotency_key = meta(IDEMPOTENCY_KEY_META).map(|value| match value.as_str() {
+        Some(text) => CarriedKey::Text(text.to_owned()),
+        None => CarriedKey::NotText,
+    });
     Ok(ToolCall {
         name,
         arguments,
-        tool_use_id: meta_text(TOOL_USE_ID_META),
-        idempotency_key: meta_text(IDEMPOTENCY_KEY_META),
+        tool_use_id: meta(TOOL_USE_ID_META)
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        idempotency_key,
     })
 }

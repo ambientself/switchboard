@@ -33,7 +33,7 @@ pub use constants::{
     MODERN, NAME_HEADER, PARSE_ERROR, PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION_META,
     SERVER_INFO_META, SESSION_ID_HEADER, TOOL_USE_ID_META, UNSUPPORTED_VERSION,
 };
-pub use message::{Call, Era, Inbound, Request, RequestId, ToolCall};
+pub use message::{Call, CarriedKey, Era, Inbound, Request, RequestId, ToolCall};
 pub use parse::{check_transport, parse};
 pub use rejection::{Rejection, RejectionKind};
 pub use reply::{HttpResponse, Reply, ServerInfo, ToolEntry, render, render_with_row};

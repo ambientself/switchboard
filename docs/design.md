@@ -889,11 +889,12 @@ receipt.
   lets a key that stays the same across a turn Otto's control plane replays cover that turn,
   whose model makes new tool-use identifiers: the replay is refused, not run again. An
   explicit key that is not a valid key, 1 to 128 printable ASCII characters other than space,
-  or a declared header sent twice or not as text, is dropped with a warning and leaves the call
-  with no key. It is not passed over for the next carrier: a call keyed by its tool-use
-  identifier in place of the key its caller chose would lose that key's cover of a replay. A
-  side effect is then denied for want of a key, and its tool-use identifier is still recorded.
-  A tool-use identifier outside that bound is dropped with a warning too.
+  a `_meta` value that is not a string included, or a declared header sent twice or not as
+  text, is dropped with a warning and leaves the call with no key. It is not passed over for
+  the next carrier: a call keyed by its tool-use identifier in place of the key its caller
+  chose would lose that key's cover of a replay. A side effect is then denied for want of a
+  key, and its tool-use identifier is still recorded. A `_meta` value of `null` is read as no
+  key sent. A tool-use identifier outside that bound is dropped with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.

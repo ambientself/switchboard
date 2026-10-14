@@ -541,8 +541,7 @@ mutate("gw-key-not-from-tool-use-id", "the tool-use identifier never keys a call
 # the Idempotency-Key header from a profile that declares its callers set it per request; the
 # tool-use identifier is recorded beside it. crates/gateway/tests/keys.rs catches these.
 mutate("gw-key-meta-ignored", "the gateway never reads a key from the switchboard/idempotencyKey _meta field", "crates/gateway/src/path.rs",
-       "            explicit_key(IDEMPOTENCY_KEY_META, idempotency_key),",
-       "            explicit_key(IDEMPOTENCY_KEY_META, None::<String>),")
+       "            meta_key(idempotency_key),", "            meta_key(None),")
 mutate("gw-key-header-from-any-profile", "the Idempotency-Key header keys a call under a profile that does not declare it", "crates/gateway/src/path.rs",
        "            key_header.honoured(declares_header),", "            key_header.honoured(true || declares_header),")
 mutate("gw-key-tool-use-id-first", "the tool-use identifier is preferred over an explicit key", "crates/gateway/src/path.rs",
@@ -558,6 +557,14 @@ mutate("gw-key-invalid-falls-back", "an explicit key that is not valid is passed
        "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n")
 mutate("gw-key-invalid-meta-passed-over", "a _meta key that is not valid is passed over for the header", "crates/gateway/src/path.rs",
        "            Self::Absent => next,\n", "            Self::Absent | Self::Invalid => next,\n")
+# A _meta key that is not a string is a key that is not valid, not an absent one, so it too
+# leaves the call with no key. keys.rs catches the first, the parse table the second.
+mutate("gw-key-non-string-meta-absent", "a _meta key that is not a string is read as no key sent, and the call keyed by its next carrier", "crates/gateway/src/path.rs",
+       "not a string; the call carries no key\"\n            );\n            Explicit::Invalid\n",
+       "not a string; the call carries no key\"\n            );\n            Explicit::Absent\n")
+mutate("mcp-non-string-key-dropped", "the parser drops a _meta key that is not a string, as if none were sent", "crates/gateway-mcp/src/parse.rs",
+       "    let idempotency_key = meta(IDEMPOTENCY_KEY_META).map(",
+       "    let idempotency_key = meta(IDEMPOTENCY_KEY_META).filter(|value| value.is_string()).map(")
 
 # --- tools/list ----------------------------------------------------------------------------
 

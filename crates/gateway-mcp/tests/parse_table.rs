@@ -8,10 +8,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use common::Raw;
 use gateway_mcp::{
-    CLIENT_CAPABILITIES_META, Call, DENIAL_CODE, Era, HEADER_MISMATCH, IDEMPOTENCY_KEY_META,
-    INVALID_PARAMS, INVALID_REQUEST, Inbound, METHOD_NOT_FOUND, MODERN, PARSE_ERROR,
-    PROTOCOL_VERSION_META, RejectionKind, Request, RequestId, TOOL_USE_ID_META, ToolCall,
-    UNSUPPORTED_VERSION,
+    CLIENT_CAPABILITIES_META, Call, CarriedKey, DENIAL_CODE, Era, HEADER_MISMATCH,
+    IDEMPOTENCY_KEY_META, INVALID_PARAMS, INVALID_REQUEST, Inbound, METHOD_NOT_FOUND, MODERN,
+    PARSE_ERROR, PROTOCOL_VERSION_META, RejectionKind, Request, RequestId, TOOL_USE_ID_META,
+    ToolCall, UNSUPPORTED_VERSION,
 };
 use http::Method;
 use serde_json::{Value, json};
@@ -41,6 +41,20 @@ fn keyed_call(
     tool_use_id: Option<&str>,
     idempotency_key: Option<&str>,
 ) -> Call {
+    carried_call(
+        name,
+        arguments,
+        tool_use_id,
+        idempotency_key.map(|key| CarriedKey::Text(key.to_owned())),
+    )
+}
+
+fn carried_call(
+    name: &str,
+    arguments: Value,
+    tool_use_id: Option<&str>,
+    idempotency_key: Option<CarriedKey>,
+) -> Call {
     let Value::Object(arguments) = arguments else {
         panic!("arguments must be an object")
     };
@@ -48,7 +62,7 @@ fn keyed_call(
         name: name.to_owned(),
         arguments,
         tool_use_id: tool_use_id.map(str::to_owned),
-        idempotency_key: idempotency_key.map(str::to_owned),
+        idempotency_key,
     })
 }
 
@@ -125,7 +139,9 @@ fn table() -> Vec<(&'static str, Raw, Expect)> {
         ("tools/call with a numeric tool-use id", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {TOOL_USE_ID_META: 7}})), request(1, Legacy, call("read_document", json!({}), None))),
         ("tools/call with an idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: "turn-7-draft"}})), request(1, Legacy, keyed_call("read_document", json!({}), None, Some("turn-7-draft")))),
         ("tools/call with a key and a tool-use id", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: "turn-7-draft", TOOL_USE_ID_META: "toolu_01"}})), request(1, Legacy, keyed_call("read_document", json!({}), Some("toolu_01"), Some("turn-7-draft")))),
-        ("tools/call with a numeric idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: 7}})), request(1, Legacy, call("read_document", json!({}), None))),
+        ("tools/call with a numeric idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: 7}})), request(1, Legacy, carried_call("read_document", json!({}), None, Some(CarriedKey::NotText)))),
+        ("tools/call with an object for an idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: {"key": "turn-7-draft"}}})), request(1, Legacy, carried_call("read_document", json!({}), None, Some(CarriedKey::NotText)))),
+        ("tools/call with a null idempotency key", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "_meta": {IDEMPOTENCY_KEY_META: null}})), request(1, Legacy, call("read_document", json!({}), None))),
         ("tools/call with a key in the wrong place", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", IDEMPOTENCY_KEY_META: "turn-7-draft"})), request(1, Legacy, call("read_document", json!({}), None))),
         ("tools/call with null arguments", Raw::legacy(json!(1), "tools/call", json!({"name": "read_document", "arguments": null})), request(1, Legacy, call("read_document", json!({}), None))),
         ("tools/call without a name", Raw::legacy(json!(1), "tools/call", json!({"arguments": {}})), Refused(InvalidParams, 200, INVALID_PARAMS)),
