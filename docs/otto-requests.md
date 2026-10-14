@@ -36,7 +36,8 @@ start until Otto's grant-format change has been rolled out ([decision 0012][0012
 
 Each request below says what is asked, why, and what Switchboard does until it is answered. It
 is marked as a **change**, which is work in Otto, or a **question**, which needs an answer from
-Otto's owners. Some are both.
+Otto's owners. Some are both. Where the sources name no stage for a request, the request says
+where it is listed and why.
 
 ## Words used here
 
@@ -82,19 +83,19 @@ Otto's owners. Some are both.
 | 8 | Check the proposal tools against the interim automation refusals | Question | Any Otto tool served |
 | 9 | Freeze Otto's gateway behavior for an agreed period | Question | Stage 2 |
 | 10 | Reconfigure Otto to call Switchboard, stage by stage | Change | Stage 2, and stage 3 |
-| 11 | How skill pins reach Switchboard | Question | `github_skill_body` moving |
-| 12 | Mint `pod`, and say whether the harness can read the pod's token | Change and question | Stage 3 |
-| 13 | The resolver interface, with the currency question | Change | Stage 3 |
-| 14 | The resolver's availability target | Question | Stage 3 |
-| 15 | Two departures from Otto's control-plane document | Question | Stage 3 |
+| 11 | How skill pins reach Switchboard | Change and question | `github_skill_body` is built |
+| 12 | Blue/green plans, and two departures from Otto's control-plane document | Question | Stage 2 |
+| 13 | Mint `pod`, and say whether the harness can read the pod's token | Change and question | Stage 3 |
+| 14 | The resolver interface, with the currency question | Change | Stage 3 |
+| 15 | The resolver's availability target | Question | Stage 3 |
 | 16 | Otto's idempotency key | Change and question | Stage 3 |
 | 17 | Never repeat what may already have happened | Change and question | Stage 3 |
 | 18 | Parity differences for side effects | Question | Stage 3 |
 | 19 | Control-plane endpoints outside the Go gateway, and their vendor actions | Change | The stage that moves those actions |
-| 20 | Rows for identity failures, `initialize` and `ping` | Question | Not blocking |
+| 20 | Parity differences for identity failures, audit outages and open rows | Question | Not blocking |
 | 21 | New columns in `gateway_audit` | Question | Not blocking |
 | 22 | The egress proxy refuses target systems' hosts | Change and question | Not blocking |
-| 23 | `make egress-check` gains rows for those hosts | Change | Not blocking |
+| 23 | `make egress-check` gains rows for those hosts | Change and question | Not blocking |
 | 24 | The sandbox's Pod Identity association | Change or question | Not blocking |
 | 25 | Mint `egress`, the turn's egress setting | Change | Not blocking |
 | 26 | Own or share the register entries for Otto | Question | Not blocking |
@@ -119,20 +120,25 @@ Otto's owners. Some are both.
 
 *Change.*
 
-- **Asked:** sign turn grants with an Ed25519 key, under a new format version that is neither
-  `v1` nor the model broker's `v2`, with its own domain prefix, a key ID derived from the public
-  key, and a separate key in each environment, none of them the model broker's. Encode each
-  part as canonical unpadded base64url and require a canonical signature, and have Otto's Go
-  gateway verify the new format by the same strict rules. Whether the Go gateway also checks
-  `aud` (request 3) is Otto's choice. Make the change once, alone, by Otto's own procedure for
-  a breaking grant change: stop admitting turns, drain, roll the control plane, the Go gateway
-  and the sandbox image together, and resume. There is no interim with the shared secret.
+- **Asked:** sign turn grants with an Ed25519 key in place of the shared secret, and have
+  Otto's Go gateway verify the new format too. Make the change once, alone, before stage 1.
+- **Details:**
+  - A new format version that is neither `v1` nor the model broker's `v2`, with its own domain
+    prefix.
+  - A key ID derived from the public key, and a separate key in each environment, none of them
+    the model broker's.
+  - Each part encoded as canonical unpadded base64url, and a canonical signature, which the Go
+    gateway checks by the same strict rules. Whether it also checks `aud` (request 3) is
+    Otto's choice.
+  - Otto's own procedure for a breaking grant change: stop admitting turns, drain, roll the
+    control plane, the Go gateway and the sandbox image together, and resume. There is no
+    interim with the shared secret.
 - **Why:** with a shared secret, anything that verifies a grant can also mint one, so a
   company-wide gateway, or whoever compromised it, could write any human's name on any Otto
-  action ([decision 0004][0004-decision]). It comes before stage 1 so that the stage 1
-  comparison verifies real grants ([decision 0012, What Otto changes][0012-changes]).
-  Decision 0004 first had the format change made with the cutover; decision 0012 amended that
-  on 2026-10-07, and this list follows the amendment.
+  action ([decision 0004][0004-decision]). Before stage 1, so that stage 1's comparison
+  verifies real grants ([decision 0012, What Otto changes][0012-changes]).
+- **Sources:** decision 0004 first had the change made with the cutover. Decision 0012 moved it
+  before stage 1 on 2026-10-07, and this list follows 0012.
 - **Meanwhile:** Switchboard never accepts a `v1` grant, so the conformance suite cannot run
   against Switchboard until it is re-pinned to the new format. Stage 1 does not start.
 
@@ -140,13 +146,16 @@ Otto's owners. Some are both.
 
 *Change, in the same breaking change as request 2, and a question about the limits.*
 
-- **Asked:** mint `aud`, the list of gateway deployments the grant is for: during the cutover
-  the Go gateway's name and the name of Switchboard's Otto deployment, and after the last stage
-  Switchboard's alone. Switchboard names its own deployments in its configuration. Mint `iat`,
-  the time of minting, beside `exp`, and have the minter refuse a lifetime over 15 minutes, so
-  that the failure shows in the control plane, not on the turn. Agree the limits: a 15-minute
-  ceiling on `exp − iat` and 30 seconds of clock leeway. Tell this project before Otto raises
-  its turn or execution timeouts past the ceiling, so that the ceiling is raised here first.
+- **Asked:** mint `aud`, the gateway deployments the grant is for, and `iat`, the time of
+  minting, beside `exp`, and have the minter refuse a lifetime over 15 minutes. Agree the
+  limits: a 15-minute ceiling on `exp − iat`, and 30 seconds of clock leeway.
+- **Details:**
+  - During the cutover `aud` names the Go gateway and Switchboard's Otto deployment; after the
+    last stage, Switchboard's alone. Switchboard names its own deployments in its
+    configuration.
+  - Refusing at the minter makes the failure show in the control plane, not on the turn.
+  - Tell this project before Otto raises its turn or execution timeouts past the ceiling, so
+    that the ceiling is raised here first.
 - **Why:** a public key can be configured anywhere, so the grant must name the gateways it is
   for, and checking only that expiry is within 15 minutes of now would accept a grant minted
   to last a year, in its final 15 minutes
@@ -159,14 +168,16 @@ Otto's owners. Some are both.
 
 - **Asked:** where Otto's private grant key is held (a mounted Secret as today, a signer like
   Otto's GitHub App custodian, or KMS or an HSM), whether that needs IT, and the rotation
-  schedule. Rotation here works like this: the new public key is added to Switchboard and
-  rolled out, Otto signs with it, and once one lifetime ceiling has passed the old key's end
-  instant passes and it is removed.
+  schedule.
 - **Why:** the private key is the issuer. Switchboard holds only public keys, read at boot, and
   never fetches a key from Otto, because whoever controlled that endpoint could add a key
-  ([decision 0012, Keys][0012-keys]). The key is first used by request 2.
-- **Meanwhile:** a grant-key change in Switchboard gets the ordinary review, and rotates by the
-  procedure above. Whether it needs more review is for the security team, not Otto.
+  ([decision 0012, Keys][0012-keys]).
+- **When:** the sources name no stage. It is listed here because the key is first used by
+  request 2.
+- **Meanwhile:** a grant-key change in Switchboard gets the ordinary review. It rotates by
+  adding the new public key here and rolling it out; Otto then signs with the new key, and once
+  one lifetime ceiling has passed, the old key's end instant passes and it is removed. Whether
+  a key change needs more review is for the security team, not Otto.
 
 ### 5. Stage 1's copies carry the sandbox's own token and grant
 
@@ -181,7 +192,10 @@ Otto's owners. Some are both.
 
 ## Before Switchboard serves any of Otto's tools
 
-Stage 1's copies are answered by Switchboard, so these three come before stage 1 as well.
+Decision 0011 asks for these three before milestone 4, and until they are answered Switchboard
+serves none of Otto's tools. In stage 1 Switchboard answers copies of Otto's reads, though only
+for the comparison: its answers do not reach Otto. That still needs these three, so they come
+before stage 1 as well.
 
 ### 6. Review the declarations for Otto's eighteen tools
 
@@ -236,8 +250,8 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
   suite passing against both gateways.
 - **Why:** Otto's gateway changes often (fifty-five commits touched it between the first two
   pins), and parity needs a fixed target ([design.md, section 18](design.md#18-testing); #13).
-  The design says only "before cutover"; it is listed here because stage 2 is the first stage
-  in which Switchboard answers Otto's calls.
+- **When:** the design says only "before cutover". It is listed here because stage 2 is the
+  first stage in which Switchboard's answers reach Otto.
 - **Meanwhile:** the suite is re-pinned to Otto on a schedule, and the failures at each re-pin
   are the list of what changed in Otto.
 
@@ -257,19 +271,42 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
 
 ### 11. How skill pins reach Switchboard
 
-*Question, settled when `github_skill_body` is built.*
+*Change and question: either answer is work in Otto.*
 
 - **Asked:** which skills a turn pinned, and at which commit, is a fact only Otto knows. Agree
-  how it reaches Switchboard: as a signed claim in the turn grant, or through the resolver.
+  how it reaches Switchboard: as a signed claim in the turn grant, or as a question on the
+  resolver (request 14).
 - **Why:** a fact fixed for the turn reaches Switchboard in one of those two ways, chosen per
   fact when the tool that needs it is built ([decision 0003][0003-decision];
-  [decision 0012, Consequences][0012-consequences]). `github_skill_body` is a read, so it moves
-  in stage 2.
+  [decision 0012, Consequences][0012-consequences]).
+- **When:** the sources tie this to building `github_skill_body`, not to a stage. That tool is
+  a read, so it moves in stage 2, and it is listed here. Until it is built, Switchboard answers
+  no call of it, not even a stage 1 copy.
 - **Meanwhile:** nothing is chosen yet, and `github_skill_body` waits on the choice.
+
+### 12. Blue/green plans, and two departures from Otto's control-plane document
+
+*Question.*
+
+- **Asked:** whether Otto plans a blue/green control-plane swap in production, or local
+  execution in sandboxes, during milestone 4. Also agree two departures from Otto's
+  control-plane document:
+  - It says grant enforcement makes no call to Otto on the ordinary tool path. From stage 3,
+    Switchboard asks the currency question (request 14) on every side-effecting call.
+  - It says the gateway fences a superseded control plane. Switchboard fences only that control
+    plane's side-effecting calls, not its reads.
+- **Why:** fencing reads would put Otto's control plane on every read, and Otto's model broker
+  already cuts a superseded control plane's turns off from the model
+  ([decision 0012, Currency][0012-currency]).
+- **When:** the sources name no stage. Reads stay unfenced until Otto enables either plan while
+  Switchboard serves its reads ([decision 0012, Decided by the owner][0012-decided]), and
+  Switchboard serves them from stage 2. So this is listed before stage 2, though the first
+  departure takes effect only in stage 3.
+- **Meanwhile:** reads are not fenced. If either plan is made, fencing reads comes back.
 
 ## Before stage 3
 
-### 12. Mint `pod`, and say whether the harness can read the pod's token
+### 13. Mint `pod`, and say whether the harness can read the pod's token
 
 *Change, and a question.*
 
@@ -278,8 +315,8 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
   minting, and refusing the turn when it cannot. This is asked for in the first change
   (request 2) if Otto can do it then, and is required before stage 3. Also say whether the
   harness can read the pod's projected service account token.
-- **Why:** without it a copied grant can be presented by any sandbox of its team until it
-  expires. In stage 3 Switchboard makes proposals in the acting human's name, and Otto's rule
+- **Why:** without it, any sandbox of the grant's team can present a copied grant until it
+  expires. From stage 3 that would make proposals in the acting human's name, and Otto's rule
   that a requester may not approve their own change depends on that name. The binding stops a
   copied grant only while the harness cannot also read the pod's token
   ([decision 0012, What the grant carries][0012-carries]).
@@ -288,30 +325,34 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
   or to load a snapshot, that would serve a tool not classified `read` to Otto's sandboxes while
   `pod` is not required.
 
-### 13. The resolver interface, with the currency question
+### 14. The resolver interface, with the currency question
 
 *Change.*
 
 - **Asked:** expose a versioned resolver interface that states what Switchboard does when Otto
-  does not answer, which is to refuse the call. Its first question is currency: is this turn
-  (session, execution, turn and epoch) current? Otto answers current, superseded (a newer epoch
-  holds the lease), ended, or revoked, within one second. It answers from durable state: the
-  lease row's holder and epoch, compared on the database's clock as Otto's own fencing does,
-  and the turn's recorded state, so Otto records turns as ended or revoked. A superseded
-  control plane that is still running must not be able to say its own turns are current; that
-  is Otto's guarantee, tested in Otto. The resolver also answers whether a pull request is one
-  of Otto's own proposals, which `github_amend_change` needs.
+  does not answer: it refuses the call. Its first question is currency: is this turn (session,
+  execution, turn and epoch) current? It also answers whether a pull request is one of Otto's
+  own proposals, which `github_amend_change` needs.
+- **Details:**
+  - Otto answers current, superseded (a newer epoch holds the lease), ended, or revoked, within
+    one second.
+  - It answers from durable state: the lease row's holder and epoch, compared on the database's
+    clock as Otto's own fencing does, and the turn's recorded state. So Otto records turns as
+    ended or revoked.
+  - A superseded control plane that is still running must not be able to say its own turns are
+    current. That is Otto's guarantee, tested in Otto.
 - **Why:** Switchboard does not read Otto's tables ([decision 0003][0003-decision]). The
   currency question enforces the fencing epoch, which today is signed and recorded but compared
   with nothing, and lets Otto stop one turn at once
   ([decision 0012, Currency][0012-currency]).
+- **Sources:** issue #13 lists the resolver among Otto's readiness for the cutover without
+  naming a stage. Decision 0012, written later, puts the currency answer before stage 3, and
+  this list follows it.
 - **Meanwhile:** Switchboard is tested against a fake resolver and calls no real one before
   stage 3. From stage 3, a side-effecting call is denied when Otto does not answer, the answer
-  is not cached, and reads are not fenced. Issue #13 lists the resolver among Otto's readiness
-  for the cutover without naming a stage; decision 0012, written later, puts the currency answer
-  before stage 3, and this list follows it.
+  is not cached, and reads are not fenced (request 12).
 
-### 14. The resolver's availability target
+### 15. The resolver's availability target
 
 *Question.*
 
@@ -322,35 +363,23 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
 - **Meanwhile:** nothing calls the resolver before stage 3. From stage 3 a side-effecting call
   is denied when the resolver does not answer within one second, and reads keep working.
 
-### 15. Two departures from Otto's control-plane document
-
-*Question.*
-
-- **Asked:** agree two departures from Otto's control-plane document. That document says grant
-  enforcement makes no call to Otto on the ordinary tool path; Switchboard asks the currency
-  question on every side-effecting call. It says the gateway fences a superseded control plane;
-  Switchboard fences only that control plane's side-effecting calls, not its reads. Also say
-  whether Otto plans a blue/green control-plane swap in production, or local execution in
-  sandboxes, during milestone 4.
-- **Why:** fencing reads would put Otto's control plane on every read, and Otto's model broker
-  already cuts a superseded control plane's turns off from the model
-  ([decision 0012, Currency][0012-currency]).
-- **Meanwhile:** reads are not fenced. If either plan is made, fencing reads comes back.
-
 ### 16. Otto's idempotency key
 
 *Change and question.*
 
-- **Asked:** for each side effect, the key that lets Switchboard's receipts tell a resend from
-  a new call. Agree the carrier Otto's control plane uses for the actions it asks for (the
-  carriers are the caller's tool-use identifier, a named `_meta` field for callers that are not
-  models, or a header from a profile that declares its callers set it per request); whether
-  the tool-use identifier Otto's gateway stores today is Otto's key; and which grant fields
-  scope a key. The session and the turn are recommended. Also say whether a turn is unique only
-  within an execution, so that the scope needs the execution too; whether the control plane can
-  send a key that stays the same when it replays a turn; and how its read-back of audit rows by
-  tool-use identifier treats the extra rows (a `duplicate`, or a refusal for reuse) that share
-  the original call's identifier.
+- **Asked:** agree the key sent with each side effect, which lets Switchboard's receipts tell a
+  resend from a new call: the carrier Otto's control plane uses for the actions it asks for,
+  whether the tool-use identifier Otto's gateway stores today is Otto's key, and which grant
+  fields scope a key. The session and the turn are recommended.
+- **Details:**
+  - The carriers are the caller's tool-use identifier, a named `_meta` field for callers that
+    are not models, or a header from a profile that declares its callers set it per request.
+  - Also say whether a turn is unique only within an execution, so that the scope needs the
+    execution too, and whether the control plane can send a key that stays the same when it
+    replays a turn.
+  - And say how the control plane's read-back of audit rows by tool-use identifier treats the
+    extra rows (a `duplicate`, or a refusal for reuse) that share the original call's
+    identifier.
 - **Why:** Otto's gateway makes the same comment twice when asked twice, even with the same
   `Idempotency-Key` header. Receipts stop that for a resend of the same call, and cover a turn
   replayed after a failover only if the key survives the replay
@@ -377,8 +406,9 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
 - **Asked:** agree these differences from Otto's gateway. `gateway_audit` has no `unknown`, no
   `duplicate` and no deadline, so the adapter writes an empty outcome for `unknown`, never
   `error`, and `ok` for `duplicate`, since the effect exists. A side effect is no longer
-  cancelled when the client disconnects. Otto's conformance test that a repeated comment is
-  written twice fails on purpose once receipts are on, and moves to the expected differences.
+  cancelled when the client disconnects. The conformance suite's test that a repeated comment
+  is written twice, `TestRepeatedCommentIsWrittenTwice` in this repository, fails on purpose
+  once receipts are on for Otto's profile, and moves to the group of expected differences.
 - **Why:** these follow from receipts and from never cancelling a side effect midway
   ([decision 0009, Consequences][0009-cons]).
 - **Meanwhile:** writes stay on Otto's Go gateway, so none of these differences reaches Otto.
@@ -404,15 +434,23 @@ Stage 1's copies are answered by Switchboard, so these three come before stage 1
 
 ## Asked, but not blocking
 
-### 20. Rows for identity failures, `initialize` and `ping`
+### 20. Parity differences for identity failures, audit outages and open rows
 
-*Question.*
+*Question: an answer, and agreement when the adapter is built.*
 
 - **Asked:** whether Otto's adapter should still write identity failures, `initialize` and
-  `ping` into `gateway_audit`, as Otto's gateway does today.
-- **Why:** Switchboard records them as telemetry, not audit rows; unverifiable grants and
-  `tools/list` stay audit rows ([decision 0009, Still open 2][0009-open]).
-- **Meanwhile:** Switchboard writes no row for them, and that is a recorded parity difference.
+  `ping` into `gateway_audit`, as Otto's gateway does today. Also agree two differences:
+  - During an audit outage, a refused identity (HTTP 401) keeps the one opaque identity
+    sentence. Otto's gateway replaces it with its audit-failure sentence.
+  - Open rows, calls whose outcome the gateway never learned, are found from Switchboard's own
+    record, since `gateway_audit` has no deadline column to tell them from calls in flight.
+- **Why:** Switchboard records identity failures, `initialize` and `ping` as telemetry, not
+  audit rows, so an identity failure writes no row and has no audit failure to report.
+  Unverifiable grants and `tools/list` stay audit rows ([decision 0009, Still open 2][0009-open]
+  and [Consequences][0009-cons]).
+- **Meanwhile:** Switchboard writes no row for them, and these are recorded parity differences.
+  They apply to reads as well as writes, so they first show in stage 1's comparison and reach
+  Otto from stage 2.
 
 ### 21. New columns in `gateway_audit`
 
@@ -560,8 +598,11 @@ The requests above are bounded. Otto keeps:
 - **Its own duplicate protection for control-plane actions,** such as the receipt poller's
   row claims ([decision 0012, Currency][0012-currency]).
 
-Otto's tools behave as they do today when Switchboard serves them, except for the differences
-named in requests 6, 8, 18 and 20.
+When Switchboard serves Otto's tools, the differences from today that this project knows of
+are the ones named above: the new grant format and its checks (requests 2, 3 and 25); the
+differences in requests 6, 8, 18 and 20; and the refusals that requests 13, 14 and 16 add by
+stage 3: a grant presented from another pod, a side-effecting call whose turn Otto does not
+confirm as current, and a side-effecting call sent without a key.
 
 [0002]: decisions/0002-replace-ottos-mcp-gateway.md
 [0002-decision]: decisions/0002-replace-ottos-mcp-gateway.md#decision
@@ -589,6 +630,7 @@ named in requests 6, 8, 18 and 20.
 [0012-changes]: decisions/0012-what-a-turn-grant-binds.md#what-otto-changes
 [0012-alternatives]: decisions/0012-what-a-turn-grant-binds.md#alternatives-rejected
 [0012-consequences]: decisions/0012-what-a-turn-grant-binds.md#consequences
+[0012-decided]: decisions/0012-what-a-turn-grant-binds.md#decided-by-the-owner
 [0012-owner]: decisions/0012-what-a-turn-grant-binds.md#still-for-the-owner
 [0012-open]: decisions/0012-what-a-turn-grant-binds.md#still-open
 [0014-s10]: decisions/0014-rollout-safeguards-and-audit-operations.md#10-ottos-audit-table
