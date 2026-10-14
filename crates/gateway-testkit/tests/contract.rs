@@ -61,7 +61,7 @@ impl ContractStore for InMemory {
     }
 
     async fn receipts(&self) -> Vec<Receipt> {
-        self.store.receipts()
+        self.store.held_receipts()
     }
 
     fn lose_every_begin_confirmation(&self) {

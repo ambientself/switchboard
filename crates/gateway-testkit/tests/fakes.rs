@@ -1765,6 +1765,24 @@ fn the_connector_records_every_call_it_receives_in_order() {
     assert_eq!(received[1].arguments, documents("team-b-notes"));
 }
 
+/// Told to report no definite answer, the connector does the work and reports `unknown`, once:
+/// a side effect sent and never answered. Its receipt is `unknown`.
+#[test]
+fn a_connector_told_to_answer_nothing_definite_does_the_work_and_reports_unknown_once() {
+    let rig = rig();
+    rig.connector.unknown_next();
+    let answer = rig.answer(Caller::TeamA, DRAFT_TOOL, documents("team-a-notes"));
+    assert!(matches!(answer, Answer::Unknown(_)), "{answer:?}");
+    assert_eq!(rig.connector.writes().len(), 1, "the draft was not made");
+    assert_eq!(
+        rig.store.receipts().pop().map(|receipt| receipt.state),
+        Some(gateway_core::ReceiptState::Unknown)
+    );
+    // Only the next call.
+    let answer = rig.answer(Caller::TeamA, DRAFT_TOOL, documents("team-a-notes"));
+    assert!(matches!(answer, Answer::Ok(_)), "{answer:?}");
+}
+
 #[test]
 fn a_connector_told_to_fail_errors_without_doing_the_work_and_is_still_recorded() {
     let rig = rig();
