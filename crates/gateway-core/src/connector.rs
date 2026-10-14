@@ -106,7 +106,7 @@ pub enum ErrorKind {
     InvalidArguments,
     /// A tool classified `read` gave an answer too large to accept, or none by its deadline.
     /// From a tool of any other classification the same failure is [`Other`](Self::Other),
-    /// until the outcome `unknown` is built.
+    /// until a connector reports the outcome `unknown`.
     OversizedOrLateRead,
     /// The credential custodian refused the credential an allowed call needed. Nothing reports
     /// it yet: no connector asks a custodian.

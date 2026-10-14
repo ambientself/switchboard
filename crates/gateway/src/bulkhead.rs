@@ -251,7 +251,7 @@ pub struct ServerCounts {
     pub refused: u64,
     /// Calls that were an error of the kind `oversized_or_late_read`: a `read` tool's answer
     /// too large, or none by the deadline. Another tool's is of the kind `other`, and is not
-    /// counted here, until the outcome `unknown` is built.
+    /// counted here, until a connector reports the outcome `unknown`.
     pub late_or_oversized: u64,
     /// Calls the server's cap refused.
     pub shed_server: u64,

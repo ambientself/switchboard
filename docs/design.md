@@ -1346,7 +1346,7 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   the completion. Error rows written before it read `before-0006`. The argument check is
   `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
   refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
-  a `read` tool and `other` for any other, until `unknown` is built; a guard given up, a lost
+  a `read` tool and `other` for any other, until a connector reports `unknown`; a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
   How the resources were found, and the credential identity: built (#56). A tool declared as
   its connector entry's reach is read by the gateway's one constant adapter, which names the
@@ -1728,7 +1728,7 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
-  late or oversized count is of reads only until `unknown` is built (the limits entry below).
+  late or oversized count is of reads only until a connector reports `unknown` (the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
