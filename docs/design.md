@@ -477,6 +477,14 @@ records for Otto's two comment tools names it. Under the profile for Otto's sand
 of any tool not classified `read` also needs a current control plane
 ([decision 0012](decisions/0012-what-a-turn-grant-binds.md)).
 
+**A profile can declare that its callers set the `Idempotency-Key` header per request,** with
+`idempotency_key_header = true`. It is false unless a policy says so, in the JSON
+configuration and in the registry file alike, and only then does the gateway read a side
+effect's key from that header (section 11). MCP clients set headers once per server, so a
+header fixed in a client's configuration would make every later side effect a reuse of one
+key; a profile declares it only for callers known to set it per request, such as a control
+plane. The decision function does not read the setting.
+
 **How a tool's resources are found** is stated in its approval, in one of four ways
 ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md), section 1):
 
@@ -888,6 +896,25 @@ receipt.
   that sends no tool-use identifier and cannot set the `_meta` field cannot make side effects;
   Q13 checks each target client. The same key with a different tool-use identifier is refused
   with a sentence of its own.
+- **The gateway reads the carriers in the other order.** Decision 0009 lists them in the order
+  above, with the tool-use identifier first; the gateway takes a key the caller sent on
+  purpose first, and the tool-use identifier is the key only when there is none. The explicit
+  carriers are the `_meta` field `switchboard/idempotencyKey`, beside the
+  `switchboard/auditRow` the answer names, and else the `Idempotency-Key` header, read only
+  for a profile whose `idempotency_key_header` is true; it is false unless a policy says so,
+  and a header from any other profile is ignored as if absent. The tool-use identifier,
+  `claudecode/toolUseId`, is recorded beside an explicit key, on the row and on the receipt.
+  That reading is what makes the refusal of one key with two tool-use identifiers reachable,
+  since a tool-use identifier that is itself the key cannot differ from it. It is also what
+  lets a key that stays the same across a turn Otto's control plane replays cover that turn,
+  whose model makes new tool-use identifiers: the replay is refused, not run again. An
+  explicit key that is not a valid key, 1 to 128 printable ASCII characters other than space,
+  a `_meta` value that is not a string included, or a declared header sent twice or not as
+  text, is dropped with a warning and leaves the call with no key. It is not passed over for
+  the next carrier: a call keyed by its tool-use identifier in place of the key its caller
+  chose would lose that key's cover of a replay. A side effect is then denied for want of a
+  key, and its tool-use identifier is still recorded. A `_meta` value of `null` is read as no
+  key sent. A tool-use identifier outside that bound is dropped with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
@@ -930,6 +957,19 @@ receipt.
   ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)) needs a key, a
   receipt and the gate below like any side effect, and declares a lookup by marker unless its
   exception says otherwise.
+- **A side effect's `error` means its connector knows nothing took effect,** and settles its
+  receipt as `not_performed`: the request failed before it was sent, or the vendor definitely
+  rejected it. A side-effecting connector reports `unknown` whenever it cannot know that. A
+  proxied tool's error is `unknown` unless its approval says its errors are safe (the
+  outcomes above), and no approval can say so yet, so the proxy connector reports a side
+  effect as an error only when nothing was sent: a credential it could not get, a request it
+  could not build, a connection it could not make and an argument refusal. Once the request
+  may have been sent, every outcome but a success is `unknown`: an answer too late, too large
+  or broken off, an exchange that failed after its connection was made, any status other than
+  `200`, `401`, `403` and every other `4xx` included, a `200` that is not MCP, a JSON-RPC error
+  and a tool result marked `isError`. A client that leaves before its side effect's connector
+  is invoked, checked immediately before, is not called for, and the receipt is
+  `not_performed`.
 - **The gateway never repeats a tool call on its own.** A connector may retry a side effect
   only if it failed before any byte was sent. A receipt does not make a side effect happen
   exactly once: a new key, a vendor's own retries and a turn that Otto's control plane replays
@@ -1398,9 +1438,11 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   kinds from the core's closed `ErrorKind`, and migration 0006 adds `error_kind`, which a row
   has exactly when its outcome is `error` (`error_kind_shape`), completed once with the rest of
   the completion. Error rows written before it read `before-0006`. The argument check is
-  `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
-  refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
-  a `read` tool and `other` for any other, until a connector reports `unknown`; a guard given up, a lost
+  `invalid_arguments`; the proxy connector's `403` to a read is `vendor_refusal`, an error
+  rather than a refusal (#61); its deadline, size cap and broken-off answer are
+  `oversized_or_late_read` for a `read` tool. From any other tool each of these, and every
+  outcome but a success once the request may have been sent, is not an error at all but the
+  outcome `unknown` (#55, section 11); a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
   How the resources were found, and the credential identity: built (#56). A tool declared as
   its connector entry's reach is read by the gateway's one constant adapter, which names the
@@ -1460,17 +1502,19 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   scope, the unique index makes the second reservation wait for the first to commit and then
   insert nothing; that begin is undone and made again from the check, which now finds the
   receipt and writes the row complete with its answer. A retried begin of a row it finds stored
-  answers `Reserved` while the row's receipt is `pending`, the answer the row was written with
-  (one of the five for the earlier receipt, whatever has become of it since), and refuses a row
-  whose receipt has left `pending`, one begun without a receipt, or one of another decision or
-  kind. Finish, the completion of a lost begin's row and `give_up` complete the row and settle
-  its receipt in one transaction, with the vendor's reference, while it is `pending` and the
-  row's deadline has not passed by the database's clock; after it the row is completed and the
-  receipt left `pending`. If the deadline passes between the store's test and the trigger's, the
-  trigger refuses with SQLSTATE `SB001` and the store completes the row again, leaving the
-  receipt `pending`. `unknown`, or a reference, for a row that reserved no receipt is refused,
-  and so is a `duplicate` at finish. The Postgres runner runs item 6 of the contract suite. A
-  begin whose confirmation is lost after it wrote a reused key's row gives that row up as
+  answers `Reserved` while the row's receipt is `pending` and the row's deadline has not passed
+  by the database's clock, the answer the row was written with (one of the five for the earlier
+  receipt, whatever has become of it since), and refuses a row whose receipt has left `pending`,
+  one whose receipt is still `pending` past the deadline, which reads as `unknown`, one begun
+  without a receipt, or one of another decision or kind. Finish, the completion of a lost
+  begin's row and `give_up` complete the row and settle its receipt in one transaction, with the
+  vendor's reference, while it is `pending` and the row's deadline has not passed by the
+  database's clock; after it the row is completed and the receipt left `pending`. If the
+  deadline passes between the store's test and the trigger's, the trigger refuses with SQLSTATE
+  `SB001` and the store completes the row again, leaving the receipt `pending`. `unknown`, or a
+  reference, for a row that reserved no receipt is refused, and so is a `duplicate` at finish.
+  The Postgres runner runs item 6 of the contract suite.
+  A begin whose confirmation is lost after it wrote a reused key's row gives that row up as
   completed differently, where the in-memory store keeps its answer silently. The row is the
   same in both. The in-memory store's silence is the behaviour to match: that row's completion
   was not lost, so the give-up Postgres counts and reports for it is a false signal.
@@ -1524,10 +1568,16 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `duplicate` answered as a success with the receipt and the reference. A denial reserves
   nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
   gains `unknown` and a vendor reference for a completed side effect, and the row's outcome
-  `unknown` and `duplicate`. The gateway fills the key from the caller's tool-use identifier
-  only; the named `_meta` field and the header come with the gateway package. Receipts in
-  Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and #47
-  below), and so is reconciliation (#55, part 4; below). Not built: resolution records.
+  `unknown` and `duplicate`. The gateway reads the key from its three carriers, an explicit key
+  first, and records the tool-use identifier beside it (#55; section 11); the profile setting
+  `idempotency_key_header`, false unless a policy says so, is the declaration the header needs.
+  An explicit key that is not valid leaves the call with no key, so a side effect is denied for
+  want of one. The core's docs say a side effect's `error` means its connector knows nothing
+  took effect, and the proxy connector reports every outcome of a side effect but a success as
+  `unknown` once its request may have been sent, its server's `4xx`, JSON-RPC errors and failed
+  tool results included, since no approval can yet say a proxied tool's errors are safe.
+  Receipts in Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and
+  #47 below), and so is reconciliation (#55, part 4; below). Not built: resolution records.
 - Reconciliation of `unknown` receipts: built (#55, part 4), up to where a person must settle
   a receipt. Each approval of a tool not classified `read` declares its settlement, which the
   loader requires (section 13); every policy file, fixture and test policy declares one, and
@@ -1564,7 +1614,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   contract suite is built and runs on it and on the Postgres store (section 18). Both test
   stores keep receipts (#55): they reserve, answer and settle them as the core's interface
   says, a lost begin's receipt as `not_performed` with its row, and the harness's store runs
-  every begin, with a receipt or without, through the same checks and fault switches.
+  every begin, with a receipt or without, through the same checks and fault switches. The
+  harness's store reads a receipt still `pending` past its row's deadline as `unknown` in
+  the receipts it gives back and in the answer to a reused key; the contract suite's runner
+  reads receipts as held. Both stores read it as `unknown` on a retried begin of its own row,
+  the Postgres store by the database's clock, and refuse that begin rather than answer it as
+  reserved, and item 6 of the contract suite checks that on each.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
   stopped. A completion carries a vendor reference for a call that reserved a receipt, which
@@ -1838,7 +1893,8 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   and each proxied server's calls by outcome, latency and late or oversized answers (#139), the
   policy's age (#132), and each server's drift polls, withdrawals, probe results and
   reach-check results (#166, #167, #176) are exported, labelled only by registry names. The
-  late or oversized count is of reads only until a connector reports `unknown` (the limits entry below).
+  late or oversized count is of reads only: a side effect's late or oversized answer is the
+  outcome `unknown` (#55), counted with the errors (the limits entry below).
 
 **#11, the argument check against the approved schema.** Built (#122): the loader accepts a
 subset of JSON Schema 2020-12 and refuses anything else at load, including a `$schema` naming
@@ -1908,10 +1964,10 @@ checked; a schema that needs them cannot be approved yet.
   registry only, `switchboard_proxied_calls_total{server,outcome}`,
   `switchboard_proxied_call_seconds{server}` and
   `switchboard_proxied_late_or_oversized_total{server}`, the last from the error kind
-  `oversized_or_late_read`, so a tool not classified `read` is not counted there until
-  `unknown` is built. Both demos show overload and a hanging server (the demonstrations entry
-  under #11 above). The configurable audit pools and the row's size bound are in the #11 list
-  above.
+  `oversized_or_late_read`, so it counts reads only; a side effect's is the outcome `unknown`,
+  counted with the errors (#55). Both demos show overload and a hanging server (the
+  demonstrations entry under #11 above). The configurable audit pools and the row's size bound
+  are in the #11 list above.
 
 **#12, Otto's GitHub and Jira tools.** The list of excepted tools on a profile, and check 5
 consulting it; the column for the exception that allowed a call (with #10); the loader's
@@ -1969,9 +2025,12 @@ off only in a development build, with CI's check of the release artifact; and th
   told apart only by its cause, and is not counted apart.
 - On a disconnect, the connector is not called if it has not been, and a read is cancelled:
   built (#40). The handler holds a signal that fires when it is dropped, which is what a
-  client going away does, and the answer task is given it. A call whose client has gone once
-  its row is begun is given up through the core's `give_up`: the connector is not called and
-  the row is completed as `error`. A read is run through the core's `run_unless`, which drops
+  client going away does, and the answer task is given it. A call whose client has gone by
+  the time its connector would be invoked is given up through the core's `give_up`: the
+  connector is not called and the row is completed as `error`, a side effect's receipt as
+  `not_performed`. The signal is checked immediately before the connector is invoked, after it
+  is looked up and wrapped and the clock read, so a client that leaves in that window is not
+  called for either (#55). A read is run through the core's `run_unless`, which drops
   the connector's future if the signal fires first and records the read as `error`. Any other
   classification ignores the signal and runs to completion. Closing a connection at the end
   of the shutdown grace is a disconnect too. `notifications/cancelled` is still accepted and
@@ -1999,7 +2058,15 @@ off only in a development build, with CI's check of the release artifact; and th
   (#40). The path gives the guard up through the core's `give_up` and answers 500 with the row
   in `error.data`. The boot gates and every reload refuse such a policy, so only a unit test
   reaches it.
-- The key read from its carriers, the tool-use identifier and the named `_meta` field.
+- The key read from its carriers: built (#55). The `_meta` field
+  `switchboard/idempotencyKey`, or else the `Idempotency-Key` header for a profile that
+  declares it, and without either the tool-use identifier, which is recorded beside an
+  explicit key (section 11). Each answer to a reused key reaches the caller: a duplicate as a
+  success naming the receipt and the vendor's reference, the other four as refusals with
+  their sentences, and an `unknown` outcome as a tool error saying the call may have happened,
+  must not be repeated and will be checked as its receipt. With audit disabled, a development
+  build refuses a keyed side effect with the audit sentence, and nothing runs. No deadline of
+  the gateway's own surrounds a proxied call; the bound around in-process connectors is #12's.
 - Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
   The path keeps refusing every `tools/call` and listing nothing, with no row
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
@@ -2158,8 +2225,10 @@ that can do what Postgres cannot tests nothing.
 6. Once receipts are built: a receipt is reserved with its row or not at all, and moves with
    its finish. A key stays unique in its scope under concurrent calls, and two delegations
    under one principal can use the same key. A begin retried after a lost confirmation finds
-   its own receipt, runs once, and is not refused as reuse. A begin whose confirmation was lost
-   on every attempt leaves its row completed as `error` and its receipt `not_performed`.
+   its own receipt, runs once, and is not refused as reuse; retried once its row's deadline
+   has passed with the receipt still `pending`, it is refused and runs nothing. A begin whose
+   confirmation was lost on every attempt leaves its row completed as `error` and its receipt
+   `not_performed`.
 
 Items 1 to 3 are built. Of item 4, the suite checks that a call row's time at begin comes from
 the store's clock and that its deadline is that time plus the begin budget, the call deadline,

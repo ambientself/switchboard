@@ -977,6 +977,17 @@ impl ReceiptRow {
     pub const STATE: &'static str =
         "SELECT state FROM switchboard_audit.receipts WHERE row_id = ($1::text)::uuid";
 
+    /// The state of the receipt reserved under the row `$1`, if one was, as it reads (decision
+    /// 0009, "What a receipt is"): `unknown` while it is still `pending` past its row's
+    /// deadline, which is earlier than `clock_timestamp()` by the database's clock, as the
+    /// trigger `receipt_moves` judges it. Otherwise its state.
+    pub const STATE_AS_READ: &'static str = "SELECT CASE
+            WHEN r.state = 'pending' AND c.deadline < clock_timestamp() THEN 'unknown'
+            ELSE r.state END
+        FROM switchboard_audit.receipts r
+            JOIN switchboard_audit.call_rows c ON c.id = r.row_id
+        WHERE r.row_id = ($1::text)::uuid";
+
     /// Settles the receipt reserved under the row `$1` as `$2`, established by the call, with
     /// the reference `$3`, in the same transaction as the row's completion: only while it is
     /// `pending` and its row's deadline has not passed by the database's clock. Matches nothing

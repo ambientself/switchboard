@@ -534,8 +534,37 @@ mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic());",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ');")
 # The gateway fills the key from the caller's tool-use identifier, its first carrier.
-mutate("gw-key-not-from-tool-use-id", "the gateway never fills a call's key, so every proposal is denied", "crates/gateway/src/path.rs",
-       "            key: idempotency_key(tool_use_id.as_ref()),", "            key: None,")
+mutate("gw-key-not-from-tool-use-id", "the tool-use identifier never keys a call, so a proposal that sends only one is denied", "crates/gateway/src/path.rs",
+       "        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n",
+       "        Explicit::Absent => tool_use_id.and(None),\n")
+# The other carriers (#55): a key sent on purpose comes first, in the _meta field, or else in
+# the Idempotency-Key header from a profile that declares its callers set it per request; the
+# tool-use identifier is recorded beside it. crates/gateway/tests/keys.rs catches these.
+mutate("gw-key-meta-ignored", "the gateway never reads a key from the switchboard/idempotencyKey _meta field", "crates/gateway/src/path.rs",
+       "            meta_key(idempotency_key),", "            meta_key(None),")
+mutate("gw-key-header-from-any-profile", "the Idempotency-Key header keys a call under a profile that does not declare it", "crates/gateway/src/path.rs",
+       "            key_header.honoured(declares_header),", "            key_header.honoured(true || declares_header),")
+mutate("gw-key-tool-use-id-first", "the tool-use identifier is preferred over an explicit key", "crates/gateway/src/path.rs",
+       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n",
+       "    if let Some(key) = tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()) {\n"
+       "        return Some(key);\n    }\n"
+       "    match meta.or(header) {\n        Explicit::Valid(key) => Some(key),\n")
+# An explicit key that is not valid leaves the call with no key, so a side effect is denied; it
+# is not passed over for the tool-use identifier, which would lose the chosen key's cover of a
+# replayed turn. keys.rs catches this.
+mutate("gw-key-invalid-falls-back", "an explicit key that is not valid is passed over, and the call keyed by its tool-use identifier", "crates/gateway/src/path.rs",
+       "        Explicit::Invalid => None,\n",
+       "        Explicit::Invalid => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),\n")
+mutate("gw-key-invalid-meta-passed-over", "a _meta key that is not valid is passed over for the header", "crates/gateway/src/path.rs",
+       "            Self::Absent => next,\n", "            Self::Absent | Self::Invalid => next,\n")
+# A _meta key that is not a string is a key that is not valid, not an absent one, so it too
+# leaves the call with no key. keys.rs catches the first, the parse table the second.
+mutate("gw-key-non-string-meta-absent", "a _meta key that is not a string is read as no key sent, and the call keyed by its next carrier", "crates/gateway/src/path.rs",
+       "not a string; the call carries no key\"\n            );\n            Explicit::Invalid\n",
+       "not a string; the call carries no key\"\n            );\n            Explicit::Absent\n")
+mutate("mcp-non-string-key-dropped", "the parser drops a _meta key that is not a string, as if none were sent", "crates/gateway-mcp/src/parse.rs",
+       "    let idempotency_key = meta(IDEMPOTENCY_KEY_META).map(",
+       "    let idempotency_key = meta(IDEMPOTENCY_KEY_META).filter(|value| value.is_string()).map(")
 
 # --- tools/list ----------------------------------------------------------------------------
 
@@ -1549,6 +1578,12 @@ mutate("testkit-reference-dropped", "a receipt's vendor reference is not kept", 
 mutate("testkit-late-finish-settles-receipt", "a finish after its row's deadline settles the receipt, as if the deadline had not passed", A,
        "            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)",
        "            && may_move(receipt.state, settled, &EstablishedBy::Call, false)")
+# A pending receipt past its row's deadline reads as unknown wherever the store reads it (#55):
+# its receipts, the reuse answer and a retried begin. tests/receipts.rs and the contract suite's
+# item 6 catch this.
+mutate("testkit-pending-past-deadline-read-as-pending", "the in-memory store reads a pending receipt past its row's deadline as pending, so a retried begin runs it", A,
+       "        read.state = receipt.state.as_read(self.past_deadline(&receipt.row, now));",
+       "        read.state = receipt.state.as_read(false && self.past_deadline(&receipt.row, now));")
 # The queue of unknown receipts in the in-memory store (decision 0009, "Reconciliation"), as the
 # contract suite's reconciliation cases and the gateway's tests/reconcile.rs check it.
 mutate("testkit-lease-ignored", "a claim is granted whatever lease another holder has", A,
@@ -1819,6 +1854,11 @@ mutate("gw-noop-store-when-enforced", "the no-op store is used although a store 
        "        (Some(_), false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::On)),\n")
 mutate("gw-disabled-store-constructible", "anyone can make the no-op audit store", GW + "audit.rs",
        "    pub(crate) fn new() -> Self {", "    pub fn new() -> Self {")
+# A development build with audit disabled keeps no receipts, so it refuses a keyed side effect
+# and nothing runs (#55). crates/gateway/tests/keys.rs catches this.
+mutate("gw-disabled-store-reserves", "with audit disabled, a side effect's receipt is answered as reserved, so it runs with no receipt", GW + "audit.rs",
+       '            Err("audit is disabled, so no receipt can be kept and no side effect runs".into())\n',
+       "            Ok(Reservation::Reserved)\n")
 mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Host starts", BOOT,
        "    if config.http.allowed_hosts.is_empty() {\n        return Err(BootError::NoAllowedHosts);\n    }\n", "")
 
@@ -2349,7 +2389,15 @@ mutate("gw-unregistered-row-left-open", "an allowed call whose connector is not 
        "            let _ = connector;\n"
        "            if let Some(failure) = None::<gateway_core::audit::AuditFailure> {\n")
 mutate("gw-disconnect-before-run-ignored", "a call whose client has gone before it runs is run all the same", GW_PATH,
-       "        if disconnect.has_fired() {\n", "        if false && disconnect.has_fired() {\n")
+       "        let gone = disconnect.has_fired();\n", "        let gone = false && disconnect.has_fired();\n")
+# The check sits immediately before the connector is invoked (#55): checked only before the
+# connector is looked up and the clock read, as before, a client that leaves in that window has
+# its side effect run. keys.rs's test drops the client in that window.
+mutate_all("gw-give-up-recheck-removed", "the client is checked for only before the connector is looked up, not again immediately before it is invoked",
+           (GW_PATH, "        let gone = disconnect.has_fired();\n", "        let gone = gone_before_lookup;\n"),
+           (GW_PATH, "        let Some(registered) = gates.registered(&guard.tool().connector) else {\n",
+            "        let gone_before_lookup = disconnect.has_fired();\n"
+            "        let Some(registered) = gates.registered(&guard.tool().connector) else {\n"))
 mutate("gw-read-not-cancelled", "a read whose client goes is run to completion", GW_PATH,
        "        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;",
        "        let ran = audit::run(connector, guard).await;")
@@ -2893,14 +2941,37 @@ PO = PROXY + "src/outcome.rs"
 PK = PROXY + "src/credentials.rs"
 # The bounds.
 mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
-       "        match tokio::time::timeout(self.deadline, self.exchange(request, late)).await {",
-       "        match Ok::<_, ()>(self.exchange(request, late).await) {")
-# The kind of an answer too large, too late or broken off: its own from a read, other from any
-# other tool until `unknown` is built (decision 0011).
+       "        match tokio::time::timeout(self.deadline, self.exchange(request, sent)).await {",
+       "        match Ok::<_, ()>(self.exchange(request, sent).await) {")
+# An answer too large, too late or broken off: its own kind of error from a read, and from any
+# other tool the outcome unknown (decision 0009, #55), as is every outcome but a success once a
+# side effect may have been sent, the server's own refusal or failure included, since no approval
+# can yet say a proxied tool's errors are safe; a failure before anything was sent stays an error.
 mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
-       "            ErrorKind::OversizedOrLateRead\n        } else {", "            ErrorKind::Other\n        } else {")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
+       "        self.without_answer(ErrorKind::Other, sentence)")
 mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
-       "        } else {\n            ErrorKind::Other\n        };", "        } else {\n            ErrorKind::OversizedOrLateRead\n        };")
+       "        let sent = if tool.classification == Classification::Read {",
+       "        let sent = if true || tool.classification == Classification::Read {")
+mutate("proxy-late-side-effect-as-error", "a side effect's answer too large, too late or broken off is reported as an error, settling its receipt not_performed", PC,
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
+       "        if self == Sent::SideEffect {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)")
+mutate("proxy-side-effect-unanswered-as-error", "every failure without a definite answer from a side effect is reported as an error", PC,
+       "            Sent::SideEffect => ToolOutcome::Unknown,", "            Sent::SideEffect => ToolOutcome::error(kind, sentence),")
+mutate("proxy-unconnected-side-effect-unknown", "a side effect whose connection could not be made is reported unknown, though nothing was sent", PC,
+       "            } else if error.is_connect() {", "            } else if false && error.is_connect() {")
+mutate("proxy-side-effect-4xx-error", "a side effect the server answered with a 4xx is reported as an error, settling its receipt not_performed", PC,
+       "        if status != StatusCode::OK {\n",
+       "        if status.is_client_error() {\n"
+       "            return Err(ToolOutcome::error(ErrorKind::Other, outcome::status(status.as_u16())));\n"
+       "        }\n"
+       "        if status != StatusCode::OK {\n")
+mutate("proxy-side-effect-401-error", "a side effect the server answered with a 401 is reported as an error, settling its receipt not_performed", PC,
+       "            return Err(sent.without_answer(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));",
+       "            return Err(ToolOutcome::error(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));")
+mutate("proxy-side-effect-tool-error-not-performed", "a side effect's JSON-RPC error or isError result is reported as an error, settling its receipt not_performed", PC,
+       "                    Ok(ToolOutcome::Error(kind, sentence)) => sent.without_answer(kind, &sentence),\n", "")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -2915,7 +2986,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| ToolOutcome::error(late, outcome::BROKEN_OFF))?;",
+       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -2941,13 +3012,15 @@ mutate("proxy-arguments-kind-other", "arguments that are not an object are recor
 # Statuses.
 mutate("proxy-401-not-named", "a rejected credential is reported as a bare status", PC,
        "        if status == StatusCode::UNAUTHORIZED {", "        if false {")
-# A 403 is the vendor's refusal (#61): an error of the kind vendor_refusal, not a connector's refusal.
-PROXY_403 = ("            return Err(ToolOutcome::error(\n                ErrorKind::VendorRefusal,\n"
-             "                outcome::UPSTREAM_REFUSED,\n            ));")
+# A 403 is the vendor's refusal (#61): from a read, an error of the kind vendor_refusal, not a
+# connector's refusal; from a side effect, unknown (#55).
+PROXY_403 = "            return Err(sent.without_answer(ErrorKind::VendorRefusal, outcome::UPSTREAM_REFUSED));"
 mutate("proxy-403-is-refused", "the server's 403 is recorded as a connector's refusal, not as an error", PC,
        PROXY_403, "            return Err(ToolOutcome::Refused(outcome::UPSTREAM_REFUSED.to_owned()));")
 mutate("proxy-403-kind-other", "the server's 403 is recorded as another error, not a vendor refusal", PC,
        PROXY_403, PROXY_403.replace("ErrorKind::VendorRefusal", "ErrorKind::Other"))
+mutate("proxy-side-effect-403-error", "a side effect the server answered with a 403 is reported as a vendor refusal, settling its receipt not_performed", PC,
+       PROXY_403, PROXY_403.replace("sent.without_answer(", "ToolOutcome::error("))
 mutate("proxy-any-status-read", "a body is read whatever the status", PC,
        "        if status != StatusCode::OK {", "        if false {")
 # Reading the answer.
@@ -2963,7 +3036,7 @@ mutate("proxy-result-and-error-accepted", "an answer with a result and an error 
        "        (Some(Value::Object(result)), _) => tool_result(result),")
 mutate("proxy-content-unchecked", "a result without content is accepted", PO,
        '    let Some(Value::Array(content)) = result.get("content") else {\n'
-       "        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);\n    };",
+       "        return Err(NotMcp);\n    };",
        "    let empty = Vec::new();\n"
        '    let content = match result.get("content") {\n        Some(Value::Array(content)) => content,\n        _ => &empty,\n    };')
 mutate("proxy-tool-error-is-ok", "a tool result marked isError is passed on as success", PO,
@@ -4144,9 +4217,10 @@ mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a for
 mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
        "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
 # Receipts (decision 0009, part 2): migration 0008's table, grants and trigger receipt_moves, the
-# begin with a receipt in one transaction, finish settling the receipt only before the deadline,
-# the boot check's third trigger, and the count of receipts in unknown. tests/receipts.rs, the
-# contract suite's item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
+# begin with a receipt in one transaction, a retried begin refused once its own receipt is pending
+# past the row's deadline, finish settling the receipt only before the deadline, the boot check's
+# third trigger, and the count of receipts in unknown. tests/receipts.rs, the contract suite's
+# item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
 PG_RECEIPTS = PG + "sql/migrations/0008_receipts.sql"
 # Migration 0009 replaces receipt_moves, so the trigger's moves are mutated in its copy.
 PG_RECONCILIATION = PG + "sql/migrations/0009_reconciliation.sql"
@@ -4167,6 +4241,9 @@ mutate_all("pg-reuse-check-counts-own-row", "the reuse check counts a receipt re
             "            AND idempotency_key = $3 AND (row_id <> ($4::text)::uuid OR true)\";"),
            (PG_COLUMNS, "            AND idempotency_key = $4 AND row_id <> ($5::text)::uuid\";",
             "            AND idempotency_key = $4 AND (row_id <> ($5::text)::uuid OR true)\";"))
+mutate("pg-begin-retry-past-deadline-reserved", "a retried begin reads its own receipt pending past its row's deadline as pending, so it is answered as reserved and its call runs again", PG_COLUMNS,
+       "            WHEN r.state = 'pending' AND c.deadline < clock_timestamp() THEN 'unknown'\n",
+       "            WHEN r.state = 'pending' AND false THEN 'unknown'\n")
 mutate("pg-reservation-outside-begin-transaction", "the row is committed before its receipt is reserved, in a transaction of its own", PG_STORE,
        "            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;\n",
        "            transaction.commit().await?;\n"

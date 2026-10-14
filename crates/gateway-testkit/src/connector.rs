@@ -97,6 +97,8 @@ struct State {
     /// The drafts the draft tool opened, each with the document it was opened against.
     drafts: BTreeMap<String, Option<String>>,
     failing: Failing,
+    /// Whether the next call reports no definite answer.
+    unknown_next: bool,
     hang: Hang,
     team_scopes: BTreeMap<TeamId, BTreeSet<String>>,
     group_scopes: BTreeMap<GroupId, BTreeSet<String>>,
@@ -131,11 +133,14 @@ struct State {
 ///   fixture policy, and [`FORBIDDEN_DOCUMENT`] is in no one's scope. A call that names no
 ///   document is served.
 /// - It can be told to fail, once or always, and to hang until a [`Gate`] opens. A hung call
-///   has been received but has done nothing yet, so a held write has not happened.
+///   has been received but has done nothing yet, so a held write has not happened. It can be
+///   told to report no definite answer once ([`unknown_next`](Self::unknown_next)), after doing
+///   what the call asks.
 /// - It can be told to lose the answer to the next draft
 ///   ([`lose_next_answer`](Self::lose_next_answer)): the draft is opened and its write
 ///   recorded, and the call reports [`ToolOutcome::Unknown`], as a vendor that acted and whose
-///   answer never arrived leaves it.
+///   answer never arrived leaves it. Unlike `unknown_next`, it waits for a call of the draft
+///   tool that opens or revises a draft, and other calls before it answer as usual.
 pub struct FixtureConnector {
     credentials: Arc<dyn CredentialSource>,
     state: Mutex<State>,
@@ -151,6 +156,7 @@ impl FixtureConnector {
                 writes: Vec::new(),
                 drafts: BTreeMap::new(),
                 failing: Failing::Never,
+                unknown_next: false,
                 hang: Hang::Never,
                 team_scopes: BTreeMap::from([
                     (TEAM_A.into(), BTreeSet::from([TEAM_A_DOCUMENT.to_owned()])),
@@ -211,6 +217,13 @@ impl FixtureConnector {
     /// Calls work again.
     pub fn stop_failing(&self) {
         self.state().failing = Failing::Never;
+    }
+
+    /// The next call does what it would, and then reports [`ToolOutcome::Unknown`] in place of
+    /// its outcome: a side effect whose request was sent and whose answer never came back.
+    /// Later calls report their own outcome.
+    pub fn unknown_next(&self) {
+        self.state().unknown_next = true;
     }
 
     /// The next call hangs until the returned gate opens.
@@ -277,7 +290,7 @@ impl Connector for FixtureConnector {
 
         // Recorded before anything else, and before the future is first polled: a call that
         // was handed to this connector is on the record whatever it then does.
-        let (hang, fail, scope, work) = {
+        let (hang, fail, unknown, scope, work) = {
             let mut state = self.state();
             state.received.push(ReceivedCall {
                 tool: tool.clone(),
@@ -315,7 +328,8 @@ impl Connector for FixtureConnector {
                     .cloned()
                     .collect(),
             };
-            (hang, fail, scope, state.work.clone())
+            let unknown = std::mem::take(&mut state.unknown_next);
+            (hang, fail, unknown, scope, state.work.clone())
         };
 
         Box::pin(async move {
@@ -346,7 +360,7 @@ impl Connector for FixtureConnector {
                 credential: credential.clone(),
                 principal: caller.get().id.clone(),
             };
-            match tool.as_str() {
+            let outcome = match tool.as_str() {
                 READ_TOOL => ToolOutcome::Ok(echo(&tool, &arguments, &credential)),
                 DRAFT_TOOL => match self.draft(&arguments) {
                     Some(_) if std::mem::take(&mut self.state().lose_next_answer) => {
@@ -380,6 +394,11 @@ impl Connector for FixtureConnector {
                     ErrorKind::Other,
                     format!("the fixture connector has no tool `{tool}`"),
                 ),
+            };
+            if unknown {
+                ToolOutcome::Unknown
+            } else {
+                outcome
             }
         })
     }

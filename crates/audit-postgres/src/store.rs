@@ -128,9 +128,13 @@ pub enum PgAuditError {
         /// The row begin named.
         row: String,
     },
-    /// A retried begin with a receipt found its row's receipt already left `pending`: its call
-    /// has run, or has been settled without running, and must not run again.
-    #[error("audit row {row}'s receipt has left pending, so its call must not run again")]
+    /// A retried begin with a receipt found its row's receipt already left `pending`, or still
+    /// `pending` past its row's deadline by the database's clock, which reads as `unknown`: its
+    /// call has run, may have run, or has been settled without running, and must not run again.
+    #[error(
+        "audit row {row}'s receipt has left pending, or is pending past its row's deadline, \
+         so its call must not run again"
+    )]
     ReceiptSettled {
         /// The row begin named.
         row: String,
@@ -739,8 +743,10 @@ pub(crate) const RECEIPT_PAST_DEADLINE: &str = "SB001";
 ///   reused key. The unique index on a key in its scope decides between two begins at once,
 ///   and the one that loses is answered from the other's receipt. A row it finds stored is a
 ///   retried begin's, answered as its receipt or the answer it was written with say: see
-///   `found`. Nothing before the commit can write a row, so a begin with a receipt counts as
-///   possibly written only once its commit was sent.
+///   `found`. A receipt still `pending` past its row's deadline, by the database's clock,
+///   reads as `unknown` there too, so that retry is refused and runs nothing. Nothing before
+///   the commit can write a row, so a begin with a receipt counts as possibly written only
+///   once its commit was sent.
 /// - Finish writes the completion columns of a row that has none, on a task of its own, in one
 ///   transaction with the move of the receipt the row reserved, if it reserved one, while the
 ///   row's deadline has not passed by the database's clock. After it, the row is completed and
@@ -1373,9 +1379,12 @@ async fn reuse_check(
 /// - A row the reuse check answered, from the receipt `earlier`, is answered with the answer it
 ///   was written with: the one of the five for that receipt whose completion it holds,
 ///   whatever has become of the receipt since. A row holding none of them is refused.
-/// - Otherwise its own receipt decides: [`Reservation::Reserved`] while it is `pending`, and
-///   refused once it has left `pending`, since its call has run or has been settled without
-///   running. A row with no receipt was begun without one, and is refused.
+/// - Otherwise its own receipt decides, as it reads ([`ReceiptRow::STATE_AS_READ`]):
+///   [`Reservation::Reserved`] while it is `pending` and its row's deadline has not passed by
+///   the database's clock, and refused once it has left `pending`, since its call has run or
+///   has been settled without running. One still `pending` past the deadline reads as
+///   `unknown`, and is refused as that is: its call may have run, and is no longer the call's
+///   to run. A row with no receipt was begun without one, and is refused.
 async fn found(
     transaction: &Transaction<'_>,
     row: &BeginRow,
@@ -1413,7 +1422,9 @@ async fn found(
         }
         return Err(PgAuditError::AnsweredDifferently { row: id() });
     }
-    let statement = transaction.prepare_cached(ReceiptRow::STATE).await?;
+    let statement = transaction
+        .prepare_cached(ReceiptRow::STATE_AS_READ)
+        .await?;
     match transaction.query_opt(&statement, &[&row.id]).await? {
         None => Err(PgAuditError::BegunWithoutReceipt { row: id() }),
         Some(own) if own.try_get::<_, &str>(0)? == "pending" => Ok(Reservation::Reserved),

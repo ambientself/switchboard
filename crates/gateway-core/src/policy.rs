@@ -232,6 +232,15 @@ pub struct Profile {
     pub classifications: BTreeSet<Classification>,
     /// Whether a call under this profile must carry a delegation.
     pub requires_delegation: bool,
+    /// Whether this profile's callers set the `Idempotency-Key` header per request, so the
+    /// gateway may take a call's key from it (decision 0009, "The key"). False unless a policy
+    /// says so. MCP clients set headers once per server, so a header fixed in a client's
+    /// configuration would make every later side effect a reuse of one key; the gateway
+    /// ignores the header from a profile that does not declare it, and keys the call as if it
+    /// were absent. The decision function does not read this: the request path does, where it
+    /// reads the key's carriers.
+    #[serde(default)]
+    pub idempotency_key_header: bool,
 }
 
 /// Which resources each team and group may reach: an allowlist of exact matches on system,
@@ -889,6 +898,7 @@ mod tests {
             name: name.into(),
             classifications: BTreeSet::new(),
             requires_delegation: false,
+            idempotency_key_header: false,
         }
     }
 

@@ -206,7 +206,8 @@ impl ServerSignals {
                 &self.error
             }
             ToolOutcome::Refused(_) => &self.refused,
-            // Only a side effect reports it, and a proxied server serves reads only.
+            // Only a side effect reports it, and the registry's rule 2 approves no proxied tool
+            // that is not a read yet.
             ToolOutcome::Unknown => &self.error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -245,13 +246,13 @@ impl ServerSignals {
 pub struct ServerCounts {
     /// Calls the server's connector completed as `ok`.
     pub ok: u64,
-    /// Calls it completed as `error`, late or too large ones included.
+    /// Calls it completed as `error`, late or too large ones included, and as `unknown`.
     pub error: u64,
     /// Calls it refused, such as one for a tool it does not serve.
     pub refused: u64,
     /// Calls that were an error of the kind `oversized_or_late_read`: a `read` tool's answer
-    /// too large, or none by the deadline. Another tool's is of the kind `other`, and is not
-    /// counted here, until a connector reports the outcome `unknown`.
+    /// too large, or none by the deadline. Another tool's is reported as the outcome
+    /// `unknown`, counted under `error` and not here.
     pub late_or_oversized: u64,
     /// Calls the server's cap refused.
     pub shed_server: u64,

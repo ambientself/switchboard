@@ -61,7 +61,7 @@ impl ContractStore for InMemory {
     }
 
     async fn receipts(&self) -> Vec<Receipt> {
-        self.store.receipts()
+        self.store.held_receipts()
     }
 
     fn lose_every_begin_confirmation(&self) {
@@ -124,6 +124,7 @@ contract!(
     a_key_is_unique_in_its_scope_under_concurrent_calls,
     two_delegations_under_one_principal_may_use_the_same_key,
     a_begin_retried_after_a_lost_confirmation_finds_its_own_receipt_and_runs_once,
+    a_retried_begin_of_a_receipt_pending_past_its_deadline_is_refused_and_runs_nothing,
     a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_error_and_its_receipt_not_performed,
     each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table_that_matches,
     a_receipt_records_the_vendor_target_its_settlement_takes,

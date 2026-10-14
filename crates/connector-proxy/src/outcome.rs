@@ -7,14 +7,26 @@
 //! - [`ToolOutcome::Error`], with its [`ErrorKind`]:
 //!   - `InvalidArguments` for arguments that are not an object, which are never sent
 //!     ([`ARGUMENTS_NOT_AN_OBJECT`]);
-//!   - `VendorRefusal` when the server answered `403`, its refusal of the call
+//!   - `VendorRefusal` when the server answered a read with `403`, its refusal of the call
 //!     ([`UPSTREAM_REFUSED`]);
 //!   - `OversizedOrLateRead` for the deadline, the size cap or an answer broken off, from a
-//!     tool classified `read`, and `Other` for the same from any other tool;
+//!     tool classified `read`;
 //!   - `Other` for everything else that went wrong on the gateway's side or the server's: a
-//!     connection that failed or was refused for its address ([`DESTINATION_REFUSED`]), a
-//!     credential the server did not accept, any other HTTP status,
-//!     an answer that is not MCP, a JSON-RPC error, and a tool result marked `isError`.
+//!     credential that could not be had or a request that could not be built, a connection
+//!     that could not be made or was refused for its address ([`DESTINATION_REFUSED`]), a
+//!     credential the server did not accept, any other HTTP status, an answer that is not
+//!     MCP, a JSON-RPC error, and a tool result marked `isError`.
+//! - [`ToolOutcome::Unknown`] in place of an error, from a tool not classified `read`, for
+//!   every outcome but a success once the request may have been sent: the deadline, the size
+//!   cap, an answer broken off, an exchange that failed after its connection was made, any HTTP
+//!   status other than `200`, `401`, `403` and every other `4xx` included, a `200` that is not
+//!   MCP, a JSON-RPC error and a tool result marked `isError`. A side effect's error settles
+//!   its receipt as `not_performed`, which must be established, and the server's own refusal
+//!   or failure does not establish it: decision 0009 holds a proxied tool's error to be
+//!   `unknown` unless its approval says its errors are safe, and no approval can say so yet.
+//!   So a side effect is an error only when nothing was sent. The caller then reads the core's
+//!   sentence that the call may have happened and must not be repeated, not one of the
+//!   sentences here.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
 //! A successful result is bounded only by the answer cap; the gateway passes its content and
@@ -70,8 +82,8 @@ pub const BROKEN_OFF: &str = "This tool's server stopped answering before its an
 pub const CREDENTIAL_REJECTED: &str = "This tool's server did not accept the gateway's credential.";
 
 /// The server answered `403`: it refused the call as outside what the gateway's credential
-/// may do. The outcome is an error of the kind `VendorRefusal`, which the row records in
-/// place of this sentence.
+/// may do. From a read, the outcome is an error of the kind `VendorRefusal`, which the row
+/// records in place of this sentence; from a side effect it is `unknown`.
 pub const UPSTREAM_REFUSED: &str =
     "This tool's server refused the call as outside what the gateway's credential may do.";
 
@@ -97,19 +109,28 @@ pub fn rpc_error(code: i64, message: &str) -> String {
     )
 }
 
-/// The outcome of a `200` answer to the request with ID `id`.
-pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> ToolOutcome {
-    let not_mcp = || ToolOutcome::error(ErrorKind::Other, NOT_MCP);
+/// A `200` answer that is not one JSON-RPC response to the request, with a tool result or an
+/// error: [`NOT_MCP`] from a read, and `unknown` from a side effect, since it says nothing of
+/// what the server did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NotMcp;
+
+/// The outcome of a `200` answer to the request with ID `id`, or [`NotMcp`].
+pub(crate) fn interpret(
+    content_type: Option<&str>,
+    body: &[u8],
+    id: u64,
+) -> Result<ToolOutcome, NotMcp> {
     if !content_type.is_some_and(is_json) {
-        return not_mcp();
+        return Err(NotMcp);
     }
     let Ok(Value::Object(message)) = serde_json::from_slice::<Value>(body) else {
-        return not_mcp();
+        return Err(NotMcp);
     };
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || message.get("id").and_then(Value::as_u64) != Some(id)
     {
-        return not_mcp();
+        return Err(NotMcp);
     }
     match (message.get("result"), message.get("error")) {
         (Some(Value::Object(result)), None) => tool_result(result),
@@ -119,32 +140,32 @@ pub(crate) fn interpret(content_type: Option<&str>, body: &[u8], id: u64) -> Too
                 error.get("message").and_then(Value::as_str),
             ) {
                 (Some(code), Some(text)) => {
-                    ToolOutcome::error(ErrorKind::Other, rpc_error(code, text))
+                    Ok(ToolOutcome::error(ErrorKind::Other, rpc_error(code, text)))
                 }
-                _ => not_mcp(),
+                _ => Err(NotMcp),
             }
         }
-        _ => not_mcp(),
+        _ => Err(NotMcp),
     }
 }
 
-fn tool_result(result: &Map<String, Value>) -> ToolOutcome {
+fn tool_result(result: &Map<String, Value>) -> Result<ToolOutcome, NotMcp> {
     let Some(Value::Array(content)) = result.get("content") else {
-        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);
+        return Err(NotMcp);
     };
     if result.get("isError") != Some(&Value::Bool(true)) {
-        return ToolOutcome::Ok(Value::Object(result.clone()));
+        return Ok(ToolOutcome::Ok(Value::Object(result.clone())));
     }
     let text: Vec<&str> = content
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect();
-    if text.is_empty() {
+    Ok(if text.is_empty() {
         ToolOutcome::error(ErrorKind::Other, TOOL_FAILED)
     } else {
         ToolOutcome::error(ErrorKind::Other, bounded(&text.join("\n")))
-    }
+    })
 }
 
 /// `application/json`, with or without parameters, in any case.

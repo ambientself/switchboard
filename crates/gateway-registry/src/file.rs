@@ -152,6 +152,10 @@ pub(crate) struct ProfileFile {
     pub name: ProfileName,
     pub classifications: BTreeSet<Classification>,
     pub requires_delegation: bool,
+    /// Whether the profile's callers set the `Idempotency-Key` header per request. Absent is
+    /// false, so a file written before the setting existed keeps its meaning.
+    #[serde(default)]
+    pub idempotency_key_header: bool,
 }
 
 #[derive(Debug, Deserialize)]

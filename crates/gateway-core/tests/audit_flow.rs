@@ -102,11 +102,13 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
                 name: "readers".into(),
                 classifications: [Classification::Read].into(),
                 requires_delegation: true,
+                idempotency_key_header: false,
             },
             Profile {
                 name: "proposers".into(),
                 classifications: [Classification::Read, Classification::Propose].into(),
                 requires_delegation: true,
+                idempotency_key_header: false,
             },
         ],
         limits: limits(),
@@ -947,6 +949,7 @@ fn snapshot_with_entry() -> PolicySnapshot {
             name: "readers".into(),
             classifications: [Classification::Read].into(),
             requires_delegation: true,
+            idempotency_key_header: false,
         }],
         limits: limits(),
         entries: Vec::new(),
@@ -1561,7 +1564,7 @@ fn a_read_or_a_denial_reserves_nothing() {
     assert_eq!(refusal.reason().kind(), ReasonKind::KeyMissing);
     assert_eq!(
         refusal.sentence(),
-        "Tool `fixture__propose` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key."
+        "Tool `fixture__propose` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key, or with a key of its own in `_meta` under `switchboard/idempotencyKey`."
     );
     assert_eq!(store.rows().len(), 3);
     assert_eq!(store.receipts(), Vec::new());

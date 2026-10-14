@@ -37,6 +37,14 @@
 //!   it wrote, in the result's `_meta` or in `error.data` (decision 0009), so a person can
 //!   quote it; see [`gateway_mcp::render_with_row`]. It names none when begin failed or audit
 //!   is disabled, because then no row was written under that identifier.
+//! - A `tools/call`'s idempotency key is read from its carriers (decision 0009, "The key"): the
+//!   named `_meta` field `switchboard/idempotencyKey`, or else the `Idempotency-Key` header,
+//!   read only for a profile that declares its callers set it per request; without either,
+//!   the caller's tool-use identifier. The tool-use identifier is recorded beside an explicit
+//!   key. An explicit key that is not valid, or a declared header sent twice or not as text,
+//!   is dropped with a warning and leaves the call with no key; it is not passed over for the
+//!   next carrier, so a side effect is then denied for want of a key. A key reused
+//!   is answered from the earlier call's receipt, and nothing runs (decision 0009, "Reuse").
 //! - While the policy is stale, `tools/list` and `tools/call` from a proved caller are refused
 //!   with [`POLICY_STALE`] before anything is decided, and no row is written: decision 0009
 //!   makes a request that reaches no decision telemetry, and each emits a `policy_stale` event.
@@ -47,10 +55,11 @@
 //!   this is a fault in the gateway.
 //!
 //! A client that disconnects is told apart by the [`Disconnect`] `respond` is given (decision
-//! 0009, "Where a call runs"). If it has fired once the row is begun, the connector is not
-//! called and the row is completed as `error`. If it fires while a read runs, the read is
-//! cancelled and recorded as `error`. A side effect runs to completion whatever it does. Either
-//! way the answer is still made; nobody is left to read it.
+//! 0009, "Where a call runs"). If it has fired by the moment the connector would be invoked,
+//! checked immediately before, the connector is not called and the row is completed as
+//! `error`, a side effect's receipt as `not_performed`. If it fires while a read runs, the read
+//! is cancelled and recorded as `error`. A side effect runs to completion whatever it does.
+//! Either way the answer is still made; nobody is left to read it.
 //!
 //! Each request takes the policy served at that moment once ([`Gates::policy`]) and decides
 //! everything from it, so a registry reload never splits one request across two versions.
@@ -83,12 +92,13 @@ use std::time::{Duration, Instant, SystemTime};
 use gateway_core::audit::{self, Answer, AuditRowId, Begun, RequestMetadata, RowStart};
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, Connector, Decision, DeclaredFrom,
-    IDENTITY_FAILURE, IdempotencyKey, Principal, Proved, RequestedTool, Resources, Reuse,
-    SurfaceName, ToolUseId, VendorReference, decide, list_tools,
+    IDENTITY_FAILURE, IdempotencyKey, MAX_IDEMPOTENCY_KEY, Principal, Proved, RequestedTool,
+    Resources, Reuse, SurfaceName, ToolUseId, VendorReference, decide, list_tools,
 };
 use gateway_identity::{Clock, Verification};
 use gateway_mcp::{
-    Call, HttpResponse, Inbound, Rejection, Reply, Request, ServerInfo, ToolCall, ToolEntry,
+    Call, CarriedKey, HttpResponse, IDEMPOTENCY_KEY_HEADER, IDEMPOTENCY_KEY_META, Inbound,
+    Rejection, Reply, Request, ServerInfo, ToolCall, ToolEntry,
 };
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, Method};
@@ -376,6 +386,7 @@ impl RequestPath {
         disconnect: Disconnect,
     ) -> impl Future<Output = HttpResponse> + Send + 'static + use<> {
         let parsed = gateway_mcp::parse(&Method::POST, headers, body);
+        let key_header = KeyHeader::of(headers);
         let path = self.clone();
         let surface = SurfaceName::new(surface);
         async move {
@@ -396,7 +407,7 @@ impl RequestPath {
                     HttpResponse::accepted()
                 }
                 Ok(Inbound::Request(request)) => {
-                    path.answer(caller, source, surface, request, disconnect)
+                    path.answer(caller, source, surface, request, key_header, disconnect)
                         .await
                 }
             }
@@ -456,6 +467,7 @@ impl RequestPath {
         source: Source,
         surface: SurfaceName,
         request: Request,
+        key_header: KeyHeader,
         disconnect: Disconnect,
     ) -> HttpResponse {
         let Request { id, era, call } = request;
@@ -486,7 +498,10 @@ impl RequestPath {
                 (Reply::Discovered, None)
             }
             Call::ToolsList => self.list(caller, source, surface).await,
-            Call::ToolsCall(call) => self.call(caller, source, surface, call, disconnect).await,
+            Call::ToolsCall(call) => {
+                self.call(caller, source, surface, call, key_header, disconnect)
+                    .await
+            }
         };
         let row = row.as_ref().map(AuditRowId::as_str);
         gateway_mcp::render_with_row(&self.inner.server, era, &id, reply, row)
@@ -562,6 +577,7 @@ impl RequestPath {
         source: Source,
         surface: SurfaceName,
         call: ToolCall,
+        key_header: KeyHeader,
         disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
@@ -576,7 +592,7 @@ impl RequestPath {
             return (Reply::Denied(POLICY_STALE.to_owned()), None);
         }
         let policy = gates.policy();
-        self.decide_and_run(&policy, principal, surface, call, disconnect)
+        self.decide_and_run(&policy, principal, surface, call, key_header, disconnect)
             .await
     }
 }
@@ -605,6 +621,7 @@ impl RequestPath {
         principal: Proved<Principal>,
         surface: SurfaceName,
         call: ToolCall,
+        key_header: KeyHeader,
         mut disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
@@ -613,16 +630,26 @@ impl RequestPath {
             name,
             arguments,
             tool_use_id,
+            idempotency_key,
         } = call;
         let arguments = Value::Object(arguments);
         let requested = RequestedTool::new(name);
         let resources = self.resources(policy, &requested, &arguments);
         let tool_use_id = bounded_tool_use_id(tool_use_id);
+        let caller = self.caller_context(policy, principal, surface);
+        let declares_header = snapshot
+            .profile(&caller.profile)
+            .is_some_and(|profile| profile.idempotency_key_header);
+        let key = call_key(
+            meta_key(idempotency_key),
+            key_header.honoured(declares_header),
+            tool_use_id.as_ref(),
+        );
         let context = CallContext {
-            caller: self.caller_context(policy, principal, surface),
+            caller,
             tool: requested,
             resources,
-            key: idempotency_key(tool_use_id.as_ref()),
+            key,
         };
         let decided = Instant::now();
         let decision = decide(snapshot, &context);
@@ -687,26 +714,6 @@ impl RequestPath {
         let row = guard.row().clone();
         let named = self.quotable(&row);
         let tool = guard.tool().name.clone();
-        // Decision 0009: a client gone before the connector is called is not called for.
-        if disconnect.has_fired() {
-            let gave_up = audit::give_up(store, guard).await;
-            if let Some(failure) = gave_up.failure() {
-                tracing::error!(
-                    %failure,
-                    row = row.as_str(),
-                    "a tool call was given up but its audit row could not be completed"
-                );
-            }
-            tracing::info!(
-                row = row.as_str(),
-                %tool,
-                decide_us,
-                begin_us,
-                "gave up a tool call: its client disconnected before it ran, and its row was \
-                 completed as error"
-            );
-            return (Reply::ToolError(DISCONNECTED_BEFORE_RUN.to_owned()), named);
-        }
         let Some(registered) = gates.registered(&guard.tool().connector) else {
             // The boot gates and every reload refuse a tool on a surface whose connector is not
             // registered, so this is a fault in the gateway. Nothing can run; the row is
@@ -745,7 +752,33 @@ impl RequestPath {
 
         let started = gates.clock().now();
         let running = Instant::now();
-        // A read is cancelled if its client goes; a side effect runs to completion.
+        // Decision 0009: a client gone before the connector is called is not called for. This
+        // is checked here, immediately before the connector is invoked, after it was looked up
+        // and wrapped and the clock read, so a client that leaves during any of that is not
+        // called for either (#55). A side effect given up so has sent nothing: its row is
+        // completed as error and its receipt settled as not_performed.
+        let gone = disconnect.has_fired();
+        if gone {
+            let gave_up = audit::give_up(store, guard).await;
+            if let Some(failure) = gave_up.failure() {
+                tracing::error!(
+                    %failure,
+                    row = row.as_str(),
+                    "a tool call was given up but its audit row could not be completed"
+                );
+            }
+            tracing::info!(
+                row = row.as_str(),
+                %tool,
+                decide_us,
+                begin_us,
+                "gave up a tool call: its client disconnected before it ran, and its row was \
+                 completed as error"
+            );
+            return (Reply::ToolError(DISCONNECTED_BEFORE_RUN.to_owned()), named);
+        }
+        // A read is cancelled if its client goes from here on; a side effect runs to
+        // completion.
         let ran = audit::run_unless(connector, guard, disconnect.fired()).await;
         let run_us = micros(running.elapsed());
         let latency_ms = elapsed_millis(gates.clock().as_ref(), started);
@@ -888,13 +921,143 @@ fn bounded_tool_use_id(value: Option<String>) -> Option<ToolUseId> {
     }
 }
 
-/// The call's idempotency key, from its first carrier only: the caller's tool-use identifier,
-/// once [`bounded_tool_use_id`] has kept it (decision 0009, "The key"). The named `_meta` field
-/// and the header come later. Every tool-use identifier kept is a valid key, since both are 1
-/// to 128 printable ASCII characters; a call with none carries no key, and a call of a tool
-/// not classified `read` is then denied by the key check.
-fn idempotency_key(tool_use_id: Option<&ToolUseId>) -> Option<IdempotencyKey> {
-    tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok())
+/// The call's idempotency key, from its carriers (decision 0009, "The key"). A key the caller
+/// sent on purpose comes first: the named `_meta` field, or else the `Idempotency-Key` header
+/// from a profile that declares it. Without one, the key is the caller's tool-use identifier,
+/// once [`bounded_tool_use_id`] has kept it. Every tool-use identifier kept is a valid key,
+/// since both are 1 to 128 printable ASCII characters. A call with none of the three carries
+/// no key, and a call of a tool not classified `read` is then denied by the key check.
+///
+/// The first explicit carrier present decides. One that holds no valid key leaves the call
+/// with no key, and is not passed over for the next carrier: a call keyed by its tool-use
+/// identifier in place of the key its caller chose would run again when a replayed turn sends
+/// that key with new tool-use identifiers.
+///
+/// The tool-use identifier is recorded beside an explicit key, on the row and on the receipt,
+/// so the same key sent again with a different tool-use identifier is refused as a key reused
+/// for another call, as a key fixed in configuration would be. That order is also what lets a
+/// key that stays the same across a replayed turn cover it, though the turn's model makes new
+/// tool-use identifiers.
+fn call_key(
+    meta: Explicit,
+    header: Explicit,
+    tool_use_id: Option<&ToolUseId>,
+) -> Option<IdempotencyKey> {
+    match meta.or(header) {
+        Explicit::Valid(key) => Some(key),
+        Explicit::Invalid => None,
+        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),
+    }
+}
+
+/// What one explicit carrier holds: a key the caller sent on purpose.
+#[derive(Debug)]
+enum Explicit {
+    /// Nothing, or a header from a profile that does not declare it.
+    Absent,
+    /// A valid key.
+    Valid(IdempotencyKey),
+    /// A value that is not a valid key, which leaves the call with no key.
+    Invalid,
+}
+
+impl Explicit {
+    /// This carrier if it holds anything, valid or not, and otherwise `next`.
+    fn or(self, next: Self) -> Self {
+        match self {
+            Self::Absent => next,
+            carried => carried,
+        }
+    }
+}
+
+/// What the caller sent in `carrier`: a valid [`IdempotencyKey`], or anything else, which is
+/// dropped with a warning, as a tool-use identifier outside its bound is, and leaves the call
+/// with no key ([`call_key`]). The value is the caller's text, so only its length is logged.
+fn explicit_key(carrier: &'static str, value: Option<String>) -> Explicit {
+    let Some(value) = value else {
+        return Explicit::Absent;
+    };
+    match IdempotencyKey::parse(&value) {
+        Ok(key) => Explicit::Valid(key),
+        Err(_) => {
+            tracing::warn!(
+                carrier,
+                length = value.len(),
+                "dropped an idempotency key that is not 1 to {MAX_IDEMPOTENCY_KEY} printable \
+                 ASCII characters; the call carries no key"
+            );
+            Explicit::Invalid
+        }
+    }
+}
+
+/// What the `_meta` field `switchboard/idempotencyKey` carries. A value that is not a string
+/// holds no valid key, and is dropped with a warning like any other, so it too leaves the call
+/// with no key ([`call_key`]).
+fn meta_key(value: Option<CarriedKey>) -> Explicit {
+    match value {
+        None => Explicit::Absent,
+        Some(CarriedKey::Text(text)) => explicit_key(IDEMPOTENCY_KEY_META, Some(text)),
+        Some(CarriedKey::NotText) => {
+            tracing::warn!(
+                carrier = IDEMPOTENCY_KEY_META,
+                "dropped an idempotency key that is not a string; the call carries no key"
+            );
+            Explicit::Invalid
+        }
+    }
+}
+
+/// The `Idempotency-Key` header as a request carried it, read before the request's future is
+/// spawned, since that future owns nothing it borrows.
+#[derive(Debug)]
+enum KeyHeader {
+    /// None.
+    Absent,
+    /// One, whose value is text.
+    One(String),
+    /// More than one, or one whose value is not text: no key can be read from it.
+    Unreadable,
+}
+
+impl KeyHeader {
+    fn of(headers: &HeaderMap) -> Self {
+        let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+        let Some(value) = values.next() else {
+            return Self::Absent;
+        };
+        match (value.to_str(), values.next()) {
+            (Ok(text), None) => Self::One(text.to_owned()),
+            _ => Self::Unreadable,
+        }
+    }
+
+    /// What the header carries, for a call under a profile that `declares` its callers set it
+    /// per request; one sent more than once or not as text holds no valid key. From any other
+    /// profile the header is ignored, and the call is keyed as if it were absent: a client sets
+    /// headers once per server, so a header fixed in its configuration would key every side
+    /// effect alike.
+    fn honoured(self, declares: bool) -> Explicit {
+        match self {
+            Self::Absent => Explicit::Absent,
+            _ if !declares => {
+                tracing::debug!(
+                    "ignored an Idempotency-Key header from a profile that does not declare it"
+                );
+                Explicit::Absent
+            }
+            Self::One(value) => explicit_key(IDEMPOTENCY_KEY_HEADER, Some(value)),
+            Self::Unreadable => {
+                tracing::warn!(
+                    carrier = IDEMPOTENCY_KEY_HEADER,
+                    "dropped an Idempotency-Key header that was sent more than once or is not \
+                     text; the call carries no key"
+                );
+                Explicit::Invalid
+            }
+        }
+    }
 }
 
 /// The reply to a call answered from the receipt of an earlier call under its key: a

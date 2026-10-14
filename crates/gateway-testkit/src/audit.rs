@@ -360,25 +360,38 @@ impl State {
 
     /// What a begin with a receipt answers for the row `id`, which an earlier attempt wrote:
     /// the answer it was written with, if it was written as the answer to a reused key, and
-    /// [`Reservation::Reserved`] while its receipt is `pending`. A row whose receipt has left
-    /// `pending` is refused, since its call has run or has been settled without running, and
-    /// so is a row begun with no receipt.
+    /// [`Reservation::Reserved`] while its receipt reads as `pending` at `now`. A row whose
+    /// receipt has left `pending` is refused, since its call has run or has been settled
+    /// without running, and so is one whose receipt is still `pending` past its row's
+    /// deadline, which reads as `unknown`: its call is no longer the call's to run or settle.
+    /// So is a row begun with no receipt.
     ///
     /// `reuse` is the reuse check's answer for this begin. Since the row reserved its key or
     /// was answered, the check finds no receipt under another row unless the row was answered
     /// from it, and then the answer it was written with stands. One found otherwise is
     /// answered as it says, as a retried begin that did not pass over its own receipt would be.
-    fn found(&self, id: &AuditRowId, reuse: Option<Reuse>) -> Result<Reservation, StoreError> {
+    fn found(
+        &self,
+        id: &AuditRowId,
+        reuse: Option<Reuse>,
+        now: SystemTime,
+    ) -> Result<Reservation, StoreError> {
         if let Some((_, reuse)) = self.reused.iter().find(|(row, _)| row == id) {
             return Ok(Reservation::Reused(reuse.clone()));
         }
         if let Some(reuse) = reuse {
             return Ok(Reservation::Reused(reuse));
         }
-        match self.receipts.iter().find(|receipt| receipt.row == *id) {
+        let receipt = self
+            .receipts
+            .iter()
+            .find(|receipt| receipt.row == *id)
+            .map(|receipt| self.as_read(receipt, now));
+        match receipt {
             Some(receipt) if receipt.state == ReceiptState::Pending => Ok(Reservation::Reserved),
             Some(_) => Err(format!(
-                "audit row {}'s receipt has left pending, so its call must not run again",
+                "audit row {}'s receipt has left pending, or is pending past its row's deadline, \
+                 so its call must not run again",
                 id.as_str()
             )
             .into()),
@@ -386,14 +399,16 @@ impl State {
         }
     }
 
-    /// The reuse check for a begin of the row `id` with `request`: the answer, if the key
-    /// already has a receipt in its scope reserved under another row. A receipt reserved under
-    /// `id` itself is passed over, so a retried begin never refuses itself. `None` with no
-    /// request. An answer whose completion the Postgres store would refuse is refused.
+    /// The reuse check for a begin of the row `id` with `request`, at `now`: the answer, if the
+    /// key already has a receipt in its scope reserved under another row, read as it reads at
+    /// `now`. A receipt reserved under `id` itself is passed over, so a retried begin never
+    /// refuses itself. `None` with no request. An answer whose completion the Postgres store
+    /// would refuse is refused.
     fn reuse_answer(
         &self,
         id: &AuditRowId,
         request: Option<&ReceiptRequest>,
+        now: SystemTime,
     ) -> Result<Option<Reuse>, StoreError> {
         let Some(request) = request else {
             return Ok(None);
@@ -405,9 +420,28 @@ impl State {
         let Some(earlier) = earlier else {
             return Ok(None);
         };
-        let reuse = Reuse::answer(request, earlier);
+        let reuse = Reuse::answer(request, &self.as_read(earlier, now));
         refused_at_finish(&reuse.completion())?;
         Ok(Some(reuse))
+    }
+
+    /// Whether the deadline of the row `id` has passed at `now`, as Postgres reads it:
+    /// `deadline < clock_timestamp()`. A row with no deadline, or no row, has not.
+    fn past_deadline(&self, id: &AuditRowId, now: SystemTime) -> bool {
+        self.rows
+            .iter()
+            .find(|(stored, _, _)| stored == id)
+            .and_then(|(_, _, times)| times.deadline)
+            .is_some_and(|deadline| deadline < now)
+    }
+
+    /// `receipt` as it reads at `now` (decision 0009, "What a receipt is"): a `pending`
+    /// receipt whose row's deadline has passed reads as `unknown`, wherever it is read. Every
+    /// other state reads as itself.
+    fn as_read(&self, receipt: &Receipt, now: SystemTime) -> Receipt {
+        let mut read = receipt.clone();
+        read.state = receipt.state.as_read(self.past_deadline(&receipt.row, now));
+        read
     }
 
     /// For the row `id`, just written open: completes it with `reuse`'s answer if there is one,
@@ -479,13 +513,7 @@ impl State {
             .into());
         }
         self.complete_row(id, completion)?;
-        // Past the deadline as Postgres reads it: `deadline < clock_timestamp()`.
-        let past_deadline = self
-            .rows
-            .iter()
-            .find(|(stored, _, _)| stored == id)
-            .and_then(|(_, _, times)| times.deadline)
-            .is_some_and(|deadline| deadline < now);
+        let past_deadline = self.past_deadline(id, now);
         if let Some(receipt) = receipt.map(|at| &mut self.receipts[at])
             && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)
         {
@@ -664,7 +692,11 @@ impl State {
 /// a begin with a receipt for one is refused. Every completion settles the row's receipt in the
 /// same write, a lost begin's as `not_performed`, only as the core's
 /// [`may_move`] allows; and a completion `unknown` for a row with no receipt, or `duplicate`,
-/// is refused.
+/// is refused. A receipt still `pending` past its row's deadline, by the store's clock, reads
+/// as `unknown` wherever the store reads it (decision 0009): in [`receipts`](Self::receipts)
+/// and [`receipt`](Self::receipt), in the reuse check's answer, and on a retried begin of its
+/// own row, which is refused rather than answered as reserved. The contract suite's runner
+/// reads them as held, with [`held_receipts`](Self::held_receipts).
 pub struct InMemoryAuditStore {
     state: Mutex<State>,
     clock: Arc<dyn Clock>,
@@ -807,18 +839,36 @@ impl InMemoryAuditStore {
             .map(|(_, record, _)| record.clone())
     }
 
-    /// Every receipt, in the order reserved, with its state now.
+    /// Every receipt, in the order reserved, with its state as it reads now: a `pending`
+    /// receipt past its row's deadline, by the store's clock, reads as `unknown` (decision
+    /// 0009).
     pub fn receipts(&self) -> Vec<Receipt> {
-        self.state().receipts.clone()
+        let now = self.clock.now();
+        let state = self.state();
+        state
+            .receipts
+            .iter()
+            .map(|receipt| state.as_read(receipt, now))
+            .collect()
     }
 
-    /// The receipt reserved under the row `id`, if one was.
+    /// The receipt reserved under the row `id`, if one was, with its state as it reads now, as
+    /// [`receipts`](Self::receipts) says.
     pub fn receipt(&self, id: &AuditRowId) -> Option<Receipt> {
-        self.state()
+        let now = self.clock.now();
+        let state = self.state();
+        state
             .receipts
             .iter()
             .find(|receipt| receipt.row == *id)
-            .cloned()
+            .map(|receipt| state.as_read(receipt, now))
+    }
+
+    /// Every receipt, in the order reserved, as the store holds it: a `pending` receipt past
+    /// its row's deadline is still `pending` here. For the contract suite, whose runner reports
+    /// what a store holds and reads each state itself.
+    pub fn held_receipts(&self) -> Vec<Receipt> {
+        self.state().receipts.clone()
     }
 
     /// How many times `begin` was called, whether or not it wrote.
@@ -990,9 +1040,10 @@ impl InMemoryAuditStore {
             if state.list_rows.iter().any(|(id, _, _)| id == row) {
                 return Err(format!("audit row {} is a list row", row.as_str()).into());
             }
+            let now = self.clock.now();
             // The reuse check comes first, for a retried begin too, and passes over a receipt
             // reserved under this row, so that a retried begin never refuses itself.
-            let reuse = state.reuse_answer(row, receipt)?;
+            let reuse = state.reuse_answer(row, receipt, now)?;
             let mut reservation = None;
             match state.rows.iter().find(|(id, _, _)| id == row) {
                 None => {
@@ -1013,7 +1064,7 @@ impl InMemoryAuditStore {
                 }
             }
             if receipt.is_some() && reservation.is_none() {
-                reservation = Some(state.found(row, reuse)?);
+                reservation = Some(state.found(row, reuse, now)?);
             }
             if state.confirmation_lost.take() {
                 // As the Postgres store completes a lost begin's row, and the core gives up a
