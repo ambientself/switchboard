@@ -625,6 +625,22 @@ mod tests {
         assert!(serde_json::from_str::<ArgumentDigest>("\"00\"").is_err());
     }
 
+    /// The digest is over the canonical form, not over `serde_json`'s: a double with a whole
+    /// value is written as the integer is, and members are sorted by UTF-16 code units.
+    #[test]
+    fn the_digest_is_of_the_canonical_form() {
+        assert_eq!(
+            ArgumentDigest::of(&json!({"n": 2.0})),
+            ArgumentDigest::of(&json!({"n": 2}))
+        );
+        let sha256 = |text: &str| ArgumentDigest(Sha256::digest(text.as_bytes()).into());
+        let value = json!({"\u{fb33}": 1, "\u{1f600}": 2});
+        assert_eq!(
+            ArgumentDigest::of(&value),
+            sha256("{\"\u{1f600}\":2,\"\u{fb33}\":1}")
+        );
+    }
+
     const STATES: [ReceiptState; 4] = [
         ReceiptState::Pending,
         ReceiptState::Completed,
