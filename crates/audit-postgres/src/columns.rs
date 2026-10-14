@@ -22,7 +22,11 @@ use gateway_core::audit::{
     AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome,
     RecordedResources, RowKind,
 };
-use gateway_core::{CredentialIdentity, CredentialMode, Principal, PrincipalKind};
+use gateway_core::receipt::ReceiptRequest;
+use gateway_core::{
+    ArgumentDigest, CredentialIdentity, CredentialMode, DelegationKeyScope, Principal,
+    PrincipalKind, Receipt, ReceiptState, Reuse, ToolName, ToolUseId, VendorReference,
+};
 use serde_json::{Value, json};
 use tokio_postgres::types::ToSql;
 
@@ -232,10 +236,33 @@ impl BeginRow {
             $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
         ) ON CONFLICT (id) DO NOTHING";
 
+    /// The first half of a row and the answer to a reused key, in one insert: the row written
+    /// complete at begin, with the [`AnswerRow`]'s columns after [`INSERT`](Self::INSERT)'s.
+    /// Inserts one row or none, as that does.
+    pub const INSERT_ANSWERED: &'static str = "INSERT INTO switchboard_audit.call_rows (
+            id, tool_use_id, deployment, surface, profile, tool, connector, classification,
+            resources, resources_omitted, decision, reason, sentence, policy_revision,
+            proved_issuer, proved_subject, proved_kind, proved_team, proved_groups,
+            proved_delegation_team, claimed_acting_person, claimed_team, instance, kind,
+            allowance_ms, credential_mode, credential_principal,
+            outcome, outcome_sentence, latency_ms, duplicate_of
+        ) VALUES (
+            ($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+            $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+            $28, $29, $30, ($31::text)::uuid
+        ) ON CONFLICT (id) DO NOTHING";
+
     /// The decision of the row already stored under an identifier, read with only the columns
     /// the gateway's role may select. A retried begin compares this and nothing more.
     pub const DECISION: &'static str =
         "SELECT decision FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
+
+    /// The decision and the completion of the row already stored under an identifier, for a
+    /// retried begin with a receipt: its decision, and the answer it was written with, if it
+    /// was written as one. Only columns the gateway's role may select.
+    pub const STORED: &'static str = "SELECT decision, outcome, outcome_sentence, latency_ms,
+            duplicate_of::text
+        FROM switchboard_audit.call_rows WHERE id = ($1::text)::uuid";
 
     /// The columns for `record`, as the row `id`, begun by a store with `budgets`. Refuses a
     /// record that is already complete: begin writes the first half of a row, and a
@@ -350,6 +377,14 @@ impl BeginRow {
                 optional_bytes(self.credential_principal.as_deref()),
             ),
         ]
+    }
+
+    /// The values for [`INSERT_ANSWERED`](Self::INSERT_ANSWERED), in order: this row's, and
+    /// then `answer`'s.
+    pub fn answered_parameters<'a>(&'a self, answer: &'a AnswerRow) -> Vec<&'a (dyn ToSql + Sync)> {
+        let mut parameters = self.parameters().to_vec();
+        parameters.extend(answer.parameters());
+        parameters
     }
 
     /// The values for [`INSERT`](Self::INSERT), in order.
@@ -614,7 +649,16 @@ fn kind(kind: RowKind) -> &'static str {
 /// `"unknown"`; and how many were left out. A count past the column's range is refused rather
 /// than recorded as less than it was.
 fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
-    let resources = match &record.resources {
+    resources_of(&record.resources, record.resources_omitted)
+}
+
+/// The resources columns for `resources`, with `omitted` of them left out, as
+/// [`resources`] writes a row's and a receipt's alike.
+fn resources_of(
+    resources: &RecordedResources,
+    omitted: usize,
+) -> Result<(Value, i64), PgAuditError> {
+    let resources = match resources {
         RecordedResources::Named(named) => Value::Array(
             named
                 .iter()
@@ -630,7 +674,7 @@ fn resources(record: &AuditRecord) -> Result<(Value, i64), PgAuditError> {
         RecordedResources::Reach(entry) => json!({ "reach": stored("resources", entry.as_str())? }),
         RecordedResources::Unknown => Value::String("unknown".to_owned()),
     };
-    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {
+    let omitted = i64::try_from(omitted).map_err(|_| {
         PgAuditError::Column("a count of resources left out past the column's range")
     })?;
     Ok((resources, omitted))
@@ -687,13 +731,18 @@ fn name_of<T: serde::Serialize>(value: &T) -> Result<String, PgAuditError> {
 }
 
 /// The completion columns finish writes, in the order of [`FinishRow::UPDATE`]'s parameters
-/// after the row's identifier.
+/// after the row's identifier, and what the row's receipt, if it reserved one, moves to with it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FinishRow {
     pub outcome: &'static str,
     pub outcome_sentence: Option<String>,
     pub error_kind: Option<&'static str>,
     pub latency_ms: i64,
+    /// The state the outcome settles a receipt in, as the core's `ReceiptState::settled_by`
+    /// says.
+    pub settles: &'static str,
+    /// The vendor's reference for what the call made, for its receipt.
+    pub reference: Option<String>,
 }
 
 impl FinishRow {
@@ -711,29 +760,20 @@ impl FinishRow {
     /// The columns for `completion`. Refuses a sentence holding U+0000, a sentence longer than
     /// [`MAX_OUTCOME_SENTENCE_BYTES`], and a latency past the column's range, rather than write
     /// another value than the completion's. So a completion written is never more than
-    /// [`COMPLETION_RESERVE`], the room begin left for it.
+    /// [`COMPLETION_RESERVE`], the room begin left for it. Refuses a `duplicate`, which only
+    /// begin writes, as the answer to a reused key.
     pub fn from_completion(completion: &Completion) -> Result<Self, PgAuditError> {
         let (outcome_sentence, error_kind) = match &completion.outcome {
-            Outcome::Refused { sentence } => (
-                Some(within_cap(
-                    "outcome_sentence",
-                    stored("outcome_sentence", sentence)?,
-                    MAX_OUTCOME_SENTENCE_BYTES,
-                )?),
-                None,
-            ),
+            Outcome::Refused { sentence } => (Some(refusal_sentence(sentence)?), None),
             Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),
-            Outcome::Ok => (None, None),
-            Outcome::Unknown => {
-                return Err(PgAuditError::NoReceipts(
-                    "an `unknown` outcome cannot be written",
-                ));
-            }
-            Outcome::Duplicate { .. } => {
-                return Err(PgAuditError::NoReceipts(
-                    "a `duplicate` outcome cannot be written",
-                ));
-            }
+            Outcome::Ok | Outcome::Unknown => (None, None),
+            Outcome::Duplicate { .. } => return Err(PgAuditError::DuplicateAtFinish),
+        };
+        let settles = match ReceiptState::settled_by(&completion.outcome) {
+            Some(ReceiptState::Completed) => "completed",
+            Some(ReceiptState::NotPerformed) => "not_performed",
+            Some(ReceiptState::Unknown) => "unknown",
+            Some(ReceiptState::Pending) | None => return Err(PgAuditError::DuplicateAtFinish),
         };
         let latency_ms = i64::try_from(completion.latency_ms)
             .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;
@@ -742,7 +782,19 @@ impl FinishRow {
             outcome_sentence,
             error_kind,
             latency_ms,
+            settles,
+            reference: None,
         })
+    }
+
+    /// The same columns, with the vendor's `reference` for the row's receipt. Refuses one
+    /// holding U+0000, as every text value is refused.
+    pub fn with_reference(
+        mut self,
+        reference: Option<&VendorReference>,
+    ) -> Result<Self, PgAuditError> {
+        self.reference = optional("reference", reference.map(VendorReference::as_str))?;
+        Ok(self)
     }
 
     /// Each column and its bytes, as [`MAX_ROW_BYTES`] counts them. Finish need not count them:
@@ -796,6 +848,266 @@ impl FinishRow {
             && self.error_kind == error_kind
             && Some(self.latency_ms) == latency_ms
     }
+}
+
+/// A refusal's sentence as the row holds it: refused, never cut, when it holds U+0000 or is
+/// longer than [`MAX_OUTCOME_SENTENCE_BYTES`].
+fn refusal_sentence(sentence: &str) -> Result<String, PgAuditError> {
+    within_cap(
+        "outcome_sentence",
+        stored("outcome_sentence", sentence)?,
+        MAX_OUTCOME_SENTENCE_BYTES,
+    )
+}
+
+/// The completion a reused key's row is written with at begin, in the order of the last four of
+/// [`BeginRow::INSERT_ANSWERED`]'s parameters: `refused` with the answer's sentence, or
+/// `duplicate` naming the earlier receipt, with a latency of zero. It is within
+/// [`COMPLETION_RESERVE`]: a refusal's sentence is held to [`MAX_OUTCOME_SENTENCE_BYTES`], and a
+/// duplicate is its outcome, 9 bytes, the receipt's identifier, 36, and the latency, 8.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AnswerRow {
+    pub outcome: &'static str,
+    pub outcome_sentence: Option<String>,
+    pub latency_ms: i64,
+    /// The earlier receipt a `duplicate` names, a UUID in the lowercase hyphenated form.
+    pub duplicate_of: Option<String>,
+}
+
+impl AnswerRow {
+    /// The columns for the completion of `reuse`.
+    pub fn from_reuse(reuse: &Reuse) -> Result<Self, PgAuditError> {
+        let completion = reuse.completion();
+        let (outcome_sentence, duplicate_of) = match &completion.outcome {
+            Outcome::Refused { sentence } => (Some(refusal_sentence(sentence)?), None),
+            Outcome::Duplicate { receipt } if is_uuid(receipt.as_str()) => {
+                (None, Some(receipt.as_str().to_owned()))
+            }
+            _ => return Err(PgAuditError::Column("an answer to a reused key")),
+        };
+        let latency_ms = i64::try_from(completion.latency_ms)
+            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;
+        Ok(Self {
+            outcome: FinishRow::outcome_of(&completion),
+            outcome_sentence,
+            latency_ms,
+            duplicate_of,
+        })
+    }
+
+    /// The values for the last four of [`BeginRow::INSERT_ANSWERED`]'s parameters, in order.
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 4] {
+        [
+            &self.outcome,
+            &self.outcome_sentence,
+            &self.latency_ms,
+            &self.duplicate_of,
+        ]
+    }
+
+    /// Whether a row read back with [`BeginRow::STORED`] holds this answer: its outcome,
+    /// sentence, latency and the receipt a duplicate names.
+    pub fn is(
+        &self,
+        outcome: Option<&str>,
+        outcome_sentence: Option<&str>,
+        latency_ms: Option<i64>,
+        duplicate_of: Option<&str>,
+    ) -> bool {
+        outcome == Some(self.outcome)
+            && outcome_sentence == self.outcome_sentence.as_deref()
+            && latency_ms == Some(self.latency_ms)
+            && duplicate_of == self.duplicate_of.as_deref()
+    }
+}
+
+/// The columns a receipt is reserved with, in the order of [`ReceiptRow::RESERVE`]'s
+/// parameters. Its state, how it was established and its time of reservation come from the
+/// table's defaults and its trigger.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReceiptRow {
+    /// The row that reserves it, a UUID in the lowercase hyphenated form.
+    pub row_id: String,
+    pub principal_issuer: String,
+    pub principal_subject: String,
+    pub delegation_scope: Option<String>,
+    pub idempotency_key: String,
+    pub tool: String,
+    pub tool_use_id: Option<String>,
+    pub digest: String,
+    pub resources: Value,
+    pub resources_omitted: i64,
+}
+
+impl ReceiptRow {
+    /// Reserves the receipt, unless the row already holds one or its key already has one in its
+    /// scope: inserts one receipt or none. Of two reservations of one key in one scope at once,
+    /// the unique index makes the second wait for the first to commit, and then insert nothing.
+    pub const RESERVE: &'static str = "INSERT INTO switchboard_audit.receipts (
+            row_id, principal_issuer, principal_subject, delegation_scope, idempotency_key,
+            tool, tool_use_id, digest, resources, resources_omitted
+        ) VALUES (($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT DO NOTHING";
+
+    /// The reuse check for a key with no delegation scope: the receipt for the key `$3` of the
+    /// principal `$1`, `$2`, reserved under a row other than `$4`, the call's own, which it
+    /// passes over. Its identifier and what [`Reuse::answer`] reads.
+    pub const EARLIER_IN_PRINCIPAL: &'static str = "SELECT row_id::text, tool, tool_use_id,
+            digest, state, reference
+        FROM switchboard_audit.receipts
+        WHERE principal_issuer = $1 AND principal_subject = $2 AND delegation_scope IS NULL
+            AND idempotency_key = $3 AND row_id <> ($4::text)::uuid";
+
+    /// The reuse check for a key in the delegation scope `$3`: the receipt for the key `$4`
+    /// reserved under a row other than `$5`, as
+    /// [`EARLIER_IN_PRINCIPAL`](Self::EARLIER_IN_PRINCIPAL) reads it.
+    pub const EARLIER_IN_DELEGATION: &'static str = "SELECT row_id::text, tool, tool_use_id,
+            digest, state, reference
+        FROM switchboard_audit.receipts
+        WHERE principal_issuer = $1 AND principal_subject = $2 AND delegation_scope = $3
+            AND idempotency_key = $4 AND row_id <> ($5::text)::uuid";
+
+    /// The state of the receipt reserved under a row, if one was.
+    pub const STATE: &'static str =
+        "SELECT state FROM switchboard_audit.receipts WHERE row_id = ($1::text)::uuid";
+
+    /// Settles the receipt reserved under the row `$1` as `$2`, established by the call, with
+    /// the reference `$3`, in the same transaction as the row's completion: only while it is
+    /// `pending` and its row's deadline has not passed by the database's clock. Matches nothing
+    /// otherwise, and the receipt is left for reconciliation or a person. The trigger
+    /// `receipt_moves` judges the same rule again as it writes.
+    pub const SETTLE: &'static str = "UPDATE switchboard_audit.receipts r
+        SET state = $2, established_by = 'call', reference = $3
+        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'
+            AND NOT EXISTS (SELECT FROM switchboard_audit.call_rows c
+                            WHERE c.id = r.row_id AND c.deadline < clock_timestamp())";
+
+    /// The columns for the receipt `request` asks for, reserved under the row `id`. Refuses a
+    /// value holding U+0000, as every text value is refused.
+    pub fn from_request(id: &AuditRowId, request: &ReceiptRequest) -> Result<Self, PgAuditError> {
+        if !is_uuid(id.as_str()) {
+            return Err(PgAuditError::Column("id"));
+        }
+        let receipt = request.reserve(id);
+        let (resources, resources_omitted) =
+            resources_of(&receipt.resources, receipt.resources_omitted)?;
+        let scope = request.scope();
+        Ok(Self {
+            row_id: id.as_str().to_owned(),
+            principal_issuer: stored("principal_issuer", scope.principal.issuer.as_str())?,
+            principal_subject: stored("principal_subject", scope.principal.subject.as_str())?,
+            delegation_scope: optional(
+                "delegation_scope",
+                scope.delegation.as_ref().map(DelegationKeyScope::as_str),
+            )?,
+            idempotency_key: stored("idempotency_key", request.key().as_str())?,
+            tool: stored("tool", request.tool().as_str())?,
+            tool_use_id: optional("tool_use_id", request.tool_use_id().map(|id| id.as_str()))?,
+            digest: request.digest().to_hex(),
+            resources,
+            resources_omitted,
+        })
+    }
+
+    /// The values for [`RESERVE`](Self::RESERVE), in order.
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 10] {
+        [
+            &self.row_id,
+            &self.principal_issuer,
+            &self.principal_subject,
+            &self.delegation_scope,
+            &self.idempotency_key,
+            &self.tool,
+            &self.tool_use_id,
+            &self.digest,
+            &self.resources,
+            &self.resources_omitted,
+        ]
+    }
+
+    /// The reuse check's statement for this receipt's scope, and its values in order.
+    pub fn earlier(&self) -> (&'static str, Vec<&(dyn ToSql + Sync)>) {
+        match &self.delegation_scope {
+            None => (
+                Self::EARLIER_IN_PRINCIPAL,
+                vec![
+                    &self.principal_issuer,
+                    &self.principal_subject,
+                    &self.idempotency_key,
+                    &self.row_id,
+                ],
+            ),
+            Some(scope) => (
+                Self::EARLIER_IN_DELEGATION,
+                vec![
+                    &self.principal_issuer,
+                    &self.principal_subject,
+                    scope,
+                    &self.idempotency_key,
+                    &self.row_id,
+                ],
+            ),
+        }
+    }
+}
+
+/// The earlier receipt the reuse check found for `request`, from the columns
+/// [`ReceiptRow::EARLIER_IN_PRINCIPAL`] reads: what [`Reuse::answer`] compares. Its scope and
+/// key are the request's, which the check matched, and so are its resources, which the answer
+/// does not read.
+pub(crate) fn earlier_receipt(
+    request: &ReceiptRequest,
+    row: &tokio_postgres::Row,
+) -> Result<Receipt, PgAuditError> {
+    let id: String = row.try_get(0)?;
+    let tool: String = row.try_get(1)?;
+    let tool_use_id: Option<String> = row.try_get(2)?;
+    let digest: String = row.try_get(3)?;
+    let state: String = row.try_get(4)?;
+    let reference: Option<String> = row.try_get(5)?;
+    let mut receipt = request.reserve(&AuditRowId::new(id));
+    receipt.tool =
+        ToolName::parse(&tool).map_err(|_| PgAuditError::Unreadable("a receipt's tool"))?;
+    receipt.tool_use_id = tool_use_id.map(ToolUseId::new);
+    receipt.digest = ArgumentDigest::try_from(digest)
+        .map_err(|_| PgAuditError::Unreadable("a receipt's digest"))?;
+    receipt.state = receipt_state(&state)?;
+    receipt.reference = reference.map(VendorReference::new);
+    Ok(receipt)
+}
+
+/// A receipt's state, from its column.
+pub(crate) fn receipt_state(state: &str) -> Result<ReceiptState, PgAuditError> {
+    Ok(match state {
+        "pending" => ReceiptState::Pending,
+        "completed" => ReceiptState::Completed,
+        "not_performed" => ReceiptState::NotPerformed,
+        "unknown" => ReceiptState::Unknown,
+        _ => return Err(PgAuditError::Unreadable("a receipt's state")),
+    })
+}
+
+/// Every answer a reused key's row could have been written with from the earlier receipt
+/// `earlier`, under `request`'s key: a retried begin finds the one its row holds, whatever has
+/// become of the earlier receipt since. A duplicate carries the receipt's reference as it is
+/// now; the row does not hold one.
+pub(crate) fn answers(request: &ReceiptRequest, earlier: &Receipt) -> [Reuse; 5] {
+    let key = request.key().clone();
+    let receipt = earlier.row.clone();
+    [
+        Reuse::DifferentCall { key: key.clone() },
+        Reuse::Conflicting { key: key.clone() },
+        Reuse::Duplicate {
+            key: key.clone(),
+            receipt: receipt.clone(),
+            reference: earlier.reference.clone(),
+        },
+        Reuse::MayHaveHappened {
+            key: key.clone(),
+            receipt: receipt.clone(),
+        },
+        Reuse::NotPerformed { key, receipt },
+    ]
 }
 
 /// The largest call row the gateway can begin, as [`MAX_ROW_BYTES`] counts it: every capped
@@ -1715,25 +2027,109 @@ mod tests {
         }
     }
 
-    /// The store keeps no receipts yet (#55), so it refuses an outcome only a call with one has,
-    /// before anything is sent: finish then gives up, and the row stays open.
+    /// Each outcome finish writes settles a receipt as the core says, `unknown` among them. A
+    /// `duplicate` is refused before anything is sent: only begin writes one.
     #[test]
-    fn an_unknown_or_duplicate_outcome_is_refused_until_receipts_are_kept() {
-        for outcome in [
-            Outcome::Unknown,
-            Outcome::Duplicate {
+    fn each_outcome_settles_its_receipt_and_a_duplicate_is_refused_at_finish() {
+        for (outcome, written, settles) in [
+            (Outcome::Ok, "ok", "completed"),
+            (
+                Outcome::Error {
+                    error_kind: ErrorKind::VendorRefusal,
+                },
+                "error",
+                "not_performed",
+            ),
+            (
+                Outcome::Refused {
+                    sentence: "No.".into(),
+                },
+                "refused",
+                "not_performed",
+            ),
+            (Outcome::Unknown, "unknown", "unknown"),
+        ] {
+            let finish = FinishRow::from_completion(&Completion {
+                outcome: outcome.clone(),
+                latency_ms: 4,
+            })
+            .unwrap();
+            assert_eq!((finish.outcome, finish.settles), (written, settles));
+            assert_eq!(finish.reference, None);
+        }
+        let refused = FinishRow::from_completion(&Completion {
+            outcome: Outcome::Duplicate {
                 receipt: AuditRowId::new("01a00000-0000-7000-8000-000000000000"),
             },
-        ] {
-            let refused = FinishRow::from_completion(&Completion {
-                outcome: outcome.clone(),
+            latency_ms: 0,
+        });
+        assert!(
+            matches!(refused, Err(PgAuditError::DuplicateAtFinish)),
+            "{refused:?}"
+        );
+        let finish = FinishRow::from_completion(&Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 4,
+        })
+        .unwrap();
+        assert!(matches!(
+            finish.with_reference(Some(&VendorReference::new("PR\u{0}7"))),
+            Err(PgAuditError::Nul {
+                column: "reference"
+            })
+        ));
+    }
+
+    /// The answer to a reused key is written as its completion says: `duplicate` naming the
+    /// earlier receipt, or `refused` with the sentence the caller reads, each with a latency of
+    /// zero, and well within the room begin leaves for a completion.
+    #[test]
+    fn a_reused_keys_answer_is_written_as_its_completion() {
+        let key = gateway_core::IdempotencyKey::parse(&"k".repeat(128)).unwrap();
+        let earlier = AuditRowId::new("01a00000-0000-7000-8000-000000000000");
+        let duplicate = AnswerRow::from_reuse(&Reuse::Duplicate {
+            key: key.clone(),
+            receipt: earlier.clone(),
+            reference: Some(VendorReference::new("PR-7")),
+        })
+        .unwrap();
+        assert_eq!(
+            duplicate,
+            AnswerRow {
+                outcome: "duplicate",
+                outcome_sentence: None,
                 latency_ms: 0,
-            });
+                duplicate_of: Some(earlier.as_str().to_owned()),
+            }
+        );
+        assert!(duplicate.is(Some("duplicate"), None, Some(0), Some(earlier.as_str())));
+        assert!(!duplicate.is(Some("duplicate"), None, Some(0), None));
+        for reuse in [
+            Reuse::DifferentCall { key: key.clone() },
+            Reuse::Conflicting { key: key.clone() },
+            Reuse::MayHaveHappened {
+                key: key.clone(),
+                receipt: earlier.clone(),
+            },
+            Reuse::NotPerformed {
+                key: key.clone(),
+                receipt: earlier.clone(),
+            },
+        ] {
+            let answer = AnswerRow::from_reuse(&reuse).unwrap();
+            assert_eq!(
+                (answer.outcome, answer.latency_ms, &answer.duplicate_of),
+                ("refused", 0, &None)
+            );
+            let sentence = answer.outcome_sentence.clone().unwrap();
+            assert_eq!(sentence, reuse.sentence());
+            assert!(answer.is(Some("refused"), Some(&sentence), Some(0), None));
             assert!(
-                matches!(refused, Err(PgAuditError::NoReceipts(_))),
-                "{outcome:?}: {refused:?}"
+                "refused".len() + sentence.len() + INTEGER_BYTES <= COMPLETION_RESERVE,
+                "{reuse:?}"
             );
         }
+        assert!("duplicate".len() + 36 + INTEGER_BYTES <= COMPLETION_RESERVE);
     }
 
     #[test]
@@ -1772,7 +2168,9 @@ mod tests {
                 outcome: "ok",
                 outcome_sentence: None,
                 error_kind: None,
-                latency_ms: 7
+                latency_ms: 7,
+                settles: "completed",
+                reference: None,
             }
         );
         assert_eq!(
@@ -1783,7 +2181,9 @@ mod tests {
                 outcome: "error",
                 outcome_sentence: None,
                 error_kind: Some("vendor_refusal"),
-                latency_ms: 7
+                latency_ms: 7,
+                settles: "not_performed",
+                reference: None,
             }
         );
         assert_eq!(
@@ -1794,7 +2194,9 @@ mod tests {
                 outcome: "refused",
                 outcome_sentence: Some("Not that one.".into()),
                 error_kind: None,
-                latency_ms: 7
+                latency_ms: 7,
+                settles: "not_performed",
+                reference: None,
             }
         );
     }
@@ -1843,6 +2245,8 @@ mod tests {
             outcome_sentence: Some("No.".into()),
             error_kind: None,
             latency_ms: 4,
+            settles: "not_performed",
+            reference: None,
         };
         assert!(row.is("refused", Some("No."), None, Some(4)));
         assert!(!row.is("error", Some("No."), None, Some(4)));
@@ -1857,6 +2261,8 @@ mod tests {
             outcome_sentence: None,
             error_kind: Some("vendor_refusal"),
             latency_ms: 4,
+            settles: "not_performed",
+            reference: None,
         };
         assert!(error.is("error", None, Some("vendor_refusal"), Some(4)));
         assert!(!error.is("error", None, Some("other"), Some(4)));

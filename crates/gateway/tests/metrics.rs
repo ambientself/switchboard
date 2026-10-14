@@ -42,7 +42,7 @@ use support::{FixtureResources, PATIENCE};
 const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
 
 /// Every family the endpoint writes with audit in Postgres.
-const AUDIT_FAMILIES: [(&str, &str); 17] = [
+const AUDIT_FAMILIES: [(&str, &str); 20] = [
     ("switchboard_audit_begin_failures_total", "counter"),
     ("switchboard_audit_failure_answers_total", "counter"),
     (
@@ -58,6 +58,15 @@ const AUDIT_FAMILIES: [(&str, &str); 17] = [
         "gauge",
     ),
     ("switchboard_audit_open_rows_poll_failures_total", "counter"),
+    ("switchboard_audit_unknown_receipts", "gauge"),
+    (
+        "switchboard_audit_oldest_unknown_receipt_reserved_seconds",
+        "gauge",
+    ),
+    (
+        "switchboard_audit_unknown_receipts_poll_failures_total",
+        "counter",
+    ),
     ("switchboard_audit_begin_latency_seconds", "histogram"),
     ("switchboard_audit_finish_latency_seconds", "histogram"),
     ("switchboard_audit_pool_connections_in_use", "gauge"),
@@ -207,7 +216,6 @@ async fn the_endpoint_answers_with_every_signal_and_nothing_else() {
         ),
         "{text}"
     );
-    assert!(!text.contains("receipt"), "{text}");
 
     // Nothing else is on the port.
     for target in ["/", "/readyz", "/mcp/read", "/metrics/x"] {
@@ -247,21 +255,28 @@ async fn with_audit_disabled_only_the_telemetry_counters_are_exported() {
 }
 
 /// The poller starts with the listener, and its first poll runs at once. Against a database
-/// that is not there, each poll fails and is counted, and no open-row count is made up.
+/// that is not there, each poll fails and is counted, and no open-row count or count of
+/// receipts in `unknown` is made up.
 #[tokio::test]
 async fn the_open_row_poll_runs_at_once_and_a_failed_poll_is_counted() {
     let (telemetry, _drain) = Telemetry::bounded(TELEMETRY_QUEUE);
     let (address, _stop) = serve(Metrics::new(telemetry, Some(unreachable_store()))).await;
     let text = until_scraped(address, "a failed poll counted", |text| {
         sample(text, "switchboard_audit_open_rows_poll_failures_total") == Some(1.0)
+            && sample(
+                text,
+                "switchboard_audit_unknown_receipts_poll_failures_total",
+            ) == Some(1.0)
     })
     .await;
-    assert_eq!(sample(&text, "switchboard_audit_open_rows"), None, "{text}");
-    assert_eq!(
-        sample(&text, "switchboard_audit_oldest_open_row_deadline_seconds"),
-        None,
-        "{text}"
-    );
+    for gauge in [
+        "switchboard_audit_open_rows",
+        "switchboard_audit_oldest_open_row_deadline_seconds",
+        "switchboard_audit_unknown_receipts",
+        "switchboard_audit_oldest_unknown_receipt_reserved_seconds",
+    ] {
+        assert_eq!(sample(&text, gauge), None, "{gauge}\n{text}");
+    }
 }
 
 /// Each issuer whose keys come from a keys URL has the age of its keys exported, from boot's
@@ -663,10 +678,20 @@ async fn open_row(in_database: tokio_postgres::Config, setup: tokio_postgres::Cl
 
     let (telemetry, _drain) = Telemetry::bounded(TELEMETRY_QUEUE);
     let (address, _stop) = serve(Metrics::new(telemetry, Some(store))).await;
+    // The row is a read's, which reserved no receipt: none is in unknown.
     let text = until_scraped(address, "the open row counted", |text| {
         sample(text, "switchboard_audit_open_rows") == Some(1.0)
+            && sample(text, "switchboard_audit_unknown_receipts") == Some(0.0)
     })
     .await;
+    assert_eq!(
+        sample(
+            &text,
+            "switchboard_audit_oldest_unknown_receipt_reserved_seconds"
+        ),
+        None,
+        "{text}"
+    );
     let oldest = sample(&text, "switchboard_audit_oldest_open_row_deadline_seconds").unwrap();
     let expected = deadline
         .duration_since(std::time::UNIX_EPOCH)

@@ -6,7 +6,10 @@ use tokio_postgres::NoTls;
 use std::collections::BTreeSet;
 
 use super::{DUMMY_PASSWORD, GATEWAY_ROLE, OWNER_ROLE, TestDatabase, connect};
-use crate::check::{INSERTED, OPEN_ROWS_DEFINITION, SELECTED, UPDATED};
+use crate::check::{
+    INSERTED, OPEN_ROWS_DEFINITION, RECEIPT_INSERTED, RECEIPT_SELECTED, RECEIPT_UPDATED, SELECTED,
+    UPDATED,
+};
 use crate::{BootCheckError, MIGRATIONS, PgAuditStore, PoolSizes, Problem};
 
 /// The problems the check found, which must be some.
@@ -552,10 +555,16 @@ async fn grant_the_gateways_own(db: &TestDatabase, role: &str, option: &str) {
              GRANT INSERT ({}) ON switchboard_audit.call_rows TO {role}{option};
              GRANT UPDATE ({}) ON switchboard_audit.call_rows TO {role}{option};
              GRANT SELECT ({}) ON switchboard_audit.call_rows TO {role}{option};
-             GRANT SELECT ON switchboard_audit.open_call_rows TO {role}{option};",
+             GRANT SELECT ON switchboard_audit.open_call_rows TO {role}{option};
+             GRANT INSERT ({}) ON switchboard_audit.receipts TO {role}{option};
+             GRANT UPDATE ({}) ON switchboard_audit.receipts TO {role}{option};
+             GRANT SELECT ({}) ON switchboard_audit.receipts TO {role}{option};",
             INSERTED.join(", "),
             UPDATED.join(", "),
             SELECTED.join(", "),
+            RECEIPT_INSERTED.join(", "),
+            RECEIPT_UPDATED.join(", "),
+            RECEIPT_SELECTED.join(", "),
         ))
         .await
         .unwrap();
@@ -663,10 +672,17 @@ async fn a_role_that_does_not_inherit_the_gateways_privileges_is_refused() {
             .all(|problem| matches!(problem, Problem::Missing { .. })),
         "{found:?}"
     );
-    // Each column privilege, USAGE on the schema, and SELECT on the open-row view.
+    // Each column privilege on both tables, USAGE on the schema, and SELECT on the open-row
+    // view.
     assert_eq!(
         found.len(),
-        INSERTED.len() + UPDATED.len() + SELECTED.len() + 2,
+        INSERTED.len()
+            + UPDATED.len()
+            + SELECTED.len()
+            + RECEIPT_INSERTED.len()
+            + RECEIPT_UPDATED.len()
+            + RECEIPT_SELECTED.len()
+            + 2,
         "{found:?}"
     );
 }
@@ -695,6 +711,19 @@ async fn the_gateways_own_privileges_with_grant_option_are_refused() {
             extra(&privilege, &format!("switchboard_audit.call_rows.{column}"))
         })
         .collect();
+    let mut on_receipts = BTreeSet::new();
+    for (privilege, columns) in [
+        ("INSERT", RECEIPT_INSERTED),
+        ("UPDATE", RECEIPT_UPDATED),
+        ("SELECT", RECEIPT_SELECTED),
+    ] {
+        for column in columns {
+            on_receipts.insert((format!("{privilege} WITH GRANT OPTION"), *column));
+        }
+    }
+    expected.extend(on_receipts.into_iter().map(|(privilege, column)| {
+        extra(&privilege, &format!("switchboard_audit.receipts.{column}"))
+    }));
     expected.push(extra(
         "USAGE WITH GRANT OPTION",
         "the schema switchboard_audit",
@@ -856,6 +885,28 @@ async fn an_unlogged_table_or_partition_is_refused() {
     let unlogged = |table: &str| Problem::Unlogged {
         table: table.into(),
     };
+    // A logged table and an unlogged one cannot reference each other, so the receipts' foreign
+    // keys go first.
+    admin
+        .batch_execute(
+            "ALTER TABLE switchboard_audit.call_rows DROP CONSTRAINT call_rows_duplicate_of_fkey;
+             ALTER TABLE switchboard_audit.receipts DROP CONSTRAINT receipts_row_id_fkey;",
+        )
+        .await
+        .unwrap();
+    store.check_at_boot().await.unwrap();
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.receipts SET UNLOGGED")
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![unlogged("switchboard_audit.receipts")]
+    );
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.receipts SET LOGGED")
+        .await
+        .unwrap();
     admin
         .batch_execute("ALTER TABLE switchboard_audit.call_rows SET UNLOGGED")
         .await
@@ -1017,53 +1068,81 @@ async fn a_disabled_or_missing_trigger_is_refused() {
     };
     let admin = db.admin().await;
     let store = db.store(PoolSizes::default());
-    let alter = |change: &str| format!("ALTER TABLE switchboard_audit.call_rows {change}");
+    let alter =
+        |table: &str, change: &str| format!("ALTER TABLE switchboard_audit.{table} {change}");
 
-    for trigger in ["set_times", "complete_once"] {
-        let disabled = vec![Problem::TriggerDisabled { trigger }];
+    for (table, trigger) in [
+        ("call_rows", "set_times"),
+        ("call_rows", "complete_once"),
+        ("receipts", "receipt_moves"),
+    ] {
+        let disabled = vec![Problem::TriggerDisabled { table, trigger }];
         admin
-            .batch_execute(&alter(&format!("DISABLE TRIGGER {trigger}")))
+            .batch_execute(&alter(table, &format!("DISABLE TRIGGER {trigger}")))
             .await
             .unwrap();
         assert_eq!(problems(&store).await, disabled);
         // A replica trigger does not fire in an ordinary session.
         admin
-            .batch_execute(&alter(&format!("ENABLE REPLICA TRIGGER {trigger}")))
+            .batch_execute(&alter(table, &format!("ENABLE REPLICA TRIGGER {trigger}")))
             .await
             .unwrap();
         assert_eq!(problems(&store).await, disabled);
         // One that fires always is fine.
         admin
-            .batch_execute(&alter(&format!("ENABLE ALWAYS TRIGGER {trigger}")))
+            .batch_execute(&alter(table, &format!("ENABLE ALWAYS TRIGGER {trigger}")))
             .await
             .unwrap();
         store.check_at_boot().await.unwrap();
     }
 
     admin
+        .batch_execute("DROP TRIGGER receipt_moves ON switchboard_audit.receipts")
+        .await
+        .unwrap();
+    assert_eq!(problems(&store).await, vec![missing("receipt_moves")]);
+    admin
         .batch_execute("DROP TRIGGER complete_once ON switchboard_audit.call_rows")
         .await
         .unwrap();
-    assert_eq!(problems(&store).await, vec![missing("complete_once")]);
+    assert_eq!(
+        problems(&store).await,
+        vec![missing("complete_once"), missing("receipt_moves")]
+    );
     admin
         .batch_execute("DROP TRIGGER set_times ON switchboard_audit.call_rows")
         .await
         .unwrap();
     assert_eq!(
         problems(&store).await,
-        vec![missing("set_times"), missing("complete_once")]
+        vec![
+            missing("set_times"),
+            missing("complete_once"),
+            missing("receipt_moves")
+        ]
     );
 }
 
 fn missing(trigger: &'static str) -> Problem {
-    let (purpose, fires) = match trigger {
+    let (table, purpose, fires) = match trigger {
         "set_times" => (
+            "call_rows",
             "sets both times and the deadline from the database's clock",
             "before each insert",
         ),
-        _ => ("completes a row at most once", "before each update"),
+        "receipt_moves" => (
+            "receipts",
+            "moves a receipt only as its state table allows, by the database's clock",
+            "before each insert or update",
+        ),
+        _ => (
+            "call_rows",
+            "completes a row at most once",
+            "before each update",
+        ),
     };
     Problem::TriggerMissing {
+        table,
         trigger,
         purpose,
         fires,
@@ -1755,8 +1834,10 @@ async fn a_definer_function_whose_owner_owns_the_table_or_a_trigger_function_is_
              CREATE FUNCTION reports.take() RETURNS void
                  LANGUAGE plpgsql SECURITY DEFINER
                  AS $$BEGIN
-                     EXECUTE format('GRANT DELETE ON switchboard_audit.call_rows TO %I',
-                                    current_user);
+                     -- SELECT and UPDATE too, for the receipts' foreign key's check of
+                     -- each row it deletes, which runs as the table's owner.
+                     EXECUTE format('GRANT SELECT, UPDATE, DELETE
+                                     ON switchboard_audit.call_rows TO %I', current_user);
                      DELETE FROM switchboard_audit.call_rows;
                  END$$;
              ALTER FUNCTION reports.take() OWNER TO {table_owner};

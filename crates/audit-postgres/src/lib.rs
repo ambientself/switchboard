@@ -14,36 +14,47 @@
 //!   begins failed, answers released before their row was complete, why finishes gave up, the
 //!   latency of begin and finish, and the connections of the begin and finish pools and of the
 //!   open-row query's.
+//! - It keeps receipts for side effects (decision 0009, part 2) in `receipts`: begin with a
+//!   receipt reserves one, or answers a reused key, in the same transaction as the row, and
+//!   finish settles it in the same transaction as the row's completion.
 //! - [`PgAuditStore::open_rows`] counts the open rows, through the view `open_call_rows`:
 //!   allowed calls with no completion past their deadline, by the database's clock. It has a
 //!   pool of its own, of one connection, so a slow count never takes a finish's connection.
-//! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the table
-//!   is as the store expects and the role it connects as can do no more than the store needs.
+//!   [`PgAuditStore::unknown_receipts`] counts the receipts in `unknown` on the same pool.
+//! - [`PgAuditStore::check_at_boot`] refuses to start, naming every reason, unless the tables
+//!   are as the store expects and the role it connects as can do no more than the store needs.
 //!
 //! What the database itself enforces, for the gateway's role:
 //!
 //! - It inserts the identifier the gateway chose and the first half of a row, with the
 //!   instance that began it, its kind and its allowance, but not the two times or the
 //!   deadline, which the database sets. For a row of kind `list` it inserts the tools listed
-//!   and their count, and none of a call's columns.
+//!   and their count, and none of a call's columns. For the answer to a reused key it inserts
+//!   the row complete, with its outcome, sentence, latency and the earlier receipt a
+//!   `duplicate` names.
 //! - It updates only the completion columns: outcome, its sentence, and latency.
 //! - It selects only the identifier, the decision, the completion, the kind and the deadline.
-//!   It cannot read who called what, and it cannot delete.
+//!   It cannot read who called what on `call_rows`, and it cannot delete.
 //! - It selects from the view `open_call_rows`, which shows each open row's identifier,
 //!   deadline and time at begin, and nothing else.
+//! - It reserves a receipt without its state, how it was established or its time, reads every
+//!   column of a receipt, which the reuse check needs, so it can read who caused each side
+//!   effect, and updates only a receipt's state, how it was established, the person who did and
+//!   the reference. It cannot delete a receipt.
 //!
-//! Those are the migration's grants on the table. Other objects can give a role more: a grant
+//! Those are the migration's grants on the tables. Other objects can give a role more: a grant
 //! on a view over the table, a rule, a `SECURITY DEFINER` function, or a function that reaches
 //! the server's files. [`PgAuditStore::check_at_boot`] refuses the ones it knows of, and its
 //! documentation lists those it does not look for.
 //!
-//! And for every role, through two triggers: both times and the deadline come from the
+//! And for every role, through three triggers: both times and the deadline come from the
 //! database's clock, whatever an insert or a completion carries; a row is completed at most
-//! once, a denial or a list row is never completed, and a completion writes nothing else. A
-//! call's deadline is its time at begin plus the allowance the store gives it: the begin
-//! budget, the call's deadline, the finish deadline and the answer budget ([`Budgets`]). A
-//! call row cannot be stored without one, and a list row cannot be stored with one or with a
-//! call's columns.
+//! once, a denial or a list row is never completed, and a completion writes nothing else; and a
+//! receipt moves only as the core's `may_move` allows, judging its row's deadline by the
+//! database's clock as it writes. A call's deadline is its time at begin plus the allowance the
+//! store gives it: the begin budget, the call's deadline, the finish deadline and the answer
+//! budget ([`Budgets`]). A call row cannot be stored without one, and a list row cannot be
+//! stored with one or with a call's columns.
 //!
 //! # Tests against a database
 //!
@@ -82,5 +93,5 @@ pub use stats::{
 };
 pub use store::{
     Budgets, FinishCounts, GivenUp, OPEN_ROWS_POOL_SIZE, OpenRows, PgAuditError, PgAuditStore,
-    PoolSizes,
+    PoolSizes, UnknownReceipts,
 };

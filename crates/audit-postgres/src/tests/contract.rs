@@ -2,6 +2,7 @@
 //! the testkit runs on its in-memory store. Rows are read back as the server's superuser, since
 //! the gateway's role cannot read who called what.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{AuditRowId, RowKind};
@@ -34,6 +35,7 @@ impl ContractStore for Postgres {
     }
 
     async fn stored(&self, row: &AuditRowId) -> Option<StoredRow> {
+        self.settled().await;
         // By the identifier's text, so an identifier that is not a UUID finds nothing rather
         // than failing the cast.
         let row = self
@@ -46,6 +48,7 @@ impl ContractStore for Postgres {
                         proved_delegation_team, claimed_acting_person, claimed_team,
                         outcome, outcome_sentence, error_kind, latency_ms, listed_tools,
                         listed_omitted, credential_mode, credential_principal,
+                        duplicate_of::text AS duplicate_of,
                         (extract(epoch FROM begun_at) * 1000000)::bigint AS begun_at_micros,
                         deadline IS NOT NULL AS deadline_set,
                         (extract(epoch FROM deadline - begun_at) * 1000000)::bigint
@@ -74,6 +77,9 @@ impl ContractStore for Postgres {
             }
             if let Some(error_kind) = text("error_kind") {
                 completion["error_kind"] = json!(error_kind);
+            }
+            if let Some(receipt) = text("duplicate_of") {
+                completion["receipt"] = json!(receipt);
             }
             completion
         });
@@ -189,21 +195,104 @@ impl ContractStore for Postgres {
         micros_since_epoch(now.get(0))
     }
 
-    /// The store keeps no receipts yet, so the functions that read them are not run here: see
-    /// [`NOT_YET_ON_POSTGRES`].
+    /// Every receipt, read as the server's superuser.
     async fn receipts(&self) -> Vec<Receipt> {
-        panic!("{NOT_YET_ON_POSTGRES}")
+        self.settled().await;
+        self.admin
+            .query(
+                "SELECT row_id::text, principal_issuer, principal_subject, delegation_scope,
+                        idempotency_key, tool, tool_use_id, digest, resources, resources_omitted,
+                        state, established_by, established_person, reference
+                 FROM switchboard_audit.receipts",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let text = |column: &str| row.get::<_, Option<String>>(column);
+                let resources = match row.get::<_, Value>("resources") {
+                    named @ Value::Array(_) => json!({ "named": named }),
+                    other => other,
+                };
+                let established_by = match text("established_by").as_deref() {
+                    Some("person") => json!({"by": "person", "person": text("established_person")}),
+                    by => json!({ "by": by }),
+                };
+                serde_json::from_value(json!({
+                    "row": text("row_id"),
+                    "scope": {
+                        "principal": {
+                            "issuer": text("principal_issuer"),
+                            "subject": text("principal_subject"),
+                        },
+                        "delegation": text("delegation_scope"),
+                    },
+                    "key": text("idempotency_key"),
+                    "tool": text("tool"),
+                    "tool_use_id": text("tool_use_id"),
+                    "digest": text("digest"),
+                    "resources": resources,
+                    "resources_omitted": row.get::<_, i64>("resources_omitted"),
+                    "state": text("state"),
+                    "established_by": established_by,
+                    "reference": text("reference"),
+                }))
+                .unwrap()
+            })
+            .collect()
     }
 
-    /// As [`receipts`](Self::receipts): only item 6's functions lose confirmations.
+    /// Every begin from here on commits and then reports failure, which the store takes as an
+    /// answer it never had, and tries again within its budget: a lost confirmation on every
+    /// attempt. A connection cut after the commit loses one, as the recovery tests' proxy does;
+    /// the store's test switch loses every one, which no proxy here can single out from the
+    /// completion the store then makes on its finish pool.
     fn lose_every_begin_confirmation(&self) {
-        panic!("{NOT_YET_ON_POSTGRES}")
+        self.store.lose_confirmations.store(true, Ordering::SeqCst);
     }
 
-    /// As [`receipts`](Self::receipts): only item 6's functions pass a row's deadline.
-    async fn pass_deadline(&self, _row: &AuditRowId) {
-        panic!("{NOT_YET_ON_POSTGRES}")
+    /// Moves the row's deadline back to its time at begin, which is past by the database's
+    /// clock, as the superuser, in a session whose `session_replication_role` turns off the
+    /// trigger that refuses any write but a completion.
+    async fn pass_deadline(&self, row: &AuditRowId) {
+        let id = uuid(row);
+        self.admin
+            .batch_execute(&format!(
+                "BEGIN;
+                 SET LOCAL session_replication_role = replica;
+                 UPDATE switchboard_audit.call_rows
+                     SET deadline = begun_at
+                     WHERE id = '{id}' AND deadline IS NOT NULL;
+                 COMMIT;"
+            ))
+            .await
+            .unwrap();
     }
+}
+
+impl Postgres {
+    /// Waits until the store has no completion in flight: a row whose begin lost its
+    /// confirmation is completed on a task of the store's own, after begin has answered.
+    async fn settled(&self) {
+        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+            while self.store.finishes().in_flight > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "the store's completions did not settle");
+    }
+}
+
+/// `row`, which must be a lowercase hyphenated UUID, as SQL may hold it inline.
+fn uuid(row: &AuditRowId) -> &str {
+    let id = row.as_str();
+    assert!(
+        id.len() == 36 && id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+        "{id} is not a UUID"
+    );
+    id
 }
 
 /// A time Postgres gave in whole microseconds since the epoch.
@@ -245,35 +334,7 @@ contract!(
     the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget,
     a_list_row_is_stored_complete_with_no_deadline,
     a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row,
-);
-
-/// Why item 6 of the contract suite, receipts, is not run against Postgres: the store keeps
-/// none yet (#55), and refuses every begin that would reserve one, so nothing runs. Each of
-/// its functions is listed below, ignored with this reason, so that `cargo test` reports each
-/// as not run rather than leaving it out. The package that stores receipts in Postgres runs
-/// them.
-const NOT_YET_ON_POSTGRES: &str = "the Postgres store keeps no receipts yet (#55), so item 6 of the contract suite is not run against it";
-
-macro_rules! not_yet_on_postgres {
-    ($($name:ident),* $(,)?) => {
-        $(
-            #[tokio::test]
-            #[ignore = "the Postgres store keeps no receipts yet (#55)"]
-            async fn $name() {
-                let Some(db) = TestDatabase::create().await else {
-                    return;
-                };
-                let postgres = Postgres {
-                    store: db.store(PoolSizes::default()).with_budgets(BUDGETS),
-                    admin: db.admin().await,
-                };
-                contract::$name(&postgres).await;
-            }
-        )*
-    };
-}
-
-not_yet_on_postgres!(
+    // Item 6: receipts.
     a_receipt_is_reserved_with_its_row_or_not_at_all,
     a_receipt_moves_with_its_finish,
     a_late_finish_completes_its_row_and_leaves_its_receipt_pending,

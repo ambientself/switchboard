@@ -1824,10 +1824,13 @@ mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Hos
 # The receipt-store gate (decision 0009): a tool not classified `read` on a surface is refused
 # outside a development build, at boot on both paths and on every registry reload. The tests
 # are in a development build, so the unit tests in boot.rs and reload.rs pass the exemption.
-RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, development)?;\n"
-RECEIPT_REGISTRY_PATH = "    receipt_gate(policy.snapshot(), basis.receipt_exempt)?;\n"
+RECEIPT_CONFIG_PATH = "    receipt_gate(&snapshot, development, receipt_store)?;\n"
+RECEIPT_REGISTRY_PATH = "    receipt_gate(policy.snapshot(), basis.receipt_exempt, basis.receipt_store)?;\n"
 REGISTRY_BOOT_POLICY = "    check_registry_policy(&basis.registry, &live.current(), &basis)?;\n"
-RECEIPT_BEFORE_CONNECTING = "    receipt_gate(snapshot, development)\n}\n"
+RECEIPT_BEFORE_CONNECTING = (
+    "    receipt_gate(\n        snapshot,\n        development,\n"
+    "        receipt_store_configured(identity, audit),\n    )\n}\n"
+)
 mutate_all("gw-receipt-gate-removed", "no path runs the receipt-store gate: not the boot gates, not a reload, not start::prepare before it connects",
            (BOOT, RECEIPT_CONFIG_PATH, ""), (BOOT, RECEIPT_REGISTRY_PATH, ""),
            (BOOT, RECEIPT_BEFORE_CONNECTING, "    let _ = snapshot;\n    Ok(())\n}\n"))
@@ -1838,11 +1841,23 @@ mutate("gw-boot-narrowing-config-path-skipped", "the JSON configuration's boot s
 mutate_all("gw-receipt-gate-only-at-boot", "the registry's policy meets the receipt-store gate at boot but not on a reload",
            (BOOT, RECEIPT_REGISTRY_PATH, ""),
            (BOOT, REGISTRY_BOOT_POLICY,
-            REGISTRY_BOOT_POLICY + "    receipt_gate(live.current().snapshot(), basis.receipt_exempt)?;\n"))
+            REGISTRY_BOOT_POLICY
+            + "    receipt_gate(live.current().snapshot(), basis.receipt_exempt, basis.receipt_store)?;\n"))
 mutate("gw-receipt-gate-exempt-always", "every build is exempt from the receipt-store gate", BOOT,
-       "    if exempt || receipt_store_configured() {", "    if true || exempt || receipt_store_configured() {")
+       "    if exempt || store {", "    if true || exempt || store {")
+RECEIPT_STORE = "    audit.postgres && !audit.disabled && identity.enforce.is_some() && !identity.disabled\n"
 mutate("gw-receipt-store-always-configured", "a receipt store counts as configured when there is none", BOOT,
-       "fn receipt_store_configured() -> bool {\n    false\n}", "fn receipt_store_configured() -> bool {\n    true\n}")
+       RECEIPT_STORE, "    let _ = (identity, audit);\n    true\n")
+# The gate needs all three of decision 0009's conditions: the audit store is the Postgres store,
+# which keeps receipts, audit is on, and identity is on. boot.rs's own tests try each missing.
+mutate("gw-receipt-gate-without-identity", "a receipt store counts as configured with identity off", BOOT,
+       RECEIPT_STORE, "    audit.postgres && !audit.disabled\n")
+mutate("gw-receipt-gate-without-audit", "a receipt store counts as configured with audit off", BOOT,
+       RECEIPT_STORE, "    audit.postgres && identity.enforce.is_some() && !identity.disabled\n")
+mutate("gw-receipt-gate-store-keeps-no-receipts", "a receipt store counts as configured when the audit store is not the Postgres store", BOOT,
+       RECEIPT_STORE, "    !audit.disabled && identity.enforce.is_some() && !identity.disabled\n")
+mutate("gw-receipt-store-from-json", "the JSON configuration may name the Postgres store as the receipt store", GW + "config.rs",
+       "    #[serde(skip)]\n    pub postgres: bool,", "    #[serde(default)]\n    pub postgres: bool,")
 mutate("gw-receipt-gate-propose-passes", "the receipt-store gate refuses `write` but lets `propose` through", BOOT,
        "            if tool.classification != Classification::Read {",
        "            if !matches!(tool.classification, Classification::Read | Classification::Propose) {")
@@ -2119,6 +2134,12 @@ mutate("gw-metrics-histogram-count-read-apart", "a histogram's _count is the cou
 # #161: the open-row query's pool is exported beside the begin and finish pools.
 mutate("gw-metrics-open-rows-pool-not-exported", "the pool metrics leave out the open-row query's pool", GW_METRICS,
        "        text.sample(name, &[(\"pool\", \"open_rows\")], of(&stats.open_rows_pool));\n", "")
+# The receipts in unknown and the age of the oldest (design section 11, "Signals"), counted by
+# the open-row poll. tests/metrics.rs scrapes them, against Postgres and against a database that
+# is not there; metrics.rs's own tests render them.
+mutate("gw-metrics-unknown-receipts-not-polled", "the metrics poll never counts the receipts in unknown", GW_METRICS,
+       "        let unknown = match audit.store.unknown_receipts().await {",
+       "        let unknown = match Err::<UnknownReceipts, _>(\"not counted\") {")
 mutate("gw-demo-kind-open-rows-names-outage", "the kind run's open-row metrics check names a database outage it did not have",
        "deploy/demo/demo.sh",
        "  local open=\"one row\"\n",
@@ -3545,10 +3566,10 @@ mutate("pg-columns-unknown-as-none", "resources nobody could name are written as
 mutate("pg-columns-resource-kind-as-system", "a resource's kind is written as its system", PG_COLUMNS,
        '"system": stored("resources", &resource.system)?,', '"system": stored("resources", &resource.kind)?,')
 mutate("pg-columns-omitted-saturates", "a count of resources left out past the column is cut short", PG_COLUMNS,
-       "    let omitted = i64::try_from(record.resources_omitted).map_err(|_| {\n"
+       "    let omitted = i64::try_from(omitted).map_err(|_| {\n"
        "        PgAuditError::Column(\"a count of resources left out past the column's range\")\n"
        "    })?;",
-       "    let omitted = i64::try_from(record.resources_omitted).unwrap_or(i64::MAX);")
+       "    let omitted = i64::try_from(omitted).unwrap_or(i64::MAX);")
 mutate("pg-columns-nul-kept", "a NUL in a text value is passed on to the database", PG_COLUMNS,
        "    if text.contains('\\0') {\n        return Err(PgAuditError::Nul { column });\n    }\n", "")
 mutate("pg-columns-nul-replaced", "a NUL in a text value is written as another character", PG_COLUMNS,
@@ -3558,11 +3579,13 @@ mutate("pg-columns-tool-use-id-nul-kept", "a NUL in the tool-use identifier is p
        '            tool_use_id: optional(\n                "tool_use_id",\n                record.tool_use_id.as_ref().map(|id| id.as_str()),\n            )?,',
        "            tool_use_id: record.tool_use_id.as_ref().map(|id| id.as_str().to_owned()),")
 mutate("pg-columns-outcome-sentence-nul-kept", "a NUL in a refusal's sentence is passed on to the database", PG_COLUMNS,
-       '                    stored("outcome_sentence", sentence)?,\n                    MAX_OUTCOME_SENTENCE_BYTES,\n',
-       "                    sentence.clone(),\n                    MAX_OUTCOME_SENTENCE_BYTES,\n")
+       '        stored("outcome_sentence", sentence)?,\n        MAX_OUTCOME_SENTENCE_BYTES,\n',
+       "        sentence.to_owned(),\n        MAX_OUTCOME_SENTENCE_BYTES,\n")
 mutate("pg-columns-latency-saturates", "a latency past the column is recorded as the most it holds", PG_COLUMNS,
-       """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;""",
-       """            .unwrap_or(i64::MAX);""")
+       """            .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;\n"""
+       """        Ok(Self {\n            outcome: Self::outcome_of(completion),""",
+       """            .unwrap_or(i64::MAX);\n"""
+       """        Ok(Self {\n            outcome: Self::outcome_of(completion),""")
 # Decision 0014, section 7: a row is at most 512 KiB, counted as the bytes of the values the store
 # sends, the completion included, and one over it is refused naming its largest column. Begin
 # leaves room for the completion, and finish refuses a refusal sentence over its cap, the
@@ -3678,10 +3701,11 @@ mutate("pg-begin-pool-wait-unbounded", "begin waits for a connection past its bu
 mutate("pg-finish-pool-wait-unbounded", "a finish attempt waits for a connection past its time", PG_STORE,
        "timeout_at(by, self.pool.get())", "timeout_at(by + Duration::from_secs(3600), self.pool.get())")
 mutate("pg-begin-insert-unbounded", "begin waits for its insert past its budget", PG_STORE,
-       "timeout_at(deadline, insert_on(&client, row, sent))", "timeout_at(deadline + Duration::from_secs(3600), insert_on(&client, row, sent))")
+       "timeout_at(deadline, insert_on(&mut client, row, sent))",
+       "timeout_at(deadline + Duration::from_secs(3600), insert_on(&mut client, row, sent))")
 mutate("pg-begin-insert-budget-restarts", "begin's insert has a budget of its own after the wait for a connection", PG_STORE,
-       "match timeout_at(deadline, insert_on(&client, row, sent)).await {",
-       "match timeout_at(Instant::now() + budget, insert_on(&client, row, sent)).await {")
+       "let inserted = timeout_at(deadline, insert_on(&mut client, row, sent)).await;",
+       "let inserted = timeout_at(Instant::now() + budget, insert_on(&mut client, row, sent)).await;")
 mutate("pg-timeout-not-cancelled", "a statement that ran out of time is left running", PG_STORE,
        "    tokio::spawn(cancel(client.cancel_token()));\n", "    let _ = cancel;\n")
 mutate("pg-timeout-connection-kept", "a connection that ran out of time goes back to its pool", PG_STORE,
@@ -3758,8 +3782,8 @@ mutate("pg-begin-retry-removed", "begin gives up after one failed attempt", PG_S
        "            if !failed.error.is_transient() {\n                break failed;",
        "            if true {\n                break failed;")
 mutate_all("pg-begin-retry-new-identifier", "begin is retried under a new identifier",
-           (PG_STORE, "    async fn insert(&self, row: Insert) -> Result<(), InsertFailed> {",
-            "    async fn insert(&self, mut row: Insert) -> Result<(), InsertFailed> {"),
+           (PG_STORE, "    async fn insert(&self, row: Insert) -> Result<Option<Reservation>, InsertFailed> {",
+            "    async fn insert(&self, mut row: Insert) -> Result<Option<Reservation>, InsertFailed> {"),
            (PG_STORE, "            pause = longer(pause);\n        };",
             "            pause = longer(pause);\n"
             "            if let Insert::Call(call) = &mut row {\n"
@@ -3781,8 +3805,8 @@ mutate("pg-recovery-no-such-row-final", "a lost confirmation's completion stops 
        "error @ (PgAuditError::NoSuchRow { .. } | PgAuditError::NotCompleted { .. }),",
        "error @ PgAuditError::NotCompleted { .. },")
 mutate("pg-lost-confirmation-before-insert-executed", "a begin whose insert was never executed starts a completion", PG_STORE,
-       "        match timeout_at(deadline, insert_on(&client, row, sent)).await {",
-       "        *sent = true;\n        match timeout_at(deadline, insert_on(&client, row, sent)).await {")
+       "        let inserted = timeout_at(deadline, insert_on(&mut client, row, sent)).await;",
+       "        *sent = true;\n        let inserted = timeout_at(deadline, insert_on(&mut client, row, sent)).await;")
 mutate("pg-recovery-attempt-cut-by-deadline", "a lost confirmation's completion has its last attempt cut short by its deadline", PG_STORE,
        "            let by = if last {\n                started + self.attempt",
        "            let by = if false {\n                started + self.attempt")
@@ -3868,8 +3892,9 @@ mutate("pg-check-column-missing-ignored", "a missing column passes the check", P
 mutate("pg-check-column-type-ignored", "a column of another type passes the check", PG_CHECK,
        "                if found != *expected {", "                if false {")
 mutate("pg-check-trigger-missing-ignored", "a missing trigger passes the check", PG_CHECK,
-       "        None => Some(Problem::TriggerMissing {\n            trigger: trigger.name,\n"
-       "            purpose: trigger.purpose,\n            fires: trigger.fires,\n        }),",
+       "        None => Some(Problem::TriggerMissing {\n            table: trigger.table,\n"
+       "            trigger: trigger.name,\n            purpose: trigger.purpose,\n"
+       "            fires: trigger.fires,\n        }),",
        "        None => None,")
 mutate("pg-check-trigger-replica-enabled", "a trigger that fires only for replication passes the check", PG_CHECK,
        'Some("O" | "A") => None,', 'Some("O" | "A" | "R") => None,')
@@ -3880,7 +3905,7 @@ mutate("pg-check-trigger-condition-ignored", "a trigger with a condition passes 
 mutate("pg-check-trigger-columns-ignored", "a trigger on some columns only passes the check", PG_CHECK,
        "AND cardinality(t.tgattr::int2[]) = 0", "AND (cardinality(t.tgattr::int2[]) = 0 OR true)")
 mutate("pg-check-set-times-unchecked", "the trigger that sets the times is not checked", PG_CHECK,
-       '    Trigger {\n        name: "set_times",\n        purpose: "sets both times and the deadline from the database\'s clock",\n'
+       '    Trigger {\n        table: "call_rows",\n        name: "set_times",\n        purpose: "sets both times and the deadline from the database\'s clock",\n'
        '        fires: "before each insert",\n        tgtype: 1 | 2 | 4,\n    },\n', "")
 mutate("pg-check-extra-column-ignored", "a column grant beyond the gateway's passes the check", PG_CHECK,
        "    for (privilege, column) in reachable.difference(&expected) {",
@@ -3894,7 +3919,8 @@ mutate("pg-check-whole-table-per-column", "a privilege on the whole table is als
 mutate("pg-check-delete-ignored", "DELETE on the table passes the check", PG_CHECK,
        '        "DELETE",\n', "")
 mutate("pg-check-other-tables-ignored", "column grants on another table in the schema pass the check", PG_CHECK,
-       "                     OR (c.relname <> 'call_rows'", "                     OR (false")
+       "                         OR (c.relname NOT IN ('call_rows', 'receipts')",
+       "                         OR (false")
 mutate("pg-check-schema-usage-ignored", "a role without USAGE on the schema passes the check", PG_CHECK,
        "        if !schema.get::<_, bool>(0) {", "        if false {")
 mutate("pg-check-schema-create-ignored", "CREATE on the schema passes the check", PG_CHECK,
@@ -4118,6 +4144,54 @@ mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a for
        "WHERE k.contype = 'f' AND k.conparentid = 0\n", "WHERE k.contype = 'f'\n")
 mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
        "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
+# Receipts (decision 0009, part 2): migration 0008's table, grants and trigger receipt_moves, the
+# begin with a receipt in one transaction, finish settling the receipt only before the deadline,
+# the boot check's third trigger, and the count of receipts in unknown. tests/receipts.rs, the
+# contract suite's item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
+PG_RECEIPTS = PG + "sql/migrations/0008_receipts.sql"
+mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_RECEIPTS,
+       "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed')\n",
+       "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed', 'pending')\n")
+mutate("pg-receipt-trigger-deadline-ignored", "the receipt trigger lets the call settle its receipt past the row's deadline", PG_RECEIPTS,
+       "            THEN NOT past AND NEW.state <> 'pending'\n",
+       "            THEN NEW.state <> 'pending'\n")
+mutate("pg-receipt-delete-granted", "the gateway's role may delete a receipt", PG_RECEIPTS,
+       "GRANT UPDATE (state, established_by, established_person, reference)\n"
+       "    ON switchboard_audit.receipts TO switchboard_gateway;\n",
+       "GRANT UPDATE (state, established_by, established_person, reference)\n"
+       "    ON switchboard_audit.receipts TO switchboard_gateway;\n"
+       "GRANT DELETE ON switchboard_audit.receipts TO switchboard_gateway;\n")
+mutate_all("pg-reuse-check-counts-own-row", "the reuse check counts a receipt reserved under the call's own row",
+           (PG_COLUMNS, "            AND idempotency_key = $3 AND row_id <> ($4::text)::uuid\";",
+            "            AND idempotency_key = $3 AND (row_id <> ($4::text)::uuid OR true)\";"),
+           (PG_COLUMNS, "            AND idempotency_key = $4 AND row_id <> ($5::text)::uuid\";",
+            "            AND idempotency_key = $4 AND (row_id <> ($5::text)::uuid OR true)\";"))
+mutate("pg-reservation-outside-begin-transaction", "the row is committed before its receipt is reserved, in a transaction of its own", PG_STORE,
+       "            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;\n",
+       "            transaction.commit().await?;\n"
+       "            let transaction = client.transaction().await?;\n"
+       "            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;\n")
+mutate("pg-settle-only-if-read-first", "a completion settles a receipt only if its first read found one, so a lost begin's receipt that commits after that read stays pending", PG_STORE,
+       "    if updated == 1 {\n        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;\n"
+       "        transaction\n            .execute(&statement, &[&row, &finish.settles, &finish.reference])\n            .await?;\n",
+       "    if updated == 1 {\n        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;\n"
+       "        if reserved {\n            transaction\n                .execute(&statement, &[&row, &finish.settles, &finish.reference])\n                .await?;\n        }\n")
+mutate("pg-finish-settles-past-deadline", "finish moves a receipt whatever its row's deadline", PG_COLUMNS,
+       "        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'\n"
+       "            AND NOT EXISTS (SELECT FROM switchboard_audit.call_rows c\n"
+       "                            WHERE c.id = r.row_id AND c.deadline < clock_timestamp())\";",
+       "        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'\";")
+mutate("pg-check-receipt-trigger-skipped", "the boot check does not look for the receipt trigger", PG_CHECK,
+       "    Trigger {\n        table: RECEIPTS,\n        name: \"receipt_moves\",\n"
+       "        purpose: \"moves a receipt only as its state table allows, by the database's clock\",\n"
+       "        fires: \"before each insert or update\",\n        tgtype: 1 | 2 | 4 | 16,\n    },\n",
+       "")
+mutate("pg-check-receipts-unchecked", "the boot check does not check the receipt table: that it is there, logged, and the role's grants on its columns", PG_CHECK,
+       "            receipts(client, &mut problems).await?;\n", "")
+mutate("pg-unknown-receipts-only-state-unknown", "the count of receipts in unknown leaves out those pending past their row's deadline", PG_STORE,
+       "     WHERE r.state = 'unknown' OR (r.state = 'pending' AND c.deadline < clock_timestamp())\";",
+       "     WHERE r.state = 'unknown'\";")
+
 # Open rows. The boot check compares the view with the definition it expects, so each change to
 # the view changes that definition as well, and the open-row tests must catch it themselves.
 PG_OPEN_ROWS = PG + "sql/migrations/0005_open_rows.sql"
@@ -4157,11 +4231,11 @@ mutate("pg-open-rows-begin-pool", "the open-row query runs on the begin pool", P
 mutate("pg-open-rows-uses-finish-pool", "the open-row query takes a connection from the finish pool again", PG_STORE,
        "timeout_at(deadline, self.open_rows_pool.get())", "timeout_at(deadline, self.finish.get())")
 mutate("pg-open-rows-no-time-limit", "the open-row query waits past its time limit", PG_STORE,
-       "        match timeout_at(deadline, query).await {",
-       "        match timeout_at(deadline + Duration::from_secs(3600), query).await {")
+       "        let answer = timeout_at(deadline, client.query_one(query, &[])).await;",
+       "        let answer = timeout_at(deadline + Duration::from_secs(3600), client.query_one(query, &[])).await;")
 mutate("pg-open-rows-not-cancelled", "an open-row query past its time limit is not cancelled, and its connection goes back to the pool", PG_STORE,
-       "                abandon(client, &self.cancel);\n                Err(PgAuditError::OpenRowsTimedOut { budget })",
-       "                drop(client);\n                Err(PgAuditError::OpenRowsTimedOut { budget })")
+       "                abandon(client, &self.cancel);\n                Err(timed_out(budget))",
+       "                drop(client);\n                Err(timed_out(budget))")
 # #161: the open-row query's pool is in the store's stats beside the other two, and its sessions
 # carry the store's settings. The second keeps the caller's options and drops only the store's.
 mutate("pg-open-rows-pool-not-in-stats", "the store's stats leave out the open-row query's pool", PG_STORE,
@@ -4958,8 +5032,8 @@ mutate("gw-start-per-user-grant-accepted", "a per-user grant is read from a file
 # The narrowing gate is the boot gates' own (#163; gw-boot-narrowing-* below). The start runs
 # it before it reads a credential or connects to anything.
 mutate("gw-start-narrowing-after-credentials", "the start reads credentials and connects before it refuses a narrowed entry", BOOT,
-       "    narrowing_gate(snapshot)?;\n    receipt_gate(snapshot, development)\n}\n",
-       "    receipt_gate(snapshot, development)\n}\n")
+       "    narrowing_gate(snapshot)?;\n    receipt_gate(\n        snapshot,\n",
+       "    receipt_gate(\n        snapshot,\n")
 mutate("gw-start-audit-unchecked", "the audit store serves without its boot checks", START,
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, store.check_at_boot()).await {",
        "    match tokio::time::timeout(AUDIT_CHECK_BUDGET, async { Ok::<(), BootCheckError>(()) }).await {")

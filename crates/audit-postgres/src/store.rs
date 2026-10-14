@@ -1,24 +1,28 @@
 //! [`PgAuditStore`]: the core's [`AuditStore`] on Postgres.
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use deadpool_postgres::{
-    ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod,
+    ClientWrapper, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Transaction,
 };
 use gateway_core::audit::{
     AuditRowId, Completion, ErrorKind, ListRecord, RowCompletion, StoreError,
 };
 use gateway_core::receipt::{ReceiptRequest, Reservation};
-use gateway_core::{AuditRecord, AuditStore, BoxFuture};
+use gateway_core::{AuditRecord, AuditStore, BoxFuture, Receipt, VendorReference};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{CancelToken, Socket};
 
-use crate::columns::{BeginRow, FinishRow, ListRow};
+use crate::columns::{
+    AnswerRow, BeginRow, FinishRow, ListRow, ReceiptRow, answers, earlier_receipt,
+};
 use crate::stats::{BeginFailures, GivenUpCauses, LatencyCounter, PoolStats, StoreStats};
 
 /// Why a row could not be written. Returned to the core boxed, as its [`StoreError`]; a test
@@ -97,14 +101,61 @@ pub enum PgAuditError {
         /// The row begin or list named.
         row: String,
     },
-    /// The store does not keep receipts yet (decision 0009, part 2; #55). A begin that would
-    /// reserve one, which every allowed call of a tool not classified `read` makes, is refused
-    /// before anything is sent, so the call is refused and nothing runs. So is a completion
-    /// only such a call can have: `unknown`, `duplicate`, or one carrying a vendor reference.
-    /// The boot gates already refuse a snapshot serving such a tool outside a development
-    /// build.
-    #[error("the Postgres audit store keeps no receipts yet, so {0}; nothing was written")]
-    NoReceipts(&'static str),
+    /// Finish was handed a `duplicate`, which only begin writes, as the answer to a reused key.
+    /// Nothing is sent.
+    #[error("a `duplicate` is written at begin, as the answer to a reused key, never by finish")]
+    DuplicateAtFinish,
+    /// Finish was handed what only a call that reserved a receipt has, `unknown` or a vendor
+    /// reference, for a row that reserved none. Nothing is written: a read reports neither.
+    #[error("audit row {row} reserved no receipt, so {what}; nothing was written")]
+    NoReceipt {
+        /// The row finish named.
+        row: String,
+        /// What it cannot have.
+        what: &'static str,
+    },
+    /// Begin with a receipt was handed a denial. A denial reserves nothing, and nothing is
+    /// written.
+    #[error("audit row {row} records a denial, which reserves no receipt; nothing was written")]
+    ReceiptForDenial {
+        /// The row begin named.
+        row: String,
+    },
+    /// A retried begin with a receipt found its row stored with no receipt and no answer: it
+    /// was begun without one.
+    #[error("audit row {row} was begun with no receipt")]
+    BegunWithoutReceipt {
+        /// The row begin named.
+        row: String,
+    },
+    /// A retried begin with a receipt found its row's receipt already left `pending`: its call
+    /// has run, or has been settled without running, and must not run again.
+    #[error("audit row {row}'s receipt has left pending, so its call must not run again")]
+    ReceiptSettled {
+        /// The row begin named.
+        row: String,
+    },
+    /// A retried begin with a receipt found its row written complete with something other than
+    /// an answer from the earlier receipt under its key.
+    #[error("audit row {row} is already complete, with no answer to its key's earlier receipt")]
+    AnsweredDifferently {
+        /// The row begin named.
+        row: String,
+    },
+    /// Begin with a receipt found its key neither free to reserve nor held by a receipt it
+    /// could read: two reservations of the key were each undone in turn.
+    #[error("audit row {row}'s key could not be reserved, nor its earlier receipt read")]
+    KeyContended {
+        /// The row begin named.
+        row: String,
+    },
+    /// A value read back from a receipt is not one the store writes.
+    #[error("the audit database holds {0} that the store does not write")]
+    Unreadable(&'static str),
+    /// The test told the store to lose this begin's confirmation after it committed.
+    #[cfg(test)]
+    #[error("the test lost this begin's confirmation after its row was written")]
+    ConfirmationLost,
     /// Finish named a row the table does not hold.
     #[error("audit row {row} does not exist")]
     NoSuchRow {
@@ -173,6 +224,13 @@ pub enum PgAuditError {
         /// The time limit that ran out.
         budget: Duration,
     },
+    /// The receipts in `unknown` were not counted within their time limit. The store asked the
+    /// server to cancel the query.
+    #[error("the receipts in unknown were not counted within {budget:?}")]
+    UnknownReceiptsTimedOut {
+        /// The time limit that ran out.
+        budget: Duration,
+    },
 }
 
 impl PgAuditError {
@@ -186,6 +244,8 @@ impl PgAuditError {
             Self::Pool(PoolError::Backend(_) | PoolError::Timeout(_)) | Self::AttemptTimedOut => {
                 true
             }
+            #[cfg(test)]
+            Self::ConfirmationLost => true,
             Self::Database(error) => match error.code() {
                 // Connection exception, transaction rollback (serialization, deadlock),
                 // insufficient resources, operator intervention, system error. Then a server
@@ -582,6 +642,30 @@ pub struct OpenRows {
     pub oldest_deadline: Option<SystemTime>,
 }
 
+/// The receipts in `unknown` (design section 11, "Signals"): those in the state `unknown`, and
+/// those still `pending` past their row's deadline, which read as `unknown` wherever they are
+/// read, by the database's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownReceipts {
+    /// How many receipts are in `unknown`.
+    pub count: u64,
+    /// When the oldest of them was reserved, by the database's clock, or `None` when none is.
+    /// Its age is the time since.
+    pub oldest_reserved: Option<SystemTime>,
+}
+
+/// The query [`PgAuditStore::unknown_receipts`] runs: the receipts in `unknown`, and those
+/// `pending` past their row's deadline by the database's clock, counted, with the earliest time
+/// one of them was reserved. Every column it reads is one the gateway's role may select.
+pub(crate) const UNKNOWN_RECEIPTS: &str =
+    "SELECT count(*), min(r.reserved_at) FROM switchboard_audit.receipts r
+         JOIN switchboard_audit.call_rows c ON c.id = r.row_id
+     WHERE r.state = 'unknown' OR (r.state = 'pending' AND c.deadline < clock_timestamp())";
+
+/// The SQLSTATE of the trigger `receipt_moves` refusing a move by the call only because its
+/// row's deadline has passed, by the database's clock as it writes.
+pub(crate) const RECEIPT_PAST_DEADLINE: &str = "SB001";
+
 /// The core's [`AuditStore`] on Postgres, writing to `switchboard_audit.call_rows`.
 ///
 /// Connect it as [`GATEWAY_ROLE`](crate::GATEWAY_ROLE), and call
@@ -623,7 +707,18 @@ pub struct OpenRows {
 /// - List writes a row of kind `list`, complete, with begin's pool, budget and handling of
 ///   an identifier already stored: a list row under it is this list's own, and a call row is
 ///   an error.
-/// - Finish writes the completion columns of a row that has none, on a task of its own. It
+/// - Begin with a receipt, for an allowed call of a tool not classified `read`, is begin with
+///   the same pool, budget and retries, in one transaction: the reuse check, then the row
+///   open with its receipt reserved `pending`, or the row complete with the answer to its
+///   reused key. The unique index on a key in its scope decides between two begins at once,
+///   and the one that loses is answered from the other's receipt. A row it finds stored is a
+///   retried begin's, answered as its receipt or the answer it was written with say: see
+///   `found`. Nothing before the commit can write a row, so a begin with a receipt counts as
+///   possibly written only once its commit was sent.
+/// - Finish writes the completion columns of a row that has none, on a task of its own, in one
+///   transaction with the move of the receipt the row reserved, if it reserved one, while the
+///   row's deadline has not passed by the database's clock. After it, the row is completed and
+///   the receipt left `pending`. It
 ///   waits for that task for [`Budgets::answer`], and fails if the row is not complete by
 ///   then. The task keeps trying, while the failure is one that trying again could fix, until
 ///   [`Budgets::finish_deadline`]. An attempt that fails that way gives up its connection,
@@ -662,6 +757,10 @@ pub struct PgAuditStore {
     cancel: Canceller,
     counters: Arc<Counters>,
     given_up: Report,
+    /// Whether every begin from now on loses its confirmation after it commits, as the
+    /// contract suite's runner tells it to.
+    #[cfg(test)]
+    pub(crate) lose_confirmations: AtomicBool,
 }
 
 impl PgAuditStore {
@@ -718,6 +817,8 @@ impl PgAuditStore {
             cancel,
             counters: Arc::default(),
             given_up: Arc::new(|_| {}),
+            #[cfg(test)]
+            lose_confirmations: AtomicBool::new(false),
         })
     }
 
@@ -784,35 +885,85 @@ impl PgAuditStore {
     /// started, asks the server to cancel it. Reads only: nothing marks a row abandoned or
     /// writes its outcome.
     pub async fn open_rows(&self) -> Result<OpenRows, PgAuditError> {
+        let (count, oldest_deadline) = self
+            .count_apart(
+                "SELECT count(*), min(deadline) FROM switchboard_audit.open_call_rows",
+                |budget| PgAuditError::OpenRowsTimedOut { budget },
+            )
+            .await?;
+        Ok(OpenRows {
+            count,
+            oldest_deadline,
+        })
+    }
+
+    /// Counts the receipts in `unknown`, and finds when the oldest of them was reserved: those
+    /// in the state `unknown`, and those still `pending` past their row's deadline, by the
+    /// database's clock (design section 11, "Signals"). As [`open_rows`](Self::open_rows), on
+    /// the open-row query's pool of its own, within 2 s in all, and asking the server to cancel
+    /// a query that runs past them. Reads only.
+    pub async fn unknown_receipts(&self) -> Result<UnknownReceipts, PgAuditError> {
+        let (count, oldest_reserved) = self
+            .count_apart(UNKNOWN_RECEIPTS, |budget| {
+                PgAuditError::UnknownReceiptsTimedOut { budget }
+            })
+            .await?;
+        Ok(UnknownReceipts {
+            count,
+            oldest_reserved,
+        })
+    }
+
+    /// Runs `query`, which answers one count and one time, on the open-row query's pool, within
+    /// [`OPEN_ROWS_TIMEOUT`] from asking for the connection; past it, fails with what
+    /// `timed_out` makes, and if the query has started, asks the server to cancel it.
+    async fn count_apart(
+        &self,
+        query: &str,
+        timed_out: impl Fn(Duration) -> PgAuditError,
+    ) -> Result<(u64, Option<SystemTime>), PgAuditError> {
         let budget = OPEN_ROWS_TIMEOUT;
         let deadline = Instant::now() + budget;
         let client = timeout_at(deadline, self.open_rows_pool.get())
             .await
-            .map_err(|_| PgAuditError::OpenRowsTimedOut { budget })??;
-        let query = client.query_one(
-            "SELECT count(*), min(deadline) FROM switchboard_audit.open_call_rows",
-            &[],
-        );
-        match timeout_at(deadline, query).await {
+            .map_err(|_| timed_out(budget))??;
+        let answer = timeout_at(deadline, client.query_one(query, &[])).await;
+        match answer {
             Ok(row) => {
                 let row = row?;
                 let count: i64 = row.get(0);
-                Ok(OpenRows {
-                    // count(*) is never negative.
-                    count: u64::try_from(count).unwrap_or_default(),
-                    oldest_deadline: row.get(1),
-                })
+                // count(*) is never negative.
+                Ok((u64::try_from(count).unwrap_or_default(), row.get(1)))
             }
             Err(_) => {
                 abandon(client, &self.cancel);
-                Err(PgAuditError::OpenRowsTimedOut { budget })
+                Err(timed_out(budget))
             }
         }
     }
 
-    /// Writes a call row's first half, or a list row, within the begin budget, on the begin
-    /// pool, trying again by identifier while the failure is one that trying again could fix.
-    async fn insert(&self, row: Insert) -> Result<(), InsertFailed> {
+    /// The error a committed begin ends with when the test told this store to lose every begin's
+    /// confirmation: its insert was sent, and its answer counts as not had. `None` otherwise,
+    /// and always outside the crate's own tests.
+    #[cfg(test)]
+    fn confirmation_lost(&self, sent: &mut bool) -> Option<PgAuditError> {
+        if !self.lose_confirmations.load(Ordering::SeqCst) {
+            return None;
+        }
+        *sent = true;
+        Some(PgAuditError::ConfirmationLost)
+    }
+
+    #[cfg(not(test))]
+    fn confirmation_lost(&self, _sent: &mut bool) -> Option<PgAuditError> {
+        None
+    }
+
+    /// Writes a call row's first half, with a receipt or the answer to its key or without
+    /// either, or a list row, within the begin budget, on the begin pool, trying again by
+    /// identifier while the failure is one that trying again could fix. What a begin with a
+    /// receipt did is returned; for any other, `None`.
+    async fn insert(&self, row: Insert) -> Result<Option<Reservation>, InsertFailed> {
         let deadline = Instant::now() + self.budgets.begin;
         // Whether an attempt executed its insert and ended without an answer, or with an error
         // trying again could fix, so that the row may exist. That error may be an explicit
@@ -827,7 +978,10 @@ impl PgAuditStore {
                 .insert_once(&row, deadline, &mut sent, &mut connected)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(inserted) => match self.confirmation_lost(&mut sent) {
+                    None => return Ok(inserted),
+                    Some(lost) => lost,
+                },
                 Err(error) => error,
             };
             let unanswered =
@@ -849,7 +1003,7 @@ impl PgAuditStore {
         // A denial is a complete record, and a list row is written complete: neither is left
         // open.
         if may_be_written
-            && let Insert::Call(call) = &row
+            && let Insert::Call(call) | Insert::WithReceipt { row: call, .. } = &row
             && call.decision == "allow"
         {
             self.complete_lost_begin(AuditRowId::new(call.id.clone()));
@@ -866,13 +1020,14 @@ impl PgAuditStore {
         deadline: Instant,
         sent: &mut bool,
         connected: &mut bool,
-    ) -> Result<(), PgAuditError> {
+    ) -> Result<Option<Reservation>, PgAuditError> {
         let budget = self.budgets.begin;
-        let client = timeout_at(deadline, self.begin.get())
+        let mut client = timeout_at(deadline, self.begin.get())
             .await
             .map_err(|_| PgAuditError::BeginBudget { budget })??;
         *connected = true;
-        match timeout_at(deadline, insert_on(&client, row, sent)).await {
+        let inserted = timeout_at(deadline, insert_on(&mut client, row, sent)).await;
+        match inserted {
             Ok(Err(error)) if error.is_transient() => {
                 // A failure trying again could fix may be the connection's own: one that found
                 // the server read-only, as the old primary is after a failover, stays so. The
@@ -903,12 +1058,15 @@ impl PgAuditStore {
             pool: self.finish.clone(),
             cancel: Arc::clone(&self.cancel),
             row: row.as_str().to_owned(),
-            // As the core gives up a guard: an error of the kind `other`.
+            // As the core gives up a guard: an error of the kind `other`, which settles a
+            // receipt the row reserved as `not_performed`, since nothing ran.
             finish: FinishRow {
                 outcome: "error",
                 outcome_sentence: None,
                 error_kind: Some(FinishRow::error_kind_name(ErrorKind::Other)),
                 latency_ms: 0,
+                settles: "not_performed",
+                reference: None,
             },
             attempt: self.budgets.answer,
             deadline: Instant::now() + self.budgets.finish_deadline,
@@ -934,19 +1092,33 @@ impl PgAuditStore {
         row: &AuditRowId,
         completion: &Completion,
     ) -> Result<(), PgAuditError> {
-        let client = self.finish.get().await?;
+        let mut client = self.finish.get().await?;
         complete_on(
-            &client,
+            &mut client,
             row.as_str(),
             &FinishRow::from_completion(completion)?,
         )
         .await
     }
 
+    /// Finish with no vendor reference, for tests, which cannot make the core's completion for
+    /// a row of their own choosing.
+    #[cfg(test)]
     pub(crate) async fn finish_within_budget(
         &self,
         row: &AuditRowId,
         completion: &Completion,
+    ) -> Result<(), PgAuditError> {
+        self.finish_with_reference(row, completion, None).await
+    }
+
+    /// Finish, as [`AuditStore::finish`] describes it, with the vendor's `reference` for the
+    /// row's receipt.
+    async fn finish_with_reference(
+        &self,
+        row: &AuditRowId,
+        completion: &Completion,
+        reference: Option<&VendorReference>,
     ) -> Result<(), PgAuditError> {
         let _timed = Timed::start(&self.counters.finish_latency);
         let started = Instant::now();
@@ -957,7 +1129,9 @@ impl PgAuditStore {
             outcome: FinishRow::outcome_of(completion),
             settled: false,
         };
-        let finish = match FinishRow::from_completion(completion) {
+        let finish = match FinishRow::from_completion(completion)
+            .and_then(|finish| finish.with_reference(reference))
+        {
             Ok(finish) => finish,
             Err(error) => {
                 let result = Err(error);
@@ -1006,9 +1180,30 @@ impl PgAuditStore {
         row: &AuditRowId,
         record: &AuditRecord,
     ) -> Result<(), PgAuditError> {
+        self.begin_counted_with(row, record, None).await.map(|_| ())
+    }
+
+    /// Begin, with a receipt to reserve or not, counted: its latency, whether it succeeds or
+    /// fails, and the cause of a failure.
+    async fn begin_counted_with(
+        &self,
+        row: &AuditRowId,
+        record: &AuditRecord,
+        receipt: Option<&ReceiptRequest>,
+    ) -> Result<Option<Reservation>, PgAuditError> {
         let _timed = Timed::start(&self.counters.begin_latency);
-        let begun = match BeginRow::from_record(row, record, &self.budgets) {
-            Ok(row) => self.insert(Insert::Call(Box::new(row))).await,
+        let insert = BeginRow::from_record(row, record, &self.budgets).and_then(|begun| {
+            Ok(match receipt {
+                None => Insert::Call(Box::new(begun)),
+                Some(request) => Insert::WithReceipt {
+                    receipt: Box::new(ReceiptRow::from_request(row, request)?),
+                    request: Box::new(request.clone()),
+                    row: Box::new(begun),
+                },
+            })
+        });
+        let begun = match insert {
+            Ok(insert) => self.insert(insert).await,
             Err(error) => Err(InsertFailed {
                 error,
                 connected: false,
@@ -1023,22 +1218,180 @@ impl PgAuditStore {
 
 /// What [`PgAuditStore::insert`] writes.
 enum Insert {
-    /// The first half of a call row, for begin. Each is boxed: the two differ much in size.
+    /// The first half of a call row, for begin. Each is boxed: they differ much in size.
     Call(Box<BeginRow>),
+    /// The first half of an allowed call row of a tool not classified `read`, and the receipt
+    /// it reserves, or the answer to its key, in one transaction: begin with a receipt.
+    WithReceipt {
+        row: Box<BeginRow>,
+        receipt: Box<ReceiptRow>,
+        request: Box<ReceiptRequest>,
+    },
     /// A list row, complete.
     List(Box<ListRow>),
 }
 
-/// Writes `row`, as begin or list. Sets `sent` just before the insert is executed: from then
-/// on it may commit, whatever answer comes back, or none.
+/// Writes `row`, as begin, begin with a receipt, or list. Sets `sent` just before the insert,
+/// or the transaction holding it, may commit: from then on it may have, whatever answer comes
+/// back, or none.
 async fn insert_on(
-    client: &ClientWrapper,
+    client: &mut ClientWrapper,
     row: &Insert,
     sent: &mut bool,
-) -> Result<(), PgAuditError> {
+) -> Result<Option<Reservation>, PgAuditError> {
     match row {
-        Insert::Call(row) => begin_on(client, row, sent).await,
-        Insert::List(row) => list_on(client, row, sent).await,
+        Insert::Call(row) => begin_on(client, row, sent).await.map(|()| None),
+        Insert::WithReceipt {
+            row,
+            receipt,
+            request,
+        } => begin_with_receipt_on(client, row, receipt, request, sent)
+            .await
+            .map(Some),
+        Insert::List(row) => list_on(client, row, sent).await.map(|()| None),
+    }
+}
+
+/// Begins an allowed call of a tool not classified `read` (decision 0009, part 2), in one
+/// transaction:
+///
+/// 1. The reuse check: a receipt for the key in its scope reserved under another row. One
+///    under this row is passed over, so a retried begin never refuses itself.
+/// 2. With none, the row is inserted open and the receipt reserved under it. If another begin
+///    reserved the key since the check, the unique index has made this reservation wait for
+///    that one to commit and then insert nothing: the transaction is undone, and made again
+///    from the check, which now finds that receipt.
+/// 3. With one, the row is inserted complete, with the answer to the reused key, and nothing is
+///    reserved.
+///
+/// A row already stored under the identifier is a retried begin's, and is answered as
+/// [`found`] says. Sets `sent` just before the transaction commits: nothing before that can
+/// have written a row.
+async fn begin_with_receipt_on(
+    client: &mut ClientWrapper,
+    row: &BeginRow,
+    receipt: &ReceiptRow,
+    request: &ReceiptRequest,
+    sent: &mut bool,
+) -> Result<Reservation, PgAuditError> {
+    if row.decision != "allow" {
+        return Err(PgAuditError::ReceiptForDenial {
+            row: row.id.clone(),
+        });
+    }
+    // At most twice: the second time, the check finds the receipt that the first lost to.
+    for _ in 0..2 {
+        let transaction = client.transaction().await?;
+        let earlier = reuse_check(&transaction, receipt, request).await?;
+        let Some(earlier) = earlier else {
+            let statement = transaction.prepare_cached(BeginRow::INSERT).await?;
+            let inserted = transaction.execute(&statement, &row.parameters()).await?;
+            if inserted == 0 {
+                return found(&transaction, row, request, None).await;
+            }
+            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;
+            let reserved = transaction
+                .execute(&statement, &receipt.parameters())
+                .await?;
+            if reserved == 1 {
+                *sent = true;
+                transaction.commit().await?;
+                return Ok(Reservation::Reserved);
+            }
+            // Another begin holds the key now: this row is not written open.
+            transaction.rollback().await?;
+            continue;
+        };
+        let reuse = gateway_core::Reuse::answer(request, &earlier);
+        let answer = AnswerRow::from_reuse(&reuse)?;
+        let statement = transaction
+            .prepare_cached(BeginRow::INSERT_ANSWERED)
+            .await?;
+        let inserted = transaction
+            .execute(&statement, &row.answered_parameters(&answer))
+            .await?;
+        if inserted == 0 {
+            return found(&transaction, row, request, Some(&earlier)).await;
+        }
+        *sent = true;
+        transaction.commit().await?;
+        return Ok(Reservation::Reused(reuse));
+    }
+    Err(PgAuditError::KeyContended {
+        row: row.id.clone(),
+    })
+}
+
+/// The reuse check, in `transaction`: the receipt for `receipt`'s key in its scope reserved
+/// under a row other than its own, if there is one, as [`Reuse::answer`](gateway_core::Reuse::answer)
+/// reads it. Each statement in a transaction at read committed sees what had committed when it
+/// began, so a check made after a reservation that lost its key sees the receipt it lost to.
+async fn reuse_check(
+    transaction: &Transaction<'_>,
+    receipt: &ReceiptRow,
+    request: &ReceiptRequest,
+) -> Result<Option<Receipt>, PgAuditError> {
+    let (query, parameters) = receipt.earlier();
+    let statement = transaction.prepare_cached(query).await?;
+    transaction
+        .query_opt(&statement, &parameters)
+        .await?
+        .map(|earlier| earlier_receipt(request, &earlier))
+        .transpose()
+}
+
+/// What a begin with a receipt answers for a row already stored under its identifier, which an
+/// earlier attempt wrote, or something else did. Read in `transaction`, which writes nothing:
+///
+/// - A row of another kind or decision is refused, as at a begin without a receipt.
+/// - A row the reuse check answered, from the receipt `earlier`, is answered with the answer it
+///   was written with: the one of the five for that receipt whose completion it holds,
+///   whatever has become of the receipt since. A row holding none of them is refused.
+/// - Otherwise its own receipt decides: [`Reservation::Reserved`] while it is `pending`, and
+///   refused once it has left `pending`, since its call has run or has been settled without
+///   running. A row with no receipt was begun without one, and is refused.
+async fn found(
+    transaction: &Transaction<'_>,
+    row: &BeginRow,
+    request: &ReceiptRequest,
+    earlier: Option<&Receipt>,
+) -> Result<Reservation, PgAuditError> {
+    let id = || row.id.clone();
+    let statement = transaction.prepare_cached(BeginRow::STORED).await?;
+    let Some(stored) = transaction.query_opt(&statement, &[&row.id]).await? else {
+        return Err(PgAuditError::NoSuchRow { row: id() });
+    };
+    let decision: Option<String> = stored.try_get(0)?;
+    match decision {
+        None => return Err(PgAuditError::OtherKind { row: id() }),
+        Some(decision) if decision != row.decision => {
+            return Err(PgAuditError::BegunDifferently { row: id() });
+        }
+        Some(_) => {}
+    }
+    if let Some(earlier) = earlier {
+        let outcome: Option<String> = stored.try_get(1)?;
+        let sentence: Option<String> = stored.try_get(2)?;
+        let latency_ms: Option<i64> = stored.try_get(3)?;
+        let duplicate_of: Option<String> = stored.try_get(4)?;
+        for reuse in answers(request, earlier) {
+            let answer = AnswerRow::from_reuse(&reuse)?;
+            if answer.is(
+                outcome.as_deref(),
+                sentence.as_deref(),
+                latency_ms,
+                duplicate_of.as_deref(),
+            ) {
+                return Ok(Reservation::Reused(reuse));
+            }
+        }
+        return Err(PgAuditError::AnsweredDifferently { row: id() });
+    }
+    let statement = transaction.prepare_cached(ReceiptRow::STATE).await?;
+    match transaction.query_opt(&statement, &[&row.id]).await? {
+        None => Err(PgAuditError::BegunWithoutReceipt { row: id() }),
+        Some(own) if own.try_get::<_, &str>(0)? == "pending" => Ok(Reservation::Reserved),
+        Some(_) => Err(PgAuditError::ReceiptSettled { row: id() }),
     }
 }
 
@@ -1112,12 +1465,60 @@ async fn list_on(
 
 /// Writes the completion of `row` if it has none, and otherwise checks the one it has.
 async fn complete_on(
-    client: &ClientWrapper,
+    client: &mut ClientWrapper,
     row: &str,
     finish: &FinishRow,
 ) -> Result<(), PgAuditError> {
-    let statement = client.prepare_cached(FinishRow::UPDATE).await?;
-    let updated = client
+    match complete_in_transaction(client, row, finish).await {
+        // The row's deadline passed between the settle's own test of it and the trigger's, by
+        // the database's clock, and the trigger refused the move. Made again, the settle finds
+        // the deadline passed, and completes the row with its receipt left `pending`.
+        Err(PgAuditError::Database(error))
+            if error.code().map(|code| code.code()) == Some(RECEIPT_PAST_DEADLINE) =>
+        {
+            complete_in_transaction(client, row, finish).await
+        }
+        completed => completed,
+    }
+}
+
+/// [`complete_on`], once, in one transaction: the row's completion, and the move of the receipt
+/// it reserved, if it reserved one, to the state the outcome settles it in, with the vendor's
+/// reference, while it is `pending` and the row's deadline has not passed
+/// ([`ReceiptRow::SETTLE`]). A receipt already settled, or past the deadline, is left as it
+/// is, and the row is completed all the same. `unknown`, or a reference, for a row that
+/// reserved no receipt is refused, and nothing is written.
+///
+/// The settle is made whenever the update completed the row, not only when the first read
+/// found a receipt: at read committed each statement sees what had committed when it began, so
+/// a lost begin whose row and receipt commit after that read and before the update has its row
+/// completed here, and its receipt is seen by the settle. For a row with no receipt the settle
+/// matches nothing.
+async fn complete_in_transaction(
+    client: &mut ClientWrapper,
+    row: &str,
+    finish: &FinishRow,
+) -> Result<(), PgAuditError> {
+    let transaction = client.transaction().await?;
+    let statement = transaction.prepare_cached(ReceiptRow::STATE).await?;
+    let reserved = transaction.query_opt(&statement, &[&row]).await?.is_some();
+    if !reserved {
+        let what = if finish.outcome == "unknown" {
+            Some("its outcome cannot be unknown")
+        } else if finish.reference.is_some() {
+            Some("it has no vendor reference to keep")
+        } else {
+            None
+        };
+        if let Some(what) = what {
+            return Err(PgAuditError::NoReceipt {
+                row: row.to_owned(),
+                what,
+            });
+        }
+    }
+    let statement = transaction.prepare_cached(FinishRow::UPDATE).await?;
+    let updated = transaction
         .execute(
             &statement,
             &[
@@ -1130,12 +1531,18 @@ async fn complete_on(
         )
         .await?;
     if updated == 1 {
+        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;
+        transaction
+            .execute(&statement, &[&row, &finish.settles, &finish.reference])
+            .await?;
+        transaction.commit().await?;
         return Ok(());
     }
     // Nothing matched: the row is missing, or already complete. A retried finish whose
-    // first attempt was written finds its own completion, which is success.
-    let statement = client.prepare_cached(FinishRow::SELECT).await?;
-    let Some(existing) = client.query_opt(&statement, &[&row]).await? else {
+    // first attempt was written finds its own completion, which is success. Nothing is written,
+    // and the transaction is undone as it is dropped.
+    let statement = transaction.prepare_cached(FinishRow::SELECT).await?;
+    let Some(existing) = transaction.query_opt(&statement, &[&row]).await? else {
         return Err(PgAuditError::NoSuchRow {
             row: row.to_owned(),
         });
@@ -1240,10 +1647,11 @@ impl Retry {
 
     /// One attempt, which ends by `by`.
     async fn once(&self, by: Instant) -> Result<(), PgAuditError> {
-        let client = timeout_at(by, self.pool.get())
+        let mut client = timeout_at(by, self.pool.get())
             .await
             .map_err(|_| PgAuditError::AttemptTimedOut)??;
-        match timeout_at(by, complete_on(&client, &self.row, &self.finish)).await {
+        let completed = timeout_at(by, complete_on(&mut client, &self.row, &self.finish)).await;
+        match completed {
             Ok(Err(error)) if error.is_transient() => {
                 // The next attempt makes a connection of its own. This one may be to a server
                 // that has become a read-only standby, which every attempt on it would find.
@@ -1274,14 +1682,16 @@ impl AuditStore for PgAuditStore {
 
     fn begin_with_receipt<'a>(
         &'a self,
-        _row: &'a AuditRowId,
-        _record: &'a AuditRecord,
-        _receipt: &'a ReceiptRequest,
+        row: &'a AuditRowId,
+        record: &'a AuditRecord,
+        receipt: &'a ReceiptRequest,
     ) -> BoxFuture<'a, Result<Reservation, StoreError>> {
-        Box::pin(async {
-            Err(StoreError::from(PgAuditError::NoReceipts(
-                "a call of a tool not classified `read` cannot be begun",
-            )))
+        Box::pin(async move {
+            match self.begin_counted_with(row, record, Some(receipt)).await {
+                Ok(Some(reservation)) => Ok(reservation),
+                Ok(None) => Err(StoreError::from("a begin with a receipt reserved nothing")),
+                Err(error) => Err(StoreError::from(error)),
+            }
         })
     }
 
@@ -1290,14 +1700,13 @@ impl AuditStore for PgAuditStore {
         completion: &'a RowCompletion,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            if completion.reference().is_some() {
-                return Err(StoreError::from(PgAuditError::NoReceipts(
-                    "a completion with a vendor reference cannot be written",
-                )));
-            }
-            self.finish_within_budget(completion.row(), completion.completion())
-                .await
-                .map_err(StoreError::from)
+            self.finish_with_reference(
+                completion.row(),
+                completion.completion(),
+                completion.reference(),
+            )
+            .await
+            .map_err(StoreError::from)
         })
     }
 
@@ -1310,6 +1719,7 @@ impl AuditStore for PgAuditStore {
             let row = ListRow::from_record(row, record)?;
             self.insert(Insert::List(Box::new(row)))
                 .await
+                .map(|_| ())
                 .map_err(|failed| StoreError::from(failed.error))
         })
     }
