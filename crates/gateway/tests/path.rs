@@ -638,6 +638,50 @@ fn an_allowed_proposal_runs_under_the_callers_credential_and_completes_its_row()
     );
 }
 
+/// A call's key is its tool-use identifier, the first carrier (decision 0009, "The key"). A
+/// proposal sent with none is denied, asking for one, and nothing runs. Sent twice with one
+/// identifier, it runs once: the second is answered from the first's receipt as a duplicate, a
+/// success naming the receipt and the vendor's reference, and its row is complete.
+#[test]
+fn a_proposals_key_is_its_tool_use_identifier() {
+    let world = World::new();
+    let arguments = json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."});
+    let sentence = world
+        .call(Caller::TeamA, SURFACE_ALL, DRAFT_TOOL, arguments.clone())
+        .denial();
+    assert!(sentence.contains("tool-use identifier"), "{sentence}");
+    assert_eq!(world.row(0).reason, Some(ReasonKind::KeyMissing));
+    world.assert_nothing_ran();
+
+    let token = world.token(Caller::TeamA);
+    let send = || {
+        world.send(
+            Some(&token),
+            SURFACE_ALL,
+            tools_call_with_id(DRAFT_TOOL, arguments.clone(), "toolu_one_call"),
+        )
+    };
+    let first = send().result();
+    assert_eq!(first["structuredContent"]["draft"], json!("draft-1"));
+    let again = send().result();
+    assert_eq!(again["isError"], json!(false), "{again}");
+    let receipt = world.store.receipts()[0].row.clone();
+    assert_eq!(
+        again["structuredContent"]["receipt"],
+        json!(receipt.as_str())
+    );
+    assert_eq!(again["structuredContent"]["reference"], json!("draft-1"));
+    assert_eq!(
+        world.connector.writes().len(),
+        1,
+        "the draft was made twice"
+    );
+    assert_eq!(
+        world.row(2).completion.map(|completion| completion.outcome),
+        Some(Outcome::Duplicate { receipt })
+    );
+}
+
 // --- Denials --------------------------------------------------------------------------------
 
 #[test]
