@@ -1715,6 +1715,27 @@ mod tests {
         }
     }
 
+    /// The store keeps no receipts yet (#55), so it refuses an outcome only a call with one has,
+    /// before anything is sent: finish then gives up, and the row stays open.
+    #[test]
+    fn an_unknown_or_duplicate_outcome_is_refused_until_receipts_are_kept() {
+        for outcome in [
+            Outcome::Unknown,
+            Outcome::Duplicate {
+                receipt: AuditRowId::new("01a00000-0000-7000-8000-000000000000"),
+            },
+        ] {
+            let refused = FinishRow::from_completion(&Completion {
+                outcome: outcome.clone(),
+                latency_ms: 0,
+            });
+            assert!(
+                matches!(refused, Err(PgAuditError::NoReceipts(_))),
+                "{outcome:?}: {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_complete_record_is_refused_at_begin() {
         let mut record = allowed_workload();
