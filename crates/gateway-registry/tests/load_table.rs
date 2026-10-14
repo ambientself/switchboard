@@ -1261,7 +1261,12 @@ fn cases() -> Vec<Case> {
         // own `ReachTestMissing` above, which comes first.
         case(
             "rule 2: a proxied tool classified propose",
-            |t| set(t, "tools.0", "classification", value("\"propose\"")),
+            |t| {
+                set(t, "tools.0", "classification", value("\"propose\""));
+                // Settled by a person, as every tool not classified read must say, so
+                // that rule 2 is the only refusal.
+                set(t, "tools.0", "settlement", value("\"person\""));
+            },
             Want::Error(E::Snapshot(SnapshotError::ProxiedNotRead {
                 tool: tool("docs__read"),
                 entry: "docs-server".into(),
@@ -1270,7 +1275,12 @@ fn cases() -> Vec<Case> {
         ),
         case(
             "rule 2: a proxied tool classified write",
-            |t| set(t, "tools.1", "classification", value("\"write\"")),
+            |t| {
+                set(t, "tools.1", "classification", value("\"write\""));
+                // Settled by a person, as every tool not classified read must say, so
+                // that rule 2 is the only refusal.
+                set(t, "tools.1", "settlement", value("\"person\""));
+            },
             Want::Error(E::Snapshot(SnapshotError::ProxiedNotRead {
                 tool: tool("wiki__search"),
                 entry: "wiki-server".into(),
