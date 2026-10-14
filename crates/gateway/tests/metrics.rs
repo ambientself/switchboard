@@ -612,6 +612,7 @@ async fn open_row(in_database: tokio_postgres::Config, setup: tokio_postgres::Cl
         resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
         caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
+        key: None,
     };
     let start = RowStart {
         call_deadline_ms: 0,

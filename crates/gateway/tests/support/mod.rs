@@ -12,12 +12,12 @@ use gateway::{
     serve_with_telemetry,
 };
 use gateway_core::{ApprovedTool, IDENTITY_FAILURE, Resources};
-use gateway_mcp::{CHALLENGE, DENIAL_CODE};
+use gateway_mcp::{CHALLENGE, DENIAL_CODE, TOOL_USE_ID_META};
 use gateway_testkit::{
     AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, FakeCredentialSource, Fixture, FixtureConnector,
     GROUP_G, GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B,
     PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, TEAM_A, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT,
-    USER_ISSUER, WORKLOAD_ISSUER, WRITE_TOOL,
+    USER_ISSUER, WORKLOAD_ISSUER, WRITE_TOOL, fresh_key,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -115,6 +115,25 @@ impl Server {
             &legacy("tools/call", json!({"name": tool, "arguments": arguments})),
         )
         .bearer(&self.token(caller))
+    }
+
+    /// A 2025-06-18 `tools/call` from `caller` carrying a fresh tool-use identifier, which is
+    /// its idempotency key: what a call of a tool not classified `read` needs.
+    pub fn call_with_key(
+        &self,
+        caller: Caller,
+        surface: &str,
+        tool: &str,
+        arguments: Value,
+    ) -> Http {
+        let key = fresh_key();
+        let params = json!({
+            "name": tool,
+            "arguments": arguments,
+            "_meta": {TOOL_USE_ID_META: key.as_str()},
+        });
+        self.post(surface, &legacy("tools/call", params))
+            .bearer(&self.token(caller))
     }
 
     /// Nothing reached the connector or the credential source, and no row was written.

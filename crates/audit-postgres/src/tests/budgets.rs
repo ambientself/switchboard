@@ -91,6 +91,7 @@ pub(super) fn decide_read(fixture: &Fixture, call: &Call) -> gateway_core::Decis
         resources: FixtureConnector::resources_of(call.tool, &call.arguments),
         caller: fixture.caller_context(call.caller, call.surface).unwrap(),
         tool: RequestedTool::new(call.tool),
+        key: None,
     };
     decide(&fixture.policy, &context)
 }

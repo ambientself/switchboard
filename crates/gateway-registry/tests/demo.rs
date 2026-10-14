@@ -188,6 +188,7 @@ fn call(registry: &Registry, caller: &CallerContext, name: &str, args: Value) ->
             caller: caller.clone(),
             tool: name.into(),
             resources,
+            key: None,
         },
     )
     .verdict()

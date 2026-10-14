@@ -24,6 +24,7 @@ use gateway_testkit::{
 use serde_json::{Value, json};
 use support::{
     AUDIT_FAILURE, Answer, PATIENCE, Request, call, call_params, client, document, eventually,
+    keyed_call_params, propose,
 };
 
 const ERAS: [Era; 2] = [Era::Legacy, Era::Modern];
@@ -174,11 +175,21 @@ fn denials(gateway: &FixtureGateway) -> Vec<Denial> {
         },
         Denial {
             kind: ReasonKind::ResourceOutsideLimit,
-            token: team_a,
+            token: team_a.clone(),
             surface: SURFACE_READ,
             tool: READ_TOOL,
             arguments: json!({}),
             names: READ_TOOL,
+        },
+        // The key check, last: team A may propose, and a proposal that carries no tool-use
+        // identifier carries no key (decision 0009).
+        Denial {
+            kind: ReasonKind::KeyMissing,
+            token: team_a,
+            surface: SURFACE_ALL,
+            tool: DRAFT_TOOL,
+            arguments: document(TEAM_A_DOCUMENT),
+            names: "tool-use identifier",
         },
     ]
 }
@@ -442,7 +453,7 @@ fn proposal(gateway: &FixtureGateway) -> Request {
         Era::Legacy,
         &gateway.url(SURFACE_ALL),
         "tools/call",
-        call_params(
+        keyed_call_params(
             DRAFT_TOOL,
             json!({"document": TEAM_A_DOCUMENT, "text": "A proposed change."}),
         ),
@@ -793,7 +804,7 @@ async fn team_a_proposes_and_revises_its_own_draft_and_a_foreign_draft_is_refuse
             .extend(extra.as_object().unwrap().clone());
         arguments
     };
-    let (is_error, opened) = call(
+    let (is_error, opened) = propose(
         &gateway,
         Caller::TeamA,
         Era::Modern,
@@ -806,7 +817,7 @@ async fn team_a_proposes_and_revises_its_own_draft_and_a_foreign_draft_is_refuse
     assert!(!is_error, "{opened}");
     assert_eq!(opened["structuredContent"]["draft"], json!("draft-1"));
 
-    let (is_error, revised) = call(
+    let (is_error, revised) = propose(
         &gateway,
         Caller::TeamA,
         Era::Legacy,
@@ -820,7 +831,7 @@ async fn team_a_proposes_and_revises_its_own_draft_and_a_foreign_draft_is_refuse
     assert_eq!(revised["structuredContent"]["draft"], json!("draft-1"));
 
     // A draft a person opened is refused by the tool when it runs, and recorded as refused.
-    let sentence = call(
+    let sentence = propose(
         &gateway,
         Caller::TeamA,
         Era::Modern,

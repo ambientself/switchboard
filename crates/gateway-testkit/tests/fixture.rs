@@ -13,7 +13,8 @@ use gateway_testkit::{
     AUDIENCE, Caller, DEPLOYMENT, DRAFT_TOOL, Fixture, FixtureConnector, GROUP_G, GROUP_REVIEW,
     PROFILE_REVIEWER, PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL,
     SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT,
-    UNKNOWN_PROFILE, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, policy, policy_data,
+    UNKNOWN_PROFILE, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, fresh_key, policy,
+    policy_data,
 };
 use serde_json::{Value, json};
 
@@ -291,6 +292,7 @@ fn a_user_in_two_groups_with_different_profiles_is_denied_whatever_it_calls() {
             READ_TOOL,
             &json!({"document": gateway_testkit::GROUP_G_DOCUMENT}),
         ),
+        key: None,
     };
     assert_eq!(
         decide(&fixture.policy, &call)
@@ -304,13 +306,19 @@ fn a_user_in_two_groups_with_different_profiles_is_denied_whatever_it_calls() {
 #[test]
 fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixture() {
     let fixture = fixture();
-    let decide_for = |caller: Caller, surface: &str, tool: &str, arguments: Value| {
-        let call = CallContext {
-            caller: fixture.caller_context(caller, surface).unwrap(),
-            tool: RequestedTool::new(tool),
-            resources: FixtureConnector::resources_of(tool, &arguments),
+    // Each call carries a key, as a call of a tool not classified `read` must.
+    let decide_keyed =
+        |caller: Caller, surface: &str, tool: &str, arguments: Value, keyed: bool| {
+            let call = CallContext {
+                caller: fixture.caller_context(caller, surface).unwrap(),
+                tool: RequestedTool::new(tool),
+                resources: FixtureConnector::resources_of(tool, &arguments),
+                key: keyed.then(fresh_key),
+            };
+            decide(&fixture.policy, &call)
         };
-        decide(&fixture.policy, &call)
+    let decide_for = |caller: Caller, surface: &str, tool: &str, arguments: Value| {
+        decide_keyed(caller, surface, tool, arguments, true)
     };
     let own = |caller: Caller| json!({"document": caller.own_document()});
 
@@ -349,6 +357,19 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
             .map(|reason| reason.kind())
     };
     use ReasonKind::*;
+    // The key check, last: team A's proposal, allowed with a key, is denied without one.
+    assert_eq!(
+        decide_keyed(
+            Caller::TeamA,
+            SURFACE_ALL,
+            DRAFT_TOOL,
+            own(Caller::TeamA),
+            false
+        )
+        .reason()
+        .map(|reason| reason.kind()),
+        Some(KeyMissing)
+    );
     // Team B's profile does not permit proposals.
     assert_eq!(
         denied(Caller::TeamB, SURFACE_ALL, DRAFT_TOOL, own(Caller::TeamB)),
@@ -442,6 +463,7 @@ fn every_kind_of_denial_the_decision_function_makes_is_reachable_from_the_fixtur
         caller,
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &own(Caller::TeamA)),
+        key: None,
     };
     assert_eq!(
         decide(&fixture.policy, &call)

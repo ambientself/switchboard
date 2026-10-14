@@ -24,7 +24,7 @@ use gateway_testkit::{
     GROUP_G_DOCUMENT, Gate, InMemoryAuditStore, PROFILE_TEAM_B, READ_TOOL, RESOURCE_KIND,
     RESOURCE_SYSTEM, SCOPE_REFUSAL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, SteppableClock,
     StoreBudgets, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL, WriteRecord, block_on,
-    document, policy_data, poll_once, row_start,
+    document, fresh_key, policy_data, poll_once, row_start,
 };
 use serde_json::{Value, json};
 
@@ -45,6 +45,8 @@ fn guard_for(
         caller: fixture.caller_context(caller, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(tool),
         resources,
+        // A key of its own, which a tool not classified `read` needs and a read ignores.
+        key: Some(fresh_key()),
     };
     let decision = decide(&fixture.policy, &call);
     assert!(decision.is_allowed(), "{decision:?}");
@@ -59,6 +61,7 @@ fn guard_for(
     {
         Begun::Allowed(guard) => guard,
         Begun::Denied(refusal) => panic!("{refusal:?}"),
+        Begun::Reused(reused) => panic!("{reused:?}"),
     }
 }
 
@@ -231,6 +234,7 @@ fn a_row_keeps_its_count_of_omitted_resources_through_begin_and_finish() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
+        key: None,
     };
     let decision = decide(&fixture.policy, &call);
     assert!(decision.is_allowed(), "{decision:?}");
@@ -262,6 +266,7 @@ fn a_failed_begin_writes_nothing_and_the_next_one_works() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &json!({"document": "team-a-notes"})),
+        key: None,
     };
     let decision = decide(&fixture.policy, &call);
     let failure = block_on(audit::begin(
@@ -301,6 +306,7 @@ fn every_begin_fails_until_told_to_stop() {
                 READ_TOOL,
                 &json!({"document": "team-a-notes"}),
             ),
+            key: None,
         };
         block_on(audit::begin(
             &store,
@@ -409,6 +415,7 @@ fn a_held_begin_writes_no_row_until_released() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &json!({"document": "team-a-notes"})),
+        key: None,
     };
     let decision = decide(&fixture.policy, &call);
     let mut begin = pin!(audit::begin(
@@ -470,6 +477,7 @@ fn a_failure_setting_is_not_consumed_by_a_held_call_until_it_is_released() {
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
         resources: FixtureConnector::resources_of(READ_TOOL, &json!({"document": "team-a-notes"})),
+        key: None,
     };
     let mut begin = pin!(audit::begin(
         &store,
@@ -497,6 +505,7 @@ fn begin_as(
         caller: fixture.team_a_workload(SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(tool),
         resources: FixtureConnector::resources_of(tool, &arguments),
+        key: None,
     };
     block_on(audit::begin(
         store,
@@ -1638,6 +1647,7 @@ fn scoped(rig: &Rig, caller: Caller, document: &str) -> Answer {
         caller: rig.fixture.caller_context(caller, surface).unwrap(),
         tool: RequestedTool::new(SCOPED_READ_TOOL),
         resources: FixtureConnector::resources_of(SCOPED_READ_TOOL, &arguments),
+        key: None,
     };
     let decision = decide(&rig.fixture.policy, &call);
     let Begun::Allowed(guard) = block_on(audit::begin(

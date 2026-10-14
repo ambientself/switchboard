@@ -210,6 +210,7 @@ fn decision_context(fixture: &Fixture, call: &Call) -> CallContext {
             .caller_context(call.caller, call.surface)
             .expect("the fixture knows the caller"),
         tool: RequestedTool::new(call.tool),
+        key: None,
     }
 }
 
@@ -1006,6 +1007,7 @@ pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
             .expect("the fixture knows team A"),
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
+        key: None,
     };
     let begun = audit::begin(
         store,
@@ -1047,6 +1049,7 @@ async fn finish_touches_only_its_completion(
         Answer::Refused(sentence) => Outcome::Refused {
             sentence: sentence.clone(),
         },
+        Answer::Unknown(_) => Outcome::Unknown,
         Answer::AuditFailed { .. } => panic!("{:?}", finished.answer()),
     };
     let completion = Completion {

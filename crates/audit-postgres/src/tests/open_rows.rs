@@ -56,6 +56,7 @@ async fn begin(
         resources: FixtureConnector::resources_of(READ_TOOL, &arguments),
         caller: fixture.caller_context(caller, SURFACE_ALL).unwrap(),
         tool: RequestedTool::new(READ_TOOL),
+        key: None,
     };
     let start = RowStart {
         call_deadline_ms: 0,
@@ -69,6 +70,7 @@ async fn begin(
         // Dropped unfinished: the row keeps an empty outcome.
         Begun::Allowed(guard) => (guard.row().clone(), true),
         Begun::Denied(refusal) => (refusal.row().clone(), false),
+        Begun::Reused(reused) => panic!("the Postgres store reserves no receipts: {reused:?}"),
     }
 }
 
