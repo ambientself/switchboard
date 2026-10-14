@@ -63,6 +63,13 @@
 //!     `switchboard_audit_oldest_unknown_receipt_reserved_seconds` and
 //!     `switchboard_audit_unknown_receipts_poll_failures_total`, from the same poll: the
 //!     receipts in `unknown` and the age of the oldest (design section 11, "Signals");
+//!   - from [`ReconcileSignals`], reconciliation's (design section 11, "Signals"):
+//!     `switchboard_reconciliation_lookups_total{result}`, the lookups made, `result` one of
+//!     `found`, `not_found_authoritative`, `not_found` and `failed`;
+//!     `switchboard_reconciliation_handed_to_person_total`, the receipts handed to a person,
+//!     which stay `unknown` and so in `switchboard_audit_unknown_receipts`; and
+//!     `switchboard_reconciliation_store_failures_total`, the reads and writes of the queue
+//!     that failed;
 //!   - `switchboard_audit_begin_latency_seconds` and `switchboard_audit_finish_latency_seconds`,
 //!     histograms with the store's fixed buckets;
 //!   - `switchboard_audit_pool_connections_in_use{pool}`, and beside it, as separate gauges,
@@ -131,6 +138,7 @@ use tokio::task::JoinHandle;
 use crate::bulkhead::{ProxiedSignals, ServerCounts};
 use crate::drift::{DriftCounts, DriftSignals};
 use crate::keys::KeyAges;
+use crate::reconcile::{ReconcileCounts, ReconcileSignals};
 use crate::reload::Freshness;
 use crate::server::{HEADER_READ_TIMEOUT, accept_failed};
 use crate::telemetry::{Telemetry, TelemetryCounts};
@@ -154,6 +162,7 @@ pub struct Metrics {
     policy: Option<Freshness>,
     proxied: ProxiedSignals,
     drift: Option<DriftSignals>,
+    reconciliation: Option<ReconcileSignals>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -165,6 +174,7 @@ impl std::fmt::Debug for Metrics {
             .field("policy", &self.policy)
             .field("proxied", &self.proxied)
             .field("drift", &self.drift)
+            .field("reconciliation", &self.reconciliation)
             .finish()
     }
 }
@@ -198,6 +208,7 @@ impl Metrics {
             policy: None,
             proxied: ProxiedSignals::default(),
             drift: None,
+            reconciliation: None,
         }
     }
 
@@ -205,6 +216,14 @@ impl Metrics {
     /// [`DriftPass::signals`](crate::drift::DriftPass::signals) gives.
     pub fn with_drift(mut self, drift: DriftSignals) -> Self {
         self.drift = Some(drift);
+        self
+    }
+
+    /// The same metrics, with what reconciliation counts, which
+    /// [`Reconciler::signals`](crate::reconcile::Reconciler::signals) gives. Written beside the
+    /// audit signals.
+    pub fn with_reconciliation(mut self, signals: ReconcileSignals) -> Self {
+        self.reconciliation = Some(signals);
         self
     }
 
@@ -256,6 +275,9 @@ impl Metrics {
                     unknown_failures: audit.unknown_failures.load(Ordering::Relaxed),
                 },
             );
+        }
+        if let Some(reconciliation) = &self.reconciliation {
+            reconciliation_signals(&mut text, &reconciliation.counts());
         }
         text.0
     }
@@ -476,6 +498,41 @@ fn proxied_signals(text: &mut Text, instance_shed: u64, servers: &[(ConnectorNam
             counts.late_or_oversized,
         );
     }
+}
+
+fn reconciliation_signals(text: &mut Text, counts: &ReconcileCounts) {
+    text.family(
+        "switchboard_reconciliation_lookups_total",
+        "counter",
+        "Lookups reconciliation made for unknown receipts, by result: found, \
+         not_found_authoritative, not_found (a search that proves nothing) or failed.",
+    );
+    for (result, count) in [
+        ("found", counts.found),
+        ("not_found_authoritative", counts.not_found_authoritative),
+        ("not_found", counts.not_found),
+        ("failed", counts.failed),
+    ] {
+        text.sample(
+            "switchboard_reconciliation_lookups_total",
+            &[("result", result)],
+            count,
+        );
+    }
+    text.single(
+        "switchboard_reconciliation_handed_to_person_total",
+        "counter",
+        "Unknown receipts handed to a person, with nothing to look in or their attempts used up. \
+         Each stays unknown until a person settles it.",
+        counts.handed_to_person,
+    );
+    text.single(
+        "switchboard_reconciliation_store_failures_total",
+        "counter",
+        "Reads and writes of the queue of unknown receipts that failed. The next pass tries \
+         again.",
+        counts.store_failures,
+    );
 }
 
 fn drift_signals(text: &mut Text, servers: &[(ConnectorName, DriftCounts)], withdrawn: u64) {
@@ -1099,5 +1156,57 @@ mod tests {
             "{none}"
         );
         assert!(lines(&closed).contains(&"switchboard_audit_open_rows 0"));
+    }
+
+    /// Reconciliation's signals: each lookup by its result, the receipts handed to a person and
+    /// the store's failures, each a counter with a sample from the start.
+    #[test]
+    fn the_reconciliation_signals_count_lookups_by_result_and_hand_offs() {
+        let mut text = Text::default();
+        reconciliation_signals(
+            &mut text,
+            &ReconcileCounts {
+                found: 1,
+                not_found_authoritative: 2,
+                not_found: 3,
+                failed: 4,
+                handed_to_person: 5,
+                store_failures: 6,
+            },
+        );
+        let text = text.0;
+        for family in [
+            "switchboard_reconciliation_lookups_total",
+            "switchboard_reconciliation_handed_to_person_total",
+            "switchboard_reconciliation_store_failures_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {family} counter\n")),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            lines(&text),
+            [
+                "switchboard_reconciliation_lookups_total{result=\"found\"} 1",
+                "switchboard_reconciliation_lookups_total{result=\"not_found_authoritative\"} 2",
+                "switchboard_reconciliation_lookups_total{result=\"not_found\"} 3",
+                "switchboard_reconciliation_lookups_total{result=\"failed\"} 4",
+                "switchboard_reconciliation_handed_to_person_total 5",
+                "switchboard_reconciliation_store_failures_total 6",
+            ]
+        );
+        let metrics = Metrics::new(Telemetry::bounded(1).0, None);
+        assert!(
+            !metrics.render().contains("switchboard_reconciliation"),
+            "with no reconciler nothing is written"
+        );
+        let zero = metrics
+            .with_reconciliation(ReconcileSignals::default())
+            .render();
+        assert!(
+            lines(&zero).contains(&"switchboard_reconciliation_handed_to_person_total 0"),
+            "{zero}"
+        );
     }
 }
