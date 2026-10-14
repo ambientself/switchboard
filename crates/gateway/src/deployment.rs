@@ -176,9 +176,9 @@
 //!   longer. See
 //!   [`DEFAULT_RECONCILE_INTERVAL`](crate::reconcile::DEFAULT_RECONCILE_INTERVAL),
 //!   [`DEFAULT_RECONCILE_LEASE`](crate::reconcile::DEFAULT_RECONCILE_LEASE) and
-//!   [`DEFAULT_RECONCILE_ATTEMPTS`](crate::reconcile::DEFAULT_RECONCILE_ATTEMPTS). They are
-//!   provisional, chosen before any connector has a lookup (#12). Each outside its range is
-//!   refused.
+//!   [`DEFAULT_RECONCILE_ATTEMPTS`](crate::reconcile::DEFAULT_RECONCILE_ATTEMPTS). The owner
+//!   accepted them on 2026-10-14, before any connector has a lookup (#12); they are revisited
+//!   once lookups exist. Each outside its range is refused.
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
 //! audit pools, the limits, each server's bounds, the drift interval and the reconciliation

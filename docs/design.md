@@ -896,9 +896,10 @@ receipt.
   that sends no tool-use identifier and cannot set the `_meta` field cannot make side effects;
   Q13 checks each target client. The same key with a different tool-use identifier is refused
   with a sentence of its own.
-- **The gateway reads the carriers in the other order.** Decision 0009 lists them in the order
-  above, with the tool-use identifier first; the gateway takes a key the caller sent on
-  purpose first, and the tool-use identifier is the key only when there is none. The explicit
+- **An explicit key wins.** Decision 0009 lists the carriers with the tool-use identifier
+  first; the gateway takes a key the caller sent on purpose first, and the tool-use identifier
+  is the key only when there is none. The owner accepted this reading on 2026-10-14, noted in
+  decision 0009. The explicit
   carriers are the `_meta` field `switchboard/idempotencyKey`, beside the
   `switchboard/auditRow` the answer names, and else the `Idempotency-Key` header, read only
   for a profile whose `idempotency_key_header` is true; it is false unless a policy says so,
@@ -948,8 +949,8 @@ receipt.
   the receipt, appended and never changed. A receipt with nothing to look in, or whose
   connector has no lookup, goes to a person at once; one whose lookups are used up goes to a
   person on its last. The interval, the lease and the number of attempts are deployment-file
-  settings, 60 s, 120 s and 5 by default, provisional until a connector has a lookup
-  (`crates/gateway/src/reconcile.rs`). A receipt handed to a person stays `unknown`, so the
+  settings, 60 s, 120 s and 5 by default, accepted by the owner on 2026-10-14 and revisited
+  once a connector has a lookup (`crates/gateway/src/reconcile.rs`). A receipt handed to a person stays `unknown`, so the
   open-row and unknown-receipt signals still count it. Nothing records a person's resolution
   yet: who may record one, and through which authenticated path, is decision 0009's Still open
   10, and who settles a receipt by hand is its Still open 9. A `propose` tool may be approved

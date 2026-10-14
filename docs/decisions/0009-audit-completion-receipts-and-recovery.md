@@ -356,6 +356,15 @@ A call that carries both a key and a tool-use identifier records both. The same 
 with a different tool-use identifier is refused with a sentence of its own, because that is
 what a key fixed in configuration looks like.
 
+Noted on 2026-10-14: the owner accepted which carrier wins when a call has more than one. "In
+this order" lists the carriers; it does not make the tool-use identifier win. A key the caller
+sends on purpose is the key: the named `_meta` field, `switchboard/idempotencyKey`, or else the
+`Idempotency-Key` header from a profile that declares it. The tool-use identifier is then
+recorded beside it, and is the key only when there is no explicit key. That is what lets the
+rule above refuse one key with two tool-use identifiers, and lets a key that stays the same
+across a replayed turn cover it. An explicit key that is not valid leaves the call with no key;
+it is not passed over for the tool-use identifier. Built in #205.
+
 A key is scoped to the proved principal and, when a delegation is present, to the delegation's
 identifying fields: for Otto, the session and the turn, to be confirmed with Otto's owners
 (Still open 8). They are also asked whether a turn is unique only within an execution, which
