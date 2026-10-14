@@ -272,7 +272,6 @@ fn expected_row(
     let delegation = presented
         .and_then(PresentedDelegation::verified)
         .map(|delegation| delegation.get());
-    let failure = presented.and_then(PresentedDelegation::unverified);
     let served = case
         .tool
         .name()
@@ -285,6 +284,11 @@ fn expected_row(
             (DecisionKind::Deny, Some(*reason), Some(sentence.clone()))
         }
     };
+    // A failure is recorded only on the row check 3 denied for it: a call denied before
+    // check 3 records that denial alone.
+    let failure = presented
+        .and_then(PresentedDelegation::unverified)
+        .filter(|_| reason == Some(ReasonKind::DelegationUnverified));
     let row = serde_json::json!({
         "kind": "call",
         "instance": common::INSTANCE,

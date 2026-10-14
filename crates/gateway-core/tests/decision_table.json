@@ -1166,7 +1166,7 @@
         "sentence": "This gateway requires a verifiable turn grant on every call, and this call's did not verify." }
     },
     {
-      "name": "order: an unknown tool is reported before a delegation that did not verify",
+      "name": "order: an unknown tool is reported before a delegation that did not verify, and its row records no failure",
       "snapshot": "base", "principal": "payments-sandbox", "delegation": "payments-turn-forged",
       "profile": "otto", "surface": "otto-sandbox", "tool": "github__force_push",
       "resources": { "named": [] },

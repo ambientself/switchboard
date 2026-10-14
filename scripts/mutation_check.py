@@ -913,6 +913,12 @@ for field, old, new in [
     ("surface-constant", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),", '        surface: SurfaceName::new(sentences::escape(\n            "x",'),
 ]:
     mutate(f"record-{field}", f"the row's {field} is wrong", SRC + "audit.rs", old, new)
+# The decision table's earlier-denial case and
+# an_unverified_delegation_denied_before_check_3_is_stored_as_that_denial_alone catch this.
+mutate("record-delegation-failure-on-earlier-denial",
+       "a delegation's failure is recorded on a row denied before check 3", SRC + "audit.rs",
+       "        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));",
+       "        delegation_failure.filter(|_| reason.is_some());")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",

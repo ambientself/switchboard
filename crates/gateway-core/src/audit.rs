@@ -820,6 +820,10 @@ pub async fn begin(
         credential,
     } = start;
     let (delegation, delegation_failure) = recorded_delegation(call.caller.delegation.as_ref());
+    // A failure is recorded only on the row check 3 denied for it. A call denied earlier, at
+    // the profile, surface or tool, is recorded as that denial alone (decision 0012).
+    let delegation_failure =
+        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));
     let record = AuditRecord {
         kind: RowKind::Call,
         instance: InstanceName::new(sentences::escape(

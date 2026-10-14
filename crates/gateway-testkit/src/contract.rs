@@ -72,8 +72,8 @@ use gateway_core::{
     Claimed, Connector, CredentialIdentity, CredentialMode, Currency, CurrencyAnswer, Decision,
     Delegation, DelegationDigest, DelegationFailure, DelegationKeyScope, Egress, IdempotencyKey,
     KeyScope, LeaseHolder, LookupAnswer, PodUid, PresentedDelegation, Principal, PrincipalKind,
-    Proved, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool, Resource,
-    Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation,
+    Proved, Reason, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
+    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation,
     VendorReference, Verifier, WasProved, decide,
 };
 use serde_json::{Value, json};
@@ -86,7 +86,7 @@ use crate::connector::{
 use crate::credentials::FakeCredentialSource;
 use crate::fixture::{
     Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    policy_data, policy_data_with_draft_lookup,
+    UNKNOWN_PROFILE, policy_data, policy_data_with_draft_lookup,
 };
 use crate::row_bound::{
     MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
@@ -1019,6 +1019,85 @@ pub async fn a_delegation_and_its_currency_are_stored_as_begin_was_given_them(
         (&None, &None, &None)
     );
     assert_eq!(record.currency, Some(CurrencyAnswer::Current));
+}
+
+/// A call carrying a delegation that did not verify, denied before check 3 at the profile, the
+/// surface or the tool, is stored through the core as that denial alone: its reason is the
+/// earlier check's, and the row records no failure, no digest and nothing of the delegation
+/// (decision 0012). The failure belongs only on the row check 3 denied for it, and a store
+/// refuses it anywhere else.
+pub async fn an_unverified_delegation_denied_before_check_3_is_stored_as_that_denial_alone(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let digest = DelegationDigest::of(b"a grant as presented");
+    let unverified = [
+        UnverifiedDelegation::new(DelegationFailure::Signature),
+        UnverifiedDelegation::after_signature(DelegationFailure::WrongPod, digest)
+            .expect("a pod is checked after the signature"),
+    ];
+    // Each case: what it names, how it changes an allowed call, and the reason it is denied.
+    type Earlier = (&'static str, fn(&mut CallContext), ReasonKind);
+    let earlier: [Earlier; 4] = [
+        (
+            "an unknown profile",
+            |context| context.caller.profile = UNKNOWN_PROFILE.into(),
+            ReasonKind::ProfileUnknown,
+        ),
+        (
+            "a surface that does not exist",
+            |context| context.caller.surface = "no-such-surface".into(),
+            ReasonKind::SurfaceNotPermitted,
+        ),
+        (
+            "an unknown tool",
+            |context| context.tool = RequestedTool::new("no_such__tool"),
+            ReasonKind::UnknownTool,
+        ),
+        (
+            "a tool its surface does not serve",
+            |context| {
+                context.caller.surface = SURFACE_READ.into();
+                context.tool = RequestedTool::new(WRITE_TOOL);
+            },
+            ReasonKind::ToolNotOnSurface,
+        ),
+    ];
+    for delegation in &unverified {
+        for (case, change, reason) in &earlier {
+            let mut context = decision_context(&fixture, &ALLOWED);
+            context.caller.delegation = Some(delegation.clone().into());
+            change(&mut context);
+            let decided = decide(&fixture.policy, &context);
+            assert_eq!(decided.reason().map(Reason::kind), Some(*reason), "{case}");
+            let start = row_start();
+            let begun = audit::begin(
+                store,
+                start.clone(),
+                decided,
+                arguments(&ALLOWED),
+                RequestMetadata::default(),
+            )
+            .await
+            .unwrap_or_else(|failure| panic!("{case}: the denial was not recorded: {failure:?}"));
+            assert!(matches!(begun, Begun::Denied(_)), "{case}: {begun:?}");
+            let StoredRecord::Call(record) = stored(contract, &start.row).await.record else {
+                panic!("{case}: a call was not stored as one");
+            };
+            assert_eq!(record.reason, Some(*reason), "{case}");
+            assert_eq!(
+                (
+                    &record.delegation_failure,
+                    &record.delegation,
+                    &record.proved_delegation_team,
+                    &record.claimed_acting_person
+                ),
+                (&None, &None, &None, &None),
+                "{case}"
+            );
+        }
+    }
 }
 
 /// `record`'s proved workload, with a pod.
