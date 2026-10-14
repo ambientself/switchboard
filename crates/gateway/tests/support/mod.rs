@@ -58,14 +58,31 @@ impl Server {
     }
 
     pub async fn start_with(timeouts: Timeouts) -> Self {
+        Self::start_from(timeouts, |_| {}).await
+    }
+
+    /// The testkit's world over loopback, with its configuration changed by `configure`. The
+    /// store is wired in unless the configuration disables audit.
+    pub async fn start_configured(configure: impl FnOnce(&mut Value)) -> Self {
+        Self::start_from(Timeouts::default(), configure).await
+    }
+
+    async fn start_from(timeouts: Timeouts, configure: impl FnOnce(&mut Value)) -> Self {
         let fixture = Fixture::new().unwrap();
         let credentials = Arc::new(FakeCredentialSource::new());
         let connector = Arc::new(FixtureConnector::new(credentials.clone()));
         let store = Arc::new(InMemoryAuditStore::new());
-        let config: Config = serde_json::from_value(config(&fixture)).unwrap();
-        let wiring = Wiring::new(Arc::new(fixture.clock.clone()))
-            .audit_store(store.clone())
-            .connector(CONNECTOR, connector.clone(), Arc::new(FixtureResources));
+        let mut config_value = config(&fixture);
+        configure(&mut config_value);
+        let mut wiring = Wiring::new(Arc::new(fixture.clock.clone())).connector(
+            CONNECTOR,
+            connector.clone(),
+            Arc::new(FixtureResources),
+        );
+        if config_value["audit"]["disabled"] != json!(true) {
+            wiring = wiring.audit_store(store.clone());
+        }
+        let config: Config = serde_json::from_value(config_value).unwrap();
         let gates = boot::check(config, wiring).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
