@@ -534,8 +534,20 @@ mutate("key-with-space-accepted", "a key may hold a space", SRC + "receipt.rs",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic());",
        "            && value.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ');")
 # The gateway fills the key from the caller's tool-use identifier, its first carrier.
-mutate("gw-key-not-from-tool-use-id", "the gateway never fills a call's key, so every proposal is denied", "crates/gateway/src/path.rs",
-       "            key: idempotency_key(tool_use_id.as_ref()),", "            key: None,")
+mutate("gw-key-not-from-tool-use-id", "the tool-use identifier never keys a call, so a proposal that sends only one is denied", "crates/gateway/src/path.rs",
+       "        .or_else(|| tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()))\n",
+       "        .or_else(|| tool_use_id.and(None))\n")
+# The other carriers (#55): a key sent on purpose comes first, in the _meta field, or else in
+# the Idempotency-Key header from a profile that declares its callers set it per request; the
+# tool-use identifier is recorded beside it. crates/gateway/tests/keys.rs catches these.
+mutate("gw-key-meta-ignored", "the gateway never reads a key from the switchboard/idempotencyKey _meta field", "crates/gateway/src/path.rs",
+       "            explicit_key(IDEMPOTENCY_KEY_META, idempotency_key),",
+       "            explicit_key(IDEMPOTENCY_KEY_META, None::<String>),")
+mutate("gw-key-header-from-any-profile", "the Idempotency-Key header keys a call under a profile that does not declare it", "crates/gateway/src/path.rs",
+       "            key_header.honoured(declares_header),", "            key_header.honoured(true || declares_header),")
+mutate("gw-key-tool-use-id-first", "the tool-use identifier is preferred over an explicit key", "crates/gateway/src/path.rs",
+       "    meta.or(header)\n        .or_else(|| tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()))\n",
+       "    tool_use_id\n        .and_then(|id| IdempotencyKey::parse(id.as_str()).ok())\n        .or(meta)\n        .or(header)\n")
 
 # --- tools/list ----------------------------------------------------------------------------
 
@@ -1520,6 +1532,11 @@ mutate("testkit-reference-dropped", "a receipt's vendor reference is not kept", 
 mutate("testkit-late-finish-settles-receipt", "a finish after its row's deadline settles the receipt, as if the deadline had not passed", A,
        "            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)",
        "            && may_move(receipt.state, settled, &EstablishedBy::Call, false)")
+# A pending receipt past its row's deadline reads as unknown wherever the store reads it (#55):
+# its receipts, the reuse answer and a retried begin. tests/receipts.rs catches this.
+mutate("testkit-pending-past-deadline-read-as-pending", "the in-memory store reads a pending receipt past its row's deadline as pending, so a retried begin runs it", A,
+       "        read.state = receipt.state.as_read(self.past_deadline(&receipt.row, now));",
+       "        read.state = receipt.state.as_read(false && self.past_deadline(&receipt.row, now));")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -1779,6 +1796,11 @@ mutate("gw-noop-store-when-enforced", "the no-op store is used although a store 
        "        (Some(_), false) => Ok((Arc::new(DisabledAuditStore::new()), GateState::On)),\n")
 mutate("gw-disabled-store-constructible", "anyone can make the no-op audit store", GW + "audit.rs",
        "    pub(crate) fn new() -> Self {", "    pub fn new() -> Self {")
+# A development build with audit disabled keeps no receipts, so it refuses a keyed side effect
+# and nothing runs (#55). crates/gateway/tests/keys.rs catches this.
+mutate("gw-disabled-store-reserves", "with audit disabled, a side effect's receipt is answered as reserved, so it runs with no receipt", GW + "audit.rs",
+       '            Err("audit is disabled, so no receipt can be kept and no side effect runs".into())\n',
+       "            Ok(Reservation::Reserved)\n")
 mutate("gw-boot-no-allowed-hosts-starts", "a gateway that would refuse every Host starts", BOOT,
        "    if config.http.allowed_hosts.is_empty() {\n        return Err(BootError::NoAllowedHosts);\n    }\n", "")
 
@@ -2258,7 +2280,15 @@ mutate("gw-unregistered-row-left-open", "an allowed call whose connector is not 
        "            let _ = connector;\n"
        "            if let Some(failure) = None::<gateway_core::audit::AuditFailure> {\n")
 mutate("gw-disconnect-before-run-ignored", "a call whose client has gone before it runs is run all the same", GW_PATH,
-       "        if disconnect.has_fired() {\n", "        if false && disconnect.has_fired() {\n")
+       "        let gone = disconnect.has_fired();\n", "        let gone = false && disconnect.has_fired();\n")
+# The check sits immediately before the connector is invoked (#55): checked only before the
+# connector is looked up and the clock read, as before, a client that leaves in that window has
+# its side effect run. keys.rs's test drops the client in that window.
+mutate_all("gw-give-up-recheck-removed", "the client is checked for only before the connector is looked up, not again immediately before it is invoked",
+           (GW_PATH, "        let gone = disconnect.has_fired();\n", "        let gone = gone_before_lookup;\n"),
+           (GW_PATH, "        let Some(registered) = gates.registered(&guard.tool().connector) else {\n",
+            "        let gone_before_lookup = disconnect.has_fired();\n"
+            "        let Some(registered) = gates.registered(&guard.tool().connector) else {\n"))
 mutate("gw-read-not-cancelled", "a read whose client goes is run to completion", GW_PATH,
        "        let ran = audit::run_unless(connector, guard, disconnect.fired()).await;",
        "        let ran = audit::run(connector, guard).await;")
@@ -2802,14 +2832,27 @@ PO = PROXY + "src/outcome.rs"
 PK = PROXY + "src/credentials.rs"
 # The bounds.
 mutate("proxy-deadline-not-applied", "a call is never abandoned", PC,
-       "        match tokio::time::timeout(self.deadline, self.exchange(request, late)).await {",
-       "        match Ok::<_, ()>(self.exchange(request, late).await) {")
-# The kind of an answer too large, too late or broken off: its own from a read, other from any
-# other tool until `unknown` is built (decision 0011).
+       "        match tokio::time::timeout(self.deadline, self.exchange(request, sent)).await {",
+       "        match Ok::<_, ()>(self.exchange(request, sent).await) {")
+# An answer too large, too late or broken off: its own kind of error from a read, and from any
+# other tool the outcome unknown (decision 0009, #55), as is every other failure once a side
+# effect may have been sent; one before anything was sent, and the server's refusal, stay errors.
 mutate("proxy-late-read-kind-other", "an oversized or late answer from a read is recorded as other", PC,
-       "            ErrorKind::OversizedOrLateRead\n        } else {", "            ErrorKind::Other\n        } else {")
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
+       "        self.without_answer(ErrorKind::Other, sentence)")
 mutate("proxy-late-non-read-kind-late", "an oversized or late answer from a propose tool is recorded as a late read", PC,
-       "        } else {\n            ErrorKind::Other\n        };", "        } else {\n            ErrorKind::OversizedOrLateRead\n        };")
+       "        let sent = if tool.classification == Classification::Read {",
+       "        let sent = if true || tool.classification == Classification::Read {")
+mutate("proxy-late-side-effect-as-error", "a side effect's answer too large, too late or broken off is reported as an error, settling its receipt not_performed", PC,
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)",
+       "        if self == Sent::SideEffect {\n            return ToolOutcome::error(ErrorKind::Other, sentence);\n        }\n"
+       "        self.without_answer(ErrorKind::OversizedOrLateRead, sentence)")
+mutate("proxy-side-effect-unanswered-as-error", "every failure without a definite answer from a side effect is reported as an error", PC,
+       "            Sent::SideEffect => ToolOutcome::Unknown,", "            Sent::SideEffect => ToolOutcome::error(kind, sentence),")
+mutate("proxy-unconnected-side-effect-unknown", "a side effect whose connection could not be made is reported unknown, though nothing was sent", PC,
+       "            } else if error.is_connect() {", "            } else if false && error.is_connect() {")
+mutate("proxy-side-effect-4xx-unknown", "a side effect the server refused with a 4xx is reported unknown", PC,
+       "        if status.is_client_error() {", "        if false && status.is_client_error() {")
 mutate("proxy-default-deadline-longer", "the default deadline is 30 s", PC,
        "Duration = Duration::from_secs(5);", "Duration = Duration::from_secs(30);")
 mutate("proxy-default-cap-larger", "the default cap is 1 MiB", PC, "usize = 64 * 1024;", "usize = 1024 * 1024;")
@@ -2824,7 +2867,7 @@ mutate("proxy-declared-length-off-by-one", "a declared length of exactly the cap
        "            .is_some_and(|length| length > self.max_response_bytes as u64)",
        "            .is_some_and(|length| length >= self.max_response_bytes as u64)")
 mutate("proxy-broken-body-read-as-complete", "a body that breaks off is read as if complete", PC,
-       "            let frame = frame.map_err(|_| ToolOutcome::error(late, outcome::BROKEN_OFF))?;",
+       "            let frame = frame.map_err(|_| sent.late(outcome::BROKEN_OFF))?;",
        "            let Ok(frame) = frame else { break };")
 # What is sent, and to whom.
 mutate("proxy-credential-not-sent", "the request carries no credential", PC,
@@ -2872,7 +2915,7 @@ mutate("proxy-result-and-error-accepted", "an answer with a result and an error 
        "        (Some(Value::Object(result)), _) => tool_result(result),")
 mutate("proxy-content-unchecked", "a result without content is accepted", PO,
        '    let Some(Value::Array(content)) = result.get("content") else {\n'
-       "        return ToolOutcome::error(ErrorKind::Other, NOT_MCP);\n    };",
+       "        return Err(NotMcp);\n    };",
        "    let empty = Vec::new();\n"
        '    let content = match result.get("content") {\n        Some(Value::Array(content)) => content,\n        _ => &empty,\n    };')
 mutate("proxy-tool-error-is-ok", "a tool result marked isError is passed on as success", PO,
