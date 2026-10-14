@@ -60,7 +60,7 @@ pub struct IdentitySection {
 }
 
 /// The audit gate. The store itself is supplied by the [`Wiring`](crate::Wiring); this says
-/// whether audit was explicitly turned off.
+/// whether audit was explicitly turned off, and whether the store is the Postgres store.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditSection {
@@ -69,6 +69,11 @@ pub struct AuditSection {
     /// supplied.
     #[serde(default)]
     pub disabled: bool,
+    /// Whether the audit store is the Postgres store, which keeps receipts (decision 0009,
+    /// part 2): true when the deployment file names its database, and never read from the
+    /// JSON configuration, whose store the wiring supplies. The receipt-store gate reads it.
+    #[serde(skip)]
+    pub postgres: bool,
 }
 
 /// What the HTTP endpoint accepts, against DNS rebinding.

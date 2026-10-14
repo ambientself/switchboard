@@ -784,9 +784,19 @@ changed.
 except the times, which a trigger sets. It selects only the identifier, kind, decision,
 deadline and completion columns, and updates only the completion columns. It cannot delete, and
 it cannot read who called what on the audit table. A trigger refuses any update to a completion
-already set, so "at most once" holds in the database. The receipt table has grants and a
-trigger of its own. The same role reads receipts, which the reuse check needs, so it can read
-who caused each side effect, on which tool and where. Deletion for retention uses a separate
+already set, so "at most once" holds in the database. The role also inserts the answer to a
+reused key's row complete, with its outcome, sentence, latency and the earlier receipt a
+`duplicate` names, and the database gives it its completion time. The receipt table has grants
+and a trigger of its own (migration 0008). The role reserves a receipt without its state, how
+that was established or its time, which the table's defaults and the trigger give it; reads
+every column, which the reuse check needs, so it can read who caused each side effect, on
+which tool and where; updates only the state, how it was established, the person who did and
+the reference; and cannot delete one. The trigger `receipt_moves` refuses, for every role,
+every move the state table does not allow and every other write, judging "past the deadline"
+by the database's clock at the time of the write: the row's deadline is earlier than
+`clock_timestamp()`. So a finish that arrives after the deadline completes its row and leaves
+its receipt `pending`. The boot check refuses a missing or disabled trigger of the three, an
+unlogged receipt table, and grants on it wider than the role's own. Deletion for retention uses a separate
 role, created before the first production deployment; until it exists nothing is deleted
 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). None of this
 protects rows against a database superuser.
@@ -901,11 +911,12 @@ receipt.
   each make a new call. Receipts cover a replayed turn only if Otto's control plane sends a key
   that stays the same across replays, which is agreed with Otto's owners.
 
-Until receipts exist, the gateway refuses any snapshot that serves a tool not classified `read`
-(section 12; not built yet, see section 17), so no proposal is served, including one that
-creates something. The first side effect to reach a real system also waits until someone is
-named to settle a receipt by hand and a way to record that exists (decision 0009, Still open 9
-and 10).
+The gateway refuses any snapshot that serves a tool not classified `read` unless the audit
+store is the Postgres store, which keeps receipts, audit is on and identity is on (section 12).
+Until built-in connectors exist, no release build serves one all the same: the snapshot
+loader's rule 2 refuses every proxied tool not classified `read` (decision 0011). The first
+side effect to reach a real system also waits until someone is named to settle a receipt by
+hand and a way to record that exists (decision 0009, Still open 9 and 10).
 
 ## 12. Boot gates
 
@@ -1038,7 +1049,11 @@ make:
 The gateway refuses a snapshot that serves any tool not classified `read` unless a receipt
 store is configured, audit is on and identity is on. It checks at boot and at every snapshot
 swap, whatever the snapshot's source. The check is in the binary, not in policy data, so no
-profile can change it. Only development builds are exempt.
+profile can change it. Only development builds are exempt. A receipt store is configured when
+the audit store is the Postgres store, which keeps receipts (#55): the gate reads it from what
+the deployment file already configures, its audit database, with its audit and identity
+sections, and no setting of its own turns it on. The JSON configuration cannot name the
+Postgres store, so on its path only a development build serves such a tool.
 
 **A development build** is a build of the gateway with the `test-support` cargo feature, which
 the release build never enables. The harness's test builds and the Rust target of the
@@ -1060,7 +1075,9 @@ each opt-out, and runs the receipt-store gate, as soon as the registry loads, be
 a credential, fetches a key or connects to the audit database. Until built-in connectors exist
 (milestone 4), a registry cannot reach the receipt-store gate: the snapshot loader's rule 2
 (decision 0011) refuses every proxied tool not classified `read` first, so CI's `propose` step
-checks that refusal instead (#26 below). The loopback refusal and its step are built (#11):
+checks that refusal instead (#26 below). That still holds now that the gate passes with the
+Postgres store, audit and identity: a release registry cannot serve a tool that is not `read`,
+and CI's check is unchanged. The loopback refusal and its step are built (#11):
 connector-proxy's own `test-support` feature, which the gateway's turns on, is the only way to
 reach loopback, and CI starts the release binary with a server at `127.0.0.1` and expects
 that refusal. With identity disabled a development build lists nothing and refuses every
@@ -1381,17 +1398,48 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   own columns with `kind_shape`. `complete_once` now refuses to complete a list row, which its
   old test of the decision let through.
 - For part 2: the outcomes `unknown` and `duplicate`, and an insert grant and shape constraint
-  that let a row be written complete at begin, for the answers to a reused key. The core has
-  both outcomes and writes a reused key's row complete through its store (#55, below), but in
-  Postgres the outcome still allows only `ok`, `error` and `refused`, and the gateway's role
-  cannot insert an outcome. Until the package that stores receipts in Postgres adds them, the
-  Postgres store refuses a begin that would reserve a receipt, and an `unknown` or
-  `duplicate` outcome or a vendor reference at finish, before it writes anything, so no side
-  effect runs against it; the receipt-store gate already keeps a release build from serving
-  one.
-- The boot check covers all three triggers. Today it covers the two on the audit table:
-  `set_times`, which now sets the deadline too and is still checked, and the one that
-  completes a row once. The third is the receipt table's (part 2).
+  that let a row be written complete at begin, for the answers to a reused key: built (#55,
+  part 2). Migration 0008 replaces the outcome's check with `outcome_known`, which allows all
+  five, and adds `duplicate_of`, the earlier receipt a `duplicate` names, which a row has
+  exactly when its outcome is `duplicate` (`duplicate_shape`), with a latency of zero
+  (`duplicate_latency`). The gateway's role inserts `outcome`, `outcome_sentence`,
+  `latency_ms` and `duplicate_of`, so a reused key's row is written complete in one insert,
+  and `set_times` gives it its completion time, its time at begin; its other completions
+  still go through `complete_once`. Rows written before 0008 keep their values and name no
+  receipt.
+- The boot check covers all three triggers: built (#55, part 2). It requires `set_times`,
+  which also sets the deadline, and `complete_once` on the audit table, and `receipt_moves`
+  on the receipt table, each enabled, and refuses a missing receipt table, an unlogged one, and
+  grants on it wider than the role's own, column by column; anything on it as a whole, `DELETE`
+  among them, is refused with the rest of the schema. The definer, rule and foreign-key routes
+  it follows to `call_rows` are not followed to `receipts` yet.
+- Receipts in Postgres: built (#55, part 2). Migration 0008 adds `switchboard_audit.receipts`,
+  one row per receipt, keyed by the audit row that reserved it (a foreign key to `call_rows`),
+  with the key's scope (the principal's issuer and subject, and the delegation's scope, which
+  may be empty), the key, the tool, the tool-use identifier, the digest, the resources as the
+  row records them, the state, how it was established and by whom, the vendor's reference and
+  the database's time of reservation. The vendor target and the lookups wait for
+  reconciliation. Two partial unique indexes make a key unique in its scope, with or without a
+  delegation scope, on any server from version 14. `PgAuditStore::begin_with_receipt` makes the
+  reuse check, which passes over a receipt under the call's own row, the row's insert and the
+  reservation one transaction at read committed. Of two begins with one key in one scope, the
+  unique index makes the second reservation wait for the first to commit and then insert
+  nothing; that begin is undone and made again from the check, which now finds the receipt and
+  writes the row complete with its answer. A retried begin of a row it finds stored answers
+  `Reserved` while the row's receipt is `pending`, the answer the row was written with (one of
+  the five for the earlier receipt, whatever has become of it since), and refuses a row whose
+  receipt has left `pending`, one begun without a receipt, or one of another decision or kind.
+  Finish, the completion of a lost begin's row and `give_up` complete the row and settle its
+  receipt in one transaction, with the vendor's reference, while it is `pending` and the row's
+  deadline has not passed by the database's clock; after it the row is completed and the
+  receipt left `pending`. If the deadline passes between the store's test and the trigger's,
+  the trigger refuses with SQLSTATE `SB001` and the store completes the row again, leaving the
+  receipt `pending`. `unknown`, or a reference, for a row that reserved no receipt is refused,
+  and so is a `duplicate` at finish. The Postgres runner runs item 6 of the contract suite.
+  A begin whose confirmation is lost after it wrote a reused key's row gives that row up as
+  completed differently, where the in-memory store keeps its answer silently. The row is the
+  same in both. The in-memory store's silence is the behaviour to match: that row's completion
+  was not lost, so the give-up Postgres counts and reports for it is a false signal.
 - If retention needs it, a partitioned audit table, with the boot check reading the triggers,
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.
@@ -1442,9 +1490,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
   gains `unknown` and a vendor reference for a completed side effect, and the row's outcome
   `unknown` and `duplicate`. The gateway fills the key from the caller's tool-use identifier
-  only; the named `_meta` field and the header come with the gateway package. Not built:
-  receipts in Postgres, reconciliation, resolution records, and the signals for `unknown`
-  receipts.
+  only; the named `_meta` field and the header come with the gateway package. Receipts in
+  Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and #47
+  below). Not built: reconciliation and resolution records.
 - With #25, the harness's in-memory store can also write and then report failure, lose the
   process between run and finish, and keep the answer budget, so the contract suite runs on
   it: built. Already built for both test stores, the core's and the harness's: an identical second
@@ -1465,8 +1513,8 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   every begin, with a receipt or without, through the same checks and fault switches.
 - A finish given up names, for a side effect, the vendor's reference (part 2). Today the
   Postgres store reports each finish it gives up, with the row, the outcome's kind and why it
-  stopped. A completion carries a vendor reference now, but only for a call that reserved a
-  receipt, which the Postgres store does not yet allow.
+  stopped. A completion carries a vendor reference for a call that reserved a receipt, which
+  the Postgres store now keeps, but the report does not name it yet.
 - Already built and relied on: synchronous commit, the `fsync` and `full_page_writes` gate, a
   finish pool of its own, the open-row query's single connection apart from it, finish
   waiting at most the answer budget and then retrying on its own task until the deadline, an
@@ -1818,11 +1866,15 @@ decision-table case for each comment tool, a case showing them denied in every o
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
 
-**#47, what the first slice (#14) still lacks.** Receipts in `unknown` and the age of the
-oldest, the two signals of section 11 not exported: they wait for receipts (#10 stage 2), and
-nothing exports a constant in their place. The rest are exported in Prometheus text at
-`GET /metrics`, on a listener of the gateway's own, the default until a sink is chosen
-(decision 0009, Still open 3). The route check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
+**#47, what the first slice (#14) still lacks.** The signals of section 11 are exported in
+Prometheus text at `GET /metrics`, on a listener of the gateway's own, the default until a
+sink is chosen (decision 0009, Still open 3). Receipts in `unknown` and the age of the oldest
+are exported since receipts are kept in Postgres (#55): the open-row poll counts the receipts
+in the state `unknown` and those `pending` past their row's deadline, by the database's
+clock, on the open-row query's own connection and within its 2 s, as
+`switchboard_audit_unknown_receipts`, and exports when the oldest was reserved as
+`switchboard_audit_oldest_unknown_receipt_reserved_seconds`. A count that fails is counted,
+and nothing is exported in its place until one succeeds. The route check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
 before and after the network policy; the kind claim holds only while the evidence log in
 [route-exceptions.md](route-exceptions.md) has a passing run from the last seven days.
 
@@ -2063,10 +2115,13 @@ database's clock as the superuser. Like the other Postgres tests, that runner is
 a test database, and CI's Postgres job fails on a skip. The read-backs are equally strict: the
 whole record, its kind and completion, the time at begin, whether the deadline was set, and the
 deadline less the time at begin. Each expectation is written to what Postgres does. The open-row query of item 5
-is tested on Postgres alone for now (#47). Item 6, receipts, runs on the in-memory store; the
-Postgres runner lists each of its functions as ignored, with the reason, until that store keeps
-receipts, and a test there shows it refuses a side effect meanwhile (#55). The fault modes below
-are each store's own, and keep their own tests.
+is tested on Postgres alone for now (#47). Item 6, receipts, runs on both stores (#55). The
+Postgres runner passes a row's deadline by moving it, as the superuser, to the row's time at
+begin, and loses every begin's confirmation through a switch only the crate's own tests have,
+which reports each committed begin as failed so the store retries and then completes the row;
+a proxy that cuts a connection after a commit loses one, as the recovery tests' does, but
+cannot single out the begins from the completion that follows. The fault modes below are each
+store's own, and keep their own tests.
 
 The fake can be told to fail before writing; to write and then report failure, which is a lost
 confirmation; to hang until released, to test the budgets; and to lose the process between run

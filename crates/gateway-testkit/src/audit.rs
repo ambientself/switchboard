@@ -588,7 +588,7 @@ impl State {
 /// would, and is held with the begins. It is not counted in
 /// [`begin_attempts`](Self::begin_attempts).
 ///
-/// It keeps receipts (decision 0009, part 2), which the Postgres store does not yet, and reads
+/// It keeps receipts (decision 0009, part 2), as the Postgres store does, and reads
 /// them back with [`receipts`](Self::receipts) and [`receipt`](Self::receipt). A begin with a
 /// receipt is a begin like any other, through the same checks, switches and gate, and in the
 /// same write it either reserves the receipt as `pending` or, when the key already has a

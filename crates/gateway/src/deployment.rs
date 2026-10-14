@@ -758,10 +758,11 @@ impl std::fmt::Debug for AuditChoice {
 }
 
 impl AuditChoice {
-    /// The audit section the boot gates read: disabled, or not.
+    /// The audit section the boot gates read: disabled, or the Postgres store.
     pub fn section(&self) -> AuditSection {
         AuditSection {
             disabled: matches!(self, Self::Disabled),
+            postgres: matches!(self, Self::Postgres { .. }),
         }
     }
 }

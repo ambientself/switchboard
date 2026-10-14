@@ -252,7 +252,10 @@ impl Replica {
         let settings = Settings {
             deployment: deployment.deployment,
             identity: deployment.identity,
-            audit: AuditSection { disabled: false },
+            audit: AuditSection {
+                disabled: false,
+                postgres: false,
+            },
             http: deployment.http,
             max_age: None,
             read_at: Instant::now(),

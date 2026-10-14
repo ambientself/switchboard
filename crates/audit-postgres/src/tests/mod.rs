@@ -12,6 +12,7 @@ mod check;
 mod contract;
 mod latency;
 mod open_rows;
+mod receipts;
 mod recovery;
 mod schema;
 mod stats;
@@ -98,7 +99,7 @@ impl TestDatabase {
         let mut owner = database.connect_as(OWNER_ROLE).await;
         assert_eq!(
             migrate(&mut owner).await.unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7]
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
         Some(database)
     }

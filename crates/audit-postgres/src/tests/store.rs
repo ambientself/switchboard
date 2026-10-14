@@ -13,9 +13,9 @@ use gateway_core::{
     decide, list_tools,
 };
 use gateway_testkit::{
-    Caller, DRAFT_TOOL, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
+    Caller, FORBIDDEN_DOCUMENT, FakeCredentialSource, Fixture, FixtureConnector,
     InMemoryAuditStore, READ_TOOL, SCOPED_READ_TOOL, SURFACE_ALL, SURFACE_READ, TEAM_A_DOCUMENT,
-    TEAM_B_DOCUMENT, WRITE_TOOL, document, fresh_key, row_start,
+    TEAM_B_DOCUMENT, WRITE_TOOL, document, row_start,
 };
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls};
@@ -725,43 +725,6 @@ async fn row_count(admin: &Client) -> i64 {
         .await
         .unwrap()
         .get(0)
-}
-
-/// The store keeps no receipts yet (#55). An allowed call of a tool not classified `read`
-/// carrying a key is refused at begin with a plain error, and nothing is written, so nothing
-/// runs. The core's MemoryStore and the testkit's store keep receipts; this one fails closed
-/// until it does.
-#[tokio::test]
-async fn a_side_effect_is_refused_until_the_store_keeps_receipts() {
-    let Some(db) = TestDatabase::create().await else {
-        return;
-    };
-    let fixture = Fixture::new().unwrap();
-    let store = db.store(PoolSizes::default());
-    let admin = db.admin().await;
-    let arguments = json!({"document": TEAM_A_DOCUMENT});
-    let context = CallContext {
-        caller: fixture.caller_context(Caller::TeamA, SURFACE_ALL).unwrap(),
-        tool: RequestedTool::new(DRAFT_TOOL),
-        resources: FixtureConnector::resources_of(DRAFT_TOOL, &arguments),
-        key: Some(fresh_key()),
-    };
-    let decision = decide(&fixture.policy, &context);
-    assert!(decision.is_allowed(), "{decision:?}");
-    let failure = audit::begin(
-        &store,
-        row_start(),
-        decision,
-        arguments,
-        RequestMetadata::default(),
-    )
-    .await
-    .expect_err("a side effect was begun without a receipt store");
-    assert!(
-        failure.to_string().contains("keeps no receipts yet"),
-        "{failure}"
-    );
-    assert_eq!(row_count(&admin).await, 0);
 }
 
 #[tokio::test]
