@@ -115,7 +115,8 @@ pub(crate) const SELECTED: &[&str] = &[
 pub(crate) const RECEIPTS: &str = "receipts";
 
 /// The columns of `receipts` the gateway's role inserts: everything a reservation holds but its
-/// state, how it was established and its time, which the defaults and the trigger give it.
+/// state, how it was established and its time, which the defaults and the trigger give it, and
+/// its lease and hand-off, which a reservation does not have. Its target is among them.
 pub(crate) const RECEIPT_INSERTED: &[&str] = &[
     "row_id",
     "principal_issuer",
@@ -127,15 +128,25 @@ pub(crate) const RECEIPT_INSERTED: &[&str] = &[
     "digest",
     "resources",
     "resources_omitted",
+    "target_system",
+    "target_kind",
+    "target_identifier",
 ];
 
-/// The columns of `receipts` the gateway's role updates: a move's. Never its row, scope, key,
-/// call or time.
-pub(crate) const RECEIPT_UPDATED: &[&str] =
-    &["state", "established_by", "established_person", "reference"];
+/// The columns of `receipts` the gateway's role updates: a move's, and reconciliation's lease
+/// and hand-off. Never its row, scope, key, call, target or time.
+pub(crate) const RECEIPT_UPDATED: &[&str] = &[
+    "state",
+    "established_by",
+    "established_person",
+    "reference",
+    "lease_holder",
+    "lease_until",
+    "handed_to_person_at",
+];
 
 /// The columns of `receipts` the gateway's role reads: every one, for the reuse check, a
-/// retried begin and the count of receipts in `unknown`.
+/// retried begin, the count of receipts in `unknown` and reconciliation.
 pub(crate) const RECEIPT_SELECTED: &[&str] = &[
     "row_id",
     "reserved_at",
@@ -151,6 +162,52 @@ pub(crate) const RECEIPT_SELECTED: &[&str] = &[
     "state",
     "established_by",
     "established_person",
+    "reference",
+    "target_system",
+    "target_kind",
+    "target_identifier",
+    "lease_holder",
+    "lease_until",
+    "handed_to_person_at",
+];
+
+/// The columns of `receipts` that migration 0009 adds for reconciliation, with their types as
+/// Postgres's `format_type` names them.
+pub(crate) const RECEIPT_COLUMNS: &[(&str, &str)] = &[
+    ("target_system", "text"),
+    ("target_kind", "text"),
+    ("target_identifier", "text"),
+    ("lease_holder", "text"),
+    ("lease_until", "timestamp with time zone"),
+    ("handed_to_person_at", "timestamp with time zone"),
+];
+
+/// The table of lookups made on receipts (decision 0009, "Reconciliation"), which migration
+/// 0009 creates.
+pub(crate) const LOOKUPS: &str = "receipt_lookups";
+
+/// Every column of `receipt_lookups`, with its type.
+pub(crate) const LOOKUP_COLUMNS: &[(&str, &str)] = &[
+    ("row_id", "uuid"),
+    ("attempt", "integer"),
+    ("looked_up_at", "timestamp with time zone"),
+    ("result", "text"),
+    ("authoritative", "boolean"),
+    ("reference", "text"),
+];
+
+/// The columns of `receipt_lookups` the gateway's role inserts: a lookup without its time,
+/// which the trigger gives it.
+pub(crate) const LOOKUP_INSERTED: &[&str] =
+    &["row_id", "attempt", "result", "authoritative", "reference"];
+
+/// The columns of `receipt_lookups` the gateway's role reads: every one. It updates none.
+pub(crate) const LOOKUP_SELECTED: &[&str] = &[
+    "row_id",
+    "attempt",
+    "looked_up_at",
+    "result",
+    "authoritative",
     "reference",
 ];
 
@@ -178,6 +235,13 @@ pub(crate) const TRIGGERS: &[Trigger] = &[
         purpose: "moves a receipt only as its state table allows, by the database's clock",
         fires: "before each insert or update",
         tgtype: 1 | 2 | 4 | 16,
+    },
+    Trigger {
+        table: LOOKUPS,
+        name: "lookup_appends",
+        purpose: "appends a lookup to a receipt in unknown, and never changes or removes one",
+        fires: "before each insert, update or delete",
+        tgtype: 1 | 2 | 4 | 8 | 16,
     },
 ];
 
@@ -497,6 +561,9 @@ pub enum Problem {
     TableMissing,
     /// `switchboard_audit.receipts`, which keeps the receipts for side effects, is not there.
     ReceiptsMissing,
+    /// `switchboard_audit.receipt_lookups`, which keeps the lookups made on receipts, is not
+    /// there.
+    LookupsMissing,
     /// `switchboard_audit.call_rows` is partitioned. Each partition has its own triggers,
     /// each enabled or disabled on its own, its own owner and its own grants, and may be in
     /// another schema, so the store refuses a partitioned table rather than trust what the
@@ -520,11 +587,15 @@ pub enum Problem {
     },
     /// A column the store writes or reads is not there.
     ColumnMissing {
+        /// The table.
+        table: &'static str,
         /// The column.
         column: &'static str,
     },
     /// A column has another type than the store writes.
     ColumnType {
+        /// The table.
+        table: &'static str,
         /// The column.
         column: &'static str,
         /// The type it has.
@@ -773,6 +844,11 @@ impl fmt::Display for Problem {
                 "the table switchboard_audit.receipts, which keeps the receipts for side effects, \
                  does not exist"
             ),
+            Self::LookupsMissing => write!(
+                f,
+                "the table switchboard_audit.receipt_lookups, which keeps the lookups made on \
+                 receipts, does not exist"
+            ),
             Self::Partitioned => write!(
                 f,
                 "the table switchboard_audit.call_rows is partitioned, and each partition has \
@@ -788,17 +864,15 @@ impl fmt::Display for Problem {
                 "the table {table} is unlogged, so a crash empties it, committed rows and all, \
                  and a standby never receives its rows"
             ),
-            Self::ColumnMissing { column } => {
-                write!(f, "the column call_rows.{column} does not exist")
+            Self::ColumnMissing { table, column } => {
+                write!(f, "the column {table}.{column} does not exist")
             }
             Self::ColumnType {
+                table,
                 column,
                 found,
                 expected,
-            } => write!(
-                f,
-                "the column call_rows.{column} is {found}, not {expected}"
-            ),
+            } => write!(f, "the column {table}.{column} is {found}, not {expected}"),
             Self::TriggerMissing {
                 table,
                 trigger,
@@ -1053,7 +1127,13 @@ impl PgAuditStore {
     ///   check does not read.
     /// - `switchboard_audit.receipts` is there, as a table that is not unlogged, with its
     ///   trigger `receipt_moves` enabled to fire before each insert or update, which moves a
-    ///   receipt only as its state table allows (decision 0009, part 2).
+    ///   receipt only as its state table allows (decision 0009, part 2), and with the columns
+    ///   reconciliation reads and writes, of their types: the vendor target, the lease and the
+    ///   hand-off to a person.
+    /// - `switchboard_audit.receipt_lookups` is there, as a table that is not unlogged, with
+    ///   every column of its type and its trigger `lookup_appends` enabled to fire before each
+    ///   insert, update or delete, which appends a lookup to a receipt in `unknown` and refuses
+    ///   every change and removal.
     /// - The session's `session_replication_role` is not `replica`, which a role or database
     ///   default can set, and under which no trigger fires.
     /// - The session logged in as the role it runs as, so `SET ROLE NONE` cannot take it
@@ -1067,13 +1147,15 @@ impl PgAuditStore {
     ///   owner can drop it, and every row with it, without CREATE on it.
     /// - The role holds its own privileges: inserting the first half of a row or a reused key's
     ///   answer, updating the completion, selecting the identifier, decision and completion,
-    ///   reserving, reading and moving a receipt, and using the schema.
+    ///   reserving, reading and moving a receipt, writing its lease and hand-off, appending and
+    ///   reading a lookup, and using the schema.
     /// - Neither the role nor any role it is a member of holds more. A membership counts
     ///   whether or not it is inherited, since `SET ROLE` reaches a role that is not. So none
     ///   holds the store's privileges with grant option; none holds anything on either table as
     ///   a whole, so none can DELETE, TRUNCATE or add a trigger; none holds a column privilege
-    ///   on `receipts` beyond the store's, so none can change a receipt's row, scope, key, call
-    ///   or time; none can CREATE in the schema or the database; none holds anything on any
+    ///   on `receipts` beyond the store's, so none can change a receipt's row, scope, key, call,
+    ///   target or time; none holds UPDATE on any column of `receipt_lookups`, so none can
+    ///   change a lookup; none can CREATE in the schema or the database; none holds anything on any
     ///   other table, view or sequence in the schema but SELECT on the open-row view;
     ///   none can set a setting only a superuser may set, such as `session_replication_role`,
     ///   which would silence both triggers; and none can change any setting with
@@ -1250,7 +1332,7 @@ async fn check(client: &ClientWrapper) -> Result<(), BootCheckError> {
             }
             inheritance(client, table, &mut problems).await?;
             unlogged(client, table, &mut problems).await?;
-            columns(client, table, &mut problems).await?;
+            columns(client, table, "call_rows", COLUMNS, &mut problems).await?;
             triggers(client, &mut problems).await?;
             rules(client, table, &mut problems).await?;
             referential_actions(client, table, &mut problems).await?;
@@ -1457,9 +1539,12 @@ async fn unlogged(
     Ok(())
 }
 
+/// Every column in `expected` is on the table `table`, named `name` in reports, with its type.
 async fn columns(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
+    name: &'static str,
+    expected: &[(&'static str, &'static str)],
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     let found = client
@@ -1470,13 +1555,17 @@ async fn columns(
             &[&table],
         )
         .await?;
-    for (column, expected) in COLUMNS {
+    for (column, expected) in expected {
         match found.iter().find(|row| row.get::<_, &str>(0) == *column) {
-            None => problems.push(Problem::ColumnMissing { column }),
+            None => problems.push(Problem::ColumnMissing {
+                table: name,
+                column,
+            }),
             Some(row) => {
                 let found: String = row.get(1);
                 if found != *expected {
                     problems.push(Problem::ColumnType {
+                        table: name,
                         column,
                         found,
                         expected,
@@ -1696,29 +1785,38 @@ async fn column_privileges(
     Ok(())
 }
 
-/// The receipt table is there, as a table that is not unlogged, and the session's role holds
-/// on its columns what the store needs of receipts and nothing more: [`RECEIPT_INSERTED`],
-/// [`RECEIPT_UPDATED`] and [`RECEIPT_SELECTED`]. Anything on the table as a whole, `DELETE`
-/// among them, is refused with the rest of the schema by `other_privileges`; its trigger is
-/// checked with the others.
-async fn receipts(
+/// The table `name` in the schema, if it is there as an ordinary table.
+async fn ordinary_table(
     client: &ClientWrapper,
-    problems: &mut Vec<Problem>,
-) -> Result<(), tokio_postgres::Error> {
-    let table = client
+    name: &str,
+) -> Result<Option<tokio_postgres::types::Oid>, tokio_postgres::Error> {
+    Ok(client
         .query_opt(
             "SELECT c.oid FROM pg_catalog.pg_class c
                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = 'switchboard_audit' AND c.relname = $1 AND c.relkind = 'r'",
-            &[&RECEIPTS],
+            &[&name],
         )
         .await?
-        .map(|row| row.get::<_, tokio_postgres::types::Oid>(0));
-    let Some(table) = table else {
+        .map(|row| row.get::<_, tokio_postgres::types::Oid>(0)))
+}
+
+/// The receipt table is there, as a table that is not unlogged, with the columns reconciliation
+/// reads and writes, of their types ([`RECEIPT_COLUMNS`]), and the session's role holds on its
+/// columns what the store needs of receipts and nothing more: [`RECEIPT_INSERTED`],
+/// [`RECEIPT_UPDATED`] and [`RECEIPT_SELECTED`]. Anything on the table as a whole, `DELETE`
+/// among them, is refused with the rest of the schema by `other_privileges`; its trigger is
+/// checked with the others. Then the same of the lookup table, [`lookups`].
+async fn receipts(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let Some(table) = ordinary_table(client, RECEIPTS).await? else {
         problems.push(Problem::ReceiptsMissing);
         return Ok(());
     };
     unlogged(client, table, problems).await?;
+    columns(client, table, RECEIPTS, RECEIPT_COLUMNS, problems).await?;
     column_privileges(
         client,
         table,
@@ -1727,6 +1825,36 @@ async fn receipts(
             ("INSERT", RECEIPT_INSERTED),
             ("UPDATE", RECEIPT_UPDATED),
             ("SELECT", RECEIPT_SELECTED),
+        ],
+        problems,
+    )
+    .await?;
+    lookups(client, problems).await
+}
+
+/// The lookup table is there, as a table that is not unlogged, with every column the store
+/// reads and writes, of its type ([`LOOKUP_COLUMNS`]), and the session's role may append a
+/// lookup ([`LOOKUP_INSERTED`]) and read them ([`LOOKUP_SELECTED`]), and nothing more: it may
+/// update no column. Anything on the table as a whole is refused by `other_privileges`; its
+/// trigger, which refuses every change and removal, is checked with the others.
+async fn lookups(
+    client: &ClientWrapper,
+    problems: &mut Vec<Problem>,
+) -> Result<(), tokio_postgres::Error> {
+    let Some(table) = ordinary_table(client, LOOKUPS).await? else {
+        problems.push(Problem::LookupsMissing);
+        return Ok(());
+    };
+    unlogged(client, table, problems).await?;
+    columns(client, table, LOOKUPS, LOOKUP_COLUMNS, problems).await?;
+    column_privileges(
+        client,
+        table,
+        &format!("switchboard_audit.{LOOKUPS}"),
+        [
+            ("INSERT", LOOKUP_INSERTED),
+            ("UPDATE", &[]),
+            ("SELECT", LOOKUP_SELECTED),
         ],
         problems,
     )
@@ -1739,9 +1867,9 @@ async fn other_privileges(
     problems: &mut Vec<Problem>,
 ) -> Result<(), tokio_postgres::Error> {
     // Nothing on any table, view or foreign table in the schema as a whole, and nothing at all
-    // on any but call_rows and receipts, for the session's role or any role it can become.
-    // SELECT on the open-row view is the exception, which `open_rows` checks. The columns of
-    // call_rows and receipts are `column_privileges`' and `receipt_privileges`'.
+    // on any but call_rows, receipts and receipt_lookups, for the session's role or any role
+    // it can become. SELECT on the open-row view is the exception, which `open_rows` checks.
+    // The columns of those three are `column_privileges`'.
     let privileges = table_privileges(version);
     let held = client
         .query(
@@ -1753,7 +1881,7 @@ async fn other_privileges(
                  WHERE n.nspname = 'switchboard_audit' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
                      AND NOT (c.relname = $2 AND c.relkind = 'v' AND p = 'SELECT')
                      AND ({}
-                         OR (c.relname NOT IN ('call_rows', 'receipts')
+                         OR (c.relname NOT IN ('call_rows', 'receipts', 'receipt_lookups')
                              AND p IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES')
                              AND {}))
                  UNION ALL
@@ -2341,6 +2469,18 @@ mod tests {
         assert_eq!(granted("INSERT", RECEIPTS), set(RECEIPT_INSERTED));
         assert_eq!(granted("UPDATE", RECEIPTS), set(RECEIPT_UPDATED));
         assert_eq!(granted("SELECT", RECEIPTS), set(RECEIPT_SELECTED));
+        assert_eq!(granted("INSERT", LOOKUPS), set(LOOKUP_INSERTED));
+        assert_eq!(granted("UPDATE", LOOKUPS), BTreeSet::new());
+        assert_eq!(granted("SELECT", LOOKUPS), set(LOOKUP_SELECTED));
+        for column in RECEIPT_COLUMNS.iter().map(|(name, _)| name) {
+            assert!(RECEIPT_SELECTED.contains(column), "{column} is not read");
+        }
+        for column in LOOKUP_INSERTED.iter().chain(LOOKUP_SELECTED) {
+            assert!(
+                LOOKUP_COLUMNS.iter().any(|(name, _)| name == column),
+                "{column} is not checked"
+            );
+        }
     }
 
     #[test]
@@ -2384,6 +2524,7 @@ mod tests {
                 7 => "INSERT",
                 19 => "UPDATE",
                 23 => "INSERT OR UPDATE",
+                31 => "INSERT OR UPDATE OR DELETE",
                 other => panic!("{}: tgtype {other}", trigger.name),
             };
             let created = format!(

@@ -231,6 +231,32 @@ pub enum PgAuditError {
         /// The time limit that ran out.
         budget: Duration,
     },
+    /// A statement of reconciliation's did not answer within its time limit. The store asked
+    /// the server to cancel it, and a transaction it was in is rolled back.
+    #[error("a reconciliation statement did not answer within {budget:?}")]
+    ReconciliationTimedOut {
+        /// The time limit that ran out.
+        budget: Duration,
+    },
+    /// The receipt is not held under the lease the caller named: its lease ended or another
+    /// holder has it, or it no longer reads as `unknown`, or it was handed to a person.
+    /// Nothing was written.
+    #[error(
+        "receipt {row} is not held under this lease, or no longer reads as unknown, or was \
+         handed to a person; nothing was written"
+    )]
+    LeaseNotHeld {
+        /// The receipt's identifier.
+        row: String,
+    },
+    /// The receipt already has as many lookups as the attempts allowed. Nothing was written.
+    #[error("receipt {row} already has {attempts} lookups, all it may have; nothing was written")]
+    AttemptsUsedUp {
+        /// The receipt's identifier.
+        row: String,
+        /// The attempts allowed.
+        attempts: u32,
+    },
 }
 
 impl PgAuditError {
@@ -592,7 +618,7 @@ impl Drop for Settle {
 }
 
 /// Asks the server to stop whatever a connection is running, over a connection of its own.
-type Canceller = Arc<dyn Fn(CancelToken) -> BoxFuture<'static, ()> + Send + Sync>;
+pub(crate) type Canceller = Arc<dyn Fn(CancelToken) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Every session the store opens commits synchronously, whatever the server, database or role
 /// sets as its default: begin must not return before its row is durable. And it looks names up
@@ -754,7 +780,7 @@ pub struct PgAuditStore {
     /// The open-row query's own pool, of [`OPEN_ROWS_POOL_SIZE`].
     pub(crate) open_rows_pool: Pool,
     budgets: Budgets,
-    cancel: Canceller,
+    pub(crate) cancel: Canceller,
     counters: Arc<Counters>,
     given_up: Report,
     /// Whether every begin from now on loses its confirmation after it commits, as the
@@ -1577,7 +1603,7 @@ async fn complete_in_transaction(
 /// statement, so that one still waiting does not go on to write after the caller was told it
 /// failed, and takes the connection out of its pool, so no later call waits behind it. The
 /// cancel does not wait, and does not undo a statement that has already finished.
-fn abandon(client: Object, cancel: &Canceller) {
+pub(crate) fn abandon(client: Object, cancel: &Canceller) {
     tokio::spawn(cancel(client.cancel_token()));
     drop(Object::take(client));
 }

@@ -74,6 +74,7 @@
 mod check;
 mod columns;
 mod migrate;
+mod reconcile;
 mod stats;
 mod store;
 
@@ -87,6 +88,7 @@ pub use columns::{
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
+pub use reconcile::MAX_DUE;
 pub use stats::{
     BeginFailures, GivenUpCauses, LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram, PoolStats,
     StoreStats,

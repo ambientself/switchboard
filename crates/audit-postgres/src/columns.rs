@@ -937,6 +937,11 @@ pub(crate) struct ReceiptRow {
     pub digest: String,
     pub resources: Value,
     pub resources_omitted: i64,
+    /// The vendor target's system, kind and identifier, or none of them for a receipt that
+    /// goes to a person.
+    pub target_system: Option<String>,
+    pub target_kind: Option<String>,
+    pub target_identifier: Option<String>,
 }
 
 impl ReceiptRow {
@@ -945,8 +950,9 @@ impl ReceiptRow {
     /// the unique index makes the second wait for the first to commit, and then insert nothing.
     pub const RESERVE: &'static str = "INSERT INTO switchboard_audit.receipts (
             row_id, principal_issuer, principal_subject, delegation_scope, idempotency_key,
-            tool, tool_use_id, digest, resources, resources_omitted
-        ) VALUES (($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            tool, tool_use_id, digest, resources, resources_omitted, target_system, target_kind,
+            target_identifier
+        ) VALUES (($1::text)::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT DO NOTHING";
 
     /// The reuse check for a key with no delegation scope: the receipt for the key `$3` of the
@@ -992,6 +998,7 @@ impl ReceiptRow {
         let (resources, resources_omitted) =
             resources_of(&receipt.resources, receipt.resources_omitted)?;
         let scope = request.scope();
+        let target = request.target();
         Ok(Self {
             row_id: id.as_str().to_owned(),
             principal_issuer: stored("principal_issuer", scope.principal.issuer.as_str())?,
@@ -1006,11 +1013,17 @@ impl ReceiptRow {
             digest: request.digest().to_hex(),
             resources,
             resources_omitted,
+            target_system: optional("target_system", target.map(|target| target.system.as_str()))?,
+            target_kind: optional("target_kind", target.map(|target| target.kind.as_str()))?,
+            target_identifier: optional(
+                "target_identifier",
+                target.map(|target| target.identifier.as_str()),
+            )?,
         })
     }
 
     /// The values for [`RESERVE`](Self::RESERVE), in order.
-    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 10] {
+    pub fn parameters(&self) -> [&(dyn ToSql + Sync); 13] {
         [
             &self.row_id,
             &self.principal_issuer,
@@ -1022,6 +1035,9 @@ impl ReceiptRow {
             &self.digest,
             &self.resources,
             &self.resources_omitted,
+            &self.target_system,
+            &self.target_kind,
+            &self.target_identifier,
         ]
     }
 
