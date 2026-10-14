@@ -669,6 +669,17 @@ mutate("snapshot-without-keeps-surface-tool", "a withdrawn tool stays on its sur
 mutate("snapshot-without-touches-limits", "a withdrawal also empties the resource limits", SRC + "policy.rs",
        "        derived.revision = revision;\n",
        "        derived.revision = revision;\n        derived.limits = ResourceLimits::default();\n")
+# Decision 0009, "Reconciliation": every approval of a tool not classified read says how an
+# unknown receipt of it is settled, and no read tool's does. tests/loader_rules.json has a
+# refusing and a passing case for each.
+mutate("snapshot-settlement-undeclared-accepted", "the loader accepts an approval of a tool not classified read that declares no settlement", SRC + "policy.rs",
+       "                return Err(SnapshotError::SettlementUndeclared {\n"
+       "                    tool: tool.name.clone(),\n"
+       "                    classification,\n"
+       "                });\n",
+       "                let _ = classification;\n")
+mutate("snapshot-settlement-on-read-accepted", "the loader accepts a read tool that declares a settlement", SRC + "policy.rs",
+       "                return Err(SnapshotError::SettlementOnRead(tool.name.clone()));\n", "")
 
 # --- Principals and proof ------------------------------------------------------------------
 
@@ -1008,6 +1019,23 @@ mutate("finish-read-unknown", "a read that reports unknown is recorded as unknow
        "        ToolOutcome::Unknown if reserved => (", "        ToolOutcome::Unknown if true || reserved => (")
 mutate("reused-fields-public", "the answer to a reused key can be made without its row", SRC + "audit.rs",
        "pub struct Reused {\n    row: AuditRowId,\n    reuse: Reuse,", "pub struct Reused {\n    pub row: AuditRowId,\n    pub reuse: Reuse,")
+# Reconciliation (decision 0009, "Reconciliation"): what a lookup's answer settles, and the
+# vendor target a receipt records at begin, which is empty for a tool settled by a person.
+# reconcile.rs's own tests, the contract suite's reconciliation cases and the gateway's
+# tests/reconcile.rs catch these.
+R = SRC + "reconcile.rs"
+mutate("reconcile-empty-search-not-performed", "a search that found nothing settles a receipt not_performed whether or not it was authoritative", R,
+       "            LookupAnswer::NotFound {\n                authoritative: true,\n            } => Some(ReceiptState::NotPerformed),",
+       "            LookupAnswer::NotFound { .. } => Some(ReceiptState::NotPerformed),")
+mutate("reconcile-found-left-unknown", "a lookup that found the effect leaves its receipt unknown", R,
+       "            LookupAnswer::Found { .. } => Some(ReceiptState::Completed),",
+       "            LookupAnswer::Found { .. } => None,")
+mutate("reconcile-person-sent-to-lookup", "a tool settled by a person records a vendor target, so its receipt is sent to the lookup", R,
+       "            Settlement::Person => None,",
+       "            Settlement::Person => named(resources).first().cloned(),")
+mutate("reconcile-target-not-recorded", "begin records no vendor target, so every receipt goes to a person", SRC + "audit.rs",
+       "            .and_then(|settlement| settlement.target(&call.resources)),",
+       "            .and_then(|_| None),")
 # The gateway answers a duplicate as a success, with the receipt and the reference.
 mutate("gw-duplicate-answered-as-refusal", "the gateway answers a duplicate as a refusal", "crates/gateway/src/path.rs",
        "        Reuse::Duplicate {\n            receipt, reference, ..\n        } => Reply::ToolOk(",
@@ -1540,7 +1568,8 @@ mutate("testkit-reuse-check-includes-own-row", "the reuse check finds the receip
 mutate("testkit-reused-row-left-open", "a row answered from an earlier receipt is written open", A,
        "                row.completion = Some(reuse.completion());\n", "")
 mutate("testkit-receipt-not-settled", "finish completes the row and leaves its receipt pending", A,
-       "            receipt.state = settled;\n", "")
+       "            receipt.state = settled;\n            receipt.established_by = EstablishedBy::Call;\n",
+       "            receipt.established_by = EstablishedBy::Call;\n")
 mutate("testkit-retry-after-settled-runs", "a begin under a row whose receipt has left pending is answered as reserved, so its call runs again", A,
        "            Some(receipt) if receipt.state == ReceiptState::Pending => Ok(Reservation::Reserved),",
        "            Some(_) => Ok(Reservation::Reserved),")
@@ -1555,6 +1584,17 @@ mutate("testkit-late-finish-settles-receipt", "a finish after its row's deadline
 mutate("testkit-pending-past-deadline-read-as-pending", "the in-memory store reads a pending receipt past its row's deadline as pending, so a retried begin runs it", A,
        "        read.state = receipt.state.as_read(self.past_deadline(&receipt.row, now));",
        "        read.state = receipt.state.as_read(false && self.past_deadline(&receipt.row, now));")
+# The queue of unknown receipts in the in-memory store (decision 0009, "Reconciliation"), as the
+# contract suite's reconciliation cases and the gateway's tests/reconcile.rs check it.
+mutate("testkit-lease-ignored", "a claim is granted whatever lease another holder has", A,
+       "            .all(|(_, _, until)| *until <= now)", "            .all(|_| true)")
+mutate_all("testkit-attempts-unbounded", "a receipt is looked up without bound, and never handed to a person for it",
+           (A, "            if made >= usize::try_from(attempts).unwrap_or(usize::MAX) {", "            if false {"),
+           (A, "                None if made + 1 >= usize::try_from(attempts).unwrap_or(usize::MAX) => {",
+            "                None if false => {"))
+mutate("testkit-lookup-record-replaced", "each lookup replaces the record of the one before it", A,
+       "            receipt.lookups.push(LookupRecord {",
+       "            receipt.lookups.truncate(made.saturating_sub(1));\n            receipt.lookups.push(LookupRecord {")
 
 C = TESTKIT_SRC + "credentials.rs"
 NEXT_FAILURE = "            Refusing::Next(failure) => {\n                state.refusing = Refusing::Never;\n                Some(failure)\n            }"
@@ -2141,6 +2181,36 @@ mutate("gw-metrics-open-rows-pool-not-exported", "the pool metrics leave out the
 mutate("gw-metrics-unknown-receipts-not-polled", "the metrics poll never counts the receipts in unknown", GW_METRICS,
        "        let unknown = match audit.store.unknown_receipts().await {",
        "        let unknown = match Err::<UnknownReceipts, _>(\"not counted\") {")
+# Reconciliation (decision 0009, "Reconciliation"): the claim is committed before the lookup,
+# and reconciliation's signals are written. tests/reconcile.rs and metrics.rs's own tests catch
+# these.
+GW_RECONCILE = GW + "reconcile.rs"
+mutate_all("gw-lookup-before-claim", "a receipt is looked up before its claim is committed, and claimed only to record the answer",
+           (GW_RECONCILE,
+            "        let claimed = match self\n"
+            "            .queue\n"
+            "            .claim(&due.row, &self.holder, self.settings.lease)\n"
+            "            .await\n"
+            "        {\n"
+            "            Ok(Some(claimed)) => claimed,\n"
+            "            Ok(None) => return,\n"
+            "            Err(error) => {\n"
+            "                self.store_failed(\"claim a receipt\", Some(&due.row), &*error);\n"
+            "                return;\n"
+            "            }\n"
+            "        };\n",
+            "        let claimed = due.clone();\n"),
+           (GW_RECONCILE,
+            "            .unwrap_or(LookupAnswer::Failed);\n",
+            "            .unwrap_or(LookupAnswer::Failed);\n"
+            "        if !matches!(\n"
+            "            self.queue.claim(&due.row, &self.holder, self.settings.lease).await,\n"
+            "            Ok(Some(_))\n"
+            "        ) {\n"
+            "            return;\n"
+            "        }\n"))
+mutate("gw-reconciliation-signals-unwritten", "the metrics leave out reconciliation's signals", GW_METRICS,
+       "        if let Some(reconciliation) = &self.reconciliation {\n", "        if let Some(reconciliation) = None::<&ReconcileSignals> {\n")
 mutate("gw-demo-kind-open-rows-names-outage", "the kind run's open-row metrics check names a database outage it did not have",
        "deploy/demo/demo.sh",
        "  local open=\"one row\"\n",
@@ -3889,7 +3959,8 @@ mutate("pg-check-owner-membership-ignored", "a member of the table's owner passe
 mutate("pg-check-table-missing-ignored", "a missing table passes the check", PG_CHECK,
        "        None => problems.push(Problem::TableMissing),", "        None => {}")
 mutate("pg-check-column-missing-ignored", "a missing column passes the check", PG_CHECK,
-       "            None => problems.push(Problem::ColumnMissing { column }),", "            None => {}")
+       "            None => problems.push(Problem::ColumnMissing {\n                table: name,\n                column,\n            }),",
+       "            None => {}")
 mutate("pg-check-column-type-ignored", "a column of another type passes the check", PG_CHECK,
        "                if found != *expected {", "                if false {")
 mutate("pg-check-trigger-missing-ignored", "a missing trigger passes the check", PG_CHECK,
@@ -3920,7 +3991,7 @@ mutate("pg-check-whole-table-per-column", "a privilege on the whole table is als
 mutate("pg-check-delete-ignored", "DELETE on the table passes the check", PG_CHECK,
        '        "DELETE",\n', "")
 mutate("pg-check-other-tables-ignored", "column grants on another table in the schema pass the check", PG_CHECK,
-       "                         OR (c.relname NOT IN ('call_rows', 'receipts')",
+       "                         OR (c.relname NOT IN ('call_rows', 'receipts', 'receipt_lookups')",
        "                         OR (false")
 mutate("pg-check-schema-usage-ignored", "a role without USAGE on the schema passes the check", PG_CHECK,
        "        if !schema.get::<_, bool>(0) {", "        if false {")
@@ -4151,10 +4222,12 @@ mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key
 # third trigger, and the count of receipts in unknown. tests/receipts.rs, the contract suite's
 # item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
 PG_RECEIPTS = PG + "sql/migrations/0008_receipts.sql"
-mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_RECEIPTS,
+# Migration 0009 replaces receipt_moves, so the trigger's moves are mutated in its copy.
+PG_RECONCILIATION = PG + "sql/migrations/0009_reconciliation.sql"
+mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_RECONCILIATION,
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed')\n",
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed', 'pending')\n")
-mutate("pg-receipt-trigger-deadline-ignored", "the receipt trigger lets the call settle its receipt past the row's deadline", PG_RECEIPTS,
+mutate("pg-receipt-trigger-deadline-ignored", "the receipt trigger lets the call settle its receipt past the row's deadline", PG_RECONCILIATION,
        "            THEN NOT past AND NEW.state <> 'pending'\n",
        "            THEN NEW.state <> 'pending'\n")
 mutate("pg-receipt-delete-granted", "the gateway's role may delete a receipt", PG_RECEIPTS,
@@ -4190,6 +4263,22 @@ mutate("pg-check-receipt-trigger-skipped", "the boot check does not look for the
        "    Trigger {\n        table: RECEIPTS,\n        name: \"receipt_moves\",\n"
        "        purpose: \"moves a receipt only as its state table allows, by the database's clock\",\n"
        "        fires: \"before each insert or update\",\n        tgtype: 1 | 2 | 4 | 16,\n    },\n",
+       "")
+# Reconciliation (decision 0009, "Reconciliation"): migration 0009's lookup table, its trigger
+# and grants, receipt_moves settling only on a lookup that establishes the state, and the claim.
+# tests/reconcile.rs, the contract suite's reconciliation cases on Postgres and tests/check.rs
+# catch these.
+mutate("pg-lookup-record-updated", "a lookup record may be changed, by any role that may write it", PG_RECONCILIATION,
+       "    IF TG_OP <> 'INSERT' THEN\n", "    IF TG_OP = 'DELETE' THEN\n")
+mutate("pg-settle-without-a-lookup", "reconciliation may settle a receipt with no lookup recorded that establishes the state", PG_RECONCILIATION,
+       "        IF NOT EXISTS (\n", "        IF false AND NOT EXISTS (\n")
+mutate("pg-claim-ignores-lease", "a claim is granted whatever lease another holder has", PG + "src/reconcile.rs",
+       "         AND (r.lease_until IS NULL OR r.lease_until <= clock_timestamp())\n     RETURNING \",",
+       "     RETURNING \",")
+mutate("pg-check-lookup-trigger-skipped", "the boot check does not look for the lookup trigger", PG_CHECK,
+       "    Trigger {\n        table: LOOKUPS,\n        name: \"lookup_appends\",\n"
+       "        purpose: \"appends a lookup to a receipt in unknown, and never changes or removes one\",\n"
+       "        fires: \"before each insert, update or delete\",\n        tgtype: 1 | 2 | 4 | 8 | 16,\n    },\n",
        "")
 mutate("pg-check-receipts-unchecked", "the boot check does not check the receipt table: that it is there, logged, and the role's grants on its columns", PG_CHECK,
        "            receipts(client, &mut problems).await?;\n", "")

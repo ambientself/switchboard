@@ -17,6 +17,10 @@
 //! - It keeps receipts for side effects (decision 0009, part 2) in `receipts`: begin with a
 //!   receipt reserves one, or answers a reused key, in the same transaction as the row, and
 //!   finish settles it in the same transaction as the row's completion.
+//! - It keeps the queue of `unknown` receipts for reconciliation, as the core's
+//!   [`ReceiptQueue`](gateway_core::ReceiptQueue), on the open-row query's pool: each receipt's
+//!   vendor target, its lease and when it was handed to a person, and the lookups made on it in
+//!   `receipt_lookups`.
 //! - [`PgAuditStore::open_rows`] counts the open rows, through the view `open_call_rows`:
 //!   allowed calls with no completion past their deadline, by the database's clock. It has a
 //!   pool of its own, of one connection, so a slow count never takes a finish's connection.
@@ -40,21 +44,27 @@
 //! - It reserves a receipt without its state, how it was established or its time, reads every
 //!   column of a receipt, which the reuse check needs, so it can read who caused each side
 //!   effect, and updates only a receipt's state, how it was established, the person who did and
-//!   the reference. It cannot delete a receipt.
+//!   the reference, and, for reconciliation, its lease and when it was handed to a person. It
+//!   cannot delete a receipt, nor change its target.
+//! - It appends a lookup to `receipt_lookups`, without its time, and reads the lookups. It
+//!   cannot change or delete one.
 //!
 //! Those are the migration's grants on the tables. Other objects can give a role more: a grant
 //! on a view over the table, a rule, a `SECURITY DEFINER` function, or a function that reaches
 //! the server's files. [`PgAuditStore::check_at_boot`] refuses the ones it knows of, and its
 //! documentation lists those it does not look for.
 //!
-//! And for every role, through three triggers: both times and the deadline come from the
+//! And for every role, through four triggers: both times and the deadline come from the
 //! database's clock, whatever an insert or a completion carries; a row is completed at most
-//! once, a denial or a list row is never completed, and a completion writes nothing else; and a
+//! once, a denial or a list row is never completed, and a completion writes nothing else; a
 //! receipt moves only as the core's `may_move` allows, judging its row's deadline by the
-//! database's clock as it writes. A call's deadline is its time at begin plus the allowance the
-//! store gives it: the begin budget, the call's deadline, the finish deadline and the answer
-//! budget ([`Budgets`]). A call row cannot be stored without one, and a list row cannot be
-//! stored with one or with a call's columns.
+//! database's clock as it writes, is settled by reconciliation only on a lookup recorded on it
+//! that establishes the state, and has its lease and hand-off written only while it is in
+//! `unknown` and not handed off; and a lookup is appended only to such a receipt, as its next
+//! attempt, at the database's time, and is never changed or removed. A call's deadline is its
+//! time at begin plus the allowance the store gives it: the begin budget, the call's deadline,
+//! the finish deadline and the answer budget ([`Budgets`]). A call row cannot be stored
+//! without one, and a list row cannot be stored with one or with a call's columns.
 //!
 //! # Tests against a database
 //!
@@ -74,6 +84,7 @@
 mod check;
 mod columns;
 mod migrate;
+mod reconcile;
 mod stats;
 mod store;
 
@@ -87,6 +98,7 @@ pub use columns::{
 pub use migrate::{
     GATEWAY_ROLE, MIGRATIONS, MigrateError, Migration, OWNER_ROLE, ROLES, SCHEMA, migrate,
 };
+pub use reconcile::MAX_DUE;
 pub use stats::{
     BeginFailures, GivenUpCauses, LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram, PoolStats,
     StoreStats,

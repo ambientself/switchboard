@@ -10,6 +10,7 @@ fn approve(text: &str) -> (ApprovedTool, ApprovedTool) {
         connector: "github".into(),
         resources: ResourceDeclaration::Declared,
         declared_from: None,
+        settlement: None,
     };
     let unparsed = ApprovedTool {
         name: "github__get_file".parse().unwrap(),
@@ -17,6 +18,7 @@ fn approve(text: &str) -> (ApprovedTool, ApprovedTool) {
         connector: "github".into(),
         resources: ResourceDeclaration::Declared,
         declared_from: None,
+        settlement: None,
     };
     (unhandled, unparsed)
 }

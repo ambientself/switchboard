@@ -9,7 +9,8 @@
 //!   records that store cannot hold, a row over its bound ([`row_bound`]) among them. It can
 //!   fail or hold `begin` and `finish`, lose a begin's confirmation after writing, answer a
 //!   finish past the answer budget and write it later, and forget finishes as a lost process
-//!   would. [`row_start`] makes a fresh identifier for a test.
+//!   would. [`row_start`] makes a fresh identifier for a test. It keeps the queue of `unknown`
+//!   receipts as the Postgres store does, and can hold or fail a claim.
 //! - [`contract`] is the audit store contract suite: test functions that every store must
 //!   pass, run on [`InMemoryAuditStore`] by this crate's tests and on the Postgres store by
 //!   that crate's.
@@ -17,7 +18,9 @@
 //!   can refuse or be unavailable.
 //! - [`FixtureConnector`] serves a read tool, a `propose` tool that acts only on drafts it
 //!   opened, a direct-write tool that every profile denies, and a scope-checking tool. It
-//!   records every call, and can fail or hang.
+//!   records every call, and can fail, hang, or lose the answer to a draft it opened.
+//! - [`FakeLookup`] is a lookup by marker that sends nothing: it answers what a test tells it,
+//!   records each request, and can be held.
 //! - [`LocalIssuer`] generates a key pair when built, gives its public keys as the JWKS
 //!   document an issuer serves, and signs tokens a test can break in any one way;
 //!   [`FixedClock`] and [`SteppableClock`] say what time it is.
@@ -42,6 +45,7 @@ mod exec;
 mod fixture;
 mod gate;
 mod issuer;
+mod lookup;
 pub mod row_bound;
 
 pub use audit::{
@@ -62,3 +66,4 @@ pub use issuer::{
     DEFAULT_LEEWAY, DEFAULT_MAX_LIFETIME, DEFAULT_TOKEN_LIFETIME, IssuerError, LocalIssuer,
     TokenBuilder,
 };
+pub use lookup::{FakeLookup, LookedUp};

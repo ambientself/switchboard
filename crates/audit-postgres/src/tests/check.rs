@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 
 use super::{DUMMY_PASSWORD, GATEWAY_ROLE, OWNER_ROLE, TestDatabase, connect};
 use crate::check::{
-    INSERTED, OPEN_ROWS_DEFINITION, RECEIPT_INSERTED, RECEIPT_SELECTED, RECEIPT_UPDATED, SELECTED,
-    UPDATED,
+    INSERTED, LOOKUP_INSERTED, LOOKUP_SELECTED, OPEN_ROWS_DEFINITION, RECEIPT_INSERTED,
+    RECEIPT_SELECTED, RECEIPT_UPDATED, SELECTED, UPDATED,
 };
 use crate::{BootCheckError, MIGRATIONS, PgAuditStore, PoolSizes, Problem};
 
@@ -558,13 +558,17 @@ async fn grant_the_gateways_own(db: &TestDatabase, role: &str, option: &str) {
              GRANT SELECT ON switchboard_audit.open_call_rows TO {role}{option};
              GRANT INSERT ({}) ON switchboard_audit.receipts TO {role}{option};
              GRANT UPDATE ({}) ON switchboard_audit.receipts TO {role}{option};
-             GRANT SELECT ({}) ON switchboard_audit.receipts TO {role}{option};",
+             GRANT SELECT ({}) ON switchboard_audit.receipts TO {role}{option};
+             GRANT INSERT ({}) ON switchboard_audit.receipt_lookups TO {role}{option};
+             GRANT SELECT ({}) ON switchboard_audit.receipt_lookups TO {role}{option};",
             INSERTED.join(", "),
             UPDATED.join(", "),
             SELECTED.join(", "),
             RECEIPT_INSERTED.join(", "),
             RECEIPT_UPDATED.join(", "),
             RECEIPT_SELECTED.join(", "),
+            LOOKUP_INSERTED.join(", "),
+            LOOKUP_SELECTED.join(", "),
         ))
         .await
         .unwrap();
@@ -672,8 +676,8 @@ async fn a_role_that_does_not_inherit_the_gateways_privileges_is_refused() {
             .all(|problem| matches!(problem, Problem::Missing { .. })),
         "{found:?}"
     );
-    // Each column privilege on both tables, USAGE on the schema, and SELECT on the open-row
-    // view.
+    // Each column privilege on the three tables, USAGE on the schema, and SELECT on the
+    // open-row view.
     assert_eq!(
         found.len(),
         INSERTED.len()
@@ -682,6 +686,8 @@ async fn a_role_that_does_not_inherit_the_gateways_privileges_is_refused() {
             + RECEIPT_INSERTED.len()
             + RECEIPT_UPDATED.len()
             + RECEIPT_SELECTED.len()
+            + LOOKUP_INSERTED.len()
+            + LOOKUP_SELECTED.len()
             + 2,
         "{found:?}"
     );
@@ -723,6 +729,18 @@ async fn the_gateways_own_privileges_with_grant_option_are_refused() {
     }
     expected.extend(on_receipts.into_iter().map(|(privilege, column)| {
         extra(&privilege, &format!("switchboard_audit.receipts.{column}"))
+    }));
+    let mut on_lookups = BTreeSet::new();
+    for (privilege, columns) in [("INSERT", LOOKUP_INSERTED), ("SELECT", LOOKUP_SELECTED)] {
+        for column in columns {
+            on_lookups.insert((format!("{privilege} WITH GRANT OPTION"), *column));
+        }
+    }
+    expected.extend(on_lookups.into_iter().map(|(privilege, column)| {
+        extra(
+            &privilege,
+            &format!("switchboard_audit.receipt_lookups.{column}"),
+        )
     }));
     expected.push(extra(
         "USAGE WITH GRANT OPTION",
@@ -788,29 +806,101 @@ async fn a_missing_column_or_one_of_another_type_is_refused() {
         .batch_execute(
             "ALTER TABLE switchboard_audit.call_rows DROP COLUMN claimed_team;
              ALTER TABLE switchboard_audit.call_rows DROP COLUMN deadline CASCADE;
-             ALTER TABLE switchboard_audit.call_rows ALTER COLUMN latency_ms TYPE integer;",
+             ALTER TABLE switchboard_audit.call_rows ALTER COLUMN latency_ms TYPE integer;
+             ALTER TABLE switchboard_audit.receipts DROP COLUMN lease_until CASCADE;
+             ALTER TABLE switchboard_audit.receipts ALTER COLUMN handed_to_person_at TYPE text;
+             ALTER TABLE switchboard_audit.receipt_lookups ALTER COLUMN attempt TYPE bigint;",
         )
         .await
         .unwrap();
     let found = problems(&db.store(PoolSizes::default())).await;
     assert!(
         found.contains(&Problem::ColumnMissing {
+            table: "call_rows",
             column: "claimed_team"
         }),
         "{found:?}"
     );
     // The column the open-row query reads, and the trigger writes.
     assert!(
-        found.contains(&Problem::ColumnMissing { column: "deadline" }),
+        found.contains(&Problem::ColumnMissing {
+            table: "call_rows",
+            column: "deadline"
+        }),
         "{found:?}"
     );
     assert!(
         found.contains(&Problem::ColumnType {
+            table: "call_rows",
             column: "latency_ms",
             found: "integer".into(),
             expected: "bigint",
         }),
         "{found:?}"
+    );
+    // Reconciliation's columns, on the receipts and on their lookups.
+    assert!(
+        found.contains(&Problem::ColumnMissing {
+            table: "receipts",
+            column: "lease_until"
+        }),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&Problem::ColumnType {
+            table: "receipts",
+            column: "handed_to_person_at",
+            found: "text".into(),
+            expected: "timestamp with time zone",
+        }),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&Problem::ColumnType {
+            table: "receipt_lookups",
+            column: "attempt",
+            found: "bigint".into(),
+            expected: "integer",
+        }),
+        "{found:?}"
+    );
+    assert_eq!(
+        Problem::ColumnMissing {
+            table: "receipts",
+            column: "lease_until"
+        }
+        .to_string(),
+        "the column receipts.lease_until does not exist"
+    );
+}
+
+/// The table of lookups made on receipts must be there, with its trigger.
+#[tokio::test]
+async fn a_missing_lookup_table_is_refused() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    db.admin()
+        .await
+        .batch_execute("DROP TABLE switchboard_audit.receipt_lookups CASCADE")
+        .await
+        .unwrap();
+    let found = problems(&db.store(PoolSizes::default())).await;
+    assert!(found.contains(&Problem::LookupsMissing), "{found:?}");
+    assert!(
+        found.iter().any(|problem| matches!(
+            problem,
+            Problem::TriggerMissing {
+                trigger: "lookup_appends",
+                ..
+            }
+        )),
+        "{found:?}"
+    );
+    assert_eq!(
+        Problem::LookupsMissing.to_string(),
+        "the table switchboard_audit.receipt_lookups, which keeps the lookups made on receipts, \
+         does not exist"
     );
 }
 
@@ -890,7 +980,9 @@ async fn an_unlogged_table_or_partition_is_refused() {
     admin
         .batch_execute(
             "ALTER TABLE switchboard_audit.call_rows DROP CONSTRAINT call_rows_duplicate_of_fkey;
-             ALTER TABLE switchboard_audit.receipts DROP CONSTRAINT receipts_row_id_fkey;",
+             ALTER TABLE switchboard_audit.receipts DROP CONSTRAINT receipts_row_id_fkey;
+             ALTER TABLE switchboard_audit.receipt_lookups
+                 DROP CONSTRAINT receipt_lookups_row_id_fkey;",
         )
         .await
         .unwrap();
@@ -905,6 +997,18 @@ async fn an_unlogged_table_or_partition_is_refused() {
     );
     admin
         .batch_execute("ALTER TABLE switchboard_audit.receipts SET LOGGED")
+        .await
+        .unwrap();
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.receipt_lookups SET UNLOGGED")
+        .await
+        .unwrap();
+    assert_eq!(
+        problems(&store).await,
+        vec![unlogged("switchboard_audit.receipt_lookups")]
+    );
+    admin
+        .batch_execute("ALTER TABLE switchboard_audit.receipt_lookups SET LOGGED")
         .await
         .unwrap();
     admin
@@ -1075,6 +1179,7 @@ async fn a_disabled_or_missing_trigger_is_refused() {
         ("call_rows", "set_times"),
         ("call_rows", "complete_once"),
         ("receipts", "receipt_moves"),
+        ("receipt_lookups", "lookup_appends"),
     ] {
         let disabled = vec![Problem::TriggerDisabled { table, trigger }];
         admin
@@ -1097,17 +1202,29 @@ async fn a_disabled_or_missing_trigger_is_refused() {
     }
 
     admin
+        .batch_execute("DROP TRIGGER lookup_appends ON switchboard_audit.receipt_lookups")
+        .await
+        .unwrap();
+    assert_eq!(problems(&store).await, vec![missing("lookup_appends")]);
+    admin
         .batch_execute("DROP TRIGGER receipt_moves ON switchboard_audit.receipts")
         .await
         .unwrap();
-    assert_eq!(problems(&store).await, vec![missing("receipt_moves")]);
+    assert_eq!(
+        problems(&store).await,
+        vec![missing("receipt_moves"), missing("lookup_appends")]
+    );
     admin
         .batch_execute("DROP TRIGGER complete_once ON switchboard_audit.call_rows")
         .await
         .unwrap();
     assert_eq!(
         problems(&store).await,
-        vec![missing("complete_once"), missing("receipt_moves")]
+        vec![
+            missing("complete_once"),
+            missing("receipt_moves"),
+            missing("lookup_appends")
+        ]
     );
     admin
         .batch_execute("DROP TRIGGER set_times ON switchboard_audit.call_rows")
@@ -1118,7 +1235,8 @@ async fn a_disabled_or_missing_trigger_is_refused() {
         vec![
             missing("set_times"),
             missing("complete_once"),
-            missing("receipt_moves")
+            missing("receipt_moves"),
+            missing("lookup_appends")
         ]
     );
 }
@@ -1134,6 +1252,11 @@ fn missing(trigger: &'static str) -> Problem {
             "receipts",
             "moves a receipt only as its state table allows, by the database's clock",
             "before each insert or update",
+        ),
+        "lookup_appends" => (
+            "receipt_lookups",
+            "appends a lookup to a receipt in unknown, and never changes or removes one",
+            "before each insert, update or delete",
         ),
         _ => (
             "call_rows",

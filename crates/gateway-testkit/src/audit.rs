@@ -9,8 +9,8 @@ use gateway_core::audit::{
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
-    AuditRecord, AuditStore, BoxFuture, IdempotencyKey, InstanceName, Receipt, ReceiptState, Reuse,
-    VendorReference,
+    AuditRecord, AuditStore, BoxFuture, IdempotencyKey, InstanceName, LeaseHolder, LookupAnswer,
+    LookupRecord, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse, VendorReference,
 };
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
@@ -337,6 +337,10 @@ struct State {
     finish_gate: Option<Gate>,
     answer_gate: Option<Gate>,
     late: Vec<Late>,
+    /// Each receipt's lease: who holds it, and until when.
+    leases: Vec<(AuditRowId, LeaseHolder, SystemTime)>,
+    claim_gate: Option<Gate>,
+    claims_failing: Failing,
 }
 
 impl State {
@@ -518,6 +522,62 @@ impl State {
             receipt.reference = reference.cloned();
         }
         Ok(())
+    }
+
+    /// Whether the receipt `receipt` reads as `unknown` at `now`, as
+    /// [`as_read`](Self::as_read) reads it: the state `unknown`, or `pending` past its row's
+    /// deadline, as Postgres reads `deadline < clock_timestamp()`.
+    fn reads_as_unknown(&self, receipt: &Receipt, now: SystemTime) -> bool {
+        receipt.state.as_read(self.past_deadline(&receipt.row, now)) == ReceiptState::Unknown
+    }
+
+    /// Whether the lease on the receipt `row` is free at `now`: never set, or ended.
+    fn lease_free(&self, row: &AuditRowId, now: SystemTime) -> bool {
+        self.leases
+            .iter()
+            .filter(|(leased, _, _)| leased == row)
+            .all(|(_, _, until)| *until <= now)
+    }
+
+    /// Whether `holder` holds the lease on the receipt `row` at `now`.
+    fn holds(&self, row: &AuditRowId, holder: &LeaseHolder, now: SystemTime) -> bool {
+        self.leases
+            .iter()
+            .any(|(leased, by, until)| leased == row && by == holder && *until > now)
+    }
+
+    /// Whether `receipt` is due at `now`: it reads as `unknown`, was not handed to a person,
+    /// and its lease is free.
+    fn due(&self, receipt: &Receipt, now: SystemTime) -> bool {
+        self.reads_as_unknown(receipt, now)
+            && receipt.handed_to_person.is_none()
+            && self.lease_free(&receipt.row, now)
+    }
+
+    /// The position of the receipt `row` if `holder` holds its lease at `now` and it reads as
+    /// `unknown`, not handed to a person; refused otherwise, as Postgres refuses it.
+    fn held(
+        &self,
+        row: &AuditRowId,
+        holder: &LeaseHolder,
+        now: SystemTime,
+    ) -> Result<usize, StoreError> {
+        self.receipts
+            .iter()
+            .position(|receipt| {
+                receipt.row == *row
+                    && self.holds(row, holder, now)
+                    && receipt.handed_to_person.is_none()
+                    && self.reads_as_unknown(receipt, now)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "receipt {} is not held under this lease, or no longer reads as unknown, or \
+                     was handed to a person; nothing was written",
+                    row.as_str()
+                )
+                .into()
+            })
     }
 
     fn complete_row(&mut self, id: &AuditRowId, completion: &Completion) -> Result<(), StoreError> {
@@ -895,6 +955,40 @@ impl InMemoryAuditStore {
         gate
     }
 
+    /// Holds every [`claim`](ReceiptQueue::claim) from here on at a gate, which is returned. No
+    /// lease is set until it opens, so a test can see that nothing is looked up before a claim
+    /// is committed.
+    pub fn hold_claims(&self) -> Gate {
+        let gate = Gate::closed();
+        self.state().claim_gate = Some(gate.clone());
+        gate
+    }
+
+    /// The next [`claim`](ReceiptQueue::claim) fails, writing nothing, and later ones work.
+    pub fn fail_next_claim(&self) {
+        self.state().claims_failing = Failing::Next;
+    }
+
+    /// Who holds the lease on the receipt `row` now, if anyone does.
+    pub fn lease_holder(&self, row: &AuditRowId) -> Option<LeaseHolder> {
+        let now = self.clock.now();
+        let state = self.state();
+        state
+            .leases
+            .iter()
+            .find(|(leased, _, until)| leased == row && *until > now)
+            .map(|(_, holder, _)| holder.clone())
+    }
+
+    /// When the last lease set on the receipt `row` ends, or ended, if one was set.
+    pub fn lease_until(&self, row: &AuditRowId) -> Option<SystemTime> {
+        self.state()
+            .leases
+            .iter()
+            .find(|(leased, _, _)| leased == row)
+            .map(|(_, _, until)| *until)
+    }
+
     /// Every `finish` from here on, while the returned gate is closed, takes longer than the
     /// answer budget: it fails at once with an error naming the budget, and its completion is
     /// written once the gate opens, as the Postgres store keeps trying on a task of its own
@@ -1089,6 +1183,117 @@ impl AuditStore for InMemoryAuditStore {
             if state.confirmation_lost.take() {
                 return Err(lost());
             }
+            Ok(())
+        })
+    }
+}
+
+/// The queue of `unknown` receipts as the Postgres store keeps it (decision 0009,
+/// "Reconciliation"), by this store's clock: a receipt is due when it reads as `unknown`, was
+/// not handed to a person and its lease is free; a claim sets a lease only on a receipt still
+/// due; a lookup is appended, never changed, and moves the receipt as the core's
+/// [`LookupAnswer::settles`] says, or hands it to a person on its last attempt; and nothing is
+/// written for a holder whose lease has ended. A claim can be held at a gate
+/// ([`hold_claims`](InMemoryAuditStore::hold_claims)) or told to fail
+/// ([`fail_next_claim`](InMemoryAuditStore::fail_next_claim)).
+impl ReceiptQueue for InMemoryAuditStore {
+    fn due<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<Receipt>, StoreError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            let state = self.state();
+            Ok(state
+                .receipts
+                .iter()
+                .filter(|receipt| state.due(receipt, now))
+                .take(limit)
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn claim<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        holder: &'a LeaseHolder,
+        lease: Duration,
+    ) -> BoxFuture<'a, Result<Option<Receipt>, StoreError>> {
+        let gate = self.state().claim_gate.clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            let now = self.clock.now();
+            let mut state = self.state();
+            if state.claims_failing.take() {
+                return Err(down());
+            }
+            let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|receipt| receipt.row == *row && state.due(receipt, now))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let until = now.checked_add(lease).unwrap_or(now);
+            state.leases.retain(|(leased, _, _)| leased != row);
+            state.leases.push((row.clone(), holder.clone(), until));
+            Ok(Some(receipt))
+        })
+    }
+
+    fn record_lookup<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        holder: &'a LeaseHolder,
+        answer: &'a LookupAnswer,
+        attempts: u32,
+    ) -> BoxFuture<'a, Result<Recorded, StoreError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            let mut state = self.state();
+            let at = state.held(row, holder, now)?;
+            let receipt = &mut state.receipts[at];
+            let made = receipt.lookups.len();
+            if made >= usize::try_from(attempts).unwrap_or(usize::MAX) {
+                return Err(format!(
+                    "receipt {} already has {attempts} lookups, all it may have; nothing was \
+                     written",
+                    row.as_str()
+                )
+                .into());
+            }
+            let answer = answer.recorded();
+            receipt.lookups.push(LookupRecord {
+                at: now,
+                answer: answer.clone(),
+            });
+            Ok(match answer.settles() {
+                Some(settled) => {
+                    receipt.state = settled;
+                    receipt.established_by = EstablishedBy::Reconciliation;
+                    receipt.reference = answer.reference().cloned();
+                    Recorded::Settled(settled)
+                }
+                None if made + 1 >= usize::try_from(attempts).unwrap_or(usize::MAX) => {
+                    receipt.handed_to_person = Some(now);
+                    Recorded::HandedToPerson
+                }
+                None => Recorded::Left,
+            })
+        })
+    }
+
+    fn hand_to_person<'a>(
+        &'a self,
+        row: &'a AuditRowId,
+        holder: &'a LeaseHolder,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            let mut state = self.state();
+            let at = state.held(row, holder, now)?;
+            state.receipts[at].handed_to_person = Some(now);
             Ok(())
         })
     }

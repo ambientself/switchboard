@@ -83,6 +83,7 @@ use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
 use crate::drift::{DriftPass, ProbeCredentialError, probe_credentials};
 use crate::keys::KeyRefresher;
 use crate::reach::{ReachCaller, ReachSettings};
+use crate::reconcile::Reconciler;
 use crate::reload::Reloader;
 
 /// The `event` field of the error logged for each audit row the Postgres store stops trying to
@@ -251,6 +252,10 @@ pub struct Prepared {
     /// The drift pass, its first pass already run. Run it beside the watch, and stop it when the
     /// gateway shuts down.
     pub drift: DriftPass,
+    /// Reconciliation of `unknown` receipts over the Postgres store, when audit is on: run it
+    /// beside the watch, and stop it when the gateway shuts down. `None` with audit disabled,
+    /// when there are no receipts.
+    pub reconciler: Option<Reconciler>,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -263,6 +268,7 @@ impl std::fmt::Debug for Prepared {
             .field("metrics", &self.metrics)
             .field("max_in_flight", &self.max_in_flight)
             .field("drift", &self.drift)
+            .field("reconciler", &self.reconciler)
             .finish_non_exhaustive()
     }
 }
@@ -516,6 +522,19 @@ async fn prepare_with(
         "serving the registry file's policy, less any tool the first drift pass withdrew"
     );
 
+    // Every instance works the queue of unknown receipts (decision 0009, "Reconciliation"). No
+    // connector registers a lookup yet, so each such receipt goes to a person.
+    let reconciler = store.clone().map(|store| {
+        let settings = deployment.reconciliation;
+        tracing::info!(
+            event = "boot",
+            reconcile_interval_seconds = settings.interval.as_secs(),
+            reconcile_lease_seconds = settings.lease.as_secs(),
+            reconcile_attempts = settings.attempts,
+            "unknown receipts are looked up, or handed to a person, every interval"
+        );
+        gates.reconciler(store, settings)
+    });
     Ok(Prepared {
         gates,
         store,
@@ -530,6 +549,7 @@ async fn prepare_with(
         max_in_flight: limits.max_in_flight,
         proxied: proxied_signals,
         drift,
+        reconciler,
     })
 }
 
@@ -1315,6 +1335,7 @@ mod tests {
             drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
             probe_credentials: BTreeMap::from([(ConnectorName::new("mock-docs"), probe)]),
             reach: None,
+            reconciliation: crate::reconcile::ReconcileSettings::default(),
             credentials: BTreeMap::from([("docs-credential".to_owned(), credential)]),
         }
     }

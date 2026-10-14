@@ -18,8 +18,8 @@ use gateway_core::{
     Decision, DeclaredFrom, Delegation, EntryKind, GroupId, IdempotencyKey, Issuer, Narrowing,
     PodUid, PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
     ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
-    ResourceProblem, Resources, SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName,
-    Verdict, decide, list_tools,
+    ResourceProblem, Resources, Settlement, SnapshotData, Subject, Surface, SurfaceName, TeamId,
+    ToolName, Verdict, decide, list_tools,
 };
 
 use gateway_core::AuditRecord;
@@ -70,6 +70,7 @@ impl World {
         let mut data = self.data.clone();
         data.profiles = vec![self.profile.clone()];
         serve_proposals_as_rules_8_and_9_allow(&mut data, &self.principal);
+        settle_every_side_effect(&mut data);
         PolicySnapshot::new(data).expect("a generated snapshot is invalid")
     }
 
@@ -107,6 +108,17 @@ impl World {
             .surfaces
             .iter_mut()
             .find(|surface| surface.name == name)
+    }
+}
+
+/// Decision 0009: every tool not classified `read` declares how its `unknown` receipts are
+/// settled, and no `read` tool does. A property may change a tool's classification after the
+/// world is drawn, so the declaration follows the classification here. Nothing a decision or a
+/// listing reads looks at it.
+fn settle_every_side_effect(data: &mut SnapshotData) {
+    for tool in &mut data.tools {
+        tool.settlement =
+            (tool.classification != Classification::Read).then_some(Settlement::Person);
     }
 }
 
@@ -308,6 +320,7 @@ fn any_tool(name: &'static str) -> impl Strategy<Value = ApprovedTool> {
             connector: "sys".into(),
             resources,
             declared_from: None,
+            settlement: (classification != Classification::Read).then_some(Settlement::Person),
         },
     )
 }
@@ -1055,6 +1068,7 @@ fn any_entry_tool(name: &'static str) -> impl Strategy<Value = ApprovedTool> {
             connector: connector.into(),
             resources,
             declared_from: from.filter(|_| resources == ResourceDeclaration::Declared),
+            settlement: (classification != Classification::Read).then_some(Settlement::Person),
         },
     )
 }

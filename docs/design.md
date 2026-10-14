@@ -803,8 +803,17 @@ the reference; and cannot delete one. The trigger `receipt_moves` refuses, for e
 every move the state table does not allow and every other write, judging "past the deadline"
 by the database's clock at the time of the write: the row's deadline is earlier than
 `clock_timestamp()`. So a finish that arrives after the deadline completes its row and leaves
-its receipt `pending`. The boot check refuses a missing or disabled trigger of the three, an
-unlogged receipt table, and grants on it wider than the role's own. Deletion for retention uses a separate
+its receipt `pending`. Migration 0009 adds what reconciliation needs: each receipt's vendor
+target, which the role inserts with the reservation and never changes; its lease and when it
+was handed to a person, which the role may write and `receipt_moves` lets it write only on a
+receipt in `unknown` not yet handed off, with the hand-off at the database's time and never
+undone; and the table `receipt_lookups`, to which the role appends a lookup and which it reads,
+and nothing more. Its trigger `lookup_appends` appends a lookup only to a receipt in `unknown`
+not handed off, as its next attempt, at the database's time, and refuses every change and
+removal for every role. `receipt_moves` lets reconciliation settle a receipt only on a lookup
+recorded on it that establishes the state. The boot check refuses a missing or disabled trigger
+of the four, an unlogged receipt or lookup table, a missing column of reconciliation's, and
+grants on either table wider than the role's own. Deletion for retention uses a separate
 role, created before the first production deployment; until it exists nothing is deleted
 ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)). None of this
 protects rows against a database superuser.
@@ -817,8 +826,9 @@ row, which is made at the finish deadline.
 
 **Signals,** counted and exported from milestone 2: begin failures and the audit-failure
 answers they cause; answers released before finish; finishes not written by their deadline;
-open rows; receipts in `unknown` and the age of the oldest; begin and finish latency;
-connections in use per pool; telemetry dropped. The alert conditions are written in
+open rows; receipts in `unknown` and the age of the oldest; reconciliation's lookups by result
+and the receipts it handed to a person; begin and finish latency; connections in use per pool;
+telemetry dropped. The alert conditions are written in
 [decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); nothing pages until
 a metrics sink and an on-call rotation exist.
 
@@ -922,13 +932,28 @@ receipt.
   | Same tool and digest, `not_performed` | `refused` | Nothing was done. A new attempt needs a new key. |
 
 - **Reconciliation only looks.** A side-effecting tool's approval declares how an `unknown`
-  receipt is settled: by a lookup or by a person. A lookup finds the effect by a marker the
-  gateway attached, carrying the receipt identifier, never by a field the caller chose alone.
-  It concludes `not_performed` only from a lookup the vendor documents as complete and
-  current. It reads through a credential narrowed to the receipt's team, vendor target and
-  resources. Every instance works the queue, claiming a receipt with a short lease. After a
-  bounded number of lookups a person settles it. A `propose` tool may be approved with no
-  lookup. A `write` tool allowed under a recorded exception
+  receipt is settled: by a lookup in a kind of resource, or by a person (section 13). The
+  receipt records, at begin, the vendor target the lookup will look in: the one resource of
+  that kind the call names, and none for a tool settled by a person or a call that names no
+  single such resource. A lookup finds the effect by a marker the gateway attached, carrying
+  the receipt identifier, never by a field the caller chose alone. It is not a tool call and
+  writes no audit row, and it never sends anything that could cause an effect. It concludes
+  `not_performed` only from a search the vendor documents as complete and current; a found
+  effect settles the receipt `completed` with the vendor's reference; anything else is recorded
+  and leaves it `unknown`. It reads through a credential narrowed to the receipt's team, vendor
+  target and resources, which comes with the built-in connectors (#12). Every instance works
+  the queue of receipts in `unknown`, the state `unknown` or `pending` past its row's deadline,
+  with no separate deployment: it claims a receipt by setting a short lease, committed before
+  any lookup is made, so no lock or connection is held across one, and records each lookup on
+  the receipt, appended and never changed. A receipt with nothing to look in, or whose
+  connector has no lookup, goes to a person at once; one whose lookups are used up goes to a
+  person on its last. The interval, the lease and the number of attempts are deployment-file
+  settings, 60 s, 120 s and 5 by default, provisional until a connector has a lookup
+  (`crates/gateway/src/reconcile.rs`). A receipt handed to a person stays `unknown`, so the
+  open-row and unknown-receipt signals still count it. Nothing records a person's resolution
+  yet: who may record one, and through which authenticated path, is decision 0009's Still open
+  10, and who settles a receipt by hand is its Still open 9. A `propose` tool may be approved
+  with no lookup. A `write` tool allowed under a recorded exception
   ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)) needs a key, a
   receipt and the gate below like any side effect, and declares a lookup by marker unless its
   exception says otherwise.
@@ -1203,8 +1228,14 @@ leaves, bounds result sizes, and tags every result as external evidence.
 
 A side-effecting tool's approval also declares how an `unknown` receipt is settled, by a
 lookup by marker or by a person, and, for a proxied tool, whether its errors are safe, meaning
-the vendor did nothing (section 11). A connector attaches the receipt marker to what it makes,
-and sends the receipt identifier as the vendor's idempotency key where the vendor honors one.
+the vendor did nothing (section 11). The declaration is the approval's `settlement`: `"person"`,
+or `{"lookup": {"system": ..., "kind": ...}}`, the kind of resource the lookup looks in, such as
+a repository or a Jira project; in the registry file, `settlement = "person"` or
+`settlement = { lookup = { system = "github", kind = "repository" } }`. The snapshot loader
+refuses an approval of a tool not classified `read` that declares neither, and a `read`
+tool's that declares one, since a read has no receipt. A connector attaches the receipt marker
+to what it makes, and sends the receipt identifier as the vendor's idempotency key where the
+vendor honors one.
 
 **Drift.** Every gateway replica runs a drift pass beside its registry reloader, every 300 s by
 default (from 5 s to 900 s; 10 s in the demos), and no shorter than any proxied entry's call
@@ -1453,33 +1484,36 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   which also sets the deadline, and `complete_once` on the audit table, and `receipt_moves`
   on the receipt table, each enabled, and refuses a missing receipt table, an unlogged one, and
   grants on it wider than the role's own, column by column; anything on it as a whole, `DELETE`
-  among them, is refused with the rest of the schema. The definer, rule and foreign-key routes
+  among them, is refused with the rest of the schema. Since migration 0009 it also requires
+  `lookup_appends` on `receipt_lookups`, the columns reconciliation reads and writes, of their
+  types, on both tables, and refuses an unlogged lookup table and any column privilege on it
+  beyond appending and reading. The definer, rule and foreign-key routes
   it follows to `call_rows` are not followed to `receipts` yet.
 - Receipts in Postgres: built (#55, part 2). Migration 0008 adds `switchboard_audit.receipts`,
   one row per receipt, keyed by the audit row that reserved it (a foreign key to `call_rows`),
   with the key's scope (the principal's issuer and subject, and the delegation's scope, which
   may be empty), the key, the tool, the tool-use identifier, the digest, the resources as the
   row records them, the state, how it was established and by whom, the vendor's reference and
-  the database's time of reservation. The vendor target and the lookups wait for
-  reconciliation. Two partial unique indexes make a key unique in its scope, with or without a
-  delegation scope, on any server from version 14. `PgAuditStore::begin_with_receipt` makes the
-  reuse check, which passes over a receipt under the call's own row, the row's insert and the
-  reservation one transaction at read committed. Of two begins with one key in one scope, the
-  unique index makes the second reservation wait for the first to commit and then insert
-  nothing; that begin is undone and made again from the check, which now finds the receipt and
-  writes the row complete with its answer. A retried begin of a row it finds stored answers
-  `Reserved` while the row's receipt is `pending` and the row's deadline has not passed by the
-  database's clock, the answer the row was written with (one of the five for the earlier
-  receipt, whatever has become of it since), and refuses a row whose receipt has left
-  `pending`, one whose receipt is still `pending` past the deadline, which reads as `unknown`,
-  one begun without a receipt, or one of another decision or kind. Finish, the completion of a
-  lost begin's row and `give_up` complete the row and settle its receipt in one transaction,
-  with the vendor's reference, while it is `pending` and the row's deadline has not passed by
-  the database's clock; after it the row is completed and the receipt left `pending`. If the
-  deadline passes between the store's test and the trigger's, the trigger refuses with
-  SQLSTATE `SB001` and the store completes the row again, leaving the receipt `pending`.
-  `unknown`, or a reference, for a row that reserved no receipt is refused, and so is a
-  `duplicate` at finish. The Postgres runner runs item 6 of the contract suite.
+  the database's time of reservation. Migration 0009 adds the vendor target and the lookups
+  (reconciliation, below). Two partial unique indexes make a key unique in its scope, with or
+  without a delegation scope, on any server from version 14. `PgAuditStore::begin_with_receipt`
+  makes the reuse check, which passes over a receipt under the call's own row, the row's insert
+  and the reservation one transaction at read committed. Of two begins with one key in one
+  scope, the unique index makes the second reservation wait for the first to commit and then
+  insert nothing; that begin is undone and made again from the check, which now finds the
+  receipt and writes the row complete with its answer. A retried begin of a row it finds stored
+  answers `Reserved` while the row's receipt is `pending` and the row's deadline has not passed
+  by the database's clock, the answer the row was written with (one of the five for the earlier
+  receipt, whatever has become of it since), and refuses a row whose receipt has left `pending`,
+  one whose receipt is still `pending` past the deadline, which reads as `unknown`, one begun
+  without a receipt, or one of another decision or kind. Finish, the completion of a lost
+  begin's row and `give_up` complete the row and settle its receipt in one transaction, with the
+  vendor's reference, while it is `pending` and the row's deadline has not passed by the
+  database's clock; after it the row is completed and the receipt left `pending`. If the
+  deadline passes between the store's test and the trigger's, the trigger refuses with SQLSTATE
+  `SB001` and the store completes the row again, leaving the receipt `pending`. `unknown`, or a
+  reference, for a row that reserved no receipt is refused, and so is a `duplicate` at finish.
+  The Postgres runner runs item 6 of the contract suite.
   A begin whose confirmation is lost after it wrote a reused key's row gives that row up as
   completed differently, where the in-memory store keeps its answer silently. The row is the
   same in both. The in-memory store's silence is the behaviour to match: that row's completion
@@ -1519,8 +1553,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `serde_json` here has no `arbitrary_precision`, so an integer outside 64 bits reaches the
   core as the nearest double, and two such integers can share a digest. A receipt holds its
   row, which is its identifier, the key's scope, the key, the tool, the tool-use identifier,
-  the digest, the resources, its state, how that was established and the vendor's reference;
-  the vendor target and the lookups wait for reconciliation. The scope is the proved
+  the digest, the resources, its state, how that was established and the vendor's reference,
+  and, since reconciliation, its vendor target, its lookups and when it was handed to a person.
+  The scope is the proved
   principal and the delegation's key scope, which no verifier fills until the delegation
   carries Otto's session, turn and execution (#22, decision 0009 Still open 8), so a key is
   scoped to the principal alone today. The moves the state table allows, among them that the
@@ -1533,16 +1568,35 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `duplicate` answered as a success with the receipt and the reference. A denial reserves
   nothing. `finish` settles the receipt with the row's completion. `ToolOutcome`
   gains `unknown` and a vendor reference for a completed side effect, and the row's outcome
-  `unknown` and `duplicate`. The gateway reads the key from its three carriers, an explicit
-  key first, and records the tool-use identifier beside it (#55; section 11); the profile
-  setting `idempotency_key_header`, false unless a policy says so, is the declaration the
-  header needs. An explicit key that is not valid leaves the call with no key, so a side
-  effect is denied for want of one. The core's docs say a side effect's `error` means its
-  connector knows nothing took effect, and the proxy connector reports every outcome of a side
-  effect but a success as `unknown` once its request may have been sent, its server's `4xx`,
-  JSON-RPC errors and failed tool results included, since no approval can yet say a proxied
-  tool's errors are safe. Receipts in Postgres and the signals for `unknown` receipts are
-  built (#55, part 2; above, and #47 below). Not built: reconciliation and resolution records.
+  `unknown` and `duplicate`. The gateway reads the key from its three carriers, an explicit key
+  first, and records the tool-use identifier beside it (#55; section 11); the profile setting
+  `idempotency_key_header`, false unless a policy says so, is the declaration the header needs.
+  An explicit key that is not valid leaves the call with no key, so a side effect is denied for
+  want of one. The core's docs say a side effect's `error` means its connector knows nothing
+  took effect, and the proxy connector reports every outcome of a side effect but a success as
+  `unknown` once its request may have been sent, its server's `4xx`, JSON-RPC errors and failed
+  tool results included, since no approval can yet say a proxied tool's errors are safe.
+  Receipts in Postgres and the signals for `unknown` receipts are built (#55, part 2; above, and
+  #47 below), and so is reconciliation (#55, part 4; below). Not built: resolution records.
+- Reconciliation of `unknown` receipts: built (#55, part 4), up to where a person must settle
+  a receipt. Each approval of a tool not classified `read` declares its settlement, which the
+  loader requires (section 13); every policy file, fixture and test policy declares one, and
+  the fixture's draft tool and the CI registry's proposal are settled by a person. The core
+  states the `Lookup` interface, which answers found with the vendor's reference, not found
+  with whether the search was authoritative, or failed, and the store's `ReceiptQueue`: the
+  receipts due, a claim that sets a lease and is committed before it returns, a lookup
+  appended with the receipt moved as its answer settles it, or handed to a person on the last
+  attempt, and a hand-off. The in-memory store and the Postgres store keep it (migration 0009,
+  section 11, on the open-row query's own connection); the testkit's `FakeLookup` stands in
+  for a vendor. `Reconciler` in the gateway makes a pass every interval in every instance with
+  audit in Postgres: it claims each receipt due, hands it to a person when it recorded no
+  target, its connector has no lookup or its attempts are used up, and otherwise asks the
+  lookup, with half the lease to answer, and records what it found. Lookups by result and
+  receipts handed to a person are counted on the metrics listener, and each hand-off is logged
+  as `receipt_handed_to_person`. No connector registers a lookup until the built-in GitHub
+  and Jira connectors (#12), so today every `unknown` receipt goes to a person at once, and
+  stays `unknown`: no resolution path is built (decision 0009, Still open 9 and 10). The
+  marker a connector attaches, and the custodian-narrowed read credential, come with #12.
 - With #25, the harness's in-memory store can also write and then report failure, lose the
   process between run and finish, and keep the answer budget, so the contract suite runs on
   it: built. Already built for both test stores, the core's and the harness's: an identical second
@@ -1930,7 +1984,12 @@ in the state `unknown` and those `pending` past their row's deadline, by the dat
 clock, on the open-row query's own connection and within its 2 s, as
 `switchboard_audit_unknown_receipts`, and exports when the oldest was reserved as
 `switchboard_audit_oldest_unknown_receipt_reserved_seconds`. A count that fails is counted,
-and nothing is exported in its place until one succeeds. The route check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
+and nothing is exported in its place until one succeeds. Reconciliation's own signals (#55,
+part 4) are `switchboard_reconciliation_lookups_total{result}`, `result` one of `found`,
+`not_found_authoritative`, `not_found` and `failed`,
+`switchboard_reconciliation_handed_to_person_total` and
+`switchboard_reconciliation_store_failures_total`.
+The route check is built, its operator step and its probe (decision 0010), and `demo.sh kind` runs it
 before and after the network policy; the kind claim holds only while the evidence log in
 [route-exceptions.md](route-exceptions.md) has a passing run from the last seven days.
 
@@ -2184,7 +2243,14 @@ database's clock as the superuser. Like the other Postgres tests, that runner is
 a test database, and CI's Postgres job fails on a skip. The read-backs are equally strict: the
 whole record, its kind and completion, the time at begin, whether the deadline was set, and the
 deadline less the time at begin. Each expectation is written to what Postgres does. The open-row query of item 5
-is tested on Postgres alone for now (#47). Item 6, receipts, runs on both stores (#55). The
+is tested on Postgres alone for now (#47). Item 6, receipts, runs on both stores (#55). So do
+reconciliation's cases (#55, part 4): a receipt records the vendor target its settlement
+takes; two claimants never both hold a receipt's lease; an ended lease can be claimed again;
+the attempts are bounded, the last handing the receipt to a person; an authoritative search
+that found nothing settles `not_performed` and no other answer does; a found effect settles
+`completed` with its reference; a lookup record is append-only; and a receipt settled by
+reconciliation is not moved by a late finish. The Postgres runner ends a lease by moving it, as
+the superuser, a second into the past. The
 Postgres runner passes a row's deadline by moving it, as the superuser, to the row's time at
 begin, and loses every begin's confirmation through a switch only the crate's own tests have,
 which reports each committed begin as failed so the store retries and then completes the row;

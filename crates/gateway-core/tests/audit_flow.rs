@@ -22,8 +22,8 @@ use gateway_core::{
     CredentialMode, Decision, Delegation, DelegationKeyScope, EntryKind, IdempotencyKey,
     InstanceName, KeyScope, Narrowing, PolicySnapshot, Principal, PrincipalId, PrincipalKind,
     PrincipalRestriction, Profile, Reason, ReasonKind, Receipt, ReceiptState, RequestedTool,
-    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Reuse, SnapshotData,
-    Surface, TeamId, ToolCall, ToolOutcome, VendorReference, decide, list_tools,
+    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Reuse, Settlement,
+    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, VendorReference, decide, list_tools,
 };
 use serde_json::json;
 
@@ -67,6 +67,7 @@ fn tool(name: &str, classification: Classification) -> ApprovedTool {
         connector: "fixture".into(),
         resources: ResourceDeclaration::NoResources,
         declared_from: None,
+        settlement: (classification != Classification::Read).then_some(Settlement::Person),
     }
 }
 
@@ -1535,6 +1536,9 @@ fn an_allowed_side_effect_reserves_a_pending_receipt_with_its_row() {
             state: ReceiptState::Pending,
             established_by: EstablishedBy::Call,
             reference: None,
+            target: None,
+            lookups: Vec::new(),
+            handed_to_person: None,
         }]
     );
 }

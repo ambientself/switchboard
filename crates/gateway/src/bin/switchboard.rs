@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use connector_proxy::ProbeFinding;
 use gateway::{
-    Deployment, Metrics, TELEMETRY_QUEUE, Telemetry, Timeouts, probe, serve_metrics,
+    Deployment, Metrics, Reconciler, TELEMETRY_QUEUE, Telemetry, Timeouts, probe, serve_metrics,
     serve_with_telemetry, start, telemetry,
 };
 use gateway_core::ConnectorName;
@@ -185,12 +185,17 @@ async fn serve(config: PathBuf) -> ExitCode {
     let freshness = prepared.gates.freshness().clone();
     let proxied = prepared.proxied.clone();
     let drift = prepared.drift.signals();
+    let reconciliation = prepared.reconciler.as_ref().map(Reconciler::signals);
     let metrics = metrics_listener.map(|listener| {
         let metrics = Metrics::new(telemetry.clone(), prepared.store.clone())
             .with_issuer_keys(prepared.keys.ages());
         let metrics = metrics.with_policy(freshness);
         let metrics = metrics.with_proxied(proxied);
         let metrics = metrics.with_drift(drift);
+        let metrics = match reconciliation {
+            Some(signals) => metrics.with_reconciliation(signals),
+            None => metrics,
+        };
         tokio::spawn(serve_metrics(listener, metrics, async {
             let _ = metrics_stopped.await;
         }))
@@ -198,6 +203,9 @@ async fn serve(config: PathBuf) -> ExitCode {
     let watching = tokio::spawn(prepared.watch.run());
     let refreshing = tokio::spawn(prepared.keys.run());
     let drifting = tokio::spawn(prepared.drift.run());
+    let reconciling = prepared
+        .reconciler
+        .map(|reconciler| tokio::spawn(reconciler.run()));
     let served = serve_with_telemetry(
         listener,
         prepared.gates,
@@ -211,6 +219,11 @@ async fn serve(config: PathBuf) -> ExitCode {
     watching.abort();
     refreshing.abort();
     drifting.abort();
+    // A pass stopped mid-way leaves at most one receipt claimed, which any instance takes again
+    // once its lease runs out.
+    if let Some(reconciling) = reconciling {
+        reconciling.abort();
+    }
     if let Some(store) = &prepared.store {
         finish_rows(store).await;
     }

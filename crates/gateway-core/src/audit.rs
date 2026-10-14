@@ -895,7 +895,9 @@ fn recorded(resources: &Resources, denied: Option<&Resource>) -> (RecordedResour
 
 /// The receipt to reserve for `call`, an allowed call of `tool`, which is not classified `read`:
 /// its key, scoped to its proved principal and its delegation's key scope, the tool, the
-/// tool-use identifier and resources its row records, and the digest of `arguments`.
+/// tool-use identifier and resources its row records, the digest of `arguments`, and the vendor
+/// target the tool's settlement takes from the call's resources. A tool with no settlement,
+/// which the loader refuses, has no target, so its receipt would go to a person.
 ///
 /// The decision function denies such a call when it carries no key, so an allowed one always
 /// carries one. If one did not, nothing would run: the call is refused as an audit failure,
@@ -927,6 +929,9 @@ fn receipt_request(
         record.tool_use_id.clone(),
         ArgumentDigest::of(arguments),
         (record.resources.clone(), record.resources_omitted),
+        tool.settlement
+            .as_ref()
+            .and_then(|settlement| settlement.target(&call.resources)),
     ))
 }
 

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gateway_core::{
     Classification, ConnectorName, CredentialMode, GroupId, Issuer, Narrowing, ProfileName,
-    Subject, SurfaceName, TeamId, ToolName,
+    Settlement, Subject, SurfaceName, TeamId, ToolName,
 };
 use serde::Deserialize;
 use toml::value::Datetime;
@@ -96,6 +96,10 @@ pub(crate) struct ToolFile {
     pub definition_sha256: String,
     pub binding_sha256: String,
     pub resources: ResourcesFile,
+    /// How an `unknown` receipt of the tool is settled (decision 0009): required for a tool not
+    /// classified `read`, which the snapshot's loader checks.
+    #[serde(default)]
+    pub settlement: Option<Settlement>,
 }
 
 #[derive(Debug, Deserialize)]

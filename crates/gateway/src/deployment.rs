@@ -73,6 +73,11 @@
 //! [drift.probe_credentials]   # one for each server the registry names
 //! mock-docs = "/run/secrets/registry-probe-credential"
 //!
+//! [reconciliation]            # optional; these are the defaults
+//! interval_seconds = 60       # 5 to 3600
+//! lease_seconds = 120         # 10 to 3600
+//! attempts = 5                # 1 to 20
+//!
 //! [credentials]
 //! docs-credential = "/run/secrets/docs-credential"
 //! ```
@@ -158,10 +163,27 @@
 //!   `http.allowed_hosts`. Loading this file allows all three left out, since it does not read
 //!   the registry, but the gateway refuses to start without them while any registry entry has a
 //!   reach check, naming the entries (see [`crate::start`]).
+//! - **Reconciliation** of `unknown` receipts runs in every instance with audit in Postgres
+//!   (see [`crate::reconcile`]). A pass is made every `reconciliation.interval_seconds`; a
+//!   claim holds a receipt for `lease_seconds`, and a lookup has half of that to answer; and a
+//!   receipt gets `attempts` lookups before it is handed to a person. The defaults are 60 s,
+//!   120 s and 5. They look up any one receipt at most once every two minutes, and hand a
+//!   receipt a vendor never shows to a person about 12 to 13 minutes after it became `unknown`
+//!   with one instance, or a little sooner with several. That is an estimate, assuming no
+//!   backlog, lookups that answer promptly and saves that succeed: a pass works through up to
+//!   50 receipts one at a time, each lookup may take half the lease, and a lookup whose save
+//!   fails uses up no attempt, so a backlog, slow lookups or a failing store can make it much
+//!   longer. See
+//!   [`DEFAULT_RECONCILE_INTERVAL`](crate::reconcile::DEFAULT_RECONCILE_INTERVAL),
+//!   [`DEFAULT_RECONCILE_LEASE`](crate::reconcile::DEFAULT_RECONCILE_LEASE) and
+//!   [`DEFAULT_RECONCILE_ATTEMPTS`](crate::reconcile::DEFAULT_RECONCILE_ATTEMPTS). They are
+//!   provisional, chosen before any connector has a lookup (#12). Each outside its range is
+//!   refused.
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
-//! audit pools, the limits, each server's bounds and the drift interval have defaults, so a
-//! gateway not told where to listen is reachable from its own machine only. `[metrics]`, each
+//! audit pools, the limits, each server's bounds, the drift interval and the reconciliation
+//! settings have defaults, so a gateway not told where to listen is reachable from its own
+//! machine only. `[metrics]`, each
 //! server's CA file and the reach settings may be left out, each under the rules above. Any
 //! other missing field is an error, and so is a field that does not belong to the chosen mode
 //! or kind, such as `subjects_file` on a user issuer.
@@ -183,6 +205,7 @@ use crate::config::{
 use crate::drift::{DriftError, DriftSection};
 use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
 use crate::reach::ReachSettings;
+use crate::reconcile::{ReconcileSettings, ReconcileSettingsError, ReconciliationSection};
 
 /// Where the gateway listens when the deployment file does not say: loopback only, never every
 /// interface.
@@ -255,6 +278,9 @@ pub struct DeploymentFile {
     /// server's probe credential.
     #[serde(default)]
     pub drift: Option<DriftSection>,
+    /// How reconciliation of `unknown` receipts runs, where it differs from the defaults.
+    #[serde(default)]
+    pub reconciliation: Option<ReconciliationSection>,
     /// Each credential reference the registry's servers name, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -628,6 +654,9 @@ pub enum DeploymentError {
     /// The drift interval is out of range.
     #[error(transparent)]
     Drift(#[from] DriftError),
+    /// A reconciliation setting is out of range.
+    #[error(transparent)]
+    Reconciliation(#[from] ReconcileSettingsError),
     /// The metrics listener would take the MCP listener's port.
     #[error(
         "`metrics.listen` ({metrics}) takes the port the gateway listens on for MCP ({listen}); \
@@ -684,6 +713,8 @@ pub struct Deployment {
     /// The reach check's settings, or `None` when none are given, which the gateway's start
     /// allows only for a registry none of whose entries has a reach check.
     pub reach: Option<ReachSettings>,
+    /// How reconciliation of `unknown` receipts runs.
+    pub reconciliation: ReconcileSettings,
     /// Each credential reference, and the file holding it.
     pub credentials: BTreeMap<String, PathBuf>,
 }
@@ -703,6 +734,7 @@ impl std::fmt::Debug for Deployment {
             .field("drift_interval", &self.drift_interval)
             .field("probe_credentials", &self.probe_credentials)
             .field("reach", &self.reach)
+            .field("reconciliation", &self.reconciliation)
             .finish_non_exhaustive()
     }
 }
@@ -811,6 +843,7 @@ impl Deployment {
         }
         let limits = limits(file.limits.unwrap_or_default())?;
         let drift_interval = DriftSection::interval(file.drift.as_ref())?;
+        let reconciliation = ReconciliationSection::settings(file.reconciliation.as_ref())?;
         let reach = DriftSection::reach(file.drift.as_ref(), &file.http.allowed_hosts, base)?;
         let probe_credentials = file
             .drift
@@ -883,6 +916,7 @@ impl Deployment {
             drift_interval,
             probe_credentials,
             reach,
+            reconciliation,
             credentials: file
                 .credentials
                 .into_iter()

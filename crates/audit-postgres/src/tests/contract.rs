@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{AuditRowId, RowKind};
-use gateway_core::{AuditStore, Receipt};
+use gateway_core::{AuditStore, Receipt, ReceiptQueue};
 use gateway_testkit::StoreBudgets;
 use gateway_testkit::contract::{self, ContractStore, StoredRecord, StoredRow};
 use serde_json::{Value, json};
@@ -195,50 +195,43 @@ impl ContractStore for Postgres {
         micros_since_epoch(now.get(0))
     }
 
-    /// Every receipt, read as the server's superuser.
+    /// Every receipt, with its lookups, read as the server's superuser.
     async fn receipts(&self) -> Vec<Receipt> {
         self.settled().await;
-        self.admin
+        let rows = self
+            .admin
             .query(
-                "SELECT row_id::text, principal_issuer, principal_subject, delegation_scope,
-                        idempotency_key, tool, tool_use_id, digest, resources, resources_omitted,
-                        state, established_by, established_person, reference
-                 FROM switchboard_audit.receipts",
+                concat!(
+                    "SELECT ",
+                    "r.row_id::text, r.principal_issuer, r.principal_subject, r.delegation_scope,
+                     r.idempotency_key, r.tool, r.tool_use_id, r.digest, r.resources,
+                     r.resources_omitted, r.state, r.established_by, r.established_person,
+                     r.reference, r.target_system, r.target_kind, r.target_identifier,
+                     r.handed_to_person_at",
+                    " FROM switchboard_audit.receipts r"
+                ),
                 &[],
             )
             .await
-            .unwrap()
-            .iter()
+            .unwrap();
+        let lookups = self
+            .admin
+            .query(
+                "SELECT row_id::text, result, authoritative, reference, looked_up_at
+                 FROM switchboard_audit.receipt_lookups ORDER BY row_id, attempt",
+                &[],
+            )
+            .await
+            .unwrap();
+        rows.iter()
             .map(|row| {
-                let text = |column: &str| row.get::<_, Option<String>>(column);
-                let resources = match row.get::<_, Value>("resources") {
-                    named @ Value::Array(_) => json!({ "named": named }),
-                    other => other,
-                };
-                let established_by = match text("established_by").as_deref() {
-                    Some("person") => json!({"by": "person", "person": text("established_person")}),
-                    by => json!({ "by": by }),
-                };
-                serde_json::from_value(json!({
-                    "row": text("row_id"),
-                    "scope": {
-                        "principal": {
-                            "issuer": text("principal_issuer"),
-                            "subject": text("principal_subject"),
-                        },
-                        "delegation": text("delegation_scope"),
-                    },
-                    "key": text("idempotency_key"),
-                    "tool": text("tool"),
-                    "tool_use_id": text("tool_use_id"),
-                    "digest": text("digest"),
-                    "resources": resources,
-                    "resources_omitted": row.get::<_, i64>("resources_omitted"),
-                    "state": text("state"),
-                    "established_by": established_by,
-                    "reference": text("reference"),
-                }))
-                .unwrap()
+                let id: String = row.get(0);
+                let made = lookups
+                    .iter()
+                    .filter(|lookup| lookup.get::<_, String>(0) == id)
+                    .map(|lookup| crate::reconcile::lookup_from(lookup).unwrap())
+                    .collect();
+                crate::reconcile::receipt_from(row, made).unwrap()
             })
             .collect()
     }
@@ -264,6 +257,28 @@ impl ContractStore for Postgres {
                  UPDATE switchboard_audit.call_rows
                      SET deadline = begun_at
                      WHERE id = '{id}' AND deadline IS NOT NULL;
+                 COMMIT;"
+            ))
+            .await
+            .unwrap();
+    }
+
+    fn queue(&self) -> &dyn ReceiptQueue {
+        &self.store
+    }
+
+    /// Ends the receipt's lease a second ago by the database's clock, as the superuser, in a
+    /// session whose `session_replication_role` turns off the trigger that writes a lease only
+    /// on a receipt in `unknown`.
+    async fn pass_lease(&self, row: &AuditRowId) {
+        let id = uuid(row);
+        self.admin
+            .batch_execute(&format!(
+                "BEGIN;
+                 SET LOCAL session_replication_role = replica;
+                 UPDATE switchboard_audit.receipts
+                     SET lease_until = clock_timestamp() - interval '1 second'
+                     WHERE row_id = '{id}' AND lease_until IS NOT NULL;
                  COMMIT;"
             ))
             .await
@@ -344,4 +359,13 @@ contract!(
     a_retried_begin_of_a_receipt_pending_past_its_deadline_is_refused_and_runs_nothing,
     a_begin_whose_confirmation_is_lost_on_every_attempt_leaves_its_row_error_and_its_receipt_not_performed,
     each_receipt_state_is_answered_by_the_first_line_of_the_reuse_table_that_matches,
+    // Item 7: reconciliation.
+    a_receipt_records_the_vendor_target_its_settlement_takes,
+    two_claimants_never_both_hold_a_receipts_lease,
+    an_ended_lease_can_be_claimed_again,
+    the_number_of_attempts_is_bounded,
+    an_authoritative_empty_search_settles_not_performed_and_no_other_does,
+    a_found_effect_settles_completed_with_its_reference,
+    a_lookup_record_is_append_only,
+    a_receipt_settled_by_reconciliation_is_not_moved_by_a_late_finish,
 );

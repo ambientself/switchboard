@@ -12,6 +12,7 @@ use crate::names::{
     ConnectorName, GroupId, PolicyRevision, ProfileName, SurfaceName, TeamId, ToolName,
 };
 use crate::principal::{Principal, PrincipalId, PrincipalKind};
+use crate::reconcile::Settlement;
 
 /// A tool a person has classified and approved.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +33,11 @@ pub struct ApprovedTool {
     /// tool.
     #[serde(default)]
     pub declared_from: Option<DeclaredFrom>,
+    /// How an `unknown` receipt of a call of the tool is settled: by a lookup, or by a person
+    /// (decision 0009, "Reconciliation"). Required for every tool not classified `read`, and
+    /// refused on a `read` tool, which has no receipt.
+    #[serde(default)]
+    pub settlement: Option<Settlement>,
 }
 
 /// Where a `declared` tool's adapter finds the resources a call reaches (decision 0011,
@@ -465,6 +471,23 @@ pub enum SnapshotError {
         /// A team the surface admits.
         team: TeamId,
     },
+    /// A tool not classified `read` whose approval does not say how an `unknown` receipt of it
+    /// is settled (decision 0009, "Reconciliation").
+    #[error(
+        "tool `{tool}` is classified `{classification}`, and its approval does not say how an \
+         `unknown` receipt of it is settled: it must declare a settlement, by a lookup or by a \
+         person"
+    )]
+    SettlementUndeclared {
+        /// The tool.
+        tool: ToolName,
+        /// Its classification.
+        classification: Classification,
+    },
+    /// A `read` tool whose approval declares how a receipt of it is settled. A read has no
+    /// receipt.
+    #[error("tool `{0}` is classified `read`, which has no receipt, and declares a settlement")]
+    SettlementOnRead(ToolName),
     /// Rule 9: a `propose` tool on a surface that admits a group, and its connector has no
     /// per-user entry: its entry is shared, or it has none.
     #[error(
@@ -503,9 +526,11 @@ impl PolicySnapshot {
     /// tool with no entry. Then it refuses a snapshot that breaks one of the nine rules of
     /// decision 0011, section 3, each named by its [`SnapshotError`] variant. Rules 1 to 8
     /// apply to tools whose connector has an entry, and rule 9 to every tool: one with no entry
-    /// is not per-user. Last, it refuses a tool `declared` as the reach whose connector has no
-    /// entry, which a snapshot with no entries at all could otherwise hold: there would be no
-    /// reach for its calls to name.
+    /// is not per-user. Then it refuses a tool not classified `read` that declares no
+    /// settlement, and a `read` tool that declares one (decision 0009, "Reconciliation"). Last,
+    /// it refuses a tool `declared` as the reach whose connector has no entry, which a snapshot
+    /// with no entries at all could otherwise hold: there would be no reach for its calls to
+    /// name.
     pub fn new(data: SnapshotData) -> Result<Self, SnapshotError> {
         let mut tools = BTreeMap::new();
         for tool in data.tools {
@@ -559,6 +584,7 @@ impl PolicySnapshot {
             entries,
         };
         check_rules(&snapshot)?;
+        check_settlements(&snapshot)?;
         if let Some(tool) = snapshot.tools.values().find(|tool| {
             tool.declared_from == Some(DeclaredFrom::Reach)
                 && !snapshot.entries.contains_key(&tool.connector)
@@ -759,6 +785,27 @@ fn check_rules(snapshot: &PolicySnapshot) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+/// Every tool not classified `read` declares how an `unknown` receipt of it is settled, and no
+/// `read` tool declares it (decision 0009, "Reconciliation").
+fn check_settlements(snapshot: &PolicySnapshot) -> Result<(), SnapshotError> {
+    for tool in snapshot.tools.values() {
+        match (tool.classification, &tool.settlement) {
+            (Classification::Read, None) => {}
+            (Classification::Read, Some(_)) => {
+                return Err(SnapshotError::SettlementOnRead(tool.name.clone()));
+            }
+            (classification, None) => {
+                return Err(SnapshotError::SettlementUndeclared {
+                    tool: tool.name.clone(),
+                    classification,
+                });
+            }
+            (_, Some(_)) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Rule 5 for one tool on one surface: every team and group the surface admits has the whole
 /// reach of the tool's entry in its limit.
 fn reach_within_limits(
@@ -832,6 +879,7 @@ mod tests {
             connector: "fixture".into(),
             resources: ResourceDeclaration::NoResources,
             declared_from: None,
+            settlement: None,
         }
     }
 

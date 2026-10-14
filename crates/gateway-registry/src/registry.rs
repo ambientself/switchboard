@@ -7,7 +7,7 @@ use gateway_core::{
     ApprovedTool, Classification, ConnectorEntry, ConnectorName, CredentialMode, DeclaredFrom,
     EntryKind, Issuer, Narrowing, PolicyRevision, PolicySnapshot, Principal, PrincipalId,
     PrincipalRestriction, Profile, ProfileName, Resource, ResourceDeclaration, ResourceLimits,
-    SnapshotData, SnapshotError, Surface, ToolName,
+    Settlement, SnapshotData, SnapshotError, Surface, ToolName,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -618,6 +618,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
             connector: checked.route.server.clone(),
             resources: checked.resources,
             declared_from: checked.declared_from,
+            settlement: checked.settlement,
         });
         definitions.insert(name.clone(), checked.definition);
         adapters.insert(name.clone(), checked.adapter);
@@ -926,6 +927,7 @@ struct CheckedTool {
     classification: gateway_core::Classification,
     resources: ResourceDeclaration,
     declared_from: Option<DeclaredFrom>,
+    settlement: Option<Settlement>,
 }
 
 /// Whether `name` is `{system}__<tool>` for `system`, with something after the separator.
@@ -1084,6 +1086,7 @@ fn check_tool(
             binding_sha256: tool.binding_sha256,
         },
         classification: tool.classification,
+        settlement: tool.settlement,
     })
 }
 

@@ -103,6 +103,8 @@ struct State {
     team_scopes: BTreeMap<TeamId, BTreeSet<String>>,
     group_scopes: BTreeMap<GroupId, BTreeSet<String>>,
     work: Option<(SteppableClock, Duration)>,
+    /// Whether the next draft is opened and its answer lost.
+    lose_next_answer: bool,
 }
 
 /// A [`Connector`] serving [`READ_TOOL`], [`DRAFT_TOOL`], [`WRITE_TOOL`] and
@@ -134,6 +136,11 @@ struct State {
 ///   has been received but has done nothing yet, so a held write has not happened. It can be
 ///   told to report no definite answer once ([`unknown_next`](Self::unknown_next)), after doing
 ///   what the call asks.
+/// - It can be told to lose the answer to the next draft
+///   ([`lose_next_answer`](Self::lose_next_answer)): the draft is opened and its write
+///   recorded, and the call reports [`ToolOutcome::Unknown`], as a vendor that acted and whose
+///   answer never arrived leaves it. Unlike `unknown_next`, it waits for a call of the draft
+///   tool that opens or revises a draft, and other calls before it answer as usual.
 pub struct FixtureConnector {
     credentials: Arc<dyn CredentialSource>,
     state: Mutex<State>,
@@ -160,6 +167,7 @@ impl FixtureConnector {
                     BTreeSet::from([GROUP_G_DOCUMENT.to_owned()]),
                 )]),
                 work: None,
+                lose_next_answer: false,
             }),
         }
     }
@@ -230,6 +238,13 @@ impl FixtureConnector {
         let gate = Gate::closed();
         self.state().hang = Hang::All(gate.clone());
         gate
+    }
+
+    /// The next call of the draft tool opens or revises its draft and records the write, as it
+    /// would, and then reports [`ToolOutcome::Unknown`]: the vendor acted and its answer was
+    /// lost. Later calls answer as usual.
+    pub fn lose_next_answer(&self) {
+        self.state().lose_next_answer = true;
     }
 
     /// Each call that completes moves `clock` forward by `duration` first, so a test measures
@@ -348,6 +363,10 @@ impl Connector for FixtureConnector {
             let outcome = match tool.as_str() {
                 READ_TOOL => ToolOutcome::Ok(echo(&tool, &arguments, &credential)),
                 DRAFT_TOOL => match self.draft(&arguments) {
+                    Some(_) if std::mem::take(&mut self.state().lose_next_answer) => {
+                        self.record(write);
+                        ToolOutcome::Unknown
+                    }
                     Some(draft) => {
                         self.record(write);
                         // The draft is what a vendor would name what it made.

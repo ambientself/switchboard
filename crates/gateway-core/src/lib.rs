@@ -32,6 +32,7 @@ mod policy;
 mod principal;
 pub mod proof;
 pub mod receipt;
+pub mod reconcile;
 mod sentences;
 
 pub use audit::{AuditGuard, AuditRecord, AuditStore, CredentialIdentity, GaveUp, give_up};
@@ -57,5 +58,9 @@ pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
 pub use receipt::{
     ArgumentDigest, DelegationKeyScope, IdempotencyKey, InvalidIdempotencyKey, KeyScope,
     MAX_IDEMPOTENCY_KEY, Receipt, ReceiptState, Reuse, VendorReference,
+};
+pub use reconcile::{
+    LeaseHolder, Lookup, LookupAnswer, LookupRecord, LookupRequest, ReceiptQueue, Recorded,
+    Settlement, TargetKind,
 };
 pub use sentences::{IDENTITY_FAILURE, MAX_RENDERED, escape};

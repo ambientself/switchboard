@@ -29,7 +29,7 @@ const STATES: [(&str, ReceiptState); 4] = [
 ];
 
 /// A fresh UUID from the database, as SQL may hold it inline.
-async fn fresh_id(client: &Client) -> String {
+pub(super) async fn fresh_id(client: &Client) -> String {
     client
         .query_one("SELECT gen_random_uuid()::text", &[])
         .await
@@ -39,7 +39,7 @@ async fn fresh_id(client: &Client) -> String {
 
 /// Writes, as the superuser with every trigger off, an allowed call row `id` whose deadline is
 /// an hour past or an hour to come, and a receipt under it in `state`, with the key `key`.
-async fn receipt_in(admin: &Client, id: &str, key: &str, state: &str, past: bool) {
+pub(super) async fn receipt_in(admin: &Client, id: &str, key: &str, state: &str, past: bool) {
     let deadline = if past {
         "clock_timestamp() - interval '1 hour'"
     } else {
@@ -68,10 +68,30 @@ async fn receipt_in(admin: &Client, id: &str, key: &str, state: &str, past: bool
         .unwrap();
 }
 
+/// Records on the receipt `id`, as the superuser with every trigger off, a lookup that found
+/// the effect with the reference `found-1` and an authoritative search that found nothing: the
+/// lookups that establish `completed` and `not_performed` by reconciliation.
+pub(super) async fn evidence_on(admin: &Client, id: &str) {
+    admin
+        .batch_execute(&format!(
+            "BEGIN;
+             SET LOCAL session_replication_role = replica;
+             INSERT INTO switchboard_audit.receipt_lookups
+                 (row_id, attempt, looked_up_at, result, authoritative, reference)
+             VALUES ('{id}', 1, clock_timestamp(), 'found', true, 'found-1'),
+                    ('{id}', 2, clock_timestamp(), 'not_found', true, NULL);
+             COMMIT;"
+        ))
+        .await
+        .unwrap();
+}
+
 /// The trigger allows exactly the moves the core's `may_move` allows: every state to every
 /// state, by the call, by reconciliation and by a person, before and after the row's deadline,
 /// each tried as the gateway's role. A move by the call refused only because the deadline has
-/// passed carries the SQLSTATE the store reads as that.
+/// passed carries the SQLSTATE the store reads as that. A move by reconciliation is tried with
+/// the lookups that establish either state recorded on the receipt, which migration 0009
+/// requires; `tests/reconcile.rs` tries it without them.
 #[tokio::test]
 async fn the_receipt_trigger_allows_exactly_the_moves_the_core_allows() {
     let Some(db) = TestDatabase::create().await else {
@@ -98,12 +118,18 @@ async fn the_receipt_trigger_allows_exactly_the_moves_the_core_allows() {
                     } else {
                         "NULL"
                     };
+                    let reference = if by_name == "reconciliation" {
+                        evidence_on(&admin, &id).await;
+                        "'found-1'"
+                    } else {
+                        "NULL"
+                    };
                     let moved = gateway
                         .execute(
                             &format!(
                                 "UPDATE switchboard_audit.receipts
                                  SET state = '{to_name}', established_by = '{by_name}',
-                                     established_person = {named}
+                                     established_person = {named}, reference = {reference}
                                  WHERE row_id = '{id}'"
                             ),
                             &[],
@@ -562,7 +588,7 @@ async fn the_receipts_migration_keeps_the_rows_already_written() {
     )
     .await;
 
-    assert_eq!(migrate(&mut owner).await.unwrap(), vec![8]);
+    assert_eq!(migrate(&mut owner).await.unwrap(), vec![8, 9]);
     let after = values(
         &owner,
         "SELECT to_jsonb(r) - 'duplicate_of' FROM switchboard_audit.call_rows r ORDER BY id",
