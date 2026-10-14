@@ -724,6 +724,16 @@ impl FinishRow {
             ),
             Outcome::Error { error_kind } => (None, Some(Self::error_kind_name(*error_kind))),
             Outcome::Ok => (None, None),
+            Outcome::Unknown => {
+                return Err(PgAuditError::NoReceipts(
+                    "an `unknown` outcome cannot be written",
+                ));
+            }
+            Outcome::Duplicate { .. } => {
+                return Err(PgAuditError::NoReceipts(
+                    "a `duplicate` outcome cannot be written",
+                ));
+            }
         };
         let latency_ms = i64::try_from(completion.latency_ms)
             .map_err(|_| PgAuditError::Column("a latency past the column's range"))?;
@@ -756,6 +766,8 @@ impl FinishRow {
             Outcome::Ok => "ok",
             Outcome::Error { .. } => "error",
             Outcome::Refused { .. } => "refused",
+            Outcome::Unknown => "unknown",
+            Outcome::Duplicate { .. } => "duplicate",
         }
     }
 

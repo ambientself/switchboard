@@ -45,7 +45,8 @@ mod issuer;
 pub mod row_bound;
 
 pub use audit::{
-    FIXTURE_CALL_DEADLINE_MS, FIXTURE_INSTANCE, InMemoryAuditStore, StoreBudgets, row_start,
+    FIXTURE_CALL_DEADLINE_MS, FIXTURE_INSTANCE, InMemoryAuditStore, StoreBudgets, fresh_key,
+    row_start,
 };
 pub use clock::{FIXTURE_NOW, FixedClock, SteppableClock};
 pub use connector::{

@@ -198,7 +198,7 @@ pub struct ServerSignals {
 impl ServerSignals {
     fn record(&self, outcome: &ToolOutcome, latency: Duration) {
         let counter = match outcome {
-            ToolOutcome::Ok(_) => &self.ok,
+            ToolOutcome::Ok(_) | ToolOutcome::Completed(..) => &self.ok,
             ToolOutcome::Error(kind, _) => {
                 if *kind == ErrorKind::OversizedOrLateRead {
                     self.late_or_oversized.fetch_add(1, Ordering::Relaxed);
@@ -206,6 +206,8 @@ impl ServerSignals {
                 &self.error
             }
             ToolOutcome::Refused(_) => &self.refused,
+            // Only a side effect reports it, and a proxied server serves reads only.
+            ToolOutcome::Unknown => &self.error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         let nanos = latency.as_nanos();
