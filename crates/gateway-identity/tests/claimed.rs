@@ -221,6 +221,10 @@ fn cases() -> Vec<Case> {
             t.claim("groups", json!("group-1"))
         })
         .only(user),
+        case("a malformed pod UID", MalformedClaim(Kubernetes), |t, _| {
+            t.claim("kubernetes.io", json!({"pod": {"uid": "not-a-uid"}}))
+        })
+        .only(workload),
     ]
 }
 

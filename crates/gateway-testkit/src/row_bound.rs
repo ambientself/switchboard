@@ -54,7 +54,7 @@ fn json_bytes(value: &Value) -> usize {
 /// `proved_kind`, `proved_team` and `proved_groups`, as the Postgres store writes them.
 fn principal_sizes(principal: &Principal) -> [(&'static str, usize); 3] {
     match &principal.kind {
-        PrincipalKind::Workload { team } => [
+        PrincipalKind::Workload { team, .. } => [
             ("proved_kind", "workload".len()),
             ("proved_team", team.as_str().len()),
             ("proved_groups", 0),

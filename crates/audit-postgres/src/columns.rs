@@ -412,7 +412,7 @@ type PrincipalKindColumns = (&'static str, Option<String>, Option<Vec<String>>);
 /// The principal's kind, and its team or its groups.
 fn principal_kind(principal: &Principal) -> Result<PrincipalKindColumns, PgAuditError> {
     Ok(match &principal.kind {
-        PrincipalKind::Workload { team } => (
+        PrincipalKind::Workload { team, .. } => (
             "workload",
             Some(stored("proved_team", team.as_str())?),
             None,

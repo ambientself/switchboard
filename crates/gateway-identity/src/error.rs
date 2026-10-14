@@ -28,6 +28,8 @@ pub enum Claim {
     IssuedAt,
     /// The claim a user issuer's groups are read from.
     Groups,
+    /// `kubernetes.io`, which a workload's pod UID is read from.
+    Kubernetes,
 }
 
 impl fmt::Display for Claim {
@@ -40,6 +42,7 @@ impl fmt::Display for Claim {
             Claim::NotBefore => "`nbf` claim",
             Claim::IssuedAt => "`iat` claim",
             Claim::Groups => "groups claim",
+            Claim::Kubernetes => "`kubernetes.io` claim",
         })
     }
 }

@@ -104,7 +104,8 @@ fn each_caller_is_proved_through_the_real_verifier_with_the_identity_policy_expe
     assert_eq!(
         principal.kind,
         PrincipalKind::Workload {
-            team: TEAM_A.into()
+            team: TEAM_A.into(),
+            pod: None,
         }
     );
     assert_eq!(
@@ -195,12 +196,14 @@ fn a_principal_the_fixture_does_not_know_gets_a_profile_the_snapshot_does_not_ho
             WORKLOAD_ISSUER,
             PrincipalKind::Workload {
                 team: "team-c".into(),
+                pod: None,
             },
         ),
         stranger(
             "https://elsewhere.test",
             PrincipalKind::Workload {
                 team: TEAM_A.into(),
+                pod: None,
             },
         ),
         stranger(

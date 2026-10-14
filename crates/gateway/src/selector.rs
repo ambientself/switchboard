@@ -120,7 +120,7 @@ impl ProfileSelector {
     pub fn select(&self, principal: &Principal) -> ProfileName {
         let issuer = &principal.id.issuer;
         let selected = match &principal.kind {
-            PrincipalKind::Workload { team } => self
+            PrincipalKind::Workload { team, .. } => self
                 .workloads
                 .get(issuer)
                 .and_then(|teams| teams.get(team))
@@ -189,7 +189,10 @@ mod tests {
                 issuer: issuer.into(),
                 subject: "system:serviceaccount:ns:sa".into(),
             },
-            kind: PrincipalKind::Workload { team: team.into() },
+            kind: PrincipalKind::Workload {
+                team: team.into(),
+                pod: None,
+            },
         }
     }
 
@@ -235,6 +238,23 @@ mod tests {
     fn the_same_team_from_another_issuer_selects_nothing() {
         assert_eq!(selects(&workload(OTHER_CLUSTER, "payments")), NO_PROFILE);
         assert_eq!(selects(&workload(IDP, "payments")), NO_PROFILE);
+    }
+
+    #[test]
+    fn a_workloads_pod_does_not_change_its_profile() {
+        for (team, profile) in [("payments", "workload-rw"), ("unlisted", NO_PROFILE)] {
+            for uid in [
+                "0f8fad5b-d9cb-469f-a165-70867728950e",
+                "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+            ] {
+                let mut principal = workload(CLUSTER, team);
+                principal.kind = PrincipalKind::Workload {
+                    team: team.into(),
+                    pod: Some(uid.parse().unwrap()),
+                };
+                assert_eq!(selects(&principal), profile, "{team} in pod {uid}");
+            }
+        }
     }
 
     #[test]

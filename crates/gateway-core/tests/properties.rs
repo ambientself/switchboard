@@ -15,10 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use gateway_core::{
     ApprovedTool, CallContext, CallerContext, Classification, ConnectorEntry, CredentialMode,
-    Decision, DeclaredFrom, Delegation, EntryKind, GroupId, Issuer, Narrowing, PolicySnapshot,
-    Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, ProfileName, Reason,
-    ReasonKind, Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources,
-    SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName, Verdict, decide, list_tools,
+    Decision, DeclaredFrom, Delegation, EntryKind, GroupId, Issuer, Narrowing, PodUid,
+    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile,
+    ProfileName, Reason, ReasonKind, Resource, ResourceDeclaration, ResourceLimits,
+    ResourceProblem, Resources, SnapshotData, Subject, Surface, SurfaceName, TeamId, ToolName,
+    Verdict, decide, list_tools,
 };
 
 use gateway_core::AuditRecord;
@@ -41,6 +42,10 @@ const TOOLS: [&str; 3] = ["sys__one", "sys__two", "sys__three"];
 const UNAPPROVED_TOOL: &str = "sys__unapproved";
 const SURFACES: [&str; 2] = ["surface-a", "surface-b"];
 const MISSING_SURFACE: &str = "surface-missing";
+const PODS: [&str; 2] = [
+    "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+];
 
 #[derive(Clone, Debug)]
 struct World {
@@ -165,7 +170,7 @@ fn open_up(world: &mut World) {
     let tool = world.tool.clone();
     if let Some(surface) = world.surface_mut() {
         match &principal.kind {
-            PrincipalKind::Workload { team } => {
+            PrincipalKind::Workload { team, .. } => {
                 surface.teams.insert(team.clone());
             }
             PrincipalKind::User { groups } => surface.groups.extend(groups.iter().cloned()),
@@ -177,7 +182,7 @@ fn open_up(world: &mut World) {
 
     // Checks 3 and 4: any delegation agrees and lists the tool; one is present if required.
     match &principal.kind {
-        PrincipalKind::Workload { team } => {
+        PrincipalKind::Workload { team, .. } => {
             if world.profile.requires_delegation && world.delegation.is_none() {
                 world.delegation = Some(Delegation {
                     acting_person: gateway_core::Claimed::new("requester@example.test".into()),
@@ -207,7 +212,7 @@ fn open_up(world: &mut World) {
     if let Resources::Named(named) = &world.resources {
         let named: BTreeSet<Resource> = named.iter().cloned().collect();
         match &principal.kind {
-            PrincipalKind::Workload { team } => {
+            PrincipalKind::Workload { team, .. } => {
                 world
                     .data
                     .limits
@@ -271,7 +276,10 @@ fn tool_names(items: Vec<&'static str>) -> BTreeSet<ToolName> {
 
 fn any_principal() -> impl Strategy<Value = Principal> {
     let kind = prop_oneof![
-        select(TEAMS.to_vec()).prop_map(|team| PrincipalKind::Workload { team: team.into() }),
+        select(TEAMS.to_vec()).prop_map(|team| PrincipalKind::Workload {
+            team: team.into(),
+            pod: None
+        }),
         subset(GROUPS.to_vec()).prop_map(|groups| PrincipalKind::User {
             groups: names(groups)
         }),
@@ -488,7 +496,7 @@ proptest! {
         second in "[a-z:/.-]{1,24}",
         subject in "[a-z:@.-]{1,24}",
         kind in prop_oneof![
-            select(TEAMS.to_vec()).prop_map(|team| PrincipalKind::Workload { team: team.into() }),
+            select(TEAMS.to_vec()).prop_map(|team| PrincipalKind::Workload { team: team.into(), pod: None }),
             subset(GROUPS.to_vec()).prop_map(|groups| PrincipalKind::User { groups: names(groups) }),
         ],
     ) {
@@ -542,6 +550,51 @@ proptest! {
         }
         let decision = world.decide();
         prop_assert!(decision.is_allowed(), "open_up left a check closed: {decision:?}");
+    }
+
+    /// Decision 0012: the pod a workload's token proves is carried, and no decision reads it.
+    /// Giving a workload a pod, another pod or none changes neither the verdict nor what is
+    /// listed, nor the sentence its row records.
+    #[test]
+    fn a_workloads_pod_never_changes_a_decision(
+        world in world(),
+        pods in proptest::collection::vec(proptest::option::of(select(PODS.to_vec())), 1..=3),
+    ) {
+        if !matches!(world.principal.kind, PrincipalKind::Workload { .. }) {
+            return Ok(());
+        }
+        let seen = |pod: Option<&str>| {
+            let mut world = world.clone();
+            if let PrincipalKind::Workload { pod: held, .. } = &mut world.principal.kind {
+                *held = pod.map(|uid| PodUid::parse(uid).unwrap());
+            }
+            let decision = world.decide();
+            // A denial's reason holds the principal, pod and all, so the verdict is compared by
+            // what it decided: allowed or not, which check refused, and the tool approved.
+            let verdict = (
+                decision.is_allowed(),
+                decision.reason().map(Reason::kind),
+                decision.tool().cloned(),
+            );
+            let listed: Vec<(ToolName, Classification)> = list_tools(&world.snapshot(), &world.caller())
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.classification))
+                .collect();
+            let store = common::MemoryStore::default();
+            let begun = common::ready(audit::begin(
+                &store,
+                common::start(),
+                decision,
+                serde_json::Value::Null,
+                Default::default(),
+            ));
+            prop_assert!(begun.is_ok());
+            Ok((verdict, listed, store.last().sentence))
+        };
+        let without = seen(None)?;
+        for pod in pods {
+            prop_assert_eq!(&seen(pod)?, &without, "a pod of {:?} changed the decision", pod);
+        }
     }
 }
 

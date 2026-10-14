@@ -8,11 +8,11 @@ mod files;
 use std::sync::{Arc, OnceLock};
 
 use files::{
-    AUDIENCE, CLUSTER_ISSUER, Files, STRANGER_SA, TEAM_A_SA, TEAM_B_SA, cluster_issuer, key_set,
-    kubernetes_token,
+    AUDIENCE, CLUSTER_ISSUER, Files, POD_UID, STRANGER_SA, TEAM_A_SA, TEAM_B_SA, cluster_issuer,
+    key_set, kubernetes_token,
 };
 use gateway::Gates;
-use gateway_core::PrincipalKind;
+use gateway_core::{PodUid, PrincipalKind};
 use gateway_identity::{SystemClock, Verification, VerifyError};
 use gateway_testkit::LocalIssuer;
 
@@ -33,14 +33,16 @@ async fn gates(files: &Files) -> Gates {
     .gates
 }
 
-/// The team a token proves, or the check that refused it.
+/// The team a token proves, or the check that refused it. Every token here names its pod,
+/// which the principal carries.
 fn team_of(gates: &Gates, token: &str) -> Result<String, VerifyError> {
     match gates.identity().check(Some(token)) {
         Verification::Proved(principal) => {
             let principal = principal.get();
             assert_eq!(principal.id.issuer.as_str(), CLUSTER_ISSUER);
+            assert_eq!(principal.pod().map(PodUid::as_str), Some(POD_UID));
             match &principal.kind {
-                PrincipalKind::Workload { team } => Ok(team.as_str().to_owned()),
+                PrincipalKind::Workload { team, .. } => Ok(team.as_str().to_owned()),
                 other => panic!("a workload issuer proved {other:?}"),
             }
         }

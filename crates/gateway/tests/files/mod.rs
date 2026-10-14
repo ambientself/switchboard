@@ -70,6 +70,9 @@ pub fn cluster_issuer() -> LocalIssuer {
     LocalIssuer::new(CLUSTER_ISSUER, SigningAlgorithm::Rs256).unwrap()
 }
 
+/// The pod UID [`kubernetes_token`] names, in the form Kubernetes gives one.
+pub const POD_UID: &str = "4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8";
+
 /// A token shaped like a projected ServiceAccount token: `aud` an array, a `jti`, `nbf`, and
 /// the nested `kubernetes.io` claim naming the namespace, ServiceAccount and pod.
 pub fn kubernetes_token(issuer: &LocalIssuer, subject: &str, audiences: &[&str]) -> String {
@@ -84,9 +87,9 @@ pub fn kubernetes_token(issuer: &LocalIssuer, subject: &str, audiences: &[&str])
             "kubernetes.io",
             json!({
                 "namespace": namespace,
-                "serviceaccount": {"name": account, "uid": "0a1b2c3d-dummy-uid"},
-                "pod": {"name": format!("{account}-pod"), "uid": "4e5f6a7b-dummy-uid"},
-                "node": {"name": "switchboard-demo-control-plane", "uid": "8c9d0e1f-dummy-uid"},
+                "serviceaccount": {"name": account, "uid": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"},
+                "pod": {"name": format!("{account}-pod"), "uid": POD_UID},
+                "node": {"name": "switchboard-demo-control-plane", "uid": "8c9d0e1f-2a3b-4c5d-9e6f-7a8b9c0d1e2f"},
             }),
         )
         .build()
