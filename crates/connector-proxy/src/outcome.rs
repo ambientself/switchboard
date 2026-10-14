@@ -7,7 +7,7 @@
 //! - [`ToolOutcome::Error`], with its [`ErrorKind`]:
 //!   - `InvalidArguments` for arguments that are not an object, which are never sent
 //!     ([`ARGUMENTS_NOT_AN_OBJECT`]);
-//!   - `VendorRefusal` when the server answered `403`, its refusal of the call
+//!   - `VendorRefusal` when the server answered a read with `403`, its refusal of the call
 //!     ([`UPSTREAM_REFUSED`]);
 //!   - `OversizedOrLateRead` for the deadline, the size cap or an answer broken off, from a
 //!     tool classified `read`;
@@ -17,13 +17,16 @@
 //!     credential the server did not accept, any other HTTP status, an answer that is not
 //!     MCP, a JSON-RPC error, and a tool result marked `isError`.
 //! - [`ToolOutcome::Unknown`] in place of an error, from a tool not classified `read`, for
-//!   every failure once the request may have been sent, unless the server answered that it did
-//!   not do it: the deadline, the size cap, an answer broken off, an exchange that failed
-//!   after its connection was made, an HTTP status other than `200` outside `4xx`, and a `200`
-//!   that is not MCP. A side effect's error means nothing took effect (decision 0009): nothing
-//!   was sent, or the server answered `4xx`, a JSON-RPC error or a tool result marked
-//!   `isError`. The caller then reads the core's sentence that the call may have happened and
-//!   must not be repeated, not one of the sentences here.
+//!   every outcome but a success once the request may have been sent: the deadline, the size
+//!   cap, an answer broken off, an exchange that failed after its connection was made, any HTTP
+//!   status other than `200`, `401`, `403` and every other `4xx` included, a `200` that is not
+//!   MCP, a JSON-RPC error and a tool result marked `isError`. A side effect's error settles
+//!   its receipt as `not_performed`, which must be established, and the server's own refusal
+//!   or failure does not establish it: decision 0009 holds a proxied tool's error to be
+//!   `unknown` unless its approval says its errors are safe, and no approval can say so yet.
+//!   So a side effect is an error only when nothing was sent. The caller then reads the core's
+//!   sentence that the call may have happened and must not be repeated, not one of the
+//!   sentences here.
 //! - [`ToolOutcome::Ok`] with the server's `result` object, unchanged, for anything else.
 //!
 //! A successful result is bounded only by the answer cap; the gateway passes its content and
@@ -79,8 +82,8 @@ pub const BROKEN_OFF: &str = "This tool's server stopped answering before its an
 pub const CREDENTIAL_REJECTED: &str = "This tool's server did not accept the gateway's credential.";
 
 /// The server answered `403`: it refused the call as outside what the gateway's credential
-/// may do. The outcome is an error of the kind `VendorRefusal`, which the row records in
-/// place of this sentence.
+/// may do. From a read, the outcome is an error of the kind `VendorRefusal`, which the row
+/// records in place of this sentence; from a side effect it is `unknown`.
 pub const UPSTREAM_REFUSED: &str =
     "This tool's server refused the call as outside what the gateway's credential may do.";
 

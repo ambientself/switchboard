@@ -170,23 +170,24 @@ pub enum UpstreamError {
 /// outcome is [`ToolOutcome::Error`] of the kind [`ErrorKind::OversizedOrLateRead`], and any
 /// other failure of the server or of the exchange is an error of the kind `Other`.
 ///
-/// From any other tool, a side effect, an error means nothing took effect (decision 0009). So
-/// once the request may have been sent, every failure without a definite answer from the
-/// server is [`ToolOutcome::Unknown`] instead: the deadline, the cap, an answer broken off, an
-/// exchange that failed after its connection was made, a status that is neither `200` nor
-/// `4xx`, and a `200` that is not MCP. The deadline counts as that even when it passed before
-/// the connection was made, which the connector cannot tell apart. A `4xx`, a JSON-RPC error
-/// and a tool result marked `isError` are the server's answer that it did not do it, and stay
-/// errors.
+/// From any other tool, a side effect, an error would settle its receipt as `not_performed`,
+/// which says nothing took effect. Decision 0009 holds a proxied tool's error to be `unknown`
+/// unless its approval says its errors are safe, and no approval can say so yet. So once the
+/// request may have been sent, every outcome but a success is [`ToolOutcome::Unknown`]: the
+/// deadline, the cap, an answer broken off, an exchange that failed after its connection was
+/// made, any status other than `200`, `4xx` included, a `200` that is not MCP, a JSON-RPC
+/// error and a tool result marked `isError`. The server's own refusal or failure does not
+/// establish that it did nothing. The deadline counts as sent even when it passed before the
+/// connection was made, which the connector cannot tell apart.
 ///
 /// Before anything is sent, a failure is an error whatever the tool, and its receipt is
 /// settled as `not_performed`: a credential that could not be had or a request that could not
 /// be built, of the kind `Other`; a connection that could not be made, or was refused for its
 /// address ([`destination`](crate::destination)), of the kind `Other`; and arguments that are
-/// not an object, of the kind [`ErrorKind::InvalidArguments`]. A `403` from the server is its
-/// refusal of the call, an error of the kind [`ErrorKind::VendorRefusal`]. A call this
-/// connector does not serve or has no credential for becomes [`ToolOutcome::Refused`]. See
-/// [`outcome`](crate::outcome) for every sentence.
+/// not an object, of the kind [`ErrorKind::InvalidArguments`]. From a read, a `403` from the
+/// server is its refusal of the call, an error of the kind [`ErrorKind::VendorRefusal`]. A
+/// call this connector does not serve or has no credential for becomes
+/// [`ToolOutcome::Refused`]. See [`outcome`](crate::outcome) for every sentence.
 ///
 /// Running a call needs a Tokio runtime.
 pub struct ProxyConnector {
@@ -298,8 +299,8 @@ impl ProxyConnector {
         let Some(request) = self.request(id, upstream_name, arguments, &secret) else {
             return ToolOutcome::error(ErrorKind::Other, outcome::NOT_SENT);
         };
-        // From here on the request may be sent. What a failure without a definite answer comes
-        // to depends on the tool: see `Sent`.
+        // From here on the request may be sent. What any outcome but a success comes to
+        // depends on the tool: see `Sent`.
         let sent = if tool.classification == Classification::Read {
             Sent::Read
         } else {
@@ -309,8 +310,13 @@ impl ProxyConnector {
             Err(_elapsed) => sent.late(outcome::TIMED_OUT),
             Ok(Err(failed)) => failed,
             Ok(Ok(received)) => {
-                outcome::interpret(received.content_type.as_deref(), &received.body, id)
-                    .unwrap_or_else(|NotMcp| sent.without_answer(ErrorKind::Other, NOT_MCP))
+                match outcome::interpret(received.content_type.as_deref(), &received.body, id) {
+                    // The server's JSON-RPC error or failed tool result: from a side effect it
+                    // does not establish that nothing took effect.
+                    Ok(ToolOutcome::Error(kind, sentence)) => sent.without_answer(kind, &sentence),
+                    Ok(answered) => answered,
+                    Err(NotMcp) => sent.without_answer(ErrorKind::Other, NOT_MCP),
+                }
             }
         }
     }
@@ -358,29 +364,17 @@ impl ProxyConnector {
                 sent.without_answer(ErrorKind::Other, outcome::UNREACHABLE)
             }
         })?;
+        // Any status but `200` is the call's outcome. The server's refusal, a `4xx`, is an error
+        // from a read. From a side effect it does not establish that nothing took effect, so it
+        // is `unknown`, as a server error, a redirect or a success that is not an answer is.
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED {
-            return Err(ToolOutcome::error(
-                ErrorKind::Other,
-                outcome::CREDENTIAL_REJECTED,
-            ));
+            return Err(sent.without_answer(ErrorKind::Other, outcome::CREDENTIAL_REJECTED));
         }
         if status == StatusCode::FORBIDDEN {
-            return Err(ToolOutcome::error(
-                ErrorKind::VendorRefusal,
-                outcome::UPSTREAM_REFUSED,
-            ));
-        }
-        if status.is_client_error() {
-            // The server refused the request: nothing took effect.
-            return Err(ToolOutcome::error(
-                ErrorKind::Other,
-                outcome::status(status.as_u16()),
-            ));
+            return Err(sent.without_answer(ErrorKind::VendorRefusal, outcome::UPSTREAM_REFUSED));
         }
         if status != StatusCode::OK {
-            // A server error, a redirect, or a success that is not an answer: the server may
-            // have acted on the request.
             return Err(sent.without_answer(ErrorKind::Other, &outcome::status(status.as_u16())));
         }
         self.read(response, sent).await
@@ -521,9 +515,10 @@ impl Connector for ProxyConnector {
     }
 }
 
-/// What a call's failure comes to once its request may have been sent and no definite answer
-/// came back: a timeout, an answer too large or broken off, an exchange that failed after its
-/// connection was made, a status that is neither `200` nor `4xx`, or a `200` that is not MCP.
+/// What a call comes to once its request may have been sent, unless it succeeded: a timeout,
+/// an answer too large or broken off, an exchange that failed after its connection was made,
+/// any status other than `200`, a `200` that is not MCP, a JSON-RPC error or a tool result
+/// marked `isError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sent {
     /// From a tool classified `read`, an error: of its own kind when the answer was too large
@@ -531,7 +526,9 @@ enum Sent {
     Read,
     /// From any other tool, a side effect, the outcome `unknown` (decision 0009): the server
     /// may have acted on the request, so the call must not be settled as `not_performed`, and
-    /// the caller must not repeat it.
+    /// the caller must not repeat it. A proxied tool's error is `unknown` unless its approval
+    /// says its errors are safe, and no approval can say so yet, so this holds for the
+    /// server's own refusal or failure too.
     SideEffect,
 }
 
@@ -541,7 +538,7 @@ impl Sent {
         self.without_answer(ErrorKind::OversizedOrLateRead, sentence)
     }
 
-    /// Any other failure without a definite answer, of `kind` with `sentence` for a read.
+    /// Any other outcome but a success, of `kind` with `sentence` for a read.
     fn without_answer(self, kind: ErrorKind, sentence: &str) -> ToolOutcome {
         match self {
             Sent::Read => ToolOutcome::error(kind, sentence),

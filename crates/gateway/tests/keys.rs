@@ -187,29 +187,61 @@ async fn the_header_is_ignored_on_a_profile_that_does_not_declare_it() {
     assert_eq!(server.store.receipts()[0].key, key("toolu_two"));
 }
 
-/// A carried key that is not a valid key is dropped, as a tool-use identifier outside its bound
-/// is, and the call is keyed as if it were absent.
+/// An explicit key that is not a valid key is dropped and leaves the call with no key: it is
+/// not passed over for the header or the tool-use identifier, so the side effect is denied
+/// for want of a key and nothing runs. The tool-use identifier is still recorded. A declared
+/// header that is not valid, or is sent twice, does the same.
 #[tokio::test]
-async fn an_invalid_key_is_dropped_and_the_call_keyed_as_if_it_were_absent() {
+async fn an_invalid_explicit_key_leaves_the_call_with_no_key() {
     let server = Server::start_configured(declaring).await;
     let too_long = "k".repeat(129);
-    let fell_back = propose(
-        &server,
-        draft("One."),
-        json!({IDEMPOTENCY_KEY_META: "has a space", TOOL_USE_ID_META: "toolu_one"}),
-    )
-    .header(IDEMPOTENCY_KEY_HEADER, &too_long)
-    .send(&server)
-    .await;
-    assert_eq!(fell_back.result()["isError"], json!(false), "{fell_back:?}");
-    assert_eq!(server.store.receipts()[0].key, key("toolu_one"));
-
-    let unkeyed = propose(&server, draft("Two."), json!({IDEMPOTENCY_KEY_META: ""}))
-        .header(IDEMPOTENCY_KEY_HEADER, "two words")
-        .send(&server)
-        .await;
-    assert!(unkeyed.denial().contains("carried none"), "{unkeyed:?}");
-    assert_eq!(server.connector.writes().len(), 1);
+    let cases: [(&str, Value, Vec<&str>); 5] = [
+        (
+            "_meta with a space",
+            json!({IDEMPOTENCY_KEY_META: "session:turn 7", TOOL_USE_ID_META: "toolu_one"}),
+            vec![],
+        ),
+        (
+            "_meta empty, beside a valid header",
+            json!({IDEMPOTENCY_KEY_META: "", TOOL_USE_ID_META: "toolu_two"}),
+            vec!["header-key-2"],
+        ),
+        (
+            "header too long",
+            json!({TOOL_USE_ID_META: "toolu_three"}),
+            vec![&too_long],
+        ),
+        (
+            "header with a space",
+            json!({TOOL_USE_ID_META: "toolu_four"}),
+            vec!["two words"],
+        ),
+        (
+            "header sent twice",
+            json!({TOOL_USE_ID_META: "toolu_five"}),
+            vec!["header-key-5", "header-key-5"],
+        ),
+    ];
+    for (index, (case, meta, headers)) in cases.into_iter().enumerate() {
+        let tool_use_id = meta[TOOL_USE_ID_META].as_str().unwrap().to_owned();
+        let mut request = propose(&server, draft(case), meta);
+        for value in headers {
+            request = request.header(IDEMPOTENCY_KEY_HEADER, value);
+        }
+        let unkeyed = request.send(&server).await;
+        assert!(
+            unkeyed.denial().contains("carried none"),
+            "{case}: {unkeyed:?}"
+        );
+        let row = server.store.row(index).unwrap();
+        assert_eq!(row.reason, Some(ReasonKind::KeyMissing), "{case}");
+        assert_eq!(row.tool_use_id.unwrap().as_str(), tool_use_id, "{case}");
+    }
+    assert!(server.store.receipts().is_empty());
+    assert!(
+        server.connector.received().is_empty(),
+        "the connector was called"
+    );
 }
 
 // --- The answers to a reused key -------------------------------------------------------------

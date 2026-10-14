@@ -876,8 +876,9 @@ receipt.
   that sends no tool-use identifier and cannot set the `_meta` field cannot make side effects;
   Q13 checks each target client. The same key with a different tool-use identifier is refused
   with a sentence of its own.
-- **The carriers, in that order,** are read as a precedence: a key the caller sent on purpose
-  comes first, and the tool-use identifier is the key only when there is none. The explicit
+- **The gateway reads the carriers in the other order.** Decision 0009 lists them in the order
+  above, with the tool-use identifier first; the gateway takes a key the caller sent on
+  purpose first, and the tool-use identifier is the key only when there is none. The explicit
   carriers are the `_meta` field `switchboard/idempotencyKey`, beside the
   `switchboard/auditRow` the answer names, and else the `Idempotency-Key` header, read only
   for a profile whose `idempotency_key_header` is true; it is false unless a policy says so,
@@ -886,10 +887,13 @@ receipt.
   That reading is what makes the refusal of one key with two tool-use identifiers reachable,
   since a tool-use identifier that is itself the key cannot differ from it. It is also what
   lets a key that stays the same across a turn Otto's control plane replays cover that turn,
-  whose model makes new tool-use identifiers: the replay is refused, not run again. A carried
-  value that is not a valid key, 1 to 128 printable ASCII characters other than space, is
-  dropped with a warning, as a tool-use identifier outside that bound is, and the call is keyed
-  as if it were absent.
+  whose model makes new tool-use identifiers: the replay is refused, not run again. An
+  explicit key that is not a valid key, 1 to 128 printable ASCII characters other than space,
+  or a declared header sent twice or not as text, is dropped with a warning and leaves the call
+  with no key. It is not passed over for the next carrier: a call keyed by its tool-use
+  identifier in place of the key its caller chose would lose that key's cover of a replay. A
+  side effect is then denied for want of a key, and its tool-use identifier is still recorded.
+  A tool-use identifier outside that bound is dropped with a warning too.
 - **A key is scoped** to the proved principal and, when a delegation is present, to its
   identifying fields. For Otto those are agreed with Otto's owners; the session and the turn
   are recommended, and whether the execution is needed too is asked.
@@ -917,15 +921,19 @@ receipt.
   ([decision 0011](decisions/0011-resource-authorization-and-tool-assurance.md)) needs a key, a
   receipt and the gate below like any side effect, and declares a lookup by marker unless its
   exception says otherwise.
-- **A side effect's `error` means nothing took effect,** and settles its receipt as
-  `not_performed`: nothing was sent, or the vendor answered that it did not do it. A
-  side-effecting connector reports `unknown` instead once anything may have been sent and no
-  definite answer came back. The proxy connector does so for a side effect's answer that is too
-  late, too large or broken off, an exchange that failed after its connection was made, a
-  status that is neither `200` nor `4xx`, and a `200` that is not MCP; a credential it could
-  not get, a request it could not build, a connection it could not make and an argument
-  refusal stay errors. A client that leaves before its side effect's connector is invoked,
-  checked immediately before, is not called for, and the receipt is `not_performed`.
+- **A side effect's `error` means its connector knows nothing took effect,** and settles its
+  receipt as `not_performed`: the request failed before it was sent, or the vendor definitely
+  rejected it. A side-effecting connector reports `unknown` whenever it cannot know that. A
+  proxied tool's error is `unknown` unless its approval says its errors are safe (the
+  outcomes above), and no approval can say so yet, so the proxy connector reports a side
+  effect as an error only when nothing was sent: a credential it could not get, a request it
+  could not build, a connection it could not make and an argument refusal. Once the request
+  may have been sent, every outcome but a success is `unknown`: an answer too late, too large
+  or broken off, an exchange that failed after its connection was made, any status other than
+  `200`, `401`, `403` and every other `4xx` included, a `200` that is not MCP, a JSON-RPC error
+  and a tool result marked `isError`. A client that leaves before its side effect's connector
+  is invoked, checked immediately before, is not called for, and the receipt is
+  `not_performed`.
 - **The gateway never repeats a tool call on its own.** A connector may retry a side effect
   only if it failed before any byte was sent. A receipt does not make a side effect happen
   exactly once: a new key, a vendor's own retries and a turn that Otto's control plane replays
@@ -1381,10 +1389,11 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   kinds from the core's closed `ErrorKind`, and migration 0006 adds `error_kind`, which a row
   has exactly when its outcome is `error` (`error_kind_shape`), completed once with the rest of
   the completion. Error rows written before it read `before-0006`. The argument check is
-  `invalid_arguments`; the proxy connector's `403` is `vendor_refusal`, an error rather than a
-  refusal (#61); its deadline, size cap and broken-off answer are `oversized_or_late_read` for
-  a `read` tool, and for any other tool not an error at all but the outcome `unknown` (#55,
-  section 11); a guard given up, a lost
+  `invalid_arguments`; the proxy connector's `403` to a read is `vendor_refusal`, an error
+  rather than a refusal (#61); its deadline, size cap and broken-off answer are
+  `oversized_or_late_read` for a `read` tool. From any other tool each of these, and every
+  outcome but a success once the request may have been sent, is not an error at all but the
+  outcome `unknown` (#55, section 11); a guard given up, a lost
   begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
   How the resources were found, and the credential identity: built (#56). A tool declared as
   its connector entry's reach is read by the gateway's one constant adapter, which names the
@@ -1476,8 +1485,12 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `unknown` and `duplicate`. The gateway reads the key from its three carriers, an explicit
   key first, and records the tool-use identifier beside it (#55; section 11); the profile
   setting `idempotency_key_header`, false unless a policy says so, is the declaration the
-  header needs. The core's docs say a side effect's `error` means nothing took effect, and the
-  proxy connector reports `unknown` once a side effect may have been sent. Not built:
+  header needs. An explicit key that is not valid leaves the call with no key, so a side
+  effect is denied for want of one. The core's docs say a side effect's `error` means its
+  connector knows nothing took effect, and the proxy connector reports every outcome of a side
+  effect but a success as `unknown` once its request may have been sent, its server's `4xx`,
+  JSON-RPC errors and failed tool results included, since no approval can yet say a proxied
+  tool's errors are safe. Not built:
   receipts in Postgres, reconciliation, resolution records, and the signals for `unknown`
   receipts.
 - With #25, the harness's in-memory store can also write and then report failure, lose the

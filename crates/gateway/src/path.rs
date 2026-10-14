@@ -41,8 +41,9 @@
 //!   named `_meta` field `switchboard/idempotencyKey`, or else the `Idempotency-Key` header,
 //!   read only for a profile that declares its callers set it per request; without either,
 //!   the caller's tool-use identifier. The tool-use identifier is recorded beside an explicit
-//!   key. A carried value that is not a valid key is dropped with a warning, as a tool-use
-//!   identifier outside its bound is, and the call is keyed as if it were absent. A key reused
+//!   key. An explicit key that is not valid, or a declared header sent twice or not as text,
+//!   is dropped with a warning and leaves the call with no key; it is not passed over for the
+//!   next carrier, so a side effect is then denied for want of a key. A key reused
 //!   is answered from the earlier call's receipt, and nothing runs (decision 0009, "Reuse").
 //! - While the policy is stale, `tools/list` and `tools/call` from a proved caller are refused
 //!   with [`POLICY_STALE`] before anything is decided, and no row is written: decision 0009
@@ -927,35 +928,66 @@ fn bounded_tool_use_id(value: Option<String>) -> Option<ToolUseId> {
 /// since both are 1 to 128 printable ASCII characters. A call with none of the three carries
 /// no key, and a call of a tool not classified `read` is then denied by the key check.
 ///
+/// The first explicit carrier present decides. One that holds no valid key leaves the call
+/// with no key, and is not passed over for the next carrier: a call keyed by its tool-use
+/// identifier in place of the key its caller chose would run again when a replayed turn sends
+/// that key with new tool-use identifiers.
+///
 /// The tool-use identifier is recorded beside an explicit key, on the row and on the receipt,
 /// so the same key sent again with a different tool-use identifier is refused as a key reused
 /// for another call, as a key fixed in configuration would be. That order is also what lets a
 /// key that stays the same across a replayed turn cover it, though the turn's model makes new
 /// tool-use identifiers.
 fn call_key(
-    meta: Option<IdempotencyKey>,
-    header: Option<IdempotencyKey>,
+    meta: Explicit,
+    header: Explicit,
     tool_use_id: Option<&ToolUseId>,
 ) -> Option<IdempotencyKey> {
-    meta.or(header)
-        .or_else(|| tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()))
+    match meta.or(header) {
+        Explicit::Valid(key) => Some(key),
+        Explicit::Invalid => None,
+        Explicit::Absent => tool_use_id.and_then(|id| IdempotencyKey::parse(id.as_str()).ok()),
+    }
 }
 
-/// A key the caller sent in `carrier`, if it is a valid [`IdempotencyKey`]. Anything else is
-/// dropped with a warning, as a tool-use identifier outside its bound is, and the call is keyed
-/// as if the carrier were absent. The value is the caller's text, so only its length is logged.
-fn explicit_key(carrier: &'static str, value: Option<String>) -> Option<IdempotencyKey> {
-    let value = value?;
+/// What one explicit carrier holds: a key the caller sent on purpose.
+#[derive(Debug)]
+enum Explicit {
+    /// Nothing, or a header from a profile that does not declare it.
+    Absent,
+    /// A valid key.
+    Valid(IdempotencyKey),
+    /// A value that is not a valid key, which leaves the call with no key.
+    Invalid,
+}
+
+impl Explicit {
+    /// This carrier if it holds anything, valid or not, and otherwise `next`.
+    fn or(self, next: Self) -> Self {
+        match self {
+            Self::Absent => next,
+            carried => carried,
+        }
+    }
+}
+
+/// What the caller sent in `carrier`: a valid [`IdempotencyKey`], or anything else, which is
+/// dropped with a warning, as a tool-use identifier outside its bound is, and leaves the call
+/// with no key ([`call_key`]). The value is the caller's text, so only its length is logged.
+fn explicit_key(carrier: &'static str, value: Option<String>) -> Explicit {
+    let Some(value) = value else {
+        return Explicit::Absent;
+    };
     match IdempotencyKey::parse(&value) {
-        Ok(key) => Some(key),
+        Ok(key) => Explicit::Valid(key),
         Err(_) => {
             tracing::warn!(
                 carrier,
                 length = value.len(),
                 "dropped an idempotency key that is not 1 to {MAX_IDEMPOTENCY_KEY} printable \
-                 ASCII characters"
+                 ASCII characters; the call carries no key"
             );
-            None
+            Explicit::Invalid
         }
     }
 }
@@ -984,26 +1016,28 @@ impl KeyHeader {
         }
     }
 
-    /// The key the header carries, for a call under a profile that `declares` its callers set
-    /// it per request. From any other profile the header is ignored, and the call is keyed as
-    /// if it were absent: a client sets headers once per server, so a header fixed in its
-    /// configuration would key every side effect alike.
-    fn honoured(self, declares: bool) -> Option<IdempotencyKey> {
+    /// What the header carries, for a call under a profile that `declares` its callers set it
+    /// per request; one sent more than once or not as text holds no valid key. From any other
+    /// profile the header is ignored, and the call is keyed as if it were absent: a client sets
+    /// headers once per server, so a header fixed in its configuration would key every side
+    /// effect alike.
+    fn honoured(self, declares: bool) -> Explicit {
         match self {
-            Self::Absent => None,
+            Self::Absent => Explicit::Absent,
             _ if !declares => {
                 tracing::debug!(
                     "ignored an Idempotency-Key header from a profile that does not declare it"
                 );
-                None
+                Explicit::Absent
             }
             Self::One(value) => explicit_key(IDEMPOTENCY_KEY_HEADER, Some(value)),
             Self::Unreadable => {
                 tracing::warn!(
                     carrier = IDEMPOTENCY_KEY_HEADER,
-                    "dropped an Idempotency-Key header that was sent more than once or is not text"
+                    "dropped an Idempotency-Key header that was sent more than once or is not \
+                     text; the call carries no key"
                 );
-                None
+                Explicit::Invalid
             }
         }
     }

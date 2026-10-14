@@ -156,23 +156,22 @@ async fn a_403_is_the_servers_refusal() {
     assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
 }
 
+/// From a read. From a side effect a `403` is `unknown`: see
+/// `a_side_effect_the_server_answered_with_a_failure_is_unknown`.
 #[tokio::test]
 async fn a_403_is_recorded_as_a_vendor_refusal() {
-    for tool in [READ_TOOL, DRAFT_TOOL] {
-        let (answer, outcome) = recorded(tool, |_| {
-            vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
-        })
-        .await;
+    let (answer, outcome) = recorded(READ_TOOL, |_| {
+        vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
+    })
+    .await;
 
-        assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
-        assert_eq!(
-            outcome,
-            Outcome::Error {
-                error_kind: ErrorKind::VendorRefusal
-            },
-            "{tool}"
-        );
-    }
+    assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
+    assert_eq!(
+        outcome,
+        Outcome::Error {
+            error_kind: ErrorKind::VendorRefusal
+        }
+    );
 }
 
 #[tokio::test]
@@ -332,11 +331,13 @@ async fn a_side_effect_with_no_definite_answer_is_unknown() {
     }
 }
 
-/// A side effect the server answered with a refusal or a failure is an error, and its receipt
-/// is settled as `not_performed`: a `4xx`, a JSON-RPC error and a tool result marked
-/// `isError` are the server's word that it did not do it.
+/// A side effect the server answered with a refusal or a failure is `unknown`, and so is its
+/// receipt: a `4xx`, a JSON-RPC error and a tool result marked `isError` come after the
+/// request was sent and do not establish that nothing took effect. Decision 0009 holds a
+/// proxied tool's error to be `unknown` unless its approval says its errors are safe, which
+/// no approval can say yet. From a read each is an error of its kind.
 #[tokio::test]
-async fn a_side_effect_the_server_refused_is_an_error_and_not_performed() {
+async fn a_side_effect_the_server_answered_with_a_failure_is_unknown() {
     let status = |status: &'static str| {
         move |_: &Value| vec![Step::Write(response(status, "text/plain", b"no"))]
     };
@@ -377,10 +378,24 @@ async fn a_side_effect_the_server_refused_is_an_error_and_not_performed() {
         ),
     ];
     for (case, steps, kind) in cases {
-        let (answer, outcome, receipt) = settled(DRAFT_TOOL, steps).await;
+        let steps = std::sync::Arc::new(steps);
+        let script = {
+            let steps = steps.clone();
+            move |request: &Value| steps(request)
+        };
+        let (answer, outcome, receipt) = settled(DRAFT_TOOL, script).await;
+        assert!(
+            matches!(&answer, Answer::Unknown(sentence) if sentence.contains("Do not repeat it")),
+            "{case}: {answer:?}"
+        );
+        assert_eq!(outcome, Outcome::Unknown, "{case}");
+        assert_eq!(receipt, Some(ReceiptState::Unknown), "{case}");
+
+        let script = move |request: &Value| steps(request);
+        let (answer, outcome, receipt) = settled(READ_TOOL, script).await;
         assert!(matches!(answer, Answer::Error(_)), "{case}: {answer:?}");
         assert_eq!(outcome, Outcome::Error { error_kind: kind }, "{case}");
-        assert_eq!(receipt, Some(ReceiptState::NotPerformed), "{case}");
+        assert_eq!(receipt, None, "{case}: a read reserved a receipt");
     }
 }
 

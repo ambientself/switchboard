@@ -74,11 +74,13 @@ pub enum ToolOutcome {
     /// The tool ran and failed: the kind of failure, which the row records, and a message for
     /// the caller, which it does not.
     ///
-    /// From a tool not classified `read`, a side effect, it means nothing took effect: nothing
-    /// was sent, or the vendor answered that it did not do it. The call's receipt is settled as
-    /// `not_performed` (decision 0009), and the caller may try again under a new key. A
-    /// side-effecting connector reports [`Unknown`](Self::Unknown) instead once anything may
-    /// have been sent and no definite answer came back.
+    /// From a tool not classified `read`, a side effect, it means the connector knows nothing
+    /// took effect: the request failed before it was sent, or the vendor definitely rejected it
+    /// (decision 0009). The call's receipt is settled as `not_performed`, and the caller may
+    /// try again under a new key. A side-effecting connector reports
+    /// [`Unknown`](Self::Unknown) instead whenever it cannot know that. A proxied tool's error
+    /// is `unknown` unless its approval says its errors are safe, and no approval can say so
+    /// yet, so a proxied side effect is an error only when nothing was sent.
     Error(ErrorKind, String),
     /// The connector refused because of what the call names. The sentence is returned to the
     /// caller and recorded on the row, and reaches the caller only after that row is finished.
@@ -93,7 +95,8 @@ pub enum ToolOutcome {
     /// cannot be read, or a result over the gateway's bound (decision 0009). Recorded as
     /// `unknown`, its receipt is `unknown`, and the caller is told not to repeat the call. A
     /// side-effecting connector reports this, never [`Error`](Self::Error), for every failure
-    /// once anything may have been sent, unless the vendor answered that it did not do it. A
+    /// once anything may have been sent, unless the vendor definitely rejected the call; from
+    /// a proxied tool, for every outcome but a success once anything may have been sent. A
     /// read never reports it: from a `read` tool it is recorded as an error of the kind
     /// `other`.
     Unknown,
@@ -108,7 +111,8 @@ impl ToolOutcome {
 
 /// The kind of an `error` outcome (decisions 0009 and 0011). A closed set, so each kind can be
 /// counted from the rows. The row records the kind, not the caller's message. For a side
-/// effect, an error of any kind means nothing took effect: see [`ToolOutcome::Error`].
+/// effect, an error of any kind means the connector knows nothing took effect: see
+/// [`ToolOutcome::Error`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -123,7 +127,7 @@ pub enum ErrorKind {
     /// it yet: no connector asks a custodian.
     CustodianRefusal,
     /// The vendor refused the call, as each connector defines a refusal: for a proxied server,
-    /// its `403`.
+    /// its `403` to a read. A proxied side effect's `403` is the outcome `unknown`.
     VendorRefusal,
     /// Any other failure.
     Other,
