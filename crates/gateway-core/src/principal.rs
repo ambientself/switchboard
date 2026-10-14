@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::names::{GroupId, Issuer, Person, Subject, TeamId, ToolName};
 use crate::proof::Claimed;
+use crate::receipt::DelegationKeyScope;
 
 /// The key of a principal: its issuer and its subject, together.
 ///
@@ -86,6 +87,12 @@ pub struct Delegation {
     /// is no value that means "every tool on the surface", and an empty set permits no tool at
     /// all (decision 0006, check 4).
     pub tools: BTreeSet<ToolName>,
+    /// The delegation's identifying fields, which scope an idempotency key with the principal
+    /// (decision 0009, "The key"): for Otto, its session and turn. `None` until the turn-grant
+    /// verifier fills it from the grant's verified fields (#22), so until then a key is scoped
+    /// to the principal alone.
+    #[serde(default)]
+    pub key_scope: Option<DelegationKeyScope>,
 }
 
 #[cfg(test)]

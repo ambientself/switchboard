@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+mod canonical;
 mod classification;
 mod connector;
 mod credential;
@@ -30,6 +31,7 @@ mod names;
 mod policy;
 mod principal;
 pub mod proof;
+pub mod receipt;
 mod sentences;
 
 pub use audit::{AuditGuard, AuditRecord, AuditStore, CredentialIdentity, GaveUp, give_up};
@@ -52,4 +54,8 @@ pub use policy::{
 };
 pub use principal::{Delegation, Principal, PrincipalId, PrincipalKind};
 pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
+pub use receipt::{
+    ArgumentDigest, DelegationKeyScope, IdempotencyKey, InvalidIdempotencyKey, KeyScope,
+    MAX_IDEMPOTENCY_KEY, Receipt, ReceiptState, Reuse, VendorReference,
+};
 pub use sentences::{IDENTITY_FAILURE, MAX_RENDERED, escape};

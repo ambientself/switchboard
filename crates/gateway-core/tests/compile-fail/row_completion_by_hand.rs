@@ -9,6 +9,7 @@ fn forge(refusal: &Refusal) -> RowCompletion {
             outcome: Outcome::Ok,
             latency_ms: 0,
         },
+        reference: None,
     }
 }
 

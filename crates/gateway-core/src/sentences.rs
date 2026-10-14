@@ -19,10 +19,12 @@
 //! reaches a sentence or a row, such as the issuer a refused token claims, is escaped the same
 //! way.
 
+use crate::audit::AuditRowId;
 use crate::classification::Classification;
 use crate::decision::{DelegationProblem, Reason, ResourceProblem};
 use crate::names::MAX_TOOL_NAME;
 use crate::principal::{Principal, PrincipalKind};
+use crate::receipt::Reuse;
 
 /// The profile the context names is not in the snapshot.
 const PROFILE_UNKNOWN: &str = "This gateway has no policy profile `{profile}`, so it cannot decide this call and has refused it. This is a fault in the gateway's configuration; report it to the gateway's operators.";
@@ -69,6 +71,37 @@ const RESOURCES_UNKNOWN: &str = "Tool `{tool}` cannot say which resources this c
 /// The tool declares its resources and the call named none.
 const RESOURCES_NONE_NAMED: &str = "Tool `{tool}` reaches resources the gateway must check, and this call named none of them, so it cannot be allowed. Name the resource the call is for.";
 
+/// A call of a tool not classified `read` carried no idempotency key (decision 0009, "The key").
+const KEY_MISSING: &str = "Tool `{tool}` is classified `{classification}`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key.";
+
+/// A key reused with a different tool-use identifier: what a key fixed in a client's
+/// configuration looks like (decision 0009, "Reuse").
+const KEY_REUSED_FOR_ANOTHER_CALL: &str = "The key `{key}` was already used by a different call, with another tool-use identifier, so this call was refused and nothing ran. A key identifies one call: send each call with a key of its own, never one fixed in configuration.";
+
+/// A key reused for another tool or other arguments.
+const KEY_CONFLICT: &str = "The key `{key}` was already used for a different call, to another tool or with other arguments, so this call was refused and nothing ran. Send each call with a key of its own.";
+
+/// The same call under the same key, already completed, with the vendor's reference. Answered
+/// as a success.
+const DUPLICATE: &str = "This call was already made under the key `{key}`, and it completed, so it was not made again. It is receipt `{receipt}`, and the vendor's reference for what it made is `{reference}`.";
+
+/// The same, where the vendor gave no reference.
+const DUPLICATE_WITHOUT_REFERENCE: &str = "This call was already made under the key `{key}`, and it completed, so it was not made again. It is receipt `{receipt}`; the vendor gave no reference for what it made.";
+
+/// The same call under the same key, still pending or unknown.
+const MAY_HAVE_HAPPENED: &str = "A call under the key `{key}` may already have taken effect, and its outcome is not known yet, so this call was refused and nothing ran. Do not repeat it, under this key or another: it will be checked as receipt `{receipt}`.";
+
+/// The same call under the same key, which did not take effect.
+const NOT_PERFORMED: &str = "A call under the key `{key}` was already made, and it did not take effect, so this call was refused and nothing ran. A key is used once: to try again, send the call with a new key.";
+
+/// A side effect sent with no definite answer: its outcome is `unknown` (decision 0009).
+const UNKNOWN_OUTCOME: &str = "The call was sent and no definite answer came back, so it may have taken effect. Do not repeat it, under this key or another: it will be checked as receipt `{receipt}`.";
+
+/// The error a read is recorded with when its connector reports no definite answer, which only
+/// a side effect may: a read never reports `unknown`.
+pub(crate) const NO_DEFINITE_ANSWER: &str =
+    "The tool gave no definite answer, so the read failed. Try again.";
+
 /// How a workload is named inside another sentence.
 const WORKLOAD: &str = "workload `{subject}` of team `{team}` from issuer `{issuer}`";
 
@@ -93,7 +126,7 @@ pub const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 17] = [
+const SENTENCES: [&str; 26] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -111,6 +144,15 @@ const SENTENCES: [&str; 17] = [
     IDENTITY_FAILURE,
     AUDIT_FAILURE,
     CALLER_DISCONNECTED,
+    KEY_MISSING,
+    KEY_REUSED_FOR_ANOTHER_CALL,
+    KEY_CONFLICT,
+    DUPLICATE,
+    DUPLICATE_WITHOUT_REFERENCE,
+    MAY_HAVE_HAPPENED,
+    NOT_PERFORMED,
+    UNKNOWN_OUTCOME,
+    NO_DEFINITE_ANSWER,
 ];
 
 /// The sentence for `reason`.
@@ -222,8 +264,77 @@ pub(crate) fn render(reason: &Reason) -> String {
         Reason::ResourceOutsideLimit(ResourceProblem::NoneNamed { tool }) => {
             fill(RESOURCES_NONE_NAMED, &[("tool", Text(tool.as_str()))])
         }
+        Reason::KeyMissing {
+            tool,
+            classification,
+        } => fill(
+            KEY_MISSING,
+            &[
+                ("tool", Text(tool.as_str())),
+                ("classification", Text(classification.as_str())),
+            ],
+        ),
     };
     rendered.0
+}
+
+/// The sentence for the answer to a reused key: what the caller reads, and what a refusal's
+/// row holds.
+pub(crate) fn render_reuse(reuse: &Reuse) -> String {
+    use Piece::Text;
+    let rendered = match reuse {
+        Reuse::DifferentCall { key } => {
+            fill(KEY_REUSED_FOR_ANOTHER_CALL, &[("key", Text(key.as_str()))])
+        }
+        Reuse::Conflicting { key } => fill(KEY_CONFLICT, &[("key", Text(key.as_str()))]),
+        Reuse::Duplicate {
+            key,
+            receipt,
+            reference: Some(reference),
+        } => fill(
+            DUPLICATE,
+            &[
+                ("key", Text(key.as_str())),
+                ("receipt", Text(receipt.as_str())),
+                ("reference", Text(reference.as_str())),
+            ],
+        ),
+        Reuse::Duplicate {
+            key,
+            receipt,
+            reference: None,
+        } => fill(
+            DUPLICATE_WITHOUT_REFERENCE,
+            &[
+                ("key", Text(key.as_str())),
+                ("receipt", Text(receipt.as_str())),
+            ],
+        ),
+        Reuse::MayHaveHappened { key, receipt } => fill(
+            MAY_HAVE_HAPPENED,
+            &[
+                ("key", Text(key.as_str())),
+                ("receipt", Text(receipt.as_str())),
+            ],
+        ),
+        Reuse::NotPerformed { key, receipt } => fill(
+            NOT_PERFORMED,
+            &[
+                ("key", Text(key.as_str())),
+                ("receipt", Text(receipt.as_str())),
+            ],
+        ),
+    };
+    rendered.0
+}
+
+/// The sentence for a side effect whose outcome is `unknown`, naming its receipt.
+pub(crate) fn render_unknown(receipt: &AuditRowId) -> String {
+    fill(
+        UNKNOWN_OUTCOME,
+        &[("receipt", Piece::Text(receipt.as_str()))],
+    )
+    .0
 }
 
 fn describe(principal: &Principal) -> Rendered {

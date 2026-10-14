@@ -15,13 +15,15 @@ use gateway_core::audit::{
     MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, Outcome, RecordedResource,
     RecordedResources, RequestMetadata, RowKind, RowStart,
 };
+use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
-    ApprovedTool, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext, Claimed,
-    Classification, Connector, ConnectorEntry, ConnectorName, CredentialIdentity, CredentialMode,
-    Decision, Delegation, EntryKind, InstanceName, Narrowing, PolicySnapshot, Principal,
-    PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason, ReasonKind, RequestedTool,
-    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, SnapshotData,
-    Surface, TeamId, ToolCall, ToolOutcome, decide, list_tools,
+    ApprovedTool, ArgumentDigest, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
+    Claimed, Classification, Connector, ConnectorEntry, ConnectorName, CredentialIdentity,
+    CredentialMode, Decision, Delegation, DelegationKeyScope, EntryKind, IdempotencyKey,
+    InstanceName, KeyScope, Narrowing, PolicySnapshot, Principal, PrincipalId, PrincipalKind,
+    PrincipalRestriction, Profile, Reason, ReasonKind, Receipt, ReceiptState, RequestedTool,
+    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Reuse, SnapshotData,
+    Surface, TeamId, ToolCall, ToolOutcome, VendorReference, decide, list_tools,
 };
 use serde_json::json;
 
@@ -161,6 +163,7 @@ fn call(tool: &str) -> CallContext {
         tools: ["fixture__read", "fixture__propose", "fixture__elsewhere"]
             .map(tool_name)
             .into(),
+        key_scope: None,
     };
     CallContext {
         caller: CallerContext {
@@ -172,6 +175,7 @@ fn call(tool: &str) -> CallContext {
         },
         tool: RequestedTool::new(tool),
         resources: Resources::Named(Vec::new()),
+        key: None,
     }
 }
 
@@ -197,6 +201,7 @@ fn allowed(store: &dyn AuditStore, tool: &str) -> gateway_core::AuditGuard {
     match begin(store, decide(&snapshot(), &call(tool))) {
         Begun::Allowed(guard) => guard,
         Begun::Denied(refusal) => panic!("expected a guard, got {refusal:?}"),
+        Begun::Reused(reused) => panic!("expected a guard, got {reused:?}"),
     }
 }
 
@@ -204,6 +209,7 @@ fn denied(store: &dyn AuditStore, decision: Decision) -> audit::Refusal {
     match begin(store, decision) {
         Begun::Denied(refusal) => refusal,
         Begun::Allowed(guard) => panic!("expected a refusal, got {guard:?}"),
+        Begun::Reused(reused) => panic!("expected a refusal, got {reused:?}"),
     }
 }
 
@@ -701,6 +707,7 @@ fn record_call(resources: Resources) -> (Option<audit::Refusal>, RecordedResourc
     let refusal = match begin(&store, decide(&snapshot(), &call)) {
         Begun::Allowed(_) => None,
         Begun::Denied(refusal) => Some(refusal),
+        Begun::Reused(reused) => panic!("{reused:?}"),
     };
     let row = store.last();
     (refusal, row.resources, row.resources_omitted)
@@ -1259,6 +1266,7 @@ fn connectors_and_stores_work_as_trait_objects() {
     let guard = match begin(store.as_ref(), decide(&snapshot(), &call("fixture__read"))) {
         Begun::Allowed(guard) => guard,
         Begun::Denied(refusal) => panic!("{refusal:?}"),
+        Begun::Reused(reused) => panic!("{reused:?}"),
     };
     let connector = registry[&guard.tool().connector].as_ref();
     let ran = common::ready(audit::run(connector, guard));
@@ -1329,9 +1337,11 @@ impl Connector for SlowConnector {
 fn allowed_proposing(store: &dyn AuditStore, tool: &str) -> gateway_core::AuditGuard {
     let mut context = call(tool);
     context.caller.profile = "proposers".into();
+    context.key = Some(common::fresh_key());
     match begin(store, decide(&snapshot(), &context)) {
         Begun::Allowed(guard) => guard,
         Begun::Denied(refusal) => panic!("expected a guard, got {refusal:?}"),
+        Begun::Reused(reused) => panic!("expected a guard, got {reused:?}"),
     }
 }
 
@@ -1448,4 +1458,357 @@ fn a_side_effect_runs_to_completion_though_its_caller_has_gone() {
             latency_ms: 4,
         })
     );
+}
+
+// --- Keys and receipts (decision 0009, part 2) ------------------------------------------------
+
+/// `tool` called under the profile that permits `propose`, carrying `key`.
+fn proposing(tool: &str, key: Option<&IdempotencyKey>) -> CallContext {
+    let mut context = call(tool);
+    context.caller.profile = "proposers".into();
+    context.key = key.cloned();
+    context
+}
+
+/// `context` begun as the row `start` names.
+fn begin_as(store: &dyn AuditStore, start: RowStart, context: &CallContext) -> Begun {
+    common::ready(audit::begin(
+        store,
+        start,
+        decide(&snapshot(), context),
+        json!({"path": "README.md", "lines": [1, 2]}),
+        metadata(),
+    ))
+    .unwrap()
+}
+
+/// The guard of an allowed proposal carrying `key`, begun as `start`.
+fn proposal_guard(
+    store: &dyn AuditStore,
+    start: RowStart,
+    key: &IdempotencyKey,
+) -> gateway_core::AuditGuard {
+    match begin_as(store, start, &proposing("fixture__propose", Some(key))) {
+        Begun::Allowed(guard) => guard,
+        other => panic!("expected a guard, got {other:?}"),
+    }
+}
+
+/// The answer to a call whose key already has a receipt.
+fn reused(begun: Begun) -> audit::Reused {
+    match begun {
+        Begun::Reused(reused) => reused,
+        other => panic!("expected the answer to a reused key, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_allowed_side_effect_reserves_a_pending_receipt_with_its_row() {
+    let store = MemoryStore::default();
+    let key = common::fresh_key();
+    let guard = proposal_guard(&store, common::start(), &key);
+    let row = guard.row().clone();
+    assert_eq!(store.ids(), vec![row.clone()]);
+    assert_eq!(
+        store.last().completion,
+        None,
+        "the row is open until finish"
+    );
+    assert_eq!(
+        store.receipts(),
+        vec![Receipt {
+            row: row.clone(),
+            scope: KeyScope {
+                principal: principal().id,
+                delegation: None,
+            },
+            key: key.clone(),
+            tool: tool_name("fixture__propose"),
+            tool_use_id: Some("toolu_fixture_1".into()),
+            digest: ArgumentDigest::of(&json!({"lines": [1, 2], "path": "README.md"})),
+            resources: RecordedResources::Named(Vec::new()),
+            resources_omitted: 0,
+            state: ReceiptState::Pending,
+            established_by: EstablishedBy::Call,
+            reference: None,
+        }]
+    );
+}
+
+/// A read needs no key and reserves no receipt; a denial reserves none even with a key, so a
+/// denial uses up no key; and a side effect without a key is denied by the key check.
+#[test]
+fn a_read_or_a_denial_reserves_nothing() {
+    let store = MemoryStore::default();
+    let key = common::fresh_key();
+    let _ = allowed(&store, "fixture__read");
+    let mut readers = proposing("fixture__propose", Some(&key));
+    readers.caller.profile = "readers".into();
+    let refusal = denied(&store, decide(&snapshot(), &readers));
+    assert_eq!(
+        refusal.reason().kind(),
+        ReasonKind::ClassificationNotPermitted
+    );
+    let refusal = denied(
+        &store,
+        decide(&snapshot(), &proposing("fixture__propose", None)),
+    );
+    assert_eq!(refusal.reason().kind(), ReasonKind::KeyMissing);
+    assert_eq!(
+        refusal.sentence(),
+        "Tool `fixture__propose` is classified `propose`, so a call to it must carry a key that identifies this one call: a retry under the same key is then answered without making the change again. This call carried none, so it was refused and nothing ran. Send the call with its tool-use identifier, which is its key."
+    );
+    assert_eq!(store.rows().len(), 3);
+    assert_eq!(store.receipts(), Vec::new());
+
+    // The key the denial carried is still free.
+    let _ = proposal_guard(&store, common::start(), &key);
+    assert_eq!(store.receipts().len(), 1);
+}
+
+/// Finish settles the receipt in the same write as the row: `ok` as `completed`, with the
+/// vendor's reference made safe, `error` and `refused` as `not_performed`, and `unknown` as
+/// `unknown`, answered with the sentence naming the receipt. A guard given up settles it as
+/// `not_performed`.
+#[test]
+fn finish_settles_the_receipt_as_its_outcome_says() {
+    let cases = [
+        (
+            ToolOutcome::Ok(json!({"draft": "draft-1"})),
+            Outcome::Ok,
+            ReceiptState::Completed,
+            None,
+        ),
+        (
+            ToolOutcome::Completed(json!({"pr": 7}), VendorReference::new("PR #7\n")),
+            Outcome::Ok,
+            ReceiptState::Completed,
+            Some(VendorReference::new("PR #7\\n")),
+        ),
+        (
+            ToolOutcome::error(ErrorKind::VendorRefusal, "no"),
+            Outcome::Error {
+                error_kind: ErrorKind::VendorRefusal,
+            },
+            ReceiptState::NotPerformed,
+            None,
+        ),
+        (
+            ToolOutcome::Refused("Not that one.".into()),
+            Outcome::Refused {
+                sentence: "Not that one.".into(),
+            },
+            ReceiptState::NotPerformed,
+            None,
+        ),
+        (
+            ToolOutcome::Unknown,
+            Outcome::Unknown,
+            ReceiptState::Unknown,
+            None,
+        ),
+    ];
+    for (reported, recorded, settled, reference) in cases {
+        let store = MemoryStore::default();
+        let guard = proposal_guard(&store, common::start(), &common::fresh_key());
+        let row = guard.row().clone();
+        let connector = RecordingConnector::answering(reported.clone());
+        let ran = common::ready(audit::run(&connector, guard));
+        let finished = common::ready(audit::finish(&store, ran, 9));
+        assert!(finished.failure().is_none(), "{reported:?}");
+        assert_eq!(
+            store.last().completion.map(|completion| completion.outcome),
+            Some(recorded),
+            "{reported:?}"
+        );
+        let receipt = store.receipt(&row).unwrap();
+        assert_eq!(
+            (receipt.state, receipt.reference, receipt.established_by),
+            (settled, reference, EstablishedBy::Call),
+            "{reported:?}"
+        );
+        if reported == ToolOutcome::Unknown {
+            assert_eq!(
+                finished.answer(),
+                &Answer::Unknown(format!(
+                    "The call was sent and no definite answer came back, so it may have taken effect. Do not repeat it, under this key or another: it will be checked as receipt `{}`.",
+                    row.as_str()
+                ))
+            );
+        }
+    }
+
+    let store = MemoryStore::default();
+    let guard = proposal_guard(&store, common::start(), &common::fresh_key());
+    let row = guard.row().clone();
+    let gave_up = common::ready(audit::give_up(&store, guard));
+    assert!(gave_up.failure().is_none());
+    assert_eq!(
+        store.receipt(&row).map(|receipt| receipt.state),
+        Some(ReceiptState::NotPerformed)
+    );
+}
+
+/// A read never reports `unknown`: from a read it is an error of the kind `other`, and a
+/// read's vendor reference is dropped, since a read has no receipt.
+#[test]
+fn a_read_is_never_unknown_and_keeps_no_reference() {
+    let store = MemoryStore::default();
+    let connector = RecordingConnector::answering(ToolOutcome::Unknown);
+    let ran = common::ready(audit::run(&connector, allowed(&store, "fixture__read")));
+    let finished = common::ready(audit::finish(&store, ran, 1));
+    assert!(finished.failure().is_none());
+    assert_eq!(
+        finished.answer(),
+        &Answer::Error("The tool gave no definite answer, so the read failed. Try again.".into())
+    );
+    assert_eq!(
+        store.last().completion.map(|completion| completion.outcome),
+        Some(Outcome::Error {
+            error_kind: ErrorKind::Other
+        })
+    );
+
+    let connector = RecordingConnector::answering(ToolOutcome::Completed(
+        json!("text"),
+        VendorReference::new("ref-1"),
+    ));
+    let ran = common::ready(audit::run(&connector, allowed(&store, "fixture__read")));
+    let finished = common::ready(audit::finish(&store, ran, 1));
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert_eq!(finished.answer(), &Answer::Ok(json!("text")));
+    assert_eq!(store.receipts(), Vec::new());
+}
+
+/// A call whose key already has a receipt does not run. Its row is written complete with the
+/// answer, no second receipt is reserved, and the earlier receipt is left as it is: `pending`
+/// is answered as possibly done, and once it completes, the same call is a `duplicate`.
+#[test]
+fn a_reused_key_is_answered_from_its_receipt_and_runs_nothing() {
+    let store = MemoryStore::default();
+    let key = common::fresh_key();
+    let guard = proposal_guard(&store, common::start(), &key);
+    let first = guard.row().clone();
+
+    let pending = reused(begin_as(
+        &store,
+        common::start(),
+        &proposing("fixture__propose", Some(&key)),
+    ));
+    assert_eq!(
+        pending.reuse(),
+        &Reuse::MayHaveHappened {
+            key: key.clone(),
+            receipt: first.clone(),
+        }
+    );
+    assert_eq!(
+        store.last().completion,
+        Some(Completion {
+            outcome: Outcome::Refused {
+                sentence: pending.sentence()
+            },
+            latency_ms: 0,
+        })
+    );
+    assert_eq!(store.last().decision, DecisionKind::Allow);
+
+    let connector = RecordingConnector::answering(ToolOutcome::Completed(
+        json!({"pr": 7}),
+        VendorReference::new("7"),
+    ));
+    let ran = common::ready(audit::run(&connector, guard));
+    let _ = common::ready(audit::finish(&store, ran, 3));
+
+    let duplicate = reused(begin_as(
+        &store,
+        common::start(),
+        &proposing("fixture__propose", Some(&key)),
+    ));
+    assert_eq!(
+        duplicate.reuse(),
+        &Reuse::Duplicate {
+            key: key.clone(),
+            receipt: first.clone(),
+            reference: Some(VendorReference::new("7")),
+        }
+    );
+    assert_eq!(
+        store.last().completion,
+        Some(Completion {
+            outcome: Outcome::Duplicate {
+                receipt: first.clone()
+            },
+            latency_ms: 0,
+        })
+    );
+    assert_eq!(connector.calls().len(), 1, "a reused key ran the call");
+    assert_eq!(store.receipts().len(), 1);
+    assert_eq!(
+        store.receipt(&first).map(|receipt| receipt.state),
+        Some(ReceiptState::Completed)
+    );
+}
+
+/// A begin retried under its own row, as the store retries one whose confirmation was lost,
+/// finds its own receipt and is not refused as reuse; once the call has run, a begin under its
+/// row is refused rather than run again.
+#[test]
+fn a_retried_begin_finds_its_own_receipt() {
+    let store = MemoryStore::default();
+    let key = common::fresh_key();
+    let start = common::start();
+    let _ = proposal_guard(&store, start.clone(), &key);
+    let guard = proposal_guard(&store, start.clone(), &key);
+    assert_eq!(guard.row(), &start.row);
+    assert_eq!((store.rows().len(), store.receipts().len()), (1, 1));
+
+    let connector = RecordingConnector::answering(ToolOutcome::Ok(json!({})));
+    let ran = common::ready(audit::run(&connector, guard));
+    let _ = common::ready(audit::finish(&store, ran, 1));
+    let again = common::ready(audit::begin(
+        &store,
+        start,
+        decide(&snapshot(), &proposing("fixture__propose", Some(&key))),
+        json!({}),
+        metadata(),
+    ));
+    assert!(again.is_err(), "a settled call was begun again: {again:?}");
+    assert_eq!(connector.calls().len(), 1);
+}
+
+/// A key is scoped to the proved principal and the delegation's key scope: two delegations of
+/// one principal may each use a key, and so may two principals; one delegation may not use it
+/// twice.
+#[test]
+fn a_key_is_unique_only_in_its_scope() {
+    let store = MemoryStore::default();
+    let key = common::fresh_key();
+    let in_turn = |turn: Option<&str>, subject: &str| {
+        let mut context = proposing("fixture__propose", Some(&key));
+        let mut delegation = context.caller.delegation.take().unwrap().get().clone();
+        delegation.key_scope = turn.map(DelegationKeyScope::new);
+        context.caller.delegation = Some(common::proved(&delegation));
+        let mut principal = principal();
+        principal.id.subject = subject.into();
+        context.caller.principal = common::proved(&principal);
+        context
+    };
+    let sandbox = "system:serviceaccount:otto:sandbox-payments";
+    for context in [
+        in_turn(Some("session-1/turn-1"), sandbox),
+        in_turn(Some("session-1/turn-2"), sandbox),
+        in_turn(None, sandbox),
+        in_turn(None, "system:serviceaccount:otto:sandbox-payments-2"),
+    ] {
+        let begun = begin_as(&store, common::start(), &context);
+        assert!(matches!(begun, Begun::Allowed(_)), "{begun:?}");
+    }
+    assert_eq!(store.receipts().len(), 4);
+    let again = begin_as(
+        &store,
+        common::start(),
+        &in_turn(Some("session-1/turn-2"), sandbox),
+    );
+    assert!(matches!(again, Begun::Reused(_)), "{again:?}");
 }
