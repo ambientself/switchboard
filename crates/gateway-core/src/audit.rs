@@ -29,7 +29,9 @@
 //!   same, except that a read whose caller goes away is cancelled and recorded as `error`.
 //! - [`finish`] consumes the `Ran`, completes the row through a [`RowCompletion`] that only it
 //!   and `give_up` can make, and only then gives out the answer, including a connector's
-//!   refusal sentence. A side effect's receipt is settled in the same write.
+//!   refusal sentence. A side effect's receipt is settled in the same write, unless the row's
+//!   deadline has passed by the store's clock, when the row is completed and the receipt stays
+//!   `pending` for reconciliation or a person.
 //! - [`give_up`] consumes a guard instead of running it, calls no connector, and completes the
 //!   row as `error` with a latency of zero. It returns a [`GaveUp`], which holds no answer:
 //!   nothing ran, so the caller chooses its own reply.
@@ -441,6 +443,8 @@ pub trait AuditStore: Send + Sync {
     /// [`reference`](RowCompletion::reference), as
     /// [`may_move`](crate::receipt::may_move) allows. A receipt that reconciliation or a person
     /// has already settled is left as it is, and the row is still completed (decision 0009).
+    /// So is a receipt whose row's deadline has passed, judged by the store's own clock at the
+    /// time of the write: it stays `pending` for reconciliation or a person.
     /// An `unknown` outcome or a vendor reference for a row that reserved no receipt is
     /// refused, since a read reports neither, and so is a `duplicate`, which only begin writes.
     fn finish<'a>(&'a self, completion: &'a RowCompletion)
@@ -1055,7 +1059,8 @@ impl Finished {
 
 /// Completes the row for a call that ran, with its outcome and latency, and only then gives
 /// out the answer. A side effect's receipt is settled in the same write, with the vendor's
-/// reference when its connector reported one.
+/// reference when its connector reported one, unless the row's deadline has passed by the
+/// store's clock, when the receipt stays `pending` for reconciliation or a person.
 ///
 /// A connector that reports [`ToolOutcome::Unknown`] for a `read` tool, which has no receipt,
 /// has its call recorded as an error of the kind `other`: a read never reports `unknown`.
@@ -1143,7 +1148,8 @@ impl GaveUp {
 /// completes the row as `error`, of the kind [`ErrorKind::Other`], with a latency of zero
 /// (decision 0009). A row can overstate what ran, never understate it, so a call that never ran
 /// is never recorded as `ok`. A side effect's receipt is settled as `not_performed` in the same
-/// write, since nothing was sent.
+/// write, since nothing was sent, unless the row's deadline has passed by the store's clock,
+/// when the receipt stays `pending` for reconciliation or a person.
 ///
 /// The caller chooses its own reply, since nothing ran.
 pub async fn give_up(store: &dyn AuditStore, guard: AuditGuard) -> GaveUp {
