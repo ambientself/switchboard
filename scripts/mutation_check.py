@@ -1550,7 +1550,8 @@ mutate("testkit-late-finish-settles-receipt", "a finish after its row's deadline
        "            && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)",
        "            && may_move(receipt.state, settled, &EstablishedBy::Call, false)")
 # A pending receipt past its row's deadline reads as unknown wherever the store reads it (#55):
-# its receipts, the reuse answer and a retried begin. tests/receipts.rs catches this.
+# its receipts, the reuse answer and a retried begin. tests/receipts.rs and the contract suite's
+# item 6 catch this.
 mutate("testkit-pending-past-deadline-read-as-pending", "the in-memory store reads a pending receipt past its row's deadline as pending, so a retried begin runs it", A,
        "        read.state = receipt.state.as_read(self.past_deadline(&receipt.row, now));",
        "        read.state = receipt.state.as_read(false && self.past_deadline(&receipt.row, now));")
@@ -4145,9 +4146,10 @@ mutate("pg-check-cascade-partition-copies-refused", "a partition's copy of a for
 mutate("pg-check-cascade-references-call-rows-refused", "a cascading foreign key that references call_rows is refused", PG_CHECK,
        "AND k.conrelid <> $1::oid AND k.confrelid <> $1::oid", "AND k.conrelid <> $1::oid")
 # Receipts (decision 0009, part 2): migration 0008's table, grants and trigger receipt_moves, the
-# begin with a receipt in one transaction, finish settling the receipt only before the deadline,
-# the boot check's third trigger, and the count of receipts in unknown. tests/receipts.rs, the
-# contract suite's item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
+# begin with a receipt in one transaction, a retried begin refused once its own receipt is pending
+# past the row's deadline, finish settling the receipt only before the deadline, the boot check's
+# third trigger, and the count of receipts in unknown. tests/receipts.rs, the contract suite's
+# item 6 on Postgres (tests/contract.rs) and tests/check.rs catch these.
 PG_RECEIPTS = PG + "sql/migrations/0008_receipts.sql"
 mutate("pg-receipt-trigger-back-to-pending", "the receipt trigger lets reconciliation or a person move an unknown receipt back to pending", PG_RECEIPTS,
        "        WHEN OLD.state = 'unknown'\n            THEN NEW.state IN ('completed', 'not_performed')\n",
@@ -4166,6 +4168,9 @@ mutate_all("pg-reuse-check-counts-own-row", "the reuse check counts a receipt re
             "            AND idempotency_key = $3 AND (row_id <> ($4::text)::uuid OR true)\";"),
            (PG_COLUMNS, "            AND idempotency_key = $4 AND row_id <> ($5::text)::uuid\";",
             "            AND idempotency_key = $4 AND (row_id <> ($5::text)::uuid OR true)\";"))
+mutate("pg-begin-retry-past-deadline-reserved", "a retried begin reads its own receipt pending past its row's deadline as pending, so it is answered as reserved and its call runs again", PG_COLUMNS,
+       "            WHEN r.state = 'pending' AND c.deadline < clock_timestamp() THEN 'unknown'\n",
+       "            WHEN r.state = 'pending' AND false THEN 'unknown'\n")
 mutate("pg-reservation-outside-begin-transaction", "the row is committed before its receipt is reserved, in a transaction of its own", PG_STORE,
        "            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;\n",
        "            transaction.commit().await?;\n"
