@@ -384,6 +384,7 @@ fn any_world() -> impl Strategy<Value = World> {
             name: "profile".into(),
             classifications: classifications.into_iter().collect(),
             requires_delegation,
+            idempotency_key_header: false,
         },
     );
     let resources = prop_oneof![

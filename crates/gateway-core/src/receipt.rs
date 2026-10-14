@@ -32,9 +32,9 @@ use crate::sentences;
 
 /// The longest an [`IdempotencyKey`] may be, in characters.
 ///
-/// The key's first carrier is the caller's tool-use identifier, which the gateway keeps only
+/// One of the key's carriers is the caller's tool-use identifier, which the gateway keeps only
 /// when it is 1 to 128 printable ASCII characters, so every tool-use identifier the gateway
-/// keeps is a valid key. A key is chosen by the caller, and is written into the receipt and
+/// keeps is a valid key; a key from the other carriers is held to the same rule. A key is chosen by the caller, and is written into the receipt and
 /// into the sentences that answer a reused key, so it is bounded like every other value a
 /// caller chooses. Claude Code's tool-use identifiers are about 30 characters.
 pub const MAX_IDEMPOTENCY_KEY: usize = 128;
@@ -540,7 +540,7 @@ impl Reuse {
 pub enum Reservation {
     /// The row was written open, and a `pending` receipt reserved under it. A retried begin
     /// that finds both, written by an earlier attempt whose confirmation was lost, answers
-    /// this too.
+    /// this too, until the row's deadline passes.
     Reserved,
     /// The key already had a receipt in its scope, reserved under another row. This call's
     /// row was written complete, with the answer's [`completion`](Reuse::completion), and no

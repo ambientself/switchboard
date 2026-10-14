@@ -1738,6 +1738,40 @@ fn each_rule_refuses_its_case() {
 
 /// A tool declared as its entry's reach is approved as `declared`, from the reach. Its adapter
 /// names nothing from the arguments: the gateway names the reach for it.
+/// A profile declares that its callers set `Idempotency-Key` per request only when it says so:
+/// a profile that does not mention it, as every file written before the setting does not, does
+/// not declare it.
+#[test]
+fn a_profile_declares_the_key_header_only_when_it_says_so() {
+    let mut table = base();
+    set(
+        &mut table,
+        "profiles.1",
+        "idempotency_key_header",
+        value("true"),
+    );
+    let registry = load(&table).unwrap();
+    let declares = |name: &str| {
+        registry
+            .snapshot()
+            .profile(&name.into())
+            .unwrap()
+            .idempotency_key_header
+    };
+    assert!(!declares("workload-read"));
+    assert!(declares("user-read"));
+    set(
+        &mut table,
+        "profiles.1",
+        "idempotency_key_header",
+        value("\"yes\""),
+    );
+    assert!(
+        load(&table).is_err(),
+        "a setting that is not a boolean loaded"
+    );
+}
+
 #[test]
 fn a_tool_declared_as_the_reach_is_approved_as_declared_from_the_reach() {
     let mut table = base();

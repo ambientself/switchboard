@@ -638,7 +638,7 @@ fn an_allowed_proposal_runs_under_the_callers_credential_and_completes_its_row()
     );
 }
 
-/// A call's key is its tool-use identifier, the first carrier (decision 0009, "The key"). A
+/// Without an explicit key, a call's key is its tool-use identifier (decision 0009, "The key"). A
 /// proposal sent with none is denied, asking for one, and nothing runs. Sent twice with one
 /// identifier, it runs once: the second is answered from the first's receipt as a duplicate, a
 /// success naming the receipt and the vendor's reference, and its row is complete.

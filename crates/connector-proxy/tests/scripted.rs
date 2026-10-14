@@ -13,8 +13,8 @@ use common::{
 use connector_proxy::{
     DEFAULT_MAX_RESPONSE_BYTES, ListError, ListedTool, PROTOCOL_VERSION, Upstream, outcome,
 };
-use gateway_core::ToolName;
 use gateway_core::audit::{Answer, ErrorKind, Outcome};
+use gateway_core::{ReceiptState, ToolName};
 use gateway_testkit::{DRAFT_TOOL, READ_TOOL};
 use serde_json::{Value, json};
 
@@ -66,6 +66,9 @@ async fn timed_answer_to(
 async fn answer_with(body: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Answer {
     answer_to(move |request| vec![Step::Write(json_response(&body(request)))]).await
 }
+
+/// A script made at run time, for a table of cases.
+type BoxedScript = Box<dyn Fn(&Value) -> Vec<Step> + Send + Sync>;
 
 fn not_mcp() -> Answer {
     Answer::Error(outcome::NOT_MCP.to_owned())
@@ -153,23 +156,22 @@ async fn a_403_is_the_servers_refusal() {
     assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
 }
 
+/// From a read. From a side effect a `403` is `unknown`: see
+/// `a_side_effect_the_server_answered_with_a_failure_is_unknown`.
 #[tokio::test]
 async fn a_403_is_recorded_as_a_vendor_refusal() {
-    for tool in [READ_TOOL, DRAFT_TOOL] {
-        let (answer, outcome) = recorded(tool, |_| {
-            vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
-        })
-        .await;
+    let (answer, outcome) = recorded(READ_TOOL, |_| {
+        vec![Step::Write(response("403 Forbidden", "text/plain", b"no"))]
+    })
+    .await;
 
-        assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
-        assert_eq!(
-            outcome,
-            Outcome::Error {
-                error_kind: ErrorKind::VendorRefusal
-            },
-            "{tool}"
-        );
-    }
+    assert_eq!(answer, Answer::Error(outcome::UPSTREAM_REFUSED.to_owned()));
+    assert_eq!(
+        outcome,
+        Outcome::Error {
+            error_kind: ErrorKind::VendorRefusal
+        }
+    );
 }
 
 #[tokio::test]
@@ -195,11 +197,26 @@ async fn a_401_is_recorded_as_another_error() {
     );
 }
 
+/// The answer to one call to `tool`, the outcome its row records, and the state of the receipt
+/// it reserved, if it reserved one.
+async fn settled(
+    tool: &str,
+    steps: impl Fn(&Value) -> Vec<Step> + Send + Sync + 'static,
+) -> (Answer, Outcome, Option<ReceiptState>) {
+    let server = Scripted::start(steps).await;
+    let harness = Harness::new();
+    let answer = harness.call(&bounded(&server), tool, arguments()).await;
+    let row = harness.rows().pop().unwrap();
+    let receipt = harness.store.receipts().pop().map(|receipt| receipt.state);
+    (answer, row.completion.unwrap().outcome, receipt)
+}
+
 /// An answer too large, too late or broken off is its own kind of error from a tool classified
-/// `read`. From the draft tool, classified `propose`, it is another error: decision 0011 makes
-/// it `unknown`, which is not built yet.
+/// `read`. From the draft tool, classified `propose`, the request may have been acted on, so it
+/// is `unknown`, and so is its receipt (decision 0009): an error would settle the receipt as
+/// `not_performed` and invite the caller to try again.
 #[tokio::test]
-async fn an_oversized_or_late_answer_is_its_own_kind_only_from_a_read() {
+async fn an_oversized_or_late_answer_is_its_own_kind_from_a_read_and_unknown_from_a_side_effect() {
     fn too_large(request: &Value) -> Vec<Step> {
         vec![Step::Write(response(
             "200 OK",
@@ -240,20 +257,173 @@ async fn an_oversized_or_late_answer_is_its_own_kind_only_from_a_read() {
         ("late", late, outcome::TIMED_OUT),
         ("broken off", broken_off, outcome::BROKEN_OFF),
     ];
-    for (tool, kind) in [
-        (READ_TOOL, ErrorKind::OversizedOrLateRead),
-        (DRAFT_TOOL, ErrorKind::Other),
-    ] {
-        for (case, steps, sentence) in cases {
-            let (answer, outcome) = recorded(tool, steps).await;
-            assert_eq!(answer, Answer::Error(sentence.to_owned()), "{tool}, {case}");
-            assert_eq!(
-                outcome,
-                Outcome::Error { error_kind: kind },
-                "{tool}, {case}"
-            );
-        }
+    for (case, steps, sentence) in cases {
+        let (answer, outcome, receipt) = settled(READ_TOOL, steps).await;
+        assert_eq!(answer, Answer::Error(sentence.to_owned()), "{case}");
+        assert_eq!(
+            outcome,
+            Outcome::Error {
+                error_kind: ErrorKind::OversizedOrLateRead
+            },
+            "{case}"
+        );
+        assert_eq!(receipt, None, "{case}: a read reserved a receipt");
+
+        let (answer, outcome, receipt) = settled(DRAFT_TOOL, steps).await;
+        assert!(
+            matches!(&answer, Answer::Unknown(sentence) if sentence.contains("Do not repeat it")),
+            "{case}: {answer:?}"
+        );
+        assert_eq!(outcome, Outcome::Unknown, "{case}");
+        assert_eq!(receipt, Some(ReceiptState::Unknown), "{case}");
     }
+}
+
+/// From a side effect, every other failure once the request may have been sent is `unknown`
+/// too: a status that is neither `200` nor `4xx`, whatever its body, a `200` that is not MCP,
+/// and a connection the server closed without answering. From a read each is an error.
+#[tokio::test]
+async fn a_side_effect_with_no_definite_answer_is_unknown() {
+    let status = |status: &'static str| {
+        move |request: &Value| {
+            vec![Step::Write(response(
+                status,
+                "application/json",
+                text_result(request, "looks fine").to_string().as_bytes(),
+            ))]
+        }
+    };
+    let cases: Vec<(&str, BoxedScript)> = vec![
+        ("500", Box::new(status("500 Internal Server Error"))),
+        ("502", Box::new(status("502 Bad Gateway"))),
+        ("202", Box::new(status("202 Accepted"))),
+        ("201", Box::new(status("201 Created"))),
+        ("303", Box::new(status("303 See Other"))),
+        (
+            "not MCP",
+            Box::new(|_: &Value| {
+                vec![Step::Write(response("200 OK", "text/html", b"<p>done</p>"))]
+            }),
+        ),
+        ("closed unanswered", Box::new(|_: &Value| Vec::new())),
+    ];
+    for (case, steps) in cases {
+        let steps = std::sync::Arc::new(steps);
+        let script = {
+            let steps = steps.clone();
+            move |request: &Value| steps(request)
+        };
+        let (answer, outcome, receipt) = settled(DRAFT_TOOL, script).await;
+        assert!(matches!(answer, Answer::Unknown(_)), "{case}: {answer:?}");
+        assert_eq!(outcome, Outcome::Unknown, "{case}");
+        assert_eq!(receipt, Some(ReceiptState::Unknown), "{case}");
+
+        let script = move |request: &Value| steps(request);
+        let (answer, outcome, _) = settled(READ_TOOL, script).await;
+        assert!(matches!(answer, Answer::Error(_)), "{case}: {answer:?}");
+        assert_eq!(
+            outcome,
+            Outcome::Error {
+                error_kind: ErrorKind::Other
+            },
+            "{case}"
+        );
+    }
+}
+
+/// A side effect the server answered with a refusal or a failure is `unknown`, and so is its
+/// receipt: a `4xx`, a JSON-RPC error and a tool result marked `isError` come after the
+/// request was sent and do not establish that nothing took effect. Decision 0009 holds a
+/// proxied tool's error to be `unknown` unless its approval says its errors are safe, which
+/// no approval can say yet. From a read each is an error of its kind.
+#[tokio::test]
+async fn a_side_effect_the_server_answered_with_a_failure_is_unknown() {
+    let status = |status: &'static str| {
+        move |_: &Value| vec![Step::Write(response(status, "text/plain", b"no"))]
+    };
+    let cases: Vec<(&str, BoxedScript, ErrorKind)> = vec![
+        ("400", Box::new(status("400 Bad Request")), ErrorKind::Other),
+        (
+            "401",
+            Box::new(status("401 Unauthorized")),
+            ErrorKind::Other,
+        ),
+        (
+            "403",
+            Box::new(status("403 Forbidden")),
+            ErrorKind::VendorRefusal,
+        ),
+        ("409", Box::new(status("409 Conflict")), ErrorKind::Other),
+        (
+            "JSON-RPC error",
+            Box::new(|request: &Value| {
+                vec![Step::Write(json_response(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32602, "message": "No such document."},
+                })))]
+            }),
+            ErrorKind::Other,
+        ),
+        (
+            "isError",
+            Box::new(|request: &Value| {
+                vec![Step::Write(json_response(&json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"content": [{"type": "text", "text": "Refused."}], "isError": true},
+                })))]
+            }),
+            ErrorKind::Other,
+        ),
+    ];
+    for (case, steps, kind) in cases {
+        let steps = std::sync::Arc::new(steps);
+        let script = {
+            let steps = steps.clone();
+            move |request: &Value| steps(request)
+        };
+        let (answer, outcome, receipt) = settled(DRAFT_TOOL, script).await;
+        assert!(
+            matches!(&answer, Answer::Unknown(sentence) if sentence.contains("Do not repeat it")),
+            "{case}: {answer:?}"
+        );
+        assert_eq!(outcome, Outcome::Unknown, "{case}");
+        assert_eq!(receipt, Some(ReceiptState::Unknown), "{case}");
+
+        let script = move |request: &Value| steps(request);
+        let (answer, outcome, receipt) = settled(READ_TOOL, script).await;
+        assert!(matches!(answer, Answer::Error(_)), "{case}: {answer:?}");
+        assert_eq!(outcome, Outcome::Error { error_kind: kind }, "{case}");
+        assert_eq!(receipt, None, "{case}: a read reserved a receipt");
+    }
+}
+
+/// A side effect whose connection could not be made sent nothing: it is an error, and its
+/// receipt is settled as `not_performed`.
+#[tokio::test]
+async fn a_side_effect_that_could_not_connect_is_an_error_and_not_performed() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", closed.local_addr().unwrap());
+    drop(closed);
+    let connector = connector(Upstream {
+        deadline: DEADLINE,
+        max_response_bytes: CAP,
+        ..upstream(&url).tool(ToolName::parse(DRAFT_TOOL).unwrap(), "draft_document")
+    });
+    let harness = Harness::new();
+    let answer = harness.call(&connector, DRAFT_TOOL, arguments()).await;
+    assert_eq!(answer, Answer::Error(outcome::UNREACHABLE.to_owned()));
+    assert_eq!(
+        harness.rows().pop().unwrap().completion.unwrap().outcome,
+        Outcome::Error {
+            error_kind: ErrorKind::Other
+        }
+    );
+    assert_eq!(
+        harness.store.receipts().pop().map(|receipt| receipt.state),
+        Some(ReceiptState::NotPerformed)
+    );
 }
 
 #[tokio::test]
