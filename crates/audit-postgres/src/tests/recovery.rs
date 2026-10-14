@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gateway_core::audit::{self, AuditFailure, AuditRowId, Begun};
 use gateway_testkit::{
     Caller, Fixture, READ_TOOL, SURFACE_ALL, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT, WRITE_TOOL,
-    row_start,
+    fresh_key, row_start,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +20,7 @@ use super::budgets::{
     SLACK, cause, count, decide_read, lock_table, release, reporting, reports_of,
     set_for_new_sessions, until, within,
 };
+use super::receipts::begin as begin_with_receipt;
 use super::store::Call;
 use super::{DUMMY_PASSWORD, GATEWAY_ROLE, TestDatabase, code};
 use crate::{Budgets, FinishCounts, GivenUpCauses, PgAuditError, PgAuditStore, PoolSizes};
@@ -922,6 +923,138 @@ async fn an_insert_that_commits_between_an_attempts_update_and_its_select_is_com
     assert_eq!(store.finishes(), FinishCounts::default());
     assert_eq!(store.stats().finishes_given_up, GivenUpCauses::default());
     assert!(reports_of(&reports).is_empty());
+}
+
+/// The key of the advisory lock that [`hold_commits`] takes.
+const COMMIT_LOCK: i64 = 4_201_010;
+
+/// Makes every transaction that inserts into `call_rows` wait as it commits, after all its
+/// statements, until [`let_commits_through`]: a constraint trigger deferred to the commit waits
+/// for an advisory lock, which the session returned holds. The transaction's row, and a receipt
+/// it reserved, become visible together once it goes on.
+async fn hold_commits(db: &TestDatabase) -> Client {
+    let lock = db.admin().await;
+    lock.batch_execute(&format!(
+        "CREATE FUNCTION public.wait_at_commit() RETURNS trigger
+             LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+         AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock({COMMIT_LOCK});
+             RETURN NULL;
+         END
+         $$;
+         CREATE CONSTRAINT TRIGGER a_wait_at_commit
+             AFTER INSERT ON switchboard_audit.call_rows
+             DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION public.wait_at_commit();
+         SELECT pg_advisory_lock({COMMIT_LOCK});"
+    ))
+    .await
+    .unwrap();
+    lock
+}
+
+async fn let_commits_through(lock: &Client) {
+    lock.batch_execute(&format!("SELECT pg_advisory_unlock({COMMIT_LOCK})"))
+        .await
+        .unwrap();
+}
+
+/// A begin with a receipt waits past the begin budget as it commits, and the store's request
+/// to cancel it is lost. An attempt to complete the row reads that no receipt is reserved under
+/// it; the answer saying so is held back while the begin commits its row and receipt. The
+/// attempt's update then completes the row as `error`, and the same transaction settles the
+/// receipt as `not_performed`, since nothing ran: it is not left `pending`.
+#[tokio::test]
+async fn a_receipt_that_commits_between_an_attempts_read_and_its_update_is_settled() {
+    let Some(db) = TestDatabase::create().await else {
+        return;
+    };
+    let fixture = Fixture::new().unwrap();
+    let cutter = Cutter::start(&db).await;
+    let budgets = Budgets {
+        begin: Duration::from_millis(300),
+        answer: Duration::from_secs(2),
+        finish_deadline: Duration::from_secs(10),
+    };
+    let (store, reports) = reporting(cutter.store(&db, budgets));
+    let admin = db.admin().await;
+    // The begin connection has the statements of a begin with a receipt prepared, and the
+    // finish connection is open.
+    let warmed = begin_with_receipt(&store, &fixture, &row_start(), "Warm up.", &fresh_key()).await;
+    assert!(matches!(warmed, Ok(Begun::Allowed(_))), "{warmed:?}");
+    drop(store.finish.get().await.unwrap());
+    let lock = hold_commits(&db).await;
+    cutter.drop_cancels();
+
+    let start = row_start();
+    let row = start.row.clone();
+    let failure = within(
+        budgets.begin + SLACK,
+        begin_with_receipt(&store, &fixture, &start, "Never ran.", &fresh_key()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(cause(&failure), PgAuditError::BeginBudget { .. }),
+        "{failure}"
+    );
+    assert_eq!(store.finishes().in_flight, 1);
+
+    // The next attempt's read of the receipt finds none, and its answer is held back.
+    cutter.set(HOLD_EMPTY);
+    until(SLACK, "an attempt's read to find nothing", || async {
+        cutter.mode() == HOLDING
+    })
+    .await;
+    let held: String = admin
+        .query_one(
+            "SELECT query FROM pg_catalog.pg_stat_activity
+             WHERE usename = $1 AND state = 'idle in transaction'",
+            &[&GATEWAY_ROLE],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        held.contains("FROM switchboard_audit.receipts"),
+        "the answer held back is not the read of the receipt: {held}"
+    );
+    // The begin commits its row and receipt before the attempt goes on to its update.
+    let_commits_through(&lock).await;
+    until(SLACK, "the begin to commit", || async {
+        rows_under(&admin, &row).await == 1
+    })
+    .await;
+    assert_eq!(receipt_of(&admin, &row).await, "pending");
+    cutter.set(PASS);
+    until(budgets.finish_deadline, "the row's completion", || async {
+        store.finishes().in_flight == 0
+    })
+    .await;
+    assert_eq!(
+        row_of(&admin, &row).await,
+        ("allow".to_owned(), Some("error:other".to_owned()), Some(0)),
+        "{:?} {:?}",
+        store.stats(),
+        reports_of(&reports)
+    );
+    assert_eq!(receipt_of(&admin, &row).await, "not_performed");
+    assert_eq!(store.finishes(), FinishCounts::default());
+    assert_eq!(store.stats().finishes_given_up, GivenUpCauses::default());
+    assert!(reports_of(&reports).is_empty());
+}
+
+/// The state of the receipt reserved under `row`, which must be stored.
+async fn receipt_of(admin: &Client, row: &AuditRowId) -> String {
+    admin
+        .query_one(
+            "SELECT state FROM switchboard_audit.receipts WHERE row_id = ($1::text)::uuid",
+            &[&row.as_str()],
+        )
+        .await
+        .unwrap()
+        .get(0)
 }
 
 /// Begins an allowed call that executes its insert while `call_rows` is locked, so the insert

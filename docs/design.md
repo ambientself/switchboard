@@ -1437,7 +1437,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   receipt `pending`. `unknown`, or a reference, for a row that reserved no receipt is refused,
   and so is a `duplicate` at finish. The Postgres runner runs item 6 of the contract suite.
   A begin whose confirmation is lost after it wrote a reused key's row gives that row up as
-  completed differently, where the in-memory store keeps its answer silently.
+  completed differently, where the in-memory store keeps its answer silently. The row is the
+  same in both. The in-memory store's silence is the behaviour to match: that row's completion
+  was not lost, so the give-up Postgres counts and reports for it is a false signal.
 - If retention needs it, a partitioned audit table, with the boot check reading the triggers,
   owner and grants of every partition, in whatever schema. Today the boot check refuses a
   partitioned audit table, and any table that inherits from it or that it inherits from.

@@ -4099,6 +4099,11 @@ mutate("pg-reservation-outside-begin-transaction", "the row is committed before 
        "            transaction.commit().await?;\n"
        "            let transaction = client.transaction().await?;\n"
        "            let statement = transaction.prepare_cached(ReceiptRow::RESERVE).await?;\n")
+mutate("pg-settle-only-if-read-first", "a completion settles a receipt only if its first read found one, so a lost begin's receipt that commits after that read stays pending", PG_STORE,
+       "    if updated == 1 {\n        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;\n"
+       "        transaction\n            .execute(&statement, &[&row, &finish.settles, &finish.reference])\n            .await?;\n",
+       "    if updated == 1 {\n        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;\n"
+       "        if reserved {\n            transaction\n                .execute(&statement, &[&row, &finish.settles, &finish.reference])\n                .await?;\n        }\n")
 mutate("pg-finish-settles-past-deadline", "finish moves a receipt whatever its row's deadline", PG_COLUMNS,
        "        WHERE r.row_id = ($1::text)::uuid AND r.state = 'pending'\n"
        "            AND NOT EXISTS (SELECT FROM switchboard_audit.call_rows c\n"

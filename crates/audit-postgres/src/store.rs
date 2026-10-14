@@ -1488,6 +1488,12 @@ async fn complete_on(
 /// ([`ReceiptRow::SETTLE`]). A receipt already settled, or past the deadline, is left as it
 /// is, and the row is completed all the same. `unknown`, or a reference, for a row that
 /// reserved no receipt is refused, and nothing is written.
+///
+/// The settle is made whenever the update completed the row, not only when the first read
+/// found a receipt: at read committed each statement sees what had committed when it began, so
+/// a lost begin whose row and receipt commit after that read and before the update has its row
+/// completed here, and its receipt is seen by the settle. For a row with no receipt the settle
+/// matches nothing.
 async fn complete_in_transaction(
     client: &mut ClientWrapper,
     row: &str,
@@ -1525,12 +1531,10 @@ async fn complete_in_transaction(
         )
         .await?;
     if updated == 1 {
-        if reserved {
-            let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;
-            transaction
-                .execute(&statement, &[&row, &finish.settles, &finish.reference])
-                .await?;
-        }
+        let statement = transaction.prepare_cached(ReceiptRow::SETTLE).await?;
+        transaction
+            .execute(&statement, &[&row, &finish.settles, &finish.reference])
+            .await?;
         transaction.commit().await?;
         return Ok(());
     }

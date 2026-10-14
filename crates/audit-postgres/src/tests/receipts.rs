@@ -246,7 +246,7 @@ fn proposal(
 }
 
 /// Begins team A's proposal under `key`, as the row `start` names.
-async fn begin(
+pub(super) async fn begin(
     store: &PgAuditStore,
     fixture: &Fixture,
     start: &RowStart,
