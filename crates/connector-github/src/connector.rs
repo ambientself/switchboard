@@ -232,12 +232,14 @@ impl GitHubConnector {
                  caller's team, and a person has none",
             );
         };
+        // The revision the call was decided under, as every token request carries it.
+        let revision = call.policy_revision().clone();
         let request = TokenRequest {
             team: team.clone(),
             tool: tool.clone(),
             repositories: Vec::new(),
             permissions: BTreeMap::from([(report::REPORT_PERMISSION.to_owned(), Access::Read)]),
-            revision: call.policy_revision().clone(),
+            revision,
         };
         let token = match self.custodian.token(&request).await {
             Ok(token) => token,

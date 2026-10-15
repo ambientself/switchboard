@@ -1367,14 +1367,15 @@ impl DriftPass {
     /// schedule, so no poll waits for one. Each entry checked against a vendor report is
     /// checked on a schedule of its own, the same way.
     pub async fn run(self) {
-        let mut entries = JoinSet::new();
+        let mut reports = JoinSet::new();
         for reporting in self.reporting() {
-            entries.spawn(report_every(
+            reports.spawn(report_every(
                 Arc::clone(&self.withdrawals),
                 reporting,
                 self.interval,
             ));
         }
+        let mut entries = JoinSet::new();
         for (server, connector) in &self.servers {
             entries.spawn(poll_every(
                 Arc::clone(&self.withdrawals),
@@ -1383,6 +1384,7 @@ impl DriftPass {
             ));
         }
         while entries.join_next().await.is_some() {}
+        while reports.join_next().await.is_some() {}
     }
 }
 
@@ -1449,7 +1451,8 @@ async fn report_every(withdrawals: Arc<Withdrawals>, reporting: Reporting, inter
                 tracing::error!(%error, server = %reporting.entry, "a reach report's task failed");
             }
         }
-        if checking.is_empty() {
+        let idle = checking.is_empty();
+        if idle {
             checking.spawn(check_report(Arc::clone(&withdrawals), reporting.clone()));
         }
     }
