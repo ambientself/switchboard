@@ -7,8 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use gateway_core::{PolicyRevision, PolicySnapshot, Principal, ProfileName, ToolName};
-use gateway_registry::{ArgumentAdapter, NoProfile, ProfileRules, Registry, RulePrincipal};
+use gateway_core::{
+    ConnectorName, PolicyRevision, PolicySnapshot, Principal, ProfileName, ToolName,
+};
+use gateway_registry::{
+    ArgumentAdapter, BuiltInEntry, NoProfile, ProfileRules, Registry, RulePrincipal,
+};
 
 use crate::catalog::{CatalogError, ToolCatalog, ToolDefinition};
 use crate::grants::WorkloadSelection;
@@ -22,6 +26,10 @@ pub struct ServedPolicy {
     catalog: ToolCatalog,
     selection: Selection,
     arguments: BTreeMap<ToolName, ArgumentAdapter>,
+    /// The registry's built-in connector entries, each with the permission set its tokens are
+    /// asked for. Part of the policy, so a version that changes one must change its revision,
+    /// as the key custodian, which reads the same entries, requires (#219).
+    connectors: BTreeMap<ConnectorName, BuiltInEntry>,
 }
 
 /// Where profile rules come from.
@@ -46,6 +54,7 @@ impl ServedPolicy {
             catalog,
             selection: Selection::Rules(selector),
             arguments: BTreeMap::new(),
+            connectors: BTreeMap::new(),
         }
     }
 
@@ -70,6 +79,7 @@ impl ServedPolicy {
             catalog,
             selection: Selection::Registry(registry.profile_rules().clone()),
             arguments: registry.adapters().clone(),
+            connectors: registry.connectors().clone(),
         })
     }
 
@@ -86,6 +96,7 @@ impl ServedPolicy {
             catalog: self.catalog.without(withdrawn),
             selection: self.selection.clone(),
             arguments,
+            connectors: self.connectors.clone(),
         }
     }
 

@@ -15,6 +15,8 @@ audit-postgres = { path = "../audit-postgres" }
 # The HTTP server: HTTP/1.1 only, with nothing axum would add by default (form and query
 # extractors, JSON, its own tracing).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# The built-in GitHub connector, which asks the key custodian for every token.
+connector-github = { path = "../connector-github" }
 # The connector for a proxied MCP server, and the file-backed credential it sends upstream.
 connector-proxy = { path = "../connector-proxy" }
 gateway-core = { path = "../gateway-core" }
@@ -58,12 +60,21 @@ uuid = { version = "1", features = ["v7"] }
 # `test-support`, which alone lets a connector reach a loopback address, for the tests' local
 # servers (decision 0013, section 3). The release build never enables it: deploy/Dockerfile
 # builds `switchboard` with `-p gateway` alone, and CI checks four refusals of that binary: a
-# `propose` tool, identity disabled, audit disabled and a server on loopback.
+# `propose` tool, identity disabled, audit disabled and a server on loopback. It turns on
+# connector-github's `loopback` too, which alone lets the GitHub connector reach a fake GitHub
+# API on loopback over plain http.
 [features]
-test-support = ["connector-proxy/test-support"]
+test-support = ["connector-github/loopback", "connector-proxy/test-support"]
 
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }
+# The fake GitHub REST API, and the key custodian with its fake GitHub App API, which the GitHub
+# connector's end-to-end tests run against.
+connector-github = { path = "../connector-github", features = ["test-support"] }
+key-custodian = { path = "../key-custodian", features = ["test-support"] }
+# The fake App's key, generated per run: no key is checked in.
+rand_core = { version = "0.6", features = ["getrandom"] }
+rsa = "0.9"
 # The test minter, which signs turn grants with keys it generates.
 gateway-otto = { path = "../gateway-otto", features = ["test-support"] }
 # The crate's own tests are a development build, as the harness's are: the testkit's fixture

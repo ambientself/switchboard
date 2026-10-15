@@ -14,9 +14,10 @@
 
 use serde_json::{Value, json};
 
-const ALLOWED: [&str; 22] = [
+const ALLOWED: [&str; 23] = [
     "audit-postgres",
     "axum",
+    "connector-github",
     "connector-proxy",
     "gateway-core",
     "gateway-identity",

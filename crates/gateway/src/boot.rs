@@ -14,9 +14,10 @@
 //!    is served only when the audit store is the Postgres store, which keeps receipts, audit
 //!    is on and identity is on, or by a development build, one with the `test-support`
 //!    feature. The JSON configuration cannot name the Postgres store, so on its path only a
-//!    development build serves one. It then passes the narrowing gate (decision 0011): until
-//!    something narrows a credential, an entry narrowed per call or to the caller's limit is
-//!    refused in every build.
+//!    development build serves one. It then passes the narrowing gate (decision 0011): a proxied
+//!    server's entry narrowed per call or to the caller's limit is refused in every build,
+//!    since the gateway sends a server one credential for every call. A built-in entry may be
+//!    narrowed: its connector asks for a credential narrowed as it says.
 //! 5. **Tool definitions**: every approved tool has exactly one, and every one is for an
 //!    approved tool.
 //! 6. **Connectors**: none is registered twice, and every tool on a surface has its connector
@@ -36,6 +37,16 @@
 //! Every approved tool's server must have a connector. The receipt-store gate and the narrowing
 //! gate run there too, at boot and on every reload.
 //!
+//! A built-in connector, gateway code in the gateway's own process such as the GitHub
+//! connector, is registered there with [`Wiring::built_in`], under the name of a built-in
+//! connector entry of the registry, `[[connectors]]`, with the definition of each tool it
+//! serves. Its calls are read as a proxied server's are, by the registry's argument adapters
+//! and behind its argument check, and it is wrapped in its [`Bounded`], as every connector in
+//! the gateway's own process is: the deadline and result bound
+//! [`Wiring::in_process_limits`] gives it, and the rate quotas [`Wiring::quotas`] gives. Every
+//! approved built-in tool's entry must have its connector registered, and its approved
+//! definition must be the one the connector serves, at boot and on every reload.
+//!
 //! A disabled gate starts, in a development build, with a warning logged here; the HTTP layer
 //! repeats it while the gateway runs. The release build refuses both opt-outs.
 //! [`start::prepare`](crate::start::prepare) runs the opt-out refusals, the narrowing gate and
@@ -50,8 +61,9 @@ use std::time::{Duration, Instant};
 
 use connector_proxy::DEFAULT_DEADLINE;
 use gateway_core::{
-    AuditStore, Classification, Connector, ConnectorName, DeploymentName, InstanceName, Issuer,
-    Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, TeamId, ToolName,
+    AuditStore, Classification, Connector, ConnectorName, DeploymentName, EntryKind, InstanceName,
+    Issuer, Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, TeamId,
+    ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
 use gateway_otto::{HttpResolver, KeyConfigError};
@@ -244,9 +256,26 @@ pub enum BootError {
         /// Its classification.
         classification: Classification,
     },
-    /// A server's credential is to be narrowed per call or to the caller's limit. The gateway
-    /// sends one credential for every call to a server until the custodian client (#12)
-    /// narrows them, so such an entry would skip rule 5 with a credential that is not narrowed.
+    /// A built-in connector was registered in a deployment whose policy is not the registry's,
+    /// where no built-in entry or approval exists for it.
+    #[error(
+        "connector `{0}` is registered as a built-in connector, which needs the policy to come          from the registry"
+    )]
+    BuiltInWithoutRegistry(ConnectorName),
+    /// A built-in connector was registered under a name the registry has no built-in entry for.
+    #[error(
+        "connector `{0}` is registered as a built-in connector, but the registry has no          `[[connectors]]` entry of that name"
+    )]
+    NotABuiltInEntry(ConnectorName),
+    /// A built-in tool's approved definition is not the one its connector serves: the
+    /// connector's code changed after the approval, or the approval was edited.
+    #[error(
+        "built-in tool `{0}`'s approved definition is not the one its connector serves; approve          the connector's definition again"
+    )]
+    BuiltInDefinitionDiffers(ToolName),
+    /// A proxied server's credential is to be narrowed per call or to the caller's limit. The
+    /// gateway sends one credential for every call to a server, so such an entry would skip
+    /// rule 5 with a credential that is not narrowed.
     #[error(
         "server `{0}` says its credential is narrowed per call or to the caller's limit, which \
          this gateway cannot do yet: it sends the same credential on every call, so only \
@@ -291,6 +320,7 @@ pub struct Wiring {
     audit_store: Option<Arc<dyn AuditStore>>,
     connectors: Vec<(ConnectorName, Registered)>,
     proxied: Vec<(ConnectorName, Arc<dyn Connector>)>,
+    built_in: Vec<BuiltIn>,
     call_deadlines: BTreeMap<ConnectorName, Duration>,
     in_process_limits: BTreeMap<ConnectorName, InProcessLimits>,
     quotas: RateQuotas,
@@ -308,6 +338,7 @@ impl Wiring {
             audit_store: None,
             connectors: Vec::new(),
             proxied: Vec::new(),
+            built_in: Vec::new(),
             call_deadlines: BTreeMap::new(),
             in_process_limits: BTreeMap::new(),
             quotas: RateQuotas::default(),
@@ -374,6 +405,25 @@ impl Wiring {
         self
     }
 
+    /// Registers `connector`, a built-in connector in the gateway's own process, for the
+    /// registry's built-in entry `name`, serving the tools in `definitions`, each with the
+    /// SHA-256 of its definition as its approval must record it. [`check_registry`] reads its
+    /// calls with the registry's adapters and wraps it in its [`Bounded`]; [`check`] refuses
+    /// it. One connector may be registered under several entries' names.
+    pub fn built_in(
+        mut self,
+        name: impl Into<ConnectorName>,
+        connector: Arc<dyn Connector>,
+        definitions: impl IntoIterator<Item = (ToolName, String)>,
+    ) -> Self {
+        self.built_in.push(BuiltIn {
+            name: name.into(),
+            connector,
+            definitions: definitions.into_iter().collect(),
+        });
+        self
+    }
+
     /// Registers `lookup` as the connector `name`'s lookup by marker, which reconciliation asks
     /// to settle an `unknown` receipt of its tools (decision 0009, "Reconciliation"). A
     /// connector with none has each such receipt handed to a person at once. No connector has
@@ -422,14 +472,23 @@ impl fmt::Debug for Wiring {
         let connectors: Vec<&ConnectorName> =
             self.connectors.iter().map(|(name, _)| name).collect();
         let proxied: Vec<&ConnectorName> = self.proxied.iter().map(|(name, _)| name).collect();
+        let built_in: Vec<&ConnectorName> = self.built_in.iter().map(|b| &b.name).collect();
         f.debug_struct("Wiring")
             .field("instance", &self.instance)
             .field("audit_store", &self.audit_store.is_some())
             .field("connectors", &connectors)
             .field("proxied", &proxied)
+            .field("built_in", &built_in)
             .field("resolver", &self.resolver.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// A built-in connector as [`Wiring::built_in`] registered it.
+struct BuiltIn {
+    name: ConnectorName,
+    connector: Arc<dyn Connector>,
+    definitions: BTreeMap<ToolName, String>,
 }
 
 pub(crate) struct Registered {
@@ -499,6 +558,8 @@ pub(crate) struct Basis {
     pub(crate) grant_issuers: Vec<(String, bool)>,
     /// Whether Otto's resolver is configured, for the currency gate.
     pub(crate) resolver: bool,
+    /// The SHA-256 of each tool's definition as the built-in connectors serve it, by tool.
+    pub(crate) built_in_definitions: BTreeMap<ToolName, String>,
 }
 
 impl fmt::Debug for Gates {
@@ -673,6 +734,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         audit_store,
         connectors: registrations,
         proxied,
+        built_in,
         call_deadlines,
         in_process_limits,
         quotas,
@@ -681,6 +743,9 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
     } = wiring;
     if let Some((name, _)) = proxied.into_iter().next() {
         return Err(BootError::ProxiedWithoutRegistry(name));
+    }
+    if let Some(built_in) = built_in.into_iter().next() {
+        return Err(BootError::BuiltInWithoutRegistry(built_in.name));
     }
     let issuers = configured_issuers(&config.identity);
     let receipt_store = receipt_store_configured(&config.identity, &config.audit);
@@ -713,17 +778,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
     let in_process = Arc::new(InProcessSignals::default());
     let mut connectors = BTreeMap::new();
     for (name, mut registered) in registrations {
-        let mut limits = in_process_limits.get(&name).copied().unwrap_or_default();
-        if let Some(deadline) = call_deadlines.get(&name) {
-            limits.deadline = *deadline;
-        }
-        if !limits.within_ceilings() {
-            return Err(BootError::InProcessLimitsOutOfRange {
-                connector: name,
-                deadline: limits.deadline,
-                max_result_bytes: limits.max_result_bytes,
-            });
-        }
+        let limits = in_process_bound(&name, &in_process_limits, &call_deadlines)?;
         registered.call_deadline = limits.deadline;
         // No connector in the gateway's own process runs without its bound (decision 0014).
         registered.connector = Arc::new(Bounded::new(
@@ -835,11 +890,12 @@ pub(crate) fn check_registry_with(
         audit_store,
         connectors: registrations,
         proxied,
+        built_in,
         call_deadlines,
-        // Only a connector in the gateway's own process takes these, and the registry's path
-        // refuses every one below. A proxied server's quotas are its bulkhead's.
-        in_process_limits: _,
-        quotas: _,
+        // Only a connector in the gateway's own process takes these: here, a built-in one. A
+        // proxied server's quotas are its bulkhead's.
+        in_process_limits,
+        quotas,
         lookups,
         resolver,
     } = wiring;
@@ -872,6 +928,36 @@ pub(crate) fn check_registry_with(
             return Err(BootError::DuplicateConnector(name));
         }
     }
+    let in_process = Arc::new(InProcessSignals::default());
+    let mut built_in_definitions = BTreeMap::new();
+    for BuiltIn {
+        name,
+        connector,
+        definitions,
+    } in built_in
+    {
+        if !registry.connectors().contains_key(&name) {
+            return Err(BootError::NotABuiltInEntry(name));
+        }
+        let limits = in_process_bound(&name, &in_process_limits, &call_deadlines)?;
+        // No connector in the gateway's own process runs without its bound (decision 0014).
+        let registered = Registered {
+            connector: Arc::new(Bounded::new(
+                name.clone(),
+                connector,
+                limits,
+                quotas,
+                in_process.clone(),
+            )),
+            reads: Reads::Registry,
+            results: Results::Values,
+            call_deadline: limits.deadline,
+        };
+        if connectors.insert(name.clone(), registered).is_some() {
+            return Err(BootError::DuplicateConnector(name));
+        }
+        built_in_definitions.extend(definitions);
+    }
     let basis = Basis {
         issuers,
         registry,
@@ -880,6 +966,7 @@ pub(crate) fn check_registry_with(
         receipt_store,
         grant_issuers: grants.issuers().to_vec(),
         resolver: resolver.is_some(),
+        built_in_definitions,
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
     let served = live.current();
@@ -902,7 +989,7 @@ pub(crate) fn check_registry_with(
         http: settings.http,
         policy: live,
         connectors,
-        in_process: Arc::default(),
+        in_process,
         lookups,
         resolver,
         freshness,
@@ -910,9 +997,33 @@ pub(crate) fn check_registry_with(
     Ok((gates, reloader))
 }
 
+/// The bound of the connector `name` in the gateway's own process: the limits the wiring gave
+/// it, or the defaults, with the call deadline the wiring gave it in place of theirs. Refused
+/// when zero or past decision 0014's ceilings.
+fn in_process_bound(
+    name: &ConnectorName,
+    limits: &BTreeMap<ConnectorName, InProcessLimits>,
+    deadlines: &BTreeMap<ConnectorName, Duration>,
+) -> Result<InProcessLimits, BootError> {
+    let mut bound = limits.get(name).copied().unwrap_or_default();
+    if let Some(deadline) = deadlines.get(name) {
+        bound.deadline = *deadline;
+    }
+    if !bound.within_ceilings() {
+        return Err(BootError::InProcessLimitsOutOfRange {
+            connector: name.clone(),
+            deadline: bound.deadline,
+            max_result_bytes: bound.max_result_bytes,
+        });
+    }
+    Ok(bound)
+}
+
 /// The gates a registry's policy must pass, at boot and on every reload: the
 /// [receipt-store gate](receipt_gate); the [narrowing gate](narrowing_gate); every approved
-/// tool's server has a connector; with identity enforced, every rule names a configured issuer
+/// tool's server has a connector; every approved built-in tool's entry has its connector, and
+/// its approved definition is the one that connector serves; with identity enforced, every rule
+/// names a configured issuer
 /// of its kind; the snapshot does not define [`NO_PROFILE`]; every profile a rule names exists;
 /// the [pod gate](pod_gate), with the rules beside the snapshot and the grant issuers the
 /// gateway started with; and the [currency gate](currency_gate), with the resolver it started
@@ -930,6 +1041,21 @@ pub(crate) fn check_registry_policy(
                 tool: tool.clone(),
                 connector: route.server.clone(),
             });
+        }
+    }
+    for (tool, entry) in registry.built_in_tools() {
+        if !basis.connectors.contains(entry) {
+            return Err(BootError::UnregisteredConnector {
+                tool: tool.clone(),
+                connector: entry.clone(),
+            });
+        }
+        let approved = registry
+            .approvals()
+            .get(tool)
+            .map(|approval| &approval.definition_sha256);
+        if basis.built_in_definitions.get(tool) != approved {
+            return Err(BootError::BuiltInDefinitionDiffers(tool.clone()));
         }
     }
     if let Some(issuers) = &basis.issuers {
@@ -1023,15 +1149,17 @@ pub(crate) fn receipt_store_configured(identity: &IdentitySection, audit: &Audit
 }
 
 /// The narrowing gate. Decision 0011 lets an entry narrowed per call or to the caller's limit
-/// skip the whole-reach check (rule 5) only because its credential really is narrowed. Nothing
-/// narrows one until the custodian client (#12) exists: the same credential goes on every call
-/// to a server. So an entry whose narrowing is not `none` is refused at boot, by [`check`] and
-/// by [`check_registry`], on every reload, and by [`before_connecting`] before a credential is
-/// read, whoever wires the connectors. No build is exempt.
+/// skip the whole-reach check (rule 5) only because its credential really is narrowed. The
+/// gateway sends a proxied server the same credential on every call, so a proxied entry whose
+/// narrowing is not `none` is refused at boot, by [`check`] and by [`check_registry`], on every
+/// reload, and by [`before_connecting`] before a credential is read, whoever wires the
+/// connectors. No build is exempt. A built-in entry's connector asks for its credential
+/// narrowed as the entry says, as the GitHub connector asks the key custodian for each token,
+/// so a built-in entry passes.
 pub(crate) fn narrowing_gate(snapshot: &PolicySnapshot) -> Result<(), BootError> {
     match snapshot
         .entries()
-        .find(|entry| entry.narrowing != Narrowing::None)
+        .find(|entry| entry.kind == EntryKind::Proxied && entry.narrowing != Narrowing::None)
     {
         Some(entry) => Err(BootError::NarrowingNotBuilt(entry.name.clone())),
         None => Ok(()),
@@ -1246,10 +1374,10 @@ pub(crate) mod tests {
     //! The receipt-store gate as a release build runs it. These tests are in a development
     //! build, which is exempt, so each passes the exemption itself.
     //!
-    //! Every tool a registry approves is proxied, and the snapshot loader refuses a proxied tool
-    //! not classified `read` (decision 0011, rule 2) before this gate runs. So the gate's own
-    //! tests run it on snapshots whose tool has an in-process connector and no connector entry,
-    //! as the JSON configuration's do, until built-in connectors exist.
+    //! The snapshot loader refuses a proxied tool not classified `read` (decision 0011, rule 2)
+    //! before this gate runs, and the only built-in connector, GitHub's, serves reads alone so
+    //! far. So the gate's own tests run it on snapshots whose tool has an in-process connector
+    //! and no connector entry, as the JSON configuration's do.
     #![allow(clippy::unwrap_used)]
 
     use gateway_core::{
@@ -1434,6 +1562,7 @@ principals = "any_in_teams_and_groups"
             receipt_store: false,
             grant_issuers: Vec::new(),
             resolver: false,
+            built_in_definitions: BTreeMap::new(),
         }
     }
 
@@ -1701,7 +1830,17 @@ principals = "any_in_teams_and_groups"
     /// connector registered.
     #[test]
     fn the_json_configuration_path_runs_the_narrowing_gate() {
-        for written in ["call", "limit", "none"] {
+        // A proxied entry narrowed per call or to the limit is refused; a built-in entry is
+        // not, since its connector narrows, and its tool is refused here only for having no
+        // connector registered.
+        for (kind, written) in [
+            ("proxied", "call"),
+            ("proxied", "limit"),
+            ("proxied", "none"),
+            ("built_in", "call"),
+            ("built_in", "limit"),
+            ("built_in", "none"),
+        ] {
             // Rule 7: an entry narrowed per call serves only tools declared from arguments.
             let tool = json!({
                 "name": "docs__list_documents",
@@ -1712,7 +1851,7 @@ principals = "any_in_teams_and_groups"
             });
             let entries = json!([{
                 "name": "mock-docs",
-                "kind": "built_in",
+                "kind": kind,
                 "credential": "gateway_token",
                 "principal": "docs-reader",
                 "narrowing": written,
@@ -1724,12 +1863,14 @@ principals = "any_in_teams_and_groups"
             let (config, wiring) = json_config(tool, entries);
             let released = check_with(config, wiring, false);
             for result in [checked, released] {
-                match (written, result) {
-                    ("none", Err(BootError::UnregisteredConnector { connector, .. })) => {
+                match (kind, written, result) {
+                    ("proxied", "call" | "limit", Err(refused)) => {
+                        assert_narrowing_refused(&refused);
+                    }
+                    (_, _, Err(BootError::UnregisteredConnector { connector, .. })) => {
                         assert_eq!(connector.as_str(), "mock-docs");
                     }
-                    ("call" | "limit", Err(refused)) => assert_narrowing_refused(&refused),
-                    (_, other) => panic!("{written}: {other:?}"),
+                    (_, _, other) => panic!("{kind} {written}: {other:?}"),
                 }
             }
         }

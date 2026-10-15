@@ -299,10 +299,12 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
         .iter()
         .find(|package| package["name"] == json!("gateway"))
         .unwrap();
-    // It turns on only connector-proxy's own, which alone lets a connector reach loopback.
+    // It turns on only connector-proxy's own, which alone lets a proxied server's connector
+    // reach loopback, and connector-github's `loopback`, which alone lets the GitHub connector
+    // reach a fake GitHub API there.
     assert_eq!(
         gateway["features"]["test-support"],
-        json!(["connector-proxy/test-support"])
+        json!(["connector-github/loopback", "connector-proxy/test-support"])
     );
     let connector = packages
         .iter()
@@ -313,6 +315,16 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
     assert!(
         defaults.is_none_or(|defaults| defaults.is_empty()),
         "connector-proxy has default features: {defaults:?}"
+    );
+    let github = packages
+        .iter()
+        .find(|package| package["name"] == json!("connector-github"))
+        .unwrap();
+    assert_eq!(github["features"]["loopback"], json!([]));
+    let defaults = github["features"]["default"].as_array();
+    assert!(
+        defaults.is_none_or(|defaults| defaults.is_empty()),
+        "connector-github has default features: {defaults:?}"
     );
     let defaults = gateway["features"]["default"].as_array();
     assert!(
@@ -325,6 +337,7 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
         if dependency["kind"] != json!("dev") {
             assert_ne!(dependency["name"], json!("gateway"), "{dependency}");
             if dependency["name"] == json!("connector-proxy")
+                || dependency["name"] == json!("connector-github")
                 || dependency["name"] == json!("gateway-otto")
             {
                 assert_eq!(dependency["features"], json!([]), "{dependency}");
