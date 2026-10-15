@@ -92,6 +92,21 @@ async fn each_request_outside_policy_is_refused_with_its_reason() {
             Refusal::StaleRevision,
         ),
         (
+            "a stale revision the gateway derived by withdrawing tools",
+            |request| request.revision = PolicyRevision::new("r0+withdrawn:docs__read"),
+            Refusal::StaleRevision,
+        ),
+        (
+            "a revision that only begins with the custodian's",
+            |request| request.revision = PolicyRevision::new("r10"),
+            Refusal::StaleRevision,
+        ),
+        (
+            "a revision with no base",
+            |request| request.revision = PolicyRevision::new("+withdrawn:docs__read"),
+            Refusal::Malformed,
+        ),
+        (
             "no repositories",
             |request| request.repositories.clear(),
             Refusal::NoRepositories,

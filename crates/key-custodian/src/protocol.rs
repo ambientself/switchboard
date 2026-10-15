@@ -2,7 +2,7 @@
 //! line of JSON.
 //!
 //! A request names the team, the tool, the repositories, the permission set and the policy
-//! revision the call was decided under. The answer is a token and when it expires, a refusal
+//! revision the call was decided under (see [`TokenRequest::revision`]). The answer is a token and when it expires, a refusal
 //! with its reason, or a failure to get a token from GitHub. The reasons are closed sets, so the
 //! client can turn each into an error kind and the custodian can count each.
 
@@ -27,7 +27,8 @@ pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
 /// The most permissions one request may name. GitHub has fewer than this.
 pub const MAX_PERMISSIONS: usize = 64;
 
-/// The longest team name or revision a request may carry.
+/// The longest team name, or base of a revision (see [`base_revision`]), a request may carry.
+/// A derived revision's withdrawn tools are bounded only by [`MAX_REQUEST_BYTES`].
 pub const MAX_NAME_BYTES: usize = 256;
 
 /// A request for one installation token.
@@ -43,8 +44,18 @@ pub struct TokenRequest {
     pub repositories: Vec<String>,
     /// The permissions the token is for, each at its level: at least one.
     pub permissions: BTreeMap<String, Access>,
-    /// The policy revision the call was decided under.
+    /// The policy revision the call was decided under, as the gateway's decision names it:
+    /// the registry's revision, or, while the gateway has withdrawn tools, the revision it
+    /// derived from that, `{base}+withdrawn:{names}`. The custodian checks the base.
     pub revision: PolicyRevision,
+}
+
+/// The base of `revision`: the part before its first `+`, or all of it if it has none. The
+/// registry loader refuses a `+` in a revision, so a revision the gateway derived by withdrawing
+/// tools, `{base}+withdrawn:{names}` (decision 0013), has the registry's revision as its base.
+pub fn base_revision(revision: &PolicyRevision) -> &str {
+    let revision = revision.as_str();
+    revision.split_once('+').map_or(revision, |(base, _)| base)
 }
 
 impl TokenRequest {
@@ -55,8 +66,9 @@ impl TokenRequest {
         if self.team.as_str().is_empty() || self.team.as_str().len() > MAX_NAME_BYTES {
             return Some("the team is empty or too long".into());
         }
-        if self.revision.as_str().is_empty() || self.revision.as_str().len() > MAX_NAME_BYTES {
-            return Some("the revision is empty or too long".into());
+        let base = base_revision(&self.revision);
+        if base.is_empty() || base.len() > MAX_NAME_BYTES {
+            return Some("the revision's base is empty or too long".into());
         }
         let mut seen = BTreeSet::new();
         for repository in &self.repositories {
@@ -183,7 +195,8 @@ pub enum Refusal {
     Peer,
     /// The request is not one line of JSON of the expected shape, or is malformed.
     Malformed,
-    /// The request was decided under a policy revision other than the custodian's.
+    /// The request was decided under a policy revision whose base is not the custodian's
+    /// revision.
     StaleRevision,
     /// The team has no limits in the custodian's copy of policy.
     UnknownTeam,

@@ -9,11 +9,13 @@
 //!   installation if none is named; to the permissions named, or every permission the
 //!   installation has if none is named. It refuses more than 500 repositories, or one not in
 //!   the installation, with 422.
-//! - `DELETE /installation/token`: it revokes the token in the `Authorization` header.
+//! - `DELETE /installation/token`: it revokes the token in the `Authorization` header, and
+//!   answers 401 to one it did not issue or has revoked.
 //!
 //! It can be told to refuse, fail, hang, widen what it issues, or issue tokens that expire
-//! sooner than GitHub's hour (see [`Behaviour`]). It keeps every token it issued and revoked,
-//! and counts the JWTs it refused, for the tests to inspect.
+//! sooner than GitHub's hour (see [`Behaviour`]), and to fail the next revocations with 500
+//! (see [`FakeGitHub::fail_revocations`]). It keeps every token it issued and revoked, when
+//! each revocation was attempted, and counts the JWTs it refused, for the tests to inspect.
 //!
 //! Its tokens look like GitHub's installation tokens, built at run time from parts, so no
 //! source file holds one.
@@ -97,6 +99,8 @@ struct FakeState {
     jwt_refusals: usize,
     issued: Vec<IssuedToken>,
     revoked: Vec<String>,
+    revocations_to_fail: usize,
+    revocation_attempts: Vec<u64>,
 }
 
 /// The fake, serving until dropped.
@@ -133,6 +137,8 @@ impl FakeGitHub {
                 jwt_refusals: 0,
                 issued: Vec::new(),
                 revoked: Vec::new(),
+                revocations_to_fail: 0,
+                revocation_attempts: Vec::new(),
             }),
         });
         let router = Router::new()
@@ -179,6 +185,16 @@ impl FakeGitHub {
     /// Every token revoked, in order.
     pub fn revoked(&self) -> Vec<String> {
         self.shared.lock().revoked.clone()
+    }
+
+    /// Answers the next `count` revocations with 500, revoking nothing.
+    pub fn fail_revocations(&self, count: usize) {
+        self.shared.lock().revocations_to_fail = count;
+    }
+
+    /// When each revocation arrived, failed or not, in seconds since the epoch.
+    pub fn revocation_attempts(&self) -> Vec<u64> {
+        self.shared.lock().revocation_attempts.clone()
     }
 }
 
@@ -372,6 +388,11 @@ async fn revoke(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
         return error(StatusCode::UNAUTHORIZED, "Bad credentials");
     };
     let mut state = shared.lock();
+    state.revocation_attempts.push(clock::now());
+    if state.revocations_to_fail > 0 {
+        state.revocations_to_fail -= 1;
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+    }
     let known = state.issued.iter().any(|issued| issued.token == token);
     if !known || state.revoked.iter().any(|revoked| revoked == token) {
         return error(StatusCode::UNAUTHORIZED, "Bad credentials");

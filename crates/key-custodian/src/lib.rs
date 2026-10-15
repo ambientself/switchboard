@@ -42,8 +42,37 @@
 //! GitHub's own expiry if that is sooner; it is never handed out for longer than GitHub issued
 //! it. When the lifetime ends first, the custodian revokes the token at that moment through
 //! GitHub's revoke endpoint (`DELETE /installation/token`), so a token taken from a compromised
-//! gateway stops working then, not at GitHub's hour. A token still outstanding when the
-//! custodian stops is not revoked, and lapses at GitHub's expiry.
+//! gateway stops working then, not at GitHub's hour, as long as GitHub accepts the revocation.
+//!
+//! Two cases leave a token working past its lifetime, each until GitHub's expiry at most, an
+//! hour after it was issued:
+//!
+//! - GitHub does not accept the revocation (a timeout, a 5xx, a rate-limit answer). The
+//!   custodian counts and logs each failed attempt and tries again with a growing wait, from
+//!   one second up to a minute, until GitHub accepts or the token reaches GitHub's expiry. So
+//!   during an outage of GitHub's revoke endpoint the token works until the first attempt
+//!   after the outage ends.
+//! - The custodian stops. A token not yet revoked then is not revoked at all.
+//!
+//! # Which revision a request carries
+//!
+//! The revision the call was decided under: the one in the gateway's
+//! `Decision::policy_revision`. While the gateway's drift check has withdrawn tools, that is a
+//! derived revision, `{base}+withdrawn:{names}` (decision 0013), which no registry file holds.
+//! The custodian checks the base, the part before the first `+`, which the registry loader
+//! refuses in a revision of its own; a withdrawal removes only proxied tools, which the
+//! custodian's copy does not hold, so it is the same copy under both. The record keeps the
+//! whole revision the request carried.
+//!
+//! # The custodian checks less of the file than the gateway
+//!
+//! The custodian loads the registry file with the gateway's loader and nothing else (see
+//! [`policy`]). A file the loader refuses, the custodian refuses too. A file the loader accepts
+//! but the gateway's reload refuses (a changed server or route, a boot gate that fails, bytes
+//! that are not UTF-8) is served by the custodian and not by the gateway. If that file names a
+//! new revision, the two hold different revisions, and every request is refused as
+//! `stale_revision` until they agree again: until the gateway restarts on the file, or the file
+//! is fixed. This fails closed.
 
 #![forbid(unsafe_code)]
 

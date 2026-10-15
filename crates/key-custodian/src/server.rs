@@ -14,8 +14,17 @@
 //!
 //! The token handed out expires at its lifetime, or at GitHub's own expiry if that is sooner.
 //! When the lifetime ends first, the custodian revokes the token then, through GitHub's revoke
-//! endpoint. A token still outstanding when the custodian stops is not revoked; it lapses at
-//! GitHub's expiry, an hour at most after it was issued.
+//! endpoint. A token GitHub issued that is not handed out, broader than asked for or with no
+//! expiry the custodian can read, is revoked the same way at once.
+//!
+//! A revocation GitHub does not accept (a timeout, a 5xx, a rate-limit answer) is tried again,
+//! after [`REVOKE_RETRY_FIRST`] and then twice as long each time, up to [`REVOKE_RETRY_MAX`],
+//! until GitHub accepts it or the token reaches GitHub's own expiry, when it stops working
+//! anyway. Each failed attempt counts as `revocations_total{result="failed"}` and is logged. So
+//! while GitHub refuses revocations, a token stays usable past the end of its lifetime, until
+//! an attempt succeeds or until GitHub's expiry, an hour at most after it was issued. A token
+//! not yet revoked when the custodian stops is not revoked at all, and lapses at GitHub's
+//! expiry too.
 //!
 //! Every request, whatever its outcome, writes one record line (see [`crate::record`]) and is
 //! counted (see [`crate::metrics`]).
@@ -45,6 +54,12 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The most connections served at once. The one peer the custodian serves is the gateway.
 const MAX_CONNECTIONS: usize = 256;
+
+/// How long the custodian waits to try a failed revocation again, the first time.
+pub const REVOKE_RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest the custodian waits between two attempts to revoke a token.
+pub const REVOKE_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// The custodian's state, shared by every connection.
 pub struct Custodian {
@@ -181,7 +196,8 @@ impl Custodian {
                 let now = clock::now();
                 let expires_at = issued.expires_at.min(now + self.lifetime.as_secs());
                 if expires_at < issued.expires_at {
-                    self.clone().revoke_at(issued.token.clone(), expires_at);
+                    self.clone()
+                        .revoke_at(issued.token.clone(), expires_at, issued.expires_at);
                 }
                 line.outcome = "issued";
                 line.reason = None;
@@ -194,6 +210,10 @@ impl Custodian {
                 }
             }
             Err(error) => {
+                if let Some(unissued) = error.unissued {
+                    self.clone()
+                        .revoke_at(unissued.token, clock::now(), unissued.expires_at);
+                }
                 line.outcome = "failed";
                 line.reason = Some(error.failure.as_str());
                 self.record.write(&line);
@@ -206,18 +226,33 @@ impl Custodian {
         }
     }
 
-    /// Revokes `token` at `expires_at`, in seconds since the epoch.
-    fn revoke_at(self: Arc<Self>, token: Secret, expires_at: u64) {
+    /// Revokes `token` at `at`, in seconds since the epoch. A failed attempt is tried again,
+    /// after [`REVOKE_RETRY_FIRST`] and then twice as long each time, up to
+    /// [`REVOKE_RETRY_MAX`], until GitHub accepts it, or until the next attempt would come at
+    /// or after `lapses_at`, GitHub's own expiry, when the token stops working anyway.
+    fn revoke_at(self: Arc<Self>, token: Secret, at: u64, lapses_at: u64) {
         tokio::spawn(async move {
-            let at = UNIX_EPOCH + Duration::from_secs(expires_at);
+            let at = UNIX_EPOCH + Duration::from_secs(at);
             let wait = at.duration_since(SystemTime::now()).unwrap_or_default();
             tokio::time::sleep(wait).await;
-            match self.github.revoke(&token).await {
-                Ok(()) => self.counters.revocation(true),
-                Err(error) => {
-                    self.counters.revocation(false);
-                    tracing::error!(message = %error.message, "could not revoke a token at the end of its lifetime");
+            let mut retry = REVOKE_RETRY_FIRST;
+            loop {
+                let Err(error) = self.github.revoke(&token).await else {
+                    self.counters.revocation(true);
+                    return;
+                };
+                self.counters.revocation(false);
+                if clock::now() + retry.as_secs() >= lapses_at {
+                    tracing::error!(
+                        message = %error.message,
+                        lapses_at,
+                        "could not revoke a token, and stopped trying: it works until GitHub's expiry"
+                    );
+                    return;
                 }
+                tracing::warn!(message = %error.message, ?retry, "could not revoke a token; trying again");
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(REVOKE_RETRY_MAX);
             }
         });
     }

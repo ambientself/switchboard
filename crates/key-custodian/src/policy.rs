@@ -1,10 +1,15 @@
 //! The custodian's own copy of what each team and tool may ask for (design section 9).
 //!
 //! It is generated from the registry file, the same file the gateway's snapshot is loaded
-//! from, by the same loader, so a file the gateway refuses the custodian refuses too. From it
-//! the custodian keeps three things:
+//! from, by the same loader. The custodian applies only the loader's checks, not the checks
+//! the gateway's boot and reload add (a changed server or route, the boot gates, bytes that are
+//! not UTF-8), so a file the loader refuses the custodian refuses too, and a file only the
+//! gateway refuses the custodian serves (see the crate's documentation for what follows). From
+//! it the custodian keeps three things:
 //!
-//! - the revision, which every request must carry;
+//! - the revision, which every request must carry: the same revision, or one the gateway
+//!   derived from it by withdrawing tools, `{base}+withdrawn:{names}`, whose base is checked
+//!   (see [`crate::protocol::base_revision`]);
 //! - each team's GitHub repositories: the resources of system `github` and kind `repository`
 //!   in the team's limit, each identified `owner/name`;
 //! - each tool's permission set: the `permissions` of the built-in connector entry of system
@@ -25,7 +30,7 @@ use gateway_registry::{Access, Registry, RegistryError};
 use thiserror::Error;
 
 use crate::metrics::Counters;
-use crate::protocol::{MAX_REPOSITORIES, Refusal, TokenRequest, split_repository};
+use crate::protocol::{MAX_REPOSITORIES, Refusal, TokenRequest, base_revision, split_repository};
 
 /// The system of a GitHub resource, in a limit and in a connector entry.
 pub const GITHUB_SYSTEM: &str = "github";
@@ -89,12 +94,13 @@ impl CustodianPolicy {
     /// an installation on `account`. The request must not be malformed (see
     /// [`TokenRequest::malformed`]).
     pub fn check(&self, request: &TokenRequest, account: &str) -> Result<(), Refused> {
-        if request.revision != self.revision {
+        let base = base_revision(&request.revision);
+        if base != self.revision.as_str() {
             return Err((
                 Refusal::StaleRevision,
                 format!(
-                    "the request was decided under revision `{}`, and the custodian holds `{}`",
-                    request.revision, self.revision
+                    "the request was decided under revision `{base}`, and the custodian holds `{}`",
+                    self.revision
                 ),
             ));
         }

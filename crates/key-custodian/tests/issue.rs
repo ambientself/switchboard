@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use common::{ACCOUNT, OTHER_KEY, World, request, write_file};
-use gateway_core::{ErrorKind, ToolName};
+use gateway_core::{ErrorKind, PolicyRevision, ToolName};
 use gateway_registry::Access;
 use key_custodian::clock;
 use key_custodian::fake::Behaviour;
@@ -144,7 +144,92 @@ async fn a_token_broader_than_asked_is_revoked_and_not_handed_out() {
     let issued = world.fake.issued();
     assert_eq!(issued.len(), 1);
     assert!(issued[0].repositories.contains("secret"));
+    until(|| !world.fake.revoked().is_empty(), 4).await;
     assert_eq!(world.fake.revoked(), vec![issued[0].token.clone()]);
+    let metrics = world.metrics().await;
+    assert!(
+        metrics.contains("switchboard_custodian_revocations_total{result=\"revoked\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("switchboard_custodian_revocations_total{result=\"failed\"} 0"),
+        "{metrics}"
+    );
+}
+
+/// Waits up to `seconds` for `done`.
+async fn until(done: impl Fn() -> bool, seconds: u64) {
+    for _ in 0..seconds * 10 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_revocation_github_fails_is_tried_again_until_it_is_accepted() {
+    let world = World::with(|config| config.limits.token_lifetime_seconds = 1).await;
+    world.fake.fail_revocations(2);
+    let token = world.client.token(&request()).await.unwrap();
+    // Tried at the end of the lifetime, a second after, and two seconds after that.
+    until(|| !world.fake.revoked().is_empty(), 8).await;
+    assert_eq!(world.fake.revoked(), vec![token.expose().to_owned()]);
+    assert_eq!(world.fake.revocation_attempts().len(), 3);
+    let metrics = world.metrics().await;
+    assert!(
+        metrics.contains("switchboard_custodian_revocations_total{result=\"failed\"} 2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("switchboard_custodian_revocations_total{result=\"revoked\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn a_revocation_github_keeps_failing_is_given_up_at_githubs_expiry() {
+    let world = World::with(|config| config.limits.token_lifetime_seconds = 1).await;
+    world.fake.set_behaviour(Behaviour::ExpireIn(3));
+    world.fake.fail_revocations(usize::MAX);
+    world.client.token(&request()).await.unwrap();
+    let lapses_at = world.fake.issued()[0].expires_at;
+    // Past GitHub's expiry, and past when a third attempt would have come had it not stopped.
+    until(|| clock::now() > lapses_at + 2, 8).await;
+    let attempts = world.fake.revocation_attempts();
+    assert!(!attempts.is_empty());
+    assert!(
+        attempts.iter().all(|at| *at <= lapses_at),
+        "no attempt after GitHub's expiry: {attempts:?}, {lapses_at}"
+    );
+    assert!(world.fake.revoked().is_empty());
+    let metrics = world.metrics().await;
+    assert!(
+        metrics.contains(&format!(
+            "switchboard_custodian_revocations_total{{result=\"failed\"}} {}",
+            attempts.len()
+        )),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_decided_under_a_withdrawal_is_checked_by_its_base_revision() {
+    // While the gateway's drift check has withdrawn tools, it decides under a derived revision.
+    // A long one is not malformed: only the base is bounded.
+    let world = World::new().await;
+    let names: Vec<String> = (0..8)
+        .map(|n| format!("docs-team-a__a_long_withdrawn_tool_name_{n:02}"))
+        .collect();
+    let derived = format!("r1+withdrawn:{}", names.join(","));
+    assert!(derived.len() > 256);
+    let mut asked = request();
+    asked.revision = PolicyRevision::new(derived.clone());
+    world.client.token(&asked).await.unwrap();
+    let lines = world.record.lines();
+    assert_eq!(lines[0]["outcome"], "issued");
+    assert_eq!(lines[0]["revision"], derived.as_str());
+    assert_eq!(lines[0]["checked_revision"], "r1");
 }
 
 #[tokio::test]

@@ -7,8 +7,11 @@
 //! - `switchboard_custodian_requests_total{outcome,reason}`: each request, `outcome` one of
 //!   `issued`, `refused` and `failed`, and `reason` the refusal's or failure's (see
 //!   [`Refusal`] and [`Failure`]), empty for `issued`;
-//! - `switchboard_custodian_revocations_total{result}`: each token revoked at the end of its
-//!   lifetime, or after GitHub widened it, `result` one of `revoked` and `failed`;
+//! - `switchboard_custodian_revocations_total{result}`: each attempt to revoke a token, at the
+//!   end of its lifetime or because it was not handed out (GitHub widened it, or gave it no
+//!   expiry the custodian can read). `result` is `revoked` for the attempt GitHub accepted, and
+//!   `failed` for each attempt it did not, which is tried again (see [`crate::server`]); a
+//!   token revoked on its third attempt counts two `failed` and one `revoked`;
 //! - `switchboard_custodian_policy_reloads_total{result}`: each new version of the registry
 //!   file, `result` one of `loaded` and `refused`.
 //!
@@ -59,7 +62,7 @@ impl Counters {
         self.failed[index(&Failure::ALL, &reason)].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Counts a revocation, made or failed.
+    /// Counts an attempt to revoke a token, accepted or failed.
     pub fn revocation(&self, revoked: bool) {
         let counter = if revoked {
             &self.revoked
@@ -109,7 +112,7 @@ impl Counters {
             );
         }
         text.push_str(
-            "# HELP switchboard_custodian_revocations_total Tokens revoked, by result.\n\
+            "# HELP switchboard_custodian_revocations_total Attempts to revoke a token, by result.\n\
              # TYPE switchboard_custodian_revocations_total counter\n",
         );
         let _ = writeln!(

@@ -9,7 +9,9 @@
 //! A token is asked for with `repositories` and `permissions` both set, so GitHub narrows it to
 //! them. What GitHub answers is checked: a token that names any other repository, all of
 //! them, or a permission beyond what was asked for (other than `metadata: read`, which GitHub
-//! adds to every token) is revoked and never handed out.
+//! adds to every token) is never handed out. It comes back in the `unissued` field of the
+//! [`VendorError`], and the server revokes it as it revokes a token at the end of its lifetime
+//! (see [`crate::server`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -42,6 +44,9 @@ pub const API_VERSION: &str = "2022-11-28";
 
 /// The `User-Agent` GitHub requires: the product, nothing about the person running it.
 pub const PRODUCT: &str = "switchboard-custodian";
+
+/// How long GitHub's installation tokens last: an hour.
+pub const GITHUB_TOKEN_SECONDS: u64 = 3600;
 
 /// The most bytes of GitHub's answer the custodian reads. A token for 500 repositories lists
 /// each repository in full, a few kilobytes each.
@@ -121,7 +126,8 @@ enum Transport {
     Tls(Client<HttpsConnector<HttpConnector>, Full<Bytes>>),
 }
 
-/// A token GitHub issued, checked against what was asked for.
+/// A token GitHub issued, and when it lapses.
+#[derive(Debug)]
 pub struct Issued {
     /// The token.
     pub token: Secret,
@@ -136,6 +142,9 @@ pub struct VendorError {
     pub failure: Failure,
     /// A sentence for the operator. Never a token or the key.
     pub message: String,
+    /// A token GitHub issued that is not handed out, because it is broader than asked for or
+    /// has no expiry the custodian can read. It must be revoked.
+    pub unissued: Option<Issued>,
 }
 
 impl VendorError {
@@ -143,6 +152,26 @@ impl VendorError {
         Self {
             failure,
             message: message.into(),
+            unissued: None,
+        }
+    }
+
+    /// A failure that leaves `token` issued and not handed out. It lapses at `expires_at`, or
+    /// an hour from now if that is sooner or GitHub's answer gave no expiry the custodian can
+    /// read.
+    fn unissued(
+        failure: Failure,
+        message: impl Into<String>,
+        token: Secret,
+        expires_at: Option<u64>,
+    ) -> Self {
+        let hour = clock::now() + GITHUB_TOKEN_SECONDS;
+        Self {
+            unissued: Some(Issued {
+                token,
+                expires_at: expires_at.map_or(hour, |at| at.min(hour)),
+            }),
+            ..Self::new(failure, message)
         }
     }
 }
@@ -324,32 +353,34 @@ impl GitHubApp {
         let expires_at = clock::parse_utc(&answer.expires_at);
         let token = Secret::new(answer.token);
         if let Some(widened) = widened {
-            self.revoke_widened(&token).await;
-            return Err(VendorError::new(Failure::Widened, widened));
+            return Err(VendorError::unissued(
+                Failure::Widened,
+                widened,
+                token,
+                expires_at,
+            ));
         }
         let Some(expires_at) = expires_at else {
-            self.revoke_widened(&token).await;
-            return Err(VendorError::new(
+            return Err(VendorError::unissued(
                 Failure::VendorFailed,
                 "GitHub's token answer has no expiry the custodian can read",
+                token,
+                None,
             ));
         };
         Ok(Issued { token, expires_at })
     }
 
-    /// Revokes a token GitHub issued that is not handed out. Best effort: a failure is logged.
-    async fn revoke_widened(&self, token: &Secret) {
-        if let Err(error) = self.revoke(token).await {
-            tracing::error!(message = %error.message, "could not revoke a token that was not handed out");
-        }
-    }
-
-    /// Revokes `token` through GitHub's revoke endpoint.
+    /// Revokes `token` through GitHub's revoke endpoint, once.
+    ///
+    /// GitHub answers 204 when it revokes the token, and 401 to a token that no longer
+    /// authenticates because it was revoked before or has expired. Either way the token no
+    /// longer works, which is what revoking is for, so both are `Ok`.
     pub async fn revoke(&self, token: &Secret) -> Result<(), VendorError> {
         let (status, _) = self
             .send(Method::DELETE, "/installation/token", token.expose(), None)
             .await?;
-        if status == StatusCode::NO_CONTENT {
+        if status == StatusCode::NO_CONTENT || status == StatusCode::UNAUTHORIZED {
             Ok(())
         } else {
             Err(VendorError::new(

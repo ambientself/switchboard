@@ -6318,7 +6318,12 @@ mutate("custodian-token-logged", "the record line of an issued token holds the t
        "                line.expires_at = Some(expires_at);\n",
        "                line.expires_at = Some(expires_at);\n                line.tool = Some(issued.token.expose());\n")
 mutate("custodian-revision-ignored", "a request decided under another revision is checked as if current", KP,
-       "        if request.revision != self.revision {", "        if false {")
+       "        if base != self.revision.as_str() {", "        if false {")
+mutate("custodian-derived-revision-compared-whole", "a request decided under a withdrawal is refused as stale", KP,
+       "        let base = base_revision(&request.revision);", "        let base = request.revision.as_str();")
+mutate("custodian-derived-revision-bounded-whole", "a long revision derived by withdrawals is refused as malformed", KC + "protocol.rs",
+       "        if base.is_empty() || base.len() > MAX_NAME_BYTES {",
+       "        if base.is_empty() || self.revision.as_str().len() > MAX_NAME_BYTES {")
 mutate("custodian-outside-limit-accepted", "a repository outside the team's limit may be asked for", KP,
        "            if !limit.contains(repository) {", "            if false {")
 mutate("custodian-other-account-accepted", "a repository on another account may be asked for", KP,
@@ -6333,8 +6338,15 @@ mutate("custodian-lifetime-not-capped", "a token is handed out until GitHub's ex
        "                let expires_at = issued.expires_at.min(now + self.lifetime.as_secs());",
        "                let expires_at = issued.expires_at.min(now + 3600);")
 mutate("custodian-not-revoked-at-lifetime", "a token is not revoked when its lifetime ends", KS,
-       "                    self.clone().revoke_at(issued.token.clone(), expires_at);",
+       "                    self.clone()\n                        .revoke_at(issued.token.clone(), expires_at, issued.expires_at);",
        "                    let _ = &issued.token;")
+mutate("custodian-unissued-not-revoked", "a token GitHub widened is not revoked", KS,
+       "                if let Some(unissued) = error.unissued {",
+       "                if let Some(unissued) = error.unissued.filter(|_| false) {")
+mutate("custodian-revocation-not-retried", "a revocation GitHub fails is not tried again", KS,
+       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if true {")
+mutate("custodian-revocation-retried-past-expiry", "a failed revocation is tried again after GitHub's expiry", KS,
+       "                if clock::now() + retry.as_secs() >= lapses_at {", "                if false {")
 mutate("custodian-key-file-open-accepted", "a key file its group or others can read is accepted", KT,
        "    if mode & 0o077 != 0 {", "    if false {")
 mutate("custodian-socket-mode-open-accepted", "a socket mode giving others access is accepted", KT,
