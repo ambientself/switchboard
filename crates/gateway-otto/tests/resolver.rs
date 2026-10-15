@@ -15,7 +15,8 @@ use gateway_core::{
 };
 use gateway_otto::fake::{FakeReply, FakeResolver, Member};
 use gateway_otto::resolver::{
-    Answer, BUDGET, CaFault, MAX_ANSWER_BYTES, ResolverConfigError, ResolverCounts, TokenFault,
+    Answer, BUDGET, CaFault, MAX_ANSWER_BYTES, MAX_TOKEN_BYTES, ResolverConfigError,
+    ResolverCounts, TokenFault,
 };
 use gateway_otto::{CurrencyQuestion, HttpResolver, Resolver, ResolverConfig, ResolverFailure};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
@@ -555,10 +556,14 @@ async fn a_token_read_that_blocks_is_unconfirmed_at_the_budget() {
 }
 
 /// Replaces the file at `path` with a FIFO no writer has opened, so reading it blocks, and
-/// starts a thread that opens it for writing once a question should long have ended. That lets
-/// the stalled read finish, so the runtime can shut down; with the read on the thread asking,
-/// it is also what ends the question, late.
+/// starts a thread that opens it for writing once a question should long have ended, and
+/// writes more than a token may hold. That lets the stalled read finish, refused as too large,
+/// so the runtime can shut down; with the read on the thread asking, it is also what ends the
+/// question, late. The read ends on the bytes, not on the writer closing: a reader whose open
+/// returns only as the writer closes may wait on for a writer.
 fn stall(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+    use std::io::Write;
+
     std::fs::remove_file(path).unwrap();
     let made = std::process::Command::new("mkfifo")
         .arg(path)
@@ -568,7 +573,8 @@ fn stall(path: &std::path::Path) -> std::thread::JoinHandle<()> {
     let path = path.to_owned();
     std::thread::spawn(move || {
         std::thread::sleep(BUDGET + SLACK);
-        drop(std::fs::OpenOptions::new().write(true).open(&path));
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let _ = writer.write_all(&[b't'; 2 * MAX_TOKEN_BYTES as usize]);
     })
 }
 

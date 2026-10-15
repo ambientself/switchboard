@@ -23,7 +23,7 @@ use gateway_identity::Clock;
 use gateway_otto::HttpResolver;
 use gateway_otto::fake::{FakeReply, FakeResolver, Member};
 use gateway_otto::minter::TestMinter;
-use gateway_otto::resolver::{Answer, BUDGET};
+use gateway_otto::resolver::{Answer, BUDGET, MAX_TOKEN_BYTES};
 use gateway_testkit::{
     AUDIENCE, CONNECTOR, Caller, DRAFT_TOOL, Fixture, FixtureConnector, InMemoryAuditStore,
     READ_TOOL, SURFACE_ALL, TEAM_A, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, WORKLOAD_ISSUER,
@@ -634,10 +634,14 @@ async fn a_token_read_that_blocks_still_answers_the_call_within_the_budget() {
 }
 
 /// Replaces the file at `path` with a FIFO no writer has opened, so reading it blocks, and
-/// starts a thread that opens it for writing once the call should long have been answered. That
-/// lets the stalled read finish, so the runtime can shut down; with the read on a runtime
-/// thread, it is also what lets the call be answered, late.
+/// starts a thread that opens it for writing once the call should long have been answered, and
+/// writes more than a token may hold. That lets the stalled read finish, refused as too large,
+/// so the runtime can shut down; with the read on a runtime thread, it is also what lets the
+/// call be answered, late. The read ends on the bytes, not on the writer closing: a reader
+/// whose open returns only as the writer closes may wait on for a writer.
 fn stall(path: &Path) -> std::thread::JoinHandle<()> {
+    use std::io::Write;
+
     std::fs::remove_file(path).unwrap();
     let made = std::process::Command::new("mkfifo")
         .arg(path)
@@ -647,7 +651,8 @@ fn stall(path: &Path) -> std::thread::JoinHandle<()> {
     let path = path.to_owned();
     std::thread::spawn(move || {
         std::thread::sleep(BUDGET + SLACK);
-        drop(std::fs::OpenOptions::new().write(true).open(&path));
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let _ = writer.write_all(&[b't'; 2 * MAX_TOKEN_BYTES as usize]);
     })
 }
 
