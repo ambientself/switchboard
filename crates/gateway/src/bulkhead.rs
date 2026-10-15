@@ -21,11 +21,17 @@
 //! decision keeps its row. The instance's own cap, on requests in flight, is the HTTP server's:
 //! it refuses before a body is read, with no row ([`crate::server`]).
 //!
+//! A call within both caps then takes its rate quotas ([`crate::quota`]): a token from its
+//! team's bucket for the server, when it has a team, and one from the server's. A call over
+//! either is `refused` with the quota's sentence, [`server_over_quota`](crate::server_over_quota)
+//! or [`team_over_quota`](crate::team_over_quota), and is not sent; the slots it took are given
+//! back. A call a cap sheds takes no token.
+//!
 //! Each bulkhead counts, in [`ServerSignals`]: the calls its server's connector ran, by
-//! outcome; how long each took; those that were late or too large, by their error kind; and
-//! the calls each cap refused. A call dropped before its connector returned is counted in none
-//! of the first three. [`crate::metrics`] exports them, labelled by the server's name in the
-//! registry and nothing a caller chooses.
+//! outcome; how long each took; those that were late or too large, by their error kind; the
+//! calls each cap refused; and the calls each quota refused. A call dropped before its
+//! connector returned is counted in none of the first three. [`crate::metrics`] exports them,
+//! labelled by the server's name in the registry and nothing a caller chooses.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +41,8 @@ use std::time::{Duration, Instant};
 use audit_postgres::{LATENCY_BOUNDS_MS, LATENCY_BUCKETS, LatencyHistogram};
 use gateway_core::{BoxFuture, Connector, ConnectorName, ErrorKind, TeamId, ToolCall, ToolOutcome};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::quota::{QuotaScope, Quotas, RateQuotas};
 
 /// The sentence for a call refused because its server has as many calls in flight from this
 /// gateway instance as the server's cap allows. Nothing was sent.
@@ -64,6 +72,7 @@ pub struct Bulkhead {
     /// One cap per team that has called the server. Teams come from the team manifests, so
     /// the map is as large as they are at most, and nothing is removed from it.
     teams: Mutex<BTreeMap<TeamId, Arc<Semaphore>>>,
+    quotas: Quotas,
     signals: Arc<ServerSignals>,
 }
 
@@ -79,7 +88,8 @@ impl std::fmt::Debug for Bulkhead {
 
 impl Bulkhead {
     /// `inner`, the connector of the server `server`, with at most `per_server` calls in flight
-    /// to it, and at most `per_team` from each team. A cap of zero is taken as one.
+    /// to it, and at most `per_team` from each team. A cap of zero is taken as one. Its rate
+    /// quotas are [`RateQuotas::default`] until [`with_quotas`](Self::with_quotas).
     pub fn new(
         server: ConnectorName,
         inner: Arc<dyn Connector>,
@@ -92,8 +102,16 @@ impl Bulkhead {
             per_server: Arc::new(semaphore(per_server)),
             per_team,
             teams: Mutex::new(BTreeMap::new()),
+            quotas: Quotas::new(RateQuotas::default()),
             signals: Arc::default(),
         }
+    }
+
+    /// This bulkhead with the rate quotas `quotas`, each bucket full.
+    #[must_use]
+    pub fn with_quotas(mut self, quotas: RateQuotas) -> Self {
+        self.quotas = Quotas::new(quotas);
+        self
     }
 
     /// What this bulkhead counts, as it counts it.
@@ -132,6 +150,24 @@ impl Bulkhead {
         );
         Box::pin(std::future::ready(ToolOutcome::Refused(sentence)))
     }
+
+    /// A call refused by the quota of `scope`, counted and logged. Nothing is sent.
+    fn over_quota(&self, scope: QuotaScope, tool: &str) -> BoxFuture<'_, ToolOutcome> {
+        match scope {
+            QuotaScope::Server => &self.signals.over_quota_server,
+            QuotaScope::Team => &self.signals.over_quota_team,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            event = crate::bound::OVER_QUOTA_EVENT,
+            scope = scope.name(),
+            server = self.server.as_str(),
+            tool,
+            "refused a call: it is over a rate quota, and it was not sent"
+        );
+        let sentence = scope.sentence(self.server.as_str(), tool);
+        Box::pin(std::future::ready(ToolOutcome::Refused(sentence)))
+    }
 }
 
 /// A semaphore with `permits`, at least one and at most what a semaphore can hold.
@@ -168,6 +204,10 @@ impl Connector for Bulkhead {
         let Ok(server) = self.per_server.clone().try_acquire_owned() else {
             return self.shed(Scope::Server, tool.as_str());
         };
+        // Within both caps: the quotas. Over one, the slots just taken are given back.
+        if let Err(scope) = self.quotas.take(call.call().caller.principal.get().team()) {
+            return self.over_quota(scope, tool.as_str());
+        }
         Box::pin(async move {
             // Held until the server's connector returns, or until this future is dropped.
             let _slots = (server, team);
@@ -189,6 +229,8 @@ pub struct ServerSignals {
     late_or_oversized: AtomicU64,
     shed_server: AtomicU64,
     shed_team: AtomicU64,
+    over_quota_server: AtomicU64,
+    over_quota_team: AtomicU64,
     latency: [AtomicU64; LATENCY_BUCKETS],
     latency_count: AtomicU64,
     /// The sum of every latency, in nanoseconds.
@@ -232,6 +274,8 @@ impl ServerSignals {
             late_or_oversized: read(&self.late_or_oversized),
             shed_server: read(&self.shed_server),
             shed_team: read(&self.shed_team),
+            over_quota_server: read(&self.over_quota_server),
+            over_quota_team: read(&self.over_quota_team),
             latency: LatencyHistogram {
                 buckets: std::array::from_fn(|i| read(&self.latency[i])),
                 count: read(&self.latency_count),
@@ -258,6 +302,10 @@ pub struct ServerCounts {
     pub shed_server: u64,
     /// Calls a team's cap refused.
     pub shed_team: u64,
+    /// Calls the server's rate quota refused.
+    pub over_quota_server: u64,
+    /// Calls a team's rate quota on the server refused.
+    pub over_quota_team: u64,
     /// How long each call the server's connector completed took.
     pub latency: LatencyHistogram,
 }

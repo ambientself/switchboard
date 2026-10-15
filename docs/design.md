@@ -226,11 +226,17 @@ Callers connect to `/mcp/{surface}`. Every `tools/call` goes through these steps
    result's size and duration above any bound of the connector's own. A result over the bound
    is never cut short silently: for a `read` tool it is outcome `error`, and for any other tool
    it is `unknown` (decision 0009). For a proxied server the bounds are 64 KiB and 5 s unless
-   its entry in the deployment file sets others, up to 1 MiB and 60 s; a connector in the
-   gateway's own process gets its bound in milestone 4 (#12). Before a proxied call is sent it
-   takes a slot under two caps in the instance: 32 calls in flight to the server, and 8 from
-   the caller's team to it. A call over either is completed as `refused` with a capacity
-   sentence, and nothing is sent. The instance's own cap, 256 requests in flight, is checked
+   its entry in the deployment file sets others, up to 1 MiB and 60 s. A connector in the
+   gateway's own process is held by the gateway to 5 s and 1 MiB of JSON unless
+   `[connectors.<name>]` sets others within the same ceilings; past its deadline a read is
+   cancelled, and a side effect is answered `unknown` but left to run to its end, never
+   cancelled once it may have been sent (#12). Before a proxied call is sent it takes a slot
+   under two caps in the instance: 32 calls in flight to the server, and 8 from the caller's
+   team to it. A call over either is completed as `refused` with a capacity sentence, and
+   nothing is sent. Then every call, proxied or in the gateway's own process, takes a token
+   from two rate quotas in the instance, the server's and the caller's team's on the server; a
+   call over either is completed as `refused` with a sentence naming the scope and the server,
+   and nothing is sent (#12). The instance's own cap, 256 requests in flight, is checked
    earlier, at admission, before the body is read: a request over it is answered 503, as
    telemetry, with no row
    ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md)).
@@ -1079,6 +1085,19 @@ connector that is not configured must be absent from every surface: a snapshot t
 its tools on a surface refuses to start, rather than starting with that tool dropped, so a tool
 the policy serves is either served or loudly refused, never silently missing. A snapshot loaded
 later is held to the same rule.
+
+Limits are checked at boot too
+([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md), sections 1 and
+2). The deployment file refuses, when it loads, a deadline or result bound of zero or past the
+ceilings of 60 s and 1 MiB, for a proxied server under `[servers.<name>]` and for a connector
+in the gateway's own process under `[connectors.<name>]`, and a cap or rate quota of zero under
+`[limits]`. The gateway refuses to start with a `[servers.<name>]` for a server the registry
+does not name, and with a `[connectors.<name>]` for a connector it does not run in its own
+process; no built-in connector is wired yet, so today every `[connectors.<name>]` is refused at
+start (#12). The boot gates wrap every connector in the gateway's own process in its bound, so
+none runs without it, and refuse one wired with a bound of zero or past the ceilings. The
+termination grace must cover the longest deadline either table sets, and demo-checks holds the
+demos' manifests to it.
 
 The Postgres store's boot check has a stated scope. It catches misconfiguration of a database
 whose roles, schema and grants come from the store's role script (`sql/roles.sql`) and its
@@ -2074,8 +2093,9 @@ checked; a schema that needs them cannot be approved yet.
   cap on calls to the server, is completed as `refused` with a fixed capacity sentence naming
   the scope, the server and the tool, and nothing is sent. The slots are held until the
   server's connector returns or the call is dropped. A caller with no team is held by the
-  server's cap alone. There is no queue, circuit breaker or rate quota, and a connector in the
-  gateway's own process is not bounded until milestone 4.
+  server's cap alone. There is no queue or circuit breaker. The rate quotas, and the bound
+  around a connector in the gateway's own process, came with #12 (the entry after #12's
+  below).
 - Isolation: a server that hangs holds at most its server's cap of slots in an instance until
   its calls' deadline, and one team at most its own cap of those. Calls from other teams to it,
   and calls to other servers, are not held up. `tests/limits.rs` shows it.
@@ -2095,6 +2115,49 @@ refusal of that list on a profile that does not require currency; the restated p
 decision-table case for each comment tool, a case showing them denied in every other profile,
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
+
+**#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
+and 2). Built before any built-in connector, so the first one is bounded from its first call:
+
+- The bound: built. The boot gates wrap every connector in the gateway's own process in a
+  bound of the gateway's own (`crates/gateway/src/bound.rs`): a deadline, 5 s unless given,
+  which each of its rows' deadlines includes, and a result size bound, 1 MiB of JSON text
+  unless given. Both default to the proxied deadline and decision 0014's size ceiling, since a
+  built-in connector passes on only what it chose to keep from a vendor's answer.
+  `[connectors.<name>]` in the deployment file sets `deadline_seconds`, 1 to 60, and
+  `max_result_bytes`, 1 to 1 MiB; outside those it is refused when the file loads, and an entry
+  for a connector the gateway does not run refuses the start (section 12). The longest
+  deadline it sets counts towards the termination grace, as a server's does.
+- Past the bound, decisions 0011 and 0009 hold. A `read` not finished by its deadline is
+  cancelled, and is `error` of the kind `oversized_or_late_read`. Any other tool is never
+  cancelled once it may have been sent ("Where a call runs"): at the deadline the call is
+  answered `unknown`, its row is `unknown` and its receipt stays `unknown`, and its work is
+  moved, as it is, to a task of its own that runs it to its end and logs what it came to.
+  Reconciliation settles the receipt, or a person does. A result over the size bound is
+  discarded: `error` of the kind `oversized_or_late_read` from a read, `unknown` from any other
+  tool, even one the vendor confirmed, whose reference is logged for reconciliation. Each
+  breach is logged with its kind, never cut short silently.
+- The rate quotas: built (`crates/gateway/src/quota.rs`). A token bucket for each server,
+  proxied or in the gateway's own process, and one for each team on each server, in each
+  instance. `[limits]` sets `per_server_calls_per_minute` and `per_server_burst`, 80 and 80
+  unless given, and `per_team_per_server_calls_per_minute` and `per_team_per_server_burst`, 40
+  and 40, each at least 1. They are taken inside the audited run, after begin: a proxied
+  server's in its bulkhead after its caps, so a call a cap sheds takes no token, and a built-in
+  connector's before it runs. A call over either is completed as `refused` with a fixed
+  sentence naming the scope and the server and saying to try again later, so a side effect's
+  receipt is `not_performed`; nothing was sent. A team's token is given back when the server's
+  quota refuses. A caller with no team is held by the server's quota alone.
+- The defaults are provisional. GitHub documents 5,000 REST requests an hour for an App's
+  installation on an organization not on GitHub Enterprise Cloud, and 15,000 for one that is.
+  80 calls a minute is 4,800 an hour, under the lower for one instance making one request a
+  call; a team's half of it means no one team uses up more than half a server's quota. The
+  quotas hold in each instance, so a deployment with more replicas, or tools that make more
+  than one request a call, sets them lower. They are revisited when the built-in connectors are
+  measured against the vendors. A dated note on decision 0014 records them.
+- The signals: built. `switchboard_calls_over_quota_total{scope}`, `scope` one of `server`
+  and `team`, summed over proxied and built-in connectors, and
+  `switchboard_in_process_bound_breaches_total{kind}`, `kind` one of `late` and `oversized`,
+  each written from zero. `tests/in_process.rs` and `tests/limits.rs` show each.
 
 **#47, what the first slice (#14) still lacks.** The signals of section 11 are exported in
 Prometheus text at `GET /metrics`, on a listener of the gateway's own, the default until a
@@ -2259,7 +2322,8 @@ before and after the network policy; the kind claim holds only while the evidenc
   their sentences, and an `unknown` outcome as a tool error saying the call may have happened,
   must not be repeated and will be checked as its receipt. With audit disabled, a development
   build refuses a keyed side effect with the audit sentence, and nothing runs. No deadline of
-  the gateway's own surrounds a proxied call; the bound around in-process connectors is #12's.
+  the gateway's own surrounds a proxied call; the bound around in-process connectors is built
+  (#12, the entry after #12's under section 17).
 - Not planned: reads served with identity disabled, with rows whose identity is `disabled`.
   The path keeps refusing every `tools/call` and listing nothing, with no row
   ([decision 0014](decisions/0014-rollout-safeguards-and-audit-operations.md); #69 closes as
