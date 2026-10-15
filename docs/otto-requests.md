@@ -345,6 +345,10 @@ before stage 1 as well.
     ended or revoked.
   - A superseded control plane that is still running must not be able to say its own turns are
     current. That is Otto's guarantee, tested in Otto.
+  - The proposed wire format is [resolver-interface.md](resolver-interface.md): the request and
+    its answer, how an answer echoes its question, how Switchboard authenticates to Otto, the
+    one-second budget, and what Switchboard does with no answer. Otto's owners can implement it
+    or answer it.
 - **Why:** Switchboard does not read Otto's tables ([decision 0003][0003-decision]). The
   currency question enforces the fencing epoch, which today is signed and recorded but compared
   with nothing, and lets Otto stop one turn at once

@@ -517,8 +517,12 @@ That covers every such tool, `propose` and any `write` tool an exception lets pa
 `propose` alone. Superseded, ended and revoked are denied as `not_current`; unconfirmed, and not
 asked, as `currency_unconfirmed`; each kind has its sentence. `tools/list` skips the check, as
 it skips check 6. Nothing asks a control plane yet: the gateway decides every call as not asked,
-and no registry sets the profile setting, until the resolver client comes with the Otto
-adapter's wiring (#22).
+and no registry sets the profile setting, until the Otto adapter's wiring (#22). The client that
+will ask is built, in `gateway-otto`, against the interface proposed to Otto's owners in
+[resolver-interface.md](resolver-interface.md): one `POST` per question, never cached, within a
+budget of one second the client enforces, and every failure (no answer in time, an error, an
+unknown version, an answer that does not echo the question, an answer over 64 KiB or out of the
+format) read as unconfirmed.
 
 **A profile can declare that its callers set the `Idempotency-Key` header per request,** with
 `idempotency_key_header = true`. It is false unless a policy says so, in the JSON
@@ -2112,11 +2116,30 @@ before and after the network policy; the kind claim holds only while the evidenc
   refusal, failed grants at check 3, composition with the tool list, and revocation by the
   team, key and surface levers. The key lever is tested across a restart, since keys are read
   at boot only; the team and surface levers are also pulled on a running gateway, each by a new
-  registry file that stops a grant the gateway had just accepted within one registry poll.
-- Not built yet: the resolver client with its one-second budget, and asking it on the request
-  path. The gateway decides every call with currency not asked, and no policy sets
-  `requires_currency`. No deployment configures a grant issuer, and no demo profile requires a
-  delegation, so the demos' calls, which carry no grant, are decided as before.
+  registry file that stops a grant the gateway had just accepted within the freshness bound
+  (one-second polls in the test, which allows three seconds).
+- Built, in `gateway-otto`, not yet wired into the request path: the client for Otto's resolver
+  interface. Its wire format is proposed to Otto's owners in
+  [resolver-interface.md](resolver-interface.md), marked a proposal until they agree. A
+  `Resolver` trait asks the currency question for a turn's session, execution, turn and epoch;
+  the HTTP client sends one `POST` per question with a fresh request ID, keeps no answer, and
+  gives up at the one-second budget, which it enforces itself over the whole exchange (except
+  that a token read which blocks the thread can overrun it, #213). It
+  follows no redirect and reads no proxy, trusts only the CA bundle the deployment names,
+  sends a projected ServiceAccount token read again for each question and only over TLS, and
+  refuses plain `http` except to a loopback address. It reads at most 64 KiB, from the
+  declared length or as the body arrives, then the version, then the format, then the echo of
+  every member of the question. The four answers map to the core's `CurrencyAnswer`, and every
+  failure (no answer in time, an error, an unknown version, an answer to another question, an
+  answer too large or out of the format) to `Unconfirmed`. Each answer, each failure by kind
+  and the latency of every question are counted, for the gateway to export (section 11). A
+  fake resolver behind `test-support` answers each state, hangs before or during its answer,
+  fails, and answers with another version or another question's echo; the tests use each.
+- Not built yet: asking the resolver on the request path, its deployment-file table and boot
+  gate, and exporting its counts. The gateway decides every call with currency not asked, and
+  no policy sets `requires_currency`. No deployment configures a grant issuer, and no demo
+  profile requires a delegation, so the demos' calls, which carry no grant, are decided as
+  before.
 
 - Built in the core (#22): the delegation in the call context is absent, present and verified,
   or present and unverified. An unverified one carries its failure kind, from the core's closed
@@ -2135,7 +2158,7 @@ before and after the network policy; the kind claim holds only while the evidenc
   world's call is current. A new one: under a profile that requires currency, a call of a tool
   not classified `read` is never allowed unless current. The row fields: built (#10 and #56,
   above).
-- Not built: the resolver client, and currency on the request path (above).
+- Not built: currency on the request path (above).
 
 **#26, the HTTP path.**
 

@@ -14,18 +14,27 @@
 //! - [`GrantVerifier`] checks a grant as presented, in the decision's order, against a clock
 //!   it is given. A failure is a [`FailureKind`] and, only once the signature verified, the
 //!   grant's [`GrantDigest`]: nothing from the claims.
-//! - `minter`, with the `test-support` feature, signs grants for tests.
+//! - [`resolver`] is the client for Otto's resolver interface (decision 0003) and its currency
+//!   question (decision 0012), with a budget of one second, no cache, a bounded answer, and
+//!   every failure unconfirmed. The interface is proposed in `docs/resolver-interface.md`. It
+//!   is not on the request path yet either.
+//! - `minter`, with the `test-support` feature, signs grants for tests, and `fake` serves a
+//!   fake resolver.
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "test-support")]
+pub mod fake;
 pub mod format;
 mod keys;
 #[cfg(feature = "test-support")]
 pub mod minter;
+pub mod resolver;
 mod tools;
 mod verify;
 
 pub use format::KeyId;
 pub use keys::{GrantKeys, IssuerConfig, IssuerName, KeyConfigError, PreviousKeyConfig};
+pub use resolver::{CurrencyQuestion, HttpResolver, Resolver, ResolverConfig, ResolverFailure};
 pub use tools::{MappingError, ToolMapping};
 pub use verify::{Egress, FailureKind, GrantDigest, GrantFailure, GrantVerifier, VerifiedGrant};
