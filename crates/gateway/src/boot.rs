@@ -21,7 +21,9 @@
 //!    approved tool.
 //! 6. **Connectors**: none is registered twice, and every tool on a surface has its connector
 //!    registered. A connector and its resource adapter are registered together, so neither
-//!    can be configured without the other.
+//!    can be configured without the other. Each such connector runs in the gateway's own
+//!    process, and is wrapped in its [`Bounded`]: a deadline, a result size bound and the rate
+//!    quotas ([`crate::bound`]). A bound of zero, or past decision 0014's ceilings, is refused.
 //! 7. **Profile selection**: with identity enforced, every rule's issuer is a configured issuer
 //!    of the rule's kind; no two rules share a key; the snapshot does not hold [`NO_PROFILE`];
 //!    and every profile a rule names exists.
@@ -57,6 +59,7 @@ use gateway_registry::{Registry, RulePrincipal};
 use thiserror::Error;
 
 use crate::audit::DisabledAuditStore;
+use crate::bound::{Bounded, DEFAULT_IN_PROCESS_DEADLINE, InProcessLimits, InProcessSignals};
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection, IssuerKindEntry};
 use crate::currency::profile_requiring_currency;
@@ -65,15 +68,16 @@ use crate::grants::{
     WorkloadSelection, issuer_gate, pod_gate,
 };
 use crate::policy::{LivePolicy, ServedPolicy};
+use crate::quota::RateQuotas;
 use crate::reconcile::{ReconcileSettings, Reconciler};
 use crate::reload::{Freshness, Reloader};
 use crate::resources::ResourceAdapter;
 use crate::selector::{NO_PROFILE, ProfileSelector, SelectorError, SelectorRules};
 
 /// The call deadline of a connector registered with [`Wiring::connector`], which runs in the
-/// gateway's own process. It only feeds the allowance each audit row's deadline is set from:
-/// nothing stops such a connector at it yet (milestone 3).
-pub const DEFAULT_CALL_DEADLINE: Duration = Duration::from_secs(5);
+/// gateway's own process, unless the wiring sets another: the deadline its [`Bounded`] wrapper
+/// holds each call to, which each audit row's deadline includes ([`crate::bound`]).
+pub const DEFAULT_CALL_DEADLINE: Duration = DEFAULT_IN_PROCESS_DEADLINE;
 
 /// The instance [`Wiring::new`] names until [`Wiring::instance`] is called. The `switchboard`
 /// binary always names one, from its environment, and refuses to start without one
@@ -169,6 +173,20 @@ pub enum BootError {
     /// Two connectors were registered under one name.
     #[error("connector `{0}` is registered more than once")]
     DuplicateConnector(ConnectorName),
+    /// A connector in the gateway's own process was given a deadline or a result bound of
+    /// zero, or past decision 0014's ceilings of 60 s and 1 MiB.
+    #[error(
+        "connector `{connector}` was given a deadline of {deadline:?} and a result bound of \
+         {max_result_bytes} bytes; each must be at least 1 and at most 60 s and 1 MiB"
+    )]
+    InProcessLimitsOutOfRange {
+        /// The connector.
+        connector: ConnectorName,
+        /// The deadline given.
+        deadline: Duration,
+        /// The result bound given, in bytes.
+        max_result_bytes: usize,
+    },
     /// A tool on a surface whose connector is not registered.
     #[error("tool `{tool}` is served but its connector `{connector}` is not registered")]
     UnregisteredConnector {
@@ -274,6 +292,8 @@ pub struct Wiring {
     connectors: Vec<(ConnectorName, Registered)>,
     proxied: Vec<(ConnectorName, Arc<dyn Connector>)>,
     call_deadlines: BTreeMap<ConnectorName, Duration>,
+    in_process_limits: BTreeMap<ConnectorName, InProcessLimits>,
+    quotas: RateQuotas,
     lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
     resolver: Option<Arc<HttpResolver>>,
 }
@@ -289,6 +309,8 @@ impl Wiring {
             connectors: Vec::new(),
             proxied: Vec::new(),
             call_deadlines: BTreeMap::new(),
+            in_process_limits: BTreeMap::new(),
+            quotas: RateQuotas::default(),
             lookups: BTreeMap::new(),
             resolver: None,
         }
@@ -303,10 +325,34 @@ impl Wiring {
     /// Gives the connector registered as `name` the call deadline it runs under, which each of
     /// its rows' deadlines includes: for a proxied server, the deadline its connector was built
     /// with. A proxied server not given one has the proxy's [`DEFAULT_DEADLINE`], and a
-    /// connector registered with [`connector`](Self::connector) has [`DEFAULT_CALL_DEADLINE`].
-    /// A deadline for a name nothing is registered under is ignored.
+    /// connector registered with [`connector`](Self::connector) has [`DEFAULT_CALL_DEADLINE`],
+    /// or the deadline [`in_process_limits`](Self::in_process_limits) gave it. For such a
+    /// connector this is also the deadline its [`Bounded`] wrapper holds each call to, and it
+    /// takes the place of the one `in_process_limits` gave. A deadline for a name nothing is
+    /// registered under is ignored.
     pub fn call_deadline(mut self, name: impl Into<ConnectorName>, deadline: Duration) -> Self {
         self.call_deadlines.insert(name.into(), deadline);
+        self
+    }
+
+    /// Holds the connector registered as `name` with [`connector`](Self::connector), which runs
+    /// in the gateway's own process, to `limits`: its deadline and its result bound, in place of
+    /// [`InProcessLimits::default`]. The boot gates refuse a bound of zero or past decision
+    /// 0014's ceilings. Limits for a name nothing is registered under that way are ignored.
+    pub fn in_process_limits(
+        mut self,
+        name: impl Into<ConnectorName>,
+        limits: InProcessLimits,
+    ) -> Self {
+        self.in_process_limits.insert(name.into(), limits);
+        self
+    }
+
+    /// Holds every connector registered with [`connector`](Self::connector) to `quotas`, in
+    /// place of [`RateQuotas::default`] ([`crate::quota`]). A proxied server's quotas are its
+    /// [`Bulkhead`](crate::bulkhead::Bulkhead)'s.
+    pub fn quotas(mut self, quotas: RateQuotas) -> Self {
+        self.quotas = quotas;
         self
     }
 
@@ -432,6 +478,7 @@ pub struct Gates {
     http: HttpSection,
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
+    in_process: Arc<InProcessSignals>,
     lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
     resolver: Option<Arc<HttpResolver>>,
     freshness: Freshness,
@@ -516,6 +563,12 @@ impl Gates {
     /// What the turn-grant gate counts, for the metrics.
     pub fn grant_signals(&self) -> GrantSignals {
         self.grants.signals().clone()
+    }
+
+    /// What the connectors in the gateway's own process count, summed over them, for the
+    /// metrics ([`crate::bound`]).
+    pub fn in_process_signals(&self) -> Arc<InProcessSignals> {
+        self.in_process.clone()
     }
 
     /// The client for Otto's resolver interface, which a call under a profile that requires
@@ -621,6 +674,8 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         connectors: registrations,
         proxied,
         call_deadlines,
+        in_process_limits,
+        quotas,
         lookups,
         resolver,
     } = wiring;
@@ -655,11 +710,29 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
     let catalog = ToolCatalog::new(config.catalog)?;
     catalog.check(&approved)?;
 
+    let in_process = Arc::new(InProcessSignals::default());
     let mut connectors = BTreeMap::new();
     for (name, mut registered) in registrations {
+        let mut limits = in_process_limits.get(&name).copied().unwrap_or_default();
         if let Some(deadline) = call_deadlines.get(&name) {
-            registered.call_deadline = *deadline;
+            limits.deadline = *deadline;
         }
+        if !limits.within_ceilings() {
+            return Err(BootError::InProcessLimitsOutOfRange {
+                connector: name,
+                deadline: limits.deadline,
+                max_result_bytes: limits.max_result_bytes,
+            });
+        }
+        registered.call_deadline = limits.deadline;
+        // No connector in the gateway's own process runs without its bound (decision 0014).
+        registered.connector = Arc::new(Bounded::new(
+            name.clone(),
+            registered.connector,
+            limits,
+            quotas,
+            in_process.clone(),
+        ));
         if connectors.insert(name.clone(), registered).is_some() {
             return Err(BootError::DuplicateConnector(name));
         }
@@ -708,6 +781,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         http: config.http,
         policy: Arc::new(LivePolicy::new(policy)),
         connectors,
+        in_process,
         lookups,
         resolver,
         // No file is read again, so the policy never goes stale.
@@ -762,6 +836,10 @@ pub(crate) fn check_registry_with(
         connectors: registrations,
         proxied,
         call_deadlines,
+        // Only a connector in the gateway's own process takes these, and the registry's path
+        // refuses every one below. A proxied server's quotas are its bulkhead's.
+        in_process_limits: _,
+        quotas: _,
         lookups,
         resolver,
     } = wiring;
@@ -824,6 +902,7 @@ pub(crate) fn check_registry_with(
         http: settings.http,
         policy: live,
         connectors,
+        in_process: Arc::default(),
         lookups,
         resolver,
         freshness,

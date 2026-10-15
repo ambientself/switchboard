@@ -75,6 +75,10 @@
 //! max_in_flight = 256         # requests in flight in this instance
 //! per_server_in_flight = 32   # calls in flight to each proxied server
 //! per_team_per_server_in_flight = 8  # from each team to each proxied server
+//! per_server_calls_per_minute = 80   # each server's rate quota, proxied or built in
+//! per_server_burst = 80
+//! per_team_per_server_calls_per_minute = 40  # each team's on each server
+//! per_team_per_server_burst = 40
 //!
 //! [servers.mock-docs]         # optional, for a server the registry names
 //! deadline_seconds = 5        # 5 if left out; 1 to 60
@@ -82,6 +86,10 @@
 //!
 //! [servers.vendor-docs]       # an https server needs its entry, for its CA file
 //! ca_file = "vendor-docs-ca.pem"  # needed for https, refused for http; the only CAs trusted
+//!
+//! [connectors.github]         # optional, for a connector in the gateway's own process
+//! deadline_seconds = 5        # 5 if left out; 1 to 60
+//! max_result_bytes = 1048576  # 1 MiB if left out; 1 to 1 MiB
 //!
 //! [drift]
 //! interval_seconds = 300      # 300 if left out; 5 to 900
@@ -186,12 +194,30 @@
 //!   each team to each server, by the caller's proved team; a caller with no team is held by
 //!   the server's cap alone. A call over either is completed as `refused`, with a capacity
 //!   sentence, and nothing is sent (see [`crate::bulkhead`]).
+//! - **Rate quotas** are a token bucket for each server, proxied or in the gateway's own
+//!   process, and one for each team on each server, in each instance (see [`crate::quota`]):
+//!   `per_server_calls_per_minute` and `per_server_burst`, and
+//!   `per_team_per_server_calls_per_minute` and `per_team_per_server_burst`, each at least 1.
+//!   A bucket gains its rate's tokens each minute and holds at most its burst. A caller with
+//!   no team is held by the server's quota alone. A call over either is completed as
+//!   `refused`, with a sentence naming the scope and the server that says to try again later,
+//!   and nothing is sent. The defaults, 80 and 80 for a server and 40 and 40 for a team on it,
+//!   are provisional, set against GitHub's documented 5,000 requests an hour for an App's
+//!   installation; a deployment with more than one replica sets them lower.
 //! - **Each server's bounds** are set under `[servers.<name>]`, for a server the registry names;
 //!   the gateway refuses to start with any other (see [`crate::start`]). `deadline_seconds`
 //!   bounds a call from sending it to the last byte of its answer, and `max_result_bytes` the
 //!   answer's HTTP body. Zero, or a value past [`MAX_SERVER_DEADLINE`] or
 //!   [`MAX_SERVER_RESULT_BYTES`], is refused. The deployment's termination grace must cover
 //!   the longest deadline set (decision 0014, section 1).
+//! - **Each connector in the gateway's own process** has its bounds under
+//!   `[connectors.<name>]` (see [`crate::bound`]): `deadline_seconds`,
+//!   [`DEFAULT_IN_PROCESS_DEADLINE`] if left out, and `max_result_bytes`, the largest result in
+//!   bytes of its JSON text, [`DEFAULT_IN_PROCESS_RESULT_BYTES`] if left out. Zero, or past the
+//!   same ceilings as a server's, is refused, and the termination grace must cover these
+//!   deadlines too. The gateway refuses to start with an entry for a connector it does not run
+//!   in its own process; no built-in connector is wired yet (#12), so today every entry is
+//!   refused when it starts.
 //! - **Each `https` server's CA file** is `[servers.<name>] ca_file`, a PEM bundle of the only
 //!   CAs the server's certificate may chain to (decision 0013, section 3). Trust is named, never
 //!   ambient: no roots are compiled in and none are read from the operating system. The
@@ -232,9 +258,9 @@
 //!   once lookups exist. Each outside its range is refused.
 //!
 //! Every table refuses fields it does not know. Only `listen`, `registry.max_age_seconds`, the
-//! audit pools, the limits, each server's bounds, the drift interval and the reconciliation
-//! settings have defaults, so a gateway not told where to listen is reachable from its own
-//! machine only. `[metrics]`, `[grants]`, `[resolver]`, each
+//! audit pools, the limits and quotas, each server's and each connector's bounds, the drift
+//! interval and the reconciliation settings have defaults, so a gateway not told where to
+//! listen is reachable from its own machine only. `[metrics]`, `[grants]`, `[resolver]`, each
 //! server's CA file and the reach settings may be left out, each under the rules above. Any
 //! other missing field is an error, and so is a field that does not belong to the chosen mode
 //! or kind, such as `subjects_file` on a user issuer.
@@ -250,6 +276,7 @@ use gateway_core::{ConnectorName, DeploymentName, Issuer, Subject, TeamId};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::bound::InProcessLimits;
 use crate::config::{
     Algorithm, AuditSection, HttpSection, IdentitySection, IssuerEntry, IssuerKindEntry,
 };
@@ -257,6 +284,7 @@ use crate::currency::ResolverSection;
 use crate::drift::{DriftError, DriftSection};
 use crate::grants::{GrantsFile, GrantsFileError, GrantsSection};
 use crate::keys::{DEFAULT_KEYS_REFRESH, MIN_KEYS_REFRESH};
+use crate::quota::{Rate, RateQuotas};
 use crate::reach::ReachSettings;
 use crate::reconcile::{ReconcileSettings, ReconcileSettingsError, ReconciliationSection};
 
@@ -301,6 +329,8 @@ pub const MAX_SERVER_DEADLINE: Duration = Duration::from_secs(60);
 /// The largest answer a server's entry may allow, in bytes: 1 MiB.
 pub const MAX_SERVER_RESULT_BYTES: usize = 1024 * 1024;
 
+pub use crate::bound::{DEFAULT_IN_PROCESS_DEADLINE, DEFAULT_IN_PROCESS_RESULT_BYTES};
+
 /// The deployment file as written.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -333,6 +363,10 @@ pub struct DeploymentFile {
     /// Each proxied server's bounds, where they differ from the defaults.
     #[serde(default)]
     pub servers: BTreeMap<ConnectorName, ServerSection>,
+    /// Each connector in the gateway's own process's bounds, where they differ from the
+    /// defaults.
+    #[serde(default)]
+    pub connectors: BTreeMap<ConnectorName, ConnectorSection>,
     /// How often the drift pass runs, where it differs from the default, and each proxied
     /// server's probe credential.
     #[serde(default)]
@@ -345,14 +379,23 @@ pub struct DeploymentFile {
 }
 
 impl DeploymentFile {
-    /// The longest call deadline the file sets for any server, or [`DEFAULT_DEADLINE`] if it
-    /// sets none longer. The deployment's termination grace must cover it.
+    /// The longest call deadline the file sets for any server or connector in the gateway's
+    /// own process, or the longer of their defaults if it sets none longer. The deployment's
+    /// termination grace must cover it.
     pub fn longest_deadline(&self) -> Duration {
         self.servers
             .values()
             .filter_map(|server| server.deadline_seconds)
+            .chain(
+                self.connectors
+                    .values()
+                    .filter_map(|connector| connector.deadline_seconds),
+            )
             .map(Duration::from_secs)
-            .fold(DEFAULT_DEADLINE, Duration::max)
+            .fold(
+                DEFAULT_DEADLINE.max(DEFAULT_IN_PROCESS_DEADLINE),
+                Duration::max,
+            )
     }
 
     /// The bounds the file sets for `server`'s calls, each defaulted, and refused if zero or
@@ -393,6 +436,40 @@ pub struct LimitsSection {
     /// [`DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT`] if left out.
     #[serde(default)]
     pub per_team_per_server_in_flight: Option<usize>,
+    /// Each server's rate quota, in calls a minute;
+    /// [`DEFAULT_PER_SERVER_PER_MINUTE`](crate::quota::DEFAULT_PER_SERVER_PER_MINUTE) if left
+    /// out.
+    #[serde(default)]
+    pub per_server_calls_per_minute: Option<u32>,
+    /// How many calls each server's quota allows at once;
+    /// [`DEFAULT_PER_SERVER_BURST`](crate::quota::DEFAULT_PER_SERVER_BURST) if left out.
+    #[serde(default)]
+    pub per_server_burst: Option<u32>,
+    /// Each team's rate quota on each server, in calls a minute;
+    /// [`DEFAULT_PER_TEAM_PER_SERVER_PER_MINUTE`](crate::quota::DEFAULT_PER_TEAM_PER_SERVER_PER_MINUTE)
+    /// if left out.
+    #[serde(default)]
+    pub per_team_per_server_calls_per_minute: Option<u32>,
+    /// How many calls each team's quota on each server allows at once;
+    /// [`DEFAULT_PER_TEAM_PER_SERVER_BURST`](crate::quota::DEFAULT_PER_TEAM_PER_SERVER_BURST) if
+    /// left out.
+    #[serde(default)]
+    pub per_team_per_server_burst: Option<u32>,
+}
+
+/// One connector in the gateway's own process's bounds, as written. Each left out has its
+/// default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorSection {
+    /// How long a call may take, in seconds: 1 to 60, and [`DEFAULT_IN_PROCESS_DEADLINE`] if
+    /// left out.
+    #[serde(default)]
+    pub deadline_seconds: Option<u64>,
+    /// The largest result accepted, in bytes of its JSON text: 1 to
+    /// [`MAX_SERVER_RESULT_BYTES`], and [`DEFAULT_IN_PROCESS_RESULT_BYTES`] if left out.
+    #[serde(default)]
+    pub max_result_bytes: Option<usize>,
 }
 
 /// One proxied server's bounds and CA file, as written. Each bound left out has its default.
@@ -422,6 +499,8 @@ pub struct Limits {
     pub per_server_in_flight: usize,
     /// Calls in flight from each team to each proxied server.
     pub per_team_per_server_in_flight: usize,
+    /// Each server's rate quota, and each team's on each server.
+    pub quotas: RateQuotas,
 }
 
 impl Default for Limits {
@@ -430,6 +509,7 @@ impl Default for Limits {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             per_server_in_flight: DEFAULT_PER_SERVER_IN_FLIGHT,
             per_team_per_server_in_flight: DEFAULT_PER_TEAM_PER_SERVER_IN_FLIGHT,
+            quotas: RateQuotas::default(),
         }
     }
 }
@@ -685,9 +765,31 @@ pub enum DeploymentError {
         /// The size given.
         size: usize,
     },
-    /// A cap in `[limits]` is zero.
+    /// A cap or a quota in `[limits]` is zero.
     #[error("`limits.{0}` must be at least 1")]
     LimitZero(&'static str),
+    /// A connector's deadline is zero or past [`MAX_SERVER_DEADLINE`].
+    #[error(
+        "`connectors.{connector}.deadline_seconds` is {seconds}; it must be from 1 to {}",
+        MAX_SERVER_DEADLINE.as_secs()
+    )]
+    ConnectorDeadlineOutOfRange {
+        /// The connector.
+        connector: ConnectorName,
+        /// The deadline given, in seconds.
+        seconds: u64,
+    },
+    /// A connector's result bound is zero or past [`MAX_SERVER_RESULT_BYTES`].
+    #[error(
+        "`connectors.{connector}.max_result_bytes` is {bytes}; it must be from 1 to \
+         {MAX_SERVER_RESULT_BYTES}"
+    )]
+    ConnectorResultBytesOutOfRange {
+        /// The connector.
+        connector: ConnectorName,
+        /// The bound given, in bytes.
+        bytes: usize,
+    },
     /// A server's deadline is zero or past [`MAX_SERVER_DEADLINE`].
     #[error(
         "`servers.{server}.deadline_seconds` is {seconds}; it must be from 1 to {}",
@@ -772,6 +874,9 @@ pub struct Deployment {
     /// The bounds of each server the file gives an entry, within their ceilings. Every other
     /// server has [`ServerLimits::default`].
     pub servers: BTreeMap<ConnectorName, ServerLimits>,
+    /// The bounds of each connector in the gateway's own process the file gives an entry,
+    /// within their ceilings. Every other has [`InProcessLimits::default`].
+    pub connectors: BTreeMap<ConnectorName, InProcessLimits>,
     /// Each `https` server's CA file, from the deployment file's directory.
     pub ca_files: BTreeMap<ConnectorName, PathBuf>,
     /// How often the drift pass runs.
@@ -800,6 +905,7 @@ impl std::fmt::Debug for Deployment {
             .field("metrics", &self.metrics)
             .field("limits", &self.limits)
             .field("servers", &self.servers)
+            .field("connectors", &self.connectors)
             .field("ca_files", &self.ca_files)
             .field("drift_interval", &self.drift_interval)
             .field("probe_credentials", &self.probe_credentials)
@@ -938,6 +1044,14 @@ impl Deployment {
                 Ok((server, bounds))
             })
             .collect::<Result<_, DeploymentError>>()?;
+        let connectors = file
+            .connectors
+            .into_iter()
+            .map(|(connector, section)| {
+                let bounds = connector_limits(&connector, section)?;
+                Ok((connector, bounds))
+            })
+            .collect::<Result<_, DeploymentError>>()?;
         let mut keys_urls = Vec::new();
         let identity = match file.identity {
             IdentityFile::Disabled {} => IdentitySection {
@@ -988,6 +1102,7 @@ impl Deployment {
             metrics: file.metrics.map(|metrics| metrics.listen),
             limits,
             servers,
+            connectors,
             ca_files,
             drift_interval,
             probe_credentials,
@@ -1042,6 +1157,75 @@ fn limits(section: LimitsSection) -> Result<Limits, DeploymentError> {
             defaults.per_team_per_server_in_flight,
             "per_team_per_server_in_flight",
         )?,
+        quotas: quotas(&section)?,
+    })
+}
+
+/// The rate quotas `section` sets, each defaulted, and refused if zero.
+fn quotas(section: &LimitsSection) -> Result<RateQuotas, DeploymentError> {
+    let defaults = RateQuotas::default();
+    let quota = |given: Option<u32>, default: u32, field: &'static str| match given {
+        Some(0) => Err(DeploymentError::LimitZero(field)),
+        given => Ok(given.unwrap_or(default)),
+    };
+    Ok(RateQuotas {
+        per_server: Rate {
+            per_minute: quota(
+                section.per_server_calls_per_minute,
+                defaults.per_server.per_minute,
+                "per_server_calls_per_minute",
+            )?,
+            burst: quota(
+                section.per_server_burst,
+                defaults.per_server.burst,
+                "per_server_burst",
+            )?,
+        },
+        per_team_per_server: Rate {
+            per_minute: quota(
+                section.per_team_per_server_calls_per_minute,
+                defaults.per_team_per_server.per_minute,
+                "per_team_per_server_calls_per_minute",
+            )?,
+            burst: quota(
+                section.per_team_per_server_burst,
+                defaults.per_team_per_server.burst,
+                "per_team_per_server_burst",
+            )?,
+        },
+    })
+}
+
+/// The bounds `section` sets for `connector`, a connector in the gateway's own process, each
+/// defaulted, and refused if zero or past its ceiling.
+fn connector_limits(
+    connector: &ConnectorName,
+    section: ConnectorSection,
+) -> Result<InProcessLimits, DeploymentError> {
+    let defaults = InProcessLimits::default();
+    let deadline = match section.deadline_seconds {
+        None => defaults.deadline,
+        Some(seconds) if seconds == 0 || seconds > MAX_SERVER_DEADLINE.as_secs() => {
+            return Err(DeploymentError::ConnectorDeadlineOutOfRange {
+                connector: connector.clone(),
+                seconds,
+            });
+        }
+        Some(seconds) => Duration::from_secs(seconds),
+    };
+    let max_result_bytes = match section.max_result_bytes {
+        None => defaults.max_result_bytes,
+        Some(bytes) if bytes == 0 || bytes > MAX_SERVER_RESULT_BYTES => {
+            return Err(DeploymentError::ConnectorResultBytesOutOfRange {
+                connector: connector.clone(),
+                bytes,
+            });
+        }
+        Some(bytes) => bytes,
+    };
+    Ok(InProcessLimits {
+        deadline,
+        max_result_bytes,
     })
 }
 

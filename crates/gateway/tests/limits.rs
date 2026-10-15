@@ -1,8 +1,9 @@
 //! Decision 0014's limits, against scripted servers that hang or answer: the instance's cap on
 //! requests in flight, each server's and each team's cap on calls in flight, the team's slot
 //! given back when the server's cap refuses, a hanging server isolated by them, the slots freed
-//! at the deadline, the argument check before any slot is taken, the caps and each server's
-//! bounds from the deployment file, their ceilings, and the signals.
+//! at the deadline, the argument check before any slot is taken, each server's and each team's
+//! rate quota, the caps, quotas and each server's and each built-in connector's bounds from the
+//! deployment file, their ceilings, and the signals.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod files;
@@ -239,6 +240,24 @@ async fn wired(
     per_team: usize,
     deadline: Duration,
 ) -> (Gates, Upstreams) {
+    wired_with(
+        name,
+        per_server,
+        per_team,
+        deadline,
+        gateway::RateQuotas::default(),
+    )
+    .await
+}
+
+/// [`wired`], with the bulkheads holding each server and each team to `quotas`.
+async fn wired_with(
+    name: &str,
+    per_server: usize,
+    per_team: usize,
+    deadline: Duration,
+    quotas: gateway::RateQuotas,
+) -> (Gates, Upstreams) {
     let slow = Scripted::hanging().await;
     let other = Scripted::answering().await;
     let files = Files::new(name, &issuer().jwks_document(), &slow.url);
@@ -278,7 +297,8 @@ async fn wired(
         .tool(tool.parse().unwrap(), "read");
         upstream.deadline = deadline;
         let connector = ProxyConnector::new(upstream, credentials.clone()).unwrap();
-        let bulkhead = Bulkhead::new(server.into(), Arc::new(connector), per_server, per_team);
+        let bulkhead = Bulkhead::new(server.into(), Arc::new(connector), per_server, per_team)
+            .with_quotas(quotas);
         signals.insert(ConnectorName::new(server), bulkhead.signals());
         wiring = wiring
             .proxied(server, Arc::new(bulkhead))
@@ -823,6 +843,83 @@ async fn the_deployment_files_caps_on_calls_in_flight_reach_the_server_and_each_
     assert_eq!((counts[0].1.shed_server, counts[0].1.shed_team), (0, 0));
 }
 
+/// Within its caps, a call to a proxied server is held to the server's rate quota and its
+/// team's on the server. A call over either is completed as `refused`, with the quota's
+/// sentence on its row, and is not sent; a team's token is given back when the server's quota
+/// refuses, and another team is still served.
+#[tokio::test]
+async fn a_proxied_servers_and_teams_quotas_refuse_with_a_row_and_nothing_sent() {
+    let quotas = gateway::RateQuotas {
+        per_server: gateway::Rate {
+            per_minute: 1,
+            burst: 3,
+        },
+        per_team_per_server: gateway::Rate {
+            per_minute: 1,
+            burst: 2,
+        },
+    };
+    let (gates, up) = wired_with("quotas", 32, 8, Duration::from_secs(3), quotas).await;
+    let world = World {
+        path: RequestPath::new(gates),
+        up,
+    };
+    assert!(is_ok(&world.call(TEAM_A_SA, OTHER_TOOL).await));
+    assert!(is_ok(&world.call(TEAM_A_SA, OTHER_TOOL).await));
+    let team = world.call(TEAM_A_SA, OTHER_TOOL).await;
+    assert_eq!(refusal(&team), gateway::team_over_quota(OTHER, OTHER_TOOL));
+    // Team b is served from the server's last token, and then meets the server's quota.
+    assert!(is_ok(&world.call(TEAM_B_SA, OTHER_TOOL).await));
+    let server = world.call(TEAM_B_SA, OTHER_TOOL).await;
+    assert_eq!(
+        refusal(&server),
+        gateway::server_over_quota(OTHER, OTHER_TOOL)
+    );
+    assert_eq!(world.up.other.received(), 3);
+    let completions = world.completions(OTHER_TOOL);
+    assert_eq!(completions.len(), 5);
+    assert_eq!(
+        outcome_of(&completions[2]),
+        Some(&refused_with(gateway::team_over_quota(OTHER, OTHER_TOOL)))
+    );
+    assert_eq!(
+        outcome_of(&completions[4]),
+        Some(&refused_with(gateway::server_over_quota(OTHER, OTHER_TOOL)))
+    );
+    let counts = world.up.signals.counts();
+    let other = &counts[0].1;
+    assert_eq!((other.over_quota_server, other.over_quota_team), (1, 1));
+    assert_eq!((other.shed_server, other.shed_team), (0, 0));
+}
+
+/// `[connectors.<name>]` for a connector the gateway does not run in its own process refuses
+/// the start. None is wired yet, so every one does.
+#[tokio::test]
+async fn bounds_for_a_connector_the_gateway_does_not_run_refuse_the_start() {
+    let files = Files::new(
+        "unknown-connector",
+        &issuer().jwks_document(),
+        "http://127.0.0.1:9/mcp",
+    );
+    files.write(
+        "gateway.toml",
+        &deployment_file(
+            "[audit]\nmode = \"disabled\"\n\n[connectors.github]\ndeadline_seconds = 9\n",
+        ),
+    );
+    let refused = prepare(
+        files.load(),
+        InstanceName::new("test-instance"),
+        Arc::new(SystemClock),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&refused, StartError::UnknownConnectorLimits(name) if name.as_str() == "github"),
+        "{refused}"
+    );
+}
+
 /// `[servers.<name>]` for a server the registry does not name refuses the start.
 #[tokio::test]
 async fn bounds_for_a_server_the_registry_lacks_refuse_the_start() {
@@ -869,9 +966,27 @@ fn the_caps_and_each_servers_bounds_have_decision_0014s_defaults() {
             max_in_flight: 256,
             per_server_in_flight: 32,
             per_team_per_server_in_flight: 8,
+            quotas: gateway::RateQuotas {
+                per_server: gateway::Rate {
+                    per_minute: 80,
+                    burst: 80,
+                },
+                per_team_per_server: gateway::Rate {
+                    per_minute: 40,
+                    burst: 40,
+                },
+            },
         }
     );
     assert!(loaded.servers.is_empty());
+    assert!(loaded.connectors.is_empty());
+    assert_eq!(
+        gateway::InProcessLimits::default(),
+        gateway::InProcessLimits {
+            deadline: Duration::from_secs(5),
+            max_result_bytes: 1024 * 1024,
+        }
+    );
     assert_eq!(
         gateway::ServerLimits::default(),
         gateway::ServerLimits {
@@ -885,9 +1000,13 @@ fn the_caps_and_each_servers_bounds_have_decision_0014s_defaults() {
 fn the_caps_and_each_servers_bounds_can_be_set_up_to_their_ceilings() {
     let loaded = load_with(
         "set",
-        "[limits]\nmax_in_flight = 1\nper_server_in_flight = 2\nper_team_per_server_in_flight = 3\n\n\
+        "[limits]\nmax_in_flight = 1\nper_server_in_flight = 2\nper_team_per_server_in_flight = 3\n\
+         per_server_calls_per_minute = 600\nper_server_burst = 5\n\
+         per_team_per_server_calls_per_minute = 7\nper_team_per_server_burst = 1\n\n\
          [servers.mock-docs]\ndeadline_seconds = 60\nmax_result_bytes = 1048576\n\n\
-         [servers.other]\ndeadline_seconds = 1\n",
+         [servers.other]\ndeadline_seconds = 1\n\n\
+         [connectors.github]\ndeadline_seconds = 60\nmax_result_bytes = 1048576\n\n\
+         [connectors.jira]\nmax_result_bytes = 1\n",
     )
     .unwrap();
     assert_eq!(
@@ -896,7 +1015,36 @@ fn the_caps_and_each_servers_bounds_can_be_set_up_to_their_ceilings() {
             max_in_flight: 1,
             per_server_in_flight: 2,
             per_team_per_server_in_flight: 3,
+            quotas: gateway::RateQuotas {
+                per_server: gateway::Rate {
+                    per_minute: 600,
+                    burst: 5,
+                },
+                per_team_per_server: gateway::Rate {
+                    per_minute: 7,
+                    burst: 1,
+                },
+            },
         }
+    );
+    assert_eq!(
+        loaded.connectors,
+        BTreeMap::from([
+            (
+                ConnectorName::new("github"),
+                gateway::InProcessLimits {
+                    deadline: gateway::MAX_SERVER_DEADLINE,
+                    max_result_bytes: gateway::MAX_SERVER_RESULT_BYTES,
+                }
+            ),
+            (
+                ConnectorName::new("jira"),
+                gateway::InProcessLimits {
+                    deadline: Duration::from_secs(5),
+                    max_result_bytes: 1,
+                }
+            ),
+        ])
     );
     assert_eq!(
         loaded.servers,
@@ -950,6 +1098,38 @@ fn values_past_the_ceilings_or_zero_are_refused() {
             "[limits]\nper_team_per_server_in_flight = 0\n",
             "`limits.per_team_per_server_in_flight` must be at least 1",
         ),
+        (
+            "[connectors.github]\ndeadline_seconds = 61\n",
+            "`connectors.github.deadline_seconds` is 61; it must be from 1 to 60",
+        ),
+        (
+            "[connectors.github]\ndeadline_seconds = 0\n",
+            "`connectors.github.deadline_seconds` is 0; it must be from 1 to 60",
+        ),
+        (
+            "[connectors.github]\nmax_result_bytes = 1048577\n",
+            "`connectors.github.max_result_bytes` is 1048577; it must be from 1 to 1048576",
+        ),
+        (
+            "[connectors.github]\nmax_result_bytes = 0\n",
+            "`connectors.github.max_result_bytes` is 0; it must be from 1 to 1048576",
+        ),
+        (
+            "[limits]\nper_server_calls_per_minute = 0\n",
+            "`limits.per_server_calls_per_minute` must be at least 1",
+        ),
+        (
+            "[limits]\nper_server_burst = 0\n",
+            "`limits.per_server_burst` must be at least 1",
+        ),
+        (
+            "[limits]\nper_team_per_server_calls_per_minute = 0\n",
+            "`limits.per_team_per_server_calls_per_minute` must be at least 1",
+        ),
+        (
+            "[limits]\nper_team_per_server_burst = 0\n",
+            "`limits.per_team_per_server_burst` must be at least 1",
+        ),
     ] {
         let refused = load_with("ceilings", extra).unwrap_err();
         assert_eq!(refused.to_string(), expected, "{extra}");
@@ -957,6 +1137,7 @@ fn values_past_the_ceilings_or_zero_are_refused() {
     for extra in [
         "[limits]\nmax_in_flight = 1\nqueue = 4\n",
         "[servers.mock-docs]\ndeadline_seconds = 5\nretries = 2\n",
+        "[connectors.github]\ndeadline_seconds = 5\nca_file = \"ca.pem\"\n",
     ] {
         let refused = load_with("unknown-field", extra).unwrap_err();
         assert!(
@@ -976,6 +1157,8 @@ fn every_refusal_sentence_fits_the_audit_rows_cap_with_long_names() {
     assert_eq!(server_at_capacity("", "").len(), 137);
     assert_eq!(team_at_capacity("", "").len(), 150);
     assert_eq!(gateway::withdrawn_while_deciding("").len(), 138);
+    assert_eq!(gateway::server_over_quota("", "").len(), 141);
+    assert_eq!(gateway::team_over_quota("", "").len(), 154);
     let name = "n".repeat(900);
     for sentence in [
         outcome::NOT_SERVED.to_owned(),
@@ -983,6 +1166,8 @@ fn every_refusal_sentence_fits_the_audit_rows_cap_with_long_names() {
         server_at_capacity(&name, &name),
         team_at_capacity(&name, &name),
         gateway::withdrawn_while_deciding(&name),
+        gateway::server_over_quota(&name, &name),
+        gateway::team_over_quota(&name, &name),
     ] {
         assert!(
             sentence.len() <= audit_postgres::MAX_OUTCOME_SENTENCE_BYTES,

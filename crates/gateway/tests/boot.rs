@@ -20,9 +20,24 @@ use gateway_testkit::{
     FakeCredentialSource, Fixture, FixtureConnector, GROUP_G, InMemoryAuditStore, LocalIssuer,
     PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPED_READ_TOOL, SURFACE_READ,
     SteppableClock, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_SUBJECT, USER_ISSUER,
-    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, policy_data, row_start,
+    USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, policy_data, row_start,
 };
 use serde_json::{Value, json};
+
+/// Runs `future` with the testkit's executor, inside a Tokio runtime: the bound the gates put
+/// around the fixture connector times each call with Tokio's timer (`gateway::bound`).
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap()
+    });
+    let _inside = runtime.enter();
+    gateway_testkit::block_on(future)
+}
 
 /// The fixture connector's adapter: the testkit's `resources_of`, chosen by the approved tool.
 struct FixtureResources;
@@ -494,7 +509,9 @@ fn passed_gates_hold_what_the_configuration_and_wiring_gave() {
     );
     let fixture = CONNECTOR.into();
     let ours: Arc<dyn gateway_core::Connector> = world.connector.clone();
-    assert!(Arc::ptr_eq(gates.connector(&fixture).unwrap(), &ours));
+    // The connector runs in the gateway's own process, so the gates hold it inside its bound
+    // (decision 0014), never bare.
+    assert!(!Arc::ptr_eq(gates.connector(&fixture).unwrap(), &ours));
     let snapshot = gates.snapshot();
     let tool = snapshot.tool(&read).unwrap();
     let adapter = gates.resource_adapter(&tool.connector).unwrap();

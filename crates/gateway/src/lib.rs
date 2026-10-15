@@ -31,8 +31,11 @@
 //! - [`serve_metrics`] exports the counters, and the audit store's, in Prometheus text at
 //!   `GET /metrics` on a listener of its own, never the MCP listener ([`metrics`]).
 //! - [`Bulkhead`] holds each proxied server to its cap on calls in flight, and each team to its
-//!   cap on calls to the server, and counts each server's calls ([`bulkhead`]). [`serve`] holds
-//!   the instance to its cap on requests in flight.
+//!   cap on calls to the server, then to their rate quotas, and counts each server's calls
+//!   ([`bulkhead`], [`quota`]). [`serve`] holds the instance to its cap on requests in flight.
+//! - [`Bounded`] holds each connector in the gateway's own process to a call deadline, a result
+//!   size bound and the rate quotas ([`bound`]). The boot gates wrap every such connector in
+//!   one.
 //!
 //! The first slice (decision 0008) runs from files:
 //!
@@ -72,6 +75,7 @@
 
 mod audit;
 pub mod boot;
+pub mod bound;
 pub mod bulkhead;
 mod catalog;
 mod config;
@@ -85,6 +89,7 @@ pub mod path;
 mod policy;
 pub mod probe;
 mod proxied;
+pub mod quota;
 pub mod reach;
 pub mod reconcile;
 pub mod reload;
@@ -96,6 +101,10 @@ pub mod telemetry;
 
 pub use audit::DisabledAuditStore;
 pub use boot::{BootError, GateState, Gates, Settings, Wiring};
+pub use bound::{
+    BOUND_BREACHED_EVENT, Bounded, DEFAULT_IN_PROCESS_DEADLINE, DEFAULT_IN_PROCESS_RESULT_BYTES,
+    InProcessCounts, InProcessLimits, InProcessSignals, LATE_SIDE_EFFECT_EVENT, OVER_QUOTA_EVENT,
+};
 pub use bulkhead::{
     Bulkhead, ProxiedSignals, ServerCounts, ServerSignals, server_at_capacity, team_at_capacity,
 };
@@ -130,6 +139,11 @@ pub use path::{
 };
 pub use policy::{LivePolicy, ServedPolicy};
 pub use proxied::{invalid_argument, undeclared_argument, withdrawn_while_deciding};
+pub use quota::{
+    DEFAULT_PER_SERVER_BURST, DEFAULT_PER_SERVER_PER_MINUTE, DEFAULT_PER_TEAM_PER_SERVER_BURST,
+    DEFAULT_PER_TEAM_PER_SERVER_PER_MINUTE, QuotaScope, Rate, RateQuotas, server_over_quota,
+    team_over_quota,
+};
 pub use reach::{ReachCaller, ReachSettings, ReachSettingsError};
 pub use reconcile::{
     DEFAULT_RECONCILE_ATTEMPTS, DEFAULT_RECONCILE_INTERVAL, DEFAULT_RECONCILE_LEASE,
