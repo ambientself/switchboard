@@ -1746,6 +1746,14 @@ mutate("otto-resolver-unknown-members-accepted", "an answer with a member the fo
        "#[serde(deny_unknown_fields)]\nstruct WireAnswer {", "struct WireAnswer {")
 mutate("otto-resolver-plain-http-anywhere", "the client asks over plain http to an address that is not loopback", OR,
        ".is_ok_and(|address| address.is_loopback())", ".is_ok_and(|_| true)")
+# The token file is read on the blocking pool, so a read that blocks cannot hold a question past
+# the budget (#213). tests/resolver.rs and the gateway's tests/currency.rs stall it on a FIFO.
+mutate("otto-resolver-token-read-on-runtime-thread", "the token file is read on the thread asking, so a read that blocks holds the question past the budget", OR,
+       "    tokio::task::spawn_blocking(move || bearer(&path))\n"
+       "        .await\n"
+       "        .map_err(|_| ResolverFailure::Token)?\n"
+       "        .map_err(|_| ResolverFailure::Token)",
+       "    bearer(&path).map_err(|_| ResolverFailure::Token)")
 
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
@@ -2303,6 +2311,14 @@ mutate("gw-grant-pod-gate-any-issuer-binding", "the pod gate passes while any on
 mutate("gw-grant-pod-gate-reads-only", "the pod gate lets a propose tool through and stops only write and destructive ones", GRANTS_SRC,
        "                .find(|tool| tool.classification != Classification::Read)",
        "                .find(|tool| !matches!(tool.classification, Classification::Read | Classification::Propose))")
+# Decision 0012's currency gate: a profile a rule selects that requires currency needs Otto's
+# resolver, at boot on both paths and on every registry reload, which keeps the running policy.
+# tests/currency.rs boots the JSON configuration's path; boot.rs's own tests run the registry's
+# policy gates and a reload.
+mutate("gw-currency-boot-gate-removed", "the JSON configuration's boot starts a profile requiring currency with no resolver", BOOT,
+       "    currency_gate(&policy, resolver.is_some())?;\n", "")
+mutate("gw-currency-snapshot-load-gate-removed", "a registry's policy is not held to the currency gate, at boot or on a reload", BOOT,
+       "    currency_gate(policy, basis.resolver)?;\n", "")
 
 # Tool definitions.
 mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
@@ -2550,6 +2566,10 @@ mutate("gw-metrics-histogram-count-read-apart", "a histogram's _count is the cou
 # #161: the open-row query's pool is exported beside the begin and finish pools.
 mutate("gw-metrics-open-rows-pool-not-exported", "the pool metrics leave out the open-row query's pool", GW_METRICS,
        "        text.sample(name, &[(\"pool\", \"open_rows\")], of(&stats.open_rows_pool));\n", "")
+# Otto's resolver's answers, failures and latency (decision 0012). tests/currency.rs scrapes
+# them after calls that asked it.
+mutate("gw-metrics-resolver-not-exported", "the metrics leave out the resolver's counts", GW_METRICS,
+       "            resolver_signals(&mut text, &resolver.counts());\n", "            let _ = resolver;\n")
 # The receipts in unknown and the age of the oldest (design section 11, "Signals"), counted by
 # the open-row poll. tests/metrics.rs scrapes them, against Postgres and against a database that
 # is not there; metrics.rs's own tests render them.
@@ -2811,6 +2831,34 @@ mutate("gw-grant-unserved-tool-kept", "a verified grant keeps a tool the surface
        "            .filter(|tool| snapshot.tool_on_surface(surface, tool).is_some())\n", "")
 mutate("gw-grant-lifetime-failure-logged", "a lifetime failure is logged one by one", GRANTS_SRC,
        "            FailureKind::Expired | FailureKind::NotYetValid | FailureKind::LifetimeOverCeiling => {}\n", "")
+
+# The currency question on the request path (decision 0012, #22): asked once, only for a
+# tools/call of a tool not classified read, under a profile that requires currency, with a
+# verified delegation, and its answer decided on. tests/currency.rs catches these.
+GW_CURRENCY = GW + "currency.rs"
+mutate("gw-currency-asked-for-a-read", "a read is asked about too", GW_CURRENCY,
+       "        .is_some_and(|tool| tool.classification != Classification::Read);",
+       "        .is_some();")
+mutate("gw-currency-asked-for-tools-list", "tools/list asks about each tool it lists", GW_PATH,
+       "        let tools = list_tools(policy.snapshot(), &caller);\n",
+       "        let tools = list_tools(policy.snapshot(), &caller);\n"
+       "        for tool in &tools {\n"
+       "            let requested = RequestedTool::new(tool.name.as_str());\n"
+       "            let _ = self.currency(policy.snapshot(), &caller, &requested).await;\n"
+       "        }\n")
+mutate("gw-currency-asked-without-a-verified-delegation", "a call with no delegation, or one that did not verify, is asked about under a turn it does not have", GW_CURRENCY,
+       "        Some(PresentedDelegation::Unverified(_)) | None => None,",
+       "        Some(PresentedDelegation::Unverified(_)) | None => Some(CurrencyQuestion {\n"
+       "            session: gateway_core::SessionId::new(\"unverified\"),\n"
+       "            execution: gateway_core::ExecutionId::new(\"unverified\"),\n"
+       "            turn: gateway_core::TurnId::new(\"unverified\"),\n"
+       "            epoch: 1,\n"
+       "        }),")
+mutate("gw-currency-answer-dropped", "the resolver is asked and its answer dropped, so the call is decided as not asked", GW_PATH,
+       "        Currency::Asked(answer)\n    }\n",
+       "        let _ = answer;\n        Currency::NotAsked\n    }\n")
+mutate("gw-currency-asked-whatever-the-profile", "a call is asked about under a profile that does not require currency", GW_CURRENCY,
+       "    if !requires_currency {\n        return None;\n    }\n", "    let _ = requires_currency;\n")
 
 
 # --- gateway server ------------------------------------------------------------------------
