@@ -161,8 +161,8 @@ lines only once the interfaces between them have settled.
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
-| `connector-github` | GitHub tools. They ask the key custodian for tokens through the client in `key-custodian`. |
-| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway links the client and never the key-holding process. |
+| `connector-github` | The GitHub connector, in the gateway's own process: Otto's GitHub tools, so far `github__get_file`, `github__get_pr` and `github__get_issue`. Every token comes from the key custodian, through the client in `key-custodian`. A fake GitHub REST API behind `test-support`. |
+| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway never starts the key-holding process; it links the whole crate, server code too, until the crate gains a client-only feature (#219). |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
@@ -702,8 +702,22 @@ to a minute between attempts, until GitHub accepts it or the token reaches GitHu
 while GitHub refuses revocations a token works past its lifetime, until GitHub's expiry at
 most, an hour after it was issued. Each request writes one JSON line to
 the custodian's own record, with the revision it was checked against and never the token, and
-is counted on a metrics listener of its own. It is not wired into the gateway or any
-deployment yet: the GitHub connector does that.
+is counted on a metrics listener of its own. No demo deploys it: that needs a real App.
+
+**The GitHub connector as built** (#12, the crate `connector-github`). It runs in the
+gateway's own process and holds no key. For each call it asks the custodian for one token,
+naming the caller's proved team, the tool, the repositories, the tool's entry's permission set
+as `[[connectors]]` states it, and the revision the call was decided under, which the core
+hands every connector with the call. The repositories are narrowed as the entry says: `limit`,
+the caller's limit as the snapshot the call was decided under holds it, its GitHub
+repositories on the one organization the deployment configures, which the decision carries to
+the connector with the call; or `call`, the one repository the call names. The connector
+refuses to be built for an entry narrowed `none`. A token is used for its one call and
+dropped; it never appears in an answer, a row or a log line. A refusal by the custodian is an
+`error` of the kind `custodian_refusal`, GitHub's refusal to issue the token `vendor_refusal`,
+and a custodian that cannot be reached or does not answer in time `other`. The deployment
+file's `[github]` table names the organization, GitHub's API URL and its CA file, and the
+custodian's socket; the gateway reads no key and names none.
 
 ## 10. The denial contract
 
@@ -1103,8 +1117,9 @@ receipt.
 
 The gateway refuses any snapshot that serves a tool not classified `read` unless the audit
 store is the Postgres store, which keeps receipts, audit is on and identity is on (section 12).
-Until built-in connectors exist, no release build serves one all the same: the snapshot
-loader's rule 2 refuses every proxied tool not classified `read` (decision 0011). The first
+No release build serves one all the same: the snapshot loader's rule 2 refuses every proxied
+tool not classified `read` (decision 0011), and the one built-in connector, GitHub's, serves
+reads alone so far (#12). The first
 side effect to reach a real system also waits until someone is named to settle a receipt by
 hand and a way to record that exists (decision 0009, Still open 9 and 10).
 
@@ -1130,9 +1145,12 @@ ceilings of 60 s and 1 MiB, for a proxied server under `[servers.<name>]` and fo
 in the gateway's own process under `[connectors.<name>]`, and a cap or rate quota of zero under
 `[limits]`. The gateway refuses to start with a `[servers.<name>]` for a server the registry
 does not name, and with a `[connectors.<name>]` for a connector it does not run in its own
-process; no built-in connector is wired yet, so today every `[connectors.<name>]` is refused at
-start (#12). The boot gates wrap every connector in the gateway's own process in its bound, so
-none runs without it, and refuse one wired with a bound of zero or past the ceilings. The
+process. The one built-in connector wired is GitHub's, under the name of each GitHub entry that
+declares its credential (section 13), so any other `[connectors.<name>]` is refused at start.
+It refuses to start, too, with such an entry and no `[github]` table, and with a `[github]`
+table and no such entry (#12). The boot gates wrap every connector in the gateway's own process
+in its bound, and in the rate quotas, so none runs without them, and refuse one wired with a
+bound of zero or past the ceilings. The
 termination grace must cover the longest deadline either table sets, and demo-checks holds the
 demos' manifests to it.
 
@@ -1275,10 +1293,10 @@ can be turned on in any build, CI checks the release artifact itself: started wi
 with audit disabled, it must refuse each, and it must refuse a loopback destination. The
 identity and audit refusals, and CI's steps for them, are built (#11): the binary refuses
 each opt-out, and runs the receipt-store gate, as soon as the registry loads, before it reads
-a credential, fetches a key or connects to the audit database. Until built-in connectors exist
-(milestone 4), a registry cannot reach the receipt-store gate: the snapshot loader's rule 2
-(decision 0011) refuses every proxied tool not classified `read` first, so CI's `propose` step
-checks that refusal instead (#26 below). That still holds now that the gate passes with the
+a credential, fetches a key or connects to the audit database. A proxied tool cannot reach
+the receipt-store gate: the snapshot loader's rule 2 (decision 0011) refuses every proxied tool
+not classified `read` first, so CI's `propose` step checks that refusal instead (#26 below).
+Only a built-in tool could, and the one built-in connector serves reads alone so far (#12). That still holds now that the gate passes with the
 Postgres store, audit and identity: a release registry cannot serve a tool that is not `read`,
 and CI's check is unchanged. The loopback refusal and its step are built (#11):
 connector-proxy's own `test-support` feature, which the gateway's turns on, is the only way to
@@ -1360,6 +1378,44 @@ proxied server usually cannot be checked that way. The rules are in
 **Built-in connectors** are gateway code calling a vendor API. The GitHub connector is the
 model: it brokers a GitHub App token, limits every call to one organization before any request
 leaves, bounds result sizes, and tags every result as external evidence.
+
+As built (#12), a built-in tool is approved in the registry file as decision 0011 requires of
+every tool. Its `[[connectors]]` entry declares its credential's mode and vendor-side
+principal, its narrowing, what it permits and, for a tool declared as the reach, its reach,
+given together or not at all; an entry that declares them is a connector entry of the
+snapshot, of kind built-in, so the loader's rules apply to its tools, and one that does not
+serves no approved tool and keeps the meaning it had for the key custodian alone. Each tool is
+approved in `[[built_in_tools]]`, on an entry that lists it: its classification, its
+definition, how its resources are known (from its arguments, as the reach, none, or checked by
+the connector itself, which only gateway code may be), its settlement, and two hashes. One is
+of its definition, under its exposed name; the other, of its binding to the entry: the entry's
+system, credential, narrowing, what it permits, permission set and reach. The loader
+recomputes both, as it does a proxied tool's. A resource source may be qualified by a second
+argument, so `{ from_argument = "repo", qualified_by = "owner" }` names the repository
+`owner/repo` exactly as a limit holds it. The gateway registers the connector under each
+entry's name, reads its calls with the registry's adapters behind the argument check, wraps it
+in its bound and quotas, and refuses, at boot and on every reload, an approved definition that
+is not the one the connector serves. The narrowing gate refuses a proxied entry narrowed per
+call or to the limit, and no built-in entry: its connector narrows. A reload that changes a
+built-in entry under the same revision is refused as an unchanged revision, as the custodian
+refuses it, and under a new one until a restart, since the connector was built with the entry.
+
+The GitHub connector serves three of Otto's read tools so far: `github__get_file`,
+`github__get_pr` and `github__get_issue`. Each checks, before anything is asked of the
+custodian or of GitHub, what Otto's gateway checks (docs/otto-baseline.md): its arguments
+parse into its own types, and a malformed one is `error` with the kind `invalid_arguments`; its
+owner is the configured organization, and a call naming another is `refused`, with the
+sentence the caller read on the row. Its repository is within the team's limit, which check 6
+decides from the resource its adapter names, so a repository outside the limit is denied there,
+with no request. Otto's gateway refuses such a call from the connector instead, and so does
+this gateway for a repository of another organization that a limit holds. A file is cut at
+256 KiB and an issue's or a pull request's comments at the first twenty, oldest first, each
+said to be cut; every result carries `provenance`, with `"trust": "untrusted-external"`. GitHub's
+404, which it also answers for a repository the token cannot see, is `other`; its 403 is
+`vendor_refusal`; its rate limit is `other`, with a sentence saying so. None of the three checks
+its own scope, so none has resources to report when it finishes: each is declared from its
+arguments, and its row names its repository. The other read tools, the write tools, Jira, the
+lookup by marker and the comment exception are not built.
 
 **Proxied servers** are onboarded through the registry:
 
@@ -1612,7 +1668,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   `oversized_or_late_read` for a `read` tool. From any other tool each of these, and every
   outcome but a success once the request may have been sent, is not an error at all but the
   outcome `unknown` (#55, section 11); a guard given up, a lost
-  begin's completion and a cancelled read are `other`. Nothing reports `custodian_refusal` yet.
+  begin's completion and a cancelled read are `other`. The GitHub connector reports
+  `custodian_refusal` when the key custodian refuses its token, and `vendor_refusal` for
+  GitHub's 403 (#12).
   How the resources were found, and the credential identity: built (#56). A tool declared as
   its connector entry's reach is read by the gateway's one constant adapter, which names the
   entry's whole reach from the policy version the call is decided from, whatever the
@@ -1903,10 +1961,11 @@ opt-outs and the policy's maximum age (#132), and the limits, caps and isolation
   withdraws them on reload (section 8); a surface that serves them, such as `registry-reach`,
   must drop them too. The scheduled reach check is built
   (the drift pass entry below). Not built: a check against a vendor's report of what a
-  credential reaches, and narrowing a credential per call or to the caller's limit. The
-  gateway sends the same credential on every call to a server, so it refuses an entry whose
-  narrowing is not `none`, until the custodian client (#12). The refusal is one of the gates
-  every registry's policy meets, at boot and on every reload, whoever wires the connectors.
+  credential reaches, and narrowing a proxied server's credential per call or to the caller's
+  limit. The gateway sends the same credential on every call to a server, so it refuses a
+  proxied entry whose narrowing is not `none`; a built-in entry's connector narrows its own
+  (#12, section 13). The refusal is one of the gates every registry's policy meets, at boot and
+  on every reload, whoever wires the connectors.
   The JSON configuration's boot runs it too, and the start also runs it before it reads a
   credential.
 - The kind slice extended to show them: built (#156, #169, #176). Both demos register the mock
@@ -2164,13 +2223,29 @@ that removes the exception-list check.
   counted; the record holding no token; nothing a client receives, nor the record or the
   metrics, holding the key; and each start refusal. The peer check is tested the same way on
   Linux and macOS: the socket is served to another UID than the test's. The registry's
-  `[[connectors]]` states each built-in entry's permission set and tools; the gateway loads and
-  checks it and otherwise ignores it. Not built: the GitHub connector that asks the custodian,
-  and any deployment of it. Left as they are: a token whose revocation GitHub keeps refusing,
+  `[[connectors]]` states each built-in entry's permission set and tools. Not built: any
+  deployment of the custodian. Left as they are: a token whose revocation GitHub keeps refusing,
   and any token not yet revoked when the custodian stops, works until GitHub's expiry, an hour
   at most after it was issued; and a registry file under a new revision that the loader accepts
   but the gateway's reload refuses makes the custodian refuse every request as stale until the
   two agree.
+
+- Built, as the crate `connector-github`: the GitHub connector and its first three read
+  tools, `github__get_file`, `github__get_pr` and `github__get_issue` (section 13), with
+  built-in approvals in the registry and the connector wired from the deployment file's
+  `[github]` (sections 9 and 12). Its tests run the gateway over HTTP against the custodian on
+  its fake App API, a fake GitHub REST API that answers only tokens that API issued, scoped as
+  asked, and the testkit's issuer: each tool's success; another organization refused before
+  any request; a repository outside the team's limit denied at check 6 with no request; the
+  token narrowed to the team's repositories on the organization, or to the call's, with the
+  entry's permissions and the revision; a custodian refusal and a custodian that is not there;
+  each vendor error; no token in an answer, a row or a log line; the in-process bound, late
+  and oversized; the team's rate quota, from the wiring and from the deployment file; each
+  start refusal; and a reload that changes an entry. Not built: the other read tools, the
+  write tools, Jira, lookups, the comment exception, and any deployment of a GitHub entry,
+  which needs a real App. Left as they are: GitHub names are compared case-sensitively, so a
+  call that writes an owner or a repository in another case than its limit does is denied;
+  and each GitHub entry has quota buckets of its own, not GitHub as a whole.
 
 **#12, the bound around in-process connectors and the rate quotas** (decision 0014, sections 1
 and 2). Built before any built-in connector, so the first one is bounded from its first call:
