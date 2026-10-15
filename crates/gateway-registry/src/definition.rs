@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::builtin::BuiltInEntry;
 use crate::registry::Server;
 
 /// The dialect of every approved input schema. Only JSON Schema 2020-12 loads (decision 0013),
@@ -109,16 +110,8 @@ pub fn definition_sha256(
 /// the probe record or the reach check: the drift pass repeats the probe and the reach check.
 pub fn binding_sha256(server: &Server) -> String {
     let credential = &server.credential;
-    let mode = match credential.mode {
-        CredentialMode::TeamServiceIdentity => "team_service_identity",
-        CredentialMode::GatewayToken => "gateway_token",
-        CredentialMode::PerUserGrant => "per_user_grant",
-    };
-    let narrowing = match server.narrowing {
-        Narrowing::Call => "call",
-        Narrowing::Limit => "limit",
-        Narrowing::None => "none",
-    };
+    let mode = credential_mode(credential.mode);
+    let narrowing = narrowing_name(server.narrowing);
     let reach: Vec<Value> = server
         .reach
         .iter()
@@ -159,6 +152,73 @@ pub fn binding_sha256(server: &Server) -> String {
     binding.insert("reach".into(), Value::Array(reach));
     binding.insert("reach_test_date".into(), tested);
     sha256_hex(&Value::Object(binding))
+}
+
+/// The SHA-256 of a built-in tool's binding to `entry`, its built-in connector entry, in
+/// lower-case hex, or `None` for an entry that declares no credential, which serves no approved
+/// tool. Each built-in tool's approval records it, and the loader recomputes it at boot and on
+/// every reload, as it does [`binding_sha256`] for a proxied tool, so a changed entry needs its
+/// tools approved again.
+///
+/// The hashed text is one JSON object, written as [`definition_sha256`] writes its own. Its keys
+/// are:
+///
+/// - `kind`: always `"built_in"`, so no built-in binding is a proxied one's;
+/// - `credential_mode` and `credential_principal`, as [`binding_sha256`] has them;
+/// - `dialect`: the input schema's dialect, always [`SCHEMA_DIALECT`];
+/// - `narrowing` and `permits`, as [`binding_sha256`] has them;
+/// - `permissions`: an object of each vendor permission the credential may be asked for and
+///   its level, `"read"` or `"write"`;
+/// - `reach`: the reach, as [`binding_sha256`] has it;
+/// - `system`: the system the entry's credential reaches.
+///
+/// The entry's name and the tools it lists are not in it.
+pub fn built_in_binding_sha256(entry: &BuiltInEntry) -> Option<String> {
+    let declaration = entry.declaration.as_ref()?;
+    let permissions: serde_json::Map<String, Value> = entry
+        .permissions
+        .iter()
+        .map(|(name, level)| (name.clone(), Value::String(level.as_str().into())))
+        .collect();
+    let reach: Vec<Value> = declaration
+        .reach
+        .iter()
+        .map(|resource| {
+            json!({
+                "system": resource.system,
+                "kind": resource.kind,
+                "identifier": resource.identifier,
+            })
+        })
+        .collect();
+    let binding = json!({
+        "kind": "built_in",
+        "credential_mode": credential_mode(declaration.credential),
+        "credential_principal": declaration.principal,
+        "dialect": SCHEMA_DIALECT,
+        "narrowing": narrowing_name(declaration.narrowing),
+        "permits": declaration.permits.as_str(),
+        "permissions": permissions,
+        "reach": reach,
+        "system": entry.system,
+    });
+    Some(sha256_hex(&binding))
+}
+
+fn credential_mode(mode: CredentialMode) -> &'static str {
+    match mode {
+        CredentialMode::TeamServiceIdentity => "team_service_identity",
+        CredentialMode::GatewayToken => "gateway_token",
+        CredentialMode::PerUserGrant => "per_user_grant",
+    }
+}
+
+fn narrowing_name(narrowing: Narrowing) -> &'static str {
+    match narrowing {
+        Narrowing::Call => "call",
+        Narrowing::Limit => "limit",
+        Narrowing::None => "none",
+    }
 }
 
 /// The SHA-256 of `value`'s canonical text, in lower-case hex.

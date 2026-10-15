@@ -3,9 +3,12 @@
 //!
 //! An adapter is declared in the registry file as a list of sources, each
 //! `{from_argument, system, kind}`: the named argument's string value is the identifier of a
-//! resource of that system and kind. The core's check 6 then compares the resources against
-//! the caller's limit. An adapter that cannot find a resource says so by naming none, which
-//! check 6 denies for a tool that declares its resources; it never guesses.
+//! resource of that system and kind. A source may add `qualified_by`, another string argument
+//! whose value comes first, joined by `/`: `{from_argument = "repo", qualified_by = "owner"}`
+//! names the repository `owner/repo`, exactly as a GitHub limit holds it. The core's check 6
+//! then compares the resources against the caller's limit. An adapter that cannot find a
+//! resource says so by naming none, which check 6 denies for a tool that declares its
+//! resources; it never guesses.
 //!
 //! # The argument check
 //!
@@ -75,6 +78,10 @@ use thiserror::Error;
 pub struct ResourceSource {
     /// The top-level argument that holds the identifier, such as `project`.
     pub from_argument: String,
+    /// The top-level argument whose value comes before it in the identifier, followed by `/`,
+    /// such as `owner` before a repository's name; `None` when the identifier is
+    /// `from_argument`'s value alone.
+    pub qualified_by: Option<String>,
     /// The resource's system, such as `docs`.
     pub system: String,
     /// The resource's kind within the system, such as `project`.
@@ -180,24 +187,34 @@ impl ArgumentAdapter {
 
     /// The resources a call with these arguments names, for the call context's `resources`.
     ///
-    /// One resource per source, in the order the file lists them. If any source's argument is
-    /// missing, is not a string, or is the empty string, the call names no resources at all:
-    /// `Named([])`, which check 6 denies for a `declared` tool. Returning the others would let
-    /// a call through with one of its targets unchecked. A tool with no sources always names
-    /// none. The result is never `Unknown`: the adapter reads the arguments, so it knows.
+    /// One resource per source, in the order the file lists them. If any source's argument,
+    /// or the argument it is qualified by, is missing, is not a string, or is the empty string,
+    /// the call names no resources at all: `Named([])`, which check 6 denies for a `declared`
+    /// tool. Returning the others would let a call through with one of its targets unchecked.
+    /// A tool with no sources always names none. The result is never `Unknown`: the adapter
+    /// reads the arguments, so it knows.
     pub fn resources(&self, arguments: &Map<String, Value>) -> Resources {
+        let text = |argument: &str| match arguments.get(argument) {
+            Some(Value::String(text)) if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        };
         let mut named = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
-            match arguments.get(&source.from_argument) {
-                Some(Value::String(identifier)) if !identifier.is_empty() => {
-                    named.push(Resource {
-                        system: source.system.clone(),
-                        kind: source.kind.clone(),
-                        identifier: identifier.clone(),
-                    });
-                }
-                _ => return Resources::Named(Vec::new()),
-            }
+            let Some(value) = text(&source.from_argument) else {
+                return Resources::Named(Vec::new());
+            };
+            let identifier = match &source.qualified_by {
+                Some(qualifier) => match text(qualifier) {
+                    Some(qualifier) => format!("{qualifier}/{value}"),
+                    None => return Resources::Named(Vec::new()),
+                },
+                None => value.to_owned(),
+            };
+            named.push(Resource {
+                system: source.system.clone(),
+                kind: source.kind.clone(),
+                identifier,
+            });
         }
         Resources::Named(named)
     }

@@ -16,10 +16,12 @@ use toml::value::Datetime;
 
 use crate::adapter::{self, ArgumentAdapter, JsonPointer, ResourceSource, SchemaProblem};
 use crate::builtin::{BuiltInEntry, built_in};
-use crate::definition::{Approval, Route, ToolDefinition, binding_sha256, definition_sha256};
+use crate::definition::{
+    Approval, Route, ToolDefinition, binding_sha256, built_in_binding_sha256, definition_sha256,
+};
 use crate::file::{
-    PrincipalsFile, RegistryFile, ResourceFile, ResourcesFile, RulePrincipalFile, ServerFile,
-    ToolFile,
+    BuiltInResourcesFile, BuiltInToolFile, PrincipalsFile, RegistryFile, ResourceFile,
+    ResourcesFile, RulePrincipalFile, ServerFile, SourceFile, ToolFile,
 };
 use crate::selection::{NoProfile, ProfileRule, ProfileRules, RulePrincipal};
 
@@ -497,6 +499,75 @@ pub enum RegistryError {
         /// The built-in entry.
         entry: ConnectorName,
     },
+    /// A built-in entry gives some of its credential, narrowing, what it permits and its reach,
+    /// and not the rest: they are given together or not at all.
+    #[error(
+        "connector `{0}` gives some of `credential`, `narrowing`, `permits` and `reach` but not \
+         the others; give the first three together, with `reach` if a tool is declared as it, \
+         or none of them"
+    )]
+    EntryPartlyDeclared(ConnectorName),
+    /// A built-in tool's approval names a connector entry the file does not have.
+    #[error(
+        "built-in tool `{tool}` names connector `{connector}`, which is not a `[[connectors]]` entry"
+    )]
+    UnknownConnector {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it names.
+        connector: ConnectorName,
+    },
+    /// A built-in tool's entry declares no credential, so decision 0011 cannot hold its tools
+    /// to the snapshot loader's rules.
+    #[error(
+        "built-in tool `{tool}` is approved on connector `{connector}`, which declares no \
+         `credential`, `narrowing` and `permits`; declare them on the entry"
+    )]
+    EntryUndeclared {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it names.
+        connector: ConnectorName,
+    },
+    /// A built-in tool is approved on an entry that does not list it among the tools it
+    /// serves, so the key custodian would not know its permission set.
+    #[error(
+        "built-in tool `{tool}` is approved on connector `{connector}`, which does not list it in `tools`"
+    )]
+    BuiltInToolNotListed {
+        /// The tool.
+        tool: ToolName,
+        /// The entry it names.
+        connector: ConnectorName,
+    },
+    /// A built-in tool's binding to its entry does not hash to what was approved: the entry's
+    /// credential, narrowing, permissions or reach changed after approval.
+    #[error(
+        "built-in tool `{tool}`'s binding to connector `{connector}` hashes to {computed}, not \
+         the approved {recorded}; approve it again"
+    )]
+    BuiltInBindingChanged {
+        /// The tool.
+        tool: ToolName,
+        /// Its entry.
+        connector: ConnectorName,
+        /// The hash the approval recorded.
+        recorded: String,
+        /// The hash of the entry in the file.
+        computed: String,
+    },
+    /// A tool qualifies its resource by an argument its schema does not declare as a string at
+    /// the top level.
+    #[error(
+        "tool `{tool}` qualifies its resource by `{argument}`, which its input schema does not \
+         declare as a string"
+    )]
+    AdapterQualifierNotString {
+        /// The tool.
+        tool: ToolName,
+        /// The argument.
+        argument: String,
+    },
     /// A profile rule names a profile the file does not define.
     #[error("a profile rule names profile `{0}`, which is not defined")]
     UnknownProfile(ProfileName),
@@ -520,6 +591,7 @@ pub struct Registry {
     approvals: BTreeMap<ToolName, Approval>,
     servers: BTreeMap<ConnectorName, Server>,
     connectors: BTreeMap<ConnectorName, BuiltInEntry>,
+    built_in_tools: BTreeMap<ToolName, ConnectorName>,
     profile_rules: ProfileRules,
 }
 
@@ -602,6 +674,13 @@ impl Registry {
     /// Every built-in connector entry, by name.
     pub fn connectors(&self) -> &BTreeMap<ConnectorName, BuiltInEntry> {
         &self.connectors
+    }
+
+    /// Every approved built-in tool, by exposed name, with the entry it is approved on. Its
+    /// definition, adapter and approval are among the others; it has no route, since nothing
+    /// is forwarded.
+    pub fn built_in_tools(&self) -> &BTreeMap<ToolName, ConnectorName> {
+        &self.built_in_tools
     }
 
     /// The profile-selection rules.
@@ -690,6 +769,26 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
 
     let proxied: BTreeSet<ToolName> = routes.keys().cloned().collect();
     let connectors = built_in(file.connectors, &servers, &proxied)?;
+    let mut built_in_tools = BTreeMap::new();
+    for tool in file.built_in_tools {
+        let checked = check_built_in_tool(tool, &connectors)?;
+        let name = checked.definition.name.clone();
+        if definitions.contains_key(&name) {
+            return Err(RegistryError::DuplicateTool(name));
+        }
+        approved.push(ApprovedTool {
+            name: name.clone(),
+            classification: checked.classification,
+            connector: checked.route.server.clone(),
+            resources: checked.resources,
+            declared_from: checked.declared_from,
+            settlement: checked.settlement,
+        });
+        built_in_tools.insert(name.clone(), checked.route.server);
+        definitions.insert(name.clone(), checked.definition);
+        adapters.insert(name.clone(), checked.adapter);
+        approvals.insert(name, checked.approval);
+    }
 
     let surfaces = file
         .surfaces
@@ -733,7 +832,11 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         surfaces,
         profiles,
         limits,
-        entries: servers.values().map(entry).collect(),
+        entries: servers
+            .values()
+            .map(entry)
+            .chain(connectors.values().filter_map(BuiltInEntry::snapshot_entry))
+            .collect(),
     })?;
 
     let mut covered = BTreeSet::new();
@@ -767,6 +870,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         approvals,
         servers,
         connectors,
+        built_in_tools,
         profile_rules: ProfileRules::new(rules),
     })
 }
@@ -1019,37 +1123,7 @@ fn check_tool(
         return Err(RegistryError::ApprovedAtIncomplete(name));
     }
 
-    if tool.input_schema.get("type") != Some(&Value::String("object".into())) {
-        return Err(RegistryError::SchemaNotObject(name));
-    }
-    adapter::followable(&tool.input_schema, &JsonPointer::default()).map_err(|problem| {
-        match problem {
-            SchemaProblem::Unfollowed { keyword, at } => RegistryError::SchemaUnfollowed {
-                tool: name.clone(),
-                keyword,
-                at,
-            },
-            SchemaProblem::Malformed { at } => RegistryError::SchemaMalformed {
-                tool: name.clone(),
-                at,
-            },
-            SchemaProblem::Dialect { dialect } => RegistryError::SchemaDialect {
-                tool: name.clone(),
-                dialect,
-            },
-            SchemaProblem::AdditionalProperties { at } => {
-                RegistryError::SchemaAdditionalPropertiesMalformed {
-                    tool: name.clone(),
-                    at,
-                }
-            }
-            SchemaProblem::Repeated { name: repeated, at } => RegistryError::SchemaRepeatedName {
-                tool: name.clone(),
-                name: repeated,
-                at,
-            },
-        }
-    })?;
+    check_schema(&name, &tool.input_schema)?;
 
     let computed = definition_sha256(
         &tool.upstream_name,
@@ -1079,35 +1153,10 @@ fn check_tool(
         // The gateway's one constant adapter names the entry's reach for it, so its argument
         // adapter reads no resources; it still checks the arguments against the schema.
         ResourcesFile::AsReach => (Vec::new(), Some(DeclaredFrom::Reach)),
-        ResourcesFile::FromArguments(sources) => {
-            if sources.is_empty() {
-                return Err(RegistryError::AdapterWithoutSources(name));
-            }
-            let properties = tool.input_schema.get("properties");
-            let mut checked = Vec::with_capacity(sources.len());
-            for source in sources {
-                require(&source.system, "resources.system", place)?;
-                require(&source.kind, "resources.kind", place)?;
-                let Some(property) = properties.and_then(|p| p.get(&source.from_argument)) else {
-                    return Err(RegistryError::AdapterArgumentUndeclared {
-                        tool: name,
-                        argument: source.from_argument,
-                    });
-                };
-                if property.get("type") != Some(&Value::String("string".into())) {
-                    return Err(RegistryError::AdapterArgumentNotString {
-                        tool: name,
-                        argument: source.from_argument,
-                    });
-                }
-                checked.push(ResourceSource {
-                    from_argument: source.from_argument,
-                    system: source.system,
-                    kind: source.kind,
-                });
-            }
-            (checked, Some(DeclaredFrom::Arguments))
-        }
+        ResourcesFile::FromArguments(sources) => (
+            sources_from(&name, &tool.input_schema, sources)?,
+            Some(DeclaredFrom::Arguments),
+        ),
     };
     let adapter = ArgumentAdapter::new(name.clone(), sources, tool.input_schema.clone());
     let resources = match declared_from {
@@ -1141,6 +1190,205 @@ fn check_tool(
     })
 }
 
+/// Checks a tool's input schema: an object schema, in the subset of JSON Schema 2020-12 the
+/// argument check follows.
+fn check_schema(name: &ToolName, schema: &Value) -> Result<(), RegistryError> {
+    if schema.get("type") != Some(&Value::String("object".into())) {
+        return Err(RegistryError::SchemaNotObject(name.clone()));
+    }
+    adapter::followable(schema, &JsonPointer::default()).map_err(|problem| match problem {
+        SchemaProblem::Unfollowed { keyword, at } => RegistryError::SchemaUnfollowed {
+            tool: name.clone(),
+            keyword,
+            at,
+        },
+        SchemaProblem::Malformed { at } => RegistryError::SchemaMalformed {
+            tool: name.clone(),
+            at,
+        },
+        SchemaProblem::Dialect { dialect } => RegistryError::SchemaDialect {
+            tool: name.clone(),
+            dialect,
+        },
+        SchemaProblem::AdditionalProperties { at } => {
+            RegistryError::SchemaAdditionalPropertiesMalformed {
+                tool: name.clone(),
+                at,
+            }
+        }
+        SchemaProblem::Repeated { name: repeated, at } => RegistryError::SchemaRepeatedName {
+            tool: name.clone(),
+            name: repeated,
+            at,
+        },
+    })
+}
+
+/// The resource sources of a tool that reads its resources from its arguments: at least one,
+/// each from a string argument its schema declares at the top level, and qualified, if at all,
+/// by another.
+fn sources_from(
+    name: &ToolName,
+    schema: &Value,
+    sources: Vec<SourceFile>,
+) -> Result<Vec<ResourceSource>, RegistryError> {
+    if sources.is_empty() {
+        return Err(RegistryError::AdapterWithoutSources(name.clone()));
+    }
+    let place = || format!("tool `{name}`");
+    let properties = schema.get("properties");
+    // Whether `argument` is declared, and if so whether as a string.
+    let string = |argument: &str| {
+        properties
+            .and_then(|p| p.get(argument))
+            .map(|property| property.get("type") == Some(&Value::String("string".into())))
+    };
+    let mut checked = Vec::with_capacity(sources.len());
+    for source in sources {
+        require(&source.system, "resources.system", place)?;
+        require(&source.kind, "resources.kind", place)?;
+        match string(&source.from_argument) {
+            None => {
+                return Err(RegistryError::AdapterArgumentUndeclared {
+                    tool: name.clone(),
+                    argument: source.from_argument,
+                });
+            }
+            Some(false) => {
+                return Err(RegistryError::AdapterArgumentNotString {
+                    tool: name.clone(),
+                    argument: source.from_argument,
+                });
+            }
+            Some(true) => {}
+        }
+        if let Some(qualifier) = &source.qualified_by
+            && string(qualifier) != Some(true)
+        {
+            return Err(RegistryError::AdapterQualifierNotString {
+                tool: name.clone(),
+                argument: qualifier.clone(),
+            });
+        }
+        checked.push(ResourceSource {
+            from_argument: source.from_argument,
+            qualified_by: source.qualified_by,
+            system: source.system,
+            kind: source.kind,
+        });
+    }
+    Ok(checked)
+}
+
+/// Checks a built-in tool's approval against its entry, as [`check_tool`] checks a proxied
+/// tool's against its server. Its definition is hashed under its exposed name, since it has no
+/// upstream name, and its binding by [`built_in_binding_sha256`]. Its route names its entry and
+/// its own name; it carries the entry to the loader and is not kept, since nothing is
+/// forwarded.
+fn check_built_in_tool(
+    tool: BuiltInToolFile,
+    connectors: &BTreeMap<ConnectorName, BuiltInEntry>,
+) -> Result<CheckedTool, RegistryError> {
+    let name = tool.name;
+    let place = || format!("built-in tool `{name}`");
+    let Some(entry) = connectors.get(&tool.connector) else {
+        return Err(RegistryError::UnknownConnector {
+            tool: name,
+            connector: tool.connector,
+        });
+    };
+    let Some(binding) = built_in_binding_sha256(entry) else {
+        return Err(RegistryError::EntryUndeclared {
+            tool: name,
+            connector: tool.connector,
+        });
+    };
+    if !under_system(&name, &entry.system) {
+        return Err(RegistryError::NameOutsideSystem {
+            tool: name,
+            system: entry.system.clone(),
+        });
+    }
+    if !entry.tools.contains(&name) {
+        return Err(RegistryError::BuiltInToolNotListed {
+            tool: name,
+            connector: tool.connector,
+        });
+    }
+    require(&tool.description, "description", place)?;
+    require(&tool.approved_by, "approved_by", place)?;
+    if let Some(title) = &tool.title {
+        require(title, "title", place)?;
+    }
+    let at = tool.approved_at;
+    if at.offset.is_none() {
+        return Err(RegistryError::ApprovedAtIncomplete(name));
+    }
+    check_schema(&name, &tool.input_schema)?;
+    let computed = definition_sha256(
+        name.as_str(),
+        tool.title.as_deref(),
+        &tool.description,
+        &tool.input_schema,
+    );
+    if computed != tool.definition_sha256 {
+        return Err(RegistryError::DefinitionChanged {
+            tool: name,
+            recorded: tool.definition_sha256,
+            computed,
+        });
+    }
+    if binding != tool.binding_sha256 {
+        return Err(RegistryError::BuiltInBindingChanged {
+            tool: name,
+            connector: tool.connector,
+            recorded: tool.binding_sha256,
+            computed: binding,
+        });
+    }
+    let (sources, declared_from, resources) = match tool.resources {
+        BuiltInResourcesFile::NoResources => (Vec::new(), None, ResourceDeclaration::NoResources),
+        BuiltInResourcesFile::AsReach => (
+            Vec::new(),
+            Some(DeclaredFrom::Reach),
+            ResourceDeclaration::Declared,
+        ),
+        BuiltInResourcesFile::FromArguments(sources) => (
+            sources_from(&name, &tool.input_schema, sources)?,
+            Some(DeclaredFrom::Arguments),
+            ResourceDeclaration::Declared,
+        ),
+        BuiltInResourcesFile::ChecksOwnScope => {
+            (Vec::new(), None, ResourceDeclaration::ChecksOwnScope)
+        }
+    };
+    let adapter = ArgumentAdapter::new(name.clone(), sources, tool.input_schema.clone());
+    Ok(CheckedTool {
+        resources,
+        declared_from,
+        adapter,
+        definition: ToolDefinition {
+            name: name.clone(),
+            title: tool.title,
+            description: tool.description,
+            input_schema: tool.input_schema,
+            read_only: tool.classification == gateway_core::Classification::Read,
+        },
+        route: Route {
+            server: tool.connector,
+            upstream_name: name.as_str().to_owned(),
+        },
+        approval: Approval {
+            approved_by: tool.approved_by,
+            approved_at: at.to_string(),
+            definition_sha256: tool.definition_sha256,
+            binding_sha256: tool.binding_sha256,
+        },
+        classification: tool.classification,
+        settlement: tool.settlement,
+    })
+}
+
 fn limit_sets<K: Ord + std::fmt::Display>(
     limits: BTreeMap<K, Vec<ResourceFile>>,
     owner: &str,
@@ -1154,7 +1402,7 @@ fn limit_sets<K: Ord + std::fmt::Display>(
 }
 
 /// A limit's or a reach's resources, each with a system, a kind and an identifier.
-fn resource_set(
+pub(crate) fn resource_set(
     resources: Vec<ResourceFile>,
     place: impl Fn() -> String,
 ) -> Result<BTreeSet<Resource>, RegistryError> {

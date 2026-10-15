@@ -7,18 +7,28 @@
 //! credential belongs to the entry: two tools that need different permission sets are served
 //! by two entries, and an approval cannot ask for more than its entry's credential carries.
 //!
-//! Until a built-in connector's tools are approved in this file, an entry lists the tools it
-//! serves. Only the key custodian reads these entries (design section 9): it checks each token
-//! request against the permission set of the tool that asks. The gateway loads them, so a file
-//! with a malformed entry is refused by both, and otherwise ignores them.
+//! An entry lists the tools it serves, and the key custodian reads these entries (design
+//! section 9): it checks each token request against the permission set of the tool that asks.
+//!
+//! An entry that serves an approved tool, `[[built_in_tools]]` in the file, also declares its
+//! credential as decision 0011, section 1, has every entry do: the credential's mode and the
+//! vendor-side identity it acts as, how it is narrowed on each call, what it permits and, when
+//! a tool is declared as the reach, its reach. These are given together or not at all. An entry
+//! without them serves no approved tool, as every entry did before built-in tools could be
+//! approved, and keeps that meaning: the custodian reads it, and the gateway loads and
+//! otherwise ignores it. An entry with them is a connector entry of the snapshot, of kind
+//! built-in, so the snapshot loader's rules apply to its tools.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use gateway_core::{ConnectorName, ToolName};
+use gateway_core::{
+    Classification, ConnectorEntry, ConnectorName, CredentialMode, EntryKind, Narrowing, Resource,
+    ToolName,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::file::ConnectorFile;
-use crate::registry::{RegistryError, Server};
+use crate::registry::{RegistryError, Server, resource_set};
 
 /// The level of one vendor permission, as GitHub names them: `read` below `write`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -51,6 +61,42 @@ pub struct BuiltInEntry {
     pub permissions: BTreeMap<String, Access>,
     /// The tools it serves. Each tool is served by one entry at most.
     pub tools: BTreeSet<ToolName>,
+    /// The entry's credential as decision 0011 records it, when the entry serves approved
+    /// tools; `None` for an entry the custodian alone reads.
+    pub declaration: Option<EntryDeclaration>,
+}
+
+/// A built-in entry's credential as decision 0011, section 1, records it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EntryDeclaration {
+    /// The credential's mode.
+    pub credential: CredentialMode,
+    /// The vendor-side identity the credential acts as, such as a GitHub App's name. Never the
+    /// secret.
+    pub principal: String,
+    /// What the credential is narrowed to on each call.
+    pub narrowing: Narrowing,
+    /// The highest classification any call made with the credential could have.
+    pub permits: Classification,
+    /// What the credential reaches, for a tool declared as the reach. Empty when not given.
+    pub reach: BTreeSet<Resource>,
+}
+
+impl BuiltInEntry {
+    /// The entry's connector entry in the snapshot, when it is declared.
+    pub(crate) fn snapshot_entry(&self) -> Option<ConnectorEntry> {
+        let declaration = self.declaration.as_ref()?;
+        Some(ConnectorEntry {
+            name: self.name.clone(),
+            kind: EntryKind::BuiltIn,
+            credential: declaration.credential,
+            principal: declaration.principal.clone(),
+            narrowing: declaration.narrowing,
+            permits: declaration.permits,
+            reach: declaration.reach.clone(),
+            reach_tested_on: None,
+        })
+    }
 }
 
 /// Whether `name` is a permission name as GitHub writes one: lowercase ASCII letters and
@@ -122,6 +168,28 @@ pub(crate) fn built_in(
                 });
             }
         }
+        let declaration = match (entry.credential, entry.narrowing, entry.permits) {
+            (Some(credential), Some(narrowing), Some(permits)) => {
+                if credential.principal.is_empty() {
+                    return Err(RegistryError::EmptyField {
+                        field: "credential.principal",
+                        place: format!("connector `{}`", entry.name),
+                    });
+                }
+                let reach = resource_set(entry.reach.unwrap_or_default(), || {
+                    format!("the reach of connector `{}`", entry.name)
+                })?;
+                Some(EntryDeclaration {
+                    credential: credential.mode,
+                    principal: credential.principal,
+                    narrowing,
+                    permits,
+                    reach,
+                })
+            }
+            (None, None, None) if entry.reach.is_none() => None,
+            _ => return Err(RegistryError::EntryPartlyDeclared(entry.name)),
+        };
         checked.insert(
             entry.name.clone(),
             BuiltInEntry {
@@ -129,6 +197,7 @@ pub(crate) fn built_in(
                 system: entry.system,
                 permissions: entry.permissions,
                 tools: entry.tools,
+                declaration,
             },
         );
     }

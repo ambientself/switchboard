@@ -12,7 +12,10 @@
 //! - a [`Route`] and an [`Approval`] per tool, the [`Server`] records, and the
 //!   [`ProfileRules`];
 //! - a [`BuiltInEntry`] per built-in connector entry, which states the vendor permissions its
-//!   credential may be asked for. Only the key custodian reads them yet.
+//!   credential may be asked for, and, for an entry that serves approved tools, its credential
+//!   as decision 0011 records it. The key custodian reads the permissions; the gateway wires a
+//!   built-in connector for each entry and serves the tools `[[built_in_tools]]` approves on
+//!   it, with their definitions and adapters among the others above.
 //!
 //! A file that is wrong in any way the loader can see is refused whole, with a
 //! [`RegistryError`] that names the first problem. Nothing is half-loaded.
@@ -38,9 +41,10 @@ mod registry;
 mod selection;
 
 pub use adapter::{ArgumentAdapter, ArgumentError, JsonPointer, ResourceSource};
-pub use builtin::{Access, BuiltInEntry};
+pub use builtin::{Access, BuiltInEntry, EntryDeclaration};
 pub use definition::{
-    Approval, Route, SCHEMA_DIALECT, ToolDefinition, binding_sha256, definition_sha256,
+    Approval, Route, SCHEMA_DIALECT, ToolDefinition, binding_sha256, built_in_binding_sha256,
+    definition_sha256,
 };
 pub use registry::{
     Credential, Destination, Probe, ProbeResult, ReachCheck, ReachTest, Registry, RegistryError,
