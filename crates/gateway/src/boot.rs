@@ -52,13 +52,14 @@ use gateway_core::{
     Lookup, Narrowing, PolicySnapshot, ProfileName, ReceiptQueue, SnapshotError, TeamId, ToolName,
 };
 use gateway_identity::{Clock, ConfigError, Identity, IdentityConfig};
-use gateway_otto::KeyConfigError;
+use gateway_otto::{HttpResolver, KeyConfigError};
 use gateway_registry::{Registry, RulePrincipal};
 use thiserror::Error;
 
 use crate::audit::DisabledAuditStore;
 use crate::catalog::{CatalogError, ToolCatalog};
 use crate::config::{AuditSection, Config, HttpSection, IdentitySection, IssuerKindEntry};
+use crate::currency::profile_requiring_currency;
 use crate::grants::{
     GrantChecking, GrantGateError, GrantPolicyError, GrantSignals, GrantsSection,
     WorkloadSelection, issuer_gate, pod_gate,
@@ -149,6 +150,13 @@ pub enum BootError {
     /// Boxed: its refusal names a tool, a surface, a team, a profile and an issuer.
     #[error(transparent)]
     GrantPolicy(Box<GrantPolicyError>),
+    /// A profile a rule selects requires currency, and no resolver is configured, so every
+    /// side effect under it would be denied as unconfirmed (decision 0012, "Currency").
+    #[error(
+        "profile `{0}`, which a profile rule selects, requires currency, but no resolver is \
+         configured: name Otto's resolver interface in `[resolver]` (decision 0012)"
+    )]
+    NoResolver(ProfileName),
     /// No host is allowed, so every request would be refused.
     #[error("`http.allowed_hosts` is empty")]
     NoAllowedHosts,
@@ -267,6 +275,7 @@ pub struct Wiring {
     proxied: Vec<(ConnectorName, Arc<dyn Connector>)>,
     call_deadlines: BTreeMap<ConnectorName, Duration>,
     lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
+    resolver: Option<Arc<HttpResolver>>,
 }
 
 impl Wiring {
@@ -281,6 +290,7 @@ impl Wiring {
             proxied: Vec::new(),
             call_deadlines: BTreeMap::new(),
             lookups: BTreeMap::new(),
+            resolver: None,
         }
     }
 
@@ -327,6 +337,14 @@ impl Wiring {
         self
     }
 
+    /// Asks Otto's resolver interface through `resolver` whether a call's turn is current
+    /// (decision 0012, "Currency"; [`crate::currency`]). Without one, the boot gates refuse a
+    /// policy with a profile that requires currency.
+    pub fn resolver(mut self, resolver: Arc<HttpResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
     /// Records every call in `store`. Configuration must not also disable audit.
     pub fn audit_store(mut self, store: Arc<dyn AuditStore>) -> Self {
         self.audit_store = Some(store);
@@ -363,6 +381,7 @@ impl fmt::Debug for Wiring {
             .field("audit_store", &self.audit_store.is_some())
             .field("connectors", &connectors)
             .field("proxied", &proxied)
+            .field("resolver", &self.resolver.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -414,6 +433,7 @@ pub struct Gates {
     policy: Arc<LivePolicy>,
     connectors: BTreeMap<ConnectorName, Registered>,
     lookups: BTreeMap<ConnectorName, Arc<dyn Lookup>>,
+    resolver: Option<Arc<HttpResolver>>,
     freshness: Freshness,
 }
 
@@ -430,6 +450,8 @@ pub(crate) struct Basis {
     pub(crate) receipt_store: bool,
     /// Each configured grant issuer, and whether its grants must carry `pod`.
     pub(crate) grant_issuers: Vec<(String, bool)>,
+    /// Whether Otto's resolver is configured, for the currency gate.
+    pub(crate) resolver: bool,
 }
 
 impl fmt::Debug for Gates {
@@ -494,6 +516,12 @@ impl Gates {
     /// What the turn-grant gate counts, for the metrics.
     pub fn grant_signals(&self) -> GrantSignals {
         self.grants.signals().clone()
+    }
+
+    /// The client for Otto's resolver interface, which a call under a profile that requires
+    /// currency asks (decision 0012), or `None` when none is configured.
+    pub fn resolver(&self) -> Option<&Arc<HttpResolver>> {
+        self.resolver.as_ref()
     }
 
     /// The `Host` values served.
@@ -594,6 +622,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         proxied,
         call_deadlines,
         lookups,
+        resolver,
     } = wiring;
     if let Some((name, _)) = proxied.into_iter().next() {
         return Err(BootError::ProxiedWithoutRegistry(name));
@@ -663,6 +692,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
     let selections = covered_teams(policy.workload_selections(), issuers.as_ref());
     issuer_gate(policy.snapshot(), &selections, &grants)?;
     pod_gate(policy.snapshot(), &selections, grants.issuers())?;
+    currency_gate(&policy, resolver.is_some())?;
 
     warn_disabled(&config.deployment, identity_state, audit_state);
     warn_grants_disabled(&config.deployment, grants.state());
@@ -679,6 +709,7 @@ fn check_with(config: Config, wiring: Wiring, development: bool) -> Result<Gates
         policy: Arc::new(LivePolicy::new(policy)),
         connectors,
         lookups,
+        resolver,
         // No file is read again, so the policy never goes stale.
         freshness: Freshness::new(None, Instant::now()),
     })
@@ -732,6 +763,7 @@ pub(crate) fn check_registry_with(
         proxied,
         call_deadlines,
         lookups,
+        resolver,
     } = wiring;
     if let Some((name, _)) = registrations.into_iter().next() {
         return Err(BootError::AdapterBesideRegistry(name));
@@ -769,6 +801,7 @@ pub(crate) fn check_registry_with(
         receipt_exempt: development,
         receipt_store,
         grant_issuers: grants.issuers().to_vec(),
+        resolver: resolver.is_some(),
     };
     check_registry_policy(&basis.registry, &live.current(), &basis)?;
     let served = live.current();
@@ -792,6 +825,7 @@ pub(crate) fn check_registry_with(
         policy: live,
         connectors,
         lookups,
+        resolver,
         freshness,
     };
     Ok((gates, reloader))
@@ -801,8 +835,9 @@ pub(crate) fn check_registry_with(
 /// [receipt-store gate](receipt_gate); the [narrowing gate](narrowing_gate); every approved
 /// tool's server has a connector; with identity enforced, every rule names a configured issuer
 /// of its kind; the snapshot does not define [`NO_PROFILE`]; every profile a rule names exists;
-/// and the [pod gate](pod_gate), with the rules beside the snapshot and the grant issuers the
-/// gateway started with.
+/// the [pod gate](pod_gate), with the rules beside the snapshot and the grant issuers the
+/// gateway started with; and the [currency gate](currency_gate), with the resolver it started
+/// with or without.
 pub(crate) fn check_registry_policy(
     registry: &Registry,
     policy: &ServedPolicy,
@@ -848,7 +883,22 @@ pub(crate) fn check_registry_policy(
     }
     let selections = covered_teams(policy.workload_selections(), basis.issuers.as_ref());
     pod_gate(policy.snapshot(), &selections, &basis.grant_issuers)?;
+    currency_gate(policy, basis.resolver)?;
     Ok(())
+}
+
+/// The currency gate (decision 0012, "Currency"; [`crate::currency`]): no profile a rule
+/// selects may require currency while no resolver is configured, since every side effect under
+/// it would be denied as unconfirmed. Checked at boot on both paths, and on every registry
+/// reload, which keeps the running policy when it refuses.
+pub(crate) fn currency_gate(policy: &ServedPolicy, resolver: bool) -> Result<(), BootError> {
+    if resolver {
+        return Ok(());
+    }
+    match profile_requiring_currency(policy) {
+        Some(profile) => Err(BootError::NoResolver(profile)),
+        None => Ok(()),
+    }
 }
 
 /// The receipt-store gate (decision 0009, "Until receipts exist"; design section 12). A
@@ -1304,6 +1354,7 @@ principals = "any_in_teams_and_groups"
             receipt_exempt: false,
             receipt_store: false,
             grant_issuers: Vec::new(),
+            resolver: false,
         }
     }
 
@@ -1679,6 +1730,15 @@ principals = "any_in_teams_and_groups"
     /// whose workloads of `https://cluster.example.test` get the profile `sandbox`, which
     /// requires a delegation, at `revision`.
     fn requiring_policy(classification: Classification, revision: &str) -> ServedPolicy {
+        sandbox_policy(classification, false, revision)
+    }
+
+    /// [`requiring_policy`], with the profile `sandbox` requiring currency or not.
+    fn sandbox_policy(
+        classification: Classification,
+        requires_currency: bool,
+        revision: &str,
+    ) -> ServedPolicy {
         let name = ToolName::parse("docs__list_documents").unwrap();
         let snapshot = PolicySnapshot::new(SnapshotData {
             revision: revision.into(),
@@ -1702,7 +1762,7 @@ principals = "any_in_teams_and_groups"
                 name: "sandbox".into(),
                 classifications: [Classification::Read, Classification::Propose].into(),
                 requires_delegation: true,
-                requires_currency: false,
+                requires_currency,
                 idempotency_key_header: false,
             }],
             limits: Default::default(),
@@ -1810,5 +1870,74 @@ principals = "any_in_teams_and_groups"
         let served = reloader.apply_policy(&registry, requiring_policy(Classification::Read, "r3"));
         assert!(served.is_ok(), "{served:?}");
         assert_eq!(live.current().revision().as_str(), "r3");
+    }
+
+    /// A development basis, so the receipt-store gate passes, with Otto's resolver configured
+    /// or not.
+    fn resolver_basis(registry: Registry, resolver: bool) -> Basis {
+        Basis {
+            receipt_exempt: true,
+            resolver,
+            ..release_basis(registry)
+        }
+    }
+
+    /// The currency gate (decision 0012, "Currency") runs wherever a registry's policy is
+    /// checked, at boot and on every reload: a profile a rule selects that requires currency is
+    /// refused while no resolver is configured, naming the profile. With a resolver it passes,
+    /// and a profile that does not require currency needs none.
+    #[test]
+    fn the_currency_gate_runs_on_every_registry_policy() {
+        let registry = registry("read", true);
+        let requiring = sandbox_policy(Classification::Read, true, "r2");
+        match check_registry_policy(
+            &registry,
+            &requiring,
+            &resolver_basis(registry.clone(), false),
+        ) {
+            Err(BootError::NoResolver(profile)) => assert_eq!(profile.as_str(), "sandbox"),
+            other => panic!("expected the currency gate, got {other:?}"),
+        }
+        let with = check_registry_policy(
+            &registry,
+            &requiring,
+            &resolver_basis(registry.clone(), true),
+        );
+        assert!(with.is_ok(), "{with:?}");
+        let not_requiring = sandbox_policy(Classification::Read, false, "r2");
+        let without = check_registry_policy(
+            &registry,
+            &not_requiring,
+            &resolver_basis(registry.clone(), false),
+        );
+        assert!(without.is_ok(), "{without:?}");
+    }
+
+    /// A version that makes a profile require currency, while the gateway runs without a
+    /// resolver, is refused when it is loaded, and the running policy is kept.
+    #[test]
+    fn a_reload_that_needs_a_resolver_keeps_the_running_policy() {
+        let registry = registry("read", true);
+        let live = Arc::new(LivePolicy::new(sandbox_policy(
+            Classification::Read,
+            false,
+            "r1",
+        )));
+        let reloader = Reloader::new(
+            live.clone(),
+            resolver_basis(registry.clone(), false),
+            Freshness::new(None, Instant::now()),
+        );
+        let refused =
+            reloader.apply_policy(&registry, sandbox_policy(Classification::Read, true, "r2"));
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::reload::ReloadError::Boot(BootError::NoResolver(profile)))
+                    if profile.as_str() == "sandbox"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(live.current().revision().as_str(), "r1");
     }
 }
