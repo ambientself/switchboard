@@ -105,6 +105,34 @@
 //! A mismatch is judged against the approvals in force when the check began, as a poll is: a
 //! tool approved again while the check was outstanding is left for the next check.
 //!
+//! **The vendor report** (decision 0011, section 4; #193) is the reach check's second kind, for
+//! a built-in entry whose vendor reports what its credential reaches: a GitHub entry with a
+//! `reach_report`, whose tool, a reach-report entry's, reads the App installation's list of
+//! repositories. Each such entry is checked on a schedule of its own, every interval, as an
+//! entry's canary is: once as soon as [`DriftPass::run`] starts, after the listener is bound, and
+//! at each tick after unless the last is still out, never in the boot pass.
+//! [`ReachCaller::report`] sends the tool through the same listener as the same principal, so
+//! the call is decided and audited like any other, and [`compare`] compares the repositories it
+//! lists with the entry's recorded reach both ways. The deadline is that of the report tool's
+//! connector, `[connectors.<name>] deadline_seconds` or the default, plus the allowance, and the
+//! bound is the canary's: a reach that widens or narrows is withdrawn within one interval plus
+//! twice the sum of that deadline and the allowance.
+//!
+//! - **Held**, the report lists exactly the recorded reach: logged as [`REACH_HELD_EVENT`] at
+//!   INFO, with `check = "vendor_report"`, and counted as `held`.
+//! - **Mismatch**, a repository reported and not recorded, or recorded and not reported: every
+//!   tool of the entry is withdrawn, with the cause `reach report mismatch`, judged against the
+//!   approvals in force when the check began, so only a new approval brings them back. It is
+//!   logged as [`REACH_MISMATCH_EVENT`] at ERROR, naming the repositories `added` and
+//!   `dropped`, with a [`TOOL_WITHDRAWN_EVENT`] for each tool, and counted as `mismatch`. The
+//!   report's own tool is another entry's, and stays served.
+//! - **Failed**, a report that could not be read, for any reason the canary's call can fail,
+//!   or a result that is an error or lists no repositories: logged as [`REACH_FAILED_EVENT`] at
+//!   WARN and counted as `failed`. Nothing is withdrawn, and the next tick tries again. A check
+//!   whose report tool is not served now fails without a call.
+//!
+//! Its counts are under the checked entry's name, beside the proxied servers'.
+//!
 //! **A standing withdrawal** is keyed by the tool's exposed name, `definition_sha256`,
 //! `binding_sha256` and `approved_at` ([`WithdrawalKey`]). When the registry reloader serves a
 //! new version, every standing withdrawal whose key is unchanged is applied to it, and the
@@ -135,14 +163,15 @@ use connector_proxy::{
     ProbeReport, ProxyConnector,
 };
 use gateway_core::{ConnectorName, PolicyRevision, ToolName};
-use gateway_registry::{ReachCheck, Registry, definition_sha256};
+use gateway_registry::{REPORTED_KIND, ReachCheck, Registry, definition_sha256};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::task::JoinSet;
 
+use crate::bound::InProcessLimits;
 use crate::deployment::ServerLimits;
 use crate::policy::{LivePolicy, ServedPolicy};
-use crate::reach::{ReachCaller, ReachSettings, ReachSettingsError, Verdict};
+use crate::reach::{ReachCaller, ReachSettings, ReachSettingsError, Reported, Verdict, compare};
 
 /// How often the drift pass runs when the deployment file does not say.
 pub const DEFAULT_DRIFT_INTERVAL: Duration = Duration::from_secs(300);
@@ -355,6 +384,8 @@ pub enum Cause {
     /// The entry's reach check tool is withdrawn, so the entry's reach can no longer be
     /// checked.
     ReachCheckToolWithdrawn,
+    /// The vendor's report of what the entry's credential reaches is not the recorded reach.
+    ReachReportMismatch,
 }
 
 impl Cause {
@@ -365,6 +396,7 @@ impl Cause {
             Self::NoLongerListed => "no longer listed",
             Self::ReachMismatch => "reach mismatch",
             Self::ReachCheckToolWithdrawn => "reach check tool withdrawn",
+            Self::ReachReportMismatch => "reach report mismatch",
         }
     }
 
@@ -384,6 +416,11 @@ impl Cause {
                 "withdrew the tool from every surface: its entry's reach check tool is withdrawn, \
                  so the entry's reach can no longer be checked; approve the reach check tool \
                  again, or remove the entry's tools from the registry"
+            }
+            Self::ReachReportMismatch => {
+                "withdrew the tool from every surface: the vendor's report of what its entry's \
+                 credential reaches is not the entry's recorded reach; make the two agree and \
+                 approve it again, or remove it from the registry"
             }
         }
     }
@@ -497,6 +534,54 @@ struct State {
     standing: BTreeMap<ToolName, Standing>,
     /// Each server's reach check, as the loaded registry gives it.
     reach_checks: BTreeMap<ConnectorName, ReachCheck>,
+    /// Each built-in entry's reach report, as the loaded registry gives it.
+    reach_reports: BTreeMap<ConnectorName, ReportCheck>,
+}
+
+/// A built-in entry's reach report, as the drift pass checks it: the report's tool, the entry
+/// that serves the tool, and the recorded reach the report is compared with, each repository by
+/// its identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReportCheck {
+    tool: ToolName,
+    served_by: ConnectorName,
+    reach: BTreeSet<String>,
+}
+
+/// Each reach report `registry` gives, by the entry it checks. The loader requires the entry's
+/// reach to hold only repositories of its system, and the tool to be a reach-report entry's.
+fn reach_reports(registry: &Registry) -> BTreeMap<ConnectorName, ReportCheck> {
+    registry
+        .connectors()
+        .values()
+        .filter_map(|entry| {
+            let report = entry.reach_report.as_ref()?;
+            let reach = entry
+                .declaration
+                .as_ref()?
+                .reach
+                .iter()
+                .filter(|resource| {
+                    resource.system == entry.system && resource.kind == REPORTED_KIND
+                })
+                .map(|resource| resource.identifier.clone())
+                .collect();
+            let served_by = registry
+                .connectors()
+                .values()
+                .find(|other| other.reports_reach && other.tools.contains(&report.tool))?
+                .name
+                .clone();
+            Some((
+                entry.name.clone(),
+                ReportCheck {
+                    tool: report.tool.clone(),
+                    served_by,
+                    reach,
+                },
+            ))
+        })
+        .collect()
 }
 
 impl State {
@@ -566,18 +651,25 @@ fn dependents(state: &State) -> BTreeMap<ToolName, Standing> {
     dependents
 }
 
-/// Each tool `registry` approves, with its server, its upstream name and its key.
+/// Each tool `registry` approves, with its server, its upstream name and its key. A built-in
+/// tool's server is its entry, and its upstream name its own: only a reach report withdraws one.
 fn approved(registry: &Registry) -> BTreeMap<ToolName, Approved> {
     registry
         .approvals()
         .iter()
         .filter_map(|(tool, approval)| {
-            let route = registry.routes().get(tool)?;
+            let (server, upstream_name) = match registry.routes().get(tool) {
+                Some(route) => (route.server.clone(), route.upstream_name.clone()),
+                None => (
+                    registry.built_in_tools().get(tool)?.clone(),
+                    tool.as_str().to_owned(),
+                ),
+            };
             Some((
                 tool.clone(),
                 Approved {
-                    server: route.server.clone(),
-                    upstream_name: route.upstream_name.clone(),
+                    server,
+                    upstream_name,
                     key: WithdrawalKey {
                         tool: tool.clone(),
                         definition_sha256: approval.definition_sha256.clone(),
@@ -611,6 +703,7 @@ impl Withdrawals {
                 approved: approved(registry),
                 standing: BTreeMap::new(),
                 reach_checks: reach_checks(registry),
+                reach_reports: reach_reports(registry),
             }),
             live,
             signals,
@@ -657,6 +750,7 @@ impl Withdrawals {
         state.base = Arc::new(policy);
         state.approved = approved(registry);
         state.reach_checks = reach_checks(registry);
+        state.reach_reports = reach_reports(registry);
         let before = std::mem::take(&mut state.standing);
         let approved = state.approved.clone();
         state.standing = before
@@ -924,6 +1018,100 @@ impl Withdrawals {
 }
 
 impl Withdrawals {
+    /// The entries whose reach is checked against a vendor report, each with the entry that
+    /// serves the report's tool.
+    fn reported_entries(&self) -> Vec<(ConnectorName, ConnectorName)> {
+        self.state()
+            .reach_reports
+            .iter()
+            .map(|(entry, check)| (entry.clone(), check.served_by.clone()))
+            .collect()
+    }
+
+    /// `entry`'s reach report, and whether its tool is served now: approved and not withdrawn.
+    /// `None` when the registry gives the entry none.
+    fn reach_report(&self, entry: &ConnectorName) -> Option<(ReportCheck, bool)> {
+        let state = self.state();
+        let check = state.reach_reports.get(entry)?.clone();
+        let served =
+            state.approved.contains_key(&check.tool) && !state.standing.contains_key(&check.tool);
+        Some((check, served))
+    }
+
+    /// Judges what `entry`'s vendor report came to (see the [module documentation](self)). A
+    /// report that differs from the recorded reach, either way, withdraws every tool approved on
+    /// the entry whose key is the one in `started`, the keys when the check began, and that is
+    /// not withdrawn for a cause of its own already. A failed report withdraws nothing.
+    fn judge_report(
+        &self,
+        entry: &ConnectorName,
+        check: &ReportCheck,
+        started: &BTreeMap<ToolName, WithdrawalKey>,
+        reported: Reported,
+    ) {
+        let tool = &check.tool;
+        let (repositories, row) = match reported {
+            Reported::Listed { repositories, row } => (repositories, row),
+            Reported::Failed(reason) => {
+                self.signals.count(entry, |counts| counts.reach_failed += 1);
+                tracing::warn!(
+                    event = REACH_FAILED_EVENT,
+                    check = "vendor_report",
+                    server = %entry,
+                    %tool,
+                    %reason,
+                    "the vendor's report of the entry's reach could not be read; nothing is \
+                     withdrawn, and the next check tries again"
+                );
+                return;
+            }
+        };
+        let difference = compare(&check.reach, &repositories);
+        if difference.is_empty() {
+            self.signals.count(entry, |counts| counts.reach_held += 1);
+            tracing::info!(
+                event = REACH_HELD_EVENT,
+                check = "vendor_report",
+                server = %entry,
+                %tool,
+                row = row.as_deref().unwrap_or("none"),
+                reported = repositories.len(),
+                "the vendor's report of what the entry's credential reaches is its recorded reach"
+            );
+            return;
+        }
+        self.signals
+            .count(entry, |counts| counts.reach_mismatch += 1);
+        let state = self.state();
+        let found: Vec<(WithdrawalKey, Cause)> = state
+            .approved
+            .iter()
+            .filter(|(name, approved)| {
+                approved.server == *entry
+                    && !state.withdrawn_on_its_own(name)
+                    && started.get(*name) == Some(&approved.key)
+            })
+            .map(|(_, approved)| (approved.key.clone(), Cause::ReachReportMismatch))
+            .collect();
+        let names = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(",");
+        tracing::error!(
+            event = REACH_MISMATCH_EVENT,
+            check = "vendor_report",
+            server = %entry,
+            %tool,
+            row = row.as_deref().unwrap_or("none"),
+            added = names(&difference.added),
+            dropped = names(&difference.dropped),
+            withdrawn = found.len(),
+            "the vendor's report of what the entry's credential reaches is not its recorded \
+             reach: a repository was added or dropped without a new approval, so every tool of \
+             the entry is withdrawn"
+        );
+        self.withdraw(state, entry, found);
+    }
+}
+
+impl Withdrawals {
     /// Counts what `server`'s probe found, and logs it unless the server refused every call.
     /// An open server is logged at ERROR and its tools stay listed: withdrawing them would
     /// close the governed route and leave the open one (decision 0010). Nothing here touches
@@ -995,6 +1183,9 @@ pub struct DriftPass {
     probes: ProbeCredentials,
     interval: Duration,
     reach: Option<Reach>,
+    /// Each in-process connector's call deadline, from the deployment file's
+    /// `[connectors.<name>]`, which a reach report's call is given.
+    report_deadlines: BTreeMap<ConnectorName, Duration>,
 }
 
 impl std::fmt::Debug for DriftPass {
@@ -1027,7 +1218,43 @@ impl DriftPass {
             probes,
             interval,
             reach: None,
+            report_deadlines: BTreeMap::new(),
         }
+    }
+
+    /// The same pass, giving each reach report's call the deadline `bounds`, the deployment
+    /// file's `[connectors.<name>]`, sets for the connector that serves the report's tool, or
+    /// the default for one it does not name, plus the caller's allowance.
+    pub fn with_report_deadlines(
+        mut self,
+        bounds: &BTreeMap<ConnectorName, InProcessLimits>,
+    ) -> Self {
+        self.report_deadlines = bounds
+            .iter()
+            .map(|(name, limits)| (name.clone(), limits.deadline))
+            .collect();
+        self
+    }
+
+    /// Each entry checked against a vendor report, as its check reaches it, when reach is
+    /// checked.
+    fn reporting(&self) -> Vec<Reporting> {
+        let Some(reach) = &self.reach else {
+            return Vec::new();
+        };
+        self.withdrawals
+            .reported_entries()
+            .into_iter()
+            .map(|(entry, served_by)| Reporting {
+                deadline: self
+                    .report_deadlines
+                    .get(&served_by)
+                    .copied()
+                    .unwrap_or_else(|| InProcessLimits::default().deadline),
+                entry,
+                caller: Arc::clone(&reach.caller),
+            })
+            .collect()
     }
 
     /// The same pass, checking each server's reach too (decision 0011, section 4) with
@@ -1094,8 +1321,9 @@ impl DriftPass {
     }
 
     /// Checks every server's reach once, all at once, and withdraws an entry whose server
-    /// answered its canary. Returns when every check has been judged. Without a caller
-    /// ([`with_reach`](Self::with_reach)) it does nothing.
+    /// answered its canary; and every entry checked against a vendor report, withdrawing one
+    /// whose report differs from its reach. Returns when every check has been judged. Without
+    /// a caller ([`with_reach`](Self::with_reach)) it does nothing.
     pub async fn reach_pass(&self) {
         let mut checks = JoinSet::new();
         for (server, connector) in &self.servers {
@@ -1103,6 +1331,9 @@ impl DriftPass {
                 Arc::clone(&self.withdrawals),
                 self.entry(server, connector),
             ));
+        }
+        for reporting in self.reporting() {
+            checks.spawn(check_report(Arc::clone(&self.withdrawals), reporting));
         }
         while let Some(checked) = checks.join_next().await {
             if let Err(error) = checked {
@@ -1133,9 +1364,17 @@ impl DriftPass {
     /// boot ran one already, before the listener was bound. With a reach caller, each server's
     /// reach is checked at once, since the binary starts this only once the listener is bound,
     /// and again at each tick unless the last check is still out. The checks run beside the
-    /// schedule, so no poll waits for one.
+    /// schedule, so no poll waits for one. Each entry checked against a vendor report is
+    /// checked on a schedule of its own, the same way.
     pub async fn run(self) {
         let mut entries = JoinSet::new();
+        for reporting in self.reporting() {
+            entries.spawn(report_every(
+                Arc::clone(&self.withdrawals),
+                reporting,
+                self.interval,
+            ));
+        }
         for (server, connector) in &self.servers {
             entries.spawn(poll_every(
                 Arc::clone(&self.withdrawals),
@@ -1161,6 +1400,59 @@ struct Entry {
     probe: Option<Arc<ProbeCredential>>,
     /// The reach check's caller and the server's call deadline, when reach is checked.
     reach: Option<(Arc<ReachCaller>, Duration)>,
+}
+
+/// One built-in entry whose reach is checked against a vendor report, as its schedule reaches
+/// it: the reach check's caller, and the call deadline of the report tool's connector.
+#[derive(Clone)]
+struct Reporting {
+    entry: ConnectorName,
+    caller: Arc<ReachCaller>,
+    deadline: Duration,
+}
+
+/// Reads `reporting`'s vendor report and judges it against the approvals in force when it
+/// began. A report tool that is not served now fails the check without a call: the gateway
+/// would refuse it.
+async fn check_report(withdrawals: Arc<Withdrawals>, reporting: Reporting) {
+    let Some((check, served)) = withdrawals.reach_report(&reporting.entry) else {
+        return;
+    };
+    let started = withdrawals.keys_on(&reporting.entry);
+    let reported = if served {
+        reporting
+            .caller
+            .report(&check.tool, reporting.deadline)
+            .await
+    } else {
+        Reported::Failed(format!(
+            "its tool `{}` is not served now, so no call was made",
+            check.tool
+        ))
+    };
+    withdrawals.judge_report(&reporting.entry, &check, &started, reported);
+}
+
+/// Checks `reporting`'s vendor report at once and again every `interval`, for ever, each check
+/// in a task of its own. A tick that comes while the last check is still out makes none, so two
+/// checks of one entry never run together, as [`poll_every`]'s reach checks do not.
+async fn report_every(withdrawals: Arc<Withdrawals>, reporting: Reporting, interval: Duration) {
+    let first = tokio::time::Instant::now() + interval;
+    let mut every = tokio::time::interval_at(first, interval);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut checking = JoinSet::new();
+    checking.spawn(check_report(Arc::clone(&withdrawals), reporting.clone()));
+    loop {
+        every.tick().await;
+        while let Some(checked) = checking.try_join_next() {
+            if let Err(error) = checked {
+                tracing::error!(%error, server = %reporting.entry, "a reach report's task failed");
+            }
+        }
+        if checking.is_empty() {
+            checking.spawn(check_report(Arc::clone(&withdrawals), reporting.clone()));
+        }
+    }
 }
 
 /// Checks `entry`'s reach, if reach is checked and its registry entry has a reach check, and
