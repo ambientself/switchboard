@@ -1527,6 +1527,172 @@ mutate_all(
 mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
        'features = ["rust_crypto"] }\n', 'features = ["rust_crypto", "rust_crypto"] }\n')
 
+# --- gateway-otto: the turn-grant verifier ------------------------------------------------
+
+OTTO_SRC = "crates/gateway-otto/src/"
+OV = OTTO_SRC + "verify.rs"
+OK = OTTO_SRC + "keys.rs"
+OF = OTTO_SRC + "format.rs"
+OT = OTTO_SRC + "tools.rs"
+OTTO_VERSION = "        if version != VERSION.as_bytes() {\n            return Err(refuse(FailureKind::Version));\n        }\n"
+OTTO_PARTS = "            return Err(refuse(FailureKind::Malformed));\n        };\n"
+mutate("otto-grant-version-unchecked", "a grant of another version is read as this one", OV,
+       "        if version != VERSION.as_bytes() {", "        if false {")
+mutate_all(
+    "otto-grant-version-after-parts",
+    "the version is matched only after the grant's length and parts are read",
+    (OV, OTTO_VERSION, ""),
+    (OV, OTTO_PARTS, OTTO_PARTS + OTTO_VERSION),
+)
+mutate("otto-grant-length-unbounded", "a grant over the size limit is verified", OV,
+       "        if grant.len() > MAX_GRANT_BYTES {", "        if false {")
+mutate("otto-grant-retired-key-accepted", "a previous key is accepted after its end instant", OV,
+       "        if key.retires_at.is_some_and(|retires_at| now >= retires_at) {", "        if false {")
+mutate("otto-grant-retired-key-at-instant", "a previous key is accepted at its end instant", OV,
+       "now >= retires_at", "now > retires_at")
+mutate("otto-grant-s-unchecked", "a non-canonical S is left to the signature library", OV,
+       "        if !s_is_canonical(&signature_bytes) {", "        if false {")
+mutate("otto-grant-signature-unchecked", "a signature that does not verify is accepted", OV,
+       "            .map_err(|_| refuse(FailureKind::Signature))?;", "            .ok();")
+mutate("otto-grant-claims-before-signature", "the claims are decoded before the signature is checked", OV,
+       "        // 3. The signature, before the claims are decoded.\n",
+       "        LENIENT.decode(claims).ok().and_then(|bytes| Claims::parse(&bytes, false, false)).ok_or(refuse(FailureKind::Malformed))?;\n")
+mutate("otto-grant-canonical-unchecked", "a grant that does not re-encode to the same bytes is accepted", OV,
+       "        if CANONICAL.encode(signature_bytes).as_bytes() != signature\n            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {",
+       "        if false {")
+mutate("otto-grant-canonical-signature-unchecked", "a non-canonical signature part is accepted", OV,
+       "        if CANONICAL.encode(signature_bytes).as_bytes() != signature\n            || ",
+       "        if ")
+mutate("otto-grant-canonical-claims-unchecked", "a non-canonical claims part is accepted", OV,
+       "\n            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n", "\n")
+mutate("otto-grant-digest-before-signature", "a failure before the signature verified carries the digest", OV,
+       "        let refuse = |kind| GrantFailure { kind, digest: None };",
+       "        let refuse = |kind| GrantFailure { kind, digest: Some(GrantDigest::of(grant)) };")
+mutate("otto-grant-digest-dropped", "a failure after the signature verified carries no digest", OV,
+       "            kind,\n            digest: Some(digest),\n", "            kind,\n            digest: None,\n")
+mutate("otto-grant-digest-of-decoded-claims", "the digest is taken over the decoded claims, not the grant as presented", OV,
+       "        let digest = GrantDigest::of(grant);",
+       "        let digest = GrantDigest::of(&LENIENT.decode(claims).unwrap_or_default());")
+mutate("otto-grant-empty-tools-accepted", "a grant with no tools is accepted", OV,
+       ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
+       ".filter(|tools| tools.iter().all(|tool| !tool.is_empty()))?;")
+mutate("otto-grant-empty-tool-name-accepted", "a grant listing an empty tool name is accepted", OV,
+       ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
+       ".filter(|tools| !tools.is_empty())?;")
+mutate("otto-grant-empty-claim-accepted", "an empty team, session, turn, execution or actor is accepted", OV,
+       "        let text = |value: Option<String>| value.filter(|value| !value.is_empty());",
+       "        let text = |value: Option<String>| value;")
+mutate("otto-grant-absent-audience-accepted", "a grant without aud is read as one for no deployment", OV,
+       "            aud: wire.aud?,", "            aud: wire.aud.unwrap_or_default(),")
+mutate("otto-grant-absent-iat-accepted", "a grant without iat is read as issued at the epoch", OV,
+       "            iat: wire.iat.filter(|iat| *iat >= 0)?,", "            iat: wire.iat.filter(|iat| *iat >= 0).unwrap_or(0),")
+mutate("otto-grant-absent-team-accepted", "a grant without team is accepted", OV,
+       "            team: text(wire.team)?,", "            team: text(wire.team).unwrap_or_default(),")
+mutate("otto-grant-absent-epoch-accepted", "a grant without epoch is read as epoch 1", OV,
+       "                .and_then(|epoch| u64::try_from(epoch).ok())?,",
+       "                .and_then(|epoch| u64::try_from(epoch).ok())\n                .unwrap_or(1),")
+mutate("otto-grant-absent-actor-accepted", "a grant without actor is accepted", OV,
+       "            actor: text(wire.actor)?,", "            actor: text(wire.actor).unwrap_or_default(),")
+mutate("otto-grant-claims-array-accepted", "claims given as a JSON array of the values in field order are accepted", OV,
+       "        if opening != Some(&b'{') {", "        if false {")
+mutate("otto-grant-extra-parts-accepted", "a grant with parts after the signature is accepted", OV,
+       "        let [version, key_id, claims, signature] = parts[..] else {",
+       "        let [version, key_id, claims, signature, ..] = parts[..] else {")
+mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with a configured key", OV,
+       "            .and_then(|id| self.keys.keys.get_key_value(id))\n",
+       "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
+mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
+       ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
+mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
+       "        if require_pod && claims.pod.is_none() {", "        if false {")
+mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,
+       "        if require_egress && claims.egress.is_none() {", "        if false {")
+mutate_all("otto-grant-egress-map-accepted", "an egress setting given as the map {\"sealed\": null} is accepted",
+           (OV, "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\npub enum Egress {",
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]\n#[serde(rename_all = \"lowercase\")]\npub enum Egress {"),
+           (OV, '    #[serde(default, deserialize_with = "egress_setting")]',
+            '    #[serde(default, deserialize_with = "present")]'))
+mutate("otto-grant-audience-unchecked", "a grant for another deployment is accepted", OV,
+       "        if !claims.aud.iter().any(|aud| aud == self.deployment.as_str()) {", "        if false {")
+mutate("otto-grant-audience-any-case", "the audience is compared ignoring case", OV,
+       "aud == self.deployment.as_str()", "aud.eq_ignore_ascii_case(self.deployment.as_str())")
+OTTO_IAT = "        if i128::from(claims.iat) > now + i128::from(LEEWAY_SECONDS) {"
+OTTO_EXP = "        if i128::from(claims.exp) <= now - i128::from(LEEWAY_SECONDS) {"
+OTTO_CEILING = "        if i128::from(claims.exp) - i128::from(claims.iat) > i128::from(MAX_LIFETIME_SECONDS) {"
+mutate("otto-grant-not-before-unchecked", "a grant issued in the future is accepted", OV, OTTO_IAT, "        if false {")
+mutate("otto-grant-not-before-at-leeway-refused", "a grant issued exactly the leeway ahead is refused", OV,
+       OTTO_IAT, OTTO_IAT.replace(" > now", " >= now"))
+mutate("otto-grant-expiry-unchecked", "an expired grant is accepted", OV, OTTO_EXP, "        if false {")
+mutate("otto-grant-expiry-at-leeway-accepted", "a grant that expired exactly the leeway ago is accepted", OV,
+       OTTO_EXP, OTTO_EXP.replace(" <= now", " < now"))
+mutate("otto-grant-expiry-without-leeway", "expiry is checked with no leeway", OV,
+       OTTO_EXP, "        if i128::from(claims.exp) <= now {")
+mutate("otto-grant-ceiling-unchecked", "a grant over the lifetime ceiling is accepted", OV, OTTO_CEILING, "        if false {")
+mutate("otto-grant-ceiling-inclusive", "a grant of exactly the lifetime ceiling is refused", OV,
+       OTTO_CEILING, OTTO_CEILING.replace(") > i128", ") >= i128"))
+mutate("otto-grant-pod-unchecked", "a required pod is not compared with the caller's", OV,
+       "        if issuer.require_pod && claims.pod.as_ref() != caller.get().pod() {", "        if false {")
+mutate("otto-grant-pod-always-checked", "the pod is compared though the issuer does not require it", OV,
+       "        if issuer.require_pod && claims.pod.as_ref()", "        if claims.pod.as_ref()")
+mutate("otto-grant-pod-caller-without-pod-accepted", "a caller whose token proves no pod passes a required pod", OV,
+       "claims.pod.as_ref() != caller.get().pod()",
+       "caller.get().pod().is_some_and(|pod| claims.pod.as_ref() != Some(pod))")
+mutate("otto-grant-leeway-changed", "the leeway is 31 seconds", OF,
+       "pub const LEEWAY_SECONDS: i64 = 30;", "pub const LEEWAY_SECONDS: i64 = 31;")
+mutate("otto-grant-ceiling-changed", "the lifetime ceiling is 16 minutes", OF,
+       "pub const MAX_LIFETIME_SECONDS: i64 = 15 * 60;", "pub const MAX_LIFETIME_SECONDS: i64 = 16 * 60;")
+mutate("otto-format-s-equal-to-order-accepted", "an S equal to the group order is canonical", OF,
+       "            return byte < GROUP_ORDER[index];\n        }\n    }\n    false",
+       "            return byte < GROUP_ORDER[index];\n        }\n    }\n    true")
+mutate("otto-format-key-id-domain-changed", "the key ID is hashed under v1's domain", OF,
+       'b"otto/gateway-turn-grant/kid/v3\\0"', 'b"otto/gateway-turn-grant/kid/v1\\0"')
+mutate("otto-format-signing-domain-changed", "the signature covers v1's domain prefix", OF,
+       'b"otto/gateway-turn-grant/v3\\0"', 'b"otto/gateway-turn-grant/v1\\0"')
+mutate("otto-format-key-id-shortened", "the key ID keeps 12 bytes of the hash", OF,
+       "pub const KEY_ID_BYTES: usize = 16;", "pub const KEY_ID_BYTES: usize = 12;")
+mutate("otto-keys-no-issuers-allowed", "grant keys with no issuer are configured", OK,
+       "        if config.is_empty() {", "        if false {")
+mutate("otto-keys-empty-issuer-allowed", "an issuer with no name is configured", OK,
+       "            if issuer.name.is_empty() {", "            if false {")
+mutate("otto-keys-duplicate-issuer-allowed", "an issuer is configured twice", OK,
+       "            if !names.insert(issuer.name.as_str()) {", "            if !names.insert(issuer.name.as_str()) && false {")
+mutate("otto-keys-private-key-armour-allowed", "a key file holding a PEM private key is read for a public key", OK,
+       '    if text.contains("PRIVATE KEY") {', "    if false {")
+mutate("otto-keys-private-key-der-allowed", "private key DER under a public label is read for a public key", OK,
+       "    if is_private_key_info(&der) {", "    if false {")
+mutate("otto-keys-small-order-allowed", "a key of small order is configured", OK,
+       "    if key.is_weak() {", "    if false {")
+mutate("otto-keys-non-canonical-allowed", "a non-canonical encoding of a key is configured", OK,
+       "    if key.to_edwards().compress().to_bytes() != bytes {", "    if false {")
+mutate("otto-keys-repeated-allowed", "an issuer's previous key can be its current key", OK,
+       "                if let Some(existing) = keys.get(&key_id) {",
+       "                if let Some(existing) = keys.get(&key_id).filter(|existing| existing.issuer != index) {")
+mutate("otto-keys-repeat-reported-as-two-issuers", "a key repeated in one issuer is reported as under two", OK,
+       "                    if existing.issuer == index {", "                    if false {")
+mutate("otto-keys-two-issuers-allowed", "one key is configured under two issuers", OK,
+       "                if let Some(existing) = keys.get(&key_id) {",
+       "                if let Some(existing) = keys.get(&key_id).filter(|existing| existing.issuer == index) {")
+mutate_all(
+    "otto-keys-previous-without-end-allowed",
+    "a previous key with no end instant is configured, and never retires",
+    (OK, "                let Some(retires_at) = previous.retires_at else {\n                    return Err(KeyConfigError::PreviousKeyWithoutEnd(issuer.name.clone()));\n                };\n",
+     "                let retires_at = previous.retires_at;\n"),
+    (OK, "                configured.push((key, Some(retires_at)));", "                configured.push((key, retires_at));"),
+)
+mutate("otto-mapping-empty-otto-name-allowed", "an empty Otto name is mapped", OT,
+       "            if otto.is_empty() {", "            if false {")
+mutate("otto-mapping-otto-name-repeat-allowed", "an Otto name is mapped twice", OT,
+       "            if by_otto.contains_key(&otto) {", "            if false {")
+mutate("otto-mapping-gateway-name-repeat-allowed", "two Otto names map to one gateway name", OT,
+       "            if let Some(first) = by_gateway.get(&gateway) {",
+       "            if let Some(first) = by_gateway.get(&gateway).filter(|_| false) {")
+mutate("otto-mapping-last-one-wins", "a mapping file's repeated name keeps only its last value", OT,
+       "        let entries: Entries<String> = parse(text)?;\n        Self::from_pairs(entries.0)",
+       "        let entries: BTreeMap<String, String> = parse(text)?;\n        Self::from_pairs(entries)")
+mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it is a valid tool name", OT,
+       ".filter_map(|name| self.get(name).cloned())",
+       ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
+
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
 A = TESTKIT_SRC + "audit.rs"
@@ -5968,8 +6134,11 @@ READERS: list[tuple[str, frozenset[str]]] = [
     # kind registry.
     ("deploy/compose/config/", frozenset({"gateway"})),
     ("deploy/kind/base/config/", frozenset({"gateway"})),
-    # gateway-testkit/tests/issuer.rs searches conformance/ for private keys.
-    ("conformance/", frozenset({"gateway-testkit"})),
+    # gateway-testkit/tests/issuer.rs searches conformance/ for private keys; gateway-otto's
+    # tests/mapping.rs loads conformance/baseline.json's tool mapping.
+    ("conformance/", frozenset({"gateway-testkit", "gateway-otto"})),
+    # gateway-otto/tests/format_doc.rs checks the format's constants and example.
+    ("docs/turn-grant-format.md", frozenset({"gateway-otto"})),
     # demo-checks/tests/manifests.rs compares the demo registries with the registry crate's own.
     ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
     # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.

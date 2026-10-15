@@ -162,7 +162,7 @@ lines only once the interfaces between them have settled.
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
 | `connector-github` | GitHub tools, and the client for the key custodian. |
-| `otto-adapter` | Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
+| `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
 | `gateway-mcp` | The MCP protocol adapter: JSON-RPC envelopes, the two revisions, header checks, rendering. No policy types. |
@@ -335,7 +335,8 @@ sign them asymmetrically so this gateway holds only a public key; see
 [decision 0004](decisions/0004-verify-turn-grants-with-a-public-key.md). A control plane that
 delegates to this gateway signs with a key the gateway cannot use to sign.
 
-What a grant binds is [decision 0012](decisions/0012-what-a-turn-grant-binds.md). Its issuer is
+What a grant binds is [decision 0012](decisions/0012-what-a-turn-grant-binds.md), and its exact
+format, version `v3`, is [turn-grant-format.md](turn-grant-format.md). Its issuer is
 fixed by the Ed25519 key that verifies it, one key per Otto environment. `aud` lists the gateway
 deployments it is for, two during the cutover. `iat` and `exp` bound its lifetime to at most 15
 minutes, with 30 seconds of leeway. `pod` binds it to the sandbox pod's UID, by stage 3 at the
@@ -345,7 +346,8 @@ reuse from another pod, or another deployment sharing this gateway's audit store
 A call of any tool not classified `read` is also checked for currency: Otto's resolver says
 whether the turn is still current, which enforces the fencing epoch and lets Otto revoke one
 turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves, and
-the principal carries it; grants are not yet bound to it (#22, section 17).
+the principal carries it. The verifier in `gateway-otto` binds a grant to it once the issuer
+requires `pod`; the gateway does not run the verifier yet (#22, section 17).
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -2050,14 +2052,28 @@ The route check is built, its operator step and its probe (decision 0010), and `
 before and after the network policy; the kind claim holds only while the evidence log in
 [route-exceptions.md](route-exceptions.md) has a passing run from the last seven days.
 
-**#22, the Otto adapter.** The Ed25519 turn-grant verifier with strict encoding; a delegation in
-the call context that is present and unverified, carrying the failure kind and an optional
-digest, and its reason kind; currency in the call context, the profile setting, the currency
-check between check 5 and check 6, skipped for `tools/list`, and its two reason kinds and
-sentences; the resolver client with its one-second budget; the grant-key and pod-required gates
-at boot and at snapshot load, reading the selector rules; the gate that allows grant checking
-off only in a development build, with CI's check of the release artifact; and the row fields
-(with #10).
+**#22, the Otto adapter.**
+
+- Built, as the crate `gateway-otto`: the turn-grant verifier, not yet wired into the request
+  path. The `v3` format is specified in [turn-grant-format.md](turn-grant-format.md). The
+  verifier checks the version first, then the key, then the strict Ed25519 signature (S below
+  the group order, no small-order point) before the claims are decoded, then canonical
+  encoding, then the claims: `aud`, `iat` and `exp` with 30 seconds of leeway, the 15-minute
+  ceiling, and `pod` and `egress` once the issuer requires them. A failure is one of section
+  11's kinds and, only once the signature verified, the grant's digest, and nothing from the
+  claims. The clock is passed in. The grant-key configuration refuses private key material, a
+  small-order or non-canonical key, a key twice or under two issuers, and a previous key with
+  no end instant; a previous key retires at its absolute end instant without a restart. The
+  tool mapping is one-to-one, read from a mapping file or from `conformance/baseline.json`, and
+  a name it lacks is dropped. A test minter is behind `test-support`.
+- Not built yet: the gateway reading grant keys and running the verifier; a delegation in the
+  call context that is present and unverified, carrying the failure kind and an optional
+  digest, and its reason kind; currency in the call context, the profile setting, the currency
+  check between check 5 and check 6, skipped for `tools/list`, and its two reason kinds and
+  sentences; the resolver client with its one-second budget; the grant-key and pod-required
+  gates at boot and at snapshot load, reading the selector rules; the gate that allows grant
+  checking off only in a development build, with CI's check of the release artifact; and the
+  row fields (with #10).
 
 - Built in the core (#22): the delegation in the call context is absent, present and verified,
   or present and unverified. An unverified one carries its failure kind, from the core's closed
