@@ -6432,8 +6432,8 @@ mutate("custodian-fake-jwt-unchecked", "the fake GitHub accepts any App JWT", KC
 # every token, narrowed as its entry says and with the revision its call was decided under, keeps
 # tokens out of what the caller reads, bounds and tags each result; and the gateway wires it from
 # the deployment file, behind its bound and quotas, and checks each approval against it (#12).
-# crates/gateway/tests/github.rs and github_logs.rs catch these, and the registry's built_in.rs
-# its loader's.
+# crates/gateway/tests/github.rs, github_reads.rs and github_logs.rs catch these, and the
+# registry's built_in.rs its loader's.
 
 GH = "crates/connector-github/src/"
 GHC = GH + "connector.rs"
@@ -6448,8 +6448,8 @@ mutate("github-limit-not-held-to-the-organization", "a token is asked for the li
 mutate("github-custodian-bypassed", "GitHub is sent a token the connector made up, not the custodian's", GHC,
        "        self.read(&parsed, token.expose()).await", "        self.read(&parsed, request.team.as_str()).await")
 mutate("github-credential-in-error", "a vendor error names the token it was read with", GHC,
-       '                format!("GitHub answered HTTP {}", status.as_u16()),',
-       '                format!("GitHub answered HTTP {} to {token}", status.as_u16()),')
+       "            Answered::Json(value) => Ok(value),\n            other => Err(vendor_error(other, what, call)),",
+       '            Answered::Json(value) => Ok(value),\n            other => Err(vendor_error(other, &format!("{what} {token}"), call)),')
 mutate("github-file-bound-removed", "a file's text is not cut at 256 KiB", GHT,
        "            let (kept, cut) = bounded(text, MAX_FILE_TEXT_BYTES);",
        "            let (kept, cut) = (text, false);")
@@ -6460,6 +6460,45 @@ mutate("github-evidence-tag-dropped", "a result is not tagged as untrusted exter
 mutate("github-revision-not-sent", "a token request carries no revision", GHC,
        "            revision: call.policy_revision().clone(),",
        '            revision: gateway_core::PolicyRevision::new(""),')
+# The newer reads (crates/connector-github/src/reads): their bounds, the job log host check, the
+# CODEOWNERS check and the frame's token for AGENTS.md, and each tool's own permission set.
+# crates/gateway/tests/github_reads.rs catches these, and reads.rs's own tests the entry check.
+GHR = GH + "reads/"
+mutate("github-check-runs-bound-removed", "every check run GitHub sends is kept", GHR + "checks.rs",
+       "    for run in runs.iter().take(MAX_CHECK_RUNS) {", "    for run in runs.iter() {")
+mutate("github-annotations-bound-removed", "every annotation of a failing check run is kept", GHR + "checks.rs",
+       "                    .take(MAX_ANNOTATIONS)\n", "")
+mutate("github-statuses-bound-removed", "every commit status GitHub sends is kept", GHR + "checks.rs",
+       "        .take(MAX_STATUSES)\n", "")
+mutate("github-check-text-bound-removed", "a check run's summary is not cut at 4 KiB", GHR + "checks.rs",
+       "    let (kept, cut) = bounded(text, MAX_CHECK_TEXT_BYTES);", "    let (kept, cut) = (text, false);")
+mutate("github-releases-bound-removed", "every release GitHub sends is kept", GHR + "releases.rs",
+       "        .take(MAX_RELEASES)\n", "")
+mutate("github-tags-bound-removed", "every tag GitHub sends is kept", GHR + "releases.rs",
+       "tags.iter().take(MAX_TAGS).map(tag_fields)", "tags.iter().map(tag_fields)")
+mutate("github-job-log-bound-removed", "a job log is kept whole, up to what is read", GHR + "job_log.rs",
+       ".get_tail(&path, MAX_LOG_BYTES, MAX_LOG_READ_BYTES)", ".get_tail(&path, MAX_LOG_READ_BYTES, MAX_LOG_READ_BYTES)")
+mutate("github-template-bound-removed", "a pull request template is not cut at 64 KiB", GHR + "config.rs",
+       "        let text = text(&path, &file)?;\n        let (kept, cut) = bounded(&text, MAX_CONFIG_TEXT_BYTES);",
+       "        let text = text(&path, &file)?;\n        let (kept, cut) = (text.as_str(), false);")
+mutate("github-agents-bound-removed", "AGENTS.md is not cut at 64 KiB", GHR + "config.rs",
+       "    let text = text(AGENTS, &file)?;\n    let (kept, cut) = bounded(&text, MAX_CONFIG_TEXT_BYTES);",
+       "    let text = text(AGENTS, &file)?;\n    let (kept, cut) = (text.as_str(), false);")
+mutate("github-job-log-host-unchecked", "a job log redirect to a host the deployment does not pin is followed", GHR + "job_log.rs",
+       "            .is_some_and(|base| base == wanted)", "            .is_some_and(|_| true)")
+mutate("github-codeowners-check-removed", "AGENTS.md is served when CODEOWNERS gives it no owner", GHR + "config.rs",
+       "    if owners.is_empty() {", "    if false {")
+mutate("github-frame-token-not-fresh", "AGENTS.md is quoted between markers with the same token every call", GHR + "config.rs",
+       "    OsRng.try_fill_bytes(&mut bytes).map_err(|_| {", "    Ok::<(), rand_core::Error>(()).map_err(|_| {")
+mutate("github-reads-ask-the-entrys-set", "a newer read asks for its entry's whole permission set, not its own", GH + "reads.rs",
+       "        permissions: set(permissions),", "        permissions: request.permissions.clone(),")
+mutate("github-tags-on-a-contents-token", "the tags are read on the releases' contents token's set, not metadata", GHR + "releases.rs",
+       "token(connector, request, TAGS_PERMISSIONS)", "token(connector, request, RELEASES_PERMISSIONS)")
+mutate("github-reads-entry-unchecked", "an entry that serves a newer read without its permissions is served", GH + "reads.rs",
+       "                if entry.permissions.get(*permission) < Some(&Access::Read) {", "                if false {")
+mutate("gateway-job-log-hosts-dropped", "the deployment file's [github] job_log_hosts do not reach the connector",
+       "crates/gateway/src/deployment.rs",
+       "            job_log_hosts: self.job_log_hosts,", "            job_log_hosts: Vec::new(),")
 mutate("core-caller-limit-not-carried", "an allowed call's decision carries no limit to narrow its token to",
        "crates/gateway-core/src/decision.rs",
        "                .is_some_and(|entry| entry.narrowing == Narrowing::Limit) =>",
