@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use gateway_core::audit::{
-    AuditRowId, DecisionKind, ListRecord, Outcome, RowCompletion, RowStart, StoreError,
+    AuditRowId, DecisionKind, ListRecord, Outcome, RecordedResources, RowCompletion, RowStart,
+    StoreError,
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
@@ -243,7 +244,18 @@ impl MemoryStore {
         match rows.iter_mut().find(|(id, _)| id == completion.row()) {
             None => return Err("no such row".into()),
             Some((_, row)) => match &row.completion {
-                None => row.completion = Some(completion.completion().clone()),
+                None => {
+                    // What a tool that checks its own scope reached replaces the unknown its
+                    // row was begun with, in the same write.
+                    if let Some(reached) = completion.reached() {
+                        if row.resources != RecordedResources::Unknown {
+                            return Err("a reach replaces only unknown resources".into());
+                        }
+                        row.resources = RecordedResources::Named(reached.resources.clone());
+                        row.resources_omitted = reached.omitted;
+                    }
+                    row.completion = Some(completion.completion().clone());
+                }
                 Some(done) if done == completion.completion() => {}
                 Some(_) => return Err("the row was already finished differently".into()),
             },

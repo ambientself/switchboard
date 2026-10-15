@@ -136,13 +136,18 @@ pub(crate) const AUDIT_FAILURE: &str = "The gateway could not record this call i
 /// read was cancelled (decision 0009). Nobody is left to read it; the row holds it as `error`.
 pub(crate) const CALLER_DISCONNECTED: &str = "The caller disconnected, so the read was cancelled.";
 
+/// The error a call is recorded with when a tool not declared `checks_own_scope` reports the
+/// resources it reached, which only such a tool may (decision 0011). Its connector broke its
+/// contract, so its result is withheld and the report is not recorded.
+pub(crate) const REACH_FROM_UNSCOPED_TOOL: &str = "The tool reported the resources it reached, which only a tool that checks its own scope may, so its result was withheld. This is a fault in the gateway's connector, not in the call.";
+
 /// The longest a value is rendered, in characters after escaping, before it is cut short. The
 /// gateway's telemetry caps a surface at the same length.
 pub const MAX_RENDERED: usize = 128;
 
 /// Every complete-sentence template, for the tests that check them all.
 #[cfg(test)]
-const SENTENCES: [&str; 29] = [
+const SENTENCES: [&str; 30] = [
     PROFILE_UNKNOWN,
     TOOL_NOT_AVAILABLE,
     INVALID_TOOL_NAME,
@@ -172,6 +177,7 @@ const SENTENCES: [&str; 29] = [
     NOT_PERFORMED,
     UNKNOWN_OUTCOME,
     NO_DEFINITE_ANSWER,
+    REACH_FROM_UNSCOPED_TOOL,
 ];
 
 /// The sentence for `reason`.

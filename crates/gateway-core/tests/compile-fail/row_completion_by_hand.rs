@@ -10,6 +10,7 @@ fn forge(refusal: &Refusal) -> RowCompletion {
             latency_ms: 0,
         },
         reference: None,
+        reached: None,
     }
 }
 
