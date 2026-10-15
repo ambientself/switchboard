@@ -187,7 +187,7 @@ pub enum ResolverFailure {
 }
 
 impl ResolverFailure {
-    /// The label each kind of failure is counted under, in the order of [`index`](Self::index).
+    /// The label each kind of failure is counted under, in the order the variants are declared.
     pub const LABELS: [&'static str; 10] = [
         "token",
         "not_sent",
