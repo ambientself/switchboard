@@ -12,7 +12,7 @@
 //! **The request path.** Every `tools/call` and `tools/list` that carries the
 //! [`GRANT_HEADER`] is verified while checking is on, whatever its profile requires, against
 //! the deployment that received it, the caller's proved principal and pod, and the gateway's
-//! clock ([`GrantChecking::present`]). A grant that verifies becomes the core's verified
+//! clock (`GrantChecking::present`). A grant that verifies becomes the core's verified
 //! delegation; one that does not becomes a delegation that is present and unverified, which
 //! check 3 denies. A request with no grant has no delegation, so a profile that requires one
 //! denies it as missing. A request with the header more than once is a malformed grant. With
