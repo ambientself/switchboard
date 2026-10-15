@@ -123,7 +123,7 @@ fn grant(server: &Server, minter: &TestMinter, changes: Value) -> String {
     minter.mint(&claims)
 }
 
-/// `caller`'s token: team A's names its pod.
+/// `caller`'s token, naming the pod a grant names.
 fn token(server: &Server, caller: Caller) -> String {
     let now = server.fixture.clock.now();
     let issuer = &server.fixture.workload_issuer;
@@ -135,7 +135,13 @@ fn token(server: &Server, caller: Caller) -> String {
                 json!({"namespace": "team-a", "pod": {"name": "sandbox-1", "uid": POD}}),
             )
             .build(),
-        Caller::TeamB => issuer.workload_token(TEAM_B_SUBJECT, AUDIENCE, now).build(),
+        Caller::TeamB => issuer
+            .workload_token(TEAM_B_SUBJECT, AUDIENCE, now)
+            .claim(
+                "kubernetes.io",
+                json!({"namespace": "team-b", "pod": {"name": "control-1", "uid": POD}}),
+            )
+            .build(),
         Caller::UserInGroupG => server.token(caller),
     }
 }
@@ -463,7 +469,8 @@ async fn a_tool_list_never_asks() {
 }
 
 /// Under the profile for Otto's control-plane surface, which does not require currency, a
-/// proposal is allowed without asking, and its row records no answer.
+/// proposal is allowed without asking, with a verified grant or with none, and its row records
+/// no answer.
 #[tokio::test]
 async fn a_profile_that_does_not_require_currency_never_asks() {
     let minter = TestMinter::generate();
@@ -471,13 +478,18 @@ async fn a_profile_that_does_not_require_currency_never_asks() {
         .await
         .unwrap();
     let server = server(&minter, client(&fake)).await;
-    assert_allowed(
-        &server,
-        call(&server, Caller::TeamB, DRAFT_TOOL, None),
-        None,
-    )
-    .await;
-    assert_eq!(last_row(&server).profile.as_str(), CONTROL_PLANE);
+    let grant = grant(&server, &minter, json!({"team": TEAM_B}));
+    for grant in [Some(grant.as_str()), None] {
+        assert_allowed(
+            &server,
+            call(&server, Caller::TeamB, DRAFT_TOOL, grant),
+            None,
+        )
+        .await;
+        let row = last_row(&server);
+        assert_eq!(row.profile.as_str(), CONTROL_PLANE);
+        assert_eq!(row.delegation.is_some(), grant.is_some(), "{row:?}");
+    }
     assert_eq!(asked(&fake), 0);
 }
 
