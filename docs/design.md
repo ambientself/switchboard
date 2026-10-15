@@ -347,7 +347,21 @@ A call of any tool not classified `read` is also checked for currency: Otto's re
 whether the turn is still current, which enforces the fencing epoch and lets Otto revoke one
 turn. Reads are not fenced. The Kubernetes verifier exposes the pod UID its token proves, and
 the principal carries it. The verifier in `gateway-otto` binds a grant to it once the issuer
-requires `pod`; the gateway does not run the verifier yet (#22, section 17).
+requires `pod`.
+
+The gateway runs that verifier on every `tools/call` and `tools/list` that carries
+`X-Otto-Turn-Grant`, whatever the caller's profile requires, against the deployment that
+received the call, the proved principal and its pod, and the gateway's clock (#22). The
+deployment file's `[grants]` table names each issuer's public key files, a previous key with
+its absolute end instant, whether `pod` and `egress` are required, and the tool-name mapping.
+The keys are read at boot only, so a key change is a restart: one rollout. A grant that
+verifies becomes the call's verified delegation, its tools mapped to this gateway's names and
+narrowed to those the surface serves. One that fails becomes a delegation that is present and
+unverified, carrying the failure and, for a binding that failed after the signature verified,
+the digest; check 3 denies it. A request with no grant has no delegation, and one with the
+header twice carries a malformed grant. Without a `[grants]` table no issuer is configured, so
+a grant a request carries is refused, and no profile a rule gives workloads may require a
+delegation. Grant checking can be turned off only in a development build (section 12).
 
 **Discovery for employees' agents.** The gateway publishes the metadata MCP's authorization
 specification defines, so a standard client can find the identity provider and sign in without
@@ -809,7 +823,7 @@ written complete, has no finish, and is never open.
   columns, but no failure, which only a call row denied at check 3 has, and no currency
   answer. The issuer, key, session, turn and execution are escaped and capped at 128 characters,
   like the surface. Rows written before migration 0010 hold NULL in every one, which means not
-  recorded. Nothing fills the delegation's columns until the gateway verifies grants (#22).
+  recorded. The gateway fills the delegation's columns from the grants it verifies (#22).
 - Otto's `gateway_audit` table has none of these. They stay in this gateway's own record unless
   Otto adds them. Whether it does is part of the question about that table in Q18.
 
@@ -1210,6 +1224,23 @@ checked when a snapshot is loaded, reading the selector rules beside it: a snaps
 breaks it is refused, and the running snapshot is kept. The gateway also refuses to start with
 grant checking turned off outside a development build.
 
+These are built (#22). Each refusal of the key configuration in `gateway-otto` refuses to start
+with its own message, and so does a tool mapping that is not one to one. Grant checking off
+(`[grants] mode = "disabled"`) is refused by the release build before it connects to anything,
+beside the identity and audit opt-outs, and CI starts the release artifact with it and expects
+that refusal. Until Otto's sandboxes have a profile, "the profile for Otto's sandboxes" is read
+as any profile a rule gives workloads that requires a delegation: the gateway refuses to start
+when such a profile exists and no grant issuer is configured. Nothing in configuration ties a
+grant issuer to a selector rule, and any configured issuer's grant verifies for any caller, so
+"`pod` is not required for that rule's issuer" is read as any configured issuer not requiring
+`pod`: the pod gate holds only when every issuer requires it, once a tool not classified `read`
+is served to such a profile's team. A registry rule for workloads covers every team in its
+issuer's manifest. The pod gate runs at boot on both configuration paths and on every registry
+reload, where a version that breaks it is refused and the running one kept. While the
+snapshot loader's rule 2 refuses every proxied tool not classified `read`, a registry cannot
+reach the pod gate, as it cannot reach the receipt-store gate; its tests run on in-process
+snapshots.
+
 ## 13. Connectors and proxied servers
 
 A connector lists its tools with their classifications and runs a call given a verified
@@ -1516,9 +1547,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   session, turn, execution, epoch and egress setting; the pod UID; and the currency answer.
   Migration 0010 adds them, additive, with the shape constraints section 11 lists; the boot
   check covers them, and the contract suite runs them and their refusals on both stores. Rows
-  written before it hold NULL in each, which means not recorded. Nothing fills the delegation's
-  columns or the currency answer until the gateway verifies grants and asks Otto's resolver
-  (#22). Not built: with #12, a column for the exception that allowed a call, since the row's
+  written before it hold NULL in each, which means not recorded. The gateway fills the
+  delegation's columns from the grants it verifies (#22); nothing fills the currency answer
+  until it asks Otto's resolver. Not built: with #12, a column for the exception that allowed a call, since the row's
   shape constraint rightly allows no reason on an allowed row.
 - Rows of kind `list`, written complete, with a list form of the record in the core: built in
   the core and the stores, and wired into `tools/list` (#40). The core's `listed` writes a
@@ -1616,8 +1647,9 @@ decision 0009 is needed for milestone 2. Its part 2, decision 0011's exception a
   The scope is the proved
   principal and a verified delegation's key scope: its session, execution and turn, as
   decision 0009's Still open 8 recommends, provisional until Otto's owners agree which of a
-  grant's fields scope a key (#22). The gateway builds no delegation yet, so its keys are
-  scoped to the principal alone today. The moves the state table allows, among them that the
+  grant's fields scope a key (#22). The gateway builds a delegation from each grant that
+  verifies (#22), so a call carrying one has its key scoped by both; a call with none, as
+  every call in the demos, is scoped to the principal alone. The moves the state table allows, among them that the
   call settles its receipt only before its row's deadline, and a `pending` receipt past its
   deadline read as `unknown`, are the core's; the in-memory store completes a late finish's
   row and leaves its receipt `pending`. `begin` reserves a `pending` receipt for an allowed
@@ -2054,8 +2086,7 @@ before and after the network policy; the kind claim holds only while the evidenc
 
 **#22, the Otto adapter.**
 
-- Built, as the crate `gateway-otto`: the turn-grant verifier, not yet wired into the request
-  path. The `v3` format is specified in [turn-grant-format.md](turn-grant-format.md). The
+- Built, as the crate `gateway-otto`: the turn-grant verifier. The `v3` format is specified in [turn-grant-format.md](turn-grant-format.md). The
   verifier checks the version first, then the key, then the strict Ed25519 signature (S below
   the group order, no small-order point) before the claims are decoded, then canonical
   encoding, then the claims: `aud`, `iat` and `exp` with 30 seconds of leeway, the 15-minute
@@ -2066,14 +2097,24 @@ before and after the network policy; the kind claim holds only while the evidenc
   no end instant; a previous key retires at its absolute end instant without a restart. The
   tool mapping is one-to-one, read from a mapping file or from `conformance/baseline.json`, and
   a name it lacks is dropped. A test minter is behind `test-support`.
-- Not built yet: the gateway reading grant keys and running the verifier; a delegation in the
-  call context that is present and unverified, carrying the failure kind and an optional
-  digest, and its reason kind; currency in the call context, the profile setting, the currency
-  check between check 5 and check 6, skipped for `tools/list`, and its two reason kinds and
-  sentences; the resolver client with its one-second budget; the grant-key and pod-required
-  gates at boot and at snapshot load, reading the selector rules; the gate that allows grant
-  checking off only in a development build, with CI's check of the release artifact; and the
-  row fields (with #10).
+- Built in the gateway (#22): grant keys read at boot from the deployment file's `[grants]`
+  table, and the verifier run on every `tools/call` and `tools/list` that carries a grant,
+  whatever the profile requires (section 7). A verified grant fills the row's delegation
+  columns, and the pod UID is the caller's; a failure is recorded on the row denied at check 3,
+  logged and counted as section 11 says (`switchboard_grant_failures_total{kind}`, and
+  `switchboard_grants_accepted_total{key_id}`); an audience or pod failure is logged at
+  `ERROR` with its digest, a lifetime failure only counted, and nothing from a refused grant's
+  claims reaches the row, the answer or the log. The gates at boot and at snapshot load, and
+  CI's check that the release artifact refuses grant checking off: built (section 12). The
+  tests run every group of decision 0012's except currency through the HTTP endpoint, with the
+  test minter: replay, another deployment and pod, format and forgery, clock skew at the leeway
+  and the ceiling, key rotation across a restart, each boot refusal and the snapshot-load
+  refusal, failed grants at check 3, composition with the tool list, and revocation by the
+  team, key and surface levers, each tested against a restart.
+- Not built yet: the resolver client with its one-second budget, and asking it on the request
+  path. The gateway decides every call with currency not asked, and no policy sets
+  `requires_currency`. No deployment configures a grant issuer, and no demo profile requires a
+  delegation, so the demos' calls, which carry no grant, are decided as before.
 
 - Built in the core (#22): the delegation in the call context is absent, present and verified,
   or present and unverified. An unverified one carries its failure kind, from the core's closed
@@ -2092,9 +2133,7 @@ before and after the network policy; the kind claim holds only while the evidenc
   world's call is current. A new one: under a profile that requires currency, a call of a tool
   not classified `read` is never allowed unless current. The row fields: built (#10 and #56,
   above).
-- Not built: the turn-grant verifier, the resolver client, the gates, and the gateway's wiring
-  of them. The gateway decides every call with currency not asked and builds no delegation, so
-  its behaviour is unchanged.
+- Not built: the resolver client, and currency on the request path (above).
 
 **#26, the HTTP path.**
 
