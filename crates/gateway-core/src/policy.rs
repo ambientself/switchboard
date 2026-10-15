@@ -263,6 +263,22 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
+    /// Everything `principal` may reach: its team's limit for a workload, the union of its
+    /// groups' for a user. Empty for a team or group with no limit.
+    pub fn of(&self, principal: &Principal) -> BTreeSet<Resource> {
+        match &principal.kind {
+            PrincipalKind::Workload { team, .. } => {
+                self.teams.get(team).cloned().unwrap_or_default()
+            }
+            PrincipalKind::User { groups } => groups
+                .iter()
+                .filter_map(|group| self.groups.get(group))
+                .flatten()
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Whether `resource` is within what `principal` may reach.
     pub fn permits(&self, principal: &Principal, resource: &Resource) -> bool {
         match &principal.kind {

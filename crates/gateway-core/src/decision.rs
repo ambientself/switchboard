@@ -22,7 +22,8 @@ use crate::names::{
     DeploymentName, PolicyRevision, ProfileName, RequestedTool, SurfaceName, TeamId, ToolName,
 };
 use crate::policy::{
-    ApprovedTool, PolicySnapshot, Profile, Resource, ResourceDeclaration, ResourceLimits, Resources,
+    ApprovedTool, Narrowing, PolicySnapshot, Profile, Resource, ResourceDeclaration,
+    ResourceLimits, Resources,
 };
 use crate::principal::{DelegationFailure, PresentedDelegation, Principal, PrincipalId};
 use crate::proof::Proved;
@@ -375,6 +376,7 @@ pub struct Decision {
     call: CallContext,
     verdict: Verdict,
     policy_revision: PolicyRevision,
+    caller_limit: Option<Vec<Resource>>,
 }
 
 impl Decision {
@@ -414,8 +416,24 @@ impl Decision {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (CallContext, Verdict, PolicyRevision) {
-        (self.call, self.verdict, self.policy_revision)
+    /// The caller's limit, as the snapshot the decision was made from holds it, when the call
+    /// is allowed and its tool's connector entry narrows its credential to the caller's limit
+    /// (decision 0011, section 1): the connector narrows the call's credential to it. `None`
+    /// for a denial, and for a tool whose entry narrows per call or not at all, or that has no
+    /// entry.
+    pub fn caller_limit(&self) -> Option<&[Resource]> {
+        self.caller_limit.as_deref()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (CallContext, Verdict, PolicyRevision, Option<Vec<Resource>>) {
+        (
+            self.call,
+            self.verdict,
+            self.policy_revision,
+            self.caller_limit,
+        )
     }
 }
 
@@ -442,10 +460,29 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
                 .cloned(),
         },
     };
+    // Only an allowed call runs, so only its decision carries the limit its credential is
+    // narrowed to, read from the same snapshot as the checks.
+    let caller_limit = match &verdict {
+        Verdict::Allow(tool)
+            if snapshot
+                .entry(&tool.connector)
+                .is_some_and(|entry| entry.narrowing == Narrowing::Limit) =>
+        {
+            Some(
+                snapshot
+                    .limits()
+                    .of(call.caller.principal.get())
+                    .into_iter()
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
     Decision {
         call: call.clone(),
         verdict,
         policy_revision: snapshot.revision().clone(),
+        caller_limit,
     }
 }
 

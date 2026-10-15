@@ -6,7 +6,8 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::decision::CallContext;
-use crate::policy::ApprovedTool;
+use crate::names::PolicyRevision;
+use crate::policy::{ApprovedTool, Resource};
 use crate::receipt::VendorReference;
 
 /// A boxed future that can move between threads.
@@ -32,21 +33,53 @@ pub trait Connector: Send + Sync {
     fn run(&self, call: ToolCall) -> BoxFuture<'_, ToolOutcome>;
 }
 
+/// What the decision that allowed a call grants its connector beside the call itself: the
+/// policy revision it was made under, and the limit to narrow its credential to. Taken from the
+/// decision by [`audit::begin`](crate::audit::begin), so a connector reads them from the same
+/// snapshot the checks read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Granted {
+    pub(crate) policy_revision: PolicyRevision,
+    pub(crate) caller_limit: Option<Vec<Resource>>,
+}
+
 /// One allowed call, handed to its connector. Made only by consuming an audit guard.
 #[derive(Debug)]
 pub struct ToolCall {
     call: CallContext,
     tool: ApprovedTool,
     arguments: serde_json::Value,
+    granted: Granted,
 }
 
 impl ToolCall {
-    pub(crate) fn new(call: CallContext, tool: ApprovedTool, arguments: serde_json::Value) -> Self {
+    pub(crate) fn new(
+        call: CallContext,
+        tool: ApprovedTool,
+        arguments: serde_json::Value,
+        granted: Granted,
+    ) -> Self {
         Self {
             call,
             tool,
             arguments,
+            granted,
         }
+    }
+
+    /// The revision of the policy snapshot the call was decided under, as its row records it. A
+    /// connector that asks a custodian for a credential sends it, so the custodian checks the
+    /// request against its own copy of that revision (design section 9).
+    pub fn policy_revision(&self) -> &PolicyRevision {
+        &self.granted.policy_revision
+    }
+
+    /// The caller's limit, as the snapshot the call was decided under holds it, when the tool's
+    /// connector entry narrows its credential to the caller's limit (decision 0011, section 1),
+    /// and `None` otherwise. A connector narrowing a credential `limit` asks for exactly these
+    /// resources of its system.
+    pub fn caller_limit(&self) -> Option<&[Resource]> {
+        self.granted.caller_limit.as_deref()
     }
 
     /// The decided call: who is calling, under which profile, on which surface.
@@ -123,8 +156,8 @@ pub enum ErrorKind {
     /// failure is not an error at all: the request may have been sent, so its connector reports
     /// [`ToolOutcome::Unknown`], and its receipt is `unknown`.
     OversizedOrLateRead,
-    /// The credential custodian refused the credential an allowed call needed. Nothing reports
-    /// it yet: no connector asks a custodian.
+    /// The credential custodian refused the credential an allowed call needed: the GitHub
+    /// connector reports it when the key custodian refuses its token request.
     CustodianRefusal,
     /// The vendor refused the call, as each connector defines a refusal: for a proxied server,
     /// its `403` to a read. A proxied side effect's `403` is the outcome `unknown`.

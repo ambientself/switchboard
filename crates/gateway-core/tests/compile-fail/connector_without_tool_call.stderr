@@ -15,24 +15,35 @@ note: method defined here
 error[E0624]: associated function `new` is private
  --> tests/compile-fail/connector_without_tool_call.rs:9:37
   |
-9 |     let _ = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));
-  |                                     ^^^ private associated function
+9 |       let _ = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));
+  |                                       ^^^ private associated function
   |
  ::: src/connector.rs
   |
-  |     pub(crate) fn new(call: CallContext, tool: ApprovedTool, arguments: serde_json::Value) -> Self {
-  |     ---------------------------------------------------------------------------------------------- private associated function defined here
+  | /     pub(crate) fn new(
+  | |         call: CallContext,
+  | |         tool: ApprovedTool,
+  | |         arguments: serde_json::Value,
+  | |         granted: Granted,
+  | |     ) -> Self {
+  | |_____________- private associated function defined here
 
-error[E0308]: mismatched types
- --> tests/compile-fail/connector_without_tool_call.rs:9:47
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+ --> tests/compile-fail/connector_without_tool_call.rs:9:27
   |
 9 |     let _ = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));
-  |                           -------------       ^^^^ expected `ApprovedTool`, found `SurfaceName`
-  |                           |
-  |                           arguments to this function are incorrect
+  |                           ^^^^^^^^^^^^^-------------------------------------
+  |                                        |      |
+  |                                        |      expected `ApprovedTool`, found `SurfaceName`
+  |                                        argument #4 of type `gateway_core::connector::Granted` is missing
   |
 note: associated function defined here
  --> src/connector.rs
   |
-  |     pub(crate) fn new(call: CallContext, tool: ApprovedTool, arguments: serde_json::Value) -> Self {
+  |     pub(crate) fn new(
   |                   ^^^
+help: provide the argument
+  |
+9 -     let _ = connector.run(ToolCall::new(call, tool, serde_json::Value::Null));
+9 +     let _ = connector.run(ToolCall::new(call, /* ApprovedTool */, serde_json::Value::Null, /* Granted */));
+  |

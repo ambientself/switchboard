@@ -60,7 +60,7 @@ use thiserror::Error;
 
 use crate::classification::Classification;
 pub use crate::connector::ErrorKind;
-use crate::connector::{BoxFuture, Connector, ToolCall, ToolOutcome};
+use crate::connector::{BoxFuture, Connector, Granted, ToolCall, ToolOutcome};
 use crate::decision::{
     CallContext, CallerContext, CurrencyAnswer, Decision, Reason, ReasonKind, ResourceProblem,
     Verdict,
@@ -622,6 +622,7 @@ pub struct AuditGuard {
     call: CallContext,
     tool: ApprovedTool,
     arguments: serde_json::Value,
+    granted: Granted,
 }
 
 impl AuditGuard {
@@ -782,7 +783,11 @@ pub async fn begin(
     arguments: serde_json::Value,
     metadata: RequestMetadata,
 ) -> Result<Begun, AuditFailure> {
-    let (call, verdict, policy_revision) = decision.into_parts();
+    let (call, verdict, policy_revision, caller_limit) = decision.into_parts();
+    let granted = Granted {
+        policy_revision: policy_revision.clone(),
+        caller_limit,
+    };
     // The sentence is rendered once, and the same string goes to the row and to the caller.
     let decided = match verdict {
         Verdict::Allow(tool) => Decided::Allow(tool),
@@ -887,6 +892,7 @@ pub async fn begin(
             call,
             tool,
             arguments,
+            granted,
         }),
         Decided::Deny {
             reason, sentence, ..
@@ -1064,8 +1070,11 @@ pub async fn run(connector: &dyn Connector, guard: AuditGuard) -> Ran {
         call,
         tool,
         arguments,
+        granted,
     } = guard;
-    let outcome = connector.run(ToolCall::new(call, tool, arguments)).await;
+    let outcome = connector
+        .run(ToolCall::new(call, tool, arguments, granted))
+        .await;
     Ran {
         row,
         outcome,
@@ -1097,6 +1106,7 @@ pub async fn run_unless(
         call,
         tool,
         arguments,
+        granted,
     } = guard;
     let cancelled = || ToolOutcome::error(ErrorKind::Other, sentences::CALLER_DISCONNECTED);
     let mut gone = pin!(gone);
@@ -1109,7 +1119,7 @@ pub async fn run_unless(
             reserved: false,
         };
     }
-    let mut running = connector.run(ToolCall::new(call, tool, arguments));
+    let mut running = connector.run(ToolCall::new(call, tool, arguments, granted));
     let outcome = poll_fn(|context| {
         if let Poll::Ready(outcome) = running.as_mut().poll(context) {
             return Poll::Ready(outcome);
