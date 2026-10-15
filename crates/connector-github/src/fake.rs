@@ -1,7 +1,8 @@
-//! A fake GitHub REST API, behind the `test-support` feature, for the three read tools.
+//! A fake GitHub REST API, behind the `test-support` feature, for the read tools.
 //!
 //! It serves, on a loopback port, what the tools ask for: a file through the contents API, a
-//! pull request, an issue, and an issue's or a pull request's comments. It records every
+//! pull request, an issue, and an issue's or a pull request's comments; and, for the newer
+//! reads, what `reads` lists, with a fake job log host ([`FakeLogHost`]). It records every
 //! request, with the token it carried, before it looks at anything else.
 //!
 //! It answers only a token that the key custodian's fake App API ([`FakeGitHub`]) issued, has
@@ -32,6 +33,10 @@ use key_custodian::fake::{FakeGitHub, IssuedToken};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+mod reads;
+
+pub use reads::{FakeLogHost, LogHit};
 
 /// One request the fake received.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +79,7 @@ struct Shared {
     mode: Mutex<Mode>,
     requests: Mutex<Vec<Recorded>>,
     content: Mutex<Content>,
+    reads: Mutex<reads::Content>,
 }
 
 /// The fake, serving until dropped.
@@ -102,6 +108,7 @@ impl FakeRest {
             mode: Mutex::new(Mode::Normal),
             requests: Mutex::new(Vec::new()),
             content: Mutex::new(Content::default()),
+            reads: Mutex::new(reads::Content::default()),
         });
         let router = Router::new().fallback(answer).with_state(shared.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -309,6 +316,10 @@ async fn answer(
             token.as_deref(),
         );
     };
+    // The endpoints of the newer reads (`reads`).
+    if let Some(response) = reads::answer(&shared, &issued, &uri, token.as_deref()) {
+        return response;
+    }
     let Some((owner, repo, endpoint)) = endpoint(uri.path()) else {
         return error(StatusCode::NOT_FOUND, "Not Found", token.as_deref());
     };
