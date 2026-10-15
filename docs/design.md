@@ -503,8 +503,12 @@ That covers every such tool, `propose` and any `write` tool an exception lets pa
 `propose` alone. Superseded, ended and revoked are denied as `not_current`; unconfirmed, and not
 asked, as `currency_unconfirmed`; each kind has its sentence. `tools/list` skips the check, as
 it skips check 6. Nothing asks a control plane yet: the gateway decides every call as not asked,
-and no registry sets the profile setting, until the resolver client comes with the Otto
-adapter's wiring (#22).
+and no registry sets the profile setting, until the Otto adapter's wiring (#22). The client that
+will ask is built, in `gateway-otto`, against the interface proposed to Otto's owners in
+[resolver-interface.md](resolver-interface.md): one `POST` per question, never cached, within a
+budget of one second the client enforces, and every failure (no answer in time, an error, an
+unknown version, an answer that does not echo the question, an answer over 64 KiB or out of the
+format) read as unconfirmed.
 
 **A profile can declare that its callers set the `Idempotency-Key` header per request,** with
 `idempotency_key_header = true`. It is false unless a policy says so, in the JSON
@@ -2066,11 +2070,27 @@ before and after the network policy; the kind claim holds only while the evidenc
   no end instant; a previous key retires at its absolute end instant without a restart. The
   tool mapping is one-to-one, read from a mapping file or from `conformance/baseline.json`, and
   a name it lacks is dropped. A test minter is behind `test-support`.
+- Built, in `gateway-otto`, not yet wired into the request path: the client for Otto's resolver
+  interface. Its wire format is proposed to Otto's owners in
+  [resolver-interface.md](resolver-interface.md), marked a proposal until they agree. A
+  `Resolver` trait asks the currency question for a turn's session, execution, turn and epoch;
+  the HTTP client sends one `POST` per question with a fresh request ID, keeps no answer, and
+  gives up at the one-second budget, which it enforces itself over the whole exchange. It
+  follows no redirect and reads no proxy, trusts only the CA bundle the deployment names,
+  sends a projected ServiceAccount token read again for each question and only over TLS, and
+  refuses plain `http` except to a loopback address. It reads at most 64 KiB, from the
+  declared length or as the body arrives, then the version, then the format, then the echo of
+  every member of the question. The four answers map to the core's `CurrencyAnswer`, and every
+  failure (no answer in time, an error, an unknown version, an answer to another question, an
+  answer too large or out of the format) to `Unconfirmed`. Each answer, each failure by kind
+  and the latency of every question are counted, for the gateway to export (section 11). A
+  fake resolver behind `test-support` answers each state, hangs before or during its answer,
+  fails, and answers with another version or another question's echo; the tests use each.
 - Not built yet: the gateway reading grant keys and running the verifier; a delegation in the
   call context that is present and unverified, carrying the failure kind and an optional
   digest, and its reason kind; currency in the call context, the profile setting, the currency
   check between check 5 and check 6, skipped for `tools/list`, and its two reason kinds and
-  sentences; the resolver client with its one-second budget; the grant-key and pod-required
+  sentences; the grant-key and pod-required
   gates at boot and at snapshot load, reading the selector rules; the gate that allows grant
   checking off only in a development build, with CI's check of the release artifact; and the
   row fields (with #10).
@@ -2092,8 +2112,8 @@ before and after the network policy; the kind claim holds only while the evidenc
   world's call is current. A new one: under a profile that requires currency, a call of a tool
   not classified `read` is never allowed unless current. The row fields: built (#10 and #56,
   above).
-- Not built: the turn-grant verifier, the resolver client, the gates, and the gateway's wiring
-  of them. The gateway decides every call with currency not asked and builds no delegation, so
+- Not built: the turn-grant verifier, the gates, and the gateway's wiring of them and of the
+  resolver client. The gateway decides every call with currency not asked and builds no delegation, so
   its behaviour is unchanged.
 
 **#26, the HTTP path.**
