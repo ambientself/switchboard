@@ -906,6 +906,33 @@ fn a_side_effecting_tool_needs_the_pod_bound() {
 
     let not_requiring = boot_with(|config| config["grants"] = grants(&minter, false), false);
     assert!(not_requiring.is_ok(), "{not_requiring:?}");
+
+    // Any configured issuer's grant verifies for any caller, so every issuer must bind the pod:
+    // one that does is not enough beside one that does not.
+    let other = TestMinter::generate();
+    let mixed = boot_with(
+        |config| {
+            requiring(config);
+            let mut grants = grants(&minter, true);
+            grants["enforce"]["issuers"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "name": "otto-unbound",
+                    "current_key": other.public_key_pem(),
+                    "require_pod": false,
+                    "require_egress": false,
+                }));
+            config["grants"] = grants;
+        },
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        mixed.contains("issuer `otto-unbound` does not require `pod`"),
+        "{mixed}"
+    );
 }
 
 /// The release build refuses grant checking disabled, before anything else; a development

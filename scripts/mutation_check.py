@@ -2209,13 +2209,46 @@ mutate("gw-opt-outs-not-before-connecting", "start::prepare leaves the opt-outs 
        "    if audit.disabled {\n        opt_out(BootError::AuditOptOut, development)?;\n    }\n", "")
 BEFORE_CONNECTING = (
     "    boot::before_connecting(\n        &deployment.identity,\n        &deployment.audit.section(),\n"
-    "        registry.snapshot(),\n        development,\n    )?;\n"
+    "        &deployment.grants,\n        registry.snapshot(),\n        development,\n    )?;\n"
 )
 mutate_all("gw-receipt-gate-after-database", "start::prepare runs the receipt-store gate and the opt-outs after it connects to the database",
            (GW + "start.rs", BEFORE_CONNECTING, ""),
            (GW + "start.rs", "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n",
             "    if let Some(store) = &store {\n        wiring = wiring.audit_store(store.clone());\n    }\n"
             + BEFORE_CONNECTING.replace("&deployment.identity", "&identity")))
+
+# Turn grants' gates (decision 0012, "Keys"): grant checking off only in a development build,
+# refused in the gates and before connecting; a profile requiring a delegation needs a grant
+# issuer; and the pod gate, at boot on both paths and on every registry reload. tests/grants.rs
+# runs the gates on the JSON path, as the release build does where it matters; boot.rs's own
+# tests run the registry's policy gates and a reload; start.rs's starts as the release build does.
+GRANTS_SRC = GW + "grants.rs"
+POD_GATE_REGISTRY = (
+    "    let selections = covered_teams(policy.workload_selections(), basis.issuers.as_ref());\n"
+    "    pod_gate(policy.snapshot(), &selections, &basis.grant_issuers)?;\n"
+)
+REGISTRY_ISSUER_GATE = "    issuer_gate(served.snapshot(), &selections, &grants)?;\n"
+mutate("gw-grant-opt-out-allowed-in-release", "grant checking disabled starts in a release build", GRANTS_SRC,
+       "                if !development {\n                    return Err(GrantGateError::OptOut);\n                }\n", "")
+mutate("gw-grant-opt-out-not-before-connecting", "start::prepare leaves grant checking disabled to the gates, after it has connected", BOOT,
+       "    if grants.disabled {\n        opt_out(BootError::GrantOptOut, development)?;\n    }\n", "")
+mutate("gw-grant-issuer-gate-skipped", "a profile a rule gives workloads requires a delegation and no grant issuer is configured, and the gateway starts", GRANTS_SRC,
+       "    if grants.state == GateState::Disabled || !grants.issuers.is_empty() {",
+       "    if true || grants.state == GateState::Disabled || !grants.issuers.is_empty() {")
+mutate("gw-grant-pod-gate-config-path-skipped", "the JSON configuration's boot serves a side-effecting tool to a profile requiring a delegation while an issuer does not require pod", BOOT,
+       "    pod_gate(policy.snapshot(), &selections, grants.issuers())?;\n", "")
+mutate("gw-grant-pod-gate-skipped-at-snapshot-load", "a registry's policy is not held to the pod gate, at boot or on a reload", BOOT,
+       POD_GATE_REGISTRY, "")
+mutate_all("gw-grant-pod-gate-only-at-boot", "the registry's policy meets the pod gate at boot but not on a reload",
+           (BOOT, POD_GATE_REGISTRY, ""),
+           (BOOT, REGISTRY_ISSUER_GATE,
+            REGISTRY_ISSUER_GATE + "    pod_gate(served.snapshot(), &selections, &basis.grant_issuers)?;\n"))
+mutate("gw-grant-pod-gate-any-issuer-binding", "the pod gate passes while any one issuer requires pod, though another does not", GRANTS_SRC,
+       "grant_issuers.iter().find(|(_, require_pod)| !require_pod) else {",
+       "grant_issuers.iter().find(|(_, require_pod)| !require_pod).filter(|_| grant_issuers.iter().all(|(_, require_pod)| !require_pod)) else {")
+mutate("gw-grant-pod-gate-reads-only", "the pod gate lets a propose tool through and stops only write and destructive ones", GRANTS_SRC,
+       "                .find(|tool| tool.classification != Classification::Read)",
+       "                .find(|tool| !matches!(tool.classification, Classification::Read | Classification::Propose))")
 
 # Tool definitions.
 mutate("gw-boot-missing-catalog-entry", "an approved tool without a definition is served", CATALOG,
@@ -2699,6 +2732,31 @@ mutate("gw-unparsable-no-event", "a body refused at the protocol layer gives no 
        "                        rejection: rejection.kind(),\n"
        "                    });\n",
        "")
+
+# Turn grants on the request path (decision 0012, #22): every request carrying a grant has it
+# verified, whatever its profile requires; two headers are a malformed grant; each of the
+# verifier's failures maps to the core's of its name; a failure carries the digest only once the
+# signature verified; and a verified grant's tools are narrowed to the surface. tests/grants.rs,
+# tests/grant_logs.rs and grants.rs's own tests catch these.
+GRANT_PRESENT = "        let delegation = gates.grants().present(grant, &principal, &request);\n"
+mutate("gw-grant-verified-only-when-required", "a grant is verified only under a profile that requires a delegation, and ignored otherwise", GW_PATH,
+       GRANT_PRESENT,
+       "        let delegation = policy\n            .snapshot()\n            .profile(&profile)\n"
+       "            .is_some_and(|profile| profile.requires_delegation)\n"
+       "            .then(|| gates.grants().present(grant, &principal, &request))\n            .flatten();\n")
+mutate("gw-grant-two-headers-accepted", "a request with the grant header twice is verified by its first", GRANTS_SRC,
+       "            (Some(_), Some(_)) => PresentedGrant::Many,",
+       "            (Some(value), Some(_)) => PresentedGrant::One(value.as_bytes().to_vec()),")
+mutate("gw-grant-failure-kind-crossed", "an expired grant is recorded as not yet valid", GRANTS_SRC,
+       "        FailureKind::Expired => DelegationFailure::Expired,",
+       "        FailureKind::Expired => DelegationFailure::NotYetValid,")
+mutate("gw-grant-digest-without-signature", "a failure is logged and recorded with the grant's digest though its signature never verified", GRANTS_SRC,
+       "                let digest = failure.digest();",
+       "                let digest = Some(GrantDigest::of(bytes));")
+mutate("gw-grant-unserved-tool-kept", "a verified grant keeps a tool the surface it arrived on does not serve", GRANTS_SRC,
+       "            .filter(|tool| snapshot.tool_on_surface(surface, tool).is_some())\n", "")
+mutate("gw-grant-lifetime-failure-logged", "a lifetime failure is logged one by one", GRANTS_SRC,
+       "            FailureKind::Expired | FailureKind::NotYetValid | FailureKind::LifetimeOverCeiling => {}\n", "")
 
 
 # --- gateway server ------------------------------------------------------------------------
