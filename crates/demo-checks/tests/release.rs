@@ -2,8 +2,9 @@
 //!
 //! A build with the gateway's `test-support` feature is exempt from the receipt-store gate, so
 //! it serves tools not classified `read` with no receipt store, it accepts the identity and
-//! audit opt-outs (decision 0014), and, through connector-proxy's own `test-support`, it may
-//! reach a server on loopback (decision 0013, section 3). Cargo unifies features across the
+//! audit opt-outs (decision 0014) and turn-grant checking off (decision 0012), and, through
+//! connector-proxy's own `test-support`, it may reach a server on loopback (decision 0013,
+//! section 3). Cargo unifies features across the
 //! packages of one build, and crates/gateway-dev turns `test-support` on, so a workspace build
 //! of `switchboard` would be one. deploy/Dockerfile builds it on its own, with `-p gateway` and
 //! no features, and copies it out before anything else is built; CI builds it with the same
@@ -11,7 +12,7 @@
 //! a development build accepts, and a proxied `propose` tool as its registry loads (decision
 //! 0011, rule 2). The receipt-store gate cannot be reached from a registry until built-in
 //! connectors exist: rule 2 refuses every proxied tool not classified `read` first. These tests
-//! pin the command in both places, the four configurations CI starts it with and the refusal
+//! pin the command in both places, the five configurations CI starts it with and the refusal
 //! each must name, and the feature's absence from the defaults.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -117,7 +118,7 @@ fn ci_checks_the_binary_the_dockerfile_builds() {
 
 /// Each configuration CI starts the release binary with, the stderr file its step writes, and
 /// the start of the refusal it must name.
-const REFUSALS: [(&str, &str, &str); 4] = [
+const REFUSALS: [(&str, &str, &str); 5] = [
     (
         "proxied-propose",
         "proxied-propose-stderr.txt",
@@ -133,6 +134,12 @@ const REFUSALS: [(&str, &str, &str); 4] = [
         "audit-disabled",
         "audit-disabled-stderr.txt",
         "refused to start: audit is disabled, which only a development build allows",
+    ),
+    (
+        "grants-disabled",
+        "grants-disabled-stderr.txt",
+        "refused to start: turn-grant checking is disabled, which only a development build \
+         allows",
     ),
     (
         "loopback-destination",
@@ -195,6 +202,22 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
         "{audit}"
     );
     assert!(audit.contains("[audit]\nmode = \"disabled\"\n"), "{audit}");
+    let grants = file("grants-disabled");
+    assert!(
+        grants.contains("[identity]\nmode = \"enforce\"\n"),
+        "{grants}"
+    );
+    assert!(
+        grants.contains("[audit]\nmode = \"postgres\"\n"),
+        "{grants}"
+    );
+    assert!(
+        grants.contains("[grants]\nmode = \"disabled\"\n"),
+        "{grants}"
+    );
+    for text in [&proxied, &identity, &audit] {
+        assert!(!text.contains("[grants]"), "{text}");
+    }
     let loopback = file("loopback-destination");
     assert!(
         loopback.contains("[identity]\nmode = \"enforce\"\n"),
@@ -204,14 +227,14 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
         loopback.contains("[audit]\nmode = \"postgres\"\n"),
         "{loopback}"
     );
-    for text in [&proxied, &identity, &loopback] {
+    for text in [&proxied, &identity, &grants, &loopback] {
         assert!(
             text.contains("url_env = \"SWITCHBOARD_CI_DATABASE_URL\""),
             "{text}"
         );
     }
     // The opt-out configurations serve nothing, so the opt-out is the only refusal.
-    for config in ["identity-disabled", "audit-disabled"] {
+    for config in ["identity-disabled", "audit-disabled", "grants-disabled"] {
         let registry = read(&format!("deploy/ci/{config}/registry/registry.toml"));
         for empty in ["servers = []", "tools = []", "surfaces = []"] {
             assert!(registry.contains(empty), "{config}: {registry}");
@@ -235,7 +258,12 @@ fn the_configurations_differ_only_in_what_ci_expects_refused() {
         "{loopback}"
     );
     // The keys are public only: no private parameter of an EC or RSA key.
-    for config in ["proxied-propose", "audit-disabled", "loopback-destination"] {
+    for config in [
+        "proxied-propose",
+        "audit-disabled",
+        "grants-disabled",
+        "loopback-destination",
+    ] {
         let keys: Value =
             serde_json::from_str(&read(&format!("deploy/ci/{config}/jwks.json"))).unwrap();
         for key in keys["keys"].as_array().unwrap() {
@@ -296,7 +324,9 @@ fn test_support_is_not_a_default_feature_of_the_gateway() {
     for dependency in gateway["dependencies"].as_array().unwrap() {
         if dependency["kind"] != json!("dev") {
             assert_ne!(dependency["name"], json!("gateway"), "{dependency}");
-            if dependency["name"] == json!("connector-proxy") {
+            if dependency["name"] == json!("connector-proxy")
+                || dependency["name"] == json!("gateway-otto")
+            {
                 assert_eq!(dependency["features"], json!([]), "{dependency}");
             }
         }

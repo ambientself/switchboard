@@ -61,9 +61,9 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # The release artifact itself (decisions 0009, 0011, 0013 and 0014, design section 12). A
-  # `test-support` build is exempt from the receipt-store gate, may disable identity or audit,
-  # and may reach a server on loopback, and a feature can be turned on in any build, so this
+  # The release artifact itself (decisions 0009, 0011, 0012, 0013 and 0014, design section 12).
+  # A `test-support` build is exempt from the receipt-store gate, may disable identity, audit or
+  # turn-grant checking, and may reach a server on loopback, and a feature can be turned on in any build, so this
   # builds `switchboard` with exactly deploy/Dockerfile's command and checks that it refuses each
   # opt-out and a server on loopback, which shows it is not a development build, and a proxied
   # `propose` tool as its registry loads. The receipt-store gate
@@ -144,6 +144,24 @@ jobs:
           fi
           if ! grep -qF 'refused to start: audit is disabled, which only a development build allows' audit-disabled-stderr.txt; then
             echo "switchboard refused to start, but not for the audit opt-out"
+            exit 1
+          fi
+      # deploy/ci/grants-disabled/ turns turn-grant checking off, which only a development build
+      # accepts (decision 0012, "Keys"). The binary must exit 1 and name that opt-out.
+      - name: The release switchboard refuses grant checking disabled
+        run: |
+          set +e
+          SWITCHBOARD_INSTANCE=ci timeout 60 target/release/switchboard \
+            --config=deploy/ci/grants-disabled/gateway.toml 2> grants-disabled-stderr.txt
+          status=$?
+          set -e
+          cat grants-disabled-stderr.txt
+          if [ "$status" -ne 1 ]; then
+            echo "expected switchboard to refuse to start with exit status 1, got $status"
+            exit 1
+          fi
+          if ! grep -qF 'refused to start: turn-grant checking is disabled, which only a development build allows' grants-disabled-stderr.txt; then
+            echo "switchboard refused to start, but not for the turn-grant opt-out"
             exit 1
           fi
       # deploy/ci/loopback-destination/ registers a server at 127.0.0.1, which only a development
