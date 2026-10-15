@@ -522,6 +522,40 @@ async fn the_gateway_starts_from_its_files_with_the_github_connector() {
     );
 }
 
+/// `start::prepare` holds the GitHub connector to the deployment file's `[limits]` quotas
+/// (#217).
+#[tokio::test]
+async fn the_deployment_files_quotas_reach_the_github_connector() {
+    let world = World::with(Options {
+        bounds: "[limits]\nper_team_per_server_calls_per_minute = 1\nper_team_per_server_burst = 1\n",
+        ..Options::default()
+    })
+    .await;
+    world.rest.file("atlas", "x.txt", "x");
+    let prepared = prepared(reloaded(&world, |_| {})).await.unwrap();
+    let path = RequestPath::new(prepared.gates);
+    let token = github_world::token(TEAM_A);
+    let call = || {
+        files::call_on(
+            &path,
+            github_world::SURFACE,
+            &token,
+            GET_FILE,
+            file("atlas", "x.txt"),
+        )
+    };
+    let first = call().await;
+    assert_eq!(first.body["result"]["isError"], false, "{}", first.body);
+    let second = call().await;
+    assert_eq!(
+        second.body["error"]["message"],
+        team_over_quota(ENTRY, GET_FILE),
+        "{}",
+        second.body
+    );
+    assert_eq!(world.app.token_requests(), 1);
+}
+
 #[tokio::test]
 async fn a_github_entry_with_no_github_table_refuses_the_start() {
     let world = World::new().await;
