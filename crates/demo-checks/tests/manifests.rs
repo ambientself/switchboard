@@ -2672,8 +2672,9 @@ fn number_after(text: &str, prefix: &str, suffix: &str) -> u64 {
 /// Decision 0009, Shutdown: how long a call that began just before the gateway was told to stop
 /// may take, with its row: the begin budget, the call deadline, and the finish deadline with one
 /// answer budget more, for the last attempt to complete a failed begin's row. The call deadline
-/// is the longest the deployment file at `path` sets for any server, or the default (decision
-/// 0014, section 1); the budgets are not configurable, so each is the code's default.
+/// is the longest the deployment file at `path` sets for any server or connector in the
+/// gateway's own process, or the default (decision 0014, section 1); the budgets are not
+/// configurable, so each is the code's default.
 fn begin_call_and_finish(path: &str) -> Duration {
     let file: DeploymentFile =
         toml::from_str(&read(path)).unwrap_or_else(|error| panic!("{path}: {error}"));
@@ -2682,7 +2683,7 @@ fn begin_call_and_finish(path: &str) -> Duration {
 }
 
 #[test]
-fn the_longest_deadline_is_the_longest_any_server_sets_or_the_default() {
+fn the_longest_deadline_is_the_longest_any_server_or_connector_sets_or_the_default() {
     let longest = |text: &str| {
         toml::from_str::<DeploymentFile>(&format!(
             "{}{text}",
@@ -2699,6 +2700,11 @@ fn the_longest_deadline_is_the_longest_any_server_sets_or_the_default() {
     assert_eq!(
         longest("\n[servers.a]\ndeadline_seconds = 2\n\n[servers.b]\ndeadline_seconds = 60\n"),
         Duration::from_secs(60)
+    );
+    // A connector in the gateway's own process counts too (decision 0014, section 1).
+    assert_eq!(
+        longest("\n[servers.a]\ndeadline_seconds = 2\n\n[connectors.c]\ndeadline_seconds = 45\n"),
+        Duration::from_secs(45)
     );
 }
 

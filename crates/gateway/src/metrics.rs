@@ -20,6 +20,16 @@
 //!   admission, each a `call_shed` telemetry event, counted here and not among the events
 //!   above; and `server` and `team` for calls completed as `refused` by a proxied server's cap
 //!   or a team's cap on calls to it, summed over the servers.
+//! - Always: `switchboard_calls_over_quota_total{scope}`, the calls completed as `refused` by a
+//!   rate quota and not sent ([`crate::quota`]), `scope` one of `server` and `team`, summed
+//!   over every proxied server and every connector in the gateway's own process. Each scope is
+//!   written from zero.
+//! - Always: `switchboard_in_process_bound_breaches_total{kind}`, the calls to a connector in
+//!   the gateway's own process that went past its bound ([`crate::bound`]), `kind` one of
+//!   `late` (a read cancelled, or a side effect answered `unknown`, at its deadline) and
+//!   `oversized` (a result over its size bound), summed over those connectors, which
+//!   [`Gates::in_process_signals`](crate::Gates::in_process_signals) gives. Each kind is written
+//!   from zero.
 //! - With proxied servers, from each one's [`Bulkhead`](crate::bulkhead::Bulkhead), labelled
 //!   `server` with the server's name in the registry, so there is one series per server and
 //!   nothing a caller chooses:
@@ -155,6 +165,7 @@ use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+use crate::bound::{InProcessCounts, InProcessSignals};
 use crate::bulkhead::{ProxiedSignals, ServerCounts};
 use crate::drift::{DriftCounts, DriftSignals};
 use crate::grants::{GrantCounts, GrantSignals};
@@ -182,6 +193,7 @@ pub struct Metrics {
     issuer_keys: KeyAges,
     policy: Option<Freshness>,
     proxied: ProxiedSignals,
+    in_process: Arc<InProcessSignals>,
     drift: Option<DriftSignals>,
     reconciliation: Option<ReconcileSignals>,
     grants: Option<GrantSignals>,
@@ -196,6 +208,7 @@ impl std::fmt::Debug for Metrics {
             .field("issuer_keys", &self.issuer_keys)
             .field("policy", &self.policy)
             .field("proxied", &self.proxied)
+            .field("in_process", &self.in_process)
             .field("drift", &self.drift)
             .field("reconciliation", &self.reconciliation)
             .field("grants", &self.grants)
@@ -232,6 +245,7 @@ impl Metrics {
             issuer_keys: KeyAges::default(),
             policy: None,
             proxied: ProxiedSignals::default(),
+            in_process: Arc::default(),
             drift: None,
             reconciliation: None,
             grants: None,
@@ -275,6 +289,13 @@ impl Metrics {
         self
     }
 
+    /// The same metrics, with what the connectors in the gateway's own process count, which
+    /// [`Gates::in_process_signals`](crate::Gates::in_process_signals) gives.
+    pub fn with_in_process(mut self, signals: Arc<InProcessSignals>) -> Self {
+        self.in_process = signals;
+        self
+    }
+
     /// The same metrics, with the age of each issuer's keys from `ages`, which
     /// [`KeyRefresher::ages`](crate::keys::KeyRefresher::ages) gives.
     pub fn with_issuer_keys(mut self, ages: KeyAges) -> Self {
@@ -294,7 +315,10 @@ impl Metrics {
         let mut text = Text::default();
         let counts = self.telemetry.counts();
         telemetry_signals(&mut text, &counts);
-        proxied_signals(&mut text, counts.calls_shed, &self.proxied.counts());
+        let proxied = self.proxied.counts();
+        let in_process = self.in_process.counts();
+        proxied_signals(&mut text, counts.calls_shed, &proxied);
+        limit_signals(&mut text, &proxied, &in_process);
         if let Some(drift) = &self.drift {
             drift_signals(&mut text, &drift.counts(), drift.withdrawn());
         }
@@ -543,6 +567,53 @@ fn proxied_signals(text: &mut Text, instance_shed: u64, servers: &[(ConnectorNam
             "switchboard_proxied_late_or_oversized_total",
             &[("server", server.as_str())],
             counts.late_or_oversized,
+        );
+    }
+}
+
+fn limit_signals(
+    text: &mut Text,
+    servers: &[(ConnectorName, ServerCounts)],
+    in_process: &InProcessCounts,
+) {
+    text.family(
+        "switchboard_calls_over_quota_total",
+        "counter",
+        "Calls refused by a rate quota, by scope: the server's, or the caller's team's on the \
+         server. Each was completed as refused and not sent.",
+    );
+    let server = servers
+        .iter()
+        .map(|(_, counts)| counts.over_quota_server)
+        .sum::<u64>()
+        + in_process.over_quota_server;
+    let team = servers
+        .iter()
+        .map(|(_, counts)| counts.over_quota_team)
+        .sum::<u64>()
+        + in_process.over_quota_team;
+    for (scope, count) in [("server", server), ("team", team)] {
+        text.sample(
+            "switchboard_calls_over_quota_total",
+            &[("scope", scope)],
+            count,
+        );
+    }
+    text.family(
+        "switchboard_in_process_bound_breaches_total",
+        "counter",
+        "Calls to a connector in the gateway's own process past its bound, by kind: late, at \
+         its deadline, or oversized, a result over its size bound. A read's is an error, any \
+         other's unknown.",
+    );
+    for (kind, count) in [
+        ("late", in_process.late),
+        ("oversized", in_process.oversized),
+    ] {
+        text.sample(
+            "switchboard_in_process_bound_breaches_total",
+            &[("kind", kind)],
+            count,
         );
     }
 }

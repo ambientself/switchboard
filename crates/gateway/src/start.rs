@@ -28,7 +28,10 @@
 //! takes audit as explicitly disabled), and then runs the boot gates
 //! ([`boot::check_registry`]). Any failure refuses to start, naming the reason,
 //! before anything is served. A `[servers.<name>]` for a server the registry does not name is
-//! refused: a bound meant for a server that is not there would be one nobody holds.
+//! refused: a bound meant for a server that is not there would be one nobody holds. So is a
+//! `[connectors.<name>]` for a connector the gateway does not run in its own process, before
+//! anything is read: no built-in connector is wired yet (#12), so today that is every one.
+//! Each bulkhead takes `[limits]`'s rate quotas too ([`crate::quota`]).
 //!
 //! Each keys URL is checked first, every one before any is fetched: it must be on its issuer's
 //! own origin, an `https` one must have a CA file that reads as a PEM bundle of certificates,
@@ -46,7 +49,8 @@
 //! report as [`GIVEN_UP_EVENT`] at `ERROR`, naming the row, so an open row is found when it is
 //! left open and not only by querying for it (decision 0009).
 //!
-//! It logs a boot line for the caps on calls in flight, and one for each server's bounds.
+//! It logs a boot line for the caps on calls in flight and the rate quotas, and one for each
+//! server's bounds.
 //!
 //! When the deployment file has a `[resolver]` table, it builds the client for Otto's resolver
 //! interface from it, before connecting to anything, and refuses to start if the client
@@ -85,6 +89,7 @@ use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles}
 use thiserror::Error;
 
 use crate::boot::{self, BootError, GateState, Gates, Settings, Wiring};
+use crate::bound::InProcessLimits;
 use crate::bulkhead::{Bulkhead, ProxiedSignals};
 use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
@@ -135,6 +140,13 @@ pub enum StartError {
         /// Its credential reference.
         reference: String,
     },
+    /// The deployment file sets bounds for a connector this gateway does not run in its own
+    /// process.
+    #[error(
+        "`[connectors.{0}]` sets bounds for a connector this gateway does not run in its own \
+         process; remove it, or name a built-in connector the gateway runs"
+    )]
+    UnknownConnectorLimits(ConnectorName),
     /// The deployment file sets bounds for a server the registry does not name.
     #[error(
         "`[servers.{0}]` sets bounds for a server the registry does not name; remove it, or \
@@ -367,6 +379,7 @@ async fn prepare_with(
         &deployment.servers,
         deployment.drift_interval,
     )?;
+    in_process_bounds(&deployment.connectors, &BTreeSet::new())?;
 
     let credentials = Arc::new(credentials(&registry, &deployment.credentials)?);
     let probes = probe_credentials(&registry, &deployment.probe_credentials)?;
@@ -503,6 +516,14 @@ async fn prepare_with(
         per_server_in_flight = limits.per_server_in_flight,
         per_team_per_server_in_flight = limits.per_team_per_server_in_flight,
         "calls in flight are capped in this instance, per server and per team per server"
+    );
+    tracing::info!(
+        event = "boot",
+        per_server_calls_per_minute = limits.quotas.per_server.per_minute,
+        per_server_burst = limits.quotas.per_server.burst,
+        per_team_per_server_calls_per_minute = limits.quotas.per_team_per_server.per_minute,
+        per_team_per_server_burst = limits.quotas.per_team_per_server.burst,
+        "calls are held to rate quotas in this instance, per server and per team per server"
     );
     for (server, bounds) in &deployment.servers {
         tracing::info!(
@@ -660,6 +681,19 @@ fn drift_interval<'a>(
     Ok(())
 }
 
+/// Refuses bounds in `bounds`, the deployment file's `[connectors.<name>]`, for a connector not
+/// in `wired`, the connectors this gateway runs in its own process: a bound meant for a
+/// connector that is not there would be one nobody holds. None is wired yet (#12).
+fn in_process_bounds(
+    bounds: &BTreeMap<ConnectorName, InProcessLimits>,
+    wired: &BTreeSet<ConnectorName>,
+) -> Result<(), StartError> {
+    match bounds.keys().find(|name| !wired.contains(*name)) {
+        Some(unknown) => Err(StartError::UnknownConnectorLimits(unknown.clone())),
+        None => Ok(()),
+    }
+}
+
 /// The connector's class of a registry entry's destination.
 pub(crate) fn destination(destination: Destination) -> connector_proxy::Destination {
     match destination {
@@ -754,7 +788,8 @@ fn proxied(
             connector,
             limits.per_server_in_flight,
             limits.per_team_per_server_in_flight,
-        );
+        )
+        .with_quotas(limits.quotas);
         signals.insert(server.name.clone(), bulkhead.signals());
         wiring = wiring
             .proxied(server.name.clone(), Arc::new(bulkhead))
@@ -1388,6 +1423,7 @@ mod tests {
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),
+            connectors: BTreeMap::new(),
             ca_files: BTreeMap::new(),
             drift_interval: crate::drift::DEFAULT_DRIFT_INTERVAL,
             probe_credentials: BTreeMap::from([(ConnectorName::new("mock-docs"), probe)]),

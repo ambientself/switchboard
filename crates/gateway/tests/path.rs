@@ -1,7 +1,8 @@
 //! The request path, design section 6, driven with raw MCP requests over the testkit's world
 //! and no HTTP server: a method, headers and a body go in, an HTTP response comes out. The
-//! futures are driven with the testkit's `block_on` and `poll_once`, so nothing here needs an
-//! async runtime.
+//! futures are driven with the testkit's `block_on` and `poll_once`, so a test sees exactly
+//! when each is polled. They run inside a Tokio runtime all the same, which only the bound
+//! around the fixture connector uses, for its deadline's timer (`gateway::bound`).
 //!
 //! The cases mirror the testkit's `end_to_end.rs`, which strings the core's steps together by
 //! hand. Here the gateway's own path does that, from a token and a JSON-RPC body.
@@ -36,11 +37,34 @@ use gateway_testkit::{
     Fixture, FixtureConnector, GROUP_G, GROUP_REVIEW, InMemoryAuditStore, PROFILE_REVIEWER,
     PROFILE_TEAM_A, PROFILE_TEAM_B, PROFILE_USER, READ_TOOL, SCOPE_REFUSAL, SCOPED_READ_TOOL,
     SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_A_SUBJECT, TEAM_B, TEAM_B_DOCUMENT,
-    TEAM_B_SUBJECT, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, block_on, document,
-    fresh_key, poll_once,
+    TEAM_B_SUBJECT, USER_ISSUER, USER_SUBJECT, WORKLOAD_ISSUER, WRITE_TOOL, document, fresh_key,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use serde_json::{Value, json};
+
+/// The runtime the bound around the fixture connector times its calls with.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .unwrap()
+    })
+}
+
+/// The testkit's `block_on`, inside [`runtime`].
+fn block_on<F: Future>(future: F) -> F::Output {
+    let _inside = runtime().enter();
+    gateway_testkit::block_on(future)
+}
+
+/// The testkit's `poll_once`, inside [`runtime`].
+fn poll_once<F: Future + ?Sized>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let _inside = runtime().enter();
+    gateway_testkit::poll_once(future)
+}
 
 const AUDIT_FAILURE: &str = "The gateway could not record this call in its audit log, so it was refused and nothing ran. Try again later.";
 

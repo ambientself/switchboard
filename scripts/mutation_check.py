@@ -2360,13 +2360,9 @@ mutate("gw-unknown-fields-IssuerKindEntry", "an issuer's kind accepts unknown fi
 mutate("gw-boot-unregistered-connector", "a served tool with no registered connector is accepted", BOOT,
        "        if !connectors.contains_key(&tool.connector) {", "        if false && !connectors.contains_key(&tool.connector) {")
 mutate("gw-boot-duplicate-connector-accepted", "a connector registered twice keeps the last one", BOOT,
-       "    for (name, mut registered) in registrations {\n"
-       "        if let Some(deadline) = call_deadlines.get(&name) {\n"
-       "            registered.call_deadline = *deadline;\n"
-       "        }\n"
-       "        if connectors.insert(name.clone(), registered).is_some() {\n"
+       "        ));\n        if connectors.insert(name.clone(), registered).is_some() {\n"
        "            return Err(BootError::DuplicateConnector(name));\n        }\n",
-       "    for (name, registered) in registrations {\n        connectors.insert(name, registered);\n")
+       "        ));\n        connectors.insert(name, registered);\n")
 mutate("gw-boot-registry-duplicate-connector-accepted", "a proxied connector registered twice keeps the last one", BOOT,
        "        };\n        if connectors.insert(name.clone(), registered).is_some() {\n"
        "            return Err(BootError::DuplicateConnector(name));\n        }\n",
@@ -2975,8 +2971,16 @@ mutate("gw-event-source-not-peer", "events name the gateway's own address, not t
 # row and nothing sent, inside the argument check, held until the call ends; and the caps and
 # each server's deadline and answer cap from the deployment file, within their ceilings.
 # tests/limits.rs watches each; start.rs's own tests the wiring of the deadline.
+#
+# With #12: the bound around a connector in the gateway's own process, a read late or too large
+# an error and a side effect `unknown`, and its bounds' ceilings in the deployment file; and the
+# rate quotas, each server's and each team's on it, refused with a row, a receipt
+# `not_performed` and nothing sent. tests/in_process.rs, tests/limits.rs and quota.rs's own
+# tests watch these.
 GW_BULKHEAD = GW + "bulkhead.rs"
 GW_START = GW + "start.rs"
+GW_BOUND = GW + "bound.rs"
+GW_QUOTA = GW + "quota.rs"
 
 mutate("gw-instance-cap-ignored", "a request over the instance's cap on requests in flight is served", GW_SERVER,
        "    let Ok(in_flight) = endpoint.in_flight.clone().try_acquire_owned() else {\n",
@@ -3021,13 +3025,20 @@ mutate("gw-server-deadline-override-ignored", "a server's deadline from the depl
 mutate("gw-server-result-cap-override-ignored", "a server's answer cap from the deployment file does not reach its connector", GW_START,
        "        upstream.max_response_bytes = bounds.max_result_bytes;\n", "")
 mutate("gw-server-limits-ceiling-unchecked", "a server's deadline past 60 s loads", GW_DEPLOY,
-       "        Some(seconds) if seconds == 0 || seconds > MAX_SERVER_DEADLINE.as_secs() => {\n",
-       "        Some(seconds) if seconds == 0 => {\n")
+       "        Some(seconds) if seconds == 0 || seconds > MAX_SERVER_DEADLINE.as_secs() => {\n"
+       "            return Err(DeploymentError::DeadlineOutOfRange {\n",
+       "        Some(seconds) if seconds == 0 => {\n"
+       "            return Err(DeploymentError::DeadlineOutOfRange {\n")
 mutate("gw-server-result-ceiling-unchecked", "a server's answer cap past 1 MiB loads", GW_DEPLOY,
-       "        Some(bytes) if bytes == 0 || bytes > MAX_SERVER_RESULT_BYTES => {\n",
-       "        Some(bytes) if bytes == 0 => {\n")
+       "        Some(bytes) if bytes == 0 || bytes > MAX_SERVER_RESULT_BYTES => {\n"
+       "            return Err(DeploymentError::ResultBytesOutOfRange {\n",
+       "        Some(bytes) if bytes == 0 => {\n"
+       "            return Err(DeploymentError::ResultBytesOutOfRange {\n")
 mutate("gw-limit-zero-accepted", "a cap of zero in [limits] loads", GW_DEPLOY,
-       "        Some(0) => Err(DeploymentError::LimitZero(field)),\n", "        Some(0) if false => Err(DeploymentError::LimitZero(field)),\n")
+       "match given {\n        Some(0) => Err(DeploymentError::LimitZero(field)),\n        given => Ok(given.unwrap_or(default)),\n"
+       "    };\n    Ok(Limits {\n",
+       "match given {\n        Some(0) if false => Err(DeploymentError::LimitZero(field)),\n"
+       "        given => Ok(given.unwrap_or(default)),\n    };\n    Ok(Limits {\n")
 mutate("gw-max-in-flight-not-from-file", "the deployment file's max_in_flight does not reach the HTTP server, which holds the instance to the default", GW_START,
        "        max_in_flight: limits.max_in_flight,\n",
        "        max_in_flight: crate::deployment::DEFAULT_MAX_IN_FLIGHT,\n")
@@ -3037,6 +3048,49 @@ mutate("gw-per-server-in-flight-not-from-file", "the deployment file's per_serve
 mutate("gw-unknown-server-limits-accepted", "bounds for a server the registry does not name are ignored", GW_START,
        "        return Err(StartError::UnknownServerLimits(unknown.clone()));\n",
        "        let _ = unknown;\n")
+mutate("gw-in-process-bound-not-applied", "a connector in the gateway's own process runs bare, with no deadline, size bound or quota", BOOT,
+       "        registered.connector = Arc::new(Bounded::new(\n"
+       "            name.clone(),\n"
+       "            registered.connector,\n"
+       "            limits,\n"
+       "            quotas,\n"
+       "            in_process.clone(),\n"
+       "        ));\n",
+       "        let _ = (&quotas, &in_process, Bounded::new);\n")
+mutate("gw-in-process-late-side-effect-error", "a side effect past its bound is recorded as error, which settles its receipt not_performed", GW_BOUND,
+       "        } else {\n            ToolOutcome::Unknown\n        };\n",
+       "        } else {\n            ToolOutcome::error(ErrorKind::Other, breach.sentence())\n        };\n")
+mutate("gw-in-process-side-effect-cancelled", "a side effect past its deadline is dropped, cancelling it half done, not run to its end", GW_BOUND,
+       "            if !read {\n",
+       "            if false {\n")
+mutate("gw-in-process-size-bound-removed", "a result of any size from a connector in the gateway's own process is passed on", GW_BOUND,
+       "        if fits(result, self.limits.max_result_bytes) {\n",
+       "        if fits(result, usize::MAX) {\n")
+mutate("gw-team-quota-not-applied", "a team's rate quota on a server is never taken, so one team can use up the server's", GW_QUOTA,
+       "        let team = team.map(|team| self.team(team, now));\n",
+       "        let team = team.filter(|_| false).map(|team| self.team(team, now));\n")
+mutate("gw-quota-team-token-kept-on-server-refusal", "a call the server's quota refuses still costs its team a token", GW_QUOTA,
+       "                lock(team).give_back();\n",
+       "                let _ = team;\n")
+mutate("gw-proxied-quotas-not-applied", "a proxied server's calls are held to no rate quota", GW_BULKHEAD,
+       "        if let Err(scope) = self.quotas.take(call.call().caller.principal.get().team()) {\n",
+       "        if let Err(scope) = Ok::<(), QuotaScope>(()) {\n")
+mutate("gw-quota-refusal-receipt-unknown", "a side effect a quota refused is answered unknown, so its receipt is not settled not_performed", GW_BOUND,
+       "        Box::pin(std::future::ready(ToolOutcome::Refused(sentence)))\n",
+       "        Box::pin(std::future::ready({\n            let _ = sentence;\n            ToolOutcome::Unknown\n        }))\n")
+mutate("gw-in-process-deadline-ceiling-unchecked", "a built-in connector's deadline past 60 s loads", GW_DEPLOY,
+       "        Some(seconds) if seconds == 0 || seconds > MAX_SERVER_DEADLINE.as_secs() => {\n"
+       "            return Err(DeploymentError::ConnectorDeadlineOutOfRange {\n",
+       "        Some(seconds) if seconds == 0 => {\n"
+       "            return Err(DeploymentError::ConnectorDeadlineOutOfRange {\n")
+mutate("gw-in-process-result-ceiling-unchecked", "a built-in connector's result bound past 1 MiB loads", GW_DEPLOY,
+       "        Some(bytes) if bytes == 0 || bytes > MAX_SERVER_RESULT_BYTES => {\n"
+       "            return Err(DeploymentError::ConnectorResultBytesOutOfRange {\n",
+       "        Some(bytes) if bytes == 0 => {\n"
+       "            return Err(DeploymentError::ConnectorResultBytesOutOfRange {\n")
+mutate("gw-in-process-wired-ceiling-unchecked", "a connector in the gateway's own process wired past the ceilings boots", BOOT,
+       "        if !limits.within_ceilings() {\n",
+       "        if false {\n")
 
 
 # --- gateway: stale policy -----------------------------------------------------------------
