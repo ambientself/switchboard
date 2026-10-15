@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use gateway_core::audit::{
     AuditRecord, AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome,
-    RecordedDelegation, RecordedFailure, RecordedResources, RowKind,
+    ReachedResources, RecordedDelegation, RecordedFailure, RecordedResources, RowKind,
 };
 use gateway_core::receipt::ReceiptRequest;
 use gateway_core::{
@@ -978,6 +978,9 @@ pub(crate) struct FinishRow {
     pub settles: &'static str,
     /// The vendor's reference for what the call made, for its receipt.
     pub reference: Option<String>,
+    /// The resources a tool that checks its own scope reached, and how many were left out,
+    /// written in place of the row's `unknown` ones by [`UPDATE_REACHED`](Self::UPDATE_REACHED).
+    pub reached: Option<(Value, i64)>,
 }
 
 impl FinishRow {
@@ -985,6 +988,14 @@ impl FinishRow {
     /// already complete; [`SELECT`](Self::SELECT) then says which.
     pub const UPDATE: &'static str = "UPDATE switchboard_audit.call_rows
         SET outcome = $2, outcome_sentence = $3, error_kind = $4, latency_ms = $5
+        WHERE id = ($1::text)::uuid AND outcome IS NULL";
+
+    /// [`UPDATE`](Self::UPDATE), and the resources the call's tool reached in place of the
+    /// row's `unknown` ones (decision 0011). `complete_once` refuses it for a row begun with
+    /// any other resources.
+    pub const UPDATE_REACHED: &'static str = "UPDATE switchboard_audit.call_rows
+        SET outcome = $2, outcome_sentence = $3, error_kind = $4, latency_ms = $5,
+            resources = $6, resources_omitted = $7
         WHERE id = ($1::text)::uuid AND outcome IS NULL";
 
     /// The completion a row already has, read back with only the columns the gateway's role
@@ -1019,6 +1030,7 @@ impl FinishRow {
             latency_ms,
             settles,
             reference: None,
+            reached: None,
         })
     }
 
@@ -1029,6 +1041,23 @@ impl FinishRow {
         reference: Option<&VendorReference>,
     ) -> Result<Self, PgAuditError> {
         self.reference = optional("reference", reference.map(VendorReference::as_str))?;
+        Ok(self)
+    }
+
+    /// The same columns, with the resources the call's tool `reached`, written as begin writes
+    /// named resources.
+    pub fn with_reached(
+        mut self,
+        reached: Option<&ReachedResources>,
+    ) -> Result<Self, PgAuditError> {
+        self.reached = reached
+            .map(|reached| {
+                resources_of(
+                    &RecordedResources::Named(reached.resources.clone()),
+                    reached.omitted,
+                )
+            })
+            .transpose()?;
         Ok(self)
     }
 
@@ -2573,6 +2602,7 @@ mod tests {
                 latency_ms: 7,
                 settles: "completed",
                 reference: None,
+                reached: None,
             }
         );
         assert_eq!(
@@ -2586,6 +2616,7 @@ mod tests {
                 latency_ms: 7,
                 settles: "not_performed",
                 reference: None,
+                reached: None,
             }
         );
         assert_eq!(
@@ -2599,6 +2630,7 @@ mod tests {
                 latency_ms: 7,
                 settles: "not_performed",
                 reference: None,
+                reached: None,
             }
         );
     }
@@ -2649,6 +2681,7 @@ mod tests {
             latency_ms: 4,
             settles: "not_performed",
             reference: None,
+            reached: None,
         };
         assert!(row.is("refused", Some("No."), None, Some(4)));
         assert!(!row.is("error", Some("No."), None, Some(4)));
@@ -2665,6 +2698,7 @@ mod tests {
             latency_ms: 4,
             settles: "not_performed",
             reference: None,
+            reached: None,
         };
         assert!(error.is("error", None, Some("vendor_refusal"), Some(4)));
         assert!(!error.is("error", None, Some("other"), Some(4)));

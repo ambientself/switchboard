@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gateway_core::audit::{
-    AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome, RecordedResources,
-    RowCompletion, RowKind, RowStart, StoreError,
+    AuditRowId, Completion, DecisionKind, ErrorKind, ListRecord, Outcome, ReachedResources,
+    RecordedResources, RowCompletion, RowKind, RowStart, StoreError,
 };
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
@@ -390,6 +390,7 @@ struct Late {
     row: AuditRowId,
     completion: Completion,
     reference: Option<VendorReference>,
+    reached: Option<ReachedResources>,
 }
 
 #[derive(Default)]
@@ -426,7 +427,13 @@ impl State {
         for late in ready {
             // A completion the row refuses is not written; the Postgres store's task gives
             // it up the same way.
-            let _ = self.complete_with(&late.row, &late.completion, late.reference.as_ref(), now);
+            let _ = self.complete_with(
+                &late.row,
+                &late.completion,
+                late.reference.as_ref(),
+                late.reached.as_ref(),
+                now,
+            );
         }
     }
 
@@ -544,7 +551,7 @@ impl State {
         completion: &Completion,
         now: SystemTime,
     ) -> Result<(), StoreError> {
-        self.complete_with(id, completion, None, now)
+        self.complete_with(id, completion, None, None, now)
     }
 
     /// Completes the row `id` with `completion`, unless it is complete already, and settles
@@ -559,11 +566,15 @@ impl State {
     /// reconciliation or a person), is left as it is, and the row is completed all the same.
     /// A `duplicate` is refused, since only begin writes one, and so is `unknown` for a row
     /// with no receipt, since a read never reports it.
+    ///
+    /// `reached`, the resources a tool that checks its own scope reached, replaces the row's
+    /// `unknown` resources in the same write, as Postgres's `complete_once` lets it.
     fn complete_with(
         &mut self,
         id: &AuditRowId,
         completion: &Completion,
         reference: Option<&VendorReference>,
+        reached: Option<&ReachedResources>,
         now: SystemTime,
     ) -> Result<(), StoreError> {
         let Some(settled) = ReceiptState::settled_by(&completion.outcome) else {
@@ -584,7 +595,7 @@ impl State {
             )
             .into());
         }
-        self.complete_row(id, completion)?;
+        self.complete_row(id, completion, reached)?;
         let past_deadline = self.past_deadline(id, now);
         if let Some(receipt) = receipt.map(|at| &mut self.receipts[at])
             && may_move(receipt.state, settled, &EstablishedBy::Call, past_deadline)
@@ -652,7 +663,15 @@ impl State {
             })
     }
 
-    fn complete_row(&mut self, id: &AuditRowId, completion: &Completion) -> Result<(), StoreError> {
+    /// Completes the row `id`, writing `reached` in place of its resources, which must be
+    /// `unknown`. A repeat is compared on its completion alone: Postgres's role cannot read a
+    /// row's resources to compare them.
+    fn complete_row(
+        &mut self,
+        id: &AuditRowId,
+        completion: &Completion,
+        reached: Option<&ReachedResources>,
+    ) -> Result<(), StoreError> {
         if self.list_rows.iter().any(|(stored, _, _)| stored == id) {
             return Err(format!(
                 "audit row {} records a listing, which is never completed",
@@ -674,6 +693,18 @@ impl State {
         }
         match &row.completion {
             None => {
+                if let Some(reached) = reached {
+                    if row.resources != RecordedResources::Unknown {
+                        return Err(format!(
+                            "audit row {} was begun with resources that are not unknown, so \
+                             what its tool reached cannot replace them",
+                            id.as_str()
+                        )
+                        .into());
+                    }
+                    row.resources = RecordedResources::Named(reached.resources.clone());
+                    row.resources_omitted = reached.omitted;
+                }
                 row.completion = Some(completion.clone());
                 Ok(())
             }
@@ -1217,6 +1248,7 @@ impl AuditStore for InMemoryAuditStore {
                     row: completion.row().clone(),
                     completion: completion.completion().clone(),
                     reference: completion.reference().cloned(),
+                    reached: completion.reached().cloned(),
                 });
                 return Err(format!(
                     "audit row {} was not completed within the answer budget; the store is still trying",
@@ -1228,6 +1260,7 @@ impl AuditStore for InMemoryAuditStore {
                 completion.row(),
                 completion.completion(),
                 completion.reference(),
+                completion.reached(),
                 self.clock.now(),
             )
         })

@@ -14,7 +14,10 @@
 //! the store's clock and its deadline is that time plus the budgets and the call deadline, as
 //! Postgres works it out; and of item 5, that a list row is stored complete with no deadline,
 //! with its time at begin from the store's clock, and is never completed, and that a call
-//! record of kind `list` is refused at begin. That the store overwrites times an insert
+//! record of kind `list` is refused at begin. Of item 3, it covers decision 0011's report of
+//! what a tool that checks its own scope reached: written in place of the row's `unknown`
+//! resources in the same write as the completion, and refused from any other tool. That the
+//! store overwrites times an insert
 //! carries cannot be tried through [`AuditStore`], whose callers pass no times: the Postgres
 //! schema tests try it. The open-row query is not here: it is Postgres's alone for now.
 //!
@@ -63,8 +66,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gateway_core::audit::RecordedResources;
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
-    MAX_RECORDED_RESOURCES, Outcome, RecordedDelegation, RecordedFailure, RequestMetadata, RowKind,
-    RowStart,
+    MAX_RECORDED_RESOURCES, Outcome, RecordedDelegation, RecordedFailure, RecordedResource,
+    RequestMetadata, RowKind, RowStart,
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
@@ -1534,6 +1537,120 @@ pub async fn an_error_is_stored_with_its_kind_and_a_repeat_must_match_it(
         );
         assert_eq!(stored(contract, &start.row).await, first);
     }
+}
+
+/// Allowed, and its tool checks its own scope, so its resources are unknown until it runs.
+const SELF_SCOPED: Call = Call {
+    caller: Caller::TeamA,
+    surface: SURFACE_READ,
+    tool: SCOPED_READ_TOOL,
+    document: TEAM_A_DOCUMENT,
+};
+
+/// Decision 0011: the resources a tool that checks its own scope reports it reached replace the
+/// `unknown` its row was begun with, in the same write as the completion, and nothing else of
+/// the row changes. They are recorded as begin records named ones: the first 64 distinct, with
+/// the rest counted. An empty report is stored as an empty list, not as `unknown`. A repeat is
+/// compared on its completion alone, as Postgres's role cannot read what a call named: one that
+/// reports another reach is accepted, and the first stands.
+pub async fn what_a_self_scoped_tool_reached_replaces_its_unknown_resources_at_finish(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let reached: Vec<Resource> = (0..MAX_RECORDED_RESOURCES + 2)
+        .map(|n| document(&format!("team-a-{n}")))
+        .collect();
+    for (reached, omitted) in [(reached, 2), (Vec::new(), 0)] {
+        let start = row_start();
+        let begun = guard(store, &fixture, &start, &SELF_SCOPED).await;
+        let before = stored(contract, &start.row).await;
+        let StoredRecord::Call(record) = before.record.clone() else {
+            panic!("a call was stored as {:?}", before.record);
+        };
+        assert_eq!(record.resources, RecordedResources::Unknown);
+        let answering = Answering::with(ToolOutcome::Reached(json!({"found": 1}), reached.clone()));
+        let finished = audit::finish(store, audit::run(&answering, begun).await, 6).await;
+        assert!(finished.failure().is_none(), "{:?}", finished.failure());
+        assert_eq!(finished.answer(), &Answer::Ok(json!({"found": 1})));
+        let completion = Completion {
+            outcome: Outcome::Ok,
+            latency_ms: 6,
+        };
+        let recorded = reached
+            .iter()
+            .take(MAX_RECORDED_RESOURCES)
+            .map(|resource| RecordedResource {
+                system: resource.system.clone(),
+                kind: resource.kind.clone(),
+                identifier: resource.identifier.clone(),
+            })
+            .collect();
+        let expected = StoredRow {
+            record: StoredRecord::Call(AuditRecord {
+                resources: RecordedResources::Named(recorded),
+                resources_omitted: omitted,
+                completion: Some(completion.clone()),
+                ..record
+            }),
+            completion: Some(completion),
+            ..before
+        };
+        assert_eq!(stored(contract, &start.row).await, expected);
+
+        // The same completion again, from a retried begin, reporting a narrower reach.
+        let begun = guard(store, &fixture, &start, &SELF_SCOPED).await;
+        let answering = Answering::with(ToolOutcome::Reached(json!({"found": 1}), Vec::new()));
+        let finished = audit::finish(store, audit::run(&answering, begun).await, 6).await;
+        assert!(
+            finished.failure().is_none(),
+            "a repeat of the completion was refused for its reach: {:?}",
+            finished.failure()
+        );
+        assert_eq!(stored(contract, &start.row).await, expected);
+    }
+}
+
+/// Decision 0011: a tool not declared `checks_own_scope` may not report what it reached. The
+/// row is completed as an error of the kind `other` with the resources begin recorded, and
+/// nothing of the report is stored.
+pub async fn a_report_of_what_was_reached_from_another_tool_is_stored_as_an_error(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let start = row_start();
+    let begun = guard(store, &fixture, &start, &ALLOWED).await;
+    let before = stored(contract, &start.row).await;
+    let answering = Answering::with(ToolOutcome::Reached(
+        json!({"found": 1}),
+        vec![document(TEAM_B_DOCUMENT)],
+    ));
+    let finished = audit::finish(store, audit::run(&answering, begun).await, 3).await;
+    assert!(finished.failure().is_none(), "{:?}", finished.failure());
+    assert!(
+        matches!(finished.answer(), Answer::Error(_)),
+        "{:?}",
+        finished.answer()
+    );
+    let completion = Completion {
+        outcome: Outcome::Error {
+            error_kind: ErrorKind::Other,
+        },
+        latency_ms: 3,
+    };
+    let StoredRecord::Call(record) = before.record.clone() else {
+        panic!("a call was stored as {:?}", before.record);
+    };
+    let expected = StoredRow {
+        record: StoredRecord::Call(AuditRecord {
+            completion: Some(completion.clone()),
+            ..record
+        }),
+        completion: Some(completion),
+        ..before
+    };
+    assert_eq!(stored(contract, &start.row).await, expected);
 }
 
 // --- Item 4: the deadline -----------------------------------------------------------------------

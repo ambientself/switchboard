@@ -359,6 +359,8 @@ contract!(
     finish_completes_once_accepts_an_identical_repeat_and_refuses_a_different_one,
     finish_touches_only_the_completion,
     an_error_is_stored_with_its_kind_and_a_repeat_must_match_it,
+    what_a_self_scoped_tool_reached_replaces_its_unknown_resources_at_finish,
+    a_report_of_what_was_reached_from_another_tool_is_stored_as_an_error,
     the_deadline_is_the_begin_time_plus_begin_budget_call_deadline_finish_deadline_and_answer_budget,
     a_list_row_is_stored_complete_with_no_deadline,
     a_call_record_of_kind_list_is_refused_at_begin_and_leaves_no_row,

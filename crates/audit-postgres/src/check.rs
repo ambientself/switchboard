@@ -116,8 +116,17 @@ pub(crate) const INSERTED: &[&str] = &[
     "currency",
 ];
 
-/// The columns the gateway's role updates: the completion, with an error's kind.
-pub(crate) const UPDATED: &[&str] = &["outcome", "outcome_sentence", "error_kind", "latency_ms"];
+/// The columns the gateway's role updates: the completion, with an error's kind, and the
+/// resources a tool that checks its own scope reached, which replace a row's unknown ones
+/// (migration 0011).
+pub(crate) const UPDATED: &[&str] = &[
+    "outcome",
+    "outcome_sentence",
+    "error_kind",
+    "latency_ms",
+    "resources",
+    "resources_omitted",
+];
 
 /// The columns the gateway's role reads: which row, whether it was allowed, its completion,
 /// with an error's kind and the receipt a duplicate names, and its kind and deadline, which say
@@ -1686,7 +1695,9 @@ async fn rules(
 /// completion's columns, and only on a row whose `outcome` is NULL, and `completion_shape` and
 /// `error_kind_shape` keep every completion column NULL until then. So a referenced key holds
 /// none of those columns and never changes, or its old value has a NULL and Postgres takes no
-/// action. A foreign key on another table, whose action runs as that table's owner, is
+/// action. The one exception is `resources` and `resources_omitted`, which the completion of a
+/// row begun with unknown resources writes once (migration 0011): a key on them can change
+/// then, and its action writes only the referencing table. A foreign key on another table, whose action runs as that table's owner, is
 /// [`cascade_actions`]'.
 async fn referential_actions(
     client: &ClientWrapper,
@@ -2265,8 +2276,8 @@ async fn definers(
 ///
 /// A foreign key on `call_rows` itself is [`referential_actions`]'. One that references
 /// `call_rows` acts only when an audit row is deleted, which the gateway's role may not do, or
-/// when its referenced key changes, which an update of the completion cannot do, as
-/// [`referential_actions`] says; it passes.
+/// when its referenced key changes, which an update of the completion cannot do, but for a key
+/// on the resources a completion writes once, as [`referential_actions`] says; it passes.
 async fn cascade_actions(
     client: &ClientWrapper,
     table: tokio_postgres::types::Oid,
