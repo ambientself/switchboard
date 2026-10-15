@@ -2,9 +2,8 @@
 //! on (design section 1).
 //!
 //! This holds the turn-grant verifier of decision 0012, its key configuration and the mapping
-//! of Otto's tool names. It is not wired into the gateway's request path yet; the gateway will
-//! turn a [`VerifiedGrant`] into the core's delegation, and a [`GrantFailure`] into a
-//! delegation that is present and unverified, which check 3 denies.
+//! of Otto's tool names. The gateway turns a [`VerifiedGrant`] into the core's delegation, and
+//! a [`GrantFailure`] into a delegation that is present and unverified, which check 3 denies.
 //!
 //! - [`format`](mod@format) holds the `v3` format's constants and its key ID. The format is
 //!   specified in `docs/turn-grant-format.md`, which Otto's owners implement from.
