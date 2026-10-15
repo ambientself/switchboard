@@ -15,9 +15,9 @@
 //! runs, keeping the version it serves, as it does for the grant gates. With no profile
 //! requiring currency the table may be left out, and nothing is asked.
 //!
-//! **When a call asks.** [`question`] says: a `tools/call` of a tool that the snapshot the call
-//! is decided from serves on the call's surface and does not classify `read`, under a profile
-//! that requires currency, with a verified delegation. Then the request path asks the resolver
+//! **When a call asks.** Only a `tools/call` of a tool that the snapshot the call is decided
+//! from serves on the call's surface and does not classify `read`, under a profile that
+//! requires currency, with a verified delegation. Then the request path asks the resolver
 //! once, with the question [`CurrencyQuestion::of`] the delegation makes, and decides with
 //! `Currency::Asked` and the answer, which the core records on the row. Every other call is
 //! decided with `Currency::NotAsked`: a read, a call under a profile that does not require
