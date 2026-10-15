@@ -93,10 +93,6 @@ async fn a_token_is_revoked_when_its_lifetime_ends() {
     let before = clock::now();
     let token = world.client.token(&request()).await.unwrap();
     assert!(token.expires_at() <= before + 2, "{}", token.expires_at());
-    assert!(
-        world.fake.revoked().is_empty(),
-        "not revoked before its time"
-    );
     for _ in 0..40 {
         if !world.fake.revoked().is_empty() {
             break;

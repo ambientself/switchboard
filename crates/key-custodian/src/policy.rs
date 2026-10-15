@@ -225,8 +225,8 @@ impl PolicyCell {
     }
 
     /// Reads the file at `path` every `every`, by path, and applies it when its bytes differ
-    /// from the last read, `loaded` at first. Runs until dropped. A failure is logged once per
-    /// version of the file.
+    /// from the last read, `loaded` at first. Runs until dropped. A version that does not load
+    /// is logged once; a read that fails is logged at every poll, and keeps the copy served.
     pub async fn watch(
         self,
         path: PathBuf,

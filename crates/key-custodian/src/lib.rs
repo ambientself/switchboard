@@ -30,10 +30,11 @@
 //! [`rate::DEFAULT_PER_MINUTE`] a minute, taken only by requests that pass the policy check.
 //! The defaults are provisional. A token is asked for per call, and an agent's turn makes a
 //! handful of GitHub calls, so 30 a minute with a burst of 10 serves a team's normal use with
-//! room to spare. At the sustained rate one team's requests are at most 1,800 an hour, well
-//! under the 5,000 requests an hour GitHub documents as an App installation's primary REST
-//! limit, so a compromised gateway asking for one team cannot by itself use up what the other
-//! teams' calls need. Both are configurable.
+//! room to spare. What the bucket bounds is how many tokens a compromised gateway can get for
+//! one team: at the sustained rate, 1,800 an hour, each narrowed to that team's repositories.
+//! It does not bound the calls each token makes. GitHub's own limits do that: an installation's
+//! tokens share its primary REST limit, which GitHub documents as 5,000 requests an hour. Both
+//! values are configurable.
 //!
 //! # What "limits lifetime" means
 //!
