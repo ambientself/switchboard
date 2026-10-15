@@ -15,6 +15,7 @@ use thiserror::Error;
 use toml::value::Datetime;
 
 use crate::adapter::{self, ArgumentAdapter, JsonPointer, ResourceSource, SchemaProblem};
+use crate::builtin::{BuiltInEntry, built_in};
 use crate::definition::{Approval, Route, ToolDefinition, binding_sha256, definition_sha256};
 use crate::file::{
     PrincipalsFile, RegistryFile, ResourceFile, ResourcesFile, RulePrincipalFile, ServerFile,
@@ -457,6 +458,45 @@ pub enum RegistryError {
     /// The policy data does not make a snapshot.
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+    /// Two connector entries share a name: two built-in entries, or a built-in entry and a
+    /// server.
+    #[error("connector entry `{0}` is registered more than once, as a server or a connector")]
+    DuplicateEntry(ConnectorName),
+    /// A built-in entry states no vendor permission, which GitHub reads as every permission
+    /// the installation has.
+    #[error("connector `{0}` states no permissions; state the set its credential may be asked for")]
+    EntryWithoutPermissions(ConnectorName),
+    /// A built-in entry states a permission whose name is not lowercase letters and underscores.
+    #[error(
+        "connector `{entry}` states the permission `{permission}`, which is not a permission name"
+    )]
+    PermissionName {
+        /// The entry.
+        entry: ConnectorName,
+        /// The name as written.
+        permission: String,
+    },
+    /// A built-in entry serves no tool.
+    #[error("connector `{0}` serves no tool")]
+    EntryWithoutTools(ConnectorName),
+    /// A tool is served by two built-in entries, so its permission set would be ambiguous.
+    #[error("tool `{tool}` is served by both connector `{first}` and connector `{second}`")]
+    ToolOnTwoEntries {
+        /// The tool.
+        tool: ToolName,
+        /// The entry that lists it first.
+        first: ConnectorName,
+        /// The other.
+        second: ConnectorName,
+    },
+    /// A built-in entry lists a tool that is approved on a proxied server.
+    #[error("connector `{entry}` serves tool `{tool}`, which is approved on a proxied server")]
+    BuiltInToolProxied {
+        /// The tool.
+        tool: ToolName,
+        /// The built-in entry.
+        entry: ConnectorName,
+    },
     /// A profile rule names a profile the file does not define.
     #[error("a profile rule names profile `{0}`, which is not defined")]
     UnknownProfile(ProfileName),
@@ -479,6 +519,7 @@ pub struct Registry {
     routes: BTreeMap<ToolName, Route>,
     approvals: BTreeMap<ToolName, Approval>,
     servers: BTreeMap<ConnectorName, Server>,
+    connectors: BTreeMap<ConnectorName, BuiltInEntry>,
     profile_rules: ProfileRules,
 }
 
@@ -556,6 +597,11 @@ impl Registry {
     /// Every registered server, by name.
     pub fn servers(&self) -> &BTreeMap<ConnectorName, Server> {
         &self.servers
+    }
+
+    /// Every built-in connector entry, by name.
+    pub fn connectors(&self) -> &BTreeMap<ConnectorName, BuiltInEntry> {
+        &self.connectors
     }
 
     /// The profile-selection rules.
@@ -642,6 +688,9 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         }
     }
 
+    let proxied: BTreeSet<ToolName> = routes.keys().cloned().collect();
+    let connectors = built_in(file.connectors, &servers, &proxied)?;
+
     let surfaces = file
         .surfaces
         .into_iter()
@@ -717,6 +766,7 @@ fn build(file: RegistryFile) -> Result<Registry, RegistryError> {
         routes,
         approvals,
         servers,
+        connectors,
         profile_rules: ProfileRules::new(rules),
     })
 }

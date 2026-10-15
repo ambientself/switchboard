@@ -1,0 +1,54 @@
+[package]
+name = "key-custodian"
+version = "0.1.0"
+description = "The key custodian (switchboard-custodian): the one process that holds the GitHub App's private key and exchanges it for short-lived, narrowed installation tokens over a Unix socket, checking each request against its own copy of policy; and the client the gateway asks it with."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The custodian is its own process (design section 9). Its client is a module of this crate, so
+# the GitHub connector can depend on the crate for the client; the gateway never starts the
+# custodian and never reads the key.
+[dependencies]
+# The metrics listener's HTTP, and the fake GitHub App API's. HTTP/1.1 only.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+gateway-core = { path = "../gateway-core" }
+# The custodian's copy of policy is loaded by the same loader as the gateway's snapshot.
+gateway-registry = { path = "../gateway-registry" }
+# The GitHub client: HTTP/1.1 only, as issuer-keys and gateway-otto have it.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+# The TLS connector for GitHub's API, with no roots of its own: only the CA file the
+# configuration names is trusted. Its provider is ring, which this crate passes to the client.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# Signs the App JWT with RS256, and the fake checks it. The pure-Rust backend, as every other
+# crate here has it: `jsonwebtoken` panics on first use if both are enabled anywhere in the build.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+# The fake's installation tokens, from the operating system's randomness.
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# The configuration file.
+toml = "1"
+tracing = "0.1"
+# Logs: one JSON object per line, on standard error. The record goes to standard output.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# `test-support` adds the fake GitHub App API, a local HTTP server. The custodian's own build
+# never turns it on.
+[features]
+test-support = ["dep:rand_core"]
+
+[dev-dependencies]
+key-custodian = { path = ".", features = ["test-support"] }
+# The tests' App keys, generated per run: no key is checked in.
+rand_core = { version = "0.6", features = ["getrandom"] }
+rsa = "0.9"
+
+[lints]
+workspace = true
