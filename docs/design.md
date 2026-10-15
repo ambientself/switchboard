@@ -161,7 +161,8 @@ lines only once the interfaces between them have settled.
 | `gateway-core` | Principals, classification, the decision function, the tool registry, the audit record type, denial sentences. No I/O. |
 | `gateway-identity` | Token verifiers, one per issuer type, and the team manifest loader. |
 | `audit-postgres` | The audit store over Postgres: the schema, its two roles, the migrations and the boot check. |
-| `connector-github` | GitHub tools, and the client for the key custodian. |
+| `connector-github` | GitHub tools. They ask the key custodian for tokens through the client in `key-custodian`. |
+| `key-custodian` | The key custodian (`switchboard-custodian`), the one process that holds the GitHub App key, and its client, a library module the GitHub connector depends on. The gateway links the client and never the key-holding process. |
 | `gateway-otto` | The Otto adapter: Otto's policy profile, the turn-grant verifier and the client for Otto's resolver interface. The core crates do not depend on it. |
 | `connector-proxy` | The connector that forwards to a separate MCP server. |
 | `gateway-registry` | The registry file: approved tool definitions, surfaces, profiles, limits and profile selection, loaded into a core snapshot. |
@@ -661,6 +662,31 @@ proposal runs on the employee's own per-user grant.
 The custodian checks token requests against its own copy of what each team and tool may ask
 for. That copy is generated from the same policy files as the snapshot, and each token request
 carries the policy revision it was decided under.
+
+**The custodian as built** (#12, the crate `key-custodian`). `switchboard-custodian` reads the
+GitHub App's private key from a file at start, and refuses to start if the file is missing,
+unreadable, not an RSA key in PEM, or gives its group or others any access. It serves token
+requests on a Unix socket whose mode it sets, refusing a mode that gives others any access,
+and answers only the UID it is configured for, read from the kernel (`SO_PEERCRED` on Linux,
+`getpeereid` elsewhere). A request names the team, the tool, the repositories (`owner/name`,
+at least one and at most 500), the permissions (at least one) and the revision. Its copy of
+policy is loaded from the registry file by the gateway's own loader and read again every few
+seconds, as the gateway reloads it: each team's repositories are the resources of system
+`github` and kind `repository` in its limit, and each tool's permission set is stated on its
+built-in connector entry, `[[connectors]]` in the registry file, with the tools it serves. The
+set is on the entry, not the approval, because decision 0011 gives an entry one credential and
+registers several permission sets as several entries. A request is refused if its revision is
+not the custodian's, its team or tool is unknown, a repository is outside the team's limit or
+on another account, or a permission is outside the tool's set or above its level there; a
+refusal comes back typed, and the client turns it into the `custodian_refusal` error kind.
+Each team has a token bucket, 30 requests a minute with a burst of 10 by default,
+provisionally. A token is asked of GitHub for exactly the repositories and permissions
+requested, and one GitHub issues broader is revoked and not handed out. Its lifetime is five
+minutes by default, never past GitHub's own expiry, and the custodian revokes it through
+GitHub's revoke endpoint when the lifetime ends first. Each request writes one JSON line to
+the custodian's own record, with the revision it was checked against and never the token, and
+is counted on a metrics listener of its own. It is not wired into the gateway or any
+deployment yet: the GitHub connector does that.
 
 ## 10. The denial contract
 
@@ -2095,6 +2121,20 @@ refusal of that list on a profile that does not require currency; the restated p
 decision-table case for each comment tool, a case showing them denied in every other profile,
 and one showing `addOrEditJiraIssueComment` denied; and the mutations `check-5-removed` and one
 that removes the exception-list check.
+
+- Built, as the crate `key-custodian`: the key custodian and its client (section 9). Its
+  tests run it against a fake GitHub App API that checks the App JWT and issues dummy tokens
+  scoped as asked, with keys generated per run: a token within policy, narrowed exactly; each
+  refusal (a repository outside the team's limit or on another account, a permission outside
+  the tool's set or above its level, more than 500 repositories, an unknown team or tool, a
+  stale revision, a peer of another UID); the rate limit; revocation at the end of the
+  lifetime; a widened token revoked; the record holding no token; nothing a client receives,
+  nor the record or the metrics, holding the key; and each start refusal. The peer check is
+  tested the same way on Linux and macOS: the socket is served to another UID than the test's.
+  The registry's `[[connectors]]` states each built-in entry's permission set and tools; the
+  gateway loads and checks it and otherwise ignores it. Not built: the GitHub connector that
+  asks the custodian, and any deployment of it; revoking tokens still outstanding when the
+  custodian stops, which lapse at GitHub's hour.
 
 **#47, what the first slice (#14) still lacks.** The signals of section 11 are exported in
 Prometheus text at `GET /metrics`, on a listener of the gateway's own, the default until a
