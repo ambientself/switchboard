@@ -1,0 +1,23 @@
+# Otto's two profiles, as `[[profiles]]` tables of a registry file (decisions 0003, 0006, 0011
+# and 0012). An example: neither demo serves them. The gateway's tests load this file
+# (crates/gateway/tests/currency.rs), so it stays a policy the gateway accepts.
+
+# The profile for Otto's sandboxes: reads and proposals, each call carrying a verified turn
+# grant, and a side effect allowed only while Otto's resolver says the turn is current
+# (decision 0012, "Currency"). Decision 0011's exception for Otto's two comment tools will be
+# listed in this profile, and in no other, once #12 builds it.
+[[profiles]]
+name = "otto-sandbox"
+classifications = ["read", "propose"]
+requires_delegation = true
+requires_currency = true
+
+# The profile for Otto's control-plane surface: reads and proposals for Otto's control plane, a
+# service that presents no turn grant. It does not require currency: Otto's pull-request
+# receipts are posted by a poller after the turn has ended, and carry no epoch (decision 0012).
+# A sandbox's subject is never admitted to this surface (decision 0003).
+[[profiles]]
+name = "otto-control-plane"
+classifications = ["read", "propose"]
+requires_delegation = false
+requires_currency = false
