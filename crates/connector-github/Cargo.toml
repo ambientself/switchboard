@@ -1,0 +1,49 @@
+[package]
+name = "connector-github"
+version = "0.1.0"
+description = "The built-in GitHub connector: Otto's GitHub read tools, run in the gateway's own process against GitHub's REST API, with every token asked of the key custodian, narrowed as the connector entry says."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Part of a running gateway. It holds no GitHub key: every token comes from the key custodian,
+# through the client in key-custodian.
+[dependencies]
+# A file's content comes base64-encoded in GitHub's answer.
+base64 = "0.22"
+gateway-core = { path = "../gateway-core" }
+# A connector entry's permission set and narrowing, as the registry states them.
+gateway-registry = { path = "../gateway-registry" }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+# The TLS connector for GitHub's API: HTTP/1.1 only, with no roots of its own; only the CA file
+# the deployment names is trusted. Its provider is ring, which this crate passes to the client.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# The client the connector asks the key custodian with. Nothing in it reads the key.
+key-custodian = { path = "../key-custodian" }
+# A path and a ref are sent percent-encoded. Already in the build through the HTTP stack.
+percent-encoding = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+tracing = "0.1"
+# The fake GitHub REST API's server, behind `test-support`.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+
+# `loopback` lets the connector reach GitHub's API over plain http on a loopback address, for
+# the tests' local fakes (decision 0013, section 3); the gateway's own `test-support` turns it
+# on, and the release build never does. `test-support` adds the fake GitHub REST API, which
+# answers only tokens the key custodian's fake App API issued.
+[features]
+loopback = []
+test-support = ["loopback", "dep:axum", "key-custodian/test-support", "tokio/net", "tokio/rt"]
+
+[dev-dependencies]
+connector-github = { path = ".", features = ["test-support"] }
+
+[lints]
+workspace = true

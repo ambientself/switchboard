@@ -287,6 +287,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "connector-github"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "connector-github",
+ "gateway-core",
+ "gateway-registry",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "key-custodian",
+ "percent-encoding",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "connector-proxy"
 version = "0.1.0"
 dependencies = [
@@ -762,6 +785,7 @@ version = "0.1.0"
 dependencies = [
  "audit-postgres",
  "axum",
+ "connector-github",
  "connector-proxy",
  "gateway",
  "gateway-core",
@@ -775,8 +799,11 @@ dependencies = [
  "hyper",
  "hyper-util",
  "issuer-keys",
+ "key-custodian",
  "mock-docs-server",
+ "rand_core 0.6.4",
  "rcgen",
+ "rsa",
  "serde",
  "serde_json",
  "sha2 0.10.9",
