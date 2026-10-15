@@ -2110,7 +2110,9 @@ before and after the network policy; the kind claim holds only while the evidenc
   test minter: replay, another deployment and pod, format and forgery, clock skew at the leeway
   and the ceiling, key rotation across a restart, each boot refusal and the snapshot-load
   refusal, failed grants at check 3, composition with the tool list, and revocation by the
-  team, key and surface levers, each tested against a restart.
+  team, key and surface levers. The key lever is tested across a restart, since keys are read
+  at boot only; the team and surface levers are also pulled on a running gateway, each by a new
+  registry file that stops a grant the gateway had just accepted within one registry poll.
 - Not built yet: the resolver client with its one-second budget, and asking it on the request
   path. The gateway decides every call with currency not asked, and no policy sets
   `requires_currency`. No deployment configures a grant issuer, and no demo profile requires a

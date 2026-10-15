@@ -730,7 +730,9 @@ async fn a_grant_only_narrows_the_tool_list() {
 
 /// The three levers this gateway holds each stop a grant that verifies: the team taken off the
 /// surface's allowlist, the key taken out of configuration, and the surface withdrawn. Each is
-/// a change of configuration, served here by a restart.
+/// a change of configuration, served here by a restart. The key is read at boot only, so a
+/// restart is how it changes; `tests/grant_revocation.rs` pulls the team and surface levers on
+/// a running gateway, by a new registry file, against decision 0013's bound.
 #[tokio::test]
 async fn the_team_key_and_surface_levers_stop_a_verified_grant() {
     let minter = TestMinter::generate();
