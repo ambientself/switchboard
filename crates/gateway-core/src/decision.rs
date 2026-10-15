@@ -2,8 +2,9 @@
 //!
 //! [`decide`] reads the snapshot and the call context and nothing else: no clock, no network,
 //! no global state. It first finds the caller's profile in the snapshot, then runs the six
-//! checks of decision 0006 in order, and then the key check, which its amendment of 2026-10-07
-//! adds last. The first that fails decides the reason.
+//! checks of decision 0006 in order, with decision 0012's currency check between checks 5 and
+//! 6, and then the key check, which its amendment of 2026-10-07 adds last. The first that fails
+//! decides the reason.
 //!
 //! A decision does not give out the sentence a caller would read. That sentence exists only on
 //! the [`Refusal`](crate::audit::Refusal) that [`audit::begin`](crate::audit::begin) returns
@@ -23,7 +24,7 @@ use crate::names::{
 use crate::policy::{
     ApprovedTool, PolicySnapshot, Profile, Resource, ResourceDeclaration, ResourceLimits, Resources,
 };
-use crate::principal::{Delegation, Principal, PrincipalId};
+use crate::principal::{DelegationFailure, PresentedDelegation, Principal, PrincipalId};
 use crate::proof::Proved;
 use crate::receipt::IdempotencyKey;
 use crate::sentences;
@@ -34,8 +35,11 @@ use crate::sentences;
 pub struct CallerContext {
     /// The proved caller.
     pub principal: Proved<Principal>,
-    /// A verified statement of whom the principal is acting for, if one was presented.
-    pub delegation: Option<Proved<Delegation>>,
+    /// The delegation the request carried, if it carried one, verified or not: so a delegation
+    /// is absent, present and verified, or present and unverified. The delegation's verifier
+    /// runs before the decision and never denies; check 3 denies an unverified delegation
+    /// (decisions 0009 and 0012).
+    pub delegation: Option<PresentedDelegation>,
     /// The name of the policy set selected for this caller from its issuer, the deployment and
     /// the principal. The decision looks it up in the snapshot it decides from, so a profile
     /// cannot be supplied from anywhere else.
@@ -67,6 +71,71 @@ pub struct CallContext {
     /// through the decision, to reserve the call's receipt, so the key the decision saw is the
     /// key the receipt holds.
     pub key: Option<IdempotencyKey>,
+    /// Whether the control plane that issued the delegation says the call's turn is current
+    /// (decision 0012, "Currency"). An adapter asks only for a tool not classified `read` under
+    /// a profile that requires currency; one that does not ask leaves [`Currency::NotAsked`],
+    /// which the currency check denies.
+    pub currency: Currency,
+}
+
+/// The call's currency: whether the control plane that issued its delegation says the turn is
+/// current, and if it was asked, what it answered (decision 0012, "Currency").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Currency {
+    /// The control plane was asked, and this is the answer.
+    Asked(CurrencyAnswer),
+    /// Nobody asked. Where the currency check applies, denied as unconfirmed.
+    NotAsked,
+}
+
+impl Currency {
+    /// The answer, if the control plane was asked: what the audit row records.
+    pub fn answer(self) -> Option<CurrencyAnswer> {
+        match self {
+            Currency::Asked(answer) => Some(answer),
+            Currency::NotAsked => None,
+        }
+    }
+}
+
+/// What the control plane answered about a turn's currency, or that it gave no answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrencyAnswer {
+    /// The control plane that issued the delegation still holds the lease at its epoch, and
+    /// the turn has neither ended nor been revoked.
+    Current,
+    /// Not current: a newer epoch holds the lease.
+    Superseded,
+    /// Not current: the turn has ended.
+    Ended,
+    /// Not current: the turn was revoked.
+    Revoked,
+    /// No answer within the budget, an error, an unknown version, or an answer to another
+    /// question.
+    Unconfirmed,
+}
+
+impl CurrencyAnswer {
+    /// Every answer.
+    pub const ALL: [CurrencyAnswer; 5] = [
+        CurrencyAnswer::Current,
+        CurrencyAnswer::Superseded,
+        CurrencyAnswer::Ended,
+        CurrencyAnswer::Revoked,
+        CurrencyAnswer::Unconfirmed,
+    ];
+
+    /// The answer's name, as the audit row records it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CurrencyAnswer::Current => "current",
+            CurrencyAnswer::Superseded => "superseded",
+            CurrencyAnswer::Ended => "ended",
+            CurrencyAnswer::Revoked => "revoked",
+            CurrencyAnswer::Unconfirmed => "unconfirmed",
+        }
+    }
 }
 
 /// Why a call was denied: one of a fixed set of kinds, with the details its sentence names.
@@ -110,6 +179,12 @@ pub enum Reason {
     /// The delegation is missing where the profile requires one, or disagrees with the
     /// principal.
     DelegationDisagrees(DelegationProblem),
+    /// The request carried a delegation that did not verify (decisions 0009 and 0012). Check 3
+    /// denies it, whatever failed, with one fixed sentence that names nothing.
+    DelegationUnverified {
+        /// Which check the delegation failed: for the row and the logs, never the sentence.
+        failure: DelegationFailure,
+    },
     /// The profile does not permit the tool's classification. Always the case for a `write`
     /// or `destructive` tool.
     ClassificationNotPermitted {
@@ -119,6 +194,23 @@ pub enum Reason {
         classification: Classification,
         /// The caller's profile.
         profile: ProfileName,
+    },
+    /// The profile requires currency, the tool is not classified `read`, and the control plane
+    /// that issued the delegation says the turn is not current: superseded, ended or revoked
+    /// (decision 0012). The currency check.
+    NotCurrent {
+        /// The tool the call named.
+        tool: ToolName,
+        /// The tool's classification, which is not `read`.
+        classification: Classification,
+    },
+    /// The profile requires currency, the tool is not classified `read`, and whether the turn
+    /// is current could not be confirmed, or was not asked (decision 0012). The currency check.
+    CurrencyUnconfirmed {
+        /// The tool the call named.
+        tool: ToolName,
+        /// The tool's classification, which is not `read`.
+        classification: Classification,
     },
     /// A resource the call names is outside what the caller may reach, or the resources the
     /// call reaches are not known well enough to check.
@@ -199,8 +291,14 @@ pub enum ReasonKind {
     ToolNotInDelegation,
     /// See [`Reason::DelegationDisagrees`].
     DelegationDisagrees,
+    /// See [`Reason::DelegationUnverified`].
+    DelegationUnverified,
     /// See [`Reason::ClassificationNotPermitted`].
     ClassificationNotPermitted,
+    /// See [`Reason::NotCurrent`].
+    NotCurrent,
+    /// See [`Reason::CurrencyUnconfirmed`].
+    CurrencyUnconfirmed,
     /// See [`Reason::ResourceOutsideLimit`].
     ResourceOutsideLimit,
     /// See [`Reason::KeyMissing`].
@@ -209,14 +307,17 @@ pub enum ReasonKind {
 
 impl ReasonKind {
     /// Every kind of reason.
-    pub const ALL: [ReasonKind; 9] = [
+    pub const ALL: [ReasonKind; 12] = [
         ReasonKind::ProfileUnknown,
         ReasonKind::UnknownTool,
         ReasonKind::ToolNotOnSurface,
         ReasonKind::SurfaceNotPermitted,
         ReasonKind::ToolNotInDelegation,
         ReasonKind::DelegationDisagrees,
+        ReasonKind::DelegationUnverified,
         ReasonKind::ClassificationNotPermitted,
+        ReasonKind::NotCurrent,
+        ReasonKind::CurrencyUnconfirmed,
         ReasonKind::ResourceOutsideLimit,
         ReasonKind::KeyMissing,
     ];
@@ -232,7 +333,10 @@ impl Reason {
             Reason::SurfaceNotPermitted { .. } => ReasonKind::SurfaceNotPermitted,
             Reason::ToolNotInDelegation { .. } => ReasonKind::ToolNotInDelegation,
             Reason::DelegationDisagrees(_) => ReasonKind::DelegationDisagrees,
+            Reason::DelegationUnverified { .. } => ReasonKind::DelegationUnverified,
             Reason::ClassificationNotPermitted { .. } => ReasonKind::ClassificationNotPermitted,
+            Reason::NotCurrent { .. } => ReasonKind::NotCurrent,
+            Reason::CurrencyUnconfirmed { .. } => ReasonKind::CurrencyUnconfirmed,
             Reason::ResourceOutsideLimit(_) => ReasonKind::ResourceOutsideLimit,
             Reason::KeyMissing { .. } => ReasonKind::KeyMissing,
         }
@@ -315,11 +419,17 @@ impl Decision {
     }
 }
 
-/// Decides one `tools/call`: every check [`list_tools`] runs, then check 6, then the key check,
-/// last.
+/// Decides one `tools/call`: every check [`list_tools`] runs, then the currency check and check
+/// 6, then the key check, last.
 pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
-    let checked = check(snapshot, &call.caller, &call.tool, Some(&call.resources))
-        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));
+    let checked = check(
+        snapshot,
+        &call.caller,
+        &call.tool,
+        Some(call.currency),
+        Some(&call.resources),
+    )
+    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));
     let verdict = match checked {
         Ok(tool) => Verdict::Allow(tool.clone()),
         Err(reason) => Verdict::Deny {
@@ -340,10 +450,10 @@ pub fn decide(snapshot: &PolicySnapshot, call: &CallContext) -> Decision {
 }
 
 /// Answers `tools/list`: the tools on the caller's surface that pass every check, decided
-/// one at a time by the same checks as [`decide`], with no resources and no key. Check 6 and
-/// the key check are skipped, as decision 0012's currency check will be: a list request names
-/// no resources and carries no key, so a `propose` tool is listed to a caller who may call it,
-/// and is denied on `tools/call` without a key.
+/// one at a time by the same checks as [`decide`], with no currency, no resources and no key.
+/// The currency check, check 6 and the key check are skipped: a list request asks no control
+/// plane, names no resources and carries no key, so a `propose` tool is listed to a caller who
+/// may call it, and is denied on `tools/call` unless its turn is current and it carries a key.
 pub fn list_tools<'s>(
     snapshot: &'s PolicySnapshot,
     caller: &CallerContext,
@@ -354,21 +464,24 @@ pub fn list_tools<'s>(
     surface
         .tools
         .iter()
-        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())
+        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())
         .collect()
 }
 
 /// The checks, in order. The order is the contract: a call that fails two checks is reported
 /// by the earlier one. Checks 1 to 6 are decision 0006's; the profile lookup comes first
-/// because none of them means anything without a profile. The key check is not here: it is
-/// last, after check 6, and [`decide`] runs it once these pass.
+/// because none of them means anything without a profile. Decision 0012's currency check sits
+/// after check 5, and after the exception step decision 0011 adds to it once #12 builds it, and
+/// before check 6. The key check is not here: it is last, after check 6, and [`decide`] runs it
+/// once these pass.
 ///
-/// `resources` is `None` for `tools/list`, which decides with no resources at all, and the
-/// call's resources otherwise.
+/// `currency` and `resources` are `None` for `tools/list`, which decides with neither, so the
+/// currency check and check 6 are skipped for it; for a call they are the call's.
 fn check<'s>(
     snapshot: &'s PolicySnapshot,
     caller: &CallerContext,
     tool: &RequestedTool,
+    currency: Option<Currency>,
     resources: Option<&Resources>,
 ) -> Result<&'s ApprovedTool, Reason> {
     let principal = caller.principal.get();
@@ -378,8 +491,9 @@ fn check<'s>(
     delegation_agrees(caller, profile, principal)?;
     delegation_lists_tool(caller.delegation.as_ref(), tool)?;
     classification_is_permitted(profile, tool)?;
-    // Decision 0012's currency check goes here, after check 5 and its exception step and
-    // before check 6, and is skipped for `tools/list` as check 6 is (#22).
+    if let Some(currency) = currency {
+        control_plane_is_current(profile, tool, currency)?;
+    }
     if let Some(resources) = resources {
         resources_are_within_limit(snapshot.limits(), principal, tool, resources)?;
     }
@@ -441,19 +555,29 @@ fn tool_is_approved_on_surface<'s>(
 /// Check 3. A delegation that is present must agree with the principal even when the profile
 /// does not require one: a delegation contradicting the proved team is a sign of something
 /// wrong, and ignoring it would let a caller present one only when it narrows nothing.
+///
+/// A delegation that did not verify is denied here too, whether or not the profile requires
+/// one, under a reason kind of its own and one fixed sentence whatever failed (decisions 0009
+/// and 0012). A team mismatch is still named: such a delegation verified, and the mismatch is
+/// usually a rollout fault.
 fn delegation_agrees(
     caller: &CallerContext,
     profile: &Profile,
     principal: &Principal,
 ) -> Result<(), Reason> {
-    let Some(delegation) = &caller.delegation else {
-        return if profile.requires_delegation {
-            Err(Reason::DelegationDisagrees(DelegationProblem::Missing {
+    let delegation = match &caller.delegation {
+        None if profile.requires_delegation => {
+            return Err(Reason::DelegationDisagrees(DelegationProblem::Missing {
                 profile: profile.name.clone(),
-            }))
-        } else {
-            Ok(())
-        };
+            }));
+        }
+        None => return Ok(()),
+        Some(PresentedDelegation::Unverified(unverified)) => {
+            return Err(Reason::DelegationUnverified {
+                failure: unverified.failure(),
+            });
+        }
+        Some(PresentedDelegation::Verified(delegation)) => delegation,
     };
     let delegated_team = &delegation.get().team;
     match principal.team() {
@@ -473,18 +597,25 @@ fn delegation_agrees(
     }
 }
 
-/// Check 4. A delegation always lists its tools, so one that is present always narrows.
+/// Check 4. A delegation always lists its tools, so one that is present always narrows. One
+/// that did not verify lists nothing; check 3 has denied it already.
 fn delegation_lists_tool(
-    delegation: Option<&Proved<Delegation>>,
+    delegation: Option<&PresentedDelegation>,
     tool: &ApprovedTool,
 ) -> Result<(), Reason> {
-    match delegation {
-        Some(delegation) if !delegation.get().tools.contains(&tool.name) => {
-            Err(Reason::ToolNotInDelegation {
-                tool: tool.name.clone(),
-            })
+    let listed = match delegation {
+        None => true,
+        Some(PresentedDelegation::Verified(delegation)) => {
+            delegation.get().tools.contains(&tool.name)
         }
-        _ => Ok(()),
+        Some(PresentedDelegation::Unverified(_)) => false,
+    };
+    if listed {
+        Ok(())
+    } else {
+        Err(Reason::ToolNotInDelegation {
+            tool: tool.name.clone(),
+        })
     }
 }
 
@@ -505,6 +636,38 @@ fn classification_is_permitted(profile: &Profile, tool: &ApprovedTool) -> Result
             classification: tool.classification,
             profile: profile.name.clone(),
         })
+    }
+}
+
+/// The currency check (decision 0012), after check 5 and before check 6. Under a profile that
+/// requires currency, a call of a tool not classified `read` is allowed only if the control
+/// plane that issued its delegation says the turn is current. That covers every such tool, not
+/// only `propose`: a `write` tool that decision 0011's exception lets past check 5 is fenced the
+/// same way. Not current is denied under its own reason; unconfirmed and not asked are denied
+/// as unconfirmed. Run only for a `tools/call`: a list request asks no control plane.
+fn control_plane_is_current(
+    profile: &Profile,
+    tool: &ApprovedTool,
+    currency: Currency,
+) -> Result<(), Reason> {
+    if !profile.requires_currency || tool.classification == Classification::Read {
+        return Ok(());
+    }
+    let (tool, classification) = (tool.name.clone(), tool.classification);
+    match currency {
+        Currency::Asked(CurrencyAnswer::Current) => Ok(()),
+        Currency::Asked(
+            CurrencyAnswer::Superseded | CurrencyAnswer::Ended | CurrencyAnswer::Revoked,
+        ) => Err(Reason::NotCurrent {
+            tool,
+            classification,
+        }),
+        Currency::Asked(CurrencyAnswer::Unconfirmed) | Currency::NotAsked => {
+            Err(Reason::CurrencyUnconfirmed {
+                tool,
+                classification,
+            })
+        }
     }
 }
 
@@ -564,5 +727,95 @@ fn key_is_carried(tool: &ApprovedTool, key: Option<&IdempotencyKey>) -> Result<(
             tool: tool.name.clone(),
             classification: tool.classification,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn tool(classification: Classification) -> ApprovedTool {
+        ApprovedTool {
+            name: ToolName::parse("sys__tool").unwrap(),
+            classification,
+            connector: "sys".into(),
+            resources: ResourceDeclaration::NoResources,
+            declared_from: None,
+            settlement: None,
+        }
+    }
+
+    fn profile(requires_currency: bool) -> Profile {
+        Profile {
+            name: "profile".into(),
+            classifications: Classification::ALL.into_iter().collect::<BTreeSet<_>>(),
+            requires_delegation: false,
+            requires_currency,
+            idempotency_key_header: false,
+        }
+    }
+
+    fn every_currency() -> impl Iterator<Item = Currency> {
+        CurrencyAnswer::ALL
+            .into_iter()
+            .map(Currency::Asked)
+            .chain([Currency::NotAsked])
+    }
+
+    /// The currency check covers every classification but `read`, `write` and `destructive`
+    /// included: check 5 denies those first today, and decision 0011's exception will let a
+    /// `write` tool past it, which must then be fenced like a proposal (decision 0012, "Tools
+    /// and resources").
+    #[test]
+    fn the_currency_check_fences_every_tool_not_classified_read() {
+        for classification in Classification::ALL {
+            for currency in every_currency() {
+                let checked =
+                    control_plane_is_current(&profile(true), &tool(classification), currency)
+                        .map_err(|reason| reason.kind());
+                let expected = match (classification, currency) {
+                    (Classification::Read, _) | (_, Currency::Asked(CurrencyAnswer::Current)) => {
+                        Ok(())
+                    }
+                    (
+                        _,
+                        Currency::Asked(
+                            CurrencyAnswer::Superseded
+                            | CurrencyAnswer::Ended
+                            | CurrencyAnswer::Revoked,
+                        ),
+                    ) => Err(ReasonKind::NotCurrent),
+                    (_, Currency::Asked(CurrencyAnswer::Unconfirmed) | Currency::NotAsked) => {
+                        Err(ReasonKind::CurrencyUnconfirmed)
+                    }
+                };
+                assert_eq!(checked, expected, "{classification} {currency:?}");
+            }
+        }
+    }
+
+    /// A profile that does not require currency is not fenced, whatever the answer.
+    #[test]
+    fn a_profile_that_does_not_require_currency_is_not_fenced() {
+        for classification in Classification::ALL {
+            for currency in every_currency() {
+                assert_eq!(
+                    control_plane_is_current(&profile(false), &tool(classification), currency),
+                    Ok(()),
+                    "{classification} {currency:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_is_written_as_its_name() {
+        for answer in CurrencyAnswer::ALL {
+            assert_eq!(serde_json::to_value(answer).unwrap(), answer.as_str());
+            assert_eq!(Currency::Asked(answer).answer(), Some(answer));
+        }
+        assert_eq!(Currency::NotAsked.answer(), None);
     }
 }

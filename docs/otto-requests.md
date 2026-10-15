@@ -133,6 +133,10 @@ where it is listed and why.
   - Otto's own procedure for a breaking grant change: stop admitting turns, drain, roll the
     control plane, the Go gateway and the sandbox image together, and resume. There is no
     interim with the shared secret.
+  - The exact format, version `v3`, is in [turn-grant-format.md](turn-grant-format.md): the
+    byte layout, the domain prefixes, the key ID's derivation, the claims and their types, the
+    strict verification rules and their order, and a worked example to test a minter against.
+    It covers request 3's `aud` and `iat` too.
 - **Why:** with a shared secret, anything that verifies a grant can also mint one, so a
   company-wide gateway, or whoever compromised it, could write any human's name on any Otto
   action ([decision 0004][0004-decision]). Before stage 1, so that stage 1's comparison

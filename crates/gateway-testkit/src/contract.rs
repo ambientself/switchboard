@@ -63,15 +63,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gateway_core::audit::RecordedResources;
 use gateway_core::audit::{
     self, Answer, AuditFailure, AuditRowId, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
-    MAX_RECORDED_RESOURCES, Outcome, RequestMetadata, RowKind, RowStart,
+    MAX_RECORDED_RESOURCES, Outcome, RecordedDelegation, RecordedFailure, RequestMetadata, RowKind,
+    RowStart,
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
     ArgumentDigest, AuditGuard, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
-    Claimed, Connector, CredentialIdentity, CredentialMode, Decision, Delegation,
-    DelegationKeyScope, IdempotencyKey, KeyScope, LeaseHolder, LookupAnswer, Proved, Receipt,
-    ReceiptQueue, ReceiptState, Recorded, RequestedTool, Resource, Resources, Reuse, TeamId,
-    ToolCall, ToolOutcome, ToolUseId, VendorReference, Verifier, decide,
+    Claimed, Connector, CredentialIdentity, CredentialMode, Currency, CurrencyAnswer, Decision,
+    Delegation, DelegationDigest, DelegationFailure, DelegationKeyScope, Egress, IdempotencyKey,
+    KeyScope, LeaseHolder, LookupAnswer, PodUid, PresentedDelegation, Principal, PrincipalKind,
+    Proved, Reason, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, RequestedTool,
+    Resource, Resources, Reuse, TeamId, ToolCall, ToolOutcome, ToolUseId, UnverifiedDelegation,
+    VendorReference, Verifier, WasProved, decide,
 };
 use serde_json::{Value, json};
 
@@ -83,7 +86,7 @@ use crate::connector::{
 use crate::credentials::FakeCredentialSource;
 use crate::fixture::{
     Caller, Fixture, SURFACE_ALL, SURFACE_READ, TEAM_A, TEAM_A_DOCUMENT, TEAM_B_DOCUMENT,
-    policy_data, policy_data_with_draft_lookup,
+    UNKNOWN_PROFILE, policy_data, policy_data_with_draft_lookup,
 };
 use crate::row_bound::{
     MAX_BEGUN_ROW_BYTES, MAX_OUTCOME_SENTENCE_BYTES, MAX_ROW_BYTES, call_row_sizes, list_row_sizes,
@@ -133,6 +136,8 @@ pub trait ContractStore {
 }
 
 /// The record a row holds.
+// Test-only, made once per read-back: boxing a call record would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoredRecord {
     /// A row of kind `call`, with its completion once finished.
@@ -258,6 +263,7 @@ fn decision_context(fixture: &Fixture, call: &Call) -> CallContext {
             .expect("the fixture knows the caller"),
         tool: RequestedTool::new(call.tool),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     }
 }
 
@@ -893,6 +899,335 @@ pub async fn a_credential_identity_is_stored_as_begin_was_given_it(contract: &im
     }
 }
 
+/// What identifies a verified delegation, which check an unverified one failed with its digest
+/// when its signature verified, the proved pod and the currency answer (decision 0012) are
+/// stored as begin was given them, on a call row and, but for the failure and the currency, on
+/// a list row. Through the core, a delegation that did not verify is stored by its failure and
+/// digest alone, on the row check 3 denied.
+pub async fn a_delegation_and_its_currency_are_stored_as_begin_was_given_them(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let records = records();
+    let (allowed, denied) = (records[0].clone(), records[1].clone());
+    let digest = DelegationDigest::of(b"a grant as presented");
+    let verified = RecordedDelegation {
+        digest,
+        issuer: "otto-test".into(),
+        key_id: "key-1".into(),
+        session: "session-1".into(),
+        turn: "turn \\\"one\\\"".into(),
+        execution: "execution-1".into(),
+        epoch: i64::MAX.unsigned_abs(),
+        egress: Some(Egress::Open),
+    };
+    let mut with_pod = allowed.clone();
+    with_pod.proved_principal = proved_with_pod(&allowed);
+    let unverified = |failure: DelegationFailure, digest: Option<DelegationDigest>| AuditRecord {
+        reason: Some(ReasonKind::DelegationUnverified),
+        proved_delegation_team: None,
+        claimed_acting_person: None,
+        delegation_failure: Some(RecordedFailure { failure, digest }),
+        ..denied.clone()
+    };
+    for written in [
+        AuditRecord {
+            delegation: Some(verified.clone()),
+            currency: Some(CurrencyAnswer::Current),
+            ..with_pod.clone()
+        },
+        AuditRecord {
+            delegation: Some(RecordedDelegation {
+                egress: None,
+                epoch: 0,
+                ..verified.clone()
+            }),
+            currency: Some(CurrencyAnswer::Unconfirmed),
+            ..denied.clone()
+        },
+        AuditRecord {
+            currency: Some(CurrencyAnswer::Revoked),
+            ..allowed.clone()
+        },
+        unverified(DelegationFailure::WrongPod, Some(digest)),
+        unverified(DelegationFailure::Signature, None),
+        unverified(DelegationFailure::Expired, None),
+    ] {
+        let row = row_start().row;
+        store
+            .begin(&row, &written)
+            .await
+            .expect("the store refused a delegation it can hold");
+        assert_eq!(
+            stored(contract, &row).await.record,
+            StoredRecord::Call(written.clone()),
+            "{written:?}"
+        );
+    }
+
+    let list = list_records().swap_remove(0);
+    let listed = ListRecord {
+        delegation: Some(verified.clone()),
+        ..list.clone()
+    };
+    let row = row_start().row;
+    store
+        .list(&row, &listed)
+        .await
+        .expect("the store refused a list row's delegation");
+    assert_eq!(
+        stored(contract, &row).await.record,
+        StoredRecord::List(listed)
+    );
+
+    let fixture = fixture();
+    let mut context = decision_context(&fixture, &ALLOWED);
+    context.caller.delegation = Some(
+        UnverifiedDelegation::after_signature(DelegationFailure::WrongAudience, digest)
+            .expect("an audience is checked after the signature")
+            .into(),
+    );
+    context.currency = Currency::Asked(CurrencyAnswer::Current);
+    let start = row_start();
+    let begun = audit::begin(
+        store,
+        start.clone(),
+        decide(&fixture.policy, &context),
+        arguments(&ALLOWED),
+        RequestMetadata::default(),
+    )
+    .await
+    .expect("the store refused a denial at check 3");
+    assert!(matches!(begun, Begun::Denied(_)), "{begun:?}");
+    let StoredRecord::Call(record) = stored(contract, &start.row).await.record else {
+        panic!("a call was not stored as one");
+    };
+    assert_eq!(record.reason, Some(ReasonKind::DelegationUnverified));
+    assert_eq!(
+        record.delegation_failure,
+        Some(RecordedFailure {
+            failure: DelegationFailure::WrongAudience,
+            digest: Some(digest),
+        })
+    );
+    assert_eq!(
+        (
+            &record.delegation,
+            &record.proved_delegation_team,
+            &record.claimed_acting_person
+        ),
+        (&None, &None, &None)
+    );
+    assert_eq!(record.currency, Some(CurrencyAnswer::Current));
+}
+
+/// A call carrying a delegation that did not verify, denied before check 3 at the profile, the
+/// surface or the tool, is stored through the core as that denial alone: its reason is the
+/// earlier check's, and the row records no failure, no digest and nothing of the delegation
+/// (decision 0012). The failure belongs only on the row check 3 denied for it, and a store
+/// refuses it anywhere else.
+pub async fn an_unverified_delegation_denied_before_check_3_is_stored_as_that_denial_alone(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let fixture = fixture();
+    let digest = DelegationDigest::of(b"a grant as presented");
+    let unverified = [
+        UnverifiedDelegation::new(DelegationFailure::Signature),
+        UnverifiedDelegation::after_signature(DelegationFailure::WrongPod, digest)
+            .expect("a pod is checked after the signature"),
+    ];
+    // Each case: what it names, how it changes an allowed call, and the reason it is denied.
+    type Earlier = (&'static str, fn(&mut CallContext), ReasonKind);
+    let earlier: [Earlier; 4] = [
+        (
+            "an unknown profile",
+            |context| context.caller.profile = UNKNOWN_PROFILE.into(),
+            ReasonKind::ProfileUnknown,
+        ),
+        (
+            "a surface that does not exist",
+            |context| context.caller.surface = "no-such-surface".into(),
+            ReasonKind::SurfaceNotPermitted,
+        ),
+        (
+            "an unknown tool",
+            |context| context.tool = RequestedTool::new("no_such__tool"),
+            ReasonKind::UnknownTool,
+        ),
+        (
+            "a tool its surface does not serve",
+            |context| {
+                context.caller.surface = SURFACE_READ.into();
+                context.tool = RequestedTool::new(WRITE_TOOL);
+            },
+            ReasonKind::ToolNotOnSurface,
+        ),
+    ];
+    for delegation in &unverified {
+        for (case, change, reason) in &earlier {
+            let mut context = decision_context(&fixture, &ALLOWED);
+            context.caller.delegation = Some(delegation.clone().into());
+            change(&mut context);
+            let decided = decide(&fixture.policy, &context);
+            assert_eq!(decided.reason().map(Reason::kind), Some(*reason), "{case}");
+            let start = row_start();
+            let begun = audit::begin(
+                store,
+                start.clone(),
+                decided,
+                arguments(&ALLOWED),
+                RequestMetadata::default(),
+            )
+            .await
+            .unwrap_or_else(|failure| panic!("{case}: the denial was not recorded: {failure:?}"));
+            assert!(matches!(begun, Begun::Denied(_)), "{case}: {begun:?}");
+            let StoredRecord::Call(record) = stored(contract, &start.row).await.record else {
+                panic!("{case}: a call was not stored as one");
+            };
+            assert_eq!(record.reason, Some(*reason), "{case}");
+            assert_eq!(
+                (
+                    &record.delegation_failure,
+                    &record.delegation,
+                    &record.proved_delegation_team,
+                    &record.claimed_acting_person
+                ),
+                (&None, &None, &None, &None),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// `record`'s proved workload, with a pod.
+fn proved_with_pod(record: &AuditRecord) -> WasProved<Principal> {
+    let mut principal = record.proved_principal.get().clone();
+    if let PrincipalKind::Workload { pod, .. } = &mut principal.kind {
+        *pod = Some(PodUid::parse("0f8fad5b-d9cb-469f-a165-70867728950e").expect("a pod UID"));
+    }
+    serde_json::from_value(serde_json::to_value(principal).expect("a principal is JSON"))
+        .expect("a principal reads back as was proved")
+}
+
+/// A row whose delegation columns break decision 0012's shape is refused at begin, and leaves
+/// no row: a failure beside anything from the delegation's claims, a failure with a digest found
+/// before the signature verified, a failure on a row check 3 did not deny for it, a denial at
+/// check 3 with no failure, a verified delegation without its team or person, and an epoch past
+/// a Postgres `bigint`. So is a list row with a verified delegation without its team or person.
+pub async fn a_delegation_of_the_wrong_shape_is_refused_and_leaves_no_row(
+    contract: &impl ContractStore,
+) {
+    let store = contract.store();
+    let records = records();
+    let (allowed, denied) = (records[0].clone(), records[1].clone());
+    let digest = DelegationDigest::of(b"a grant as presented");
+    let verified = RecordedDelegation {
+        digest,
+        issuer: "otto-test".into(),
+        key_id: "key-1".into(),
+        session: "session-1".into(),
+        turn: "turn-1".into(),
+        execution: "execution-1".into(),
+        epoch: 7,
+        egress: None,
+    };
+    let failure = |failure: DelegationFailure, digest: Option<DelegationDigest>| {
+        Some(RecordedFailure { failure, digest })
+    };
+    let at_check_3 = AuditRecord {
+        reason: Some(ReasonKind::DelegationUnverified),
+        proved_delegation_team: None,
+        claimed_acting_person: None,
+        delegation_failure: failure(DelegationFailure::Signature, None),
+        ..denied.clone()
+    };
+    let cannot_hold = [
+        // Something from the delegation's claims beside its failure.
+        AuditRecord {
+            claimed_acting_person: denied.claimed_acting_person.clone(),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            proved_delegation_team: denied.proved_delegation_team.clone(),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            delegation: Some(verified.clone()),
+            proved_delegation_team: denied.proved_delegation_team.clone(),
+            claimed_acting_person: denied.claimed_acting_person.clone(),
+            ..at_check_3.clone()
+        },
+        // A digest for a failure found before the signature verified.
+        AuditRecord {
+            delegation_failure: failure(DelegationFailure::Signature, Some(digest)),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            delegation_failure: failure(DelegationFailure::Malformed, Some(digest)),
+            ..at_check_3.clone()
+        },
+        // A failure on a row check 3 did not deny for it, and such a denial with none.
+        AuditRecord {
+            reason: Some(ReasonKind::ClassificationNotPermitted),
+            ..at_check_3.clone()
+        },
+        AuditRecord {
+            proved_delegation_team: None,
+            claimed_acting_person: None,
+            delegation_failure: failure(DelegationFailure::Expired, Some(digest)),
+            ..allowed.clone()
+        },
+        AuditRecord {
+            delegation_failure: None,
+            ..at_check_3.clone()
+        },
+        // A verified delegation without its team or its person.
+        AuditRecord {
+            delegation: Some(verified.clone()),
+            proved_delegation_team: None,
+            ..allowed.clone()
+        },
+        AuditRecord {
+            delegation: Some(verified.clone()),
+            claimed_acting_person: None,
+            ..allowed.clone()
+        },
+        // An epoch past a bigint.
+        AuditRecord {
+            delegation: Some(RecordedDelegation {
+                epoch: u64::MAX,
+                ..verified.clone()
+            }),
+            ..allowed.clone()
+        },
+    ];
+    for record in &cannot_hold {
+        let row = row_start().row;
+        let begun = store.begin(&row, record).await;
+        assert!(begun.is_err(), "the store accepted {record:?}");
+        assert_eq!(contract.stored(&row).await, None, "{record:?}");
+    }
+
+    let list = list_records().swap_remove(0);
+    for record in [
+        ListRecord {
+            delegation: Some(verified.clone()),
+            proved_delegation_team: None,
+            ..list.clone()
+        },
+        ListRecord {
+            delegation: Some(verified.clone()),
+            claimed_acting_person: None,
+            ..list.clone()
+        },
+    ] {
+        let row = row_start().row;
+        assert!(store.list(&row, &record).await.is_err(), "{record:?}");
+        assert_eq!(contract.stored(&row).await, None, "{record:?}");
+    }
+}
+
 /// A second begin under a stored row's identifier compares the decision and nothing more, as
 /// [`begin_is_ok_only_once_stored_and_idempotent_by_identifier`] says: one with the same
 /// decision and another reach, other resources, another credential identity or none is
@@ -1055,6 +1390,7 @@ pub async fn finish_touches_only_the_completion(contract: &impl ContractStore) {
         tool: RequestedTool::new(READ_TOOL),
         resources: Resources::Named(named),
         key: None,
+        currency: gateway_core::Currency::NotAsked,
     };
     let begun = audit::begin(
         store,
@@ -1524,10 +1860,31 @@ impl Connector for Answering {
 }
 
 /// Proves a delegation exactly as it is given. The contract suite's own, for item 6's scope
-/// case: the fixture has no delegation verifier, and a key's scope reads the delegation's key
-/// scope, which no verifier fills until #22. Every `impl Verifier` creates proof, so it is
-/// private to this module and used only there.
+/// case and the delegation columns: the fixture has no delegation verifier. Every
+/// `impl Verifier` creates proof, so it is private to this module and used only there.
 struct DelegationAsGiven;
+
+/// Team A's delegation for `turn` of one session and execution, listing the draft tool, as
+/// [`DelegationAsGiven`] proves it. Its digest is of the turn's name.
+fn turn_delegation(turn: &str) -> PresentedDelegation {
+    let delegation = Delegation {
+        acting_person: Claimed::new("requester@example.test".into()),
+        team: TEAM_A.into(),
+        tools: [DRAFT_TOOL.parse().expect("a valid tool name")].into(),
+        issuer: "otto-test".into(),
+        digest: DelegationDigest::of(turn.as_bytes()),
+        key_id: "key-1".into(),
+        session: "session-1".into(),
+        turn: turn.into(),
+        execution: "execution-1".into(),
+        epoch: 7,
+        egress: Some(Egress::Sealed),
+    };
+    PresentedDelegation::Verified(match Proved::verify(&DelegationAsGiven, &delegation) {
+        Ok(proved) => proved,
+        Err(never) => match never {},
+    })
+}
 
 impl Verifier for DelegationAsGiven {
     type Evidence = Delegation;
@@ -1567,6 +1924,7 @@ fn keyed_decision(
         tool: RequestedTool::new(DRAFT_TOOL),
         resources: FixtureConnector::resources_of(DRAFT_TOOL, arguments),
         key: key.cloned(),
+        currency: gateway_core::Currency::NotAsked,
     };
     decide(&fixture.policy, &context)
 }
@@ -1958,20 +2316,11 @@ pub async fn two_delegations_under_one_principal_may_use_the_same_key(
         let mut caller = fixture
             .caller_context(Caller::TeamA, SURFACE_ALL)
             .expect("the fixture knows team A");
-        let delegation = Delegation {
-            acting_person: Claimed::new("requester@example.test".into()),
-            team: TEAM_A.into(),
-            tools: [DRAFT_TOOL.parse().expect("a valid tool name")].into(),
-            key_scope: Some(DelegationKeyScope::new(turn)),
-        };
-        caller.delegation = Some(match Proved::verify(&DelegationAsGiven, &delegation) {
-            Ok(proved) => proved,
-            Err(never) => match never {},
-        });
+        caller.delegation = Some(turn_delegation(turn));
         keyed_decision(&fixture, caller, &arguments, Some(&key))
     };
     let mut rows = Vec::new();
-    for turn in ["session-1/turn-1", "session-1/turn-2"] {
+    for turn in ["turn-1", "turn-2"] {
         let start = row_start();
         let begun = begin_keyed(store, &start, in_turn(turn), &arguments, Some(key.as_str())).await;
         assert!(matches!(begun, Ok(Begun::Allowed(_))), "{turn}: {begun:?}");
@@ -1989,13 +2338,19 @@ pub async fn two_delegations_under_one_principal_may_use_the_same_key(
                 .map(DelegationKeyScope::as_str)
         })
         .collect();
-    assert!(scopes.contains(&Some("session-1/turn-1")), "{scopes:?}");
-    assert!(scopes.contains(&Some("session-1/turn-2")), "{scopes:?}");
+    assert!(
+        scopes.contains(&Some(r#"["session-1","execution-1","turn-1"]"#)),
+        "{scopes:?}"
+    );
+    assert!(
+        scopes.contains(&Some(r#"["session-1","execution-1","turn-2"]"#)),
+        "{scopes:?}"
+    );
 
     let again = begin_keyed(
         store,
         &row_start(),
-        in_turn("session-1/turn-2"),
+        in_turn("turn-2"),
         &arguments,
         Some(key.as_str()),
     )

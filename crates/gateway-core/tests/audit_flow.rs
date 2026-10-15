@@ -12,18 +12,20 @@ use std::task::{Context, Poll, Waker};
 
 use gateway_core::audit::{
     self, Answer, AuditFailure, Begun, Completion, DecisionKind, ErrorKind, ListRecord,
-    MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, Outcome, RecordedResource,
-    RecordedResources, RequestMetadata, RowKind, RowStart,
+    MAX_RECORDED_IDENTIFIER, MAX_RECORDED_RESOURCES, MAX_RECORDED_TOOLS, Outcome,
+    RecordedDelegation, RecordedFailure, RecordedResource, RecordedResources, RequestMetadata,
+    RowKind, RowStart,
 };
 use gateway_core::receipt::EstablishedBy;
 use gateway_core::{
     ApprovedTool, ArgumentDigest, AuditRecord, AuditStore, BoxFuture, CallContext, CallerContext,
     Claimed, Classification, Connector, ConnectorEntry, ConnectorName, CredentialIdentity,
-    CredentialMode, Decision, Delegation, DelegationKeyScope, EntryKind, IdempotencyKey,
-    InstanceName, KeyScope, Narrowing, PolicySnapshot, Principal, PrincipalId, PrincipalKind,
-    PrincipalRestriction, Profile, Reason, ReasonKind, Receipt, ReceiptState, RequestedTool,
-    Resource, ResourceDeclaration, ResourceLimits, ResourceProblem, Resources, Reuse, Settlement,
-    SnapshotData, Surface, TeamId, ToolCall, ToolOutcome, VendorReference, decide, list_tools,
+    CredentialMode, Currency, CurrencyAnswer, Decision, Delegation, DelegationDigest,
+    DelegationFailure, Egress, EntryKind, IdempotencyKey, InstanceName, KeyScope, Narrowing,
+    PolicySnapshot, Principal, PrincipalId, PrincipalKind, PrincipalRestriction, Profile, Reason,
+    ReasonKind, Receipt, ReceiptState, RequestedTool, Resource, ResourceDeclaration,
+    ResourceLimits, ResourceProblem, Resources, Reuse, Settlement, SnapshotData, Surface, TeamId,
+    ToolCall, ToolOutcome, TurnId, UnverifiedDelegation, VendorReference, decide, list_tools,
 };
 use serde_json::json;
 
@@ -102,12 +104,14 @@ fn snapshot_with(elsewhere: bool) -> PolicySnapshot {
                 name: "readers".into(),
                 classifications: [Classification::Read].into(),
                 requires_delegation: true,
+                requires_currency: false,
                 idempotency_key_header: false,
             },
             Profile {
                 name: "proposers".into(),
                 classifications: [Classification::Read, Classification::Propose].into(),
                 requires_delegation: true,
+                requires_currency: false,
                 idempotency_key_header: false,
             },
         ],
@@ -160,19 +164,19 @@ fn principal() -> Principal {
     }
 }
 
+/// The delegation every [`call`] carries.
+fn delegation() -> Delegation {
+    common::delegation(
+        "payments",
+        ["fixture__read", "fixture__propose", "fixture__elsewhere"].map(tool_name),
+    )
+}
+
 fn call(tool: &str) -> CallContext {
-    let delegation = Delegation {
-        acting_person: Claimed::new("requester@example.test".into()),
-        team: "payments".into(),
-        tools: ["fixture__read", "fixture__propose", "fixture__elsewhere"]
-            .map(tool_name)
-            .into(),
-        key_scope: None,
-    };
     CallContext {
         caller: CallerContext {
             principal: common::proved(&principal()),
-            delegation: Some(common::proved(&delegation)),
+            delegation: Some(common::presented(&delegation())),
             profile: "readers".into(),
             surface: "fixture".into(),
             deployment: "test".into(),
@@ -180,6 +184,7 @@ fn call(tool: &str) -> CallContext {
         tool: RequestedTool::new(tool),
         resources: Resources::Named(Vec::new()),
         key: None,
+        currency: Currency::NotAsked,
     }
 }
 
@@ -949,6 +954,7 @@ fn snapshot_with_entry() -> PolicySnapshot {
             name: "readers".into(),
             classifications: [Classification::Read].into(),
             requires_delegation: true,
+            requires_currency: false,
             idempotency_key_header: false,
         }],
         limits: limits(),
@@ -1213,6 +1219,16 @@ fn a_list_row_records_the_caller_the_revision_and_the_instance() {
             "proved_delegation_team": "payments",
             "claimed_acting_person": "requester@example.test",
             "claimed_team": "search",
+            "delegation": {
+                "digest": delegation().digest,
+                "issuer": "otto-test",
+                "key_id": "key-1",
+                "session": "session-1",
+                "turn": "turn-1",
+                "execution": "execution-1",
+                "epoch": 7,
+                "egress": null
+            },
             "tools": ["fixture__read"],
             "tools_omitted": 0
         })
@@ -1241,6 +1257,7 @@ fn a_list_row_records_the_caller_the_revision_and_the_instance() {
     assert_eq!(record.proved_delegation_team, None);
     assert_eq!(record.claimed_acting_person, None);
     assert_eq!(record.claimed_team, None);
+    assert_eq!(record.delegation, None);
 }
 
 #[test]
@@ -1525,7 +1542,7 @@ fn an_allowed_side_effect_reserves_a_pending_receipt_with_its_row() {
             row: row.clone(),
             scope: KeyScope {
                 principal: principal().id,
-                delegation: None,
+                delegation: Some(delegation().key_scope()),
             },
             key: key.clone(),
             tool: tool_name("fixture__propose"),
@@ -1785,38 +1802,140 @@ fn a_retried_begin_finds_its_own_receipt() {
     assert_eq!(connector.calls().len(), 1);
 }
 
-/// A key is scoped to the proved principal and the delegation's key scope: two delegations of
-/// one principal may each use a key, and so may two principals; one delegation may not use it
-/// twice.
+/// A key is scoped to the proved principal and the delegation's key scope, its session,
+/// execution and turn: two delegations of one principal may each use a key, and so may two
+/// principals; one delegation may not use it twice.
 #[test]
 fn a_key_is_unique_only_in_its_scope() {
     let store = MemoryStore::default();
     let key = common::fresh_key();
-    let in_turn = |turn: Option<&str>, subject: &str| {
+    let in_turn = |session: &str, execution: &str, turn: &str, subject: &str| {
         let mut context = proposing("fixture__propose", Some(&key));
-        let mut delegation = context.caller.delegation.take().unwrap().get().clone();
-        delegation.key_scope = turn.map(DelegationKeyScope::new);
-        context.caller.delegation = Some(common::proved(&delegation));
+        let mut delegation = delegation();
+        delegation.session = session.into();
+        delegation.execution = execution.into();
+        delegation.turn = turn.into();
+        context.caller.delegation = Some(common::presented(&delegation));
         let mut principal = principal();
         principal.id.subject = subject.into();
         context.caller.principal = common::proved(&principal);
         context
     };
     let sandbox = "system:serviceaccount:otto:sandbox-payments";
+    let other = "system:serviceaccount:otto:sandbox-payments-2";
     for context in [
-        in_turn(Some("session-1/turn-1"), sandbox),
-        in_turn(Some("session-1/turn-2"), sandbox),
-        in_turn(None, sandbox),
-        in_turn(None, "system:serviceaccount:otto:sandbox-payments-2"),
+        in_turn("session-1", "execution-1", "turn-1", sandbox),
+        in_turn("session-1", "execution-1", "turn-2", sandbox),
+        in_turn("session-1", "execution-2", "turn-1", sandbox),
+        in_turn("session-2", "execution-1", "turn-1", sandbox),
+        in_turn("session-1", "execution-1", "turn-1", other),
     ] {
         let begun = begin_as(&store, common::start(), &context);
         assert!(matches!(begun, Begun::Allowed(_)), "{begun:?}");
     }
-    assert_eq!(store.receipts().len(), 4);
+    assert_eq!(store.receipts().len(), 5);
     let again = begin_as(
         &store,
         common::start(),
-        &in_turn(Some("session-1/turn-2"), sandbox),
+        &in_turn("session-1", "execution-1", "turn-2", sandbox),
     );
     assert!(matches!(again, Begun::Reused(_)), "{again:?}");
+}
+
+// --- Delegations and currency on the row (decision 0012) -------------------------------------
+
+/// A verified delegation's row records what identifies it, each value the issuing control
+/// plane chose escaped and capped like the surface, and the currency answer when one was asked.
+#[test]
+fn a_verified_delegation_is_recorded_with_what_identifies_it() {
+    let store = MemoryStore::default();
+    let mut context = proposing("fixture__propose", Some(&common::fresh_key()));
+    let mut delegation = delegation();
+    delegation.session = "session\nforged".into();
+    delegation.turn = TurnId::new("t".repeat(200));
+    delegation.egress = Some(Egress::Sealed);
+    context.caller.delegation = Some(common::presented(&delegation));
+    context.currency = Currency::Asked(CurrencyAnswer::Current);
+    let begun = begin_as(&store, common::start(), &context);
+    assert!(matches!(begun, Begun::Allowed(_)), "{begun:?}");
+    let row = store.last();
+    assert_eq!(
+        row.delegation,
+        Some(RecordedDelegation {
+            digest: delegation.digest,
+            issuer: "otto-test".into(),
+            key_id: "key-1".into(),
+            session: "session\\nforged".into(),
+            turn: format!("{}…", "t".repeat(128)).as_str().into(),
+            execution: "execution-1".into(),
+            epoch: 7,
+            egress: Some(Egress::Sealed),
+        })
+    );
+    assert_eq!(row.delegation_failure, None);
+    assert_eq!(row.currency, Some(CurrencyAnswer::Current));
+    assert_eq!(
+        row.proved_delegation_team.map(|team| team.get().clone()),
+        Some(TeamId::new("payments"))
+    );
+}
+
+/// A delegation that did not verify is denied at check 3, and its row records which check it
+/// failed and, after a verified signature only, its digest: nothing from its claims, and the
+/// caller reads one sentence whatever failed.
+#[test]
+fn an_unverified_delegation_is_recorded_by_its_failure_alone() {
+    let digest = DelegationDigest::of(b"a grant");
+    for failure in DelegationFailure::ALL {
+        let unverified = if failure.follows_signature() {
+            UnverifiedDelegation::after_signature(failure, digest).unwrap()
+        } else {
+            UnverifiedDelegation::new(failure)
+        };
+        let store = MemoryStore::default();
+        let mut context = proposing("fixture__propose", Some(&common::fresh_key()));
+        context.caller.delegation = Some(unverified.into());
+        context.currency = Currency::Asked(CurrencyAnswer::Current);
+        let refusal = match begin_as(&store, common::start(), &context) {
+            Begun::Denied(refusal) => refusal,
+            other => panic!("{failure}: {other:?}"),
+        };
+        assert_eq!(
+            refusal.sentence(),
+            "This gateway requires a verifiable turn grant on every call, and this call's did not verify.",
+            "{failure}"
+        );
+        let row = store.last();
+        assert_eq!(row.reason, Some(ReasonKind::DelegationUnverified));
+        assert_eq!(
+            row.delegation_failure,
+            Some(RecordedFailure {
+                failure,
+                digest: failure.follows_signature().then_some(digest),
+            })
+        );
+        assert_eq!(row.delegation, None, "{failure}");
+        assert_eq!(row.proved_delegation_team, None, "{failure}");
+        assert_eq!(row.claimed_acting_person, None, "{failure}");
+        let written = serde_json::to_string(&row).unwrap();
+        assert!(!written.contains("requester@example.test"), "{written}");
+        assert!(store.receipts().is_empty(), "a denial reserved a receipt");
+    }
+}
+
+/// The currency answer is recorded when one was asked, whatever the decision, and not when
+/// it was not.
+#[test]
+fn the_currency_answer_is_recorded_when_one_was_asked() {
+    for currency in CurrencyAnswer::ALL
+        .map(Currency::Asked)
+        .into_iter()
+        .chain([Currency::NotAsked])
+    {
+        let store = MemoryStore::default();
+        let mut context = proposing("fixture__propose", Some(&common::fresh_key()));
+        context.currency = currency;
+        let _ = begin_as(&store, common::start(), &context);
+        assert_eq!(store.last().currency, currency.answer(), "{currency:?}");
+    }
 }

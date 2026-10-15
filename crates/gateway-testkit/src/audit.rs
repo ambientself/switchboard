@@ -10,7 +10,8 @@ use gateway_core::audit::{
 use gateway_core::receipt::{EstablishedBy, ReceiptRequest, Reservation, may_move};
 use gateway_core::{
     AuditRecord, AuditStore, BoxFuture, IdempotencyKey, InstanceName, LeaseHolder, LookupAnswer,
-    LookupRecord, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse, VendorReference,
+    LookupRecord, ReasonKind, Receipt, ReceiptQueue, ReceiptState, Recorded, Reuse,
+    VendorReference,
 };
 use gateway_identity::Clock;
 use rand_core::{OsRng, RngCore};
@@ -237,6 +238,9 @@ fn refused_at_begin(
         "the count of resources left out",
         as_u64(record.resources_omitted),
     )?;
+    if let Some(delegation) = &record.delegation {
+        refuse_past_bigint("a delegation's epoch", delegation.epoch)?;
+    }
     let allowance = allowance_ms(budgets, record.call_deadline_ms);
     refuse_past_bigint("the row's allowance", allowance)?;
     refuse_over(&call_row_sizes(id, record), MAX_BEGUN_ROW_BYTES)?;
@@ -258,7 +262,66 @@ fn refused_at_begin(
         )
         .into());
     }
+    refused_delegation(
+        id,
+        record.delegation.is_some(),
+        record.proved_delegation_team.is_some(),
+        record.claimed_acting_person.is_some(),
+    )?;
+    refused_failure(id, record)?;
     Ok(allowance)
+}
+
+/// Why the Postgres store would refuse a row's verified delegation, if it would: its table's
+/// `delegation_shape` writes one with its team and its person.
+fn refused_delegation(
+    id: &AuditRowId,
+    delegation: bool,
+    team: bool,
+    person: bool,
+) -> Result<(), StoreError> {
+    if delegation && !(team && person) {
+        return Err(violates(id, "delegation_shape"));
+    }
+    Ok(())
+}
+
+/// Why the Postgres store would refuse a call record's delegation failure, if it would, as its
+/// table's constraints say (migration 0010): a failure is recorded exactly on a row check 3
+/// denied for a delegation that did not verify (`delegation_failure_shape`), beside nothing from
+/// the delegation's claims (`delegation_failure_unclaimed`), and with a digest only for a
+/// failure that follows a verified signature (`delegation_digest_shape`).
+fn refused_failure(id: &AuditRowId, record: &AuditRecord) -> Result<(), StoreError> {
+    let at_check_3 = record.reason == Some(ReasonKind::DelegationUnverified);
+    let Some(failure) = &record.delegation_failure else {
+        return if at_check_3 {
+            Err(violates(id, "delegation_failure_shape"))
+        } else {
+            Ok(())
+        };
+    };
+    if !at_check_3 || record.decision != DecisionKind::Deny {
+        return Err(violates(id, "delegation_failure_shape"));
+    }
+    if record.delegation.is_some()
+        || record.proved_delegation_team.is_some()
+        || record.claimed_acting_person.is_some()
+    {
+        return Err(violates(id, "delegation_failure_unclaimed"));
+    }
+    if failure.digest.is_some() && !failure.failure.follows_signature() {
+        return Err(violates(id, "delegation_digest_shape"));
+    }
+    Ok(())
+}
+
+/// The Postgres store's refusal of a row that breaks the check constraint `constraint`.
+fn violates(id: &AuditRowId, constraint: &str) -> StoreError {
+    format!(
+        "audit row {} violates the check constraint \"{constraint}\"",
+        id.as_str()
+    )
+    .into()
 }
 
 /// Why the Postgres store would refuse to write `record` as the row `id`, if it would: a list
@@ -267,7 +330,16 @@ fn refused_at_list(id: &AuditRowId, record: &ListRecord) -> Result<(), StoreErro
     refuse_non_uuid(id)?;
     refuse_nul(serde_json::to_value(record))?;
     refuse_past_bigint("the count of tools left out", as_u64(record.tools_omitted))?;
-    refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES)
+    if let Some(delegation) = &record.delegation {
+        refuse_past_bigint("a delegation's epoch", delegation.epoch)?;
+    }
+    refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES)?;
+    refused_delegation(
+        id,
+        record.delegation.is_some(),
+        record.proved_delegation_team.is_some(),
+        record.claimed_acting_person.is_some(),
+    )
 }
 
 /// Why the Postgres store would refuse to write `completion`, if it would: a refusal's sentence
@@ -637,9 +709,13 @@ impl State {
 /// allowance is past one. It holds that store's row bound, as [`row_bound`](crate::row_bound)
 /// counts it: begin refuses a call row over 522,203 bytes and list a list row over 512 KiB,
 /// naming the row's largest column, and finish refuses a refusal's sentence over 2,048 bytes,
-/// leaving the row open. Of the table's own constraints it checks three: unknown resources or
-/// a reach with a count left out, a reach naming no entry, and `kind_shape`, which refuses a
-/// call record of kind `list` at begin. It keeps a row's credential identity as begin was
+/// leaving the row open. Of the table's own constraints it checks these: unknown resources or
+/// a reach with a count left out, a reach naming no entry, `kind_shape`, which refuses a call
+/// record of kind `list` at begin, and the delegation's (migration 0010): a verified
+/// delegation's columns only with its team and person, and a delegation's failure only on a
+/// row check 3 denied for it, beside nothing from its claims, and with a digest only after a
+/// verified signature. An epoch past a Postgres `bigint` is refused too. It keeps a row's
+/// credential identity as begin was
 /// given it, its mode and principal together, as the table's `credential_shape` requires.
 /// Of its triggers it follows both: `set_times`, which refuses a deadline past what a Postgres
 /// time holds, and `complete_once`.

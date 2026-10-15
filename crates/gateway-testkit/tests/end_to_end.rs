@@ -120,6 +120,7 @@ impl Gateway {
             caller: Fixture::context_for(principal, surface),
             tool: RequestedTool::new(tool),
             key: key.clone(),
+            currency: gateway_core::Currency::NotAsked,
         };
         let decision = decide(&self.fixture.policy, &call);
         let begun = match audit::begin(

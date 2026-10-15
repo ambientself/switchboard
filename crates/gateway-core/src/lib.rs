@@ -40,20 +40,25 @@ pub use classification::{Classification, UnrecognizedClassification};
 pub use connector::{BoxFuture, Connector, ErrorKind, ToolCall, ToolOutcome};
 pub use credential::{CredentialError, CredentialHandle, CredentialSource};
 pub use decision::{
-    CallContext, CallerContext, Decision, DelegationProblem, Reason, ReasonKind, ResourceProblem,
-    Verdict, decide, list_tools,
+    CallContext, CallerContext, Currency, CurrencyAnswer, Decision, DelegationProblem, Reason,
+    ReasonKind, ResourceProblem, Verdict, decide, list_tools,
 };
 pub use names::{
-    ConnectorName, DeploymentName, GroupId, InstanceName, InvalidPodUid, InvalidToolName, Issuer,
-    MAX_TOOL_NAME, Person, PodUid, PolicyRevision, ProfileName, RequestedTool, Subject,
-    SurfaceName, TeamId, ToolName, ToolUseId,
+    ConnectorName, DelegationIssuer, DeploymentName, ExecutionId, GroupId, InstanceName,
+    InvalidPodUid, InvalidToolName, Issuer, KeyId, MAX_TOOL_NAME, Person, PodUid, PolicyRevision,
+    ProfileName, RequestedTool, SessionId, Subject, SurfaceName, TeamId, ToolName, ToolUseId,
+    TurnId,
 };
 pub use policy::{
     Admitted, ApprovedTool, ConnectorEntry, CredentialMode, DeclaredFrom, EntryKind, Narrowing,
     PolicySnapshot, PrincipalRestriction, Profile, Resource, ResourceDeclaration, ResourceLimits,
     Resources, SnapshotData, SnapshotError, Surface,
 };
-pub use principal::{Delegation, Principal, PrincipalId, PrincipalKind};
+pub use principal::{
+    Delegation, DelegationDigest, DelegationFailure, DigestBeforeSignature, Egress,
+    InvalidDelegationDigest, PresentedDelegation, Principal, PrincipalId, PrincipalKind,
+    UnverifiedDelegation,
+};
 pub use proof::{Claimed, Provable, Proved, Verifier, WasProved};
 pub use receipt::{
     ArgumentDigest, DelegationKeyScope, IdempotencyKey, InvalidIdempotencyKey, KeyScope,

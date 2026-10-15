@@ -130,13 +130,13 @@ CHECK = {
         "    }\n"
     ),
 }
-# Where decision 0012's currency check goes, between checks 5 and 6 (#22).
-BETWEEN = {
-    (5, 6): (
-        "    // Decision 0012's currency check goes here, after check 5 and its exception step and\n"
-        "    // before check 6, and is skipped for `tools/list` as check 6 is (#22).\n"
-    ),
-}
+# Decision 0012's currency check, between checks 5 and 6 (#22).
+CURRENCY_CHECK = (
+    "    if let Some(currency) = currency {\n"
+    "        control_plane_is_current(profile, tool, currency)?;\n"
+    "    }\n"
+)
+BETWEEN = {(5, 6): CURRENCY_CHECK}
 for first, second in [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]:
     between = BETWEEN.get((first, second), "")
     mutate(
@@ -155,6 +155,13 @@ mutate(
 )
 for number in (1, 3, 4, 5, 6):
     mutate(f"check-{number}-removed", f"check {number} is not run", SRC + "decision.rs", CHECK[number], "")
+# The currency check after check 5 (decision 0012): a direct write is reported before currency.
+# tests/decision_table.json's order cases catch these.
+mutate("currency-before-check-5", "the currency check runs before check 5, so a direct write is reported as not current",
+       SRC + "decision.rs", CHECK[5] + CURRENCY_CHECK, CURRENCY_CHECK + CHECK[5])
+mutate("currency-after-check-6", "the currency check runs after check 6, so a resource outside the limit is reported first",
+       SRC + "decision.rs", CURRENCY_CHECK + CHECK[6], CHECK[6] + CURRENCY_CHECK)
+mutate("currency-check-removed", "the currency check is not run", SRC + "decision.rs", CURRENCY_CHECK, "")
 
 # --- Check 0: the profile ------------------------------------------------------------------
 
@@ -285,9 +292,38 @@ mutate(
     "delegation-missing-accepted",
     "a profile that requires a delegation accepts a call without one",
     SRC + "decision.rs",
-    "        return if profile.requires_delegation {",
-    "        return if false && profile.requires_delegation {",
+    "        None if profile.requires_delegation => {",
+    "        None if false && profile.requires_delegation => {",
 )
+# A delegation that did not verify (decisions 0009 and 0012): check 3 denies it, under its own
+# reason kind, whether or not the profile requires a delegation. tests/decision_table.json and
+# tests/properties.rs catch these.
+UNVERIFIED_AT_CHECK_3 = (
+    "        Some(PresentedDelegation::Unverified(unverified)) => {\n"
+    "            return Err(Reason::DelegationUnverified {\n"
+    "                failure: unverified.failure(),\n"
+    "            });\n"
+    "        }\n"
+)
+mutate("unverified-delegation-allowed-past-check-3", "a delegation that did not verify passes check 3", SRC + "decision.rs",
+       UNVERIFIED_AT_CHECK_3, "        Some(PresentedDelegation::Unverified(_)) => return Ok(()),\n")
+mutate("unverified-delegation-checked-only-if-required", "a delegation that did not verify passes check 3 where the profile does not require one",
+       SRC + "decision.rs", UNVERIFIED_AT_CHECK_3,
+       "        Some(PresentedDelegation::Unverified(_)) if !profile.requires_delegation => return Ok(()),\n" + UNVERIFIED_AT_CHECK_3)
+mutate("unverified-delegation-read-as-missing", "a delegation that did not verify is denied as missing, naming the profile",
+       SRC + "decision.rs", UNVERIFIED_AT_CHECK_3,
+       "        Some(PresentedDelegation::Unverified(_)) => {\n"
+       "            return Err(Reason::DelegationDisagrees(DelegationProblem::Missing {\n"
+       "                profile: profile.name.clone(),\n"
+       "            }));\n"
+       "        }\n")
+# A failure carries a digest only after a verified signature (decision 0012, "Failures").
+# principal.rs's own tests catch these.
+mutate("digest-recorded-before-signature", "a failure found before the signature verified carries the delegation's digest",
+       SRC + "principal.rs", "        if !failure.follows_signature() {", "        if false && !failure.follows_signature() {")
+mutate("digest-recorded-for-malformed-claims", "a delegation whose claims are malformed carries its digest", SRC + "principal.rs",
+       "            DelegationFailure::Expired\n                | DelegationFailure::NotYetValid",
+       "            DelegationFailure::Malformed\n                | DelegationFailure::Expired\n                | DelegationFailure::NotYetValid")
 mutate(
     "delegation-checked-only-if-required",
     "a delegation is ignored by check 3 where the profile does not require one",
@@ -302,13 +338,13 @@ mutate(
     "        None => Err(Reason::DelegationDisagrees(\n            DelegationProblem::PrincipalHasNoTeam {",
     "        None if true => Ok(()),\n        None => Err(Reason::DelegationDisagrees(\n            DelegationProblem::PrincipalHasNoTeam {",
 )
-DELEGATION_LISTS = "        Some(delegation) if !delegation.get().tools.contains(&tool.name) => {"
+DELEGATION_LISTS = "            delegation.get().tools.contains(&tool.name)\n"
 mutate(
     "delegation-empty-list-narrows-nothing",
     "a delegation that lists no tools narrows nothing",
     SRC + "decision.rs",
     DELEGATION_LISTS,
-    "        Some(delegation) if !delegation.get().tools.is_empty() && !delegation.get().tools.contains(&tool.name) => {",
+    "            delegation.get().tools.is_empty() || delegation.get().tools.contains(&tool.name)\n",
 )
 mutate(
     "delegation-tools-may-be-omitted",
@@ -322,13 +358,13 @@ mutate_all(
     "a delegation whose tool list is null reads as one that lists no tools",
     (
         SRC + "principal.rs",
-        "    pub tools: BTreeSet<ToolName>,\n    /// The delegation's identifying fields",
-        "    #[serde(deserialize_with = \"null_is_empty\")]\n    pub tools: BTreeSet<ToolName>,\n    /// The delegation's identifying fields",
+        "    pub tools: BTreeSet<ToolName>,\n    /// The issuer whose key verified",
+        "    #[serde(deserialize_with = \"null_is_empty\")]\n    pub tools: BTreeSet<ToolName>,\n    /// The issuer whose key verified",
     ),
     (
         SRC + "principal.rs",
-        "    pub key_scope: Option<DelegationKeyScope>,\n}",
-        "    pub key_scope: Option<DelegationKeyScope>,\n}\n\n"
+        "    pub egress: Option<Egress>,\n}",
+        "    pub egress: Option<Egress>,\n}\n\n"
         "fn null_is_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeSet<ToolName>, D::Error> {\n"
         "    Ok(Option::<BTreeSet<ToolName>>::deserialize(deserializer)?.unwrap_or_default())\n}",
     ),
@@ -428,6 +464,36 @@ mutate(
     'Classification::Read => "reader",',
 )
 
+# --- The currency check -------------------------------------------------------------------
+
+# Decision 0012: under a profile that requires currency, a call of a tool not classified `read`
+# is allowed only while its turn is current; not current, unconfirmed and not asked are denied,
+# and tools/list skips the check. decision.rs's own tests catch the first, which no table case
+# can reach while check 5 denies every `write` tool; tests/decision_table.json and
+# tests/properties.rs catch the rest.
+CURRENCY_APPLIES = "    if !profile.requires_currency || tool.classification == Classification::Read {"
+mutate("currency-keyed-on-propose", "the currency check fences `propose` alone, not every tool not classified `read`",
+       SRC + "decision.rs", CURRENCY_APPLIES,
+       "    if !profile.requires_currency || tool.classification != Classification::Propose {")
+mutate("currency-on-reads", "the currency check fences reads too", SRC + "decision.rs", CURRENCY_APPLIES,
+       "    if !profile.requires_currency {")
+mutate("currency-ignores-profile", "every profile requires currency", SRC + "decision.rs", CURRENCY_APPLIES,
+       "    if tool.classification == Classification::Read {")
+CURRENCY_UNCONFIRMED_ARM = "        Currency::Asked(CurrencyAnswer::Unconfirmed) | Currency::NotAsked => {\n"
+mutate("currency-not-asked-allowed", "a call whose currency was not asked is allowed", SRC + "decision.rs",
+       CURRENCY_UNCONFIRMED_ARM,
+       "        Currency::NotAsked => Ok(()),\n        Currency::Asked(CurrencyAnswer::Unconfirmed) => {\n")
+mutate("currency-unconfirmed-allowed", "a call whose currency could not be confirmed is allowed", SRC + "decision.rs",
+       CURRENCY_UNCONFIRMED_ARM,
+       "        Currency::Asked(CurrencyAnswer::Unconfirmed) => Ok(()),\n        Currency::NotAsked => {\n")
+mutate("currency-revoked-allowed", "a call whose turn was revoked is allowed", SRC + "decision.rs",
+       "        Currency::Asked(CurrencyAnswer::Current) => Ok(()),\n",
+       "        Currency::Asked(CurrencyAnswer::Current | CurrencyAnswer::Revoked) => Ok(()),\n")
+mutate("currency-not-current-as-unconfirmed", "a turn that is not current is reported as unconfirmed", SRC + "decision.rs",
+       "        ) => Err(Reason::NotCurrent {\n", "        ) => Err(Reason::CurrencyUnconfirmed {\n")
+mutate("currency-setting-required", "a policy that does not mention requires_currency is refused, not read as false", SRC + "policy.rs",
+       "    #[serde(default)]\n    pub requires_currency: bool,", "    pub requires_currency: bool,")
+
 # --- Check 6: the resources ----------------------------------------------------------------
 
 NAMED_SCAN = "            match named\n                .iter()\n                .find("
@@ -507,22 +573,33 @@ mutate("reach-from-arguments", "a tool declared as the reach is read by its conn
 # and the check is skipped for tools/list. tests/decision_table.json, tests/properties.rs and
 # the dev gateway's denial cases catch these.
 DECIDE_CHECKED = (
-    "    let checked = check(snapshot, &call.caller, &call.tool, Some(&call.resources))\n"
-    "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));\n"
+    "    let checked = check(\n"
+    "        snapshot,\n"
+    "        &call.caller,\n"
+    "        &call.tool,\n"
+    "        Some(call.currency),\n"
+    "        Some(&call.resources),\n"
+    "    )\n"
+    "    .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool));\n"
 )
 mutate("key-check-on-list", "tools/list runs the key check, so a proposal is never listed", SRC + "decision.rs",
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())",
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).and_then(|tool| key_is_carried(tool, None).map(|()| tool)).ok())")
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())",
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).and_then(|tool| key_is_carried(tool, None).map(|()| tool)).ok())")
 mutate("key-check-before-resources", "the key check runs before check 6, so a call outside its limit is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
-       "    let checked = check(snapshot, &call.caller, &call.tool, None)\n"
+       "    let checked = check(snapshot, &call.caller, &call.tool, Some(call.currency), None)\n"
        "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
-       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(&call.resources)));\n")
+       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
+mutate("key-check-before-currency", "the key check runs before the currency check, so a turn that is not current is asked for a key",
+       SRC + "decision.rs", DECIDE_CHECKED,
+       "    let checked = check(snapshot, &call.caller, &call.tool, None, None)\n"
+       "        .and_then(|tool| key_is_carried(tool, call.key.as_ref()).map(|()| tool))\n"
+       "        .and_then(|_| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 mutate("key-check-first", "the key check runs before every other check, so a denied write is asked for a key", SRC + "decision.rs",
        DECIDE_CHECKED,
        "    let checked = call.tool.name().ok().and_then(|name| snapshot.tool(&name))\n"
        "        .map_or(Ok(()), |tool| key_is_carried(tool, call.key.as_ref()))\n"
-       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(&call.resources)));\n")
+       "        .and_then(|()| check(snapshot, &call.caller, &call.tool, Some(call.currency), Some(&call.resources)));\n")
 KEY_CARRIED = "    if tool.classification == Classification::Read || key.is_some() {"
 mutate("key-check-removed", "a side effect with no key is allowed", SRC + "decision.rs",
        KEY_CARRIED, "    if true || tool.classification == Classification::Read || key.is_some() {")
@@ -568,11 +645,14 @@ mutate("mcp-non-string-key-dropped", "the parser drops a _meta key that is not a
 
 # --- tools/list ----------------------------------------------------------------------------
 
-LIST = "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None).ok())"
+LIST = "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, None).ok())"
 mutate("list-ignores-delegation", "tools/list ignores the delegation", SRC + "decision.rs", LIST,
-       "        .filter_map(|tool| check(snapshot, &CallerContext { delegation: None, ..caller.clone() }, &tool.clone().into(), None).ok())")
+       "        .filter_map(|tool| check(snapshot, &CallerContext { delegation: None, ..caller.clone() }, &tool.clone().into(), None, None).ok())")
 mutate("list-checks-empty-resources", "tools/list decides with an empty resource list instead of none", SRC + "decision.rs", LIST,
-       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), Some(&Resources::Named(Vec::new()))).ok())")
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), None, Some(&Resources::Named(Vec::new()))).ok())")
+mutate("currency-check-on-list", "tools/list runs the currency check, so a proposal under a profile that requires currency is never listed",
+       SRC + "decision.rs", LIST,
+       "        .filter_map(|tool| check(snapshot, caller, &tool.clone().into(), Some(Currency::NotAsked), None).ok())")
 
 # --- The snapshot --------------------------------------------------------------------------
 
@@ -820,16 +900,25 @@ for field, old, new in [
     ("tool-use-id", "        tool_use_id: metadata.tool_use_id,", "        tool_use_id: None,"),
     ("claimed-team", "        claimed_team: metadata.claimed_team,", "        claimed_team: None,"),
     ("revision", "        policy_revision,\n        proved_principal: call.caller", '        policy_revision: { let _ = policy_revision; PolicyRevision::new("x") },\n        proved_principal: call.caller'),
-    ("delegation-team", "            .caller\n            .delegation\n            .as_ref()\n            .map(|delegation| delegation.team().into()),",
-     "            .caller\n            .delegation\n            .as_ref()\n            .map(|_| None).flatten(),"),
-    ("acting-person", "            .caller\n            .delegation\n            .as_ref()\n            .map(|delegation| delegation.acting_person()),",
-     "            .caller\n            .delegation\n            .as_ref()\n            .map(|_| None).flatten(),"),
+    ("delegation-team", "        proved_delegation_team: verified(&call.caller).map(|delegation| delegation.team().into()),",
+     "        proved_delegation_team: None,"),
+    ("acting-person", "        claimed_acting_person: verified(&call.caller).map(Proved::acting_person),",
+     "        claimed_acting_person: None,"),
+    ("delegation", "        delegation,\n        delegation_failure,\n", "        delegation: { let _ = delegation; None },\n        delegation_failure,\n"),
+    ("delegation-failure", "        delegation_failure,\n        currency:", "        delegation_failure: { let _ = delegation_failure; None },\n        currency:"),
+    ("currency", "        currency: call.currency.answer(),", "        currency: None,"),
     ("tool-unescaped", "        tool: sentences::escape(call.tool.as_str(), sentences::MAX_RENDERED),", "        tool: call.tool.as_str().to_owned(),"),
     ("surface-unescaped", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),\n            sentences::MAX_RENDERED,\n        )),",
      "        surface: call.caller.surface.clone(),"),
     ("surface-constant", "        surface: SurfaceName::new(sentences::escape(\n            call.caller.surface.as_str(),", '        surface: SurfaceName::new(sentences::escape(\n            "x",'),
 ]:
     mutate(f"record-{field}", f"the row's {field} is wrong", SRC + "audit.rs", old, new)
+# The decision table's earlier-denial case and
+# an_unverified_delegation_denied_before_check_3_is_stored_as_that_denial_alone catch this.
+mutate("record-delegation-failure-on-earlier-denial",
+       "a delegation's failure is recorded on a row denied before check 3", SRC + "audit.rs",
+       "        delegation_failure.filter(|_| reason == Some(ReasonKind::DelegationUnverified));",
+       "        delegation_failure.filter(|_| reason.is_some());")
 mutate("outcome-ok-renamed", "the Ok outcome is written as `success`", SRC + "audit.rs",
        "    Ok,\n    /// The ", "    #[serde(rename = \"success\")]\n    Ok,\n    /// The ")
 mutate("outcome-error-renamed", "the Error outcome is written as `failed`", SRC + "audit.rs",
@@ -961,15 +1050,28 @@ mutate("core-list-instance-uncapped", "a list row records the instance uncapped"
        "            instance.as_str(),\n            sentences::MAX_RENDERED,\n        )),\n",
        "    let record = ListRecord {\n        instance,\n")
 mutate("core-list-delegation-team-dropped", "a list row leaves out the delegation's proved team", SRC + "audit.rs",
-       "        proved_delegation_team: caller\n            .delegation\n            .as_ref()\n"
-       "            .map(|delegation| delegation.team().into()),\n",
+       "        proved_delegation_team: verified(caller).map(|delegation| delegation.team().into()),\n",
        "        proved_delegation_team: None,\n")
 mutate("core-list-acting-person-dropped", "a list row leaves out the delegation's acting person", SRC + "audit.rs",
-       "            .map(|delegation| delegation.acting_person()),\n        claimed_team,\n",
-       "            .map(|delegation| delegation.acting_person()).filter(|_| false),\n        claimed_team,\n")
+       "        claimed_acting_person: verified(caller).map(Proved::acting_person),\n        claimed_team,\n",
+       "        claimed_acting_person: verified(caller).map(Proved::acting_person).filter(|_| false),\n        claimed_team,\n")
 mutate("core-list-claimed-team-dropped", "a list row leaves out the team the caller claimed", SRC + "audit.rs",
-       "        claimed_team,\n        tools: tools\n",
-       "        claimed_team: None,\n        tools: tools\n")
+       "        claimed_team,\n        delegation: verified(caller)",
+       "        claimed_team: None,\n        delegation: verified(caller)")
+mutate("core-list-delegation-dropped", "a list row leaves out what identifies the delegation", SRC + "audit.rs",
+       "        delegation: verified(caller).map(RecordedDelegation::of),\n",
+       "        delegation: None,\n")
+# What a row records of a delegation (decision 0012): the verified one's identifying fields
+# escaped and capped, and an unverified one's failure with its digest, and nothing from claims.
+# tests/audit_flow.rs, tests/decision_table.rs and tests/properties.rs catch these.
+mutate("record-delegation-session-unescaped", "a verified delegation's session is recorded as the control plane sent it",
+       SRC + "audit.rs", "            session: SessionId::new(safe(delegation.session.as_str())),",
+       "            session: delegation.session.clone(),")
+mutate("record-delegation-turn-from-session", "a verified delegation's turn is recorded as its session",
+       SRC + "audit.rs", "            turn: TurnId::new(safe(delegation.turn.as_str())),",
+       "            turn: TurnId::new(safe(delegation.session.as_str())),")
+mutate("record-failure-digest-dropped", "an unverified delegation's digest is not recorded after a verified signature",
+       SRC + "audit.rs", "                digest: unverified.digest().copied(),", "                digest: None,")
 
 # Receipts (decision 0009, part 2): begin reserves one for an allowed side effect, in the same
 # write as its row; a reused key is answered by the first line of the reuse table that matches;
@@ -979,8 +1081,11 @@ mutate("receipt-reserved-for-denial", "begin asks the store to reserve a receipt
        "        Decided::Allow(tool) if tool.classification != Classification::Read => {",
        "        Decided::Allow(tool) | Decided::Deny { tool: Some(tool), .. } if tool.classification != Classification::Read => {")
 mutate("receipt-scope-ignores-delegation", "a key is scoped to the principal alone, whatever the delegation", SRC + "audit.rs",
-       "            .and_then(|delegation| delegation.get().key_scope.clone()),",
-       "            .and_then(|_| None),")
+       "        delegation: verified(&call.caller).map(|delegation| delegation.get().key_scope()),",
+       "        delegation: None,")
+mutate("receipt-scope-ignores-turn", "a delegation's key scope leaves out its turn, so two turns of one session share a key",
+       SRC + "principal.rs", "            self.execution.as_str(),\n            self.turn.as_str(),\n",
+       "            self.execution.as_str(),\n")
 mutate("receipt-scope-ignored", "a key is unique across every scope", SRC + "receipt.rs",
        "        receipt.scope == self.scope && receipt.key == self.key", "        receipt.key == self.key")
 mutate("receipt-reuse-ignores-digest", "reuse with other arguments is answered as the same call", SRC + "receipt.rs",
@@ -1048,7 +1153,7 @@ SENTENCE_NAMES = [
     "TOOL_NOT_IN_DELEGATION", "DELEGATION_MISSING", "DELEGATION_TEAM_MISMATCH",
     "DELEGATION_WITHOUT_TEAM", "DESTRUCTIVE", "DIRECT_WRITE", "CLASSIFICATION_NOT_PERMITTED",
     "RESOURCE_OUTSIDE_LIMIT", "RESOURCES_UNKNOWN", "RESOURCES_NONE_NAMED", "WORKLOAD", "USER",
-    "IDENTITY_FAILURE", "AUDIT_FAILURE",
+    "IDENTITY_FAILURE", "AUDIT_FAILURE", "DELEGATION_UNVERIFIED", "NOT_CURRENT", "CURRENCY_UNCONFIRMED",
 ]
 
 
@@ -1069,6 +1174,11 @@ def sentence_mutations(source: str) -> None:
                SRC + "sentences.rs", declaration, declaration.replace(f'"{text}"', f'"{changed}"'))
 
 
+# Decisions 0009 and 0012: a delegation that did not verify reads one fixed sentence, which never
+# says which check failed. sentences.rs's own tests and tests/properties.rs catch this.
+mutate("sentence-unverified-names-failure", "the sentence for a delegation that did not verify names the check it failed",
+       SRC + "sentences.rs", "        Reason::DelegationUnverified { .. } => fill(DELEGATION_UNVERIFIED, &[]),",
+       '        Reason::DelegationUnverified { failure } => Rendered(format!("{DELEGATION_UNVERIFIED} It failed `{failure}`.")),')
 mutate("sentence-surfaces-differ", "tool not on this surface reads differently from an unknown tool", SRC + "sentences.rs",
        "        Reason::ToolNotOnSurface { tool, surface } => fill(\n            TOOL_NOT_AVAILABLE,",
        "        Reason::ToolNotOnSurface { tool, surface } => fill(\n            TOOL_NOT_IN_DELEGATION,")
@@ -1417,6 +1527,172 @@ mutate_all(
 mutate("identity-second-crypto-backend", "the crypto feature list gains a second entry", IDENTITY + "Cargo.toml",
        'features = ["rust_crypto"] }\n', 'features = ["rust_crypto", "rust_crypto"] }\n')
 
+# --- gateway-otto: the turn-grant verifier ------------------------------------------------
+
+OTTO_SRC = "crates/gateway-otto/src/"
+OV = OTTO_SRC + "verify.rs"
+OK = OTTO_SRC + "keys.rs"
+OF = OTTO_SRC + "format.rs"
+OT = OTTO_SRC + "tools.rs"
+OTTO_VERSION = "        if version != VERSION.as_bytes() {\n            return Err(refuse(FailureKind::Version));\n        }\n"
+OTTO_PARTS = "            return Err(refuse(FailureKind::Malformed));\n        };\n"
+mutate("otto-grant-version-unchecked", "a grant of another version is read as this one", OV,
+       "        if version != VERSION.as_bytes() {", "        if false {")
+mutate_all(
+    "otto-grant-version-after-parts",
+    "the version is matched only after the grant's length and parts are read",
+    (OV, OTTO_VERSION, ""),
+    (OV, OTTO_PARTS, OTTO_PARTS + OTTO_VERSION),
+)
+mutate("otto-grant-length-unbounded", "a grant over the size limit is verified", OV,
+       "        if grant.len() > MAX_GRANT_BYTES {", "        if false {")
+mutate("otto-grant-retired-key-accepted", "a previous key is accepted after its end instant", OV,
+       "        if key.retires_at.is_some_and(|retires_at| now >= retires_at) {", "        if false {")
+mutate("otto-grant-retired-key-at-instant", "a previous key is accepted at its end instant", OV,
+       "now >= retires_at", "now > retires_at")
+mutate("otto-grant-s-unchecked", "a non-canonical S is left to the signature library", OV,
+       "        if !s_is_canonical(&signature_bytes) {", "        if false {")
+mutate("otto-grant-signature-unchecked", "a signature that does not verify is accepted", OV,
+       "            .map_err(|_| refuse(FailureKind::Signature))?;", "            .ok();")
+mutate("otto-grant-claims-before-signature", "the claims are decoded before the signature is checked", OV,
+       "        // 3. The signature, before the claims are decoded.\n",
+       "        LENIENT.decode(claims).ok().and_then(|bytes| Claims::parse(&bytes, false, false)).ok_or(refuse(FailureKind::Malformed))?;\n")
+mutate("otto-grant-canonical-unchecked", "a grant that does not re-encode to the same bytes is accepted", OV,
+       "        if CANONICAL.encode(signature_bytes).as_bytes() != signature\n            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n        {",
+       "        if false {")
+mutate("otto-grant-canonical-signature-unchecked", "a non-canonical signature part is accepted", OV,
+       "        if CANONICAL.encode(signature_bytes).as_bytes() != signature\n            || ",
+       "        if ")
+mutate("otto-grant-canonical-claims-unchecked", "a non-canonical claims part is accepted", OV,
+       "\n            || CANONICAL.encode(&claims_bytes).as_bytes() != claims\n", "\n")
+mutate("otto-grant-digest-before-signature", "a failure before the signature verified carries the digest", OV,
+       "        let refuse = |kind| GrantFailure { kind, digest: None };",
+       "        let refuse = |kind| GrantFailure { kind, digest: Some(GrantDigest::of(grant)) };")
+mutate("otto-grant-digest-dropped", "a failure after the signature verified carries no digest", OV,
+       "            kind,\n            digest: Some(digest),\n", "            kind,\n            digest: None,\n")
+mutate("otto-grant-digest-of-decoded-claims", "the digest is taken over the decoded claims, not the grant as presented", OV,
+       "        let digest = GrantDigest::of(grant);",
+       "        let digest = GrantDigest::of(&LENIENT.decode(claims).unwrap_or_default());")
+mutate("otto-grant-empty-tools-accepted", "a grant with no tools is accepted", OV,
+       ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
+       ".filter(|tools| tools.iter().all(|tool| !tool.is_empty()))?;")
+mutate("otto-grant-empty-tool-name-accepted", "a grant listing an empty tool name is accepted", OV,
+       ".filter(|tools| !tools.is_empty() && tools.iter().all(|tool| !tool.is_empty()))?;",
+       ".filter(|tools| !tools.is_empty())?;")
+mutate("otto-grant-empty-claim-accepted", "an empty team, session, turn, execution or actor is accepted", OV,
+       "        let text = |value: Option<String>| value.filter(|value| !value.is_empty());",
+       "        let text = |value: Option<String>| value;")
+mutate("otto-grant-absent-audience-accepted", "a grant without aud is read as one for no deployment", OV,
+       "            aud: wire.aud?,", "            aud: wire.aud.unwrap_or_default(),")
+mutate("otto-grant-absent-iat-accepted", "a grant without iat is read as issued at the epoch", OV,
+       "            iat: wire.iat.filter(|iat| *iat >= 0)?,", "            iat: wire.iat.filter(|iat| *iat >= 0).unwrap_or(0),")
+mutate("otto-grant-absent-team-accepted", "a grant without team is accepted", OV,
+       "            team: text(wire.team)?,", "            team: text(wire.team).unwrap_or_default(),")
+mutate("otto-grant-absent-epoch-accepted", "a grant without epoch is read as epoch 1", OV,
+       "                .and_then(|epoch| u64::try_from(epoch).ok())?,",
+       "                .and_then(|epoch| u64::try_from(epoch).ok())\n                .unwrap_or(1),")
+mutate("otto-grant-absent-actor-accepted", "a grant without actor is accepted", OV,
+       "            actor: text(wire.actor)?,", "            actor: text(wire.actor).unwrap_or_default(),")
+mutate("otto-grant-claims-array-accepted", "claims given as a JSON array of the values in field order are accepted", OV,
+       "        if opening != Some(&b'{') {", "        if false {")
+mutate("otto-grant-extra-parts-accepted", "a grant with parts after the signature is accepted", OV,
+       "        let [version, key_id, claims, signature] = parts[..] else {",
+       "        let [version, key_id, claims, signature, ..] = parts[..] else {")
+mutate("otto-grant-unknown-key-falls-back", "an unknown key ID is verified with a configured key", OV,
+       "            .and_then(|id| self.keys.keys.get_key_value(id))\n",
+       "            .and_then(|id| self.keys.keys.get_key_value(id).or_else(|| self.keys.keys.iter().next()))\n")
+mutate("otto-grant-epoch-zero-accepted", "a grant with epoch 0 is accepted", OV,
+       ".filter(|epoch| *epoch > 0)", ".filter(|epoch| *epoch >= 0)")
+mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when the issuer requires it", OV,
+       "        if require_pod && claims.pod.is_none() {", "        if false {")
+mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,
+       "        if require_egress && claims.egress.is_none() {", "        if false {")
+mutate_all("otto-grant-egress-map-accepted", "an egress setting given as the map {\"sealed\": null} is accepted",
+           (OV, "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\npub enum Egress {",
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]\n#[serde(rename_all = \"lowercase\")]\npub enum Egress {"),
+           (OV, '    #[serde(default, deserialize_with = "egress_setting")]',
+            '    #[serde(default, deserialize_with = "present")]'))
+mutate("otto-grant-audience-unchecked", "a grant for another deployment is accepted", OV,
+       "        if !claims.aud.iter().any(|aud| aud == self.deployment.as_str()) {", "        if false {")
+mutate("otto-grant-audience-any-case", "the audience is compared ignoring case", OV,
+       "aud == self.deployment.as_str()", "aud.eq_ignore_ascii_case(self.deployment.as_str())")
+OTTO_IAT = "        if i128::from(claims.iat) > now + i128::from(LEEWAY_SECONDS) {"
+OTTO_EXP = "        if i128::from(claims.exp) <= now - i128::from(LEEWAY_SECONDS) {"
+OTTO_CEILING = "        if i128::from(claims.exp) - i128::from(claims.iat) > i128::from(MAX_LIFETIME_SECONDS) {"
+mutate("otto-grant-not-before-unchecked", "a grant issued in the future is accepted", OV, OTTO_IAT, "        if false {")
+mutate("otto-grant-not-before-at-leeway-refused", "a grant issued exactly the leeway ahead is refused", OV,
+       OTTO_IAT, OTTO_IAT.replace(" > now", " >= now"))
+mutate("otto-grant-expiry-unchecked", "an expired grant is accepted", OV, OTTO_EXP, "        if false {")
+mutate("otto-grant-expiry-at-leeway-accepted", "a grant that expired exactly the leeway ago is accepted", OV,
+       OTTO_EXP, OTTO_EXP.replace(" <= now", " < now"))
+mutate("otto-grant-expiry-without-leeway", "expiry is checked with no leeway", OV,
+       OTTO_EXP, "        if i128::from(claims.exp) <= now {")
+mutate("otto-grant-ceiling-unchecked", "a grant over the lifetime ceiling is accepted", OV, OTTO_CEILING, "        if false {")
+mutate("otto-grant-ceiling-inclusive", "a grant of exactly the lifetime ceiling is refused", OV,
+       OTTO_CEILING, OTTO_CEILING.replace(") > i128", ") >= i128"))
+mutate("otto-grant-pod-unchecked", "a required pod is not compared with the caller's", OV,
+       "        if issuer.require_pod && claims.pod.as_ref() != caller.get().pod() {", "        if false {")
+mutate("otto-grant-pod-always-checked", "the pod is compared though the issuer does not require it", OV,
+       "        if issuer.require_pod && claims.pod.as_ref()", "        if claims.pod.as_ref()")
+mutate("otto-grant-pod-caller-without-pod-accepted", "a caller whose token proves no pod passes a required pod", OV,
+       "claims.pod.as_ref() != caller.get().pod()",
+       "caller.get().pod().is_some_and(|pod| claims.pod.as_ref() != Some(pod))")
+mutate("otto-grant-leeway-changed", "the leeway is 31 seconds", OF,
+       "pub const LEEWAY_SECONDS: i64 = 30;", "pub const LEEWAY_SECONDS: i64 = 31;")
+mutate("otto-grant-ceiling-changed", "the lifetime ceiling is 16 minutes", OF,
+       "pub const MAX_LIFETIME_SECONDS: i64 = 15 * 60;", "pub const MAX_LIFETIME_SECONDS: i64 = 16 * 60;")
+mutate("otto-format-s-equal-to-order-accepted", "an S equal to the group order is canonical", OF,
+       "            return byte < GROUP_ORDER[index];\n        }\n    }\n    false",
+       "            return byte < GROUP_ORDER[index];\n        }\n    }\n    true")
+mutate("otto-format-key-id-domain-changed", "the key ID is hashed under v1's domain", OF,
+       'b"otto/gateway-turn-grant/kid/v3\\0"', 'b"otto/gateway-turn-grant/kid/v1\\0"')
+mutate("otto-format-signing-domain-changed", "the signature covers v1's domain prefix", OF,
+       'b"otto/gateway-turn-grant/v3\\0"', 'b"otto/gateway-turn-grant/v1\\0"')
+mutate("otto-format-key-id-shortened", "the key ID keeps 12 bytes of the hash", OF,
+       "pub const KEY_ID_BYTES: usize = 16;", "pub const KEY_ID_BYTES: usize = 12;")
+mutate("otto-keys-no-issuers-allowed", "grant keys with no issuer are configured", OK,
+       "        if config.is_empty() {", "        if false {")
+mutate("otto-keys-empty-issuer-allowed", "an issuer with no name is configured", OK,
+       "            if issuer.name.is_empty() {", "            if false {")
+mutate("otto-keys-duplicate-issuer-allowed", "an issuer is configured twice", OK,
+       "            if !names.insert(issuer.name.as_str()) {", "            if !names.insert(issuer.name.as_str()) && false {")
+mutate("otto-keys-private-key-armour-allowed", "a key file holding a PEM private key is read for a public key", OK,
+       '    if text.contains("PRIVATE KEY") {', "    if false {")
+mutate("otto-keys-private-key-der-allowed", "private key DER under a public label is read for a public key", OK,
+       "    if is_private_key_info(&der) {", "    if false {")
+mutate("otto-keys-small-order-allowed", "a key of small order is configured", OK,
+       "    if key.is_weak() {", "    if false {")
+mutate("otto-keys-non-canonical-allowed", "a non-canonical encoding of a key is configured", OK,
+       "    if key.to_edwards().compress().to_bytes() != bytes {", "    if false {")
+mutate("otto-keys-repeated-allowed", "an issuer's previous key can be its current key", OK,
+       "                if let Some(existing) = keys.get(&key_id) {",
+       "                if let Some(existing) = keys.get(&key_id).filter(|existing| existing.issuer != index) {")
+mutate("otto-keys-repeat-reported-as-two-issuers", "a key repeated in one issuer is reported as under two", OK,
+       "                    if existing.issuer == index {", "                    if false {")
+mutate("otto-keys-two-issuers-allowed", "one key is configured under two issuers", OK,
+       "                if let Some(existing) = keys.get(&key_id) {",
+       "                if let Some(existing) = keys.get(&key_id).filter(|existing| existing.issuer == index) {")
+mutate_all(
+    "otto-keys-previous-without-end-allowed",
+    "a previous key with no end instant is configured, and never retires",
+    (OK, "                let Some(retires_at) = previous.retires_at else {\n                    return Err(KeyConfigError::PreviousKeyWithoutEnd(issuer.name.clone()));\n                };\n",
+     "                let retires_at = previous.retires_at;\n"),
+    (OK, "                configured.push((key, Some(retires_at)));", "                configured.push((key, retires_at));"),
+)
+mutate("otto-mapping-empty-otto-name-allowed", "an empty Otto name is mapped", OT,
+       "            if otto.is_empty() {", "            if false {")
+mutate("otto-mapping-otto-name-repeat-allowed", "an Otto name is mapped twice", OT,
+       "            if by_otto.contains_key(&otto) {", "            if false {")
+mutate("otto-mapping-gateway-name-repeat-allowed", "two Otto names map to one gateway name", OT,
+       "            if let Some(first) = by_gateway.get(&gateway) {",
+       "            if let Some(first) = by_gateway.get(&gateway).filter(|_| false) {")
+mutate("otto-mapping-last-one-wins", "a mapping file's repeated name keeps only its last value", OT,
+       "        let entries: Entries<String> = parse(text)?;\n        Self::from_pairs(entries.0)",
+       "        let entries: BTreeMap<String, String> = parse(text)?;\n        Self::from_pairs(entries)")
+mutate("otto-mapping-unmapped-kept", "a name the mapping lacks is kept when it is a valid tool name", OT,
+       ".filter_map(|name| self.get(name).cloned())",
+       ".filter_map(|name| self.get(name).cloned().or_else(|| ToolName::parse(name).ok()))")
+
 # --- The testkit's fakes: each failure switch ----------------------------------------------
 
 A = TESTKIT_SRC + "audit.rs"
@@ -1544,8 +1820,20 @@ mutate("testkit-row-bound-no-completion-reserve", "the in-memory store's begin l
        "    refuse_over(&call_row_sizes(id, record), MAX_BEGUN_ROW_BYTES)?;\n",
        "    refuse_over(&call_row_sizes(id, record), MAX_ROW_BYTES)?;\n")
 mutate("testkit-list-row-unbounded", "the in-memory store writes a list row over 512 KiB", A,
-       "    refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES)\n",
-       "    let _ = refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES);\n    Ok(())\n")
+       "    refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES)?;\n",
+       "    let _ = refuse_over(&list_row_sizes(id, record), MAX_ROW_BYTES);\n")
+# Decision 0012's shapes, as migration 0010 holds them: the contract suite's
+# a_delegation_of_the_wrong_shape_is_refused_and_leaves_no_row catches these.
+mutate("testkit-failure-beside-claims", "the in-memory store records a delegation's failure beside its claims", A,
+       "    if record.delegation.is_some()\n        || record.proved_delegation_team.is_some()\n        || record.claimed_acting_person.is_some()\n    {",
+       "    if false {")
+mutate("testkit-digest-before-signature", "the in-memory store records a digest with a failure found before the signature verified", A,
+       "    if failure.digest.is_some() && !failure.failure.follows_signature() {",
+       "    if false && failure.digest.is_some() && !failure.failure.follows_signature() {")
+mutate("testkit-failure-on-any-row", "the in-memory store records a delegation's failure on a row check 3 did not deny for it", A,
+       "    if !at_check_3 || record.decision != DecisionKind::Deny {", "    if false {")
+mutate("testkit-delegation-without-team", "the in-memory store records a verified delegation without its team or person", A,
+       "    if delegation && !(team && person) {", "    if false && delegation && !(team && person) {")
 mutate("testkit-outcome-sentence-uncapped", "the in-memory store writes a refusal's sentence of any length at finish", A,
        "        refuse_long_sentence(sentence)?;\n", "        let _ = refuse_long_sentence(sentence);\n")
 mutate("testkit-outcome-sentence-refused-at-cap", "the in-memory store refuses a refusal's sentence of exactly the cap", ROW_BOUND,
@@ -3226,6 +3514,12 @@ for struct in ["RegistryFile", "ServerFile", "CredentialFile", "ReachTestFile", 
                "ResourceFile"]:
     mutate(f"registry-unknown-field-{struct}", f"{struct} ignores fields it does not know", RF,
            f"#[serde(deny_unknown_fields)]\npub(crate) struct {struct} {{", f"pub(crate) struct {struct} {{")
+mutate("registry-currency-required-by-default", "a profile in a registry file requires currency whether or not it says so", RR,
+       "            requires_currency: profile.requires_currency,", "            requires_currency: true,")
+mutate("registry-currency-ignored", "a registry file's requires_currency is not carried to the profile", RR,
+       "            requires_currency: profile.requires_currency,", "            requires_currency: false,")
+mutate("registry-currency-setting-required", "a registry file that does not mention requires_currency is refused", RF,
+       "    #[serde(default)]\n    pub requires_currency: bool,", "    pub requires_currency: bool,")
 mutate("registry-empty-text-accepted", "required text may be empty", RR,
        "    if value.is_empty() {\n        Err(RegistryError::EmptyField {", "    if false {\n        Err(RegistryError::EmptyField {")
 mutate("registry-limit-identifier-empty", "a limit or a reach may name the empty identifier", RR,
@@ -3593,7 +3887,7 @@ mutate("pg-session-search-path-kept", "sessions look names up in the schemas a d
 mutate("pg-session-options-caller-last", "the caller's session options override the store's", PG_STORE,
        'format!("{existing} {SESSION_OPTIONS}")', 'format!("{SESSION_OPTIONS} {existing}")')
 mutate("pg-begin-no-on-conflict", "a retried begin inserts again and fails on its own row", PG_COLUMNS,
-       '$26, $27\n        ) ON CONFLICT (id) DO NOTHING";', '$26, $27\n        )";')
+       '$37, $38\n        ) ON CONFLICT (id) DO NOTHING";', '$37, $38\n        )";')
 mutate("pg-begin-decision-not-compared", "a begin with a known identifier and another decision succeeds", PG_STORE,
        "    if decision == row.decision {", "    if true {")
 mutate("pg-columns-id-unchecked", "an identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
@@ -3755,7 +4049,7 @@ mutate("pg-begin-list-row-accepted", "a begin with a list row's identifier succe
        "    let Some(decision) = decision else {\n        return Err(PgAuditError::OtherKind {\n            row: row.id.clone(),\n        });\n    };",
        "    let Some(decision) = decision else {\n        return Ok(());\n    };")
 mutate("pg-list-no-on-conflict", "a retried list inserts again and fails on its own row", PG_COLUMNS,
-       '$15, $16\n        ) ON CONFLICT (id) DO NOTHING";', '$15, $16\n        )";')
+       '$24, $25\n        ) ON CONFLICT (id) DO NOTHING";', '$24, $25\n        )";')
 mutate("pg-list-columns-id-unchecked", "a list row's identifier that is not a lowercase UUID is sent to the database", PG_COLUMNS,
        "    pub fn from_record(id: &AuditRowId, record: &ListRecord) -> Result<Self, PgAuditError> {\n        if !is_uuid(id.as_str()) {",
        "    pub fn from_record(id: &AuditRowId, record: &ListRecord) -> Result<Self, PgAuditError> {\n        if false {")
@@ -4389,8 +4683,51 @@ mutate("pg-credential-columns-unshaped", "a credential mode may be stored withou
 mutate("pg-credential-grant-missing", "the gateway's role may not insert the credential identity", PG_REACH,
        "GRANT INSERT (credential_mode, credential_principal)\n    ON switchboard_audit.call_rows TO switchboard_gateway;\n", "")
 mutate("pg-credential-not-written", "begin writes no credential identity", PG_COLUMNS,
-       "            credential_mode,\n            credential_principal,\n        };",
-       "            credential_mode: None,\n            credential_principal: None,\n        };")
+       "            credential_mode,\n            credential_principal,\n            delegation,\n",
+       "            credential_mode: None,\n            credential_principal: None,\n            delegation,\n")
+
+# Migration 0010: decision 0012's columns and their shapes (#22, #56). The schema test
+# the_delegation_columns_hold_decision_0012s_shapes_and_no_others and the contract suite's
+# delegation functions catch the constraints, against Postgres; the columns' own tests and the
+# boot check's catch the rest without a server.
+PG_DELEGATION = PG + "sql/migrations/0010_delegation_and_currency.sql"
+mutate("pg-failure-beside-claims", "a delegation's failure may be stored beside its claims", PG_DELEGATION,
+       "    ADD CONSTRAINT delegation_failure_unclaimed CHECK (\n        delegation_failure IS NULL\n",
+       "    ADD CONSTRAINT delegation_failure_unclaimed CHECK (\n        true OR delegation_failure IS NULL\n")
+mutate("pg-digest-before-signature", "a digest may be stored with a failure found before the signature verified", PG_DELEGATION,
+       "        OR coalesce(delegation_failure IN (\n            'expired',",
+       "        OR coalesce(delegation_failure IS NOT NULL OR delegation_failure IN (\n            'expired',")
+mutate("pg-failure-on-any-row", "a delegation's failure may be stored on a row check 3 did not deny for it", PG_DELEGATION,
+       "        coalesce(reason = 'delegation_unverified', false) = (delegation_failure IS NOT NULL)\n",
+       "        (delegation_failure IS NULL OR delegation_failure IS NOT NULL)\n")
+mutate("pg-delegation-unshaped", "a verified delegation's columns may be stored apart, or without its team", PG_DELEGATION,
+       "    ADD CONSTRAINT delegation_shape CHECK (\n        (delegation_issuer IS NULL)",
+       "    ADD CONSTRAINT delegation_shape CHECK (\n        true OR (delegation_issuer IS NULL)")
+mutate("pg-currency-on-list-row", "a list row may store a currency answer", PG_DELEGATION,
+       "    ADD CONSTRAINT currency_shape CHECK (currency IS NULL OR kind = 'call');",
+       "    ADD CONSTRAINT currency_shape CHECK (true);")
+mutate("pg-pod-on-user", "a user's row may store a pod", PG_DELEGATION,
+       "        OR (proved_kind = 'workload'\n", "        OR (true\n")
+mutate("pg-delegation-grant-missing", "the gateway's role may not insert decision 0012's columns", PG_DELEGATION,
+       "    delegation_failure, currency\n) ON switchboard_audit.call_rows TO switchboard_gateway;\n",
+       "    delegation_failure\n) ON switchboard_audit.call_rows TO switchboard_gateway;\n")
+mutate("pg-columns-currency-not-written", "begin writes no currency answer", PG_COLUMNS,
+       "            currency: record.currency.map(|answer| answer.as_str()),",
+       "            currency: { let _ = record.currency; None },")
+mutate("pg-columns-failure-not-written", "begin writes no delegation failure", PG_COLUMNS,
+       "            delegation_failure: record\n                .delegation_failure\n                .as_ref()\n                .map(|failure| failure.failure.as_str()),\n",
+       "            delegation_failure: None,\n")
+mutate("pg-columns-list-delegation-not-written", "a list row writes no delegation", PG_COLUMNS,
+       "            delegation: DelegationColumns::of(principal, record.delegation.as_ref(), None)?,",
+       "            delegation: DelegationColumns::of(principal, None, None)?,")
+mutate("pg-columns-pod-not-written", "a row writes no pod", PG_COLUMNS,
+       "            proved_pod: principal.pod().map(|pod| pod.as_str().to_owned()),",
+       "            proved_pod: None,")
+mutate("pg-columns-failure-digest-not-written", "a failure's digest is not written", PG_COLUMNS,
+       "            delegation_digest: failure\n                .and_then(|failure| failure.digest)\n",
+       "            delegation_digest: failure\n                .and_then(|_| None::<gateway_core::DelegationDigest>)\n")
+mutate("pg-check-misses-currency", "the boot check does not require the currency column", PG_CHECK,
+       '    ("currency", "text"),\n];', "];")
 
 # --- demo-checks ---------------------------------------------------------------------------
 # The demo's scripts and manifests in deploy/, watched by crates/demo-checks.
@@ -5797,8 +6134,11 @@ READERS: list[tuple[str, frozenset[str]]] = [
     # kind registry.
     ("deploy/compose/config/", frozenset({"gateway"})),
     ("deploy/kind/base/config/", frozenset({"gateway"})),
-    # gateway-testkit/tests/issuer.rs searches conformance/ for private keys.
-    ("conformance/", frozenset({"gateway-testkit"})),
+    # gateway-testkit/tests/issuer.rs searches conformance/ for private keys; gateway-otto's
+    # tests/mapping.rs loads conformance/baseline.json's tool mapping.
+    ("conformance/", frozenset({"gateway-testkit", "gateway-otto"})),
+    # gateway-otto/tests/format_doc.rs checks the format's constants and example.
+    ("docs/turn-grant-format.md", frozenset({"gateway-otto"})),
     # demo-checks/tests/manifests.rs compares the demo registries with the registry crate's own.
     ("crates/gateway-registry/demo/", frozenset({"demo-checks"})),
     # mock-docs-server/tests/dependencies.rs includes the identity crate's manifest.

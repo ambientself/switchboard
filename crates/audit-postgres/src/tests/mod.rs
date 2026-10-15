@@ -100,7 +100,7 @@ impl TestDatabase {
         let mut owner = database.connect_as(OWNER_ROLE).await;
         assert_eq!(
             migrate(&mut owner).await.unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
         Some(database)
     }
@@ -251,6 +251,61 @@ pub(crate) fn message(error: &tokio_postgres::Error) -> String {
     error
         .as_db_error()
         .map_or_else(|| error.to_string(), |db| db.message().to_owned())
+}
+
+/// The columns migration 0010 adds (decision 0012), for a read-back's `SELECT`.
+pub(crate) const DELEGATION_COLUMNS: &str = "proved_pod, delegation_digest, delegation_issuer,
+    delegation_key_id, delegation_session, delegation_turn, delegation_execution,
+    delegation_epoch, delegation_egress, delegation_failure, currency";
+
+/// The columns migration 0010 adds, as an SQL array of their names: a test that a migration
+/// before it keeps the rows already written takes them out of what it compares.
+pub(crate) const ADDED_BY_0010: &str = "ARRAY['proved_pod', 'delegation_digest',
+    'delegation_issuer', 'delegation_key_id', 'delegation_session', 'delegation_turn',
+    'delegation_execution', 'delegation_epoch', 'delegation_egress', 'delegation_failure',
+    'currency']";
+
+/// What a row read with [`DELEGATION_COLUMNS`] records of decision 0012, as the core's record
+/// writes it in JSON: the pod, the verified delegation, the failure and the currency answer.
+/// The pod goes in the principal.
+pub(crate) struct DelegationRead {
+    pub pod: Option<String>,
+    pub delegation: serde_json::Value,
+    pub failure: serde_json::Value,
+    pub currency: serde_json::Value,
+}
+
+impl DelegationRead {
+    pub(crate) fn of(row: &tokio_postgres::Row) -> Self {
+        use serde_json::json;
+        let text = |column: &str| row.get::<_, Option<String>>(column);
+        let delegation = match text("delegation_issuer") {
+            None => serde_json::Value::Null,
+            Some(issuer) => json!({
+                "digest": text("delegation_digest"),
+                "issuer": issuer,
+                "key_id": text("delegation_key_id"),
+                "session": text("delegation_session"),
+                "turn": text("delegation_turn"),
+                "execution": text("delegation_execution"),
+                "epoch": row.get::<_, Option<i64>>("delegation_epoch"),
+                "egress": text("delegation_egress"),
+            }),
+        };
+        let failure = match text("delegation_failure") {
+            None => serde_json::Value::Null,
+            Some(failure) => json!({
+                "failure": failure,
+                "digest": text("delegation_digest"),
+            }),
+        };
+        Self {
+            pod: text("proved_pod"),
+            delegation,
+            failure,
+            currency: json!(text("currency")),
+        }
+    }
 }
 
 /// The SQLSTATE for a missing privilege.

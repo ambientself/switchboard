@@ -1,0 +1,36 @@
+[package]
+name = "gateway-otto"
+version = "0.1.0"
+description = "The Otto adapter: Otto's turn-grant format, its strict Ed25519 verifier, the grant-key configuration and the tool-name mapping. The core does not depend on it."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# What is specific to Otto is confined to this crate (design section 1). It depends on the core
+# for the names a verified grant carries; nothing in the core depends on it.
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+base64 = "0.22"
+# Already in the build through `jsonwebtoken`. Verification is `verify_strict`.
+ed25519-dalek = "2"
+# Only for the test minter, which generates each key from the operating system's randomness, so
+# no key is checked in. As the testkit has it.
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The key ID and the grant's digest.
+sha2 = "0.10"
+thiserror = "2"
+
+# `test-support` adds the test minter, which signs grants with keys it generates. The gateway's
+# own build never turns it on.
+[features]
+test-support = ["dep:rand_core"]
+
+[dev-dependencies]
+gateway-otto = { path = ".", features = ["test-support"] }
+proptest = "1"
+
+[lints]
+workspace = true
