@@ -8,9 +8,10 @@ use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use gateway_core::{PolicyRevision, PolicySnapshot, Principal, ProfileName, ToolName};
-use gateway_registry::{ArgumentAdapter, NoProfile, ProfileRules, Registry};
+use gateway_registry::{ArgumentAdapter, NoProfile, ProfileRules, Registry, RulePrincipal};
 
 use crate::catalog::{CatalogError, ToolCatalog, ToolDefinition};
+use crate::grants::WorkloadSelection;
 use crate::selector::{NO_PROFILE, ProfileSelector};
 
 /// One version of the policy: everything a request reads from it, taken together, so one
@@ -137,6 +138,32 @@ impl ServedPolicy {
                 .rules()
                 .iter()
                 .map(|rule| rule.profile.clone())
+                .collect(),
+        }
+    }
+
+    /// Each rule that gives workloads a profile, with the teams it covers: one team for a rule
+    /// of the JSON configuration, and every team its issuer vouches for, `None` here, for a
+    /// registry's rule for workloads.
+    pub(crate) fn workload_selections(&self) -> Vec<WorkloadSelection> {
+        match &self.selection {
+            Selection::Rules(selector) => selector
+                .workload_rules()
+                .map(|(issuer, team, profile)| WorkloadSelection {
+                    issuer: issuer.clone(),
+                    teams: Some(BTreeSet::from([team.clone()])),
+                    profile: profile.clone(),
+                })
+                .collect(),
+            Selection::Registry(rules) => rules
+                .rules()
+                .iter()
+                .filter(|rule| rule.principal == RulePrincipal::Workload)
+                .map(|rule| WorkloadSelection {
+                    issuer: rule.issuer.clone(),
+                    teams: None,
+                    profile: rule.profile.clone(),
+                })
                 .collect(),
         }
     }

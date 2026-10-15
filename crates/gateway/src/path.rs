@@ -108,6 +108,7 @@ use uuid::Uuid;
 
 use crate::boot::{DEFAULT_CALL_DEADLINE, GateState, Gates, Reads, Results};
 use crate::catalog::ToolDefinition;
+use crate::grants::{GrantRequest, PresentedGrant};
 use crate::policy::ServedPolicy;
 use crate::proxied::{CheckedArguments, registry_resources};
 use crate::resources::{ReachAdapter, ResourceAdapter};
@@ -387,6 +388,7 @@ impl RequestPath {
     ) -> impl Future<Output = HttpResponse> + Send + 'static + use<> {
         let parsed = gateway_mcp::parse(&Method::POST, headers, body);
         let key_header = KeyHeader::of(headers);
+        let grant = PresentedGrant::of(headers);
         let path = self.clone();
         let surface = SurfaceName::new(surface);
         async move {
@@ -407,7 +409,8 @@ impl RequestPath {
                     HttpResponse::accepted()
                 }
                 Ok(Inbound::Request(request)) => {
-                    path.answer(caller, source, surface, request, key_header, disconnect)
+                    let carried = Carried { key_header, grant };
+                    path.answer(caller, source, surface, request, carried, disconnect)
                         .await
                 }
             }
@@ -467,7 +470,7 @@ impl RequestPath {
         source: Source,
         surface: SurfaceName,
         request: Request,
-        key_header: KeyHeader,
+        carried: Carried,
         disconnect: Disconnect,
     ) -> HttpResponse {
         let Request { id, era, call } = request;
@@ -497,9 +500,9 @@ impl RequestPath {
                 });
                 (Reply::Discovered, None)
             }
-            Call::ToolsList => self.list(caller, source, surface).await,
+            Call::ToolsList => self.list(caller, source, surface, &carried.grant).await,
             Call::ToolsCall(call) => {
-                self.call(caller, source, surface, call, key_header, disconnect)
+                self.call(caller, source, surface, call, carried, disconnect)
                     .await
             }
         };
@@ -518,6 +521,7 @@ impl RequestPath {
         caller: Caller,
         source: Source,
         surface: SurfaceName,
+        grant: &PresentedGrant,
     ) -> (Reply, Option<AuditRowId>) {
         let Caller::Proved(principal) = caller else {
             return (Reply::Tools(Vec::new()), None);
@@ -527,7 +531,7 @@ impl RequestPath {
         }
         let gates = &self.inner.gates;
         let policy = gates.policy();
-        let caller = self.caller_context(&policy, principal, surface);
+        let caller = self.caller_context(&policy, principal, surface, grant);
         let tools = list_tools(policy.snapshot(), &caller);
         // One identifier per list, made here. A list row has no deadline and names no tool's
         // credential, so neither is given.
@@ -577,7 +581,7 @@ impl RequestPath {
         source: Source,
         surface: SurfaceName,
         call: ToolCall,
-        key_header: KeyHeader,
+        carried: Carried,
         disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
         let gates = &self.inner.gates;
@@ -592,7 +596,7 @@ impl RequestPath {
             return (Reply::Denied(POLICY_STALE.to_owned()), None);
         }
         let policy = gates.policy();
-        self.decide_and_run(&policy, principal, surface, call, key_header, disconnect)
+        self.decide_and_run(&policy, principal, surface, call, carried, disconnect)
             .await
     }
 }
@@ -621,9 +625,10 @@ impl RequestPath {
         principal: Proved<Principal>,
         surface: SurfaceName,
         call: ToolCall,
-        key_header: KeyHeader,
+        carried: Carried,
         mut disconnect: Disconnect,
     ) -> (Reply, Option<AuditRowId>) {
+        let Carried { key_header, grant } = carried;
         let gates = &self.inner.gates;
         let snapshot = policy.snapshot();
         let ToolCall {
@@ -636,7 +641,7 @@ impl RequestPath {
         let requested = RequestedTool::new(name);
         let resources = self.resources(policy, &requested, &arguments);
         let tool_use_id = bounded_tool_use_id(tool_use_id);
-        let caller = self.caller_context(policy, principal, surface);
+        let caller = self.caller_context(policy, principal, surface, &grant);
         let declares_header = snapshot
             .profile(&caller.profile)
             .is_some_and(|profile| profile.idempotency_key_header);
@@ -872,19 +877,30 @@ impl RequestPath {
             .map_or(DEFAULT_CALL_DEADLINE, |registered| registered.call_deadline)
     }
 
-    /// Design section 6's step 3: the profile, from the configured rules. There is no
-    /// delegation verifier yet.
+    /// Design section 6's step 3: the profile, from the configured rules, and the delegation
+    /// the request presents. A turn grant is verified whatever the profile requires
+    /// ([`crate::grants`]), against this deployment, the proved caller and its pod, the
+    /// gateway's clock, and the surface the request arrived on, in the policy version it took.
     fn caller_context(
         &self,
         policy: &ServedPolicy,
         principal: Proved<Principal>,
         surface: SurfaceName,
+        grant: &PresentedGrant,
     ) -> CallerContext {
         let gates = &self.inner.gates;
+        let profile = policy.select(principal.get());
+        let request = GrantRequest {
+            deployment: gates.deployment(),
+            surface: &surface,
+            snapshot: policy.snapshot(),
+            now: gates.clock().now(),
+        };
+        let delegation = gates.grants().present(grant, &principal, &request);
         CallerContext {
-            profile: policy.select(principal.get()),
+            profile,
             principal,
-            delegation: None,
+            delegation,
             surface,
             deployment: gates.deployment().clone(),
         }
@@ -1010,6 +1026,14 @@ fn meta_key(value: Option<CarriedKey>) -> Explicit {
             Explicit::Invalid
         }
     }
+}
+
+/// What a request's headers carried for `tools/call` and `tools/list` beside the body: its
+/// `Idempotency-Key` and its turn grant, read before the request's future is spawned.
+#[derive(Debug)]
+struct Carried {
+    key_header: KeyHeader,
+    grant: PresentedGrant,
 }
 
 /// The `Idempotency-Key` header as a request carried it, read before the request's future is

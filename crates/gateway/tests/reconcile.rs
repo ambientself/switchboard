@@ -57,6 +57,7 @@ async fn start(policy: Value, answer: LookupAnswer) -> World {
         .lookup(CONNECTOR, lookup.clone());
     let gates = boot::check(config, wiring).unwrap();
     let reconciler = gates.reconciler(store.clone(), SETTINGS);
+    let grant_signals = gates.grant_signals();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -81,6 +82,7 @@ async fn start(policy: Value, answer: LookupAnswer) -> World {
             connector,
             address,
             telemetry,
+            grant_signals,
             stop: Some(stop),
             serving,
         },

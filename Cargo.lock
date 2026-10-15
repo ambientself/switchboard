@@ -767,6 +767,7 @@ dependencies = [
  "gateway-core",
  "gateway-identity",
  "gateway-mcp",
+ "gateway-otto",
  "gateway-registry",
  "gateway-testkit",
  "http",

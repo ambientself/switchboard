@@ -174,6 +174,16 @@ impl Reloader {
             }
         }
         let policy = ServedPolicy::from_registry(registry).map_err(BootError::from)?;
+        self.apply_policy(registry, policy)
+    }
+
+    /// Serves `policy`, loaded from `registry`, if it passes the gates every registry version
+    /// meets, the pod gate among them, or refuses it and keeps the policy served now.
+    pub(crate) fn apply_policy(
+        &self,
+        registry: &Registry,
+        policy: ServedPolicy,
+    ) -> Result<PolicyRevision, ReloadError> {
         check_registry_policy(registry, &policy, &self.basis)?;
         // Compared with the loaded registry's policy, not the one served: a withdrawal's derived
         // policy has a revision no registry can have.

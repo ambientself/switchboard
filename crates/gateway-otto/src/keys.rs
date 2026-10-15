@@ -188,6 +188,29 @@ impl GrantKeys {
         Ok(Self { issuers, keys })
     }
 
+    /// No keys at all: what a deployment that configures no issuer verifies against, so a grant
+    /// it is sent is still checked in order and refused, by its version, its shape or its
+    /// unknown key. [`GrantKeys::new`] refuses a configuration that names no issuer, which is a
+    /// mistake in a table meant to name some; this is for a deployment with no table.
+    pub fn none() -> Self {
+        Self {
+            issuers: Vec::new(),
+            keys: BTreeMap::new(),
+        }
+    }
+
+    /// Whether any key is configured.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Each issuer's name, and whether its grants must carry `pod`.
+    pub fn issuers(&self) -> impl Iterator<Item = (&IssuerName, bool)> {
+        self.issuers
+            .iter()
+            .map(|issuer| (&issuer.name, issuer.require_pod))
+    }
+
     /// The ID of every configured key, with its issuer and its end instant (`None` for a
     /// current key), for the boot log.
     pub fn key_ids(&self) -> impl Iterator<Item = (&KeyId, &IssuerName, Option<SystemTime>)> {

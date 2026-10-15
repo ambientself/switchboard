@@ -20,6 +20,8 @@ connector-proxy = { path = "../connector-proxy" }
 gateway-core = { path = "../gateway-core" }
 gateway-identity = { path = "../gateway-identity" }
 gateway-mcp = { path = "../gateway-mcp" }
+# The Otto adapter: the turn-grant verifier, its keys and the tool-name mapping (decision 0012).
+gateway-otto = { path = "../gateway-otto" }
 # The registry file: the policy, the approved definitions and the argument adapters.
 gateway-registry = { path = "../gateway-registry" }
 # The request vocabulary the MCP adapter speaks: methods, header maps and status codes.
@@ -62,6 +64,8 @@ test-support = ["connector-proxy/test-support"]
 
 [dev-dependencies]
 gateway-testkit = { path = "../gateway-testkit" }
+# The test minter, which signs turn grants with keys it generates.
+gateway-otto = { path = "../gateway-otto", features = ["test-support"] }
 # The crate's own tests are a development build, as the harness's are: the testkit's fixture
 # serves `propose` and `write` tools.
 gateway = { path = ".", features = ["test-support"] }

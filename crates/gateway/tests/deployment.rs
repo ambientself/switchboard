@@ -701,3 +701,130 @@ fn the_demo_deployment_files_are_valid_deployment_files() {
         assert!(withdrawn.snapshot().tool(&tool.parse().unwrap()).is_some());
     }
 }
+
+/// Writes two minters' public keys and `mapping` beside a deployment file whose audit is
+/// disabled and whose `[grants]` table is `grants`, and loads it.
+fn with_grants_mapping(
+    name: &str,
+    grants: &str,
+    mapping: &str,
+) -> Result<gateway::Deployment, DeploymentError> {
+    let files = files(name);
+    let current = gateway_otto::minter::TestMinter::from_seed([7; 32]);
+    let previous = gateway_otto::minter::TestMinter::from_seed([8; 32]);
+    files.write("otto.pem", &current.public_key_pem());
+    files.write("otto-previous.pem", &previous.public_key_pem());
+    files.write("otto-tools.json", mapping);
+    files.write(
+        "gateway.toml",
+        &deployment_file(&format!("[audit]\nmode = \"disabled\"\n\n{grants}\n")),
+    );
+    files.load_with(&[])
+}
+
+fn with_grants(name: &str, grants: &str) -> Result<gateway::Deployment, DeploymentError> {
+    with_grants_mapping(
+        name,
+        grants,
+        r#"{"github_get_pr": "github__get_pr", "github_create_pr": "github__create_pr"}"#,
+    )
+}
+
+const GRANTS: &str = r#"[grants]
+mode = "enforce"
+tool_mapping_file = "otto-tools.json"
+
+[[grants.issuers]]
+name = "otto-prod"
+key_file = "otto.pem"
+require_pod = true
+require_egress = false
+
+[grants.issuers.previous]
+key_file = "otto-previous.pem"
+retires_at = 2026-11-01T02:00:00+02:00
+"#;
+
+/// The `[grants]` table reads each issuer's key files and the mapping from the deployment
+/// file's directory, and its previous key's end as an absolute instant. Left out, grant
+/// checking is on with no issuer; `mode = "disabled"` stands alone.
+#[test]
+fn the_grants_table_reads_its_key_files_and_mapping() {
+    let loaded = with_grants("grants", GRANTS).unwrap();
+    let config = loaded.grants.enforce.expect("grant checking enforced");
+    assert!(!loaded.grants.disabled);
+    assert_eq!(config.tool_mapping.len(), 2);
+    let issuer = &config.issuers[0];
+    assert_eq!(issuer.name, "otto-prod");
+    assert!(issuer.require_pod);
+    assert!(!issuer.require_egress);
+    assert!(issuer.current_key.starts_with("-----BEGIN PUBLIC KEY-----"));
+    let previous = issuer.previous_key.as_ref().unwrap();
+    assert_ne!(previous.key, issuer.current_key);
+    assert_eq!(previous.retires_at, Some(1_793_491_200));
+
+    let left_out = files("grants-left-out").load();
+    assert_eq!(left_out.grants, gateway::GrantsSection::default());
+    let disabled = with_grants("grants-disabled", "[grants]\nmode = \"disabled\"\n").unwrap();
+    assert!(disabled.grants.disabled);
+    assert!(disabled.grants.enforce.is_none());
+    let crowded = with_grants(
+        "grants-disabled-crowded",
+        "[grants]\nmode = \"disabled\"\ntool_mapping_file = \"otto-tools.json\"\n",
+    );
+    assert!(
+        matches!(crowded, Err(DeploymentError::Parse { .. })),
+        "{crowded:?}"
+    );
+}
+
+/// Each way the table is refused as it loads: a local time for the previous key's end, a
+/// mapping that is not one to one, a key file that cannot be read, and a field it does not
+/// know. A previous key with no end loads, and the boot gates refuse it.
+#[test]
+fn the_grants_table_is_refused_as_it_loads() {
+    let local = with_grants(
+        "grants-local",
+        &GRANTS.replace("2026-11-01T02:00:00+02:00", "2026-11-01T02:00:00"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        local.contains("the previous key of turn-grant issuer `otto-prod` has a `retires_at`"),
+        "{local}"
+    );
+    let missing = with_grants(
+        "grants-missing",
+        &GRANTS.replace("\"otto.pem\"", "\"nowhere.pem\""),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(missing.contains("nowhere.pem"), "{missing}");
+    let unknown = with_grants(
+        "grants-unknown",
+        &GRANTS.replace("require_egress", "require_egres"),
+    );
+    assert!(
+        matches!(unknown, Err(DeploymentError::Parse { .. })),
+        "{unknown:?}"
+    );
+    let mapping = with_grants_mapping(
+        "grants-mapping",
+        GRANTS,
+        r#"{"github_get_pr": "github__get_pr", "github_get_pr": "github__other"}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        mapping.contains("otto-tools.json` was refused"),
+        "{mapping}"
+    );
+
+    let no_end = with_grants(
+        "grants-no-end",
+        &GRANTS.replace("retires_at = 2026-11-01T02:00:00+02:00\n", ""),
+    )
+    .unwrap();
+    let issuer = &no_end.grants.enforce.unwrap().issuers[0];
+    assert_eq!(issuer.previous_key.as_ref().unwrap().retires_at, None);
+}

@@ -121,6 +121,7 @@ impl Replica {
                 disabled: false,
                 postgres: false,
             },
+            grants: Default::default(),
             http: deployment.http,
             max_age: None,
             read_at: Instant::now(),

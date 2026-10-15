@@ -76,7 +76,7 @@ use gateway_registry::{Destination, Registry, RegistryError};
 use issuer_keys::{FetchError, FetchOptions, KeySource, SourceError, SourceFiles};
 use thiserror::Error;
 
-use crate::boot::{self, BootError, Gates, Settings, Wiring};
+use crate::boot::{self, BootError, GateState, Gates, Settings, Wiring};
 use crate::bulkhead::{Bulkhead, ProxiedSignals};
 use crate::config::{IdentitySection, IssuerKindEntry};
 use crate::deployment::{AuditChoice, Deployment, KeysUrl, Limits, ServerLimits};
@@ -340,6 +340,7 @@ async fn prepare_with(
     boot::before_connecting(
         &deployment.identity,
         &deployment.audit.section(),
+        &deployment.grants,
         registry.snapshot(),
         development,
     )?;
@@ -388,6 +389,7 @@ async fn prepare_with(
         deployment: deployment.deployment,
         identity,
         audit: deployment.audit.section(),
+        grants: deployment.grants,
         http: deployment.http,
         max_age: Some(deployment.max_age),
         read_at,
@@ -440,6 +442,25 @@ async fn prepare_with(
         );
     } else {
         tracing::warn!(event = "boot", audit = "disabled", "audit is disabled");
+    }
+    let grants = gates.grants();
+    match grants.state() {
+        GateState::On => tracing::info!(
+            event = "boot",
+            grants = "enforce",
+            grant_issuers = grants.issuers().len(),
+            grant_issuers_requiring_pod = grants
+                .issuers()
+                .iter()
+                .filter(|(_, require_pod)| *require_pod)
+                .count(),
+            "turn grants are verified on every call and list that carries one"
+        ),
+        GateState::Disabled => tracing::warn!(
+            event = "boot",
+            grants = "disabled",
+            "turn-grant checking is disabled"
+        ),
     }
     let limits = deployment.limits;
     tracing::info!(
@@ -1328,6 +1349,7 @@ mod tests {
             keys_urls,
             audit,
             audit_pools: PoolSizes::default(),
+            grants: Default::default(),
             metrics: None,
             limits: Limits::default(),
             servers: BTreeMap::new(),
@@ -1485,6 +1507,30 @@ mod tests {
             };
             assert!(expected, "{name}: {refused}");
         }
+        assert_eq!(counted.connections(), 0, "something was connected to first");
+    }
+
+    /// Decision 0012, "Keys": a release build refuses turn-grant checking disabled before it
+    /// reads a credential or connects to anything, as it refuses the other opt-outs.
+    #[tokio::test]
+    async fn grant_checking_off_is_refused_before_anything_is_connected() {
+        let counted = Counted::start().await;
+        let text = crate::boot::tests::registry_text("read", true, "r1");
+        let directory = std::env::temp_dir().join(format!(
+            "switchboard-start-opt-out-grants-{}",
+            std::process::id()
+        ));
+        let mut started = deployment(&directory, &text, &counted, false, false);
+        started.grants = crate::grants::GrantsSection {
+            enforce: None,
+            disabled: true,
+        };
+        let refused = refused_as_release(started).await;
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            matches!(refused, StartError::Boot(BootError::GrantOptOut)),
+            "{refused}"
+        );
         assert_eq!(counted.connections(), 0, "something was connected to first");
     }
 

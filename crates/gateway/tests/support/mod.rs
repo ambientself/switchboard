@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gateway::{
-    Config, ResourceAdapter, TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot,
+    Config, GrantSignals, ResourceAdapter, TELEMETRY_QUEUE, Telemetry, Timeouts, Wiring, boot,
     serve_with_telemetry,
 };
 use gateway_core::{ApprovedTool, IDENTITY_FAILURE, Resources};
@@ -48,6 +48,8 @@ pub struct Server {
     pub address: SocketAddr,
     /// The server's telemetry, for its counters.
     pub telemetry: Telemetry,
+    /// What the turn-grant gate counts.
+    pub grant_signals: GrantSignals,
     pub stop: Option<oneshot::Sender<()>>,
     pub serving: JoinHandle<std::io::Result<()>>,
 }
@@ -84,6 +86,7 @@ impl Server {
         }
         let config: Config = serde_json::from_value(config_value).unwrap();
         let gates = boot::check(config, wiring).unwrap();
+        let grant_signals = gates.grant_signals();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -107,6 +110,7 @@ impl Server {
             connector,
             address,
             telemetry,
+            grant_signals,
             stop: Some(stop),
             serving,
         }
