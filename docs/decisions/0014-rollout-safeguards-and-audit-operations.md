@@ -104,6 +104,22 @@ quotas they meet (#12). Until then the caps are the only limit. A caller with no
 an employee from milestone 5, is held by the per-server cap alone until the per-user rate
 limit is answered (Still open).
 
+Noted on 2026-10-15 (#12): the quotas, and the bound of section 1 around a connector in the
+gateway's own process, are built, before any built-in connector. Each server, proxied or built
+in, has a token bucket in each instance, and so has each team on each server, set in the
+deployment file's `[limits]`. They are taken after begin, a proxied server's after its caps,
+and a call over either is `refused` with a fixed sentence naming the scope and the server, so
+a side effect's receipt is `not_performed`. A caller with no team meets the server's quota
+alone. The defaults are provisional: 80 calls a minute with a burst of 80 for each server,
+and 40 with a burst of 40 for each team on it. They are set against GitHub's documented 5,000
+requests an hour for a GitHub App's installation, which 80 a minute keeps under for one
+instance making one request a call, and are revisited when the built-in connectors are
+measured against the vendors. A deployment with more replicas sets them lower. The bound
+defaults to 5 s and 1 MiB, set per connector in `[connectors.<name>]` within the ceilings of
+section 1. Past its deadline a `read` is cancelled and is `error`, and any other tool is
+answered `unknown` but left to run to its end, as decision 0009's "Where a call runs" requires.
+design.md, section 17, records the rest.
+
 ### 3. Audit overload
 
 - **Admission is the caps.** No other admission control sits in front of the store. An
