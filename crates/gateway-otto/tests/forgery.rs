@@ -338,6 +338,8 @@ fn signed_claims_of_the_wrong_shape_are_malformed() {
         json!({"egress": null}),
         json!({"egress": "closed"}),
         json!({"egress": true}),
+        json!({"egress": {"sealed": null}}),
+        json!({"egress": {"open": null}}),
     ] {
         malformed(with(changes).to_string().as_bytes());
     }

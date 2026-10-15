@@ -140,8 +140,7 @@ impl GrantFailure {
 }
 
 /// The turn's egress setting (decision 0010): sealed, or open through Otto's proxy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Egress {
     /// The turn has no egress.
     Sealed,
@@ -396,7 +395,7 @@ struct Wire {
     actor: Option<String>,
     #[serde(default, deserialize_with = "present")]
     pod: Option<PodUid>,
-    #[serde(default, deserialize_with = "present")]
+    #[serde(default, deserialize_with = "egress_setting")]
     egress: Option<Egress>,
 }
 
@@ -405,6 +404,20 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
+}
+
+/// An egress setting that is present is the string `sealed` or `open`. A derived enum would
+/// also read the externally tagged form, such as `{"sealed": null}`, which the format does not
+/// allow.
+fn egress_setting<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Egress>, D::Error> {
+    match String::deserialize(deserializer)?.as_str() {
+        "sealed" => Ok(Some(Egress::Sealed)),
+        "open" => Ok(Some(Egress::Open)),
+        other => Err(serde::de::Error::unknown_variant(
+            other,
+            &["sealed", "open"],
+        )),
+    }
 }
 
 impl Claims {

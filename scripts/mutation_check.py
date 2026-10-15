@@ -1497,6 +1497,11 @@ mutate("otto-grant-required-pod-optional", "a grant without pod is accepted when
        "        if require_pod && claims.pod.is_none() {", "        if false {")
 mutate("otto-grant-required-egress-optional", "a grant without egress is accepted when the issuer requires it", OV,
        "        if require_egress && claims.egress.is_none() {", "        if false {")
+mutate_all("otto-grant-egress-map-accepted", "an egress setting given as the map {\"sealed\": null} is accepted",
+           (OV, "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\npub enum Egress {",
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]\n#[serde(rename_all = \"lowercase\")]\npub enum Egress {"),
+           (OV, '    #[serde(default, deserialize_with = "egress_setting")]',
+            '    #[serde(default, deserialize_with = "present")]'))
 mutate("otto-grant-audience-unchecked", "a grant for another deployment is accepted", OV,
        "        if !claims.aud.iter().any(|aud| aud == self.deployment.as_str()) {", "        if false {")
 mutate("otto-grant-audience-any-case", "the audience is compared ignoring case", OV,
